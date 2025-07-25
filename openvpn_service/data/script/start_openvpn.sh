@@ -72,6 +72,7 @@ EOF
 fi
 
 chmod +x "${OPENVPN_ROOT_DIR}/../utils/openvpn"
+chmod +x "${OPENVPN_ROOT_DIR}/../utils/ip"
 
 if [ -f "$OPENVPN_ROOT_DIR/run/client.pid" ];then
   pid="$(cat $OPENVPN_ROOT_DIR/run/client.pid)"
@@ -81,5 +82,5 @@ if [ -f "$OPENVPN_ROOT_DIR/run/client.pid" ];then
   fi
 fi
 
-echo "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\""
-"${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid" &
+echo "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" \"$OPENVPN_ROOT_DIR/../utils/ip\""
+"${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid" --iproute  "$OPENVPN_ROOT_DIR/../utils/ip" &
