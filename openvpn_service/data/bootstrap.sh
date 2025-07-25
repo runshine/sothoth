@@ -29,6 +29,8 @@ else
     echo "WORKSPACE=${WORKSPACE}"    > "${TARGET_DIR}/sothoth.conf"
     echo "UPSTREAM=${UPSTREAM}"     >> "${TARGET_DIR}/sothoth.conf"
     echo "TARGET_DIR=${TARGET_DIR}" >> "${TARGET_DIR}/sothoth.conf"
+    uuid="$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3"-"$4$5"-"$6$7"-"$8$9}')"
+    echo "NODE_ID=$uuid" >> "${TARGET_DIR}/sothoth.conf"
     ROOT_DIR="$TARGET_DIR"
     cp "$0" "$TARGET_DIR/bootstrap.sh"
     chmod +x "$TARGET_DIR/bootstrap.sh"

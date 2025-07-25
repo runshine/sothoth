@@ -35,8 +35,11 @@ if [ ! -f "${OPENVPN_ROOT_DIR}/conf/ca.crt" ];then
   download "$UPSTREAM/download/cert/ca.crt" "${OPENVPN_ROOT_DIR}/conf/ca.crt"
 fi
 
-echo "$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3"-"$4$5"-"$6$7"-"$8$9}')" > "${OPENVPN_ROOT_DIR}/conf/auth.txt"
-echo "pass" >> "${OPENVPN_ROOT_DIR}/conf/auth.txt"
+if [ ! -f "${OPENVPN_ROOT_DIR}/conf/auth.txt" ];then
+  .  "$OPENVPN_ROOT_DIR/../sothoth.conf"
+  echo "$NODE_ID" > "${OPENVPN_ROOT_DIR}/conf/auth.txt"
+  echo "pass" >> "${OPENVPN_ROOT_DIR}/conf/auth.txt"
+fi
 
 if [ ! -f "${OPENVPN_ROOT_DIR}/conf/client.ovpn" ];then
 cat << EOF > ${OPENVPN_ROOT_DIR}/conf/client.ovpn

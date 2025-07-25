@@ -33,7 +33,7 @@ if [ -f "${ROOT_DIR}/sothoth.conf" ];then
   "$ROOT_DIR/script/stop_openvpn.sh"
   "$ROOT_DIR/script/stop_nginx.sh"
 
-  if [ "x$(ps -ef|grep -v grep|grep sothoth)" == "x" ];then
+  if [ "x$(ps -ef|grep -v grep|grep sothoth)" = "x" ];then
     echo "check success"
   else
     echo "check failed"
