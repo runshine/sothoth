@@ -64,6 +64,9 @@ download_script(){
   url=$1
   target=$2
   download "${url}" "${target}"
+  if [ -f "${target}" ];then
+    chmod +x "${target}"
+  fi
 #  if [ ! -f '/bin/bash' ];then
 #    sed -i 's#/bin/bash#${ROOT_DIR}/utils/bash#g' "${target}"
 #  fi
@@ -78,23 +81,25 @@ do
   fi
 done
 
-bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip"
+bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl"
 for bin in ${bootstrap_utils_list};
 do
   download "$UPSTREAM/utils/$bin/$OS/$ARCH" "${ROOT_DIR}/utils/$bin"
+  if [ -f "${ROOT_DIR}/utils/$bin" ];then
+    chmod +x "${ROOT_DIR}/utils/$bin"
+  fi
 done
 
 download_script "$UPSTREAM/download/stop_all.sh" "$ROOT_DIR/stop_all.sh"
-chmod +x "$ROOT_DIR/stop_all.sh"
 
 download_script "$UPSTREAM/download/script/start_nginx.sh" "$ROOT_DIR/script/start_nginx.sh"
-chmod +x "$ROOT_DIR/script/start_nginx.sh"
 "$ROOT_DIR/script/start_nginx.sh" "${WORKSPACE}" "${UPSTREAM}"
 
 download_script "$UPSTREAM/download/script/start_ttyd.sh" "$ROOT_DIR/script/start_ttyd.sh"
-chmod +x "$ROOT_DIR/script/start_ttyd.sh"
 "$ROOT_DIR/script/start_ttyd.sh" "${WORKSPACE}" "${UPSTREAM}"
 
 download_script "$UPSTREAM/download/script/start_openvpn.sh" "$ROOT_DIR/script/start_openvpn.sh"
-chmod +x "$ROOT_DIR/script/start_openvpn.sh"
 "$ROOT_DIR/script/start_openvpn.sh" "${WORKSPACE}" "${UPSTREAM}"
+
+download_script "$UPSTREAM/download/script/prepare_cpython.sh" "$ROOT_DIR/script/prepare_cpython.sh"
+"$ROOT_DIR/script/prepare_cpython.sh" "${WORKSPACE}" "${UPSTREAM}"

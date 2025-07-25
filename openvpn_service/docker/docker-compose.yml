@@ -123,6 +123,8 @@ services:
       - 11196:11196/udp
       - 11197:11197/udp
       - 8080:8080/tcp
+      - 11193:8848/tcp
+      - 8082:8082/tcp
     environment:
       - TZ=Asia/Shanghai
       - MAP_LIST=11194:1194 11195:1195 11196:1196 11197:1197
@@ -132,6 +134,23 @@ services:
     entrypoint:
       - /data/entrypoint_nginx.sh
 
+  nacos:
+    image: nacos/nacos-server:latest # ${NACOS_VERSION} 替换为你想要部署的Nacos版本号
+    restart: always
+    container_name: nacos
+    environment:
+      - MODE=standalone # 指定为单机模式
+      - TZ=Asia/Shanghai
+      - NACOS_AUTH_TOKEN=YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=
+      - NACOS_AUTH_IDENTITY_KEY=abcdefg
+      - NACOS_AUTH_IDENTITY_VALUE=abcdefg
+      - NACOS_AUTH_ENABLE=false
+      - NACOS_CONSOLE_PORT=8082
+    network_mode: "service:nginx_frontend"
+    volumes:
+      - ./nacos_data/:/home/nacos/data # 挂载数据目录以持久化数据
+    depends_on:
+      - nginx_frontend
 
 networks:
   openvpn_network:

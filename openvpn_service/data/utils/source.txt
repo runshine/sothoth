@@ -1,0 +1,1 @@
+https://github.com/moparisthebest/static-curl/releases/tag/v8.11.0
