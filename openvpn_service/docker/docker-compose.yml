@@ -1,0 +1,149 @@
+name: 'openvpn_service'
+services:
+  openvpn_server_01:
+    image: kylemanna/openvpn:latest
+    restart: always
+    container_name: openvpn_server_01
+    network_mode: "service:nginx_frontend"
+    cap_add:
+      - MKNOD
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - TZ=Asia/Shanghai
+      - MASTER=true
+      - MASTER_GW=100.64.0.1
+      - MASTER_IP=100.64.0.2
+      - PORT=1194
+      - NET_START=100.64.0.3
+      - NET_END=100.64.31.255
+    volumes:
+      - ../data:/data
+      - ../data/cert:/etc/openvpn
+    entrypoint:
+      - /data/entrypoint_openvpn.sh
+    depends_on:
+      - nginx_frontend
+
+  openvpn_server_02:
+    image: kylemanna/openvpn:latest
+    restart: always
+    container_name: openvpn_server_02
+    network_mode: "service:nginx_frontend"
+    cap_add:
+      - MKNOD
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - TZ=Asia/Shanghai
+      - MASTER_IP=100.64.0.2
+      - PORT=1195
+      - NET_START=100.64.32.0
+      - NET_END=100.64.63.255
+    volumes:
+      - ../data:/data
+      - ../data/cert:/etc/openvpn
+    entrypoint:
+      - /data/entrypoint_openvpn.sh
+    depends_on:
+      - openvpn_server_01
+
+  openvpn_server_03:
+    image: kylemanna/openvpn:latest
+    restart: always
+    container_name: openvpn_server_03
+    network_mode: "service:nginx_frontend"
+    cap_add:
+      - MKNOD
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - TZ=Asia/Shanghai
+      - MASTER_IP=100.64.0.2
+      - PORT=1196
+      - NET_START=100.64.64.0
+      - NET_END=100.64.95.255
+    volumes:
+      - ../data:/data
+      - ../data/cert:/etc/openvpn
+    entrypoint:
+      - /data/entrypoint_openvpn.sh
+    depends_on:
+      - openvpn_server_01
+
+  openvpn_server_04:
+    image: kylemanna/openvpn:latest
+    restart: always
+    container_name: openvpn_server_04
+    network_mode: "service:nginx_frontend"
+    cap_add:
+      - MKNOD
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - TZ=Asia/Shanghai
+      - MASTER_IP=100.64.0.2
+      - PORT=1197
+      - NET_START=100.64.66.0
+      - NET_END=100.64.127.255
+    volumes:
+      - ../data:/data
+      - ../data/cert:/etc/openvpn
+    entrypoint:
+      - /data/entrypoint_openvpn.sh
+    depends_on:
+      - openvpn_server_01
+
+  vpn_server:
+    build:
+      context: vpn_server
+      dockerfile: Dockerfile
+    restart: always
+    container_name: vpn_server
+    network_mode: "service:nginx_frontend"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ../data:/data
+
+  nginx_frontend:
+    image: nginx:latest
+    restart: always
+    container_name: nginx_frontend
+    hostname: nginx_frontend
+    networks:
+      - openvpn_network
+    ports:
+      - 11194:11194/udp
+      - 11195:11195/udp
+      - 11196:11196/udp
+      - 11197:11197/udp
+      - 8080:8080/tcp
+    environment:
+      - TZ=Asia/Shanghai
+      - MAP_LIST=11194:1194 11195:1195 11196:1196 11197:1197
+    volumes:
+      - ../data:/data
+      - ../data/nginx.conf:/etc/nginx/nginx.conf
+    entrypoint:
+      - /data/entrypoint_nginx.sh
+
+
+networks:
+  openvpn_network:
+    driver: bridge
+    enable_ipv6: false
+    internal: false
+    ipam:
+      driver: default
+      config:
+        - subnet: 100.64.0.0/16
+
+
+
+
+
