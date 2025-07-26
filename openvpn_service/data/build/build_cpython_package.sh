@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -e
-addtional_packges="nacos-sdk-python"
+addtional_packges="requests"
 
 ARCH="$(uname -m)"
 if [ "$ARCH" = "aarch64" ];then

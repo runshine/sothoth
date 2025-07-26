@@ -1,6 +1,6 @@
 #!/bin/sh
 
-OPENVPN_ROOT_DIR="$(cd "$(dirname $0)";pwd)/../openvpn"
+NACOS_ROOT_DIR="$(cd "$(dirname $0)";pwd)/../nacos"
 ARCH="$(uname -m)"
 OS="linux"
 WORKSPACE="$1"
@@ -10,4 +10,4 @@ UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
 cd "$(cd "$(dirname $0)";pwd)"
 . common.sh
 
-kill_pid_file "${OPENVPN_ROOT_DIR}/run/client.pid"
+kill_pid_file "$NACOS_ROOT_DIR/run/client.pid"

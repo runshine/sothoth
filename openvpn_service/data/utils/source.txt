@@ -1,1 +1,4 @@
 https://github.com/moparisthebest/static-curl/releases/tag/v8.11.0
+https://github.com/justdan96/7zip_static
+
+https://github.com/tj/mon

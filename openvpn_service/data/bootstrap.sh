@@ -18,12 +18,13 @@ else
   if [ "x${TARGET_DIR}" = "x" ];then
     TARGET_DIR="/sothoth"
   fi
+  ROOT_DIR="$TARGET_DIR"
   if [ ! -d "${TARGET_DIR}" ];then
     mkdir -p "$TARGET_DIR"
   fi
 
   if [ -f "${TARGET_DIR}/sothoth.conf" ];then
-    source "$ROOT_DIR/sothoth.conf" | .  "$ROOT_DIR/sothoth.conf"
+    .  "$ROOT_DIR/sothoth.conf"
     ROOT_DIR="$TARGET_DIR"
   else
     echo "WORKSPACE=${WORKSPACE}"    > "${TARGET_DIR}/sothoth.conf"
@@ -52,7 +53,7 @@ download() {
     if [ -f "$target" ];then
       return
     fi
-    wget "${url}" -O "$target" || curl "${url}" -o "$target"
+    wget -q "${url}" -O "$target" || curl "${url}" -s -o "$target"
     if [ ! -f "$target" ];then
       echo "$(date): file: $target download failed --> $url"
     else
@@ -67,9 +68,12 @@ download_script(){
   if [ -f "${target}" ];then
     chmod +x "${target}"
   fi
-#  if [ ! -f '/bin/bash' ];then
-#    sed -i 's#/bin/bash#${ROOT_DIR}/utils/bash#g' "${target}"
-#  fi
+
+  if [ -f "${ROOT_DIR}/utils/bash" ];then
+    sed -i "1s:.*:#!${ROOT_DIR}/utils/bash:g" "${target}"
+  elif [ -f '/bin/bash' ];then
+    sed -i "1s/.*/#!\/bin\/bash/" "$2"
+  fi
 }
 
 pre_build_dirs="$ROOT_DIR/utils $ROOT_DIR/script"
@@ -81,7 +85,7 @@ do
   fi
 done
 
-bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl"
+bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz"
 for bin in ${bootstrap_utils_list};
 do
   download "$UPSTREAM/utils/$bin/$OS/$ARCH" "${ROOT_DIR}/utils/$bin"
@@ -90,16 +94,20 @@ do
   fi
 done
 
+download_script "$UPSTREAM/download/script/common.sh" "$ROOT_DIR/script/common.sh"
 download_script "$UPSTREAM/download/stop_all.sh" "$ROOT_DIR/stop_all.sh"
-
-download_script "$UPSTREAM/download/script/start_nginx.sh" "$ROOT_DIR/script/start_nginx.sh"
-"$ROOT_DIR/script/start_nginx.sh" "${WORKSPACE}" "${UPSTREAM}"
-
 download_script "$UPSTREAM/download/script/start_ttyd.sh" "$ROOT_DIR/script/start_ttyd.sh"
-"$ROOT_DIR/script/start_ttyd.sh" "${WORKSPACE}" "${UPSTREAM}"
-
+download_script "$UPSTREAM/download/script/stop_ttyd.sh" "$ROOT_DIR/script/stop_ttyd.sh"
 download_script "$UPSTREAM/download/script/start_openvpn.sh" "$ROOT_DIR/script/start_openvpn.sh"
-"$ROOT_DIR/script/start_openvpn.sh" "${WORKSPACE}" "${UPSTREAM}"
-
+download_script "$UPSTREAM/download/script/stop_openvpn.sh" "$ROOT_DIR/script/stop_openvpn.sh"
+download_script "$UPSTREAM/download/script/start_nginx.sh" "$ROOT_DIR/script/start_nginx.sh"
+download_script "$UPSTREAM/download/script/stop_nginx.sh" "$ROOT_DIR/script/stop_nginx.sh"
+download_script "$UPSTREAM/download/script/start_nacos_client.sh" "$ROOT_DIR/script/start_nacos_client.sh"
+download_script "$UPSTREAM/download/script/stop_nacos_client.sh" "$ROOT_DIR/script/stop_nacos_client.sh"
 download_script "$UPSTREAM/download/script/prepare_cpython.sh" "$ROOT_DIR/script/prepare_cpython.sh"
+
+"$ROOT_DIR/script/start_nginx.sh" "${WORKSPACE}" "${UPSTREAM}"
+"$ROOT_DIR/script/start_ttyd.sh" "${WORKSPACE}" "${UPSTREAM}"
+"$ROOT_DIR/script/start_openvpn.sh" "${WORKSPACE}" "${UPSTREAM}"
 "$ROOT_DIR/script/prepare_cpython.sh" "${WORKSPACE}" "${UPSTREAM}"
+"$ROOT_DIR/script/start_nacos_client.sh" "${WORKSPACE}" "${UPSTREAM}"

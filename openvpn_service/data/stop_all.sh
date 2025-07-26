@@ -2,41 +2,21 @@
 
 ROOT_DIR="$(cd "$(dirname $0)";pwd)"
 ret="true"
-download() {
-    url=$1
-    target=$2
-    if [ -f "$target" ];then
-      return
-    fi
-    wget "${url}" -O "$target" || curl "${url}" -o "$target"
-    if [ ! -f "$target" ];then
-      echo "$(date): file: $target download failed --> $url"
-    else
-      echo "$(date): file: $target download success"
-    fi
-}
 
 if [ -f "${ROOT_DIR}/sothoth.conf" ];then
   chmod +x "${ROOT_DIR}/sothoth.conf"
   .  "$ROOT_DIR/sothoth.conf"
 
-  download "$UPSTREAM/download/script/stop_ttyd.sh" "$ROOT_DIR/script/stop_ttyd.sh"
-  chmod +x "$ROOT_DIR/script/stop_ttyd.sh"
-
-  download "$UPSTREAM/download/script/stop_openvpn.sh" "$ROOT_DIR/script/stop_openvpn.sh"
-  chmod +x "$ROOT_DIR/script/stop_openvpn.sh"
-
-  download "$UPSTREAM/download/script/stop_nginx.sh" "$ROOT_DIR/script/stop_nginx.sh"
-  chmod +x "$ROOT_DIR/script/stop_nginx.sh"
-
   "$ROOT_DIR/script/stop_ttyd.sh"
   "$ROOT_DIR/script/stop_openvpn.sh"
   "$ROOT_DIR/script/stop_nginx.sh"
+  "$ROOT_DIR/script/stop_nacos_client.sh"
 
-  if [ "x$(ps -ef|grep -v grep|grep sothoth)" = "x" ];then
+  check_result="$(ps -ef|grep -v grep|grep sothoth | grep -v stop_all)"
+  if [ "x${check_result}" = "x" ];then
     echo "check success"
   else
-    echo "check failed"
+    echo "check failed, result: ${check_result}"
   fi
 
 else

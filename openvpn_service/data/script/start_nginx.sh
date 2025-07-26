@@ -7,35 +7,16 @@ WORKSPACE="$1"
 UPSTREAM="$2"
 UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
+cd "$(cd "$(dirname $0)";pwd)"
+. common.sh
 
-download() {
-    url=$1
-    target=$2
-    if [ -f "$target" ];then
-      return
-    fi
-    wget "${url}" -O "$target" || curl "${url}" -o "$target"
-    if [ ! -f "$target" ];then
-      echo "$(date): file: $target download failed --> $url"
-    else
-      echo "$(date): file: $target download success"
-    fi
-}
+pre_build_dirs="$NGINX_ROOT_DIR/conf $NGINX_ROOT_DIR/log $NGINX_ROOT_DIR/run $NGINX_ROOT_DIR/conf/conf.d $NGINX_ROOT_DIR/conf/stream.d"
+prepare_dir "$pre_build_dirs"
 
 download_replace(){
   download "$1" "$2"
   sed -i "s#/var/log/nginx#${NGINX_ROOT_DIR}#g" "$2"
 }
-
-pre_build_dirs="$NGINX_ROOT_DIR/conf $NGINX_ROOT_DIR/log $NGINX_ROOT_DIR/run $NGINX_ROOT_DIR/conf/conf.d $NGINX_ROOT_DIR/conf/stream.d"
-
-for dir in ${pre_build_dirs};
-do
-  if [ ! -d "${dir}" ];then
-    echo "$(date): start create dir: ${dir}"
-    mkdir -p "$dir"
-  fi
-done
 
 download_replace "$UPSTREAM/download/conf/nginx/nginx.conf" "${NGINX_ROOT_DIR}/conf/nginx.conf"
 download_replace "$UPSTREAM/download/conf/nginx/mime.types" "${NGINX_ROOT_DIR}/conf/mime.types"
@@ -89,6 +70,12 @@ server {
 
 EOF
 
-echo "start nginx daemon: ${NGINX_ROOT_DIR}/../utils/nginx -p \"${NGINX_ROOT_DIR}\" -c \"${NGINX_ROOT_DIR}/conf/nginx.conf\" -g \"daemon on;\""
-chmod +x "${NGINX_ROOT_DIR}/../utils/nginx"
-"${NGINX_ROOT_DIR}/../utils/nginx" -p "${NGINX_ROOT_DIR}" -c "${NGINX_ROOT_DIR}/conf/nginx.conf" -g "daemon on;"
+if ! is_pid_file_running "${NGINX_ROOT_DIR}/run/nginx.pid";then
+  logger "start nginx daemon: ${NGINX_ROOT_DIR}/../utils/nginx -p \"${NGINX_ROOT_DIR}\" -c \"${NGINX_ROOT_DIR}/conf/nginx.conf\" -g \"daemon on;\""
+  chmod +x "${NGINX_ROOT_DIR}/../utils/nginx"
+  "${NGINX_ROOT_DIR}/../utils/nginx" -p "${NGINX_ROOT_DIR}" -c "${NGINX_ROOT_DIR}/conf/nginx.conf" -g "daemon on;"
+else
+  logger "nginx already run, ignore re-run, pid: $(cat ${NGINX_ROOT_DIR}/run/nginx.pid)"
+fi
+
+
