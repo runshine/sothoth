@@ -105,9 +105,12 @@ download_script "$UPSTREAM/download/script/stop_nginx.sh" "$ROOT_DIR/script/stop
 download_script "$UPSTREAM/download/script/start_nacos_client.sh" "$ROOT_DIR/script/start_nacos_client.sh"
 download_script "$UPSTREAM/download/script/stop_nacos_client.sh" "$ROOT_DIR/script/stop_nacos_client.sh"
 download_script "$UPSTREAM/download/script/prepare_cpython.sh" "$ROOT_DIR/script/prepare_cpython.sh"
+download_script "$UPSTREAM/download/script/start_openssh.sh" "$ROOT_DIR/script/start_openssh.sh"
+download_script "$UPSTREAM/download/script/stop_openssh.sh" "$ROOT_DIR/script/stop_openssh.sh"
 
 "$ROOT_DIR/script/start_nginx.sh" "${WORKSPACE}" "${UPSTREAM}"
 "$ROOT_DIR/script/start_ttyd.sh" "${WORKSPACE}" "${UPSTREAM}"
 "$ROOT_DIR/script/start_openvpn.sh" "${WORKSPACE}" "${UPSTREAM}"
 "$ROOT_DIR/script/prepare_cpython.sh" "${WORKSPACE}" "${UPSTREAM}"
 "$ROOT_DIR/script/start_nacos_client.sh" "${WORKSPACE}" "${UPSTREAM}"
+"$ROOT_DIR/script/start_openssh.sh" "${WORKSPACE}" "${UPSTREAM}"

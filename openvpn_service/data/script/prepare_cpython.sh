@@ -15,5 +15,10 @@ prepare_dir "$pre_build_dirs"
 
 if [ ! -f "${PYTHON_ROOT_DIR}/bin/python" ];then
   download "$UPSTREAM/package/cpython/$OS/$ARCH" "${PYTHON_ROOT_DIR}/cpython.tar.gz"
-  tar -zxvf "${PYTHON_ROOT_DIR}/cpython.tar.gz" -C "${PYTHON_ROOT_DIR}/../"
+  tar -zxvf "${PYTHON_ROOT_DIR}/cpython.tar.gz" -C "${PYTHON_ROOT_DIR}/../" 1>/dev/null
+  if [ $? -eq 0 ];then
+    logger "cpython decompress process success!"
+  else
+    logger "cpython decompress process failed!"
+  fi
 fi
