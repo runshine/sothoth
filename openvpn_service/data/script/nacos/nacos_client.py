@@ -12,7 +12,7 @@ def start_openssh_service():
 
 
 def start_nginx_proxy_service():
-    start_nacos_service("nginx_proxy","11199",None,check_tcp_port_is_listen,11199)
+    start_nacos_service("nginx-proxy","11199",None,check_tcp_port_is_listen,11199)
 
 
 def graceful_exit():

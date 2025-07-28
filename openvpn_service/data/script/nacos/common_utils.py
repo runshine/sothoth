@@ -181,6 +181,8 @@ def nacos_service_register(service_name,service_ip,service_port,metadata = None)
               "ephemeral":"true",
               "metadata": json.dumps(metadata)
               }
+    if 'service_name' in metadata.keys():
+        params["clusterName"] = metadata['service_name']
     url = "{}?{}".format(url,urlencode(params))
     try:
         res = requests.post(url)
