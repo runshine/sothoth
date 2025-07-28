@@ -8,6 +8,9 @@ UPSTREAM="$2"
 UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
 cd "$(cd "$(dirname $0)";pwd)"
+if [ -d "${PYTHON_ROOT_DIR}" ];then
+  mkdir -p "${PYTHON_ROOT_DIR}"
+fi
 . "${PYTHON_ROOT_DIR}/../script/common.sh"
 
 pre_build_dirs="$PYTHON_ROOT_DIR"

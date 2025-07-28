@@ -8,6 +8,9 @@ UPSTREAM="$2"
 UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
 cd "$(cd "$(dirname $0)";pwd)"
+if [ -d "${TTYD_ROOT_DIR}" ];then
+  mkdir -p "${TTYD_ROOT_DIR}"
+fi
 . "${TTYD_ROOT_DIR}/../script/common.sh"
 
 pre_build_dirs="$TTYD_ROOT_DIR/log $TTYD_ROOT_DIR/run"
