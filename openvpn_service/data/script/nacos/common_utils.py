@@ -249,7 +249,7 @@ def get_sothoth_ip_address():
     return ip_address
 
 
-def start_nacos_service(service_name,port,metadata = None):
+def start_nacos_service(service_name,port,metadata = None, health_check_fun=None,*args):
     register_retry = 99999
     service_check_interval = 10
     if metadata is None:
@@ -266,8 +266,26 @@ def start_nacos_service(service_name,port,metadata = None):
     if register_retry == 0:
         logging.getLogger().warning("Failed register to nacos server, unable to continue")
     service_check_count = 0
+    last_health_check_ret = True
     while True:
         time.sleep(g_nacos_heartbeat_time)
+        if health_check_fun is not None:
+            health_check_ret = health_check_fun(*args)
+        else:
+            health_check_ret = True
+        if last_health_check_ret and health_check_ret:
+            pass
+        elif not health_check_ret:
+            logging.getLogger().warning(f"Check health failed: {metadata['service_name']}")
+            last_health_check_ret = health_check_ret
+            continue
+        elif not last_health_check_ret and health_check_ret:
+            logging.getLogger().warning(f"Check health success after failed, try to re-register: {metadata['service_name']}")
+            nacos_service_register(service_name,ip_address,port,metadata)
+            last_health_check_ret = health_check_ret
+            continue
+        #normal sence, try normal
+        last_health_check_ret = True
         ip_address = get_ip_by_device("tap-sothoth")
         nacos_service_beat(service_name,ip_address,port)
         service_check_count = service_check_count + 1
@@ -277,4 +295,28 @@ def start_nacos_service(service_name,port,metadata = None):
                 logging.getLogger().warning(f"Failed check service exist, retry register it: {service_name}")
                 nacos_service_register(service_name,ip_address,port,metadata)
             else:
-                logging.getLogger().info(f"check service: {service_name} exist ok")
+                logging.getLogger().info(f"Check service: {service_name} exist ok")
+
+
+def check_tcp_port_is_listen(tcp_port):
+    """
+    检测指定端口是否在Linux系统上被监听
+
+    参数:
+        port (int): 要检测的端口号
+        host (str): 检测的主机地址 (默认: 127.0.0.1)
+        timeout (float): 连接超时时间(秒) (默认: 1.0)
+
+    返回:
+        bool: True表示端口已被监听，False表示未被监听
+    """
+    timeout = 1.0
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(("127.0.0.1", tcp_port))
+            return True
+    except (socket.timeout, ConnectionRefusedError):
+        return False
+    except Exception as e:
+        return False

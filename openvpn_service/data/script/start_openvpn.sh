@@ -51,6 +51,15 @@ remote-random
 EOF
 fi
 
+if [ ! -c "/dev/net/tun" ];then
+  if [ ! -d "/dev/net" ];then
+    mkdir -p "/dev/net"
+    chmod 777 '/dev/net'
+  fi
+  mknod /dev/net/tun c 10 200
+  chmod 0666 /dev/net/tun
+fi
+
 if ! is_pid_file_running "${OPENVPN_ROOT_DIR}/run/client.pid";then
   if [ "$ARCH" = "x86_64" ];then
     logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" \"$OPENVPN_ROOT_DIR/../utils/ip\""

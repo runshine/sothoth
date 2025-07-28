@@ -4,11 +4,15 @@ server_should_stop = False
 
 
 def start_ttyd_service():
-    start_nacos_service(service_name="ttyd",port="11198",metadata=translate_ipv4_list_to_map(get_ipv4_addresses()))
+    start_nacos_service("ttyd","11198",translate_ipv4_list_to_map(get_ipv4_addresses()),check_tcp_port_is_listen,11198)
 
 
 def start_openssh_service():
-    start_nacos_service(service_name="sshd",port="11192")
+    start_nacos_service("sshd","11192",None,check_tcp_port_is_listen,11192)
+
+
+def start_nginx_proxy_service():
+    start_nacos_service("nginx_proxy","11199",None,check_tcp_port_is_listen,11199)
 
 
 def graceful_exit():
@@ -34,7 +38,8 @@ if __name__ == "__main__":
     ttyd_thread.start()
     sshd_thread = threading.Thread(target=start_openssh_service)
     sshd_thread.start()
-
+    nginx_proxy_thread = threading.Thread(target=start_nginx_proxy_service)
+    nginx_proxy_thread.start()
     ttyd_thread.join()
     sshd_thread.join()
 
