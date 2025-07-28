@@ -7,6 +7,11 @@ WORKSPACE="$1"
 UPSTREAM="$2"
 TARGET_DIR="$3"
 
+unset http_proxy
+unset https_proxy
+unset HTTP_PROXY
+unset HTTPS_PROXY
+
 
 if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ];then
   #we are in local run mode
