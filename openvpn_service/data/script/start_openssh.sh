@@ -8,7 +8,7 @@ UPSTREAM="$2"
 UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
 cd "$(cd "$(dirname $0)";pwd)"
-. common.sh
+. "${OPENSSH_ROOT_DIR}/../script/common.sh"
 
 pre_build_dirs="$OPENSSH_ROOT_DIR $OPENSSH_ROOT_DIR/run $OPENSSH_ROOT_DIR/log $OPENSSH_ROOT_DIR/var/empty"
 prepare_dir "$pre_build_dirs"

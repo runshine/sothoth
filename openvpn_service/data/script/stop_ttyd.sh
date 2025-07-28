@@ -8,6 +8,6 @@ UPSTREAM="$2"
 UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
 cd "$(cd "$(dirname $0)";pwd)"
-. common.sh
+. "${TTYD_ROOT_DIR}/../script/common.sh"
 
 kill_pid_file "${TTYD_ROOT_DIR}/run/ttyd.pid"

@@ -8,7 +8,7 @@ UPSTREAM="$2"
 UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
 cd "$(cd "$(dirname $0)";pwd)"
-. common.sh
+. "${NGINX_ROOT_DIR}/../script/common.sh"
 
 pre_build_dirs="$NGINX_ROOT_DIR/conf $NGINX_ROOT_DIR/log $NGINX_ROOT_DIR/run $NGINX_ROOT_DIR/conf/conf.d $NGINX_ROOT_DIR/conf/stream.d"
 prepare_dir "$pre_build_dirs"
