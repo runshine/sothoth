@@ -8,7 +8,7 @@ UPSTREAM="$2"
 UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
 cd "$(cd "$(dirname $0)";pwd)"
-if [ -d "${NACOS_ROOT_DIR}" ];then
+if [ ! -d "${NACOS_ROOT_DIR}" ];then
   mkdir -p "${NACOS_ROOT_DIR}"
 fi
 . "${NACOS_ROOT_DIR}/../script/common.sh"
