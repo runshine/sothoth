@@ -1,0 +1,106 @@
+apiVersion: networking.higress.io/v1
+kind: McpBridge
+metadata:
+  name: default
+  namespace: higress-system
+  creationTimestamp: "2000-01-01T00:00:00Z"
+  resourceVersion: "1"
+spec:
+  registries:
+  - domain: 127.0.0.1:8001
+    name: higress-console
+    port: 80
+    type: static
+  # AI_REGISTRIES_START
+  - name: llm-aliyun.internal
+    type: dns
+    protocol: https
+    domain: dashscope.aliyuncs.com
+    port: 443
+  - name: llm-moonshot.internal
+    type: dns
+    protocol: https
+    domain: api.moonshot.cn
+    port: 443
+  - name: llm-openai.internal
+    type: dns
+    protocol: https
+    domain: api.openai.com
+    port: 443
+  - name: llm-ai360.internal
+    type: dns
+    protocol: https
+    domain: api.360.cn
+    port: 443
+  - name: llm-baichuan.internal
+    type: dns
+    protocol: https
+    domain: api.baichuan-ai.com
+    port: 443
+  - name: llm-yi.internal
+    type: dns
+    protocol: https
+    domain: api.lingyiwanwu.com
+    port: 443
+  - name: llm-deepseek.internal
+    type: dns
+    protocol: https
+    domain: api.deepseek.com
+    port: 443
+  - name: llm-zhipuai.internal
+    type: dns
+    protocol: https
+    domain: open.bigmodel.cn
+    port: 443
+  - name: llm-baidu.internal
+    type: dns
+    protocol: https
+    domain: qianfan.baidubce.com
+    port: 443
+  - name: llm-stepfun.internal
+    type: dns
+    protocol: https
+    domain: api.stepfun.com
+    port: 443
+  - name: llm-gemini.internal
+    type: dns
+    protocol: https
+    domain: generativelanguage.googleapis.com
+    port: 443
+  - name: llm-mistral.internal
+    type: dns
+    protocol: https
+    domain: api.mistral.ai
+    port: 443
+  - name: llm-cohere.internal
+    type: dns
+    protocol: https
+    domain: api.cohere.com
+    port: 443
+  - name: llm-doubao.internal
+    type: dns
+    protocol: https
+    domain: ark.cn-beijing.volces.com
+    port: 443
+  - name: llm-azure.internal
+    type: dns
+    protocol: https
+    domain: YOUR_RESOURCE_NAME.openai.azure.com
+    port: 443
+  - name: llm-claude.internal
+    type: dns
+    protocol: https
+    domain: api.anthropic.com
+    port: 443
+  - name: llm-ollama.internal
+    type: static
+    protocol: http
+    domain: 127.0.0.127:11434
+    port: 80
+  - name: llm-minimax.internal
+    type: dns
+    protocol: https
+    domain: api.minimax.chat
+    port: 443
+  # AI_REGISTRIES_END
+status: {}

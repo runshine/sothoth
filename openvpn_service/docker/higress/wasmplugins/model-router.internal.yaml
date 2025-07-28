@@ -1,0 +1,22 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  annotations:
+    higress.io/wasm-plugin-title: AI Model Router
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "true"
+    higress.io/wasm-plugin-category: ai
+    higress.io/wasm-plugin-name: model-router
+    higress.io/wasm-plugin-version: 1.0.0
+  name: model-router.internal
+  namespace: higress-system
+  resourceVersion: "1"
+spec:
+  defaultConfig:
+    modelToHeader: x-higress-llm-model
+  defaultConfigDisable: false
+  failStrategy: FAIL_OPEN
+  phase: AUTHN
+  priority: 900
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/model-router:1.0.0

@@ -1,0 +1,190 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  annotations:
+    higress.io/wasm-plugin-title: AI Proxy
+  labels:
+    higress.io/resource-definer: higress
+    higress.io/wasm-plugin-built-in: "true"
+    higress.io/wasm-plugin-category: ai
+    higress.io/wasm-plugin-name: ai-proxy
+    higress.io/wasm-plugin-version: 1.0.0
+  name: ai-proxy.internal
+  namespace: higress-system
+  resourceVersion: "1"
+spec:
+  defaultConfig:
+    providers:
+    - id: aliyun
+      type: qwen
+      apiTokens:
+      - "YOUR_DASHSCOPE_API_KEY"
+    - id: moonshot
+      type: moonshot
+      apiTokens:
+      - "YOUR_MOONSHOT_API_KEY"
+    - id: openai
+      type: openai
+      apiTokens:
+      - "YOUR_OPENAI_API_KEY"
+    - id: ai360
+      type: ai360
+      apiTokens:
+      - "YOUR_AI360_API_KEY"
+    - id: baichuan
+      type: baichuan
+      apiTokens:
+      - "YOUR_BAICHUAN_API_KEY"
+    - id: yi
+      type: yi
+      apiTokens:
+      - "YOUR_YI_API_KEY"
+    - id: deepseek
+      type: deepseek
+      apiTokens:
+      - "YOUR_DEEPSEEK_API_KEY"
+    - id: zhipuai
+      type: zhipuai
+      apiTokens:
+      - "YOUR_ZHIPUAI_API_KEY"
+    - id: baidu
+      type: baidu
+      apiTokens:
+      - "YOUR_BAIDU_API_KEY"
+    - id: stepfun
+      type: stepfun
+      apiTokens:
+      - "YOUR_STEPFUN_API_KEY"
+    - id: gemini
+      type: gemini
+      apiTokens:
+      - "YOUR_GEMINI_API_KEY"
+    - id: mistral
+      type: mistral
+      apiTokens:
+      - "YOUR_MISTRAL_API_KEY"
+    - id: cohere
+      type: cohere
+      apiTokens:
+      - "YOUR_COHERE_API_KEY"
+    - id: doubao
+      type: doubao
+      apiTokens:
+      - "YOUR_DOUBAO_API_KEY"
+    - id: azure
+      type: azure
+      apiTokens:
+      - "YOUR_AZURE_API_KEY"
+      azureServiceUrl: https://YOUR_RESOURCE_NAME.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT_NAME/chat/completions?api-version=2024-06-01
+    - id: claude
+      type: claude
+      apiTokens:
+      - "YOUR_CLAUDE_API_KEY"
+      claudeVersion: "2023-06-01"
+    - id: ollama
+      type: ollama
+      apiTokens:
+      - "YOUR_OLLAMA_API_KEY"
+      ollamaServerHost: "127.0.0.127"
+      ollamaServerPort: 11434
+    - id: minimax
+      type: minimax
+      apiTokens:
+      - "YOUR_MINIMAX_API_KEY"
+      minimaxGroupId: ""
+  defaultConfigDisable: false
+  matchRules:
+  - service:
+    - llm-aliyun.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: aliyun
+  - service:
+    - llm-moonshot.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: moonshot
+  - service:
+    - llm-openai.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: openai
+  - service:
+    - llm-ai360.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: ai360
+  - service:
+    - llm-baichuan.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: baichuan
+  - service:
+    - llm-yi.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: yi
+  - service:
+    - llm-deepseek.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: deepseek
+  - service:
+    - llm-zhipuai.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: zhipuai
+  - service:
+    - llm-baidu.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: baidu
+  - service:
+    - llm-stepfun.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: stepfun
+  - service:
+    - llm-gemini.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: gemini
+  - service:
+    - llm-mistral.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: mistral
+  - service:
+    - llm-cohere.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: cohere
+  - service:
+    - llm-doubao.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: doubao
+  - service:
+    - llm-azure.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: azure
+  - service:
+    - llm-claude.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: claude
+  - service:
+    - llm-ollama.internal.static
+    configDisable: false
+    config:
+      activeProviderId: ollama
+  - service:
+    - llm-minimax.internal.dns
+    configDisable: false
+    config:
+      activeProviderId: minimax
+  failStrategy: FAIL_OPEN
+  phase: UNSPECIFIED_PHASE
+  priority: 100
+  url: oci://higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/ai-proxy:1.0.0
