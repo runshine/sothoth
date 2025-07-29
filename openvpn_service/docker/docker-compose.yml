@@ -179,6 +179,20 @@ services:
     depends_on:
       - openvpn_server_04
 
+  mcp-server-ssh:
+    build:
+      context: mcp-ssh/mcp-ssh
+      dockerfile: Dockerfile
+    restart: always
+    container_name: mcp-server-ssh
+    network_mode: "service:nginx_frontend"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ../data:/data
+    depends_on:
+      - openvpn_server_04
+
 networks:
   openvpn_network:
     driver: bridge

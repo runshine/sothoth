@@ -1,3 +1,5 @@
 https://github.com/moparisthebest/static-curl/releases/tag/v8.11.0
 https://github.com/justdan96/7zip_static
-https://github.com/binary-manu/static-cross-openssh?tab=readme-ov-file
+https://github.com/binary-manu/static-cross-openssh?tab=readme-ov-file3
+https://github.com/ernw/static-toolbox
+https://files.serverless.industries/bin/

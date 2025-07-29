@@ -253,7 +253,7 @@ def get_sothoth_ip_address():
 
 def start_nacos_service(service_name,port,metadata = None, health_check_fun=None,*args):
     register_retry = 99999
-    service_check_interval = 10
+    service_check_interval = 12
     if metadata is None:
         metadata = {}
     metadata['service_name'] = service_name
@@ -298,6 +298,7 @@ def start_nacos_service(service_name,port,metadata = None, health_check_fun=None
                 nacos_service_register(service_name,ip_address,port,metadata)
             else:
                 logging.getLogger().info(f"Check service: {service_name} exist ok")
+                nacos_service_register(service_name,ip_address,port,metadata)
 
 
 def check_tcp_port_is_listen(tcp_port):

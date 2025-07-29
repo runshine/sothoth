@@ -11,7 +11,7 @@ if [ "x${NET_START}" != "x" ] && [ "x${NET_END}" != "x" ] ; then
       ifconfig ${bridge_name} up
       ip addr add ${MASTER_IP}/16 dev ${bridge_name}
       ip route add default via ${MASTER_GW}
-      ip addr add 100.64.0.3 dev eth0
+      ip addr add "$(echo ${MASTER_IP} | cut -d '.' -f 1-2).0.3" dev eth0
     else
       echo "$(date): bridge ${bridge_name} already setup, ignore re-setup it"
     fi
