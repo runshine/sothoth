@@ -129,7 +129,7 @@ do
   fi
 done
 
-bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz nmap"
+bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz"
 for bin in ${bootstrap_utils_list};
 do
   download "$UPSTREAM/utils/$bin/$OS/$ARCH" "${ROOT_DIR}/utils/$bin"

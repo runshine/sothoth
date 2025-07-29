@@ -3,3 +3,4 @@ https://github.com/justdan96/7zip_static
 https://github.com/binary-manu/static-cross-openssh?tab=readme-ov-file3
 https://github.com/ernw/static-toolbox
 https://files.serverless.industries/bin/
+https://github.com/ernw/static-toolbox/releases
