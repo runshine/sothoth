@@ -13,7 +13,7 @@ if [ -f "${ROOT_DIR}/sothoth.conf" ];then
   "$ROOT_DIR/script/stop_nacos_client.sh"
   "$ROOT_DIR/script/stop_openssh.sh"
 
-  check_result="$(ps -ef|grep -v grep|grep sothoth | grep -v stop_all)"
+  check_result="$(ps -ef|grep -v grep|grep "$ROOT_DIR" | grep -v stop_all)"
   if [ "x${check_result}" = "x" ];then
     echo "check success"
   else

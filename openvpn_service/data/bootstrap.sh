@@ -28,7 +28,7 @@ else
     mkdir -p "$TARGET_DIR"
   fi
 
-  if [ -f "${TARGET_DIR}/sothoth.conf" ];then
+  if [ -f "${TARGET_DIR}/sothoth.conf" ] && [ "x${FORCE_DOWNLOAD}" = "x" ];then
     .  "$ROOT_DIR/sothoth.conf"
     ROOT_DIR="$TARGET_DIR"
   else
