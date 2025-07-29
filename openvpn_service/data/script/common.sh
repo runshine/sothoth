@@ -1,17 +1,57 @@
 #!/bin/sh
 
 download() {
-  url=$1
-  target=$2
-  if [ -f "$target" ];then
-    return
-  fi
-  wget -q "${url}" -O "$target" || curl "${url}" -s -o "$target"
-  if [ ! -f "$target" ];then
-    echo "$(date): file: $target download failed --> $url"
-  else
-    echo "$(date): file: $target download success"
-  fi
+    local url="$1"
+    local output_file="$2"
+
+    # 检查URL是否为空
+    if [ -z "$url" ]; then
+        logger "错误：URL参数为空" >&2
+        return 1
+    fi
+
+    # 检查输出路径是否为空
+    if [ -z "$output_file" ]; then
+        logger "错误：输出文件路径为空" >&2
+        return 1
+    fi
+
+
+    if [ -f "$output_file" ] && [ "x${FORCE_DOWNLOAD}" = "x" ];then
+      return 0
+    fi
+
+    # 创建输出目录（如果不存在）
+    local output_dir=$(dirname "$output_file")
+    if [ ! -d "$output_dir" ]; then
+        mkdir -p "$output_dir" || {
+            logger "错误：无法创建目录 '$output_dir'" >&2
+            return 1
+        }
+    fi
+
+    # 检查下载工具
+    if [ "x$(command -v curl)" != "x" ]; then
+        if ! curl -fL -s -o "$output_file" "$url"; then
+            logger "错误：curl下载失败: $url" >&2
+            rm -f "$output_file"  # 删除可能的部分下载文件
+            return 1
+        else
+          logger "下载成功: $url --> $output_file"
+        fi
+    elif [ "x$(command -v wget)" != "x" ]; then
+        if ! wget -q -O "$output_file" "$url"; then
+            logger "错误：wget下载失败: $url" >&2
+            rm -f "$output_file"  # 删除可能的部分下载文件
+            return 1
+        else
+          logger "下载成功: $url --> $output_file"
+        fi
+    else
+        logger "错误：未找到curl或wget，请安装任一工具" >&2
+        return 1
+    fi
+    return 0
 }
 
 download_if_none_exist() {

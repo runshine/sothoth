@@ -270,6 +270,8 @@ def start_nacos_service(service_name,port,metadata = None, health_check_fun=None
     service_check_count = 0
     last_health_check_ret = True
     while True:
+        ip_address = get_sothoth_ip_address()
+        service_name = "{}-{}".format(socket.gethostname(),ip_address)
         time.sleep(g_nacos_heartbeat_time)
         if health_check_fun is not None:
             health_check_ret = health_check_fun(*args)
@@ -288,7 +290,6 @@ def start_nacos_service(service_name,port,metadata = None, health_check_fun=None
             continue
         #normal sence, try normal
         last_health_check_ret = True
-        ip_address = get_ip_by_device("tap-sothoth")
         nacos_service_beat(service_name,ip_address,port)
         service_check_count = service_check_count + 1
         if service_check_count >= service_check_interval:
