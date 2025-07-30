@@ -185,9 +185,7 @@ services:
       - openvpn_server_04
 
   mcp-server-ssh:
-    build:
-      context: mcp-ssh/mcp-ssh
-      dockerfile: Dockerfile
+    image: runshine0819/mcp-ssh:latest
     restart: always
     container_name: mcp-server-ssh
     network_mode: "service:nginx_frontend"
@@ -199,9 +197,7 @@ services:
       - openvpn_server_04
 
   vpn-status:
-    build:
-      context: vpn-status/openvpn-status-web
-      dockerfile: Dockerfile
+    image: runshine0819/openvpn-status-web:status
     restart: always
     container_name: vpn-status
     network_mode: "service:nginx_frontend"
