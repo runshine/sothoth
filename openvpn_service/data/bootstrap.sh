@@ -12,6 +12,7 @@ unset https_proxy
 unset HTTP_PROXY
 unset HTTPS_PROXY
 
+ulimit -n 65535
 
 if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ];then
   #we are in local run mode
@@ -129,7 +130,7 @@ do
   fi
 done
 
-bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz"
+bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz socat"
 for bin in ${bootstrap_utils_list};
 do
   download "$UPSTREAM/utils/$bin/$OS/$ARCH" "${ROOT_DIR}/utils/$bin"
