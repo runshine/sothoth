@@ -197,7 +197,7 @@ services:
       - openvpn_server_04
 
   vpn-status:
-    image: runshine0819/openvpn-status-web:status
+    image: runshine0819/openvpn-status-web:latest
     restart: always
     container_name: vpn-status
     network_mode: "service:nginx_frontend"
