@@ -134,6 +134,7 @@ services:
       - 8001:8001/tcp #for higress
       - 8081:8080/tcp #for higress
       - 8443:8443/tcp #for higress
+      - 8079:80/tcp #for vpn-sstatus-web page
       - 8078:8078/tcp #for vpn-sstatus-web page
     environment:
       - TZ=Asia/Shanghai

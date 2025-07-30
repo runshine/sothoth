@@ -1,5 +1,7 @@
 FROM node:18-alpine
 
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
+
 # 安装 Python 和其他构建工具
 RUN apk add --no-cache python3 py3-pip git
 

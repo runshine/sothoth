@@ -4,6 +4,8 @@ EXPOSE 8080
 
 ENV VERSION=3.4.0
 
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
+
 RUN apk --no-cache add openssl ca-certificates && \
     apk --no-cache add ruby ruby-webrick && \
     apk --no-cache add --virtual .build-deps ruby-dev build-base tzdata && \
