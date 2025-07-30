@@ -10,17 +10,17 @@ logfile: "openvpn-status-web.log"
 vpns:
   udp-openvpn-server-11194:
     # the status file path and status file format version are required
-    version: 3
+    version: 1
     status_file: "/tmp/openvpn/openvpn-1194-status.log"
   udp-openvpn-server-11195:
     # the status file path and status file format version are required
-    version: 3
+    version: 1
     status_file: "/tmp/openvpn/openvpn-1195-status.log"
   udp-openvpn-server-11196:
     # the status file path and status file format version are required
-    version: 3
+    version: 1
     status_file: "/tmp/openvpn/openvpn-1196-status.log"
   udp-openvpn-server-11197:
     # the status file path and status file format version are required
-    version: 3
+    version: 1
     status_file: "/tmp/openvpn/openvpn-1197-status.log"
