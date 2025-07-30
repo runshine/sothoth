@@ -16,8 +16,8 @@ services:
       - MASTER_GW=100.64.0.1
       - MASTER_IP=100.64.0.2
       - PORT=1194
-      - NET_START=100.64.0.4
-      - NET_END=100.64.31.255
+      - NET_START=100.64.0.100
+      - NET_END=100.64.7.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -41,8 +41,8 @@ services:
       - TZ=Asia/Shanghai
       - MASTER_IP=100.64.0.2
       - PORT=1195
-      - NET_START=100.64.32.0
-      - NET_END=100.64.63.255
+      - NET_START=100.64.8.0
+      - NET_END=100.64.15.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -66,8 +66,8 @@ services:
       - TZ=Asia/Shanghai
       - MASTER_IP=100.64.0.2
       - PORT=1196
-      - NET_START=100.64.64.0
-      - NET_END=100.64.95.255
+      - NET_START=100.64.16.0
+      - NET_END=100.64.23.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -91,8 +91,8 @@ services:
       - TZ=Asia/Shanghai
       - MASTER_IP=100.64.0.2
       - PORT=1197
-      - NET_START=100.64.96.0
-      - NET_END=100.64.127.255
+      - NET_START=100.64.24.0
+      - NET_END=100.64.31.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -116,8 +116,8 @@ services:
       - TZ=Asia/Shanghai
       - MASTER_IP=100.64.0.2
       - PORT=1194
-      - NET_START=100.64.128.0
-      - NET_END=100.64.143.255
+      - NET_START=100.64.32.0
+      - NET_END=100.64.39.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -126,6 +126,81 @@ services:
       - /data/entrypoint_openvpn_tcp.sh
     depends_on:
       - openvpn_server_04
+
+  openvpn_server_tcp_02:
+    image: kylemanna/openvpn:latest
+    restart: always
+    container_name: openvpn_server_tcp_02
+    network_mode: "service:nginx_frontend"
+    cap_add:
+      - MKNOD
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - TZ=Asia/Shanghai
+      - MASTER_IP=100.64.0.2
+      - PORT=1195
+      - NET_START=100.64.40.0
+      - NET_END=100.64.47.255
+    volumes:
+      - ../data:/data
+      - ../data/cert:/etc/openvpn
+      - ./vpn-status/openvpn:/tmp/openvpn
+    entrypoint:
+      - /data/entrypoint_openvpn_tcp.sh
+    depends_on:
+      - openvpn_server_tcp_01
+
+  openvpn_server_tcp_03:
+    image: kylemanna/openvpn:latest
+    restart: always
+    container_name: openvpn_server_tcp_03
+    network_mode: "service:nginx_frontend"
+    cap_add:
+      - MKNOD
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - TZ=Asia/Shanghai
+      - MASTER_IP=100.64.0.2
+      - PORT=1196
+      - NET_START=100.64.48.0
+      - NET_END=100.64.55.255
+    volumes:
+      - ../data:/data
+      - ../data/cert:/etc/openvpn
+      - ./vpn-status/openvpn:/tmp/openvpn
+    entrypoint:
+      - /data/entrypoint_openvpn_tcp.sh
+    depends_on:
+      - openvpn_server_tcp_02
+
+  openvpn_server_tcp_04:
+    image: kylemanna/openvpn:latest
+    restart: always
+    container_name: openvpn_server_tcp_04
+    network_mode: "service:nginx_frontend"
+    cap_add:
+      - MKNOD
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    environment:
+      - TZ=Asia/Shanghai
+      - MASTER_IP=100.64.0.2
+      - PORT=1197
+      - NET_START=100.64.56.0
+      - NET_END=100.64.63.255
+    volumes:
+      - ../data:/data
+      - ../data/cert:/etc/openvpn
+      - ./vpn-status/openvpn:/tmp/openvpn
+    entrypoint:
+      - /data/entrypoint_openvpn_tcp.sh
+    depends_on:
+      - openvpn_server_tcp_03
 
   vpn_server:
     build:
@@ -150,13 +225,13 @@ services:
       - openvpn_network
     ports:
       - 11194:1194/tcp
-      - 11194:11194/udp
+      - 11194:1194/udp
       - 11195:1195/tcp
-      - 11195:11195/udp
+      - 11195:1195/udp
       - 11196:1196/tcp
-      - 11196:11196/udp
+      - 11196:1196/udp
       - 11197:1957/tcp
-      - 11197:11197/udp
+      - 11197:1197/udp
       - 8080:8079/tcp # for vpn file server
       - 11193:8848/tcp #for nacso api
       - 8082:8082/tcp #for nacos console

@@ -11,16 +11,32 @@ vpns:
   udp-openvpn-server-11194:
     # the status file path and status file format version are required
     version: 1
-    status_file: "/tmp/openvpn/openvpn-1194-status.log"
+    status_file: "/tmp/openvpn/openvpn-1194-udp-status.log"
   udp-openvpn-server-11195:
     # the status file path and status file format version are required
     version: 1
-    status_file: "/tmp/openvpn/openvpn-1195-status.log"
+    status_file: "/tmp/openvpn/openvpn-1195-udp-status.log"
   udp-openvpn-server-11196:
     # the status file path and status file format version are required
     version: 1
-    status_file: "/tmp/openvpn/openvpn-1196-status.log"
+    status_file: "/tmp/openvpn/openvpn-1196-udp-status.log"
   udp-openvpn-server-11197:
     # the status file path and status file format version are required
     version: 1
-    status_file: "/tmp/openvpn/openvpn-1197-status.log"
+    status_file: "/tmp/openvpn/openvpn-1197-udp-status.log"
+  tcp-openvpn-server-11194:
+    # the status file path and status file format version are required
+    version: 1
+    status_file: "/tmp/openvpn/openvpn-1194-tcp-status.log"
+  tcp-openvpn-server-11195:
+    # the status file path and status file format version are required
+    version: 1
+    status_file: "/tmp/openvpn/openvpn-1195-tcp-status.log"
+  tcp-openvpn-server-11196:
+    # the status file path and status file format version are required
+    version: 1
+    status_file: "/tmp/openvpn/openvpn-1196-tcp-status.log"
+  tcp-openvpn-server-11197:
+    # the status file path and status file format version are required
+    version: 1
+    status_file: "/tmp/openvpn/openvpn-1197-tcp-status.log"

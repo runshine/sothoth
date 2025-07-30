@@ -49,7 +49,7 @@ topology subnet
 persist-key
 persist-tun
 keepalive 10 60
-status /tmp/openvpn/openvpn-${PORT}-status.log
+status /tmp/openvpn/openvpn-${PORT}-udp-status.log
 verb 3
 client-to-client
 script-security 2
