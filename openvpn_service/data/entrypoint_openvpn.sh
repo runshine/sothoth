@@ -25,6 +25,10 @@ if [ "x${NET_START}" != "x" ] && [ "x${NET_END}" != "x" ] ; then
   fi
   echo "$(date): start generate config, ip range is: ${NET_START} --> ${NET_END}"
 
+if [ ! -d "/tmp/opepnvpn" ];then
+  mkdir -p "/tmp/openvpn"
+fi
+
 cat << EOF > /server.ovpn
 port ${PORT}
 dev tap
@@ -45,7 +49,7 @@ topology subnet
 persist-key
 persist-tun
 keepalive 10 60
-status /tmp/openvpn-status.log
+status /tmp/openvpn/openvpn-${PORT}-status.log
 verb 3
 client-to-client
 script-security 2

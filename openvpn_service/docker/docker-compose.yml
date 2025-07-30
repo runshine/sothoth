@@ -21,6 +21,7 @@ services:
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
+      - ./vpn-status/openvpn:/tmp/openvpn
     entrypoint:
       - /data/entrypoint_openvpn.sh
     depends_on:
@@ -45,6 +46,7 @@ services:
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
+      - ./vpn-status/openvpn:/tmp/openvpn
     entrypoint:
       - /data/entrypoint_openvpn.sh
     depends_on:
@@ -69,6 +71,7 @@ services:
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
+      - ./vpn-status/openvpn:/tmp/openvpn
     entrypoint:
       - /data/entrypoint_openvpn.sh
     depends_on:
@@ -93,6 +96,7 @@ services:
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
+      - ./vpn-status/openvpn:/tmp/openvpn
     entrypoint:
       - /data/entrypoint_openvpn.sh
     depends_on:
@@ -130,6 +134,7 @@ services:
       - 8001:8001/tcp #for higress
       - 8081:8080/tcp #for higress
       - 8443:8443/tcp #for higress
+      - 8078:8078/tcp #for vpn-sstatus-web page
     environment:
       - TZ=Asia/Shanghai
       - MAP_LIST=11194:1194 11195:1195 11196:1196 11197:1197
@@ -190,6 +195,21 @@ services:
       - TZ=Asia/Shanghai
     volumes:
       - ../data:/data
+    depends_on:
+      - openvpn_server_04
+
+  vpn-status:
+    build:
+      context: vpn-status/openvpn-status-web
+      dockerfile: Dockerfile
+    restart: always
+    container_name: vpn-status
+    network_mode: "service:nginx_frontend"
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ./vpn-status/openvpn:/tmp/openvpn
+      - ./vpn-status/openvpn-status-web/config.yaml:/etc/openvpn-status-web/config.yml
     depends_on:
       - openvpn_server_04
 

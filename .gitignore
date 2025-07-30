@@ -1,2 +1,3 @@
 openvpn_service/docker/higress
 openvpn_service/docker/nacos_data
+openvpn_service/docker/vpn-status/openvpn
