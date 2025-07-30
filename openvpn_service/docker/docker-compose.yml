@@ -13,11 +13,11 @@ services:
     environment:
       - TZ=Asia/Shanghai
       - MASTER=true
-      - MASTER_GW=100.64.0.1
-      - MASTER_IP=100.64.0.2
+      - MASTER_GW=200.64.0.1
+      - MASTER_IP=200.64.0.2
       - PORT=1194
-      - NET_START=100.64.0.100
-      - NET_END=100.64.7.255
+      - NET_START=200.64.0.100
+      - NET_END=200.64.7.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -39,10 +39,10 @@ services:
       - /dev/net/tun
     environment:
       - TZ=Asia/Shanghai
-      - MASTER_IP=100.64.0.2
+      - MASTER_IP=200.64.0.2
       - PORT=1195
-      - NET_START=100.64.8.0
-      - NET_END=100.64.15.255
+      - NET_START=200.64.8.0
+      - NET_END=200.64.15.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -64,10 +64,10 @@ services:
       - /dev/net/tun
     environment:
       - TZ=Asia/Shanghai
-      - MASTER_IP=100.64.0.2
+      - MASTER_IP=200.64.0.2
       - PORT=1196
-      - NET_START=100.64.16.0
-      - NET_END=100.64.23.255
+      - NET_START=200.64.16.0
+      - NET_END=200.64.23.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -89,10 +89,10 @@ services:
       - /dev/net/tun
     environment:
       - TZ=Asia/Shanghai
-      - MASTER_IP=100.64.0.2
+      - MASTER_IP=200.64.0.2
       - PORT=1197
-      - NET_START=100.64.24.0
-      - NET_END=100.64.31.255
+      - NET_START=200.64.24.0
+      - NET_END=200.64.31.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -114,10 +114,10 @@ services:
       - /dev/net/tun
     environment:
       - TZ=Asia/Shanghai
-      - MASTER_IP=100.64.0.2
+      - MASTER_IP=200.64.0.2
       - PORT=1194
-      - NET_START=100.64.32.0
-      - NET_END=100.64.39.255
+      - NET_START=200.64.32.0
+      - NET_END=200.64.39.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -139,10 +139,10 @@ services:
       - /dev/net/tun
     environment:
       - TZ=Asia/Shanghai
-      - MASTER_IP=100.64.0.2
+      - MASTER_IP=200.64.0.2
       - PORT=1195
-      - NET_START=100.64.40.0
-      - NET_END=100.64.47.255
+      - NET_START=200.64.40.0
+      - NET_END=200.64.47.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -164,10 +164,10 @@ services:
       - /dev/net/tun
     environment:
       - TZ=Asia/Shanghai
-      - MASTER_IP=100.64.0.2
+      - MASTER_IP=200.64.0.2
       - PORT=1196
-      - NET_START=100.64.48.0
-      - NET_END=100.64.55.255
+      - NET_START=200.64.48.0
+      - NET_END=200.64.55.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -189,10 +189,10 @@ services:
       - /dev/net/tun
     environment:
       - TZ=Asia/Shanghai
-      - MASTER_IP=100.64.0.2
+      - MASTER_IP=200.64.0.2
       - PORT=1197
-      - NET_START=100.64.56.0
-      - NET_END=100.64.63.255
+      - NET_START=200.64.56.0
+      - NET_END=200.64.63.255
     volumes:
       - ../data:/data
       - ../data/cert:/etc/openvpn
@@ -322,7 +322,7 @@ networks:
     ipam:
       driver: default
       config:
-        - subnet: 100.64.0.0/16
+        - subnet: 200.64.0.0/16
 
 
 
