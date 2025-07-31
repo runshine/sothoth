@@ -36,8 +36,8 @@ if [ ! -f "${DOCKER_ROOT_DIR}/bin/dockerd" ];then
   rm -rf "${DOCKER_ROOT_DIR}/docker.tar.gz"
 fi
 
-if [ "x$(command -v iptables)" = "x" ]; then
-  logger "disable iptables support because no iptables binary"
+if [ "x$(command -v iptables)" = "x" ] || [ "x$(ps -ef|grep -v grep | grep -v sothothv2 |grep dockerd)" != "x" ]; then
+  logger "disable iptables support because no iptables binary or docker is already run"
   sed -i '/"iptables":/ s/true/false/' "${DOCKER_ROOT_DIR}/conf/daemon.json"
 fi
 
