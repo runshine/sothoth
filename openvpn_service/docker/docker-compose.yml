@@ -314,6 +314,19 @@ services:
     depends_on:
       - openvpn_server_04
 
+  nginx_service:
+    image: nginx:latest
+    restart: always
+    container_name: nginx_service
+    hostname: nginx_service
+    networks:
+      openvpn_network:
+        ipv4_address: 200.64.0.4
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ../data/conf/nginx/nginx_service.conf:/etc/nginx/nginx.conf
+
 networks:
   openvpn_network:
     driver: bridge
