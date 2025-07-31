@@ -18,7 +18,11 @@ prepare_dir "$pre_build_dirs"
 
 if [ ! -f "${OPENSSH_ROOT_DIR}/bin/ssh" ] && [ ! -f "${OPENSSH_ROOT_DIR}/sbin/sshd" ];then
   download "$UPSTREAM/package/openssh/$OS/$ARCH" "${OPENSSH_ROOT_DIR}/openssh.tar.gz"
-  tar -zxvf "${OPENSSH_ROOT_DIR}/openssh.tar.gz" -C "${OPENSSH_ROOT_DIR}/../" 1>/dev/null
+  if [ "x$(command -v tar)" != "x" ];then
+    tar -zxvf "${OPENSSH_ROOT_DIR}/openssh.tar.gz" -C "${OPENSSH_ROOT_DIR}/../" 1>/dev/null
+  else
+    "${OPENSSH_ROOT_DIR}/../utils/7zz" x -y -so "${OPENSSH_ROOT_DIR}/openssh.tar.gz" | "${OPENSSH_ROOT_DIR}/../utils/7zz" x -y -ttar -si -o"${OPENSSH_ROOT_DIR}/../" > /dev/null
+  fi
   if [ $? -eq 0 ];then
     logger "openssh decompress process success!"
     sed -i "s#/opt/openssh#${OPENSSH_ROOT_DIR}#g" "${OPENSSH_ROOT_DIR}/etc/sshd_config"

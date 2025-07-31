@@ -15,6 +15,10 @@ def start_nginx_proxy_service():
     start_nacos_service("nginx-proxy","11199",None,check_tcp_port_is_listen,11199)
 
 
+def start_docker_service():
+    start_nacos_service("dockerd","11191",None,check_tcp_port_is_listen,11191)
+
+
 def graceful_exit():
     global server_should_stop
     server_should_stop = True
@@ -40,7 +44,11 @@ if __name__ == "__main__":
     sshd_thread.start()
     nginx_proxy_thread = threading.Thread(target=start_nginx_proxy_service)
     nginx_proxy_thread.start()
+    docker_thread = threading.Thread(target=start_docker_service)
+    docker_thread.start()
     ttyd_thread.join()
     sshd_thread.join()
+    nginx_proxy_thread.join()
+    docker_thread.join()
 
 

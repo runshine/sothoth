@@ -179,3 +179,29 @@ clean_proxy(){
   unset HTTP_PROXY
   unset HTTPS_PROXY
 }
+
+create_bridge() {
+    local bridge_name="$1"
+    # 检查网桥是否存在
+    if ! ip link show type bridge | grep -q "$bridge_name"; then
+        #logger "网桥 $bridge_name 不存在，正在创建..."
+        ip link add name "$bridge_name" type bridge
+        ip link set dev "$bridge_name" up
+        logger "已成功创建网桥 $bridge_name"
+    else
+        logger "网桥 $bridge_name 已存在，无需创建"
+    fi
+}
+
+remove_bridge_if_exists() {
+    local bridge_name="$1"
+    # 检查网桥是否存在
+    if ip link show type bridge | grep -q "$bridge_name"; then
+        #logger "网桥 $bridge_name 存在，正在删除..."
+        ip link set dev "$bridge_name" down
+        ip link delete "$bridge_name" type bridge
+        logger "已成功删除网桥 $bridge_name"
+    else
+        logger "网桥 $bridge_name 不存在，无需操作"
+    fi
+}
