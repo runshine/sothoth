@@ -55,6 +55,7 @@ client-to-client
 script-security 2
 up "/data/up.sh"
 reneg-sec 0
+client-config-dir /data/conf/openvpn/ccd
 EOF
 
 else
