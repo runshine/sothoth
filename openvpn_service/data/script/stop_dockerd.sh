@@ -25,3 +25,8 @@ fi
 kill_pid_file "${DOCKER_ROOT_DIR}/run/dockerd.pid"
 kill_pid_file "${DOCKER_ROOT_DIR}/run/containerd.pid"
 remove_bridge_if_exists br-sothoth
+for point in $(mount | grep sothothv2 | awk '{print $3}')
+do
+  logger "try umount point: ${point}"
+  umount "$point"
+done
