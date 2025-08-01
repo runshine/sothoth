@@ -39,6 +39,7 @@ verify-client-cert none
 auth none
 cipher none
 ;data-ciphers none
+ncp-disable
 ca /etc/openvpn/ca.crt
 cert /etc/openvpn/server.crt
 key /etc/openvpn/server.key
