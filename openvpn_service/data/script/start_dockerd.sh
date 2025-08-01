@@ -67,7 +67,7 @@ if [ ! -f "${DOCKER_ROOT_DIR}/conf/docker-swarm.conf" ] || [ "x${FORCE_DOWNLOAD}
     max_retries=10
     retry_delay=2
     for ((attempt=1; attempt<=max_retries; attempt++)); do
-        if [[ -f "${DOCKER_ROOT_DIR}/run/docker.sock" ]]; then
+        if [[ -S "${DOCKER_ROOT_DIR}/run/docker.sock" ]]; then
             "${DOCKER_ROOT_DIR}/bin/docker" -H "unix://${DOCKER_ROOT_DIR}/run/docker.sock" swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}
             break
         else
