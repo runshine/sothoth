@@ -64,7 +64,17 @@ if [ ! -f "${DOCKER_ROOT_DIR}/conf/docker-swarm.conf" ] || [ "x${FORCE_DOWNLOAD}
   fi
   if [ "x${DOCKER_SWARM_TOKEN}" != "x" ] && [ "x${DOCKER_SWARM_SERVER}" != "x" ] && is_valid_ip_port "${DOCKER_SWARM_SERVER}";then
     logger "docker swarm info is not none, try to join it:  \"${DOCKER_ROOT_DIR}/bin/docker\" -H \"unix:///${DOCKER_ROOT_DIR}/run/docker.sock\" swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}"
-    "${DOCKER_ROOT_DIR}/bin/docker" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}
+    local max_retries=10
+    local retry_delay=2
+    for ((attempt=1; attempt<=max_retries; attempt++)); do
+        if [[ -f "${DOCKER_ROOT_DIR}/run/docker.sock" ]]; then
+            "${DOCKER_ROOT_DIR}/bin/docker" -H "unix://${DOCKER_ROOT_DIR}/run/docker.sock" swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}
+            break
+        else
+            logger "第 $attempt 次检查:${DOCKER_ROOT_DIR}/run/docker.sock 失败，等待 ${retry_delay}秒后重试..."
+            sleep $retry_delay
+        fi
+    done
   else
     logger "docker-swarm.conf exist build not set, ignore swarm mode init"
   fi
