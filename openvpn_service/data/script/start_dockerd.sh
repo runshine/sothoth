@@ -63,8 +63,8 @@ if [ ! -f "${DOCKER_ROOT_DIR}/conf/docker-swarm.conf" ] || [ "x${FORCE_DOWNLOAD}
     . "${DOCKER_ROOT_DIR}/confdocker-swarm.conf" ]
   fi
   if [ "x${DOCKER_SWARM_TOKEN}" != "x" ] && [ "x${DOCKER_SWARM_SERVER}" != "x" ] && is_valid_ip_port "${DOCKER_SWARM_SERVER}";then
-    logger "docker swarm info is not none, try to join it:  docker swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}"
-    docker swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}
+    logger "docker swarm info is not none, try to join it:  \"${DOCKER_ROOT_DIR}/bin/docker\" -H \"unix:///${DOCKER_ROOT_DIR}/run/docker.sock\" swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}"
+    "${DOCKER_ROOT_DIR}/bin/docker" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}
   else
     logger "docker-swarm.conf exist build not set, ignore swarm mode init"
   fi
