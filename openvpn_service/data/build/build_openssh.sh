@@ -97,7 +97,7 @@ KbdInteractiveAuthentication yes
 # If you just want the PAM account and session checks to run without
 # PAM authentication, then enable this but set PasswordAuthentication
 # and KbdInteractiveAuthentication to 'no'.
-#UsePAM no
+UsePAM no
 
 AllowAgentForwarding yes
 AllowTcpForwarding yes
