@@ -325,7 +325,7 @@ services:
     environment:
       - TZ=Asia/Shanghai
     volumes:
-      - ../data/:/data
+      - ../data:/data
       - ../data/conf/nginx/nginx_service.conf:/etc/nginx/nginx.conf
 
 networks:

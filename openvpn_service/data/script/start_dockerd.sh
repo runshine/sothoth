@@ -16,7 +16,7 @@ fi
 pre_build_dirs="${DOCKER_ROOT_DIR}/conf ${DOCKER_ROOT_DIR}/run ${DOCKER_ROOT_DIR}/run/containerd ${DOCKER_ROOT_DIR}/log ${DOCKER_ROOT_DIR}/data-root ${DOCKER_ROOT_DIR}/tmp ${DOCKER_ROOT_DIR}/var/lib/containerd ${DOCKER_ROOT_DIR}/var/run"
 prepare_dir "$pre_build_dirs"
 
-if [ ! -f "${DOCKER_ROOT_DIR}/bin/dockerd" ];then
+if [ ! -f "${DOCKER_ROOT_DIR}/bin/dockerd" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];then
   download "$UPSTREAM/docker/docker/$OS/$ARCH" "${DOCKER_ROOT_DIR}/docker.tar.gz"
   download "$UPSTREAM/download/package/docker/daemon.json" "${DOCKER_ROOT_DIR}/conf/daemon.json"
   download "$UPSTREAM/download/package/docker/config.toml" "${DOCKER_ROOT_DIR}/conf/config.toml"
@@ -57,3 +57,17 @@ else
   logger "dockerd already run, ignore re-run, pid: $(cat ${DOCKER_ROOT_DIR}/run/dockerd.pid)"
 fi
 
+if [ ! -f "${DOCKER_ROOT_DIR}/conf/docker-swarm.conf" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];then
+  download "$UPSTREAM/download/package/docker/docker-swarm.conf" "${DOCKER_ROOT_DIR}/confdocker-swarm.conf"
+  if [ -f "${DOCKER_ROOT_DIR}/confdocker-swarm.conf" ];then
+    . "${DOCKER_ROOT_DIR}/confdocker-swarm.conf" ]
+  fi
+  if [ "x${DOCKER_SWARM_TOKEN}" != "x" ] && [ "x${DOCKER_SWARM_SERVER}" != "x" ] && is_valid_ip_port "${DOCKER_SWARM_SERVER}";then
+    logger "docker swarm info is not none, try to join it:  docker swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}"
+    docker swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}
+  else
+    logger "docker-swarm.conf exist build not set, ignore swarm mode init"
+  fi
+else
+  logger "docker-swarm.conf not exist, ignore swarm mode init"
+fi

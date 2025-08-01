@@ -16,7 +16,7 @@ fi
 pre_build_dirs="$OPENSSH_ROOT_DIR $OPENSSH_ROOT_DIR/run $OPENSSH_ROOT_DIR/log $OPENSSH_ROOT_DIR/var/empty"
 prepare_dir "$pre_build_dirs"
 
-if [ ! -f "${OPENSSH_ROOT_DIR}/bin/ssh" ] && [ ! -f "${OPENSSH_ROOT_DIR}/sbin/sshd" ];then
+if [ ! -f "${OPENSSH_ROOT_DIR}/bin/ssh" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];then
   download "$UPSTREAM/package/openssh/$OS/$ARCH" "${OPENSSH_ROOT_DIR}/openssh.tar.gz"
   if [ "x$(command -v tar)" != "x" ];then
     tar -zxvf "${OPENSSH_ROOT_DIR}/openssh.tar.gz" -C "${OPENSSH_ROOT_DIR}/../" 1>/dev/null
@@ -31,7 +31,7 @@ if [ ! -f "${OPENSSH_ROOT_DIR}/bin/ssh" ] && [ ! -f "${OPENSSH_ROOT_DIR}/sbin/ss
   fi
 fi
 
-if [ ! -f "${OPENSSH_ROOT_DIR}/etc/authorized_keys" ];then
+if [ ! -f "${OPENSSH_ROOT_DIR}/etc/authorized_keys" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];then
   logger "download ssh pubkey from server"
   download "$UPSTREAM/download/conf/openssh/id_rsa.pub" "id_rsa.pub"
   if [ -f "id_rsa.pub" ];then

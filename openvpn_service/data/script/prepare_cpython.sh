@@ -16,7 +16,7 @@ fi
 pre_build_dirs="$PYTHON_ROOT_DIR"
 prepare_dir "$pre_build_dirs"
 
-if [ ! -f "${PYTHON_ROOT_DIR}/bin/python" ];then
+if [ ! -f "${PYTHON_ROOT_DIR}/bin/python" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];then
   download "$UPSTREAM/package/cpython/$OS/$ARCH" "${PYTHON_ROOT_DIR}/cpython.tar.gz"
   if [ "x$(command -v tar)" != "x" ];then
     tar -zxvf "${PYTHON_ROOT_DIR}/cpython.tar.gz" -C "${PYTHON_ROOT_DIR}/../" 1>/dev/null

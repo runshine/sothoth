@@ -71,7 +71,7 @@
   "ip6tables": false,
   "ipv6": false,
   "labels": [],
-  "live-restore": true,
+  "live-restore": false,
   "log-driver": "json-file",
   "log-format": "text",
   "log-level": "",

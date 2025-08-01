@@ -205,3 +205,39 @@ remove_bridge_if_exists() {
         logger "网桥 $bridge_name 不存在，无需操作"
     fi
 }
+
+is_valid_ip_port() {
+    local input="$1"
+
+    # 检查是否只包含一个冒号
+    if [[ $(grep -o ':' <<< "$input" | wc -l) -ne 1 ]]; then
+        return 1
+    fi
+
+    # 分割IP和端口
+    local ip="${input%%:*}"
+    local port="${input##*:}"
+
+    # 验证IP部分（IPv4格式）
+    if [[ ! $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 1
+    fi
+    local IFS='.'
+    read -ra ip_parts <<< "$ip"
+    if [[ ${#ip_parts[@]} -ne 4 ]]; then
+        return 1
+    fi
+    for part in "${ip_parts[@]}"; do
+        if [[ $part -lt 0 || $part -gt 255 ]]; then
+            return 1
+        fi
+    done
+    # 验证端口部分（0-65535）
+    if [[ ! $port =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if [[ $port -lt 0 || $port -gt 65535 ]]; then
+        return 1
+    fi
+    return 0
+}

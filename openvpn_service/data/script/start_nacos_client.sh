@@ -16,7 +16,7 @@ fi
 pre_build_dirs="$NACOS_ROOT_DIR/log $NACOS_ROOT_DIR/script $NACOS_ROOT_DIR/run"
 prepare_dir "$pre_build_dirs"
 
-if [ ! -f "${NACOS_ROOT_DIR}/script/nacos_client.py" ];then
+if [ ! -f "${NACOS_ROOT_DIR}/script/nacos_client.py" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];then
   download "$UPSTREAM/download/script/nacos/nacos_client.py" "${NACOS_ROOT_DIR}/script/nacos_client.py"
   download "$UPSTREAM/download/script/nacos/common_utils.py" "${NACOS_ROOT_DIR}/script/common_utils.py"
 fi
