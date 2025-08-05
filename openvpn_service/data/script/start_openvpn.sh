@@ -51,8 +51,14 @@ verb 3
 keepalive 10 60
 reneg-sec 0
 remote-random
+
 EOF
+if [ "${ARCH}" = "aarch64" ];then
+  echo "data-ciphers none" >> "${OPENVPN_ROOT_DIR}/conf/client.ovpn"
 fi
+fi
+
+
 
 if [ ! -c "/dev/net/tun" ];then
   if [ ! -d "/dev/net" ];then

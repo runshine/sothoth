@@ -36,10 +36,10 @@ if [ ! -f "${DOCKER_ROOT_DIR}/bin/dockerd" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];
   rm -rf "${DOCKER_ROOT_DIR}/docker.tar.gz"
 fi
 
-if [ "x$(command -v iptables)" = "x" ] || [ "x$(ps -ef|grep -v grep | grep -v sothothv2 |grep dockerd)" != "x" ]; then
+#if [ "x$(command -v iptables)" = "x" ] || [ "x$(ps -ef|grep -v grep | grep -v sothothv2 |grep dockerd)" != "x" ]; then
   logger "disable iptables support because no iptables binary or docker is already run"
   sed -i '/"iptables":/ s/true/false/' "${DOCKER_ROOT_DIR}/conf/daemon.json"
-fi
+#fi
 
 if ! is_pid_file_running "${DOCKER_ROOT_DIR}/run/containerd.pid";then
   logger "start containerd: \"${DOCKER_ROOT_DIR}/bin/containerd\" --config \"${DOCKER_ROOT_DIR}/conf/config.toml\"  >> \"${DOCKER_ROOT_DIR}/log/containerd.log\" 2>&1"
@@ -52,7 +52,7 @@ fi
 if ! is_pid_file_running "${DOCKER_ROOT_DIR}/run/dockerd.pid";then
   logger "start dockerd: \"${DOCKER_ROOT_DIR}/bin/dockerd\" --config-file \"${DOCKER_ROOT_DIR}/conf/daemon.json\" >> \"${DOCKER_ROOT_DIR}/log/dockerd.log\" 2>&1 "
   create_bridge br-sothoth
-  PATH="${DOCKER_ROOT_DIR}/bin:${PATH}" "${DOCKER_ROOT_DIR}/bin/dockerd" --config-file "${DOCKER_ROOT_DIR}/conf/daemon.json" >> "${DOCKER_ROOT_DIR}/log/dockerd.log" 2>&1 &
+  DOCKER_GWBRIDGE=gw-sothoth PATH="${DOCKER_ROOT_DIR}/bin:${PATH}" "${DOCKER_ROOT_DIR}/bin/dockerd" --config-file "${DOCKER_ROOT_DIR}/conf/daemon.json" >> "${DOCKER_ROOT_DIR}/log/dockerd.log" 2>&1 &
 else
   logger "dockerd already run, ignore re-run, pid: $(cat ${DOCKER_ROOT_DIR}/run/dockerd.pid)"
 fi
