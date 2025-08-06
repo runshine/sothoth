@@ -72,11 +72,11 @@ AuthorizedKeysFile      /opt/openssh/etc/authorized_keys
 #IgnoreRhosts yes
 
 # To disable tunneled clear text passwords, change to no here!
-PasswordAuthentication yes
+PasswordAuthentication no
 PermitEmptyPasswords no
 
 # Change to no to disable s/key passwords
-KbdInteractiveAuthentication yes
+KbdInteractiveAuthentication no
 
 # Kerberos options
 #KerberosAuthentication no
@@ -97,7 +97,7 @@ KbdInteractiveAuthentication yes
 # If you just want the PAM account and session checks to run without
 # PAM authentication, then enable this but set PasswordAuthentication
 # and KbdInteractiveAuthentication to 'no'.
-UsePAM no
+#UsePAM no
 
 AllowAgentForwarding yes
 AllowTcpForwarding yes
