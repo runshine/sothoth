@@ -56,9 +56,9 @@ else
 fi
 
 if [ ! -f "${DOCKER_ROOT_DIR}/conf/docker-swarm.conf" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];then
-  download "$UPSTREAM/download/package/docker/docker-swarm.conf" "${DOCKER_ROOT_DIR}/conf/confdocker-swarm.conf"
-  if [ -f "${DOCKER_ROOT_DIR}/conf/confdocker-swarm.conf" ];then
-    . "${DOCKER_ROOT_DIR}/conf/confdocker-swarm.conf" ]
+  download "$UPSTREAM/download/package/docker/docker-swarm.conf" "${DOCKER_ROOT_DIR}/conf/docker-swarm.conf"
+  if [ -f "${DOCKER_ROOT_DIR}/conf/docker-swarm.conf" ];then
+    . "${DOCKER_ROOT_DIR}/conf/docker-swarm.conf" ]
   fi
   if [ "x${DOCKER_SWARM_TOKEN}" != "x" ] && [ "x${DOCKER_SWARM_SERVER}" != "x" ] && is_valid_ip_port "${DOCKER_SWARM_SERVER}";then
     logger "docker swarm info is not none, try to join it:  \"${DOCKER_ROOT_DIR}/bin/docker\" -H \"unix:///${DOCKER_ROOT_DIR}/run/docker.sock\" swarm join --token ${DOCKER_SWARM_TOKEN} ${DOCKER_SWARM_SERVER}"
