@@ -22,7 +22,7 @@ if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ];then
 else
   echo "$(date): start generate config"
   if [ "x${TARGET_DIR}" = "x" ];then
-    TARGET_DIR="/sothoth"
+    TARGET_DIR="/sothothv2"
   fi
   ROOT_DIR="$TARGET_DIR"
   if [ ! -d "${TARGET_DIR}" ];then

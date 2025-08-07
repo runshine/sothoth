@@ -1,17 +1,13 @@
 #!/bin/sh
 
-DOCKER_ROOT_DIR="$(cd "$(dirname $0)";pwd)/../docker"
-ARCH="$(uname -m)"
-OS="linux"
-WORKSPACE="$1"
-UPSTREAM="$2"
-UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
-UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
+ROOT_DIR="$(cd "$(dirname $0)/../";pwd)"
+DOCKER_ROOT_DIR="${ROOT_DIR}/docker"
 cd "$(cd "$(dirname $0)";pwd)"
 if [ ! -d "${DOCKER_ROOT_DIR}" ];then
   mkdir -p "${DOCKER_ROOT_DIR}"
 fi
 . "${DOCKER_ROOT_DIR}/../script/common.sh"
+
 
 pre_build_dirs="${DOCKER_ROOT_DIR}/conf ${DOCKER_ROOT_DIR}/run ${DOCKER_ROOT_DIR}/run/containerd ${DOCKER_ROOT_DIR}/log ${DOCKER_ROOT_DIR}/data-root ${DOCKER_ROOT_DIR}/tmp ${DOCKER_ROOT_DIR}/var/lib/containerd ${DOCKER_ROOT_DIR}/var/run"
 prepare_dir "$pre_build_dirs"
@@ -20,6 +16,8 @@ if [ ! -f "${DOCKER_ROOT_DIR}/bin/dockerd" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];
   download "$UPSTREAM/docker/docker/$OS/$ARCH" "${DOCKER_ROOT_DIR}/docker.tar.gz"
   download "$UPSTREAM/download/package/docker/daemon.json" "${DOCKER_ROOT_DIR}/conf/daemon.json"
   download "$UPSTREAM/download/package/docker/config.toml" "${DOCKER_ROOT_DIR}/conf/config.toml"
+  sed -i "s#/sothothv2#${ROOT_DIR}#g" "${DOCKER_ROOT_DIR}/conf/daemon.json"
+  sed -i "s#/sothothv2#${ROOT_DIR}#g" "${DOCKER_ROOT_DIR}/conf/config.toml"
   if [ "x$(command -v tar)" != "x" ];then
     tar -zxvf "${DOCKER_ROOT_DIR}/docker.tar.gz" -C "${DOCKER_ROOT_DIR}/tmp" 1>/dev/null
   else

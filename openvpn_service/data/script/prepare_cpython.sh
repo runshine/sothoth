@@ -1,17 +1,13 @@
 #!/bin/sh
 
-PYTHON_ROOT_DIR="$(cd "$(dirname $0)";pwd)/../python"
-ARCH="$(uname -m)"
-OS="linux"
-WORKSPACE="$1"
-UPSTREAM="$2"
-UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
-UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
+ROOT_DIR="$(cd "$(dirname $0)/../";pwd)"
+PYTHON_ROOT_DIR="${ROOT_DIR}/python"
 cd "$(cd "$(dirname $0)";pwd)"
 if [ ! -d "${PYTHON_ROOT_DIR}" ];then
   mkdir -p "${PYTHON_ROOT_DIR}"
 fi
 . "${PYTHON_ROOT_DIR}/../script/common.sh"
+
 
 pre_build_dirs="$PYTHON_ROOT_DIR"
 prepare_dir "$pre_build_dirs"

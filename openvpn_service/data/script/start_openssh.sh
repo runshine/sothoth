@@ -1,17 +1,13 @@
 #!/bin/sh
 
-OPENSSH_ROOT_DIR="$(cd "$(dirname $0)";pwd)/../openssh"
-ARCH="$(uname -m)"
-OS="linux"
-WORKSPACE="$1"
-UPSTREAM="$2"
-UPSTREAM_SERVER="$(echo $2 | awk -F':' '{print $1}')"
-UPSTREAM_PORT="$(echo $2 | awk -F':' '{print $2}')"
+ROOT_DIR="$(cd "$(dirname $0)/../";pwd)"
+OPENSSH_ROOT_DIR="${ROOT_DIR}/openssh"
 cd "$(cd "$(dirname $0)";pwd)"
 if [ ! -d "${OPENSSH_ROOT_DIR}" ];then
   mkdir -p "${OPENSSH_ROOT_DIR}"
 fi
 . "${OPENSSH_ROOT_DIR}/../script/common.sh"
+
 
 pre_build_dirs="$OPENSSH_ROOT_DIR $OPENSSH_ROOT_DIR/run $OPENSSH_ROOT_DIR/log $OPENSSH_ROOT_DIR/var/empty"
 prepare_dir "$pre_build_dirs"
@@ -43,6 +39,9 @@ fi
 chown root:root "$OPENSSH_ROOT_DIR/var/empty"
 chmod 711 -R "$OPENSSH_ROOT_DIR/var/empty"
 if [ ! -L "/opt/openssh" ];then
+  ln -s "$OPENSSH_ROOT_DIR" "/opt/openssh"
+else
+  rm "/opt/openssh" -f
   ln -s "$OPENSSH_ROOT_DIR" "/opt/openssh"
 fi
 
