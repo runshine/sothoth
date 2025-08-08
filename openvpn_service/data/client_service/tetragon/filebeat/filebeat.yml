@@ -4,7 +4,11 @@ filebeat.inputs:
   enabled: true
   paths:
     - /var/log/tetragon/tetragon.log
-    -
+  json:
+    keys_under_root: false    # 将解析后的字段放在事件顶层
+    overwrite_keys: false      # 覆盖 Filebeat 默认字段（如 message）
+    add_error_key: true       # 为解析失败的行添加错误标记
+
 processors:
   - timestamp:
       field: "time"
@@ -35,3 +39,8 @@ logging:
     name: filebeat.log        # 日志文件名
     keepfiles: 7              # 保留7天日志
     permissions: 0644         # 文件权限
+
+# filebeat.yml
+agent:
+  name: "${HOSTNAME}"     # 自定义名称
+  id: "${NODE_ID}"  # 使用主机名动态生成唯一ID
