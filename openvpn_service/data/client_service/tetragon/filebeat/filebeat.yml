@@ -1,17 +1,20 @@
 agent:
   name: "NODE_NAME"     # 自定义名称
   id: "NODE_ID"  # 使用主机名动态生成唯一ID
-  
+
 filebeat.inputs:
 - type: filestream
   id: tetragon-log
   enabled: true
   paths:
     - /var/log/tetragon/tetragon.log
-  json:
-    keys_under_root: false    # 将解析后的字段放在事件顶层
-    overwrite_keys: false      # 覆盖 Filebeat 默认字段（如 message）
-    add_error_key: true       # 为解析失败的行添加错误标记
+  parsers:
+    - ndjson:
+        keys_under_root: false
+        target: "json"
+        overwrite_keys: true
+        add_error_key: true
+
 
 processors:
   - timestamp:
@@ -24,6 +27,15 @@ processors:
         - '2019-06-22T16:33:51Z'
         - '2019-11-18T04:59:51.123Z'
         - '2020-08-03T07:10:20.123456+02:00'
+
+  - add_fields:
+      target: "agent"
+      fields:
+        name: "FIXED_NODE_NAME"  # 双重保险
+        id: "FIXED_NODE_ID"       # 双重保险
+        type: "filebeat"
+    when:                       # 始终应用
+      always: true
 
 output:
   logstash:
