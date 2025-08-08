@@ -15,4 +15,4 @@ alias docker-compose="${DOCKER_ROOT_DIR}/../utils/docker-compose -H 'unix:///${D
 
 echo "start down tetragon service"
 cd "${TETRAGON_ROOT_DIR}"
-"${DOCKER_ROOT_DIR}/../utils/docker-compose" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" up -d
+"${DOCKER_ROOT_DIR}/../utils/docker-compose" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" down -v
