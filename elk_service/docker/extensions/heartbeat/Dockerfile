@@ -1,0 +1,3 @@
+ARG ELASTIC_VERSION
+
+FROM elastic/heartbeat:${ELASTIC_VERSION:-9.1.0}

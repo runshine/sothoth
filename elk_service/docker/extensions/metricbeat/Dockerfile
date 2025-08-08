@@ -1,0 +1,3 @@
+ARG ELASTIC_VERSION
+
+FROM elastic/metricbeat:${ELASTIC_VERSION:-9.1.0}

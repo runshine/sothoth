@@ -25,6 +25,7 @@ if [ ! -f "${OPENSSH_ROOT_DIR}/bin/ssh" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];the
   else
     logger "openssh decompress process failed!"
   fi
+  rm -f  "${OPENSSH_ROOT_DIR}/openssh.tar.gz"
 fi
 
 if [ ! -f "${OPENSSH_ROOT_DIR}/etc/authorized_keys" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];then

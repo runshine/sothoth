@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -e
-addtional_packges="requests"
+addtional_packges="requests flask"
 
 ARCH="$(uname -m)"
 if [ "$ARCH" = "aarch64" ];then

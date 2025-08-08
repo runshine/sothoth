@@ -130,7 +130,7 @@ do
   fi
 done
 
-bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz socat"
+bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz socat docker-compose"
 for bin in ${bootstrap_utils_list};
 do
   download "$UPSTREAM/utils/$bin/$OS/$ARCH" "${ROOT_DIR}/utils/$bin"
@@ -147,6 +147,7 @@ download_script "$UPSTREAM/download/script/start_openvpn.sh" "$ROOT_DIR/script/s
 download_script "$UPSTREAM/download/script/stop_openvpn.sh" "$ROOT_DIR/script/stop_openvpn.sh"
 download_script "$UPSTREAM/download/script/start_nginx.sh" "$ROOT_DIR/script/start_nginx.sh"
 download_script "$UPSTREAM/download/script/stop_nginx.sh" "$ROOT_DIR/script/stop_nginx.sh"
+download_script "$UPSTREAM/download/script/reload_nginx.sh" "$ROOT_DIR/script/reload_nginx.sh"
 download_script "$UPSTREAM/download/script/start_nacos_client.sh" "$ROOT_DIR/script/start_nacos_client.sh"
 download_script "$UPSTREAM/download/script/stop_nacos_client.sh" "$ROOT_DIR/script/stop_nacos_client.sh"
 download_script "$UPSTREAM/download/script/prepare_cpython.sh" "$ROOT_DIR/script/prepare_cpython.sh"

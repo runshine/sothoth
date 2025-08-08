@@ -8,3 +8,6 @@ if [ ! -d "${NGINX_ROOT_DIR}" ];then
 fi
 . "${NGINX_ROOT_DIR}/../script/common.sh"
 
+logger "reload nginx: \"${NGINX_ROOT_DIR}/../utils/nginx\" -p \"${NGINX_ROOT_DIR}\" -c \"${NGINX_ROOT_DIR}/conf/nginx.conf\" -s reload"
+
+"${NGINX_ROOT_DIR}/../utils/nginx" -p "${NGINX_ROOT_DIR}" -c "${NGINX_ROOT_DIR}/conf/nginx.conf" -s reload

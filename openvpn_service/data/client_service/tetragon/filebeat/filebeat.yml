@@ -1,0 +1,37 @@
+filebeat.inputs:
+- type: filestream
+  id: tetragon-log
+  enabled: true
+  paths:
+    - /var/log/tetragon/tetragon.log
+    -
+processors:
+  - timestamp:
+      field: "time"
+      layouts:
+        - '2006-01-02T15:04:05Z'
+        - '2006-01-02T15:04:05.999Z'
+        - '2006-01-02T15:04:05.999-07:00'
+      test:
+        - '2019-06-22T16:33:51Z'
+        - '2019-11-18T04:59:51.123Z'
+        - '2020-08-03T07:10:20.123456+02:00'
+
+output:
+  logstash:
+    enabled: true
+    hosts: [ "127.0.0.1:5044" ]  # Logstash默认端口5044
+    index: "tetragon-logs"     # 可选索引名称
+#  console:
+#    enabled: true
+#    pretty: true
+
+
+logging:
+  level: info                 # 自身日志级别
+  to_files: true
+  files:
+    path: /tmp  # 日志存储目录
+    name: filebeat.log        # 日志文件名
+    keepfiles: 7              # 保留7天日志
+    permissions: 0644         # 文件权限
