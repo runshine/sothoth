@@ -1,3 +1,7 @@
+agent:
+  name: "NODE_NAME"     # 自定义名称
+  id: "NODE_ID"  # 使用主机名动态生成唯一ID
+  
 filebeat.inputs:
 - type: filestream
   id: tetragon-log
@@ -40,7 +44,3 @@ logging:
     keepfiles: 7              # 保留7天日志
     permissions: 0644         # 文件权限
 
-# filebeat.yml
-agent:
-  name: "NODE_NAME"     # 自定义名称
-  id: "NODE_ID"  # 使用主机名动态生成唯一ID
