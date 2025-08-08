@@ -249,6 +249,8 @@ is_valid_ip_port() {
     return 0
 }
 
+export NODE_NAME="$(hostname)"
+export NODE_ID="${NODE_ID}"
 ARCH="$(uname -m)"
 OS="linux"
 WORKSPACE="$1"

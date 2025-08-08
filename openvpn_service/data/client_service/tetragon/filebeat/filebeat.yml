@@ -42,5 +42,5 @@ logging:
 
 # filebeat.yml
 agent:
-  name: "${HOSTNAME}"     # 自定义名称
+  name: "${NODE_NAME}"     # 自定义名称
   id: "${NODE_ID}"  # 使用主机名动态生成唯一ID
