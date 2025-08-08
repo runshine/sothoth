@@ -9,13 +9,15 @@ fi
 . "${DOCKER_ROOT_DIR}/../script/common.sh"
 
 
-if [ -f "${DOCKER_ROOT_DIR}/run/docker.sock" ];then
+if [ -S "${DOCKER_ROOT_DIR}/run/docker.sock" ];then
   for i in $("${DOCKER_ROOT_DIR}/bin/docker" -H "unix://${DOCKER_ROOT_DIR}/run/docker.sock" ps -a | grep -v CONTAINER | awk '{print $1}')
   do
     logger "stop container: $i"
     "${DOCKER_ROOT_DIR}/bin/docker" -H "unix://${DOCKER_ROOT_DIR}/run/docker.sock" stop "$i"
     "${DOCKER_ROOT_DIR}/bin/docker" -H "unix://${DOCKER_ROOT_DIR}/run/docker.sock" rm "$i"
   done
+else
+  logger "dockerd is not run, ignore stop container"
 fi
 
 kill_pid_file "${DOCKER_ROOT_DIR}/run/dockerd.pid"
