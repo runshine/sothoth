@@ -14,7 +14,7 @@ pre_build_dirs="${TETRAGON_ROOT_DIR}/filebeat ${TETRAGON_ROOT_DIR}/log ${TETRAGO
 prepare_dir "$pre_build_dirs"
 
 if [ ! -f "${TETRAGON_ROOT_DIR}/docker-compose.yml" ] ;then
-  download_scrpt "$UPSTREAM/download/client_service/tetragon/stop_tetragon.sh"            "${TETRAGON_ROOT_DIR}/stop_tetragon.sh"
+  download_script "$UPSTREAM/download/client_service/tetragon/stop_tetragon.sh"            "${TETRAGON_ROOT_DIR}/stop_tetragon.sh"
   download       "$UPSTREAM/download/client_service/tetragon/docker-compose.yml"          "${TETRAGON_ROOT_DIR}/docker-compose.yml"
   download       "$UPSTREAM/download/client_service/tetragon/filebeat/filebeat.yml"       "${TETRAGON_ROOT_DIR}/filebeat/filebeat.yml"
   download       "$UPSTREAM/download/client_service/tetragon/policy/file_monitoring.yaml" "${TETRAGON_ROOT_DIR}/policy/file_monitoring.yaml"
