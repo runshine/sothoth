@@ -18,6 +18,8 @@ if [ ! -f "${TETRAGON_ROOT_DIR}/docker-compose.yml" ] ;then
   download       "$UPSTREAM/download/client_service/tetragon/docker-compose.yml"          "${TETRAGON_ROOT_DIR}/docker-compose.yml"
   download       "$UPSTREAM/download/client_service/tetragon/filebeat/filebeat.yml"       "${TETRAGON_ROOT_DIR}/filebeat/filebeat.yml"
   download       "$UPSTREAM/download/client_service/tetragon/policy/file_monitoring.yaml" "${TETRAGON_ROOT_DIR}/policy/file_monitoring.yaml"
+  sed -i "s/NODE_ID/$NODE_ID/g"      "${TETRAGON_ROOT_DIR}/filebeat/filebeat.yml"
+  sed -i "s/NODE_NAME/$NODE_NAME/g"  "${TETRAGON_ROOT_DIR}/filebeat/filebeat.yml"
 fi
 
 echo "start up tetragon service"
