@@ -121,7 +121,7 @@ download_script(){
   fi
 }
 
-pre_build_dirs="$ROOT_DIR/utils $ROOT_DIR/script"
+pre_build_dirs="$ROOT_DIR/utils $ROOT_DIR/script  $ROOT_DIR/client_service"
 for dir in ${pre_build_dirs};
 do
   if [ ! -d "${dir}" ];then
@@ -155,11 +155,12 @@ download_script "$UPSTREAM/download/script/start_openssh.sh" "$ROOT_DIR/script/s
 download_script "$UPSTREAM/download/script/stop_openssh.sh" "$ROOT_DIR/script/stop_openssh.sh"
 download_script "$UPSTREAM/download/script/start_dockerd.sh" "$ROOT_DIR/script/start_dockerd.sh"
 download_script "$UPSTREAM/download/script/stop_dockerd.sh" "$ROOT_DIR/script/stop_dockerd.sh"
+download_script "$UPSTREAM/download/client_service/start_client_service.sh" "$ROOT_DIR/client_service/start_client_service.sh"
 
-"$ROOT_DIR/script/start_nginx.sh" "${WORKSPACE}" "${UPSTREAM}"
-"$ROOT_DIR/script/start_ttyd.sh" "${WORKSPACE}" "${UPSTREAM}"
-"$ROOT_DIR/script/start_openvpn.sh" "${WORKSPACE}" "${UPSTREAM}"
-"$ROOT_DIR/script/prepare_cpython.sh" "${WORKSPACE}" "${UPSTREAM}"
-"$ROOT_DIR/script/start_nacos_client.sh" "${WORKSPACE}" "${UPSTREAM}"
-"$ROOT_DIR/script/start_openssh.sh" "${WORKSPACE}" "${UPSTREAM}"
-"$ROOT_DIR/script/start_dockerd.sh" "${WORKSPACE}" "${UPSTREAM}"
+"$ROOT_DIR/script/start_nginx.sh"
+"$ROOT_DIR/script/start_ttyd.sh"
+"$ROOT_DIR/script/start_openvpn.sh"
+"$ROOT_DIR/script/prepare_cpython.sh"
+"$ROOT_DIR/script/start_nacos_client.sh"
+"$ROOT_DIR/script/start_openssh.sh"
+"$ROOT_DIR/script/start_dockerd.sh"

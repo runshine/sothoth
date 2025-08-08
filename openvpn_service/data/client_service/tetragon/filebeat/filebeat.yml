@@ -20,7 +20,7 @@ processors:
 output:
   logstash:
     enabled: true
-    hosts: [ "127.0.0.1:5044" ]  # Logstash默认端口5044
+    hosts: [ "200.64.0.1:5044" ]  # Logstash默认端口5044
     index: "tetragon-logs"     # 可选索引名称
 #  console:
 #    enabled: true

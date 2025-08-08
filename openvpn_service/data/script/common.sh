@@ -67,6 +67,13 @@ download_script() {
   fi
 }
 
+download_script_if_none_exist() {
+  download_if_none_exist "$1" "$2"
+  if [ -f "$2" ];then
+    chmod +x "$2"
+  fi
+}
+
 download_utils(){
   download_script "$1" "$2"
 }
@@ -210,7 +217,7 @@ is_valid_ip_port() {
     local input="$1"
 
     # 检查是否只包含一个冒号
-    if [[ $(grep -o ':' <<< "$input" | wc -l) -ne 1 ]]; then
+    if [[ $(echo "$input" |grep -o ':' | wc -l) -ne 1 ]]; then
         return 1
     fi
 
@@ -223,7 +230,7 @@ is_valid_ip_port() {
         return 1
     fi
     local IFS='.'
-    read -ra ip_parts <<< "$ip"
+    echo "$ip" | read -ra ip_parts
     if [[ ${#ip_parts[@]} -ne 4 ]]; then
         return 1
     fi

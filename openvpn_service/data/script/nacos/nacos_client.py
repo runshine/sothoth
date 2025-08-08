@@ -158,4 +158,4 @@ if __name__ == "__main__":
     setup_logger(os.path.join(NACOS_ROOT_DIR,"log/nacos_client.log"))
     setup_singal_runner(os.path.join(NACOS_ROOT_DIR,"run/nacos_client.lock"))
     threading.Thread(target=start_nacos).start()
-    app.run(host="0.0.0.0",port="11191",debug=False,threaded=True)
+    app.run(host="0.0.0.0",port="11190",debug=False,threaded=True)
