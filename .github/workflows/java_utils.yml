@@ -70,7 +70,7 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push reboot_helper
+      - name: Build and push attach_helper
         uses: docker/build-push-action@v5
         with:
           context: ./java_utils/attach_helper
@@ -80,3 +80,45 @@ jobs:
             runshine0819/attach_helper:latest
             ghcr.io/runshine/attach_helper:latest
           file: ./java_utils/attach_helper/Dockerfile
+
+  build_opentelemetry_helper:
+    runs-on: ubuntu-latest
+    needs:
+      - build_attach_helper
+      - build_reboot_helper
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push opentelemetry_helper
+        uses: docker/build-push-action@v5
+        with:
+          context: ./java_utils/opentelemetry_helper
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            runshine0819/opentelemetry_helper:latest
+            ghcr.io/runshine/opentelemetry_helper:latest
+          file: ./java_utils/opentelemetry_helper/Dockerfile
