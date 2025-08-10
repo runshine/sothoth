@@ -1,0 +1,48 @@
+name: 'opentelemetry_java_service'
+services:
+  tetragon:
+    image: quay.io/cilium/tetragon:v1.5.0
+    restart: always
+    container_name: tetragon
+    network_mode: host
+    privileged: true
+    pid: host
+    cgroup: host
+    environment:
+      - TZ=Asia/Shanghai
+    command:
+      - "tetragon"
+      - "--export-filename"
+      - "/var/log/tetragon/tetragon.log"
+    volumes:
+      - ./log:/var/log/tetragon
+      - ./policy:/etc/tetragon/tetragon.tp.d/
+      - /sys/kernel/btf/vmlinux:/var/lib/tetragon/btf
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "1"
+
+  filebeat:
+    image: elastic/filebeat:9.1.0
+    hostname: "filebeat"
+    container_name: "filebeat"
+    user: root
+    network_mode: host
+    volumes:
+      - ./log:/var/log/tetragon
+      - ./filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml
+    environment:
+      - TZ=Asia/Shanghai
+      - NODE_ID=${NODE_ID:-11111-11111-11111-11111}
+      - NODE_NAME=${NODE_NAME:-unknown-host}
+    # disable strict permission checks
+    command: [ "--strict.perms=false" ]
+    depends_on:
+      - tetragon
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "1"
