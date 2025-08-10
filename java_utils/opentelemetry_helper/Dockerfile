@@ -1,15 +1,9 @@
-FROM ubuntu:latest as nodevpn-builder
-LABEL previous-stage=nodevpn-builder
+FROM runshine0819/java_helper:latest as java_helper
 
-# prepare builder
-RUN apt update && apt install -y make gcc g++ liblzo2-dev cmake openjdk-8-jdk
-# do make
-RUN mkdir -p /build/
+FROM ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:2.18.1 as autoinstrumentation-java
 
-COPY . /build/
+FROM openjdk:8-jdk
 
-RUN cd /build/source && cmake -DCMAKE_BUILD_TYPE=Release . && make && make install
-
-FROM busybox:latest
-COPY --from=nodevpn-builder /build/source/dist/lib/libjava_helper.so /libjava_helper.so
+COPY --from=java_helper /libjava_helper.so /libjava_helper.so
+COPY --from=autoinstrumentation-java /javaagent.jar /opentelemetry-javaagent.jar
 CMD ["/bin/sh"]
