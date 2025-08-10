@@ -1,4 +1,4 @@
-FROM ubuntu:latest as reboot_helper_builder
+FROM ubuntu:latest AS reboot_helper_builder
 
 # prepare builder
 RUN apt update && apt install -y make gcc g++ liblzo2-dev cmake openjdk-8-jdk

@@ -1,4 +1,4 @@
-FROM runshine0819/java_helper:latest as java_helper
+FROM runshine0819/java_helper:latest AS java_helper
 
 FROM ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:2.18.1 as autoinstrumentation-java
 

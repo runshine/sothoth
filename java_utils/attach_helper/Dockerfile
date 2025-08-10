@@ -1,4 +1,4 @@
-FROM ubuntu:latest as attach_helper_builder
+FROM ubuntu:latest AS attach_helper_builder
 
 # prepare builder
 RUN apt update && apt install -y openjdk-8-jdk maven
