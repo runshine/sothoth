@@ -74,7 +74,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: ./java_utils/attach_helper
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             runshine0819/attach_helper:latest
