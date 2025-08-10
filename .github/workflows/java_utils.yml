@@ -1,11 +1,13 @@
-name: java_helper
+name: java_utils
 
 on: push
 
 jobs:
-  build:
+  build_java_helper:
     runs-on: ubuntu-latest
-
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,7 +35,7 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: ./java_utils/java_helper
-          platforms: linux/amd64,linux/arm64,linux/s390x,linux/arm/v7
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: |
             runshine0819/java_helper:latest
