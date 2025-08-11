@@ -5,4 +5,5 @@ FROM openjdk:8-jdk
 COPY --from=reboot_helper            /libreboot_helper.so /libreboot_helper.so
 COPY --from=attach_helper            /attach_helper.jar   /attach_helper.jar
 COPY --from=autoinstrumentation-java /javaagent.jar       /opentelemetry-javaagent.jar
+COPY . /opt/
 CMD ["/bin/sh"]
