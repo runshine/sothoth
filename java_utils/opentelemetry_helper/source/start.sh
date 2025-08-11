@@ -32,11 +32,14 @@ if [ "x${nspid}" = "x" ];then
   exit 255
 fi
 
-if [ "x${nspdi}" = "x${pid}" ];then
-  echo "start with no docker"
-  exec ./start_normal.sh "$pid"
-else
-  echo "start with docker"
+host_pid_ns=$(readlink /proc/1/ns/pid)
+process_pid_ns=$(readlink /proc/$pid/ns/pid)
+
+if [ "$host_pid_ns" != "$process_pid_ns" ]; then
+  echo "Process $pid is running inside a container."
   exec ./start_docker.sh "$pid"
+else
+  echo "Process $pid is not running inside a container."
+  exec ./start_normal.sh "$pid"
 fi
 
