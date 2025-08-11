@@ -1,6 +1,9 @@
 #!/bin/sh
 
 pid="$1"
+echo "start add mount for docker sence"
+/addmount 1 "${SOTHOTH_DIR}" "$pid" "${SOTHOTH_DIR}"
+
 echo "java -jar /attach_helper.jar -options 'sothoth_dir=${SOTHOTH_DIR}' -displayName attach_helper.jar -agent-so \"${SOTHOTH_DIR}/share/libreboot_helper.so\" -pid \"$pid\""
 java -jar /attach_helper.jar -options "sothoth_dir=${SOTHOTH_DIR}" -displayName attach_helper.jar -agent-so "${SOTHOTH_DIR}/share/libreboot_helper.so" -pid "$pid"
 if [ $? -eq 0 ];then
