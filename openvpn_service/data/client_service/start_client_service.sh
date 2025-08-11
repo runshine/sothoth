@@ -12,7 +12,8 @@ fi
 pre_build_dirs="${CLIENT_SERVICE_ROOT_DIR}/tetragon"
 prepare_dir "$pre_build_dirs"
 
-download_script_if_none_exist "$UPSTREAM/download/client_service/stop_client_service.sh"            "${CLIENT_SERVICE_ROOT_DIR}/stop_client_service.sh"
-download_script_if_none_exist "$UPSTREAM/download/client_service/tetragon/start_tetragon.sh"            "${CLIENT_SERVICE_ROOT_DIR}/tetragon/start_tetragon.sh"
+download_script_if_none_exist "$UPSTREAM/download/client_service/stop_client_service.sh"                               "${CLIENT_SERVICE_ROOT_DIR}/stop_client_service.sh"
+download_script_if_none_exist "$UPSTREAM/download/client_service/tetragon/start_tetragon.sh"                           "${CLIENT_SERVICE_ROOT_DIR}/tetragon/start_tetragon.sh"
+download_script_if_none_exist "$UPSTREAM/download/client_service/opentelemetry_java/start_opentelemetry.sh"            "${CLIENT_SERVICE_ROOT_DIR}/opentelemetry_java/start_opentelemetry.sh"
 
 "${CLIENT_SERVICE_ROOT_DIR}/tetragon/start_tetragon.sh"
