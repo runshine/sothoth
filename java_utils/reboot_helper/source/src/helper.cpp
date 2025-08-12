@@ -26,7 +26,7 @@ void close_all_fd(){
         close_at_exec(i);
 }
 
-int restart_with_javaagent(std::map<std::string, std::string> option_map) {
+int restart_with_javaagent(std::vector<std::string> option_list) {
     // 直接读取原始命令行参数（以\0分隔）
     std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
     if (!cmdline) {
@@ -62,42 +62,22 @@ int restart_with_javaagent(std::map<std::string, std::string> option_map) {
     std::string agent_arg = "-javaagent:";
     bool agent_found = false;
     size_t agent_index = 0;
-    if(option_map.find("sothoth_dir") != option_map.end()){
-        agent_arg = agent_arg + option_map.find("sothoth_dir")->second + "/share/opentelemetry-javaagent.jar";
-    }else{
-        fprintf(stderr, "use sothoth_dir with default dir: %s\n","/sothothv2");
-        agent_arg = agent_arg + "/sothothv2" + "/share/opentelemetry-javaagent.jar";
-    }
 
     if(access(agent_arg.c_str(),O_RDONLY) != 0){
         fprintf(stderr, "failed access opentelemetry-javaagent.jar: %s\n",agent_arg.c_str());
         return EXIT_FAILURE;
     }
 
-    for (size_t i = 1; i < args.size(); ++i) {
-        if (args[i].find("-javaagent:") == 0) {
-            if (args[i].find("opentelemetry-javaagent.jar") != std::string::npos) {
-                agent_found = true;
-                agent_index = i;
-                break;
-            }
-        }
-    }
-
     // 构建新参数列表
     std::vector<std::string> new_args;
     new_args.push_back(args[0]); // 程序名
 
-    // 添加/替换agent参数
-    if (agent_found) {
-        for (size_t i = 1; i < args.size(); ++i) {
-            new_args.push_back(i == agent_index ? agent_arg : args[i]);
-        }
-    } else {
-        new_args.push_back(agent_arg);
-        for (size_t i = 1; i < args.size(); ++i) {
-            new_args.push_back(args[i]);
-        }
+    for (size_t i = 0; i < option_list.size(); ++i) {
+        new_args.push_back(option_list[i]);
+    }
+
+    for (size_t i = 1; i < args.size(); ++i) {
+        new_args.push_back(args[i]);
     }
 
     // 准备execve参数数组
@@ -106,6 +86,12 @@ int restart_with_javaagent(std::map<std::string, std::string> option_map) {
         exec_args.push_back(const_cast<char*>(arg.c_str()));
     }
     exec_args.push_back(nullptr);
+
+    std::cout << "Executing with arguments:\n";
+    for (char** arg = exec_args.data(); *arg != nullptr; ++arg) {
+        std::cout << "  " << *arg << "\n";
+    }
+    std::cout << std::flush; // 确保在execve前刷新输出
 
     // 重新执行进程
     execve(exec_args[0], exec_args.data(), environ);
@@ -125,39 +111,48 @@ std::string trim(const std::string& str) {
     return str.substr(start, end - start + 1);
 }
 
-// 主解析函数
-std::map<std::string, std::string> parseOptions(const std::string& input) {
-    std::map<std::string, std::string> options;
-    std::istringstream ss(input);
+std::vector<std::string> splitArguments(const std::string& input) {
+    std::vector<std::string> tokens;
+    bool inSingleQuote = false;
+    bool inDoubleQuote = false;
     std::string token;
 
-    // 按逗号分割键值对
-    while (std::getline(ss, token, ',')) {
-        // 查找等号位置
-        size_t eq_pos = token.find('=');
-        if (eq_pos == std::string::npos) continue; // 跳过无效格式
+    for (size_t i = 0; i < input.length(); ++i) {
+        char c = input[i];
 
-        // 分割键和值
-        std::string key = trim(token.substr(0, eq_pos));
-        std::string value = trim(token.substr(eq_pos + 1));
-
-        // 跳过空键
-        if (key.empty()) continue;
-
-        // 存储到map
-        options[key] = value;
+        if (c == '\'' && !inDoubleQuote) {
+            inSingleQuote = !inSingleQuote;
+        } else if (c == '"' && !inSingleQuote) {
+            inDoubleQuote = !inDoubleQuote;
+        } else if (std::isspace(static_cast<unsigned char>(c))) {
+            if (inSingleQuote || inDoubleQuote) {
+                token += c;
+            } else {
+                if (!token.empty()) {
+                    tokens.push_back(token);
+                    token.clear();
+                }
+            }
+        } else {
+            token += c;
+        }
     }
 
-    return options;
+    if (!token.empty()) {
+        tokens.push_back(token);
+    }
+
+    return tokens;
 }
+
 
 JNIEXPORT jint JNICALL Agent_OnAttach(JavaVM *vm, char *options, void *reserved) {
     cout << "Agent_OnAttach, options: "<< options << endl;
-    std::map<std::string, std::string> option_map;
+    std::vector<std::string> option_list;
     if(options != NULL)
-        parseOptions(options);
+        option_list = splitArguments(options);
     close_all_fd();
-    restart_with_javaagent(option_map);
+    restart_with_javaagent(option_list);
     return JNI_OK;
 }
 
