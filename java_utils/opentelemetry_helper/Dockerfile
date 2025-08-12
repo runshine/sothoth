@@ -8,4 +8,4 @@ COPY --from=attach_helper            /attach_helper.jar         /attach_helper.j
 COPY --from=add_mount                /usr/local/bin/addmount   /addmount
 COPY --from=autoinstrumentation-java /javaagent.jar             /opentelemetry-javaagent.jar
 COPY . /opt/
-ENTRYPOINT ["/opt/source/start.sh"]
+CMD ["/opt/source/start.sh"]
