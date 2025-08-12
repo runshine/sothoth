@@ -64,6 +64,6 @@ public class JavaAgentLoader {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
+        System.exit(255);
     }
-    System.exit(255);
 }
