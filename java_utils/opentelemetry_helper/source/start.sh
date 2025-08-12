@@ -46,8 +46,8 @@ fi
 options="-javaagent:${SOTHOTH_DIR}/share/opentelemetry-javaagent.jar \
             -Dotel.resource.attributes=service.name=,service.version=,deployment.environment= \
             -Dotel.exporter.otlp.protocol=http/protobuf \
-            -Dotel.exporter.otlp.traces.endpoint=http://200.64.0.1:8077/api/otlp/traces \
-            -Dotel.exporter.otlp.metrics.endpoint=http://200.64.0.1:8077/api/otlp/metrics \
+            -Dotel.exporter.otlp.traces.endpoint=http://200.64.0.1:4318/api/otlp/traces \
+            -Dotel.exporter.otlp.metrics.endpoint=http://200.64.0.1:4318/api/otlp/metrics \
             -Dotel.logs.exporter=none"
 
 echo "java -jar /attach_helper.jar -displayName attach_helper.jar -agent-so \"${SOTHOTH_DIR}/share/libreboot_helper.so\" -pid \"$pid\" -options \"${options}\""
