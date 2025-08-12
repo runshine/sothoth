@@ -10,24 +10,11 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 
 public class Config {
-    public static final String LINUX_DIR = "/usr/local/ddtrace";
-
-    public static final String WIN_DIR = "D:/usr/local/ddtrace";
-
-    public static final String FILE_NAME="dd-java-agent.jar";
-
-    public String getDir(){
-        if (System.getProperty("os.name").toLowerCase().contains("win")) {
-           return WIN_DIR;
-        } else {
-            return LINUX_DIR;
-        }
-    }
     private String options;
 
-    private String downloadAddress;
-
     private  String agentJar;
+
+    private String agentSo;
 
     private String pid;
 
@@ -37,20 +24,20 @@ public class Config {
         return this.options;
     }
 
-    public String getDownloadAddress() {
-        return  this.downloadAddress;
-    }
-
     public String getAgentJar() {
         return  this.agentJar;
+    }
+
+    public String getAgentSo(){
+        return this.agentSo;
     }
 
     public String getPid(){return this.pid;}
     public String getDisplayName(){return this.displayName;}
 
-    private Config(String options,String downloadAddress,String agentJar,String pid,String displayName){
+    private Config(String options,String agentSo,String agentJar,String pid,String displayName){
         this.options = options;
-        this.downloadAddress = downloadAddress;
+        this.agentSo = agentSo;
         this.agentJar = agentJar;
         this.pid = pid;
         this.displayName = displayName;
@@ -58,8 +45,8 @@ public class Config {
 
     static Config parse(String... args){
         String option = "";
-        String downloadAddr= "";
         String currentArg = "";
+        String agentSo= "";
         String agentJar= "";
         String pid = "";
         String displayName = "";
@@ -75,12 +62,11 @@ public class Config {
                     case "-options":
                         option = arg;
                         break;
-                    case "-download":
-                        downloadAddr = arg;
-                        download(arg,createDir());
-                        break;
                     case "-agent-jar":
                          agentJar = arg;
+                        break;
+                    case "-agent-so":
+                         agentSo = arg;
                         break;
                     case "-pid":
                         pid = arg;
@@ -91,68 +77,14 @@ public class Config {
                 }
             }
         }
-        return new Config(option,downloadAddr,agentJar,pid,displayName);
-    }
-
-    private static void download(String arg,String path)  {
-        try{
-            File file = new File(path+"/"+FILE_NAME);
-            //创建新文件
-            if(file!=null && !file.exists()){
-                file.createNewFile();
-            }
-              //输出流
-            OutputStreamWriter out = new OutputStreamWriter(new FileOutputStream(file));
-            URL url = new URL(arg);
-            //获取链接
-            HttpURLConnection uc = (HttpURLConnection) url.openConnection();
-            uc.setDoInput(true);//设置是否要从 URL 连接读取数据,默认为true
-            uc.connect();
-            //获取输入流，读取文件
-            InputStreamReader in = new InputStreamReader(uc.getInputStream());
-            char[] buffer = new char[4*1024];
-            int length;
-            //读取文件
-            while((length=in.read(buffer))!= -1){
-                //写出
-                out.write(buffer, 0, length);
-            }
-            out.flush();
-            in.close();
-            out.close();
-        }catch (IOException e){
-            e.printStackTrace();
-        }
-    }
-
-    // 生成文件夹
-    public static String createDir() {
-        // if win else linux
-        String path = "";
-        if (System.getProperty("os.name").toLowerCase().contains("win")) {
-            path = WIN_DIR;
-        } else {
-            path = LINUX_DIR;
-        }
-        File folder = new File(path);
-        if (!folder.exists() && !folder.isDirectory()) {
-            folder.setWritable(true, false);
-            try{
-                folder.mkdirs();
-            }catch (SecurityException e){
-                e.printStackTrace();
-            }
-            System.out.println("mkdir");
-        } else {
-            System.out.println("文件夹已存在");
-        }
-        return path;
+        return new Config(option,agentSo,agentJar,pid,displayName);
     }
 
     public static void printOut(){
         PrintStream out =   System.out;
         out.println("java -jar agent-attach-java.jar [-options <dd options>]");
         out.println("                                [-agent-jar <agent filepath>]");
+        out.println("                                [-agent-so <agent so filepath>]");
         out.println("                                [-pid <pid>]");
         out.println("                                [-displayName <service name/displayName>]");
         out.println("                                [-h]");
@@ -168,8 +100,6 @@ public class Config {
         out.println("   service name");
         out.println("Note: -pid or -displayName must have a non empty !!!");
         out.println("");
-        out.println("[-download]");
-        out.println("   https://static.guance.com/dd-image/dd-java-agent.jar");
         out.println("example command line:");
         out.println("java -jar agent-attach-java.jar -options 'dd.service=test,dd.tag=v1'\\");
         out.println(" -displayName tmall.jar \\");

@@ -7,8 +7,6 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 
-import static com.guance.javaagent.Config.FILE_NAME;
-
 public class JavaAgentLoader {
     static final Logger logger = LoggerFactory.getLogger(JavaAgentLoader.class);
 
@@ -16,6 +14,7 @@ public class JavaAgentLoader {
     public static void loadAgent(Config config) {
         logger.info("dynamically loading javaagent");
         logger.info("config.options:"+ config.getOptions());
+        logger.info("config.agentSo: "+config.getAgentSo());
         logger.info("config.agentJar: "+config.getAgentJar());
         logger.info("config.pid: "+config.getPid());
         logger.info("config.displayName: "+config.getDisplayName());
@@ -50,15 +49,21 @@ public class JavaAgentLoader {
                 }
                 if (config.getAgentJar() != null && !config.getAgentJar().equals("")){
                     attach.loadAgent(config.getAgentJar(), config.getOptions());
-                }else {
-                    attach.loadAgent(config.getDir()+"/"+ FILE_NAME, config.getOptions());
                 }
+                 if (config.getAgentSo() != null && !config.getAgentSo().equals("")){
+                    if( config.getOptions() == null ||  config.getOptions().length() == 0 )
+                        attach.loadAgentPath(config.getAgentSo());
+                    else
+                    attach.loadAgentPath(config.getAgentSo(), config.getOptions());
+                 }
                 attach.detach();
                 logger.info(String.format("attach agent into [%s]",virtualMachineDescriptor.displayName()));
+                System.exit(0);
                 return;
             }
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
     }
+    System.exit(255);
 }
