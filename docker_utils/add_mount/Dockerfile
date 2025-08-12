@@ -11,4 +11,4 @@ ENTRYPOINT ["/bin/sleep", "infinity"]
 FROM docker:dind
 RUN apk update && apk add jq
 COPY --from=build /src/addmount /src/script.sh /usr/local/bin/
-ENTRYPOINT ["/usr/local/bin/script.sh"]
+CMD ["/usr/local/bin/script.sh"]
