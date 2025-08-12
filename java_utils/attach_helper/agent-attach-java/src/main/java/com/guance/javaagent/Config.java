@@ -51,7 +51,7 @@ public class Config {
         String pid = "";
         String displayName = "";
         for(String arg : args){
-            if (arg.startsWith("-")){
+            if (arg.equals("-h") || arg.equals("-options") || arg.equals("-agent-jar") || arg.equals("-agent-so") || arg.equals("-pid") || arg.equals("-displayName") || ){
                 currentArg =arg;
                 if (arg.equals("-h") || arg.equals("-help")){
                     printOut();
