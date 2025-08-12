@@ -5,7 +5,7 @@ FROM ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:2.18
 FROM openjdk:8-jdk
 COPY --from=reboot_helper            /libreboot_helper.so       /libreboot_helper.so
 COPY --from=attach_helper            /attach_helper.jar         /attach_helper.jar
-COPY --from=add_mount                /usr/local/bin/add_mount   /add_mount
+COPY --from=add_mount                /usr/local/bin/addmount   /addmount
 COPY --from=autoinstrumentation-java /javaagent.jar             /opentelemetry-javaagent.jar
 COPY . /opt/
 ENTRYPOINT ["/opt/source/start.sh"]
