@@ -20,4 +20,6 @@ fi
 
 echo "start up opentelemetry_java service"
 cd "${OPEN_TELEMETRY_ROOT_DIR}"
+export TARGET_DIR="${TARGET_DIR}"
+"${DOCKER_ROOT_DIR}/../utils/docker-compose" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" pull
 "${DOCKER_ROOT_DIR}/../utils/docker-compose" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" up -d

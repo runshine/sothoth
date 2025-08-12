@@ -9,7 +9,7 @@ if [ "x${pid}" = "x" ];then
 fi
 
 if [ "x${SOTHOTH_DIR}" = "x" ] || [ ! -d "${SOTHOTH_DIR}" ] || [ ! -f "${SOTHOTH_DIR}/sothoth.conf" ];then
-  echo "Env SOTHOTH_DIR must set and exist, and must ok"
+  echo "Env SOTHOTH_DIR must set and exist, and must ok, current SOTHOTH_DIR --> ${SOTHOTH_DIR}"
   exit 255
 fi
 

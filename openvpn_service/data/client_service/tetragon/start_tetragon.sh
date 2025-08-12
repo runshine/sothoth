@@ -24,4 +24,5 @@ fi
 
 echo "start up tetragon service"
 cd "${TETRAGON_ROOT_DIR}"
+"${DOCKER_ROOT_DIR}/../utils/docker-compose" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" pull
 "${DOCKER_ROOT_DIR}/../utils/docker-compose" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" up -d
