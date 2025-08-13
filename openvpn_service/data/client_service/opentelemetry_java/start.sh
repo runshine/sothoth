@@ -18,11 +18,17 @@ if [ ! -d "/host/${SOTHOTH_DIR}/share/" ];then
   mkdir -p "/host/${SOTHOTH_DIR}/share/"
 fi
 
+chmod +x "/host/${SOTHOTH_DIR}/share/"
+
 if [ ! -f "${SOTHOTH_DIR}/share/libreboot_helper.so" ];then
   cp /libreboot_helper.so         "/host/${SOTHOTH_DIR}/share/libreboot_helper.so"
   cp /attach_helper.jar           "/host/${SOTHOTH_DIR}/share/attach_helper.jar"
   cp /opentelemetry-javaagent.jar "/host/${SOTHOTH_DIR}/share/opentelemetry-javaagent.jar"
   cp /addmount                   "/host/${SOTHOTH_DIR}/share/addmount"
+  chmod +r "/host/${SOTHOTH_DIR}/share/libreboot_helper.so"
+  chmod +r "/host/${SOTHOTH_DIR}/share/attach_helper.jar"
+  chmod +r "/host/${SOTHOTH_DIR}/share/opentelemetry-javaagent.jar"
+  chmod +r "/host/${SOTHOTH_DIR}/share/addmount"
 else
   echo "file already exist, ignore copy"
 fi
