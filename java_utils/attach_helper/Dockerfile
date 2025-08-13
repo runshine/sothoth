@@ -9,7 +9,7 @@ COPY . /build/
 
 RUN cd /build/agent-attach-java && mvn -B package --file pom.xml
 
-FROM openjdk:8-jdk
+FROM openjdk:17-jdk-alpine
 COPY --from=attach_helper_builder /build/agent-attach-java/target/agent-attach-java-jar-with-dependencies.jar /attach_helper.jar
 CMD ["/bin/sh"]
 
