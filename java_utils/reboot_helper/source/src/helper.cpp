@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <map>
 #include <sstream>
+#include <pthread.h>
 
 using namespace std;
 
@@ -135,14 +136,28 @@ std::vector<std::string> splitArguments(const std::string& input) {
     return tokens;
 }
 
+static string local_option_buf = "";
+
+static void* restart_worker(void*){
+    std::vector<std::string> option_list;
+    sleep(5);
+    option_list = splitArguments(local_option_buf);
+    close_all_fd();
+    restart_with_javaagent(option_list);
+    return NULL;
+}
+
 
 JNIEXPORT jint JNICALL Agent_OnAttach(JavaVM *vm, char *options, void *reserved) {
     cout << "Agent_OnAttach, options: "<< options << endl;
-    std::vector<std::string> option_list;
-    if(options != NULL)
-        option_list = splitArguments(options);
-    close_all_fd();
-    restart_with_javaagent(option_list);
+    if(options != NULL) {
+        local_option_buf = options;
+    }else{
+        local_option_buf = "";
+    };
+    pthread_t tid;
+    pthread_create(&tid,NULL,restart_worker,NULL);
+    cout << "Start new TID: " << tid <<endl;
     return JNI_OK;
 }
 
