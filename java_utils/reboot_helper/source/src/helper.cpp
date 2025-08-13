@@ -24,7 +24,7 @@ void close_at_exec(int fd){
 
 void close_all_fd(){
     int i = 0;
-    for(i=0;i<4096;i++)
+    for(i=3;i<4096;i++)
         close_at_exec(i);
 }
 
