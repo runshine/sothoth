@@ -10,6 +10,7 @@
 #include <map>
 #include <sstream>
 #include <pthread.h>
+#include <climits>
 
 using namespace std;
 
@@ -25,6 +26,30 @@ void close_all_fd(){
     int i = 0;
     for(i=0;i<4096;i++)
         close_at_exec(i);
+}
+
+bool endsWith(const std::string& str, const std::string& suffix) {
+    if (str.length() < suffix.length())
+        return false;
+    return std::equal(suffix.rbegin(), suffix.rend(), str.rbegin());
+}
+
+std::string removeSuffix(const std::string& str, const std::string& suffix) {
+    // 空后缀直接返回原字符串
+    if (suffix.empty()) return str;
+
+    // 检测后缀并截取
+    if (endsWith(str, suffix)) {
+        return str.substr(0, str.length() - suffix.length());
+    }
+    return str;  // 不匹配时返回原字符串
+}
+
+
+bool file_exist(std::string dir, std::string filename){
+    if(access((dir + "/" + filename).data(),0))
+        return true;
+    return false;
 }
 
 int restart_with_javaagent(std::vector<std::string> option_list) {
@@ -61,7 +86,24 @@ int restart_with_javaagent(std::vector<std::string> option_list) {
 
     // 构建新参数列表
     std::vector<std::string> new_args;
-    new_args.push_back(args[0]); // 程序名
+    char cwd[PATH_MAX] = {0};
+    char exe[PATH_MAX] = {0};
+    getcwd(cwd,sizeof(cwd));
+    if(file_exist(cwd,args[0])){
+        new_args.push_back(args[0]); // 程序名
+    }else {
+        readlink("/proc/self/exe",exe,sizeof(exe));
+        if(strcmp(exe,args[0].c_str()) == 0) {
+            new_args.push_back(exe);
+        }else if(endsWith(exe,args[0])){
+            cout << "start chdir to: " << removeSuffix(exe,args[0]).data() << endl;
+            chdir(removeSuffix(exe,args[0]).data());
+            new_args.push_back(args[0]);
+        }else{
+            new_args.push_back(exe);
+        }
+    }
+
 
     for (size_t i = 0; i < option_list.size(); ++i) {
         new_args.push_back(option_list[i]);
@@ -154,7 +196,7 @@ JNIEXPORT jint JNICALL Agent_OnAttach(JavaVM *vm, char *options, void *reserved)
         local_option_buf = options;
     }else{
         local_option_buf = "";
-    };
+    }
     pthread_t tid;
     pthread_create(&tid,NULL,restart_worker,NULL);
     cout << "Start new TID: " << tid <<endl;
