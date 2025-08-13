@@ -5,6 +5,8 @@ RUN apt update && apt install -y openjdk-8-jdk maven
 # do make
 RUN mkdir -p /build/
 
+
+
 COPY . /build/
 
 RUN cd /build/agent-attach-java && mvn -B package --file pom.xml

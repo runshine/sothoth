@@ -72,7 +72,8 @@ int main(int argc, char *argv[]) {
     close(smfd);
 
     // this creates a file descriptor equavalent to the mount --rbind tree at the source path
-    int fd = open_tree(AT_FDCWD, src, OPEN_TREE_CLONE|AT_RECURSIVE);
+    //int fd = open_tree(AT_FDCWD, src, OPEN_TREE_CLONE|AT_RECURSIVE);
+    int fd = open_tree(AT_FDCWD, src, OPEN_TREE_CLONE);
     if (fd == -1) {
         if (errno == ENOSYS) {
             printf("open_tree ENOSYS: you need kernel 5.2 to run this code, please upgrade\n");

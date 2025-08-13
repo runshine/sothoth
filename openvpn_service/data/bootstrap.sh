@@ -130,7 +130,7 @@ do
   fi
 done
 
-bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz socat docker-compose"
+bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz socat docker-compose jattach"
 for bin in ${bootstrap_utils_list};
 do
   download "$UPSTREAM/utils/$bin/$OS/$ARCH" "${ROOT_DIR}/utils/$bin"
