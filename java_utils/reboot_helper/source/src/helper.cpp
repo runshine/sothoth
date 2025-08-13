@@ -47,7 +47,7 @@ std::string removeSuffix(const std::string& str, const std::string& suffix) {
 
 
 bool file_exist(std::string dir, std::string filename){
-    if(access((dir + "/" + filename).data(),0))
+    if(access((dir + "/" + filename).data(),0)==0)
         return true;
     return false;
 }
@@ -89,17 +89,29 @@ int restart_with_javaagent(std::vector<std::string> option_list) {
     char cwd[PATH_MAX] = {0};
     char exe[PATH_MAX] = {0};
     getcwd(cwd,sizeof(cwd));
+    readlink("/proc/self/exe",exe,sizeof(exe));
+    cout << "current dir: " << (char*)cwd << endl;
+    cout << "exe: " << (char*)exe << endl;
     if(file_exist(cwd,args[0])){
+        cout << "execute file is exist in current dir, use it again" << endl;
         new_args.push_back(args[0]); // 程序名
     }else {
-        readlink("/proc/self/exe",exe,sizeof(exe));
         if(strcmp(exe,args[0].c_str()) == 0) {
+            cout << "execute file is same with /proc/self/exe file, use exe directly" << endl;
             new_args.push_back(exe);
         }else if(endsWith(exe,args[0])){
-            cout << "start chdir to: " << removeSuffix(exe,args[0]).data() << endl;
-            chdir(removeSuffix(exe,args[0]).data());
-            new_args.push_back(args[0]);
+            std::string folder =  removeSuffix(exe,args[0]);
+            cout << "we are guess exe file work dir: "<< folder << endl;
+            if(access(folder.data(),0)==0) {
+                cout << "folder exist, start chdir to: " <<folder.data() << endl;
+                chdir(removeSuffix(exe, args[0]).data());
+                new_args.push_back(args[0]);
+            }else{
+                cout << "folder not exist, use exe directly" <<folder.data() << endl;
+                new_args.push_back(exe);
+            }
         }else{
+            cout << "other sence, use exe directly" << endl;
             new_args.push_back(exe);
         }
     }
