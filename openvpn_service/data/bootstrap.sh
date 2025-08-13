@@ -17,7 +17,7 @@ ulimit -n 65535
 if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ];then
   #we are in local run mode
   ROOT_DIR="$(cd "$(dirname $0)";pwd)"
-  chmod +x "${ROOT_DIR}"
+  chmod 755 "${ROOT_DIR}"
   chmod +x "${ROOT_DIR}/sothoth.conf"
   .  "$ROOT_DIR/sothoth.conf"
 else
@@ -43,7 +43,7 @@ else
     cp "$0" "$TARGET_DIR/bootstrap.sh"
     chmod +x "$TARGET_DIR/bootstrap.sh"
   fi
-  chmod +x "${ROOT_DIR}"
+  chmod 755 "${ROOT_DIR}"
 fi
 
 if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ] || [ "x${TARGET_DIR}" = "x" ];then
