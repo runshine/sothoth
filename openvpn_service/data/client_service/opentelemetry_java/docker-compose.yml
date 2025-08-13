@@ -2,7 +2,7 @@ name: 'opentelemetry_java_service'
 services:
   opentelemetry_helper:
     image: runshine0819/opentelemetry_helper:latest
-    restart: always
+    restart: no
     container_name: opentelemetry_helper
     network_mode: host
     privileged: true
@@ -13,7 +13,10 @@ services:
       - SOTHOTH_DIR=${TARGET_DIR:-/sothothv2}
     command:
       - "/opt/source/start.sh"
-      - "83012"
+      - "235706"
+    volumes:
+      - ./start.sh:/opt/source/start.sh
+      - /:/host
     logging:
       driver: "json-file"
       options:

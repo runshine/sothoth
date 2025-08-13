@@ -10,12 +10,13 @@ fi
 . "${ROOT_DIR}/script/common.sh"
 
 
-pre_build_dirs="${OPEN_TELEMETRY_ROOT_DIR}/log"
-prepare_dir "$pre_build_dirs"
+#pre_build_dirs="${OPEN_TELEMETRY_ROOT_DIR}/log"
+#prepare_dir "$pre_build_dirs"
 
 if [ ! -f "${OPEN_TELEMETRY_ROOT_DIR}/docker-compose.yml" ] ;then
-  download_script "$UPSTREAM/download/client_service/opentelemetry_java/stop_opentelemetry.sh"            "${OPEN_TELEMETRY_ROOT_DIR}/stop_opentelemetry.sh"
-  download       "$UPSTREAM/download/client_service/opentelemetry_java/docker-compose.yml"                "${OPEN_TELEMETRY_ROOT_DIR}/docker-compose.yml"
+  download_script       "$UPSTREAM/download/client_service/opentelemetry_java/stop_opentelemetry.sh"            "${OPEN_TELEMETRY_ROOT_DIR}/stop_opentelemetry.sh"
+  download              "$UPSTREAM/download/client_service/opentelemetry_java/docker-compose.yml"                "${OPEN_TELEMETRY_ROOT_DIR}/docker-compose.yml"
+  download_script       "$UPSTREAM/download/client_service/opentelemetry_java/start.sh"                "${OPEN_TELEMETRY_ROOT_DIR}/start.sh"
 fi
 
 echo "start up opentelemetry_java service"
