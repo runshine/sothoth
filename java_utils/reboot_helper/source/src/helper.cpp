@@ -58,16 +58,6 @@ int restart_with_javaagent(std::vector<std::string> option_list) {
         }
     }
 
-    // 检查是否已存在目标参数
-    std::string agent_arg = "-javaagent:";
-    bool agent_found = false;
-    size_t agent_index = 0;
-
-    if(access(agent_arg.c_str(),O_RDONLY) != 0){
-        fprintf(stderr, "failed access opentelemetry-javaagent.jar: %s\n",agent_arg.c_str());
-        return EXIT_FAILURE;
-    }
-
     // 构建新参数列表
     std::vector<std::string> new_args;
     new_args.push_back(args[0]); // 程序名
