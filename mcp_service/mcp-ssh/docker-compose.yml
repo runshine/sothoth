@@ -1,9 +1,9 @@
-name: 'mcp_server_ssh_service'
+name: 'mcp_ssh_service'
 services:
   mcp-server-ssh:
     image: runshine0819/mcp-ssh:latest
     restart: always
-    container_name: mcp-server-ssh
+    container_name: mcp-ssh
     ports:
       - 10001:10001
     networks:
