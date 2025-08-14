@@ -18,11 +18,17 @@ if [ ! -d "/host/${SOTHOTH_DIR}/share/" ];then
   mkdir -p "/host/${SOTHOTH_DIR}/share/"
 fi
 
+chmod 755  "/host/${SOTHOTH_DIR}/share/"
+
 if [ ! -f "${SOTHOTH_DIR}/share/libreboot_helper.so" ];then
   cp /libreboot_helper.so         "/host/${SOTHOTH_DIR}/share/libreboot_helper.so"
   cp /attach_helper.jar           "/host/${SOTHOTH_DIR}/share/attach_helper.jar"
   cp /opentelemetry-javaagent.jar "/host/${SOTHOTH_DIR}/share/opentelemetry-javaagent.jar"
   cp /addmount                   "/host/${SOTHOTH_DIR}/share/addmount"
+  chmod 755 "/host/${SOTHOTH_DIR}/share/libreboot_helper.so"
+  chmod 755 "/host/${SOTHOTH_DIR}/share/attach_helper.jar"
+  chmod 755 "/host/${SOTHOTH_DIR}/share/opentelemetry-javaagent.jar"
+  chmod 755 "/host/${SOTHOTH_DIR}/share/addmount"
 else
   echo "file already exist, ignore copy"
 fi
@@ -71,11 +77,14 @@ fi
 
 
 options="-javaagent:${SOTHOTH_DIR}/share/opentelemetry-javaagent.jar"
-options="$options -Dotel.resource.attributes=service.name=,service.version=,deployment.environment="
+options="$options -Dotel.resource.attributes=service.name=$(hostname)-$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3}'),service.version=,deployment.environment="
 options="$options -Dotel.exporter.otlp.protocol=http/protobuf"
-options="$options -Dotel.exporter.otlp.traces.endpoint=http://200.64.0.1:4318/api/otlp/traces"
-options="$options -Dotel.exporter.otlp.metrics.endpoint=http://200.64.0.1:4318/api/otlp/metrics"
+options="$options -Dotel.exporter.otlp.traces.endpoint=http://200.64.0.1:4318/v1/traces"
+#options="$options -Dotel.exporter.otlp.metrics.endpoint=http://200.64.0.1:4318"
+#options="$options -Dotel.exporter.otlp.logs.endpoint=http://200.64.0.1:4318"
 options="$options -Dotel.logs.exporter=none"
+options="$options -Dotel.metrics.exporter=none"
+#options="$options -Dotel.javaagent.debug=true"
 
 
 #attach method 1
@@ -91,6 +100,14 @@ if [ $? -eq 0 ];then
 else
   echo "check run load agent failed"
 fi
+
+stop_helper(){
+  echo "receive stop signal, we must exit, now we try to clean agent with reboot again"
+  echo "Method 2: \"/host/${SOTHOTH_DIR}/utils/jattach\" \"$pid\" load \"${SOTHOTH_DIR}/share/libreboot_helper.so\" true \"--restore_mode ${options}\""
+  "/host/${SOTHOTH_DIR}/utils/jattach" "$pid" load "${SOTHOTH_DIR}/share/libreboot_helper.so" true "--restore_mode ${options}"
+}
+
+trap "stop_helper;exit" SIGTERM
 
 while [ "x" = "x" ]
 do
