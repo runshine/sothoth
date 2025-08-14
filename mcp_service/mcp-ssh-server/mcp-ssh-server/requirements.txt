@@ -1,4 +1,9 @@
+fastmcp
 uvicorn
 fastapi
 paramiko
 asyncio
+six
+gssapi
+asyncssh
+requests

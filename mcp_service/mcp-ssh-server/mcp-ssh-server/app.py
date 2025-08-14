@@ -1,137 +1,96 @@
-import asyncio
-from fastapi import FastAPI, HTTPException
-import paramiko
-from contextlib import asynccontextmanager
-import os
 import logging
-from fastapi.responses import Response
+import re
 
-# 设置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import requests
+import asyncio
+import asyncssh
+from fastmcp import FastMCP
 
-# 全局配置
-PRIVATE_KEY_PATH = "/data/id_rsa"
-SSH_TIMEOUT = 120  # 2分钟超时
-
-app = FastAPI()
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # 验证私钥文件是否存在
-    if not os.path.exists(PRIVATE_KEY_PATH):
-        logger.error(f"SSH私钥文件不存在: {PRIVATE_KEY_PATH}")
-        raise RuntimeError(f"SSH私钥文件未找到: {PRIVATE_KEY_PATH}")
-    yield
-
-app = FastAPI(lifespan=lifespan)
+app = FastMCP("mcp-ssh-server")
+ssh_port = 11192
+private_key = "/data/id_rsa"
+#private_key = "/root/CLionProjects/sothoth/openvpn_service/data/conf/openssh/id_rsa"
+timeout_command = 120  # 2分钟
+timeout_file = 1200    # 20分钟
 
 
-def create_ssh_client(ip: str, username: str) -> paramiko.SSHClient:
-    """创建并配置SSH客户端"""
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+async def connect_ssh(ip, username):
+    """建立SSH连接"""
+    return await asyncssh.connect(
+        host=ip,
+        username=username,
+        client_keys=[private_key],
+        port=ssh_port,
+        known_hosts=None,  # 跳过主机密钥验证
+        connect_timeout=30
+    )
 
+
+@app.tool(name="list_all_node",title="列出当前所有可连接的节点",description="列出当前所有可连接的节点,，返回IP列表")
+def list_all_node() -> list:
     try:
-        # 加载私钥
-        private_key = paramiko.RSAKey.from_private_key_file(PRIVATE_KEY_PATH)
-        client.connect(
-            hostname=ip,
-            username=username,
-            pkey=private_key,
-            timeout=10,  # 连接超时
-            banner_timeout=10
-        )
-        return client
-    except paramiko.AuthenticationException:
-        logger.error(f"认证失败: {username}@{ip}")
-        raise HTTPException(status_code=401, detail="SSH认证失败")
+        # logging.info("list_all_node call")
+        service_lists = []
+        node_list = []
+        current_page = 1
+        page_size = 1000
+        while True:
+            tmp_service = requests.get(f"http://200.64.0.2:8848/nacos/v1/ns/service/list?pageNo={current_page}&pageSize={page_size}").json()
+            if tmp_service["count"] != page_size:
+                service_lists = service_lists + tmp_service["doms"]
+                break
+            else:
+                service_lists = service_lists + tmp_service["doms"]
+                current_page = current_page + 1
+        for service in service_lists:
+            # logging.info(f"process: {service}")
+            node_ip = re.findall(r".*-(\d+.\d+.\d+.\d+)$",service)
+            if len(node_ip) == 1:
+                node_list.append(node_ip[0])
+                # logging.info(f"add ip {node_ip[0]} to list")
+        return node_list
     except Exception as e:
-        logger.error(f"连接错误: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"SSH连接错误: {str(e)}")
+        logging.error(f"error happened: {e}")
+        return []
 
 
-async def execute_remote_command(ip: str, username: str, command: str) -> str:
-    """在远程主机执行命令（带超时）"""
+@app.tool(name="execute_command",title="在远程服务器上执行命令并获取结果",description="在远程服务器上执行命令并获取结果，输入远程IP、用户名和要执行的命令")
+async def execute_command(ip: str,username: str,command: str) -> str:
+    """功能一：远程执行命令"""
+    res = ""
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(_execute_command, ip, username, command),
-            timeout=SSH_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        logger.warning(f"命令执行超时: {command} @ {ip}")
-        raise HTTPException(status_code=408, detail="命令执行超时")
-
-
-def _execute_command(ip: str, username: str, command: str) -> str:
-    """同步执行命令的实现"""
-    client = None
-    try:
-        client = create_ssh_client(ip, username)
-        # 设置命令执行超时
-        _, stdout, stderr = client.exec_command(command, timeout=SSH_TIMEOUT)
-        output = stdout.read().decode() + stderr.read().decode()
-        return output.strip()
-    finally:
-        if client:
-            client.close()
-
-
-async def fetch_remote_file(ip: str, username: str, file_path: str) -> Response:
-    """从远程主机获取文件（带超时）"""
-    try:
-        content = await asyncio.wait_for(
-            asyncio.to_thread(_fetch_file, ip, username, file_path),
-            timeout=SSH_TIMEOUT
-        )
-        return Response(content, media_type="application/octet-stream",
-                        headers={"Content-Disposition": f"attachment; filename={os.path.basename(file_path)}"})
-    except asyncio.TimeoutError:
-        logger.warning(f"文件传输超时: {file_path} @ {ip}")
-        raise HTTPException(status_code=408, detail="文件传输超时")
-    except FileNotFoundError:
-        logger.error(f"文件不存在: {file_path} @ {ip}")
-        raise HTTPException(status_code=404, detail="远程文件不存在")
+        conn = await asyncio.wait_for(connect_ssh(ip, username), timeout=timeout_command)
+        try:
+            result = await asyncio.wait_for(conn.run(command), timeout=timeout_command)
+            res = result.stdout + result.stderr
+        finally:
+            conn.close()
     except Exception as e:
-        logger.error(f"文件传输错误: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"文件传输错误: {str(e)}")
+        res = str(e)
+    return res
 
 
-def _fetch_file(ip: str, username: str, file_path: str) -> bytes:
-    """同步获取文件的实现"""
-    client = None
+@app.tool(name="get_remote_file_content",title="在远程服务器上打开文件并返回文件内容",description="在远程服务器上打开文件并返回文件内容，输入远程IP和要打开的文件名")
+async def get_remote_file_content(ip: str,remote_path: str) -> bytes:
+    """功能二：远程获取文件"""
+    content = b""
     try:
-        client = create_ssh_client(ip, username)
-        sftp = client.open_sftp()
-        # 设置SFTP操作超时
-        sftp.get_channel().settimeout(SSH_TIMEOUT)
-        with sftp.open(file_path, "rb") as remote_file:
-            return remote_file.read()
-    except IOError as e:
-        if "No such file" in str(e):
-            raise FileNotFoundError(f"文件不存在: {file_path}")
-        raise
+        conn = await asyncio.wait_for(connect_ssh(ip, "root"), timeout=timeout_file)
+        async with conn.start_sftp_client() as sftp:
+            file_stat = await asyncio.wait_for(sftp.stat(remote_path), timeout=timeout_file)
+            chunks = []
+            async with sftp.open(remote_path, "rb") as file:
+                while True:
+                    chunk = await asyncio.wait_for(file.read(4096), timeout=timeout_file)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            content = b"".join(chunks)
     finally:
-        if client:
-            client.close()
-
-
-@app.post("/execute-command/")
-async def execute_command(ip: str, username: str, command: str):
-    """远程执行命令端点"""
-    logger.info(f"执行命令: {command} @ {username}@{ip}")
-    result = await execute_remote_command(ip, username, command)
-    return {"result": result}
-
-
-@app.get("/fetch-file/")
-async def fetch_file(ip: str, username: str, file_path: str):
-    """远程获取文件端点"""
-    logger.info(f"获取文件: {file_path} @ {username}@{ip}")
-    return await fetch_remote_file(ip, username, file_path)
+        conn.close()
+    return content
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=10002)
+    #logging.basicConfig(format="%(asctime)s-%(name)s-%(levelname)s-%(message)s",level=logging.INFO)
+    app.run(transport="sse",host="0.0.0.0",port=10002)
