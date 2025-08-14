@@ -289,18 +289,6 @@ services:
     depends_on:
       - openvpn_server_04
 
-  mcp-server-ssh:
-    image: runshine0819/mcp-ssh:latest
-    restart: always
-    container_name: mcp-server-ssh
-    network_mode: "service:nginx_frontend"
-    environment:
-      - TZ=Asia/Shanghai
-    volumes:
-      - ../data:/data
-    depends_on:
-      - openvpn_server_04
-
   vpn-status:
     image: runshine0819/openvpn-status-web:latest
     restart: always
