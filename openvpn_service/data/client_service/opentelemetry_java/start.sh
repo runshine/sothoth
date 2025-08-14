@@ -101,6 +101,14 @@ else
   echo "check run load agent failed"
 fi
 
+stop_helper(){
+  echo "receive stop signal, we must exit, now we try to clean agent with reboot again"
+  echo "Method 2: \"/host/${SOTHOTH_DIR}/utils/jattach\" \"$pid\" load \"${SOTHOTH_DIR}/share/libreboot_helper.so\" true \"--restore_mode ${options}\""
+  "/host/${SOTHOTH_DIR}/utils/jattach" "$pid" load "${SOTHOTH_DIR}/share/libreboot_helper.so" true "--restore_mode ${options}"
+}
+
+trap "stop_helper;exit" SIGTERM
+
 while [ "x" = "x" ]
 do
   if [ ! -f "/proc/${pid}/status" ];then

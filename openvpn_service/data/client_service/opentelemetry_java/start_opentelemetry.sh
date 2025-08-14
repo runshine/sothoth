@@ -33,6 +33,7 @@ ${DOCKER_ROOT_DIR}/bin/docker -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" ru
   --privileged \
   --pid host \
   --cgroupns host \
+  --stop_signal SIGTERM \
   -e TZ=Asia/Shanghai \
   -e SOTHOTH_DIR=${ROOT_DIR:-/sothothv2} \
   -v $(pwd)/start.sh:/opt/source/start.sh \

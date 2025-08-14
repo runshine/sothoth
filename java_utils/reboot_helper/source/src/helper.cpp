@@ -53,6 +53,7 @@ bool file_exist(std::string dir, std::string filename){
 }
 
 int restart_with_javaagent(std::vector<std::string> option_list) {
+    bool restore_mode = false;
     // 直接读取原始命令行参数（以\0分隔）
     std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
     if (!cmdline) {
@@ -116,13 +117,40 @@ int restart_with_javaagent(std::vector<std::string> option_list) {
         }
     }
 
-
     for (size_t i = 0; i < option_list.size(); ++i) {
-        new_args.push_back(option_list[i]);
+        if(option_list[i] == "--restore_mode") {
+            restore_mode = true;
+            break;
+        }
     }
 
-    for (size_t i = 1; i < args.size(); ++i) {
-        new_args.push_back(args[i]);
+    if(!restore_mode) {
+        cout << "current is inject agent mode" << endl;
+        for (size_t i = 0; i < option_list.size(); ++i) {
+            new_args.push_back(option_list[i]);
+        }
+        for (size_t i = 1; i < args.size(); ++i) {
+            new_args.push_back(args[i]);
+        }
+    }else{
+        cout << "current is restore agent mode" << endl;
+        for (size_t i = 1; i < args.size(); ++i) {
+            bool push_flag = true;
+            for (size_t j = 0; j < option_list.size(); ++j) {
+                if(option_list[j] == args[i]){
+                    cout << "drop agent arg: " << option_list[j] << endl;
+                    push_flag = false;
+                    break;
+                }
+            }
+            if(push_flag)
+                new_args.push_back(args[i]);
+        }
+    }
+
+    if(args.size() == new_args.size() && restore_mode){
+        cout << "in restore mode we have no drop any options, ignore reboot" << endl;
+        return NULL;
     }
 
     // 准备execve参数数组
