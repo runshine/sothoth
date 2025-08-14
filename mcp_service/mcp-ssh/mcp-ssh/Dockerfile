@@ -32,4 +32,4 @@ ENV IS_DOCKER=true
 RUN npm install -g supergateway
 
 # 运行启动脚本
-CMD ["npx", "-y", "supergateway", "--stdio", "python3 bridging_ssh_mcp.py","--port", "10001","--baseUrl","http://localhost:10001","--ssePath","/sse","--messagePath","/message"]
+CMD ["npx", "-y", "supergateway", "--stdio", "python3 bridging_ssh_mcp.py","--port", "10001","--baseUrl","http://0.0.0.0:10001","--ssePath","/sse","--messagePath","/message"]

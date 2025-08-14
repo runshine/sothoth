@@ -1,0 +1,21 @@
+name: 'mcp_inspector_service'
+services:
+  mcp-inspector:
+    image: runshine0819/mcp_inspector:latest
+    restart: always
+    container_name: mcp-inspector
+    ports:
+      - 6277:6277
+      - 6274:6274
+    networks:
+      openvpn_service_openvpn_network:
+        ipv4_address: 200.64.0.7
+    environment:
+      - TZ=Asia/Shanghai
+      - HOST=0.0.0.0
+    volumes:
+      - ../data:/data
+
+networks:
+  openvpn_service_openvpn_network:
+    external: true

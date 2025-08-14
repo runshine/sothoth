@@ -4,3 +4,4 @@ https://github.com/binary-manu/static-cross-openssh?tab=readme-ov-file3
 https://github.com/ernw/static-toolbox
 https://files.serverless.industries/bin/
 https://github.com/ernw/static-toolbox/releases
+https://github.com/perryflynn/static-binaries?tab=readme-ov-file
