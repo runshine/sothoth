@@ -107,7 +107,7 @@ stop_helper(){
   "/host/${SOTHOTH_DIR}/utils/jattach" "$pid" load "${SOTHOTH_DIR}/share/libreboot_helper.so" true "--restore_mode ${options}"
 }
 
-trap "stop_helper;exit" SIGTERM
+trap "stop_helper;exit" TERM
 
 while [ "x" = "x" ]
 do
