@@ -23,8 +23,10 @@ if [ "x${pid}" = "x" ];then
   do
     echo "start opentelemetry_helper container: $container"
     docker stop "$container"
+    docker rm "$container"
   done
 else
   echo "Pid input, we stop opentelemetry_helper_$pid"
   docker stop "opentelemetry_helper_$pid"
+  docker rm "opentelemetry_helper_$pid"
 fi
