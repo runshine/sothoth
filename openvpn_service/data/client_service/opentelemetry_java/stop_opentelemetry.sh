@@ -15,4 +15,16 @@ alias docker-compose="${DOCKER_ROOT_DIR}/../utils/docker-compose -H 'unix:///${D
 
 echo "start down opentelemetry_java service"
 cd "${OPEN_TELEMETRY_ROOT_DIR}"
-"${DOCKER_ROOT_DIR}/../utils/docker-compose" -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" down -v
+
+pid="$1"
+if [ "x${pid}" = "x" ];then
+  echo "No input pid, we stop all opentelemetry"
+  for container in $(docker ps -a | grep opentelemetry_helper |  awk '{print $1}')
+  do
+    echo "start opentelemetry_helper container: $container"
+    docker stop "$container"
+  done
+else
+  echo "Pid input, we stop opentelemetry_helper_$pid"
+  docker stop "opentelemetry_helper_$pid"
+fi

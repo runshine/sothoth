@@ -253,14 +253,10 @@ export NODE_NAME="$(hostname)"
 export NODE_ID="${NODE_ID}"
 ARCH="$(uname -m)"
 OS="linux"
-WORKSPACE="$1"
-UPSTREAM="$2"
 
-if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ];then
-  #we are in local run mode
-  chmod +x "${ROOT_DIR}/sothoth.conf"
-  .  "$ROOT_DIR/sothoth.conf"
-fi
+#we are in local run mode
+chmod +x "${ROOT_DIR}/sothoth.conf"
+.  "$ROOT_DIR/sothoth.conf"
 
 UPSTREAM_SERVER="$(echo ${UPSTREAM} | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo ${UPSTREAM} | awk -F':' '{print $2}')"

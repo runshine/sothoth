@@ -18,7 +18,7 @@ if [ ! -d "/host/${SOTHOTH_DIR}/share/" ];then
   mkdir -p "/host/${SOTHOTH_DIR}/share/"
 fi
 
-chmod 755 "/host/${SOTHOTH_DIR}/share/"
+chmod 755  "/host/${SOTHOTH_DIR}/share/"
 
 if [ ! -f "${SOTHOTH_DIR}/share/libreboot_helper.so" ];then
   cp /libreboot_helper.so         "/host/${SOTHOTH_DIR}/share/libreboot_helper.so"
