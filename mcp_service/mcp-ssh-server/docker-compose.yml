@@ -1,0 +1,19 @@
+name: 'mcp_ssh_server_service'
+services:
+  mcp-server-ssh:
+    image: runshine0819/mcp-ssh-server:latest
+    restart: always
+    container_name: mcp_ssh_server
+    ports:
+      - 10002:10002
+    networks:
+      openvpn_service_openvpn_network:
+        ipv4_address: 200.64.0.8
+    environment:
+      - TZ=Asia/Shanghai
+    volumes:
+      - ../../openvpn_service/data/conf/openssh/:/data
+
+networks:
+  openvpn_service_openvpn_network:
+    external: true
