@@ -57,7 +57,12 @@ def list_all_node() -> list:
 @app.tool(name="execute_command",title="在远程服务器上执行命令并获取结果",description="在远程服务器上执行命令并获取结果，输入远程IP、用户名和要执行的命令")
 async def execute_command(ip: str,username: str,command: str) -> str:
     """功能一：远程执行命令"""
-    res = ""
+    if ip is None or len(ip) == 0:
+        return "请输入IP地址"
+    if username is None or len(username) == 0:
+        return "请输入执行的用户名"
+    if command is None or len(command) == 0:
+        return "请输入执行的命令"
     try:
         conn = await asyncio.wait_for(connect_ssh(ip.strip(), username.strip()), timeout=timeout_command)
         try:
@@ -73,6 +78,10 @@ async def execute_command(ip: str,username: str,command: str) -> str:
 @app.tool(name="get_remote_file_content",title="在远程服务器上打开文件并返回文件内容",description="在远程服务器上打开文件并返回文件内容，输入远程IP和要打开的文件名")
 async def get_remote_file_content(ip: str,remote_path: str) -> bytes:
     """功能二：远程获取文件"""
+    if ip is None or len(ip) == 0:
+        return "请输入IP地址"
+    if remote_path is None or len(remote_path) == 0:
+        return "请输入要获取的文件名"
     content = b""
     try:
         conn = await asyncio.wait_for(connect_ssh(ip.strip(), "root"), timeout=timeout_file)
