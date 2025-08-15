@@ -77,11 +77,19 @@ fi
 
 
 options="-javaagent:${SOTHOTH_DIR}/share/opentelemetry-javaagent.jar"
-options="$options -Dotel.resource.attributes=service.name=$(hostname)-${pid}-$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3}'),service.version=,deployment.environment="
+options="$options -Dotel.resource.attributes=service.name=$(hostname)-java-${pid}-$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3}'),service.version=,deployment.environment="
 options="$options -Dotel.exporter.otlp.protocol=http/protobuf"
 options="$options -Dotel.exporter.otlp.traces.endpoint=http://200.64.0.1:4318/v1/traces"
 #options="$options -Dotel.exporter.otlp.metrics.endpoint=http://200.64.0.1:4318"
 #options="$options -Dotel.exporter.otlp.logs.endpoint=http://200.64.0.1:4318"
+options="$options -Dotel.instrumentation.spring-boot-actuator-autoconfigure.enabled=true"
+options="$options -D"
+options="$options -D"
+options="$options -D"
+options="$options -D"
+options="$options -D"
+options="$options -D"
+options="$options -D"
 options="$options -Dotel.logs.exporter=none"
 options="$options -Dotel.metrics.exporter=none"
 #options="$options -Dotel.javaagent.debug=true"
@@ -114,6 +122,7 @@ do
   if [ ! -f "/proc/${pid}/status" ];then
     break
   else
+
     sleep 10
   fi
 done

@@ -1,9 +1,9 @@
-name: 'opentelemetry_java_service'
+name: 'opentelemetry_go_service'
 services:
   opentelemetry_helper:
     image: runshine0819/opentelemetry_helper:latest
     restart: no
-    container_name: opentelemetry_java_helper
+    container_name: opentelemetry_helper
     network_mode: host
     privileged: true
     pid: host

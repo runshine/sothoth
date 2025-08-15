@@ -11,3 +11,4 @@ fi
 
 "${CLIENT_SERVICE_ROOT_DIR}/tetragon/stop_tetragon.sh"
 "${CLIENT_SERVICE_ROOT_DIR}/opentelemetry_java/stop_opentelemetry.sh"
+"${CLIENT_SERVICE_ROOT_DIR}/opentelemetry_go/stop_opentelemetry.sh"

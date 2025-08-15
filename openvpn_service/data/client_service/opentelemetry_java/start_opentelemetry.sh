@@ -28,7 +28,7 @@ echo "start up opentelemetry_java service"
 cd "${OPEN_TELEMETRY_ROOT_DIR}"
 ${DOCKER_ROOT_DIR}/bin/docker -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" pull runshine0819/opentelemetry_helper:latest
 ${DOCKER_ROOT_DIR}/bin/docker -H "unix:///${DOCKER_ROOT_DIR}/run/docker.sock" run -d \
-  --name opentelemetry_helper_$pid \
+  --name opentelemetry_java_helper_$pid \
   --network host \
   --privileged \
   --pid host \

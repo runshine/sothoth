@@ -1,7 +1,7 @@
 #!/bin/sh
 
 ROOT_DIR="$(cd "$(dirname $0)/../../";pwd)"
-OPEN_TELEMETRY_ROOT_DIR="${ROOT_DIR}/client_service/opentelemetry_java"
+OPEN_TELEMETRY_ROOT_DIR="${ROOT_DIR}/client_service/opentelemetry_go"
 DOCKER_ROOT_DIR="${ROOT_DIR}/docker"
 cd "${ROOT_DIR}"
 if [ ! -d "${OPEN_TELEMETRY_ROOT_DIR}" ];then
@@ -13,20 +13,20 @@ fi
 alias docker="${DOCKER_ROOT_DIR}/bin/docker -H 'unix:///${DOCKER_ROOT_DIR}/run/docker.sock'"
 alias docker-compose="${DOCKER_ROOT_DIR}/../utils/docker-compose -H 'unix:///${DOCKER_ROOT_DIR}/run/docker.sock'"
 
-echo "start down opentelemetry_java service"
+echo "start down opentelemetry_go service"
 cd "${OPEN_TELEMETRY_ROOT_DIR}"
 
 pid="$1"
 if [ "x${pid}" = "x" ];then
-  echo "No input pid, we stop all opentelemetry_java"
-  for container in $(docker ps -a | grep opentelemetry_java_helper |  awk '{print $1}')
+  echo "No input pid, we stop all opentelemetry_go"
+  for container in $(docker ps -a | grep opentelemetry_go_helper |  awk '{print $1}')
   do
-    echo "start opentelemetry_java_helper container: $container"
+    echo "start opentelemetry_go_helper container: $container"
     docker stop "$container"
     docker rm "$container"
   done
 else
-  echo "Pid input, we stop opentelemetry_java_helper_$pid"
-  docker stop "opentelemetry_java_helper_$pid"
-  docker rm "opentelemetry_java_helper_$pid"
+  echo "Pid input, we stop opentelemetry_go_helper_$pid"
+  docker stop "opentelemetry_go_helper_$pid"
+  docker rm "opentelemetry_go_helper_$pid"
 fi

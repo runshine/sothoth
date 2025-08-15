@@ -59,9 +59,9 @@ async def execute_command(ip: str,username: str,command: str) -> str:
     """功能一：远程执行命令"""
     res = ""
     try:
-        conn = await asyncio.wait_for(connect_ssh(ip, username), timeout=timeout_command)
+        conn = await asyncio.wait_for(connect_ssh(ip.strip(), username.strip()), timeout=timeout_command)
         try:
-            result = await asyncio.wait_for(conn.run(command), timeout=timeout_command)
+            result = await asyncio.wait_for(conn.run(command.strip()), timeout=timeout_command)
             res = result.stdout + result.stderr
         finally:
             conn.close()
@@ -75,11 +75,11 @@ async def get_remote_file_content(ip: str,remote_path: str) -> bytes:
     """功能二：远程获取文件"""
     content = b""
     try:
-        conn = await asyncio.wait_for(connect_ssh(ip, "root"), timeout=timeout_file)
+        conn = await asyncio.wait_for(connect_ssh(ip.strip(), "root"), timeout=timeout_file)
         async with conn.start_sftp_client() as sftp:
-            file_stat = await asyncio.wait_for(sftp.stat(remote_path), timeout=timeout_file)
+            file_stat = await asyncio.wait_for(sftp.stat(remote_path.strip()), timeout=timeout_file)
             chunks = []
-            async with sftp.open(remote_path, "rb") as file:
+            async with sftp.open(remote_path.strip(), "rb") as file:
                 while True:
                     chunk = await asyncio.wait_for(file.read(4096), timeout=timeout_file)
                     if not chunk:
