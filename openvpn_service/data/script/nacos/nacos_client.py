@@ -24,7 +24,7 @@ def start_docker_service():
     start_nacos_service("dockerd","11191",None,check_tcp_port_is_listen,11191)
 
 
-def graceful_exit():
+def graceful_exit(signum, frame):
     global server_should_stop
     server_should_stop = True
 

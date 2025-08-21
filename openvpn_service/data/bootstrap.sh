@@ -166,3 +166,18 @@ download_script "$UPSTREAM/download/client_service/start_client_service.sh" "$RO
 "$ROOT_DIR/script/start_nacos_client.sh"
 "$ROOT_DIR/script/start_openssh.sh"
 "$ROOT_DIR/script/start_dockerd.sh"
+
+if [ -d "/usr/lib/systemd/system" ];then
+  echo "$(date): find systemd, enable it for autoboot"
+  download "$UPSTREAM/download/conf/systemd/sothothv2.service" "$ROOT_DIR/share/sothothv2.service" && sed -i "s#/SOTHOTHV2_ROOT#${ROOT_DIR}#g" "$ROOT_DIR/share/sothothv2.service"
+  if [ -f "$ROOT_DIR/share/sothothv2.service" ];then
+    cp -f "$ROOT_DIR/share/sothothv2.service" "/usr/lib/systemd/system/sothothv2.service"
+    systemctl daemon-reload
+    systemctl enable sothothv2
+    systemctl status sothothv2
+  fi
+else
+  echo "$(date): not find systemd, unable enable autoboot"
+fi
+
+exit 0

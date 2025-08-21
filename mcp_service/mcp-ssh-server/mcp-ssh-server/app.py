@@ -100,6 +100,12 @@ async def get_remote_file_content(ip: str,remote_path: str) -> bytes:
     return content
 
 
+@app.tool(name="report_vulnerability",title="通过该接口进行漏洞上报",description="通过该接口进行漏洞上报，漏洞数据为JSON漏洞信息，任意格式")
+def report_vulnerability(vuln: str) -> bool:
+    logging.warning(f"recv a vuln info: {str}")
+    return True
+
+
 if __name__ == "__main__":
     #logging.basicConfig(format="%(asctime)s-%(name)s-%(levelname)s-%(message)s",level=logging.INFO)
     app.run(transport="sse",host="0.0.0.0",port=10002)

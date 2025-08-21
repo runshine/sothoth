@@ -1,0 +1,24 @@
+[Unit]
+Description=SothothV2 Service
+After=network.target
+Documentation=https://example.com/sothothv2-docs
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/SOTHOTHV2_ROOT
+ExecStart=/SOTHOTHV2_ROOT/bootstrap.sh
+ExecStop=/SOTHOTHV2_ROOT/stop_all.sh
+PIDFile=/SOTHOTHV2_ROOT/nacos/run/client.pid
+Restart=no
+KillMode=none
+TimeoutSec=300
+
+# 安全相关设置
+#NoNewPrivileges=yes
+#ProtectSystem=strict
+#ProtectHome=read-only
+#PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
