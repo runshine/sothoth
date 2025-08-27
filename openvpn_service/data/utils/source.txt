@@ -1,7 +1,13 @@
-https://github.com/moparisthebest/static-curl/releases/tag/v8.11.0
 https://github.com/justdan96/7zip_static
+https://github.com/robxu9/bash-static/releases/tag/5.2.015-1.2.3-2
+https://github.com/moparisthebest/static-curl/releases/tag/v8.11.0
+https://github.com/docker/compose/releases/tag/v2.39.2
+https://github.com/jirutka/nginx-binaries
 https://github.com/binary-manu/static-cross-openssh?tab=readme-ov-file3
 https://github.com/ernw/static-toolbox
 https://files.serverless.industries/bin/
 https://github.com/ernw/static-toolbox/releases
 https://github.com/perryflynn/static-binaries?tab=readme-ov-file
+https://github.com/XMCVE/static-tools/tree/main/strace
+https://github.com/tsl0922/ttyd/releases/tag/1.7.7
+https://github.com/runshine/nginx-binaries/actions/runs/17272372223
