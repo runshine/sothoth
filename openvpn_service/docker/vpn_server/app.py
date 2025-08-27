@@ -59,8 +59,17 @@ def deregister_instance(client, servic_name,service_ip,service_port):
             time.sleep(5)
 
 
+arch_mapping = {
+    "armv7l": "armhf",
+    "armv8l": "armhf",
+    "armv7": "armhf"
+}
+
+
 @app.route('/utils/<name>/<release>/<arch>', methods=['GET'])
 def download_utils(name,release,arch):
+    if arch in arch_mapping.keys():
+        arch = arch_mapping[arch]
     if os.path.exists("/data/utils/{}-{}-{}".format(name,release,arch)):
         return redirect("/download/utils/{}-{}-{}".format(name,release,arch))
     return abort(404)
@@ -68,6 +77,8 @@ def download_utils(name,release,arch):
 
 @app.route('/package/<name>/<release>/<arch>', methods=['GET'])
 def download_package(name,release,arch):
+    if arch in arch_mapping.keys():
+        arch = arch_mapping[arch]
     suffix_list = ["tar.gz","tar.zst","tar","zip"]
     for suffix in suffix_list:
         if os.path.exists("/data/package/{}-{}-{}.{}".format(name,release,arch,suffix)):
@@ -77,6 +88,8 @@ def download_package(name,release,arch):
 
 @app.route('/docker/<name>/<release>/<arch>', methods=['GET'])
 def download_docker_package(name,release,arch):
+    if arch in arch_mapping.keys():
+        arch = arch_mapping[arch]
     suffix_list = ["tar.gz","tar.zst","tar","zip"]
     for suffix in suffix_list:
         if os.path.exists("/data/package/docker/{}-{}-{}.{}".format(name,release,arch,suffix)):

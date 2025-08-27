@@ -29,27 +29,44 @@ download() {
             return 1
         }
     fi
-
-    # 检查下载工具
-    if [ "x$(command -v curl)" != "x" ]; then
-        if ! curl -fL -s -o "$output_file" "$url"; then
-            logger "错误：curl下载失败: $url" >&2
+    if [ "x${CURL}" != "x" ];then
+      if ! "${CURL}" -fL -s -o "$output_file" "$url"; then
+            echo "$(date):错误：${CURL}下载失败: $url" >&2
             rm -f "$output_file"  # 删除可能的部分下载文件
             return 1
-        else
-          logger "下载成功: $url --> $output_file"
-        fi
-    elif [ "x$(command -v wget)" != "x" ]; then
-        if ! wget -q -O "$output_file" "$url"; then
-            logger "错误：wget下载失败: $url" >&2
-            rm -f "$output_file"  # 删除可能的部分下载文件
-            return 1
-        else
-          logger "下载成功: $url --> $output_file"
-        fi
-    else
-        logger "错误：未找到curl或wget，请安装任一工具" >&2
+      else
+        echo "$(date):下载成功: $url --> $output_file"
+      fi
+    elif [ "x${WGET}" != "x" ]; then
+      if ! "${WGET}" -q -O "$output_file" "$url"; then
+        echo "$(date):错误：${WGET}下载失败: $url" >&2
+        rm -f "$output_file"  # 删除可能的部分下载文件
         return 1
+      else
+        echo "$(date):下载成功: $url --> $output_file"
+      fi
+    else
+      # 检查下载工具
+      if [ "x$(command -v curl)" != "x" ]; then
+          if ! curl -fL -s -o "$output_file" "$url"; then
+              logger "错误：curl下载失败: $url" >&2
+              rm -f "$output_file"  # 删除可能的部分下载文件
+              return 1
+          else
+            logger "下载成功: $url --> $output_file"
+          fi
+      elif [ "x$(command -v wget)" != "x" ]; then
+          if ! wget -q -O "$output_file" "$url"; then
+              logger "错误：wget下载失败: $url" >&2
+              rm -f "$output_file"  # 删除可能的部分下载文件
+              return 1
+          else
+            logger "下载成功: $url --> $output_file"
+          fi
+      else
+          logger "错误：未找到curl或wget，请安装任一工具" >&2
+          return 1
+      fi
     fi
     return 0
 }
@@ -257,6 +274,10 @@ OS="linux"
 #we are in local run mode
 chmod +x "${ROOT_DIR}/sothoth.conf"
 .  "$ROOT_DIR/sothoth.conf"
+
+if [ -f "${ROOT_DIR}/utils/curl" ];then
+  export CURL="${ROOT_DIR}/utils/curl"
+fi
 
 UPSTREAM_SERVER="$(echo ${UPSTREAM} | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo ${UPSTREAM} | awk -F':' '{print $2}')"
