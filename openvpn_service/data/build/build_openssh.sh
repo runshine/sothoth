@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$(dirname $0)";pwd)/../"
 
 aarch64_linux_data="${ROOT_DIR}/storage_data/ssh-binaries-for-aarch64.zip"
 x86_64_linux_data="${ROOT_DIR}/storage_data/ssh-binaries-for-x86-64-small.zip"
+armhf_linux_data="${ROOT_DIR}/storage_data/ssh-binaries-for-armv7-eabihf.zip"
 
 generate_sshd_config(){
   sshd_config_file="$1"
