@@ -11,3 +11,6 @@ https://github.com/perryflynn/static-binaries?tab=readme-ov-file
 https://github.com/XMCVE/static-tools/tree/main/strace
 https://github.com/tsl0922/ttyd/releases/tag/1.7.7
 https://github.com/runshine/nginx-binaries/actions/runs/17272372223
+
+
+openvpn: https://gist.github.com/Anubisss/afea82b97058e418e8030ee35e40f54f
