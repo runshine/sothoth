@@ -48,10 +48,10 @@ def list_all_node() -> list:
             if len(node_ip) == 1:
                 node_list.append(node_ip[0])
                 # logging.info(f"add ip {node_ip[0]} to list")
-        return node_list
+        return {"node_list": node_list}
     except Exception as e:
         logging.error(f"error happened: {e}")
-        return []
+        return {"node_list": []}
 
 
 @app.tool(name="execute_command",title="在远程服务器上执行命令并获取结果",description="在远程服务器上执行命令并获取结果，输入远程IP、用户名和要执行的命令")
