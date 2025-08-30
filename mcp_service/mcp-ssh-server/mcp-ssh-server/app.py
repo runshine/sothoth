@@ -27,7 +27,7 @@ async def connect_ssh(ip, username):
 
 
 @app.tool(name="list_all_node",title="列出当前所有可连接的节点",description="列出当前所有可连接的节点,，返回IP列表")
-def list_all_node() -> list:
+def list_all_node() -> dict:
     try:
         # logging.info("list_all_node call")
         service_lists = []
