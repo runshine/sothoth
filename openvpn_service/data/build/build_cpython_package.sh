@@ -29,7 +29,7 @@ download() {
     if [ -f "$target" ];then
       return
     fi
-    wget "${url}" -O "$target" || curl "${url}" -o "$target"
+    wget "${url}" -O "$target" || curl -L "${url}" -o "$target"
     if [ ! -f "$target" ];then
       echo "$(date): file: $target download failed --> $url"
     else
