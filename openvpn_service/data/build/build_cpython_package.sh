@@ -11,7 +11,7 @@ elif [ "$ARCH" = "x86_64" ]; then
   URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250723/cpython-3.12.11+20250723-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 elif [ "$ARCH" = "armv8l" ] || [ "$ARCH" = "armv7l" ] || [ "$ARCH" = "armv7" ] ; then
 #  URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250818/cpython-3.12.11+20250818-armv7-unknown-linux-gnueabihf-install_only.tar.gz"
-  if [ -s "/lib/ld-linux.so.3" ];then
+  if [ -L "/lib/ld-linux.so.3" ] || [ -f "/lib/ld-linux.so.3" ];then
     URL="${ROOT_DIR}/../storage_data/cpython-linux-armel.tar.gz"
   else
     URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250828/cpython-3.12.11+20250828-armv7-unknown-linux-gnueabi-install_only.tar.gz"
