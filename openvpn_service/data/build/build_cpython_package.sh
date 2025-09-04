@@ -2,6 +2,7 @@
 
 set -e
 addtional_packges="requests flask"
+ROOT_DIR="$(cd "$(dirname $0)/../";pwd)"
 
 ARCH="$(uname -m)"
 if [ "$ARCH" = "aarch64" ];then
@@ -9,8 +10,12 @@ if [ "$ARCH" = "aarch64" ];then
 elif [ "$ARCH" = "x86_64" ]; then
   URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250723/cpython-3.12.11+20250723-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 elif [ "$ARCH" = "armv8l" ] || [ "$ARCH" = "armv7l" ] || [ "$ARCH" = "armv7" ] ; then
-  #URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250818/cpython-3.12.11+20250818-armv7-unknown-linux-gnueabihf-install_only.tar.gz"
-  URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250828/cpython-3.12.11+20250828-armv7-unknown-linux-gnueabi-install_only.tar.gz"
+#  URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250818/cpython-3.12.11+20250818-armv7-unknown-linux-gnueabihf-install_only.tar.gz"
+  if [ -s "/lib/ld-linux.so.3" ];then
+    URL="${ROOT_DIR}/../storage_data/cpython-linux-armel.tar.gz"
+  else
+    URL="https://github.com/astral-sh/python-build-standalone/releases/download/20250828/cpython-3.12.11+20250828-armv7-unknown-linux-gnueabi-install_only.tar.gz"
+  fi
 fi
 
 if [ "x${ARCH}" = "x" ] || [ "x${URL}" = "x" ];then
@@ -32,8 +37,13 @@ download() {
     fi
 }
 
-download "$URL" "cpython.tar.gz"
-  if [ -f "cpython.tar.gz" ];then
+if [ -f "$URL" ];then
+  cp "$URL" "cpython.tar.gz"
+else
+  download "$URL" "cpython.tar.gz"
+fi
+
+if [ -f "cpython.tar.gz" ];then
   tar -zxvf "cpython.tar.gz"
   for package in $addtional_packges
   do
