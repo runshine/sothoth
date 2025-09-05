@@ -49,9 +49,9 @@ reneg-sec 0
 remote-random
 
 EOF
-if [ "${ARCH}" = "aarch64" ];then
-  echo "data-ciphers none" >> "${OPENVPN_ROOT_DIR}/conf/client.ovpn"
-fi
+#if [ "${ARCH}" = "aarch64" ];then
+#  echo "data-ciphers none" >> "${OPENVPN_ROOT_DIR}/conf/client.ovpn"
+#fi
 fi
 
 
@@ -67,13 +67,13 @@ fi
 
 if ! is_pid_file_running "${OPENVPN_ROOT_DIR}/run/client.pid";then
   if [ "$ARCH" = "x86_64" ];then
-    logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" \"$OPENVPN_ROOT_DIR/../utils/ip\""
+    logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" --iproute \"$OPENVPN_ROOT_DIR/../utils/ip\""
     "${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid" --iproute  "$OPENVPN_ROOT_DIR/../utils/ip" &
   elif [ "$ARCH" = "aarch64" ];then
-    logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" "
-    "${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid"  &
+    logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" --iproute \"$OPENVPN_ROOT_DIR/../utils/ip\""
+    "${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid"  --iproute  "$OPENVPN_ROOT_DIR/../utils/ip" &
   elif [ "$ARCH" = "armv8l" ] || [ "$ARCH" = "armv7l" ];then
-    logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" \"$OPENVPN_ROOT_DIR/../utils/ip\""
+    logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" --iproute \"$OPENVPN_ROOT_DIR/../utils/ip\""
     "${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid" --iproute  "$OPENVPN_ROOT_DIR/../utils/ip" &
   fi
 else
