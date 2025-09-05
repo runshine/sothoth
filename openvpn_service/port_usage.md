@@ -8,3 +8,16 @@ EIP -->  VPN --> SERVICE_NAME
 4. 11195/udp--> VPN_SERVER_CLUSTER_01
 5. 11196/udp--> VPN_SERVER_CLUSTER_01
 6. 11197/udp--> VPN_SERVER_CLUSTER_01
+
+
+# client port usage
+11189 --> frida_server
+11190 --> nacos_client
+11191 --> dockerd remote control api
+11192 --> sshd
+11194 --> nginx openvpn proxy
+11195 --> nginx openvpn proxy
+11196 --> nginx openvpn proxy
+11197 --> nginx openvpn proxy
+11198 --> ttyd
+11199 --> nginx VPN_SERVER tcp port proxy

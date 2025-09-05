@@ -11,6 +11,7 @@ if [ -f "${ROOT_DIR}/sothoth.conf" ];then
   "$ROOT_DIR/script/stop_openvpn.sh"
   "$ROOT_DIR/script/stop_nginx.sh"
   if [ "x${VPN_ONLY_NODE}" = "x" ];then
+    "$ROOT_DIR/script/stop_frida_server.sh"
     "$ROOT_DIR/script/stop_nacos_client.sh"
     "$ROOT_DIR/script/stop_openssh.sh"
     if [ -f "$ROOT_DIR/client_service/stop_client_service.sh" ];then

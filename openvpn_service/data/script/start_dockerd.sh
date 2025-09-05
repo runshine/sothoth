@@ -39,14 +39,16 @@ fi
   sed -i '/"iptables":/ s/true/false/' "${DOCKER_ROOT_DIR}/conf/daemon.json"
 #fi
 
-for sys in $(awk '!/^#/ { if ($4 == 1) print $1 }' /proc/cgroups); do
-  [ -d "/sys/fs/cgroup/$sys" ] || mkdir -p "/sys/fs/cgroup/$sys"
-	if ! mountpoint -q "/sys/fs/cgroup/$sys"; then
-	  logger "trying to mount cgroup: $sys"
-		if ! mount -n -t cgroup -o $sys cgroup "/sys/fs/cgroup/$sys"; then rmdir "/sys/fs/cgroup/$sys" || true
-		fi
-	fi
-done
+if [ "x${MOUNT_CGROUP}" != "x" ];then
+  for sys in $(awk '!/^#/ { if ($4 == 1) print $1 }' /proc/cgroups); do
+    [ -d "/sys/fs/cgroup/$sys" ] || mkdir -p "/sys/fs/cgroup/$sys"
+    if ! mountpoint -q "/sys/fs/cgroup/$sys"; then
+      logger "trying to mount cgroup: $sys"
+      if ! mount -n -t cgroup -o $sys cgroup "/sys/fs/cgroup/$sys"; then rmdir "/sys/fs/cgroup/$sys" || true
+      fi
+    fi
+  done
+fi
 
 if ! is_pid_file_running "${DOCKER_ROOT_DIR}/run/containerd.pid";then
   logger "start containerd: \"${DOCKER_ROOT_DIR}/bin/containerd\" --config \"${DOCKER_ROOT_DIR}/conf/config.toml\"  >> \"${DOCKER_ROOT_DIR}/log/containerd.log\" 2>&1"
