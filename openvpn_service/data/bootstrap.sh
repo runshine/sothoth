@@ -6,6 +6,12 @@ WORKSPACE="$1"
 UPSTREAM="$2"
 TARGET_DIR="$3"
 
+# avaiable environment
+# VPN_ONLY_NODE: when set, means only do in openvpn
+# FORCE_DOWNLOAD: when set, means we do download everytime
+# CURL: when set, must point to a avaiable curl binary
+# WGET: when set, must point to a avaiable wget binary
+
 unset http_proxy
 unset https_proxy
 unset HTTP_PROXY
@@ -38,6 +44,9 @@ else
     echo "TARGET_DIR=${TARGET_DIR}" >> "${TARGET_DIR}/sothoth.conf"
     uuid="$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3"-"$4$5"-"$6$7"-"$8$9}')"
     echo "NODE_ID=$uuid" >> "${TARGET_DIR}/sothoth.conf"
+    if [ "x${VPN_ONLY_NODE}" != "x" ];then
+      echo "VPN_ONLY_NODE=1" >> "${TARGET_DIR}/sothoth.conf"
+    fi
     ROOT_DIR="$TARGET_DIR"
     cp "$0" "$TARGET_DIR/bootstrap.sh"
     chmod +x "$TARGET_DIR/bootstrap.sh"
@@ -148,7 +157,13 @@ do
   fi
 done
 
-bootstrap_utils_list="bash nginx ttyd strace tcpdump openvpn ip curl 7zz socat docker-compose jattach"
+if [ "x${VPN_ONLY_NODE}" = "x" ];then
+  echo "$(date): we are in FULL MODE"
+  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip 7zz docker-compose jattach"
+else
+  echo "$(date): we are in VPN_ONLY_MODE"
+  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip"
+fi
 for bin in ${bootstrap_utils_list};
 do
   download "$UPSTREAM/utils/$bin/$OS/$ARCH" "${ROOT_DIR}/utils/$bin"
@@ -170,22 +185,27 @@ download_script "$UPSTREAM/download/script/stop_openvpn.sh" "$ROOT_DIR/script/st
 download_script "$UPSTREAM/download/script/start_nginx.sh" "$ROOT_DIR/script/start_nginx.sh"
 download_script "$UPSTREAM/download/script/stop_nginx.sh" "$ROOT_DIR/script/stop_nginx.sh"
 download_script "$UPSTREAM/download/script/reload_nginx.sh" "$ROOT_DIR/script/reload_nginx.sh"
-download_script "$UPSTREAM/download/script/start_nacos_client.sh" "$ROOT_DIR/script/start_nacos_client.sh"
-download_script "$UPSTREAM/download/script/stop_nacos_client.sh" "$ROOT_DIR/script/stop_nacos_client.sh"
-download_script "$UPSTREAM/download/script/prepare_cpython.sh" "$ROOT_DIR/script/prepare_cpython.sh"
-download_script "$UPSTREAM/download/script/start_openssh.sh" "$ROOT_DIR/script/start_openssh.sh"
-download_script "$UPSTREAM/download/script/stop_openssh.sh" "$ROOT_DIR/script/stop_openssh.sh"
-download_script "$UPSTREAM/download/script/start_dockerd.sh" "$ROOT_DIR/script/start_dockerd.sh"
-download_script "$UPSTREAM/download/script/stop_dockerd.sh" "$ROOT_DIR/script/stop_dockerd.sh"
-download_script "$UPSTREAM/download/client_service/start_client_service.sh" "$ROOT_DIR/client_service/start_client_service.sh"
+if [ "x${VPN_ONLY_NODE}" = "x" ];then
+  download_script "$UPSTREAM/download/script/start_nacos_client.sh" "$ROOT_DIR/script/start_nacos_client.sh"
+  download_script "$UPSTREAM/download/script/stop_nacos_client.sh" "$ROOT_DIR/script/stop_nacos_client.sh"
+  download_script "$UPSTREAM/download/script/prepare_cpython.sh" "$ROOT_DIR/script/prepare_cpython.sh"
+  download_script "$UPSTREAM/download/script/start_openssh.sh" "$ROOT_DIR/script/start_openssh.sh"
+  download_script "$UPSTREAM/download/script/stop_openssh.sh" "$ROOT_DIR/script/stop_openssh.sh"
+  download_script "$UPSTREAM/download/script/start_dockerd.sh" "$ROOT_DIR/script/start_dockerd.sh"
+  download_script "$UPSTREAM/download/script/stop_dockerd.sh" "$ROOT_DIR/script/stop_dockerd.sh"
+  download_script "$UPSTREAM/download/client_service/start_client_service.sh" "$ROOT_DIR/client_service/start_client_service.sh"
+fi
 
 "$ROOT_DIR/script/start_nginx.sh"
 "$ROOT_DIR/script/start_ttyd.sh"
 "$ROOT_DIR/script/start_openvpn.sh"
-"$ROOT_DIR/script/prepare_cpython.sh"
-"$ROOT_DIR/script/start_nacos_client.sh"
-"$ROOT_DIR/script/start_openssh.sh"
-"$ROOT_DIR/script/start_dockerd.sh"
+
+if [ "x${VPN_ONLY_NODE}" = "x" ];then
+  "$ROOT_DIR/script/prepare_cpython.sh"
+  "$ROOT_DIR/script/start_nacos_client.sh"
+  "$ROOT_DIR/script/start_openssh.sh"
+  "$ROOT_DIR/script/start_dockerd.sh"
+fi
 
 if [ -d "/usr/lib/systemd/system" ];then
   echo "$(date): find systemd, enable it for autoboot"
@@ -194,7 +214,7 @@ if [ -d "/usr/lib/systemd/system" ];then
     cp -f "$ROOT_DIR/share/sothothv2.service" "/usr/lib/systemd/system/sothothv2.service"
     systemctl daemon-reload
     systemctl enable sothothv2
-    systemctl status sothothv2
+    #systemctl status sothothv2
   fi
 else
   echo "$(date): not find systemd, unable enable autoboot"
