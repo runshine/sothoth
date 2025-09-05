@@ -24,6 +24,10 @@ def start_docker_service():
     start_nacos_service("dockerd","11191",None,check_tcp_port_is_listen,11191)
 
 
+def start_frida_server_service():
+    start_nacos_service("frida_server","11189",None,check_tcp_port_is_listen,11189)
+
+
 def graceful_exit(signum, frame):
     global server_should_stop
     server_should_stop = True
@@ -39,10 +43,13 @@ def start_nacos():
     nginx_proxy_thread.start()
     docker_thread = threading.Thread(target=start_docker_service)
     docker_thread.start()
+    frida_server_thread = threading.Thread(target=start_frida_server_service)
+    frida_server_thread.start()
     ttyd_thread.join()
     sshd_thread.join()
     nginx_proxy_thread.join()
     docker_thread.join()
+    frida_server_thread.join()
 
 
 @app.route('/nginx/tcp/add/<local_port>/<remote_host>/<remote_port>', methods=['GET'])
