@@ -9,4 +9,4 @@ fi
 . "${FRIDA_ROOT_DIR}/../script/common.sh"
 
 
-kill_pid_file "${NGINX_ROOT_DIR}/run/frida_server.pid"
+kill_pid_file "${FRIDA_ROOT_DIR}/run/frida_server.pid"

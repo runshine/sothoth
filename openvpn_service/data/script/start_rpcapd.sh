@@ -17,11 +17,11 @@ pre_build_dirs="${RPCAPD_ROOT_DIR}/log ${RPCAPD_ROOT_DIR}/run"
 prepare_dir "$pre_build_dirs"
 
 if ! is_pid_file_running "${RPCAPD_ROOT_DIR}/run/rpcapd.pid";then
-  logger "start rpcapd: ${ROOT_DIR}/utils/rpcapd  -b 0.0.0.0 -p 11188 -4 -n -D -C"
+  logger "start rpcapd: ${ROOT_DIR}/utils/rpcapd  -b 0.0.0.0 -p 11188 -4 -n -D"
   chmod +x "${ROOT_DIR}/utils/rpcapd"
-  "${ROOT_DIR}/utils/rpcapd"  -b 0.0.0.0 -p 11188 -4 -n -D -C >> "${RPCAPD_ROOT_DIR}/log/rpcapd.log" 2>&1 &
+  "${ROOT_DIR}/utils/rpcapd"  -b 0.0.0.0 -p 11188 -4 -n -D >> "${RPCAPD_ROOT_DIR}/log/rpcapd.log" 2>&1 &
   echo "$!" > "${RPCAPD_ROOT_DIR}/run/rpcapd.pid"
 else
-  logger "rpcapd already run, ignore re-run, pid: $(cat ${FRIDA_ROOT_DIR}/run/rpcapd.pid)"
+  logger "rpcapd already run, ignore re-run, pid: $(cat ${RPCAPD_ROOT_DIR}/run/rpcapd.pid)"
 fi
 
