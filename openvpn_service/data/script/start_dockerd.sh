@@ -35,11 +35,13 @@ if [ ! -f "${DOCKER_ROOT_DIR}/bin/dockerd" ] || [ "x${FORCE_DOWNLOAD}" != "x" ];
 fi
 
 #if [ "x$(command -v iptables)" = "x" ] || [ "x$(ps -ef|grep -v grep | grep -v sothothv2 |grep dockerd)" != "x" ]; then
-  logger "disable iptables support because no iptables binary or docker is already run"
+if [ "x${DOCKER_IPTABLES_ENABLE}" = "x" ] || [ "x$(command -v iptables)" = "x" ] || [ "x$(ps -ef|grep -v grep | grep -v sothothv2 |grep dockerd)" != "x" ];then
+  logger "disable docker iptables support"
   sed -i '/"iptables":/ s/true/false/' "${DOCKER_ROOT_DIR}/conf/daemon.json"
+fi
 #fi
 
-if [ "x${MOUNT_CGROUP}" != "x" ];then
+if [ "x${DOCKER_MOUNT_CGROUP}" != "x" ];then
   for sys in $(awk '!/^#/ { if ($4 == 1) print $1 }' /proc/cgroups); do
     [ -d "/sys/fs/cgroup/$sys" ] || mkdir -p "/sys/fs/cgroup/$sys"
     if ! mountpoint -q "/sys/fs/cgroup/$sys"; then
@@ -60,8 +62,13 @@ fi
 
 if ! is_pid_file_running "${DOCKER_ROOT_DIR}/run/dockerd.pid";then
   logger "start dockerd: \"${DOCKER_ROOT_DIR}/bin/dockerd\" --config-file \"${DOCKER_ROOT_DIR}/conf/daemon.json\" >> \"${DOCKER_ROOT_DIR}/log/dockerd.log\" 2>&1 "
-  create_bridge br-sothoth
-  DOCKER_GWBRIDGE=gw-sothoth PATH="${DOCKER_ROOT_DIR}/bin:${PATH}" "${DOCKER_ROOT_DIR}/bin/dockerd" --config-file "${DOCKER_ROOT_DIR}/conf/daemon.json" >> "${DOCKER_ROOT_DIR}/log/dockerd.log" 2>&1 &
+  if create_bridge br-sothoth ;then
+    DOCKER_GWBRIDGE=gw-sothoth PATH="${DOCKER_ROOT_DIR}/bin:${PATH}" "${DOCKER_ROOT_DIR}/bin/dockerd" --config-file "${DOCKER_ROOT_DIR}/conf/daemon.json" >> "${DOCKER_ROOT_DIR}/log/dockerd.log" 2>&1 &
+  else
+    logger "disable bridige support with dockerd"
+    sed -i 's/br-sothoth/none/g' "${DOCKER_ROOT_DIR}/conf/daemon.json"
+    PATH="${DOCKER_ROOT_DIR}/bin:${PATH}" "${DOCKER_ROOT_DIR}/bin/dockerd" --config-file "${DOCKER_ROOT_DIR}/conf/daemon.json" >> "${DOCKER_ROOT_DIR}/log/dockerd.log" 2>&1 &
+  fi
 else
   logger "dockerd already run, ignore re-run, pid: $(cat ${DOCKER_ROOT_DIR}/run/dockerd.pid)"
 fi

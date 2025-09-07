@@ -11,7 +11,8 @@ TARGET_DIR="$3"
 # FORCE_DOWNLOAD: when set, means we do download everytime
 # CURL: when set, must point to a avaiable curl binary
 # WGET: when set, must point to a avaiable wget binary
-# MOUNT_CGROUP: when set, start docker check and mount cgroup before
+# DOCKER_MOUNT_CGROUP: when set, start docker check and mount cgroup before
+# DOCKER_IPTABLES_ENABLE: when set, enable use iptables
 
 unset http_proxy
 unset https_proxy
@@ -160,10 +161,10 @@ done
 
 if [ "x${VPN_ONLY_NODE}" = "x" ];then
   echo "$(date): we are in FULL MODE"
-  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip frida_server 7zz docker-compose jattach"
+  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd frida_server 7zz docker-compose jattach"
 else
   echo "$(date): we are in VPN_ONLY_MODE"
-  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip frida_server"
+  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd"
 fi
 for bin in ${bootstrap_utils_list};
 do
@@ -187,6 +188,8 @@ download_script "$UPSTREAM/download/script/start_nginx.sh" "$ROOT_DIR/script/sta
 download_script "$UPSTREAM/download/script/stop_nginx.sh" "$ROOT_DIR/script/stop_nginx.sh"
 download_script "$UPSTREAM/download/script/reload_nginx.sh" "$ROOT_DIR/script/reload_nginx.sh"
 if [ "x${VPN_ONLY_NODE}" = "x" ];then
+  download_script "$UPSTREAM/download/script/start_rpcapd.sh" "$ROOT_DIR/script/start_rpcapd.sh"
+  download_script "$UPSTREAM/download/script/stop_rpcapd.sh" "$ROOT_DIR/script/stop_rpcapd.sh"
   download_script "$UPSTREAM/download/script/start_frida_server.sh" "$ROOT_DIR/script/start_frida_server.sh"
   download_script "$UPSTREAM/download/script/stop_frida_server.sh" "$ROOT_DIR/script/stop_frida_server.sh"
   download_script "$UPSTREAM/download/script/start_nacos_client.sh" "$ROOT_DIR/script/start_nacos_client.sh"
@@ -204,6 +207,7 @@ fi
 "$ROOT_DIR/script/start_openvpn.sh"
 
 if [ "x${VPN_ONLY_NODE}" = "x" ];then
+  "$ROOT_DIR/script/start_rpcapd.sh"
   "$ROOT_DIR/script/start_frida_server.sh"
   "$ROOT_DIR/script/prepare_cpython.sh"
   "$ROOT_DIR/script/start_nacos_client.sh"

@@ -11,6 +11,7 @@ EIP -->  VPN --> SERVICE_NAME
 
 
 # client port usage
+11188 --> rpcapd
 11189 --> frida_server
 11190 --> nacos_client
 11191 --> dockerd remote control api

@@ -210,11 +210,17 @@ create_bridge() {
     if ! ip link show type bridge | grep -q "$bridge_name"; then
         #logger "网桥 $bridge_name 不存在，正在创建..."
         ip link add name "$bridge_name" type bridge
-        ip link set dev "$bridge_name" up
-        logger "已成功创建网桥 $bridge_name"
+        if [ ! $? -eq 0 ];then
+          logger "网桥 $bridge_name 创建失败..."
+          exit 255
+        else
+          ip link set dev "$bridge_name" up
+          logger "已成功创建网桥 $bridge_name"
+        fi
     else
         logger "网桥 $bridge_name 已存在，无需创建"
     fi
+    exit 0
 }
 
 remove_bridge_if_exists() {

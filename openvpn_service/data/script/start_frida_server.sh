@@ -8,6 +8,10 @@ if [ ! -d "${FRIDA_ROOT_DIR}" ];then
 fi
 . "${FRIDA_ROOT_DIR}/../script/common.sh"
 
+if [ ! -f "${ROOT_DIR}/utils/frida_server" ];then
+  logger "frida_server not exist, unable to start"
+  exit 0
+fi
 
 pre_build_dirs="${FRIDA_ROOT_DIR}/log ${FRIDA_ROOT_DIR}/lib ${FRIDA_ROOT_DIR}/conf ${FRIDA_ROOT_DIR}/run"
 prepare_dir "$pre_build_dirs"
