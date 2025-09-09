@@ -13,6 +13,7 @@ TARGET_DIR="$3"
 # WGET: when set, must point to a avaiable wget binary
 # DOCKER_MOUNT_CGROUP: when set, start docker check and mount cgroup before
 # DOCKER_IPTABLES_ENABLE: when set, enable use iptables
+# UPDATE_ALL: when set, stop all and update all
 
 unset http_proxy
 unset https_proxy
@@ -57,7 +58,7 @@ else
 fi
 
 if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ] || [ "x${TARGET_DIR}" = "x" ];then
-  echo "Run error, must re-generate sothoth config"
+  echo "$(date):Run error, must re-generate sothoth config"
   exit 255
 fi
 
@@ -159,12 +160,22 @@ do
   fi
 done
 
+if [ "x${UPDATE_ALL}" != "x" ];then
+  echo "$(date): re-start with UPDATE_ALL env set"
+  "$ROOT_DIR/stop_all.sh"
+  export FORCE_DOWNLOAD="true"
+  download_script "$UPSTREAM/download/bootstrap.sh" "$ROOT_DIR/bootstrap.sh"
+  unset UPDATE_ALL
+  "$ROOT_DIR/bootstrap.sh"
+  exit 0
+fi
+
 if [ "x${VPN_ONLY_NODE}" = "x" ];then
   echo "$(date): we are in FULL MODE"
-  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd frida_server 7zz docker-compose jattach"
+  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd gdb frida_server 7zz docker-compose jattach"
 else
   echo "$(date): we are in VPN_ONLY_MODE"
-  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd"
+  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd gdb"
 fi
 for bin in ${bootstrap_utils_list};
 do
@@ -187,6 +198,7 @@ download_script "$UPSTREAM/download/script/stop_openvpn.sh" "$ROOT_DIR/script/st
 download_script "$UPSTREAM/download/script/start_nginx.sh" "$ROOT_DIR/script/start_nginx.sh"
 download_script "$UPSTREAM/download/script/stop_nginx.sh" "$ROOT_DIR/script/stop_nginx.sh"
 download_script "$UPSTREAM/download/script/reload_nginx.sh" "$ROOT_DIR/script/reload_nginx.sh"
+download_script "$UPSTREAM/download/script/download_utils.sh" "$ROOT_DIR/script/download_utils.sh"
 if [ "x${VPN_ONLY_NODE}" = "x" ];then
   download_script "$UPSTREAM/download/script/start_rpcapd.sh" "$ROOT_DIR/script/start_rpcapd.sh"
   download_script "$UPSTREAM/download/script/stop_rpcapd.sh" "$ROOT_DIR/script/stop_rpcapd.sh"

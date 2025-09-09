@@ -28,3 +28,6 @@ do
   logger "try umount point: ${point}"
   umount "$point"
 done
+if [ -f "${DOCKER_ROOT_DIR}/run/docker.sock" ];then
+  rm -rf "${DOCKER_ROOT_DIR}/run/docker.sock"
+fi
