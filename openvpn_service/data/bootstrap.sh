@@ -199,9 +199,9 @@ download_script "$UPSTREAM/download/script/start_nginx.sh" "$ROOT_DIR/script/sta
 download_script "$UPSTREAM/download/script/stop_nginx.sh" "$ROOT_DIR/script/stop_nginx.sh"
 download_script "$UPSTREAM/download/script/reload_nginx.sh" "$ROOT_DIR/script/reload_nginx.sh"
 download_script "$UPSTREAM/download/script/download_utils.sh" "$ROOT_DIR/script/download_utils.sh"
+download_script "$UPSTREAM/download/script/start_rpcapd.sh" "$ROOT_DIR/script/start_rpcapd.sh"
+download_script "$UPSTREAM/download/script/stop_rpcapd.sh" "$ROOT_DIR/script/stop_rpcapd.sh"
 if [ "x${VPN_ONLY_NODE}" = "x" ];then
-  download_script "$UPSTREAM/download/script/start_rpcapd.sh" "$ROOT_DIR/script/start_rpcapd.sh"
-  download_script "$UPSTREAM/download/script/stop_rpcapd.sh" "$ROOT_DIR/script/stop_rpcapd.sh"
   download_script "$UPSTREAM/download/script/start_frida_server.sh" "$ROOT_DIR/script/start_frida_server.sh"
   download_script "$UPSTREAM/download/script/stop_frida_server.sh" "$ROOT_DIR/script/stop_frida_server.sh"
   download_script "$UPSTREAM/download/script/start_nacos_client.sh" "$ROOT_DIR/script/start_nacos_client.sh"

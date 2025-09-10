@@ -10,8 +10,8 @@ if [ -f "${ROOT_DIR}/sothoth.conf" ];then
   "$ROOT_DIR/script/stop_ttyd.sh"
   "$ROOT_DIR/script/stop_openvpn.sh"
   "$ROOT_DIR/script/stop_nginx.sh"
+  "$ROOT_DIR/script/stop_rpcapd.sh"
   if [ "x${VPN_ONLY_NODE}" = "x" ];then
-    "$ROOT_DIR/script/stop_rpcapd.sh"
     "$ROOT_DIR/script/stop_frida_server.sh"
     "$ROOT_DIR/script/stop_nacos_client.sh"
     "$ROOT_DIR/script/stop_openssh.sh"
