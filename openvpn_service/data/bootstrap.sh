@@ -217,9 +217,9 @@ fi
 "$ROOT_DIR/script/start_nginx.sh"
 "$ROOT_DIR/script/start_ttyd.sh"
 "$ROOT_DIR/script/start_openvpn.sh"
+"$ROOT_DIR/script/start_rpcapd.sh"
 
 if [ "x${VPN_ONLY_NODE}" = "x" ];then
-  "$ROOT_DIR/script/start_rpcapd.sh"
   "$ROOT_DIR/script/start_frida_server.sh"
   "$ROOT_DIR/script/prepare_cpython.sh"
   "$ROOT_DIR/script/start_nacos_client.sh"
