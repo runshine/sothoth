@@ -15,3 +15,6 @@ if [ "x${bin}" = "x" ];then
 fi
 
 download "$UPSTREAM/utils/$bin/$OS/$ARCH" "${ROOT_DIR}/utils/$bin"
+if [ -f  "${ROOT_DIR}/utils/$bin" ];then
+  chmod +x  "${ROOT_DIR}/utils/$bin"
+fi
