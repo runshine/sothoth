@@ -188,7 +188,7 @@ done
 if [ -f "${ROOT_DIR}/utils/curl" ];then
   export CURL="${ROOT_DIR}/utils/curl"
 fi
-
+download_script "$UPSTREAM/download/script/gef.py" "$ROOT_DIR/script/gef.py"
 download_script "$UPSTREAM/download/script/common.sh" "$ROOT_DIR/script/common.sh"
 download_script "$UPSTREAM/download/stop_all.sh" "$ROOT_DIR/stop_all.sh"
 download_script "$UPSTREAM/download/script/start_ttyd.sh" "$ROOT_DIR/script/start_ttyd.sh"
@@ -225,6 +225,14 @@ if [ "x${VPN_ONLY_NODE}" = "x" ];then
   "$ROOT_DIR/script/start_nacos_client.sh"
   "$ROOT_DIR/script/start_openssh.sh"
   "$ROOT_DIR/script/start_dockerd.sh"
+fi
+
+if [ -f "$ROOT_DIR/script/gef.py" ];then
+  STARTUP_COMMAND="python sys.path.insert(0, \"${ROOT_DIR}/script\"); from gef import *; Gef.main()"
+  GDBINIT_PATH="/root/.gdbinit"
+  sed -i -e '/from gef import/d' /root/.gdbinit
+  echo "${STARTUP_COMMAND}" >> "${GDBINIT_PATH}"
+  echo ""
 fi
 
 if [ -d "/usr/lib/systemd/system" ];then
