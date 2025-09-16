@@ -86,6 +86,11 @@ download() {
       return 0
     fi
 
+    #ignore base even in force download
+    if [ -f "$output_file" ] && [ "x$(basename $output_file)" = "xbash" ];then
+      return 0;
+    fi
+
     # 创建输出目录（如果不存在）
     local output_dir=$(dirname "$output_file")
     if [ ! -d "$output_dir" ]; then
