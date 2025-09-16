@@ -231,6 +231,7 @@ if [ -f "$ROOT_DIR/script/gef.py" ];then
   STARTUP_COMMAND="python sys.path.insert(0, \"${ROOT_DIR}/script\"); from gef import *; Gef.main()"
   GDBINIT_PATH="/root/.gdbinit"
   sed -i -e '/from gef import/d' /root/.gdbinit
+  GDBINIT_PATH="${ROOT_DIR}/script/.gdbinit"
   echo "${STARTUP_COMMAND}" >> "${GDBINIT_PATH}"
   echo ""
 fi

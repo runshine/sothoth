@@ -12,6 +12,8 @@ export HISTSIZE=9999
 export HISTFILESIZE=9999
 export PROMPT_COMMAND=
 export HISTFILE="${DOCKER_ROOT_DIR}/../.bash_history"
+export PATH="${DOCKER_ROOT_DIR}/../utils:${DOCKER_ROOT_DIR}/../script:$PATH"
+export HOME="${DOCKER_ROOT_DIR}/../script/"
 EOF
 # 启动子 shell 并加载初始化文件
 "${DOCKER_ROOT_DIR}/../utils/bash" --rcfile "$INIT_FILE"
