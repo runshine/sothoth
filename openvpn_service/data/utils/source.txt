@@ -16,3 +16,5 @@ https://github.com/runshine/nginx-binaries/actions/runs/17272372223
 openvpn: https://gist.github.com/Anubisss/afea82b97058e418e8030ee35e40f54f
 
 https://github.com/shutingrz/busybox-static-binaries-fat/blob/main/busybox-aarch64-linux-gnu
+
+https://github.com/runshine/gdb-static/actions/runs/17877356300
