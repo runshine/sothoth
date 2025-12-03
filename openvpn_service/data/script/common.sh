@@ -212,7 +212,6 @@ create_bridge() {
         ip link add name "$bridge_name" type bridge
         if [ ! $? -eq 0 ];then
           logger "网桥 $bridge_name 创建失败..."
-          exit 255
         else
           ip link set dev "$bridge_name" up
           logger "已成功创建网桥 $bridge_name"
