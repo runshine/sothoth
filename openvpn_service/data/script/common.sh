@@ -220,7 +220,6 @@ create_bridge() {
     else
         logger "网桥 $bridge_name 已存在，无需创建"
     fi
-    exit 0
 }
 
 remove_bridge_if_exists() {
