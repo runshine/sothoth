@@ -18,10 +18,10 @@ if [ ! -f "${NACOS_ROOT_DIR}/script/nacos_client.py" ] || [ "x${FORCE_DOWNLOAD}"
 fi
 
 if ! is_pid_file_running "${NACOS_ROOT_DIR}/run/client.pid";then
-  logger "start nacos_client "
   chmod +x "${NACOS_ROOT_DIR}/script/nacos_client.py"
   NACOS_ROOT_DIR="${NACOS_ROOT_DIR}" UPSTREAM_SERVER="${UPSTREAM_SERVER}" "${NACOS_ROOT_DIR}/../python/bin/python" "${NACOS_ROOT_DIR}/script/nacos_client.py" &
   echo "$!" > "${NACOS_ROOT_DIR}/run/client.pid"
+  logger "start nacos_client, pid: $(cat ${NACOS_ROOT_DIR}/run/client.pid)"
 else
   logger "nacos_client already run, ignore re-run, pid: $(cat ${NACOS_ROOT_DIR}/run/client.pid)"
 fi

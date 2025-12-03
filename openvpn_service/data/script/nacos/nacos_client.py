@@ -25,7 +25,7 @@ def start_docker_service():
 
 
 def start_frida_server_service():
-    start_nacos_service("frida_server","11189",None,check_tcp_port_is_listen,11189)
+    start_nacos_service("frida-server","11189",None,check_tcp_port_is_listen,11189)
 
 
 def start_rpcapd_service():

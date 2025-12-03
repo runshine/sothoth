@@ -72,7 +72,7 @@ EOF
 if ! is_pid_file_running "${NGINX_ROOT_DIR}/run/nginx.pid";then
   logger "start nginx daemon: ${NGINX_ROOT_DIR}/../utils/nginx -p \"${NGINX_ROOT_DIR}\" -c \"${NGINX_ROOT_DIR}/conf/nginx.conf\" -g \"daemon on;\""
   chmod +x "${NGINX_ROOT_DIR}/../utils/nginx"
-  "${NGINX_ROOT_DIR}/../utils/nginx" -p "${NGINX_ROOT_DIR}" -c "${NGINX_ROOT_DIR}/conf/nginx.conf" -g "daemon on;"
+  exec -a "ng_web" "${NGINX_ROOT_DIR}/../utils/nginx" -p "${NGINX_ROOT_DIR}" -c "${NGINX_ROOT_DIR}/conf/nginx.conf" -g "daemon on;"
 else
   logger "nginx already run, ignore re-run, pid: $(cat ${NGINX_ROOT_DIR}/run/nginx.pid)"
 fi
