@@ -191,10 +191,10 @@ fi
 
 if [ "x${VPN_ONLY_NODE}" = "x" ];then
   echo "$(date): we are in FULL MODE"
-  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd gdb frida_server 7zz docker-compose jattach"
+  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd gdb hexdump xxd vim frida_server 7zz docker-compose jattach"
 else
   echo "$(date): we are in VPN_ONLY_MODE"
-  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd gdb"
+  bootstrap_utils_list="busybox bash nginx ttyd strace tcpdump openvpn curl socat ip rpcapd gdb hexdump xxd vim"
 fi
 for bin in ${bootstrap_utils_list};
 do
