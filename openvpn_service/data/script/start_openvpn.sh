@@ -72,9 +72,11 @@ if ! is_pid_file_running "${OPENVPN_ROOT_DIR}/run/client.pid";then
   elif [ "$ARCH" = "aarch64" ];then
     logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" --iproute \"$OPENVPN_ROOT_DIR/../utils/ip\""
     "${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid"  --iproute  "$OPENVPN_ROOT_DIR/../utils/ip" &
-  elif [ "$ARCH" = "armv8l" ] || [ "$ARCH" = "armv7l" ];then
+  elif [ "$ARCH" = "armv8l" ] || [ "$ARCH" = "armv7l" ] || [ "$ARCH" = "armv5" ];then
     logger "start openvpn client: \"${OPENVPN_ROOT_DIR}/../utils/openvpn\" --config \"${OPENVPN_ROOT_DIR}/conf/client.ovpn\" --writepid \"$OPENVPN_ROOT_DIR/run/client.pid\" --iproute \"$OPENVPN_ROOT_DIR/../utils/ip\""
     "${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid" --iproute  "$OPENVPN_ROOT_DIR/../utils/ip" &
+  else
+    logger "unable start openvpn client, unknown arch: $ARCH"
   fi
 else
   logger "openvpn already run, ignore re-run , pid: $(cat ${OPENVPN_ROOT_DIR}/run/client.pid)"

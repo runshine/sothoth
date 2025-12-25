@@ -4,7 +4,7 @@ After=network.target
 Documentation=https://example.com/sothothv2-docs
 
 [Service]
-Type=oneshot
+Type=forking
 User=root
 WorkingDirectory=/SOTHOTHV2_ROOT
 ExecStart=/SOTHOTHV2_ROOT/bootstrap.sh

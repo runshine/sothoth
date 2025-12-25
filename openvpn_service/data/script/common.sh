@@ -275,6 +275,16 @@ export NODE_ID="${NODE_ID}"
 ARCH="$(uname -m)"
 OS="linux"
 
+if [ "$ARCH" = "armv7l" ] || [ "$ARCH" = "armv7" ] || [ "$ARCH" = "armv8l" ];then
+  if [ "x$(cat /proc/self/maps | grep ld-linux-armhf)" != "x" ];then
+    ARCH="armv7l"
+  elif [ "x$(cat /proc/self/maps | grep ld-linux.so)" != "x" ];then
+    ARCH="armv5"
+  else
+    logger" unable current ARCH, use origin: $ARCH"
+  fi
+fi
+
 #we are in local run mode
 chmod +x "${ROOT_DIR}/sothoth.conf"
 .  "$ROOT_DIR/sothoth.conf"

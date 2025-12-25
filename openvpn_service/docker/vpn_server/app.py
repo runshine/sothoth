@@ -60,9 +60,8 @@ def deregister_instance(client, servic_name,service_ip,service_port):
 
 
 arch_mapping = {
-    "armv7l": "armel",
-    "armv8l": "armel",
-    "armv7": "armel"
+    "armv7l": "armhf",
+    "armv5": "armel"
 }
 
 

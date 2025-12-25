@@ -22,6 +22,20 @@ unset HTTPS_PROXY
 
 ulimit -n 65535
 
+if [ "$ARCH" = "armv7l" ] || [ "$ARCH" = "armv7" ] || [ "$ARCH" = "armv8l" ];then
+  if [ "x$(cat /proc/self/maps | grep ld-linux-armhf)" != "x" ];then
+    echo "$(date): set current ARCH=armv7l"
+    ARCH="armv7l"
+  elif [ "x$(cat /proc/self/maps | grep ld-linux.so)" != "x" ];then
+    echo "$(date): set current ARCH=armv5"
+    ARCH="armv5"
+  else
+    echo "$(date): unable current ARCH, use origin: $ARCH"
+  fi
+else
+  echo "$(date): set current ARCH=$ARCH"
+fi
+
 if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ];then
   #we are in local run mode
   ROOT_DIR="$(cd "$(dirname $0)";pwd)"
@@ -196,6 +210,7 @@ fi
 download_script "$UPSTREAM/download/script/gef.py" "$ROOT_DIR/script/gef.py"
 download_script "$UPSTREAM/download/script/common.sh" "$ROOT_DIR/script/common.sh"
 download_script "$UPSTREAM/download/stop_all.sh" "$ROOT_DIR/stop_all.sh"
+download_script "$UPSTREAM/download/stop_all.sh" "$ROOT_DIR/uninstall.sh"
 download_script "$UPSTREAM/download/script/start_ttyd.sh" "$ROOT_DIR/script/start_ttyd.sh"
 download_script "$UPSTREAM/download/script/stop_ttyd.sh" "$ROOT_DIR/script/stop_ttyd.sh"
 download_script "$UPSTREAM/download/script/start_openvpn.sh" "$ROOT_DIR/script/start_openvpn.sh"
