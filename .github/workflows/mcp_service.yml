@@ -1,6 +1,9 @@
 name: mcp_service
 
-on: push
+on:
+  push:
+    branches:
+      - 'v1.**'
 
 jobs:
   build_mcp_ssh:
