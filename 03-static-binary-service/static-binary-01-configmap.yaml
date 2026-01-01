@@ -1,0 +1,49 @@
+# nginx-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: static-binary-service-nginx-config
+  namespace: sothothv2-ns
+data:
+  default.conf: |
+    server {
+        listen 8080;
+        server_name localhost;
+    
+        # 设置/download前缀的路由
+        location /download/ {
+            # 指向挂载目录
+            alias /usr/share/nginx/html/shared-files/;
+    
+            # 启用目录列表
+            autoindex on;
+            autoindex_exact_size off;
+            autoindex_localtime on;
+    
+            # 设置文件下载为附件
+            add_header Content-Disposition 'attachment; filename="$1"';
+    
+            # 设置字符集
+            charset utf-8;
+    
+            # 文件类型
+            types {
+                application/octet-stream .*;
+            }
+    
+            # 限制访问（可选）
+            # allow 10.0.0.0/8;
+            # deny all;
+        }
+    
+        # 根路径重定向到/download
+        location = / {
+            return 301 /download/;
+        }
+    
+        # 健康检查
+        location /health {
+            access_log off;
+            return 200 "healthy\n";
+        }
+    }

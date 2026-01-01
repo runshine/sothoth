@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: sothothv2-ns
+data:
+  environment.sh: |
+    #!/bin/bash
+    export APP_ENV=production
+    export APP_PORT=81
+    export APP_HOST=0.0.0.0
+    export LOG_LEVEL=info
+    export NFS_SHARE_PATH=/shared/data

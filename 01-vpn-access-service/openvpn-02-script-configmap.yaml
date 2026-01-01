@@ -1,0 +1,154 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openvpn-script-vpn-access-config
+  namespace: sothothv2-ns
+data:
+  server_up.sh: |
+    #!/bin/bash
+    #set -x
+    brctl addif br-vpn $dev
+    ip link set $dev up
+    echo "${date}: device $dev is up"
+
+  entrypoint.sh: |
+    #!/bin/bash
+    #set -x
+    echo "$(date): Running openvpn new entrypoint"
+    if [ "x$TCP_MODE" = "x" ];then
+      echo "$(date): Current is UDP Mode"
+      MODE="udp"
+      START_NET="0"
+    else
+      echo "$(date): Current is TCP Mode"
+      MODE="tcp"
+      START_NET="32"
+    fi
+    
+    POD_NAME="${HOSTNAME:-$(hostname)}"
+    POD_ORDINAL="${POD_NAME##*-}"
+    # 确保POD_ORDINAL是数字，否则设为0
+    if ! [[ "$POD_ORDINAL" =~ ^[0-9]+$ ]]; then
+      echo "$(date): POD_ORDINAL is not a number, setting to 0"
+      POD_ORDINAL=0
+    fi
+    VPN_POD_ORDINAL=$(expr "${POD_ORDINAL}" \* 4 + ${START_NET})  # 转义乘号
+    
+    if [ "x${NET_ADDRESS}" == "x" ];then
+      echo "$(date): NET_ADDRESS check failed: ${NET_ADDRESS}"
+      exit 255
+    fi
+    IFS='./' read -r octet1 octet2 octet3 octet4 mask <<< "${NET_ADDRESS}"
+    CURRENT_IP="$octet1.$octet2.${VPN_POD_ORDINAL}.1/$(expr ${mask} + 6)"
+    CURRENT_START="$octet1.$octet2.${VPN_POD_ORDINAL}.100"
+    CURRENT_END="$octet1.$octet2.$(expr ${VPN_POD_ORDINAL} + 3).255"
+  
+    echo "$(date): Current POD index: ${POD_ORDINAL}, net address: ${CURRENT_IP}, net start: ${CURRENT_START}, net end: ${CURRENT_END}"
+    
+    echo "$(date): Setup bridge first: ${bridge_name}"
+    bridge_name="br-vpn"
+    brctl addbr ${bridge_name}
+    ifconfig ${bridge_name} up
+    ip addr add ${CURRENT_IP} dev ${bridge_name}
+    while [ "x$(brctl show ${bridge_name} 2>/dev/null)" == "x" ]
+    do
+      echo "$(date): Start wait bridge ${bridge_name} avaiable, sleeping 2 second"
+      sleep 2
+    done
+    echo "$(date): Bridge ${bridge_name} is avaiable"
+    echo "$(date): Start generate config, ip range is: ${CURRENT_START} --> ${CURRENT_END}"
+
+    if [ ! -d "/tmp/opepnvpn" ];then
+      mkdir -p "/tmp/openvpn"
+    fi
+
+    cat << EOF > /server.ovpn
+    port 11194
+    dev tap
+    proto ${MODE}
+    server-bridge $octet1.$octet2.${VPN_POD_ORDINAL}.1 255.255.252.0 ${CURRENT_START} ${CURRENT_END}
+    tls-server
+    verify-client-cert none
+    auth none
+    cipher none
+    ;data-ciphers none
+    ncp-disable
+    ca /etc/openvpn/ca.crt
+    cert /etc/openvpn/server.crt
+    key /etc/openvpn/server.key
+    dh /etc/openvpn/dh.pem
+    auth-user-pass-verify "/bin/true" via-env  # 始终返回验证成功的虚拟脚本
+    username-as-common-name
+    topology subnet
+    persist-key
+    persist-tun
+    keepalive 10 60
+    status /tmp/openvpn/openvpn-${PORT}-${MODE}-status.log
+    verb 3
+    client-to-client
+    script-security 2
+    up "/script/server_up.sh"
+    reneg-sec 0
+    push "route 200.64.0.0 255.255.0.0"
+    push "route 10.42.0.0 255.255.0.0"
+    client-config-dir /etc/openvpn/ccd
+    EOF
+    
+    sysctl -w net.ipv4.ip_forward=1
+    # 关闭rp_filter
+    sysctl -w net.ipv4.conf.all.rp_filter=0
+    sysctl -w net.ipv4.conf.default.rp_filter=0
+    sysctl -w net.ipv4.conf.eth0.rp_filter=0
+    
+    echo "$(date): Running old entrypoint: /usr/sbin/openvpn --config /server.ovpn"
+    # Run OpennConnect Server
+    exec /usr/sbin/openvpn --config /server.ovpn
+
+  healthcheck.sh: |
+    #!/bin/bash
+    set -e
+    
+    # 检查进程
+    if ! pgrep "openvpn" > /dev/null; then
+        echo "$(date): ERROR: OpenVPN process not found"
+        exit 1
+    fi
+    
+    # 检查tun设备
+    if ! [ -c /dev/net/tun ]; then
+        echo "$(date): ERROR: TUN device not found"
+        exit 1
+    fi
+    
+    if [ "x$TCP_MODE" = "x" ];then
+      MODE="udp"
+    else
+      MODE="tcp"
+    fi
+    
+    # 检查UDP端口监听
+    PORT="11194"
+    if [ "$MODE" = "udp" ];then
+      if ! ss -uln | grep -q ":$PORT "; then
+          echo "$(date): ERROR: OpenVPN not listening on UDP port $PORT"
+          exit 1
+      fi
+    fi
+    
+    if [ "$MODE" = "tcp" ];then
+      if ! ss -ln | grep -q ":$PORT "; then
+          echo "$(date): ERROR: OpenVPN not listening on TCP port $PORT"
+          exit 1
+      fi
+    fi
+    
+    # 可选：检查管理接口
+    if [ -n "$MANAGEMENT_PORT" ]; then
+        if ! timeout 1 bash -c "echo status 2>/dev/null > /dev/tcp/localhost/$MANAGEMENT_PORT"; then
+            echo "$(date): WARNING: Management interface not responding on port $MANAGEMENT_PORT"
+            # 这里不退出，因为管理接口可能没启用
+        fi
+    fi
+    
+    echo "$(date): OpenVPN is healthy"
+    exit 0

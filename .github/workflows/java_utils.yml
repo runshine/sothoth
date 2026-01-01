@@ -1,6 +1,11 @@
 name: java_utils
 
-on: push
+on:
+  push:
+    branches:
+      - 'v2.*'
+    paths:
+      - java_utils/*
 
 jobs:
   build_reboot_helper:

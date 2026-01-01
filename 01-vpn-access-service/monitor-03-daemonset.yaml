@@ -1,0 +1,50 @@
+# vpn-monitor-daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vpn-monitor
+  namespace: sothothv2-ns
+spec:
+  selector:
+    matchLabels:
+      name: vpn-monitor
+  template:
+    metadata:
+      labels:
+        name: vpn-monitor
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: vpn-monitor
+      containers:
+        - name: monitor
+          image: alpine/kubectl:latest  # 包含kubectl命令
+          command: ["/bin/sh"]
+          args:
+            - -c
+            - |
+              # 安装必要工具
+              sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
+              apk add --no-cache jq iproute2 net-tools vim curl bash grep ipcalc
+              # 运行监控脚本
+              /monitor.sh
+          volumeMounts:
+            - name: monitor-script
+              mountPath: /monitor.sh
+              subPath: monitor.sh
+            - name: config
+              mountPath: /config
+            - name: k3s-containerd
+              mountPath: /run/containerd/containerd.sock
+          securityContext:
+            privileged: true  # 需要特权来访问网络命名空间
+      volumes:
+        - name: monitor-script
+          configMap:
+            name: vpn-monitor-script
+            defaultMode: 0555
+        - name: config
+          emptyDir: {}
+        - name: k3s-containerd
+          hostPath:
+            path: /run/k3s/containerd/containerd.sock

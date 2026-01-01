@@ -1,0 +1,95 @@
+# frr-simple-daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-flannel-frr-ds
+  namespace: kube-flannel
+  labels:
+    app: frr
+    tier: node
+spec:
+  selector:
+    matchLabels:
+      app: frr
+  template:
+    metadata:
+      labels:
+        app: frr
+    spec:
+      hostNetwork: true
+      serviceAccountName: frr
+      initContainers:
+        - name: frr-init
+          image: alpine:3.14
+          command: ["sh", "-c"]
+          args:
+            - |
+              # 安装必要的工具
+              sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
+              apk add --no-cache iproute2 bash grep
+              
+              # 等待flannel.1接口就绪
+              echo "$(date): Waiting for flannel.1 interface..."
+              for i in $(seq 1 30); do
+                if ip link show flannel.1 >/dev/null 2>&1; then
+                  echo "flannel.1 interface found"
+                  break
+                fi
+                sleep 2
+              done
+              
+              # 运行简单设置脚本
+              echo "$(date): Running simple setup..."
+              /scripts/simple-setup.sh
+              
+              echo "$(date): FRR initialization completed"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+          volumeMounts:
+            - name: frr-tmp-config
+              mountPath: /etc/tmp-frr
+            - name: frr-config
+              mountPath: /etc/frr
+            - name: frr-scripts
+              mountPath: /scripts
+              readOnly: true
+      containers:
+        - name: frr
+          image: frrouting/frr:v8.4.1
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["NET_ADMIN", "NET_RAW"]
+          ports:
+            - containerPort: 179
+              name: bgp
+              hostPort: 179
+          volumeMounts:
+            - name: frr-config
+              mountPath: /etc/frr
+            - name: frr-scripts
+              mountPath: /scripts
+              readOnly: true
+          livenessProbe:
+            exec:
+              command: ["/scripts/health-check.sh"]
+            initialDelaySeconds: 60
+            periodSeconds: 60
+          readinessProbe:
+            exec:
+              command: ["/scripts/health-check.sh"]
+            initialDelaySeconds: 60
+            periodSeconds: 60
+      volumes:
+        - name: frr-config
+          emptyDir: { }
+        - name: frr-tmp-config
+          configMap:
+            name: frr-config
+            defaultMode: 0644
+        - name: frr-scripts
+          configMap:
+            name: frr-scripts
+            defaultMode: 0755

@@ -1,0 +1,20 @@
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: elasticsearch
+  namespace: sothothv2-ns  # 指定命名空间
+spec:
+  version: 9.1.9
+  nodeSets:
+    - name: elasticsearch
+      count: 3
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            resources:
+              requests:
+                storage: 40Gi
+            storageClassName: nfs-storage-192.168.13.66

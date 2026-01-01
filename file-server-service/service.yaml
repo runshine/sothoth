@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-app-service
+  namespace: sothothv2-ns
+  annotations:
+  # 如果使用云提供商，可以添加负载均衡器注释
+  # service.beta.kubernetes.io/aws-load-balancer-type: "external"
+  # service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer  # 或使用NodePort、ClusterIP，根据需求调整
+  selector:
+    app: web-app
+    component: fullstack
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+  # 注意：不暴露应用服务的81端口，只通过Nginx内部转发
+  sessionAffinity: None
+  externalTrafficPolicy: Cluster  # 或Local，根据需求调整

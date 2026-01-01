@@ -1,14 +1,13 @@
-name: docker_utils
-
+name: build-static-binary-server-image
 on:
   push:
     branches:
       - 'v2.*'
     paths:
-      - docker_utils/*
-
+      - static-binary-server.yml
+      - 03-static-binary-service/image_build/static-binary-server/*
 jobs:
-  build_add_mount:
+  build-static-binary-server-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,13 +35,13 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push add_mount
+      - name: Build and push static-binary-server-image
         uses: docker/build-push-action@v5
         with:
-          context: ./docker_utils/add_mount
+          context: ./03-static-binary-service/image_build/static-binary-server/
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            runshine0819/add_mount:latest
-            ghcr.io/runshine/add_mount:latest
-          file: ./docker_utils/add_mount/Dockerfile
+            runshine0819/static-binary-server:latest
+            ghcr.io/runshine/static-binary-server:latest
+          file: ./03-static-binary-service/image_build/static-binary-server/Dockerfile

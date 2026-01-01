@@ -1,0 +1,289 @@
+# monitor-script-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vpn-monitor-script
+  namespace: sothothv2-ns
+data:
+  monitor.sh: |
+    #!/bin/bash
+    #set -x
+    # 配置
+    FRR_NAMESPACE="kube-flannel"  # FRR DaemonSet所在的命名空间
+    FRR_POD_LABEL="app=frr"     # FRR Pod的标签
+    VPN_POD_PATTERN="vpn-access-openvpn"
+    CHECK_INTERVAL=30
+    STATE_FILE="/config/state.json"
+    
+    # 日志函数
+    log() {
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+    }
+    
+    # 获取当前节点名
+    NODE_NAME=$(cat /etc/hostname)
+    if [ -z "$NODE_NAME" ]; then
+      NODE_NAME=$(hostname)
+    fi
+    
+    # 获取FRR Pod名称
+    get_frr_pod() {
+      kubectl get pods -n $FRR_NAMESPACE --field-selector spec.nodeName=$NODE_NAME \
+        -l $FRR_POD_LABEL -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+    }
+    
+    # 执行vtysh命令到FRR容器
+    exec_vtysh() {
+      local frr_pod=$1
+      local command=$2
+    
+      kubectl exec -n $FRR_NAMESPACE $frr_pod -- vtysh -c "$command" 2>&1
+    }
+    
+    
+    # 配置FRR路由
+    configure_frr_route() {
+      local frr_pod=$1
+      local subnet=$2
+      local next_hop=$3
+      local vpn_pod=$4
+  
+      log "Configuring route for VPN pod $vpn_pod: $subnet via $next_hop"
+  
+      # 使用heredoc传递多行命令
+      local vtysh_commands=$(cat <<EOF
+    configure terminal
+    ip route $subnet $next_hop
+    quit
+    write
+    EOF
+    )
+  
+    # 执行多行命令
+      echo "$vtysh_commands" | kubectl exec -i -n kube-flannel $frr_pod -- vtysh
+    
+      if [ $? -eq 0 ]; then
+        log "Route configured successfully"
+      else
+        log "Failed to configure route"
+        return 1
+      fi
+      }
+    
+    
+    
+    # 删除FRR路由
+    remove_frr_route() {
+      local frr_pod=$1
+      local subnet=$2
+      local next_hop=$3
+    
+      log "Removing route: $subnet via $next_hop"
+    
+      local vtysh_commands=$(cat <<EOF
+    configure terminal
+    no ip route $subnet $next_hop
+    quit
+    write
+    EOF
+    )
+      echo "$vtysh_commands" | kubectl exec -i -n kube-flannel $frr_pod -- vtysh
+    
+      if [ $? -eq 0 ]; then
+        log "Route removed successfully"
+      else
+        log "Failed to remove route"
+        return 1
+      fi
+    }
+    
+    clean_frr_static_route() {
+      local frr_pod=$1
+      log "clean_frr_static_route: ${frr_pod}"
+      if [ -z "${frr_pod}" ];then
+        return 1
+      fi
+      while read -r route_net gateway <&4; 
+      do
+        remove_frr_route "${frr_pod}" "${route_net}" "${gateway}"  
+      done 4<<< "$(echo 'show ip route static' | kubectl exec -i  $frr_pod -n kube-flannel -- vtysh 2>/dev/null | grep 'S>' | awk -F'[ ,]+' '{print $2,$5}')"
+    }   
+    
+    clean_all_static_route() {
+      log "clean_all_static_route"
+      while read -r route_net gateway dev <&4; 
+      do
+        log "remove:  ip route del ${route} via ${gateway} dev ${dev} "
+        ip route del "${route}" via "${gateway}" dev "${dev}"  
+      done 4<<< "$(ip route | grep cni | grep via | awk '{print $1,$5,$7}')"
+    }   
+    
+    
+    # 获取Pod的网络命名空间并执行命令
+    exec_in_pod_netns() {
+      local pid=$1
+      local command=$2
+    
+      nsenter -t $pid -n -- $command
+    }
+    
+    # 获取VPN Pod的网桥IP
+    get_br_vpn_ip() {
+      local vpn_pod=$1
+      local namespace=$2
+    
+      # 在容器的网络命名空间中执行命令获取br-vpn IP
+      local bridge_info=$(kubectl exec -i ${vpn_pod} -n ${namespace} -- ip -4 addr show br-vpn 2>/dev/null || echo 'not found')
+    
+      if echo "$bridge_info" | grep -q "not found"; then
+        log "Bridge br-vpn not found in pod $vpn_pod"
+        return 1
+      fi
+    
+      # 提取IP和CIDR
+      local ip_cidr=$(echo "$bridge_info" | grep -oP 'inet \K[\d./]+')
+      echo $ip_cidr
+    }
+    
+    # 提取子网地址（将IP/CIDR转换为子网/CIDR）
+    get_subnet_from_cidr() {
+      local ip_cidr=$1
+      local ip=$(echo $ip_cidr | cut -d/ -f1)
+      local cidr=$(echo $ip_cidr | cut -d/ -f2)
+    
+      if [ -z "$cidr" ]; then
+        echo $ip_cidr
+        return
+      fi
+    
+      # 使用ipcalc计算子网
+      if command -v ipcalc &> /dev/null; then
+        ipcalc $ip_cidr | grep Network | awk '{print $2}'
+      else
+        # 简单处理：假设是标准的/24, /16等
+        echo $ip_cidr
+      fi
+    }
+    
+    # 发现并处理VPN Pods
+    discover_and_process_vpn_pods() {
+      local frr_pod=$(get_frr_pod)
+      if [ -z "$frr_pod" ]; then
+        #log "FRR pod not found on node $NODE_NAME"
+        return 1
+      fi
+    
+      #log "FRR pod: $frr_pod"
+    
+      # 获取当前节点上所有匹配的Pod
+      local current_pods=$(kubectl get pods --all-namespaces \
+        --field-selector spec.nodeName=$NODE_NAME \
+        -o json | jq -r ".items[] | select(.metadata.name | contains(\"$VPN_POD_PATTERN\")) | \"\(.metadata.namespace) \(.metadata.name)\"")
+    
+      local result="("
+    
+      while read -r namespace pod_name <&4; do
+        if [ -z "$pod_name" ]; then
+          continue
+        fi
+        #log "Processing VPN pod: $namespace/$pod_name"
+    
+        # 获取Pod IP
+        local pod_ip=$(kubectl get pod -n $namespace $pod_name \
+          -o jsonpath='{.status.podIP}')
+    
+        if [ -z "$pod_ip" ]; then
+          #log "Cannot get IP for pod $pod_name"
+          continue
+        fi
+    
+        # 获取br-vpn的IP地址
+        local br_vpn_cidr=$(get_br_vpn_ip $pod_name $namespace)
+        if [ -z "$br_vpn_cidr" ]; then
+          #log "Cannot get br-vpn IP for pod $pod_name"
+          continue
+        fi
+    
+        # 获取子网
+        local subnet=$(get_subnet_from_cidr $br_vpn_cidr)
+    
+        #log "Pod $pod_name: IP=$pod_ip, Bridge=$br_vpn_cidr, Subnet=$subnet"
+    
+        # 存储当前状态
+        local key="${namespace}/${pod_name}"
+        local value="$subnet $pod_ip"
+        result+="[\"$key\"]=\"$value\" "
+    
+      done 4<<< "$current_pods"
+      result+=")"
+      echo "$result"
+
+    }
+    
+    # 主循环
+    main() {
+      log "Starting VPN BGP monitor on node $NODE_NAME"
+    
+      # 加载上次状态
+      declare -A last_state
+      clean_all_static_route $(get_frr_pod)
+      clean_all_static_route
+      while true; do
+        # 获取FRR Pod
+        FRR_POD=$(get_frr_pod)
+    
+        log "Checking for VPN pods: ${FRR_POD}."
+    
+        if [ -n "$FRR_POD" ]; then
+          # 发现当前状态
+          declare -A current_state_str
+          eval "declare -A current_state_str=$(discover_and_process_vpn_pods)"
+  
+          # 转换字符串为关联数组
+          declare -A current_state
+          for key in "${!current_state_str[@]}"; do
+            current_state["$key"]="${current_state_str[$key]}"
+          done
+    
+          # 比较状态并更新路由
+          for key in "${!last_state[@]}"; do
+            if [ -z "${current_state[$key]}" ]; then
+              # Pod已删除，移除路由
+              local old_subnet=$(echo ${last_state[$key]} | awk '{print $1}')
+              local old_nexthop=$(echo ${last_state[$key]} | awk '{print $2}')
+              remove_frr_route $FRR_POD $old_subnet $old_nexthop
+              unset last_state[$key]
+            fi
+          done
+    
+          for key in "${!current_state[@]}"; do
+            local subnet=$(echo ${current_state[$key]} | awk '{print $1}')
+            local nexthop=$(echo ${current_state[$key]} | awk '{print $2}')
+    
+            if [ "${last_state[$key]}" != "${current_state[$key]}" ]; then
+              # 新Pod或配置变更，添加/更新路由
+              if [ -n "${last_state[$key]}" ]; then
+                # 先移除旧路由
+                local old_subnet=$(echo ${last_state[$key]} | awk '{print $1}')
+                local old_nexthop=$(echo ${last_state[$key]} | awk '{print $2}')
+                remove_frr_route $FRR_POD $old_subnet $old_nexthop
+              fi
+    
+              # 添加新路由
+              configure_frr_route $FRR_POD $subnet $nexthop $key
+              last_state[$key]="${current_state[$key]}"
+            fi
+          done
+    
+        else
+          log "Waiting for FRR pod to be available..."
+        fi
+    
+        sleep $CHECK_INTERVAL
+      done
+    }
+    
+    # 捕获退出信号
+    trap 'log "Shutting down..."; exit 0' SIGTERM SIGINT
+    
+    main

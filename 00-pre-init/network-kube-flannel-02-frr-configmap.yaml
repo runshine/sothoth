@@ -1,0 +1,309 @@
+# frr-simple-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frr-scripts
+  namespace: kube-flannel
+data:
+  elect-rr.sh: |
+    #!/bin/bash
+    set -e
+    
+    echo "$(date): === FRR Route Reflector Election ==="
+    
+    # 方法1：尝试从flannel.1接口获取IP
+    if ip link show flannel.1 >/dev/null 2>&1; then
+      FLANNEL_IP=$(ip -4 addr show flannel.1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+      if [ ! -z "$FLANNEL_IP" ]; then
+        echo "$(date): Got flannel.1 IP: $FLANNEL_IP"
+        # 提取第三个数字
+        THIRD_OCTET=$(echo $FLANNEL_IP | cut -d. -f3)
+        if [ "$THIRD_OCTET" = "0" ]; then
+          echo "ROLE=route-reflector" > /etc/frr/frr-role
+          echo "$(date): I am Route Reflector (flannel.1 IP: $FLANNEL_IP, third octet is 0)"
+        else
+          echo "ROLE=client" > /etc/frr/frr-role
+          echo "$(date): I am Client (flannel.1 IP: $FLANNEL_IP, third octet is $THIRD_OCTET)"
+        fi
+      else
+        echo "$(date): WARNING: flannel.1 exists but has no IP"
+      fi
+    fi
+    
+    # 方法2：如果flannel.1没有IP，尝试从cni0接口或路由表推断Pod CIDR
+    if [ ! -f /etc/frr/frr-role ]; then
+      # 尝试从cni0获取Pod CIDR
+      if ip link show cni0 >/dev/null 2>&1; then
+        POD_CIDR=$(ip route show dev cni0 | grep -oP '(\d+\.\d+\.\d+\.\d+/\d+)' | head -1)
+        if [ ! -z "$POD_CIDR" ]; then
+          echo "$(date): Got Pod CIDR from cni0: $POD_CIDR"
+          THIRD_OCTET=$(echo $POD_CIDR | cut -d. -f3)
+          if [ "$THIRD_OCTET" = "0" ]; then
+            echo "ROLE=route-reflector" > /etc/frr/frr-role
+            echo "$(date): I am Route Reflector (Pod CIDR: $POD_CIDR, third octet is 0)"
+          else
+            echo "ROLE=client" > /etc/frr/frr-role
+            echo "$(date): I am Client (Pod CIDR: $POD_CIDR, third octet is $THIRD_OCTET)"
+          fi
+        fi
+      fi
+    fi
+    
+    # 方法3：如果以上都失败，使用默认值（第一个节点是RR）
+    if [ ! -f /etc/frr/frr-role ]; then
+      echo "$(date): WARNING: Could not determine network configuration. Using fallback method."
+    
+      # 获取节点主机名，取最后一个字符作为判断依据
+      NODE_NAME=$(hostname)
+      NODE_NUM=$(echo $NODE_NAME | grep -o '[0-9]\+$' || echo "1")
+    
+      if [ "$NODE_NUM" = "1" ]; then
+        echo "$(date): ROLE=route-reflector" > /etc/frr/frr-role
+        echo "$(date): I am Route Reflector (fallback: node $NODE_NAME)"
+      else
+        echo "$(date): ROLE=client" > /etc/frr/frr-role
+        echo "$(date): I am Client (fallback: node $NODE_NAME)"
+      fi
+    fi
+    
+    # 计算flannel.1 IP（如果还没获取到）
+    if [ -f /etc/frr/frr-role ] && [ -z "$FLANNEL_IP" ]; then
+      source /etc/frr/frr-role
+      if [ "$ROLE" = "route-reflector" ]; then
+        # RR的flannel.1 IP固定为10.42.0.1
+        echo "FLANNEL_IP=10.42.0.0" >> /etc/frr/frr-role
+        echo "RR_FLANNEL_IP=10.42.0.0" >> /etc/frr/frr-role
+      else
+        # 客户端尝试获取自己的flannel.1 IP
+        CLIENT_IP=$(ip -4 addr show flannel.1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+        if [ ! -z "$CLIENT_IP" ]; then
+          echo "FLANNEL_IP=$CLIENT_IP" >> /etc/frr/frr-role
+        fi
+        # RR的IP固定为10.42.0.1
+        echo "RR_FLANNEL_IP=10.42.0.0" >> /etc/frr/frr-role
+      fi
+    fi
+    
+    echo "$(date): === Election Complete ==="
+    cat /etc/frr/frr-role
+
+  generate-rr-config.sh: |
+    #!/bin/bash
+    # 生成FRR配置
+    
+    # 等待选举完成
+    if [ ! -f /etc/frr/frr-role ]; then
+      echo "$(date): Role not determined yet. Running election..."
+      /scripts/elect-rr.sh
+    fi
+    
+    source /etc/frr/frr-role
+    
+    # 获取flannel.1 IP，如果还没有则计算
+    if [ -z "$FLANNEL_IP" ]; then
+      FLANNEL_IP=$(ip -4 addr show flannel.1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+      if [ -z "$FLANNEL_IP" ] && [ "$ROLE" = "route-reflector" ]; then
+        FLANNEL_IP="10.42.0.0"
+      fi
+    fi
+    
+    if [ -z "$RR_FLANNEL_IP" ] && [ "$ROLE" = "client" ]; then
+      RR_FLANNEL_IP="10.42.0.0"
+    fi
+    
+    cp /etc/tmp-frr/* /etc/frr/ 
+    
+    echo "$(date): Generating FRR configuration for role: $ROLE"
+    echo "$(date): Local flannel.1 IP: $FLANNEL_IP"
+   
+    if [ "$ROLE" = "route-reflector" ]; then
+      # 生成路由反射器配置
+      cat > /etc/frr/bgpd.conf <<EOF
+    log file /etc/frr/bgpd.log
+    log timestamp precision 3
+    !
+    router bgp 65000
+    bgp router-id $FLANNEL_IP
+    no bgp ebgp-requires-policy
+    no bgp network import-check
+    !
+    ! 配置BGP路由反射器集群ID
+    bgp cluster-id $FLANNEL_IP
+    !
+    ! 为每个客户端配置路由反射
+    neighbor RR-CLIENTS peer-group
+    neighbor RR-CLIENTS remote-as 65000
+    neighbor RR-CLIENTS update-source flannel.1
+    neighbor RR-CLIENTS route-reflector-client
+    neighbor RR-CLIENTS soft-reconfiguration inbound
+    neighbor RR-CLIENTS timers 3 10
+    !
+    ! 客户端组配置 - 监听整个Flannel网络范围
+    bgp listen range 10.42.0.0/16 peer-group RR-CLIENTS
+    !
+    ! 网络通告
+    network 10.42.0.0/16
+    !
+    ! 路由重分发
+    redistribute static
+    !
+    address-family ipv4 unicast
+    network 10.42.0.0/16
+    redistribute static
+    exit-address-family
+    !
+    ! 静态路由配置
+    EOF
+    
+    echo "$(date): Generated Route Reflector configuration"
+    
+    else
+    # 生成客户端配置
+    cat > /etc/frr/bgpd.conf <<EOF
+    log file /etc/frr/bgpd.log
+    log timestamp precision 3
+    !
+    router bgp 65000
+    bgp router-id $FLANNEL_IP
+    no bgp ebgp-requires-policy
+    no bgp network import-check
+    !
+    ! 连接到路由反射器
+    neighbor $RR_FLANNEL_IP remote-as 65000
+    neighbor $RR_FLANNEL_IP description "Route-Reflector"
+    neighbor $RR_FLANNEL_IP update-source flannel.1
+    neighbor $RR_FLANNEL_IP timers 3 10
+    !
+    ! 网络通告
+    network 10.42.0.0/16
+    !
+    ! 路由重分发
+    redistribute static
+    !
+    address-family ipv4 unicast
+    network 10.42.0.0/16
+    redistribute static
+    exit-address-family
+    !
+    ! 静态路由配置
+    EOF
+    
+    echo "$(date): Generated Client configuration"
+    echo "$(date): Connecting to RR: $RR_FLANNEL_IP"
+    fi
+
+  health-check.sh: |
+    #!/bin/bash
+    # FRR健康检查脚本
+    
+    # 等待/获取角色信息
+    if [ ! -f /etc/frr/frr-role ]; then
+      echo "$(date): FRR role not determined yet"
+      exit 0  # 不要失败，还在初始化
+    fi
+    
+    source /etc/frr/frr-role
+    
+    # 检查FRR进程是否运行
+    if ! ps aux | grep -v grep | grep -q "frr"; then
+      echo "$(date): FRR processes not running"
+      exit 1
+    fi
+    
+    # 检查BGP状态
+    if [ "x$(vtysh -c "show bgp summary" 2>/dev/null | grep  neighbors  | awk '{print $5}')" != "x0" ]; then
+      exit 0
+    else
+      echo "$(date): No established BGP sessions"
+      exit 1
+    fi
+
+  simple-setup.sh: |
+    #!/bin/bash
+    # 简易设置脚本
+    
+    echo "$(date): === Simple FRR Setup ==="
+    
+    # 创建必要目录
+    [ -d "/etc/frr" ]     || mkdir -p /etc/frr
+    [ -d "/var/run/frr" ] || mkdir -p /var/run/frr
+    [ -d "/var/lib/frr" ] || mkdir -p /var/lib/frr
+    
+    chmod 777 -R /var/run/frr 
+    chmod 777 -R /var/lib/frr
+    chmod 777 -R /etc/frr 
+    
+    # 运行选举
+    echo "$(date): Running election..."
+    /scripts/elect-rr.sh
+    
+    # 生成配置
+    echo "$(date): Generating configuration..."
+    /scripts/generate-rr-config.sh
+    
+    # 启动FRR（由容器主进程执行）
+    echo "$(date): Setup complete!"
+    
+
+---
+# frr-simple-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frr-config
+  namespace: kube-flannel
+data:
+  daemons: |
+    # This file tells the frr package which daemons to start.
+    # Entries are in the format: <daemon>=(yes|no|priority)
+    # See /usr/share/doc/frr/README.Debian for details.
+    #
+    # Sample daemons file.  Uncomment to enable.
+    #
+    zebra=yes
+    bgpd=yes
+    staticd=yes
+    ospfd=no
+    ospf6d=no
+    ripd=no
+    ripngd=no
+    isisd=no
+    pimd=no
+    ldpd=no
+    nhrpd=no
+    eigrpd=no
+    babeld=no
+    sharpd=no
+    pbrd=no
+    bfdd=no
+    fabricd=no
+    vtysh_enable=yes
+    zebra_options="  -A 127.0.0.1 -s 90000000"
+    bgpd_options="   -A 127.0.0.1"
+    ospfd_options="  -A 127.0.0.1"
+    ospf6d_options=" -A ::1"
+    ripd_options="   -A 127.0.0.1"
+    ripngd_options=" -A ::1"
+    isisd_options="  -A 127.0.0.1"
+    pimd_options="   -A 127.0.0.1"
+    ldpd_options="   -A 127.0.0.1"
+    nhrpd_options="  -A 127.0.0.1"
+    eigrpd_options=" -A 127.0.0.1"
+    babeld_options=" -A 127.0.0.1"
+    sharpd_options=" -A 127.0.0.1"
+    pbrd_options="   -A 127.0.0.1"
+    staticd_options="-A 127.0.0.1"
+    bfdd_options="   -A 127.0.0.1"
+    fabricd_options="-A 127.0.0.1"
+    vrrpd_options="  -A 127.0.0.1"
+    mgmtd_options="  -A 127.0.0.1"
+  
+
+  vtysh.conf: |
+    !
+    ! Sample configuration file for vtysh.
+    !
+    !service integrated-vtysh-config
+    !hostname quagga-router
+    !username root nopassword
+    !

@@ -1,0 +1,170 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: file-server-deployment
+  namespace: sothothv2-ns
+  labels:
+    app: file-server
+    tier: frontend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: file-server
+      component: fullstack
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  minReadySeconds: 30
+  template:
+    metadata:
+      labels:
+        app: file-server
+        component: fullstack
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "80"
+        prometheus.io/path: "/metrics"
+    spec:
+      # 亲和性设置 - 避免同一应用的所有副本都在同一节点
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - file-server
+                topologyKey: kubernetes.io/hostname
+
+      # 容器定义
+      containers:
+        # Nginx容器
+        - name: nginx
+          image: nginx:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 80
+              name: http
+              protocol: TCP
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+            - name: shared-storage
+              mountPath: /usr/share/nginx/html/static
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 101  # nginx用户ID
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+
+        # 应用容器
+        - name: app-server
+          image: ghcr.io/runshine/file-server-backend:latest  # 替换为您的应用镜像
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 81
+              name: app
+              protocol: TCP
+          env:
+            - name: APP_PORT
+              value: "81"
+            - name: APP_HOST
+              value: "0.0.0.0"
+            - name: NFS_MOUNT_PATH
+              value: "/shared/data"
+          volumeMounts:
+            - name: app-config
+              mountPath: /app/config
+            - name: shared-storage
+              mountPath: /shared/data
+            - name: shared-storage
+              mountPath: /app/logs
+              subPath: logs
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 81
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/ready
+              port: 81
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+
+            readOnlyRootFilesystem: false  # 应用可能需要写权限
+
+        # 初始化容器 - 用于准备共享存储
+        - name: init-storage
+          image: busybox:1.28
+          imagePullPolicy: IfNotPresent
+          command: ['sh', '-c', 'mkdir -p /shared/data/logs && chmod -R 777 /shared/data']
+          volumeMounts:
+            - name: shared-storage
+              mountPath: /shared/data
+
+      # 卷定义
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: nginx-config
+        - name: app-config
+          configMap:
+            name: app-config
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: file-server-pvc
