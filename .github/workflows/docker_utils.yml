@@ -1,6 +1,9 @@
 name: docker_utils
 
-on: push
+on:
+  push:
+    branches:
+      - 'v1.**'
 
 jobs:
   build_add_mount:
