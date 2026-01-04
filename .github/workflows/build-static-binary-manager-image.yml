@@ -92,7 +92,7 @@ jobs:
           tags: |
             runshine0819/static-binary-manager-frontend:latest
             ghcr.io/runshine/static-binary-manager-frontend:latest
-          file: ./04-static-binary-service/image_build/static-binary-manager-frontend/Dockerfile
+          file: ./04-static-binary-service/image_build/static-binary-manager-frontend.Dockerfile
 
 
 
