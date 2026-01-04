@@ -1,28 +1,12 @@
 apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: sothothv2-static-binary-service-nfs-pv
-spec:
-  capacity:
-    storage: 100Gi
-  volumeMode: Filesystem
-  accessModes:
-    - ReadWriteMany  # 关键：多节点读写
-  persistentVolumeReclaimPolicy: Retain
-  storageClassName: nfs-storage-192.168.13.66
-  nfs:
-    path: /nvme/share_k8s
-    server: 192.168.13.66  # NFS服务器IP
----
-apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: sothothv2-static-binary-service-nfs-pvc
-  namespace: sothothv2-ns  # 指定命名空间
+  namespace: sothothv2-ns
 spec:
-  accessModes:
-    - ReadWriteMany  # 必须与PV匹配
   storageClassName: nfs-storage-192.168.13.66
+  accessModes:
+    - ReadWriteMany
   resources:
     requests:
       storage: 100Gi
