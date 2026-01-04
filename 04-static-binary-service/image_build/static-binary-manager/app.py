@@ -48,6 +48,15 @@ logger.info("PACKAGE_ROOT_DIR: {}".format(PACKAGE_ROOT_DIR))
 app.config['SECRET_KEY'] = 'your-secret-key-change-this'
 
 app.config['SQLALCHEMY_DATABASE_URI'] = MYSQL_SERVER_ADDRESS
+# 明确设置引擎选项禁用SSL
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+    'connect_args': {
+        'ssl': False,
+        'connect_timeout': 10
+    }
+}
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = '/tmp/uploads'  # 临时上传目录
 app.config['STORAGE_FOLDER'] = PACKAGE_ROOT_DIR  # 永久存储目录
@@ -1613,4 +1622,4 @@ if __name__ == '__main__':
     # 初始化数据库
     init_database()
     # 启动Flask应用
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    app.run(host='0.0.0.0', port=8080, debug=False)
