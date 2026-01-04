@@ -4,4 +4,4 @@ mysqlclient==2.2.0
 Werkzeug==2.3.7
 python-dotenv==1.0.0
 flask-cors==4.0.0
-pymsql
+PyMySQL
