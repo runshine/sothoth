@@ -22,7 +22,7 @@ spec:
         - containerPort: 8080
         env:
           - name: MYSQL_SERVER_ADDRESS
-            value: mysql://static-binary:Huawei12#$@192.168.12.90/static-binary-service
+            value: mysql+pymysql://static-binary:Huawei12%23%24@192.168.12.90/static-binary-service?ssl=false
           - name: PACKAGE_ROOT_DIR
             value: /data
         volumeMounts:
