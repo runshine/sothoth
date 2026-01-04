@@ -8,7 +8,7 @@ metadata:
 spec:
   type: LoadBalancer
   selector:
-    app: "client-script-service"
+    name: "client-script-service"
   ports:
     - port: 8082
       targetPort: 80
