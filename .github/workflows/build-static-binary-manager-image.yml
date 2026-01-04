@@ -58,6 +58,12 @@ jobs:
         with:
           submodules: 'true'
 
+      - name: clean to default
+        run: sed -i 's/https:\/\/develop.819819.xyz//g'   ./04-static-binary-service/image_build/static-binary-manager-frontend/services/packageService.ts
+
+      - name: cat packageService.ts
+        run: cat ./04-static-binary-service/image_build/static-binary-manager-frontend/services/packageService.ts
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
