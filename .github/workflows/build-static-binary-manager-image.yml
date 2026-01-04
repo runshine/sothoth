@@ -1,0 +1,87 @@
+name: build-static-binary-manager-image
+on:
+  push:
+    branches:
+      - 'v2.*'
+    paths:
+      - static-binary-manager.yml
+      - 04-static-binary-service/image_build/static-binary-manager/*
+      - 04-static-binary-service/image_build/static-binary-manager-frontend/*
+jobs:
+  build-static-binary-manager-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push static-binary-manager-image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./04-static-binary-service/image_build/static-binary-manager/
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            runshine0819/static-binary-manager:latest
+            ghcr.io/runshine/static-binary-manager:latest
+          file: ./04-static-binary-service/image_build/static-binary-manager/Dockerfile
+
+  build-static-binary-manager-frontend-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push static-binary-manager-frontend-image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./04-static-binary-service/image_build/static-binary-manager-frontend/
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            runshine0819/static-binary-manager-frontend:latest
+            ghcr.io/runshine/static-binary-manager-frontend:latest
+          file: ./04-static-binary-service/image_build/static-binary-manager-frontend/Dockerfile

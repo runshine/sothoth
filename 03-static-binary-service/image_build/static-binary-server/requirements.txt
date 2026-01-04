@@ -1,4 +1,0 @@
-flask
-pymysql
-DBUtils
-nacos-sdk-python

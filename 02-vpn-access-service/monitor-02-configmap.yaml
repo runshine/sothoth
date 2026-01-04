@@ -106,15 +106,17 @@ data:
       while read -r route_net gateway <&4; 
       do
         remove_frr_route "${frr_pod}" "${route_net}" "${gateway}"  
-      done 4<<< "$(echo 'show ip route static' | kubectl exec -i  $frr_pod -n kube-flannel -- vtysh 2>/dev/null | grep 'S>' | awk -F'[ ,]+' '{print $2,$5}')"
+      done 4<<< "$(echo 'show running-config ' | kubectl exec -i  $frr_pod -n kube-flannel -- vtysh 2>/dev/null | grep 'ip route' | awk  '{print $3,$4}')"
     }   
     
     clean_all_static_route() {
       log "clean_all_static_route"
       while read -r route_net gateway dev <&4; 
       do
-        log "remove:  ip route del ${route} via ${gateway} dev ${dev} "
-        ip route del "${route}" via "${gateway}" dev "${dev}"  
+        if [ ! -z "${route_net}" ] && [ ! -z "${gateway}" ] && [ ! -z "${dev}" ];then
+          log "remove:  ip route del ${route_net} via ${gateway} dev ${dev} "
+          ip route del "${route_net}" via "${gateway}" dev "${dev}"  
+        fi
       done 4<<< "$(ip route | grep cni | grep via | awk '{print $1,$5,$7}')"
     }   
     
@@ -226,7 +228,7 @@ data:
     
       # 加载上次状态
       declare -A last_state
-      clean_all_static_route $(get_frr_pod)
+      clean_frr_static_route $(get_frr_pod)
       clean_all_static_route
       while true; do
         # 获取FRR Pod

@@ -2,6 +2,7 @@ FROM python:3.11-alpine
 
 WORKDIR /python-docker
 
+#sudo apt install default-libmysqlclient-dev
 # 安装编译依赖
 RUN apk add --no-cache --virtual .build-deps \
     gcc \
