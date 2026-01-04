@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: client-script-service
+  namespace: sothothv2-ns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      name: client-script-service
+  template:
+    metadata:
+      labels:
+        name: client-script-service
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: nginx
+        image: nginx:alpine
+        imagePullPolicy: IfNotPresent
+        ports:
+          - containerPort: 80
+        volumeMounts:
+          - name: static-binary-service-nginx-config
+            mountPath: /etc/nginx/nginx.conf
+            subPath: nginx.conf
+          - name: shared-client-script-storage
+            mountPath: /data
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        # 资源限制
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+
+      volumes:
+      - name: shared-client-script-storage
+        persistentVolumeClaim:
+          claimName: sothothv2-client-script-service-nfs-pvc  # 引用PVC
+      - name: static-binary-service-nginx-config
+        configMap:
+          name: static-binary-service-nginx-config
+          items:
+            - key: nginx.conf
+              path: nginx.conf
+
