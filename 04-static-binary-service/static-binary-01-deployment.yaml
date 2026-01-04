@@ -17,6 +17,7 @@ spec:
       containers:
       - name: static-binary-manager
         image: ghcr.io/runshine/static-binary-manager:latest  # 包含kubectl命令
+        imagePullPolicy: Always
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -44,6 +45,7 @@ spec:
 
       - name: nginx
         image: ghcr.io/runshine/static-binary-manager-frontend:latest
+        imagePullPolicy: Always
         ports:
           - containerPort: 80
         volumeMounts:
