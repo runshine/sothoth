@@ -12,7 +12,7 @@ RUN apk add --no-cache --virtual .build-deps \
     python3-dev \
     && apk add --no-cache mariadb-dev  # 如果使用pymysql可能需要
 
-RUN RUN apk --no-cache add ca-certificates   && update-ca-certificates
+RUN apk --no-cache add ca-certificates   && update-ca-certificates
 
 COPY requirements.txt requirements.txt
 
