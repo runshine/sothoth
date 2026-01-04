@@ -46,11 +46,6 @@ logger.info("PACKAGE_ROOT_DIR: {}".format(PACKAGE_ROOT_DIR))
 
 # 配置
 app.config['SECRET_KEY'] = 'your-secret-key-change-this'
-app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
-    'connect_args': {
-        'ssl_disabled': True
-    }
-}
 
 app.config['SQLALCHEMY_DATABASE_URI'] = MYSQL_SERVER_ADDRESS
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
