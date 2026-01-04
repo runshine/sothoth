@@ -4,7 +4,7 @@ on:
     branches:
       - 'v2.*'
     paths:
-      - static-binary-manager.yml
+      - ./.github/workflows/build-static-binary-manager-image.yml
       - 04-static-binary-service/image_build/static-binary-manager/*
       - 04-static-binary-service/image_build/static-binary-manager-frontend/*
 jobs:
