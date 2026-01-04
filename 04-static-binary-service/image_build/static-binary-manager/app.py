@@ -46,6 +46,40 @@ logger.info("PACKAGE_ROOT_DIR: {}".format(PACKAGE_ROOT_DIR))
 
 # 配置
 app.config['SECRET_KEY'] = 'your-secret-key-change-this'
+
+# 处理连接字符串
+# 如果连接字符串中包含ssl参数，我们将其移除，因为我们将通过connect_args传递
+# 同时，将mysql://替换为mysql+pymysql://
+if MYSQL_SERVER_ADDRESS.startswith('mysql://'):
+    connection_string = MYSQL_SERVER_ADDRESS.replace('mysql://', 'mysql+pymysql://', 1)
+else:
+    connection_string = MYSQL_SERVER_ADDRESS
+
+# 移除可能存在的ssl参数（包括ssl=false等）
+# 这里简单起见，我们直接分割掉?后面的部分，然后重新添加参数（除了ssl）
+# 但是注意，可能还有其他参数，所以我们保留非ssl参数
+if '?' in connection_string:
+    base, query = connection_string.split('?', 1)
+    # 解析查询参数
+    params = []
+    for param in query.split('&'):
+        if not param.startswith('ssl'):
+            params.append(param)
+    # 重新组合
+    if params:
+        connection_string = base + '?' + '&'.join(params)
+    else:
+        connection_string = base
+
+logger.info("处理后的连接字符串: {}".format(connection_string))
+
+app.config['SQLALCHEMY_DATABASE_URI'] = connection_string
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'connect_args': {
+        'ssl_disabled': True
+    }
+}
+
 app.config['SQLALCHEMY_DATABASE_URI'] = MYSQL_SERVER_ADDRESS
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = '/tmp/uploads'  # 临时上传目录
