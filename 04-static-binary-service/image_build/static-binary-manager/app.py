@@ -54,6 +54,7 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_recycle': 300,
     'connect_args': {
         'ssl': False,
+        'ssl_mode': 'DISABLED',  # 明确SSL模式
         'connect_timeout': 10
     }
 }
