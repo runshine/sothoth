@@ -41,6 +41,9 @@ data:
             root /usr/share/nginx/html;
             index index.html;
     
+            # 修正：正确的指令名称是 client_max_body_size
+            client_max_body_size 500m;
+    
             # API请求代理到8080端口
             location /api/ {
                 proxy_pass http://api_backend;
