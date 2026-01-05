@@ -789,11 +789,6 @@ class PackageUploader:
             if len(self.failed_files) > 10:
                 print(f"  ... 还有 {len(self.failed_files) - 10} 个文件")
 
-            # 保存失败文件列表到文件
-            failed_list_path = "failed_uploads.json"
-            with open(failed_list_path, 'w', encoding='utf-8') as f:
-                json.dump(self.failed_files, f, ensure_ascii=False, indent=2)
-            print(f"\n失败文件列表已保存到: {failed_list_path}")
 
 def main():
     # 解析命令行参数

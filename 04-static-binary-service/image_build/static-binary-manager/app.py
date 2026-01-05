@@ -22,15 +22,49 @@ from flask_cors import CORS
 from sqlalchemy import or_, func
 
 
-logging.basicConfig(
-    level=logging.DEBUG,  # 设置日志级别
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+
+# ==================== 日志配置 ====================
+
+# 禁用 werkzeug 默认的访问日志
+class NoHealthCheckFilter(logging.Filter):
+    """过滤器：过滤掉健康检查的日志"""
+    def filter(self, record):
+        # 检查是否是访问日志，且路径为 /api/health
+        message = record.getMessage()
+        # 匹配 werkzeug 的访问日志格式
+        if 'GET /api/health HTTP/1.1' in message and '" 200' in message:
+            return False
+        return True
+
+# 配置根日志记录器
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# 禁用 werkzeug 默认的访问日志处理器
+werkzeug_logger = logging.getLogger('werkzeug')
+werkzeug_logger.setLevel(logging.WARNING)  # 只记录警告和错误
+# 添加过滤器，进一步过滤健康检查
+werkzeug_logger.addFilter(NoHealthCheckFilter())
+
+# 配置应用日志记录器
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# 创建控制台处理器
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# 创建格式器
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
+console_handler.setFormatter(formatter)
 
-# 使用示例
-logger = logging.getLogger(__name__)
+# 添加处理器到应用日志记录器
+logger.addHandler(console_handler)
 
+# ==================== Flask应用初始化 ====================
 # 初始化Flask应用
 app = Flask(__name__)
 CORS(app)
@@ -1379,9 +1413,11 @@ def delete_package(package_id):
         return jsonify({'success': False, 'error': f'删除失败: {str(e)}'}), 500
 
 
+# ==================== 解决数据库锁超时问题 ====================
+
 @app.route('/api/packages/batch-delete', methods=['POST'])
 def batch_delete_packages():
-    """批量删除软件包"""
+    """批量删除软件包 - 优化版本，避免锁超时"""
     data = request.get_json()
     if not data or 'package_ids' not in data:
         return jsonify({'success': False, 'error': '请提供要删除的软件包ID列表'}), 400
@@ -1394,31 +1430,55 @@ def batch_delete_packages():
     error_count = 0
     errors = []
 
-    for package_id in package_ids:
-        package = Package.query.get(package_id)
-        if not package:
-            errors.append(f"软件包 {package_id} 不存在")
-            error_count += 1
-            continue
+    # 限制批量删除的数量，避免长时间锁定
+    MAX_BATCH_SIZE = 1000
+    if len(package_ids) > MAX_BATCH_SIZE:
+        return jsonify({
+            'success': False,
+            'error': f'批量删除数量超过限制，最多允许{MAX_BATCH_SIZE}个',
+            'current_count': len(package_ids)
+        }), 400
 
-        try:
-            # 删除存储的文件
-            if os.path.exists(package.storage_path):
-                shutil.rmtree(package.storage_path)
+    try:
+        for package_id in package_ids:
+            package = Package.query.get(package_id)
+            if not package:
+                errors.append(f"软件包 {package_id} 不存在")
+                error_count += 1
+                continue
 
-            # 删除原始包文件
-            if package.original_package_path and os.path.exists(package.original_package_path):
-                os.remove(package.original_package_path)
+            try:
+                # 使用独立的事务处理每个删除，避免长事务
+                # 注意：这里我们为每个删除创建新的事务
+                with db.session.begin_nested():
+                    # 删除存储的文件
+                    if os.path.exists(package.storage_path):
+                        shutil.rmtree(package.storage_path)
 
-            # 删除数据库记录
-            db.session.delete(package)
-            success_count += 1
+                    # 删除原始包文件
+                    if package.original_package_path and os.path.exists(package.original_package_path):
+                        os.remove(package.original_package_path)
 
-        except Exception as e:
-            errors.append(f"删除软件包 {package_id} 失败: {str(e)}")
-            error_count += 1
+                    # 删除数据库记录
+                    db.session.delete(package)
+                    success_count += 1
 
-    db.session.commit()
+                    # 立即提交这个嵌套事务
+                    db.session.flush()
+
+            except Exception as e:
+                db.session.rollback()  # 回滚嵌套事务
+                errors.append(f"删除软件包 {package_id} 失败: {str(e)}")
+                error_count += 1
+                # 继续处理下一个包
+                continue
+
+        # 提交所有更改
+        db.session.commit()
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': f'批量删除失败: {str(e)}'}), 500
 
     return jsonify({
         'success': True,
