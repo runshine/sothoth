@@ -1276,7 +1276,7 @@ def get_package_detail(package_id):
 
     # 获取文件列表
     files = []
-    for file_record in package.files.limit(100):  # 限制返回数量
+    for file_record in package.files.limit(10000):  # 限制返回数量
         files.append({
             'path': file_record.file_path,
             'name': file_record.file_name,
