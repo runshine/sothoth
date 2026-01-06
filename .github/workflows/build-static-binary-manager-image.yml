@@ -94,7 +94,3 @@ jobs:
             ghcr.io/runshine/static-binary-manager-frontend:latest
           file: ./04-static-binary-service/image_build/static-binary-manager-frontend.Dockerfile
 
-
-
-
-
