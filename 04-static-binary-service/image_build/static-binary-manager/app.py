@@ -1186,14 +1186,37 @@ def upload_package():
         # 计算MD5作为唯一ID
         package_id = calculate_md5(temp_path)
 
-        # 检查是否已存在
-        existing = Package.query.get(package_id)
-        if existing:
+        # 检查是否已存在相同的MD5
+        existing_by_md5 = Package.query.get(package_id)
+        if existing_by_md5:
             os.remove(temp_path)
             return jsonify({
                 'success': False,
-                'error': '相同的软件包已存在',
+                'error': '相同的软件包已存在（文件内容相同）',
                 'package_id': package_id
+            }), 409
+
+        # 检查是否已存在相同的name, version, system, architecture
+        existing_by_composite = Package.query.filter_by(
+            name=package_info['name'],
+            version=package_info['version'],
+            system=package_info['system'],
+            architecture=package_info['architecture']
+        ).first()
+
+        if existing_by_composite:
+            os.remove(temp_path)
+            return jsonify({
+                'success': False,
+                'error': f'已存在相同名称、版本、系统和架构的软件包。请先删除现有软件包（ID: {existing_by_composite.id}），或使用不同的版本号',
+                'existing_package_id': existing_by_composite.id,
+                'existing_package_name': f"{existing_by_composite.name}-{existing_by_composite.version}",
+                'conflict_details': {
+                    'name': package_info['name'],
+                    'version': package_info['version'],
+                    'system': package_info['system'],
+                    'architecture': package_info['architecture']
+                }
             }), 409
 
         # 保存原始包文件
@@ -1219,7 +1242,7 @@ def upload_package():
             original_package_path=original_package_path,
             total_size=total_size,
             file_count=file_count,
-            download_count=0  # 初始化下载次数为0
+            download_count=0
         )
         db.session.add(package)
 
@@ -1231,7 +1254,7 @@ def upload_package():
                 file_name=file_info['file_name'],
                 file_size=file_info['file_size'],
                 storage_path=file_info['storage_path'],
-                download_count=0  # 初始化下载次数为0
+                download_count=0
             )
             db.session.add(file_record)
 
