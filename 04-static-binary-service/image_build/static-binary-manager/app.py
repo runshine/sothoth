@@ -24,45 +24,14 @@ from sqlalchemy import or_, func
 
 
 # ==================== 日志配置 ====================
-
-# 禁用 werkzeug 默认的访问日志
-class NoHealthCheckFilter(logging.Filter):
-    """过滤器：过滤掉健康检查的日志"""
-    def filter(self, record):
-        # 检查是否是访问日志，且路径为 /api/health
-        message = record.getMessage()
-        # 匹配 werkzeug 的访问日志格式
-        if 'GET /api/health HTTP/1.1' in message and '" 200' in message:
-            return False
-        return True
-
-# 配置根日志记录器
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
-
-# 禁用 werkzeug 默认的访问日志处理器
-werkzeug_logger = logging.getLogger('werkzeug')
-werkzeug_logger.setLevel(logging.WARNING)  # 只记录警告和错误
-# 添加过滤器，进一步过滤健康检查
-werkzeug_logger.addFilter(NoHealthCheckFilter())
-
-# 配置应用日志记录器
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-# 创建控制台处理器
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-# 创建格式器
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+logging.basicConfig(
+    level=logging.DEBUG,  # 设置日志级别
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-console_handler.setFormatter(formatter)
 
-# 添加处理器到应用日志记录器
-logger.addHandler(console_handler)
+# 使用示例
+logger = logging.getLogger(__name__)
 
 # ==================== Flask应用初始化 ====================
 # 初始化Flask应用
