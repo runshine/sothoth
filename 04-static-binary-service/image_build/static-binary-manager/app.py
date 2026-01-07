@@ -1438,7 +1438,7 @@ def batch_delete_packages():
                 errors.append(f"软件包 {package_id} 不存在")
                 error_count += 1
                 continue
-
+            logger.info("start delete package: {}".format(package.name))
             try:
                 # 使用独立的事务处理每个删除，避免长事务
                 # 注意：这里我们为每个删除创建新的事务
