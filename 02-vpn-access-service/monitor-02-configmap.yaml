@@ -93,6 +93,7 @@ data:
         log "Route removed successfully"
       else
         log "Failed to remove route"
+        exit 255
         return 1
       fi
     }

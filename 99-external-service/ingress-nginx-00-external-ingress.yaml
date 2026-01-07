@@ -33,6 +33,13 @@ spec:
                 name: static-binary-service
                 port:
                   number: 8081
+          - path: /packages
+            pathType: Prefix
+            backend:
+              service:
+                name: static-binary-service
+                port:
+                  number: 8081
           - path: /script
             pathType: Prefix
             backend:
