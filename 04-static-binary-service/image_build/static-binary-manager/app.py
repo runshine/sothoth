@@ -1464,6 +1464,7 @@ def batch_delete_packages():
                 error_count += 1
                 # 继续处理下一个包
                 continue
+            db.session.commit()
 
         # 提交所有更改
         db.session.commit()
