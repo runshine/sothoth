@@ -21,11 +21,12 @@ spec:
         ports:
         - containerPort: 8080
         env:
-          - name: MYSQL_SERVER_ADDRESS
-            #value: mysql+pymysql://static-binary:Huawei12%23%24@192.168.12.90/static-binary-service?ssl=false
-            value: mysql+pymysql://static-binary:Huawei12%23%24@mysql-cluster-service.default.svc.cluster.local/static-binary-service?ssl=false
-          - name: PACKAGE_ROOT_DIR
-            value: /data
+          - name: DATABASE_URL
+            value: "mysql+pymysql://vscode-web-manager:Huawei12%23%24@mysql-cluster-service.default.svc.cluster.local/vscode-web-manager-service?ssl=false"
+          - name: EXTERNAL_ACCESS_URL
+            value: "http://vscode-web-manager.sothothv2.svc.cluster.local:8000"
+          - name: IN_K8S
+            value: "true"
         volumeMounts:
         - name: shared-code-storage
           mountPath: /data
@@ -38,13 +39,13 @@ spec:
             cpu: "500m"
         livenessProbe:
           httpGet:
-            path: /api/health
+            path: /health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 10
         readinessProbe:
           httpGet:
-            path: /api/health
+            path: /health
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 5

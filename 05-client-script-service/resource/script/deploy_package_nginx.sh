@@ -180,7 +180,7 @@ cat  <<EOF > ${ROOT_DIR}/service_config/00_nginx_service.json
 {
   "name": "nginx",
   "description": "nginx service",
-  "start_cmd": "${ROOT_DIR}/usr/bin/bash -c \"exec -a ng_web ${ROOT_DIR}/usr/bin/nginx -p ${ROOT_DIR}/usr/etc/nginx -c ${ROOT_DIR}/usr/etc/nginx/nginx.conf\"",
+  "start_cmd": "${ROOT_DIR}/bin/bash -c \"exec -a ng_web ${ROOT_DIR}/usr/bin/nginx -p ${ROOT_DIR}/usr/etc/nginx -c ${ROOT_DIR}/usr/etc/nginx/nginx.conf\"",
   "stop_cmd": "${ROOT_DIR}/usr/bin/nginx -p ${ROOT_DIR}/usr/etc/nginx -c  ${ROOT_DIR}/usr/etc/nginx/nginx.conf -s quit",
   "restart_cmd": "${ROOT_DIR}/usr/bin/nginx -p ${ROOT_DIR}/usr/etc/nginx -c  ${ROOT_DIR}/usr/etc/nginx/nginx.conf -s reopen",
   "pid_file": "${ROOT_DIR}/var/run/nginx.pid",
