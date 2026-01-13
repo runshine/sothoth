@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 import base64
 import re
 from kubernetes.stream import stream
+from urllib.parse import quote_plus  # 添加这行
 
 # ============ Kubernetes API 配置示例 ============
 """
@@ -365,13 +366,57 @@ class ProjectTaskLog(Base):
     completed_at = Column(DateTime)
     project = relationship("Project", backref="task_logs")
 
+
 # ============ 数据库连接 ============
+# 创建数据库URL，确保密码正确编码
+def create_database_url():
+    """创建安全的数据库URL"""
+    db_url = Config.DATABASE_URL
+
+    # 如果是MySQL连接，确保密码正确编码
+    if db_url.startswith("mysql"):
+        try:
+            # 解析URL
+            from sqlalchemy.engine.url import make_url
+            url = make_url(db_url)
+
+            # 如果密码需要编码，重新构建URL
+            if url.password:
+                # 重新编码密码
+                encoded_password = quote_plus(url.password)
+
+                # 重建URL
+                url = make_url(
+                    f"mysql+pymysql://{url.username}:{encoded_password}@{url.host}:{url.port}/{url.database}"
+                )
+
+                # 添加查询参数
+                if url.query:
+                    # 保留原有的查询参数
+                    query_str = '&'.join([f"{k}={v}" for k, v in url.query.items()])
+                    return str(url) + f"?{query_str}"
+                return str(url)
+        except Exception as e:
+            print(f"数据库URL解析失败，使用原始URL: {e}")
+
+    return db_url
+
+# 使用安全的数据库URL
+safe_database_url = create_database_url()
+print(f"使用数据库URL: {safe_database_url.split('@')[0]}@{safe_database_url.split('@')[1] if '@' in safe_database_url else safe_database_url}")
+
 engine = create_engine(
-    Config.DATABASE_URL,
+    safe_database_url,  # 使用安全的URL
     poolclass=QueuePool,
     pool_size=5,
     max_overflow=10,
-    connect_args={"check_same_thread": False} if Config.DATABASE_URL.startswith("sqlite") else {}
+    pool_pre_ping=True,  # 添加连接健康检查
+    echo=Config.DEBUG,   # 调试模式下显示SQL
+    connect_args={
+        "ssl": {"ssl_disabled": True} if "ssl=false" in safe_database_url.lower() else {}
+    } if safe_database_url.startswith("mysql") else {}
+    # SQLite的连接参数保持不变
+    # connect_args={"check_same_thread": False} if safe_database_url.startswith("sqlite") else {}
 )
 SessionLocal = sessionmaker(bind=engine)
 
@@ -405,11 +450,15 @@ def init_db():
                 print("创建默认管理员: admin/admin123")
         except Exception as e:
             print(f"创建默认管理员失败: {e}")
+            print(f"错误详情: {type(e).__name__}: {str(e)}")
             db.rollback()
         finally:
             db.close()
     except Exception as e:
-        print(f"初始化数据库失败: {e}")
+        print(f"初始化数据库失败: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()  # 打印详细堆栈信息
+        exit(255)
 
 # ============ 认证工具 ============
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

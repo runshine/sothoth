@@ -22,7 +22,7 @@ spec:
         - containerPort: 8080
         env:
           - name: DATABASE_URL
-            value: "mysql+pymysql://vscode-web-manager:Huawei12%23%24@mysql-cluster-service.default.svc.cluster.local/vscode-web-manager-service?ssl=false"
+            value: mysql+pymysql://vscode-web-manager:Huawei12%23%24@mysql-cluster-service.default.svc.cluster.local/vscode-web-manager-service?ssl=false
           - name: EXTERNAL_ACCESS_URL
             value: "http://vscode-web-manager.sothothv2.svc.cluster.local:8000"
           - name: IN_K8S
