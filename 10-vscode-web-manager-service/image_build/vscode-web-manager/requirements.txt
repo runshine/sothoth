@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+sqlalchemy
+pymysql
+passlib
+python-jose
+python-multipart
+kubernetes
+python-magic
+PyJWT

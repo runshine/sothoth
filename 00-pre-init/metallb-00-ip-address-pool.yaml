@@ -20,4 +20,4 @@ metadata:
 spec:
   addresses:
     - 192.168.12.190-192.168.12.199    # 专门用于固定IP的范围
-  autoAssign: false               # 必须设置为false才能手动分配
+  autoAssign: true               # 必须设置为false才能手动分配

@@ -5,9 +5,9 @@ set -e
 
 # 配置参数
 LOCAL_DIR="./resource"
-PVC_NAME="sothothv2-client-script-service-nfs-pv"
+PVC_NAME="sothothv2-client-script-service-nfs-pvc"
 POD_NAME="copy-pod-$(date +%s)"
-NAMESPACE="default"  # 根据实际情况修改命名空间
+NAMESPACE="sothothv2-ns"  # 根据实际情况修改命名空间
 MOUNT_PATH="/data"
 
 # 颜色定义
@@ -157,12 +157,10 @@ copy_files_to_pvc() {
     local container_name=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.containers[0].name}')
 
     # 清空目标目录（可选）
-    read -p "是否清空PVC中的目标目录 $MOUNT_PATH? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        log_info "清空目标目录..."
-        kubectl exec "$POD_NAME" -n "$NAMESPACE" -c "$container_name" -- sh -c "rm -rf $MOUNT_PATH/* 2>/dev/null || true"
-    fi
+
+    log_info "清空目标目录..."
+    kubectl exec "$POD_NAME" -n "$NAMESPACE" -c "$container_name" -- sh -c "rm -rf $MOUNT_PATH/* 2>/dev/null || true"
+
 
     # 创建目标目录结构（如果需要）
     kubectl exec "$POD_NAME" -n "$NAMESPACE" -c "$container_name" -- mkdir -p "$MOUNT_PATH"

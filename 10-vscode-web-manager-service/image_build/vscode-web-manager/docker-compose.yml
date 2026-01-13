@@ -1,0 +1,94 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: source_manager_db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: source_manager
+      MYSQL_USER: sourceuser
+      MYSQL_PASSWORD: sourcepass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: source_manager_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: source_manager_app
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: mysql+pymysql://sourceuser:sourcepass@mysql/source_manager
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-here}
+      IN_K8S: "false"
+      DEBUG: "true"
+    volumes:
+      - ./data:/data
+      - ./app:/app
+      - /var/run/docker.sock:/var/run/docker.sock  # 用于Docker操作
+      - ${HOME}/.kube/config:/root/.kube/config  # K8S配置
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  celery-worker:
+    build: .
+    container_name: source_manager_celery
+    command: celery -A app.tasks.code_server_creator.celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: mysql+pymysql://sourceuser:sourcepass@mysql/source_manager
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-here}
+      IN_K8S: "false"
+    volumes:
+      - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${HOME}/.kube/config:/root/.kube/config
+    depends_on:
+      - app
+      - redis
+    restart: unless-stopped
+
+  celery-beat:
+    build: .
+    container_name: source_manager_celery_beat
+    command: celery -A app.tasks.code_server_creator.celery_app beat --loglevel=info
+    environment:
+      DATABASE_URL: mysql+pymysql://sourceuser:sourcepass@mysql/source_manager
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-here}
+      IN_K8S: "false"
+    depends_on:
+      - app
+      - redis
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  redis_data:

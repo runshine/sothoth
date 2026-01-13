@@ -8,10 +8,22 @@ metadata:
 spec:
   type: LoadBalancer
   selector:
-    name: "nacos-registry"
+    app: nacos
   ports:
+    - port: 8849
+      targetPort: 8080
+      protocol: TCP
+      name: nacos-registry-8080
     - port: 8848
       targetPort: 8848
       protocol: TCP
-      name: nacos-registry
+      name: nacos-registry-8848
+    - port: 7848
+      targetPort: 7848
+      protocol: TCP
+      name: nacos-registry-7848
+    - port: 9848
+      targetPort: 9848
+      protocol: TCP
+      name: nacos-registry-9848
   loadBalancerIP: "192.168.12.90"  # 必须在static-ips-pool范围内
