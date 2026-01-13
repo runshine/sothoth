@@ -21,6 +21,7 @@ cat  <<EOF > ${ROOT_DIR}/service_config/99_nacos_client_service.json
   "monitor_mode": "monitor",
   "check_interval": 30,
   "max_failures": 2,
-  "depends_on": []
+  "depends_on": [],
+  "shell": true
 }
 EOF

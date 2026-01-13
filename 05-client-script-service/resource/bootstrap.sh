@@ -18,10 +18,10 @@ ulimit -n 65535
 if [ "$ARCH" = "armv7l" ] || [ "$ARCH" = "armv7" ] || [ "$ARCH" = "armv8l" ];then
   if [ "x$(cat /proc/self/maps | grep ld-linux-armhf)" != "x" ];then
     echo "$(date): set current ARCH=armhf"
-    ARCH="armv7l"
+    ARCH="armhf"
   elif [ "x$(cat /proc/self/maps | grep ld-linux.so)" != "x" ];then
     echo "$(date): set current ARCH=armel"
-    ARCH="armv5"
+    ARCH="armel"
   else
     echo "$(date): unable current ARCH, use origin: $ARCH"
   fi
@@ -59,14 +59,14 @@ download() {
     if [ ! -d "$output_dir" ]; then
         mkdir -p "$output_dir" || {
             echo "$(date):错误：无法创建目录 '$output_dir'" >&2
-            return 1
+            exit 255
         }
     fi
     if [ "x${CURL}" != "x" ];then
       if ! "${CURL}" -fL -s -o "$output_file" "$url"; then
             echo "$(date):错误：${CURL}下载失败: $url" >&2
             rm -f "$output_file"  # 删除可能的部分下载文件
-            return 1
+            exit 255
       else
         echo "$(date):下载成功: $url --> $output_file"
       fi
@@ -74,7 +74,7 @@ download() {
       if ! "${WGET}" -q -O "$output_file" "$url"; then
         echo "$(date):错误：${WGET}下载失败: $url" >&2
         rm -f "$output_file"  # 删除可能的部分下载文件
-        return 1
+        exit 255
       else
         echo "$(date):下载成功: $url --> $output_file"
       fi
@@ -84,7 +84,7 @@ download() {
           if ! curl -fL -s -o "$output_file" "$url"; then
               echo "$(date):错误：curl下载失败: $url" >&2
               rm -f "$output_file"  # 删除可能的部分下载文件
-              return 1
+              exit 255
           else
             echo "$(date):下载成功: $url --> $output_file"
           fi
@@ -92,13 +92,13 @@ download() {
           if ! wget -q -O "$output_file" "$url"; then
               echo "$(date):错误：wget下载失败: $url" >&2
               rm -f "$output_file"  # 删除可能的部分下载文件
-              return 1
+              exit 255
           else
             echo "$(date):下载成功: $url --> $output_file"
           fi
       else
           echo "$(date):错误：未找到curl或wget，请安装任一工具" >&2
-          return 1
+          exit 255
       fi
     fi
     return 0
@@ -171,11 +171,49 @@ download_script_file  "script/deploy_package.sh"          "$ROOT_DIR/script/depl
 package_list="base_file sothothv2_agent nginx openvpn ttyd openssh rpcapd docker frida_server nacos_client"
 for package in ${package_list};
 do
+  if [ "$ARCH" = "armel" ] && [ "${package}" = "frida_server" ];then
+    continue
+  fi
   download_script_file "script/deploy_package_${package}.sh" "${ROOT_DIR}/script/deploy_package_${package}.sh"
   "${ROOT_DIR}/script/deploy_package_${package}.sh"
 done
 
-"$ROOT_DIR/bin/sothothv2_agent" -config "$ROOT_DIR/config/sothothv2_agent.ini"
+if [ -d "/usr/lib/systemd/system" ];then
+  echo "$(date): find systemd, enable it for autoboot"
+
+  cat << EOF > /usr/lib/systemd/system/sothothv2.service
+[Unit]
+Description=SothothV2 Service
+After=network.target
+Documentation=https://example.com/sothothv2-docs
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$ROOT_DIR
+ExecStart="$ROOT_DIR/bin/sothothv2_agent" -config "$ROOT_DIR/config/sothothv2_agent.ini" -foreground
+PIDFile=$ROOT_DIR/var/run/sothothv2_agent.pid
+Restart=yes
+KillMode=mixed
+TimeoutSec=300
+
+# 安全相关设置
+#NoNewPrivileges=yes
+#ProtectSystem=strict
+#ProtectHome=read-only
+#PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable sothothv2
+    systemctl start sothothv2
+else
+  echo "$(date): not find systemd, unable enable autoboot, start it maunal: $ROOT_DIR/bin/sothothv2_agent -config $ROOT_DIR/config/sothothv2_agent.ini"
+  "$ROOT_DIR/bin/sothothv2_agent" -config "$ROOT_DIR/config/sothothv2_agent.ini"
+fi
+
 
 exit 0
 

@@ -111,6 +111,7 @@ spec:
   containers:
   - name: busybox
     image: busybox:latest
+    imagePullPolicy: IfNotPresent
     command: ["sh", "-c", "sleep 3600"]
     volumeMounts:
     - name: data-volume

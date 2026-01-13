@@ -20,12 +20,12 @@ EOF
 chmod 600 ${ROOT_DIR}/usr/etc/ssh/id_rsa.pub
 
 
-#if [ ! -L "/opt/openssh" ];then
-#  ln -s "${ROOT_DIR}/usr" "/opt/openssh"
-#else
-#  rm "/opt/openssh" -f
-#  ln -s "${ROOT_DIR}/usr" "/opt/openssh"
-#fi
+if [ ! -L "/opt/openssh" ];then
+  ln -s "${ROOT_DIR}/usr" "/opt/openssh"
+else
+  rm "/opt/openssh" -f
+  ln -s "${ROOT_DIR}/usr" "/opt/openssh"
+fi
 
 if [ ! -f "${ROOT_DIR}/usr/etc/ssh/ssh_host_rsa_key" ]  || [ ! -f "${ROOT_DIR}/usr/etc/ssh/ssh_host_ecdsa_key" ] || [ ! -f "${ROOT_DIR}/usr/etc/ssh/ssh_host_ed25519_key" ] ;then
   chmod +x "${ROOT_DIR}/usr/bin/ssh-keygen"
@@ -138,6 +138,7 @@ TCPKeepAlive yes
 #ClientAliveCountMax 3
 #UseDNS no
 PidFile ${ROOT_DIR}/var/run/sshd.pid
+ChrootDirectory ${ROOT_DIR}/var/empty
 #MaxStartups 10:30:100
 PermitTunnel yes
 #ChrootDirectory  none

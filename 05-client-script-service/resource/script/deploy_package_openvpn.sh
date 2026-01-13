@@ -69,7 +69,7 @@ cat  <<EOF > ${ROOT_DIR}/service_config/01_openvpn_service.json
 {
   "name": "openvpn",
   "description": "openvpn service",
-  "start_cmd": "${ROOT_DIR}/usr/bin/openvpn --config \"${ROOT_DIR}/usr/etc/openvpn/client.ovpn\" --writepid \"$ROOT_DIR/var/run/openvpn.pid\" --iproute  \"$ROOT_DIR/usr/bin/ip\" ",
+  "start_cmd": "${ROOT_DIR}/usr/bin/openvpn --config ${ROOT_DIR}/usr/etc/openvpn/client.ovpn --writepid $ROOT_DIR/var/run/openvpn.pid --iproute  $ROOT_DIR/usr/bin/ip",
   "pid_file": "${ROOT_DIR}/var/run/openvpn.pid",
   "stdout_log": "${ROOT_DIR}/var/log/monitor_openvpn_stdout.log",
   "stderr_log": "${ROOT_DIR}/var/log/monitor_openvpn_stderr.log",
@@ -77,7 +77,8 @@ cat  <<EOF > ${ROOT_DIR}/service_config/01_openvpn_service.json
   "monitor_mode": "self",
   "check_interval": 10,
   "max_failures": 2,
-  "depends_on": []
+  "depends_on": [],
+  "shell": false
 }
 EOF
 
