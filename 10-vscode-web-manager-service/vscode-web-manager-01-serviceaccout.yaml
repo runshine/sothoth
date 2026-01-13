@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: source-manager
+  name: vscode-web-manager
   namespace: vscode
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: source-manager-role
+  name: vscode-web-manager-role
 rules:
   - apiGroups: [""]
     resources: ["pods", "services", "persistentvolumeclaims", "persistentvolumes", "namespaces"]
@@ -28,12 +28,12 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: source-manager-binding
+  name: vscode-web-manager-binding
 subjects:
   - kind: ServiceAccount
-    name: source-manager
+    name: vscode-web-manager
     namespace: vscode
 roleRef:
   kind: ClusterRole
-  name: source-manager-role
+  name: vscode-web-manager-role
   apiGroup: rbac.authorization.k8s.io
