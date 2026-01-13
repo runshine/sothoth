@@ -1,3 +1,6 @@
 [submodule "04-static-binary-service/image_build/static-binary-manager-frontend"]
 	path = 04-static-binary-service/image_build/static-binary-manager-frontend
 	url = https://github.com/runshine/static-binary-manager-frontend.git
+[submodule "10-vscode-web-manager-service/image_build/vscode-web-manager-frontend"]
+	path = 10-vscode-web-manager-service/image_build/vscode-web-manager-frontend
+	url = https://github.com/runshine/vscode-web-manager-frontend.git

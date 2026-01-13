@@ -1,15 +1,15 @@
-name: build-static-binary-manager-image
+name: build-vscode-web-manager-image
 on:
   push:
     branches:
       - 'v2.*'
     paths:
-      - .github/workflows/build-static-binary-manager-image.yml
-      - 04-static-binary-service/image_build/static-binary-manager/*
-      - 04-static-binary-service/image_build/static-binary-manager-frontend/*
-      - 04-static-binary-service/image_build/static-binary-manager-frontend.Dockerfile
+      - .github/workflows/build-vscode-web-manager-image.yml
+      - 10-vscode-web-manager-service/image_build/vscode-web-manager/*
+      - 10-vscode-web-manager-service/image_build/vscode-web-manager-frontend/*
+      - 10-vscode-web-manager-service/image_build/vscode-web-manager-frontend.Dockerfile
 jobs:
-  build-static-binary-manager-image:
+  build-vscode-web-manager-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -37,18 +37,18 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push static-binary-manager-image
+      - name: Build and push vscode-web-manager-image
         uses: docker/build-push-action@v5
         with:
-          context: ./04-static-binary-service/image_build/static-binary-manager/
+          context: ./10-vscode-web-manager-service/image_build/vscode-web-manager/
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            runshine0819/static-binary-manager:latest
-            ghcr.io/runshine/static-binary-manager:latest
-          file: ./04-static-binary-service/image_build/static-binary-manager/Dockerfile
+            runshine0819/vscode-web-manager:latest
+            ghcr.io/runshine/vscode-web-manager:latest
+          file: ./10-vscode-web-manager-service/image_build/vscode-web-manager/Dockerfile
 
-  build-static-binary-manager-frontend-image:
+  build-vscode-web-manager-frontend-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -60,10 +60,10 @@ jobs:
           submodules: 'true'
 
       - name: clean to default
-        run: sed -i 's/https:\/\/develop.819819.xyz//g'   ./04-static-binary-service/image_build/static-binary-manager-frontend/services/packageService.ts
+        run: sed -i 's/https:\/\/developsource.819819.xyz//g'   ./10-vscode-web-manager-service/image_build/vscode-web-manager-frontend/services/api.ts
 
-      - name: cat packageService.ts
-        run: cat ./04-static-binary-service/image_build/static-binary-manager-frontend/services/packageService.ts
+      - name: cat api.ts
+        run: cat ./10-vscode-web-manager-service/image_build/vscode-web-manager-frontend/services/api.ts
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -84,13 +84,13 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push static-binary-manager-frontend-image
+      - name: Build and pushvscode-web-manager-frontend-image
         uses: docker/build-push-action@v5
         with:
-          context: ./04-static-binary-service/image_build/static-binary-manager-frontend/
+          context: ./10-vscode-web-manager-service/image_build/vscode-web-manager-frontend/
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            runshine0819/static-binary-manager-frontend:latest
-            ghcr.io/runshine/static-binary-manager-frontend:latest
-          file: ./04-static-binary-service/image_build/static-binary-manager-frontend.Dockerfile
+            runshine0819/vscode-web-manager-frontend:latest
+            ghcr.io/runshine/vscode-web-manager-frontend:latest
+          file: ./10-vscode-web-manager-service/image_build/vscode-web-manager-frontend.Dockerfile
