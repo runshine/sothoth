@@ -396,7 +396,7 @@ def create_database_url():
                     query_str = '&'.join([f"{k}={v}" for k, v in url.query.items()])
                     return str(url) + f"?{query_str}"
                 else:
-                    str(url) + "?ssl=false"
+                    str = str(url) + "?ssl=false"
                 return str(url)
         except Exception as e:
             print(f"数据库URL解析失败，使用原始URL: {e}")
