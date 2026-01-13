@@ -387,7 +387,7 @@ def create_database_url():
 
                 # 重建URL
                 url = make_url(
-                    f"mysql+pymysql://{url.username}:{encoded_password}@{url.host}:{url.port}/{url.database}"
+                    f"mysql+pymysql://{url.username}:{encoded_password}@{url.host}:{3306 if url.port is None else url.port}/{url.database}"
                 )
 
                 # 添加查询参数
@@ -395,6 +395,8 @@ def create_database_url():
                     # 保留原有的查询参数
                     query_str = '&'.join([f"{k}={v}" for k, v in url.query.items()])
                     return str(url) + f"?{query_str}"
+                else:
+                    str(url) + "?ssl=false"
                 return str(url)
         except Exception as e:
             print(f"数据库URL解析失败，使用原始URL: {e}")
