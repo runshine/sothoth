@@ -5,16 +5,14 @@
 # 部署脚本
 set -e
 
-modprobe nfsd      # NFS服务器守护进程
-modprobe exportfs  # 导出文件系统
-modprobe auth_rpcgss  # 认证支持
-modprobe lockd     # 文件锁
-modprobe nfs_acl
+#modprobe nfsd      # NFS服务器守护进程
+#modprobe exportfs  # 导出文件系统
+#modprobe auth_rpcgss  # 认证支持
+#modprobe lockd     # 文件锁
+#modprobe nfs_acl
+#sysctl -w vm.max_map_count=262144
+#apt-get install -y nfs-common
 
-sysctl -w vm.max_map_count=262144
-
-apt-get install -y nfs-common
-#yum install -y nfs-utils
 
 for file in ./*;
 do
