@@ -18,16 +18,8 @@ spec:
       serviceAccountName: vpn-monitor
       containers:
         - name: monitor
-          image: alpine/kubectl:latest  # 包含kubectl命令
-          command: ["/bin/sh"]
-          args:
-            - -c
-            - |
-              # 安装必要工具
-              sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
-              apk add --no-cache jq iproute2 net-tools vim curl bash grep ipcalc
-              # 运行监控脚本
-              /monitor.sh
+          image: ghcr.io/runshine/vpn-monitor:latest
+          command: ["/monitor.sh"]
           volumeMounts:
             - name: monitor-script
               mountPath: /monitor.sh
