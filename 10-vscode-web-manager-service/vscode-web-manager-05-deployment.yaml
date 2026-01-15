@@ -13,6 +13,7 @@ spec:
       labels:
         name: vscode-web-manager-service
     spec:
+      serviceAccountName: vscode-web-manager
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: vscode-web-manager

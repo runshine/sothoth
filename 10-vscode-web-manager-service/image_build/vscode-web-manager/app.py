@@ -157,49 +157,68 @@ class Config:
         warnings = []
         info = {}
 
-        # 检查是否设置了自定义API URL
-        if cls.K8S_API_URL:
-            info["api_url"] = cls.K8S_API_URL
+        # 检查是否在K8S集群内部运行
+        in_k8s = os.getenv("IN_K8S", "false").lower() == "true"
+        info["in_k8s"] = in_k8s
 
-            # 验证URL格式
-            if not cls.K8S_API_URL.startswith(("http://", "https://")):
-                errors.append(f"K8S_API_URL 必须以 http:// 或 https:// 开头，当前值: {cls.K8S_API_URL}")
+        if in_k8s:
+            # 集群内部运行，使用ServiceAccount token，跳过外部配置验证
+            info["auth_method"] = "serviceaccount"
+            info["api_url"] = "集群内部（使用in-cluster配置）"
 
-            # 检查鉴权配置
-            if cls.K8S_API_TOKEN:
-                # Token认证
-                info["auth_method"] = "token"
-                # 检查Token长度
-                if len(cls.K8S_API_TOKEN) < 10:
-                    warnings.append("K8S_API_TOKEN 长度太短，可能无效")
-            elif cls.K8S_API_CERT and cls.K8S_API_KEY:
-                # 证书认证
-                info["auth_method"] = "certificate"
-                # 检查证书文件是否存在
-                if not os.path.exists(cls.K8S_API_CERT):
-                    errors.append(f"证书文件不存在: {cls.K8S_API_CERT}")
-                if not os.path.exists(cls.K8S_API_KEY):
-                    errors.append(f"密钥文件不存在: {cls.K8S_API_KEY}")
+            # 只需要验证命名空间
+            if not cls.K8S_NAMESPACE or cls.K8S_NAMESPACE.strip() == "":
+                errors.append("K8S_NAMESPACE 不能为空")
             else:
-                # 尝试使用kubeconfig
-                warnings.append("自定义API URL但未提供鉴权信息，将尝试使用kubeconfig")
+                # 检查命名空间格式
+                if not re.match(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', cls.K8S_NAMESPACE):
+                    warnings.append(f"K8S_NAMESPACE 格式可能不正确: {cls.K8S_NAMESPACE}")
+        else:
+            # 集群外部运行，验证外部配置
+            # 检查是否设置了自定义API URL
+            if cls.K8S_API_URL:
+                info["api_url"] = cls.K8S_API_URL
+
+                # 验证URL格式
+                if not cls.K8S_API_URL.startswith(("http://", "https://")):
+                    errors.append(f"K8S_API_URL 必须以 http:// 或 https:// 开头，当前值: {cls.K8S_API_URL}")
+
+                # 检查鉴权配置
+                if cls.K8S_API_TOKEN:
+                    # Token认证
+                    info["auth_method"] = "token"
+                    # 检查Token长度
+                    if len(cls.K8S_API_TOKEN) < 10:
+                        warnings.append("K8S_API_TOKEN 长度太短，可能无效")
+                elif cls.K8S_API_CERT and cls.K8S_API_KEY:
+                    # 证书认证
+                    info["auth_method"] = "certificate"
+                    # 检查证书文件是否存在
+                    if not os.path.exists(cls.K8S_API_CERT):
+                        errors.append(f"证书文件不存在: {cls.K8S_API_CERT}")
+                    if not os.path.exists(cls.K8S_API_KEY):
+                        errors.append(f"密钥文件不存在: {cls.K8S_API_KEY}")
+                else:
+                    # 尝试使用kubeconfig
+                    warnings.append("自定义API URL但未提供鉴权信息，将尝试使用kubeconfig")
+                    info["auth_method"] = "kubeconfig"
+
+                # 检查CA证书文件是否存在
+                if cls.K8S_CA_CERT and not os.path.exists(cls.K8S_CA_CERT):
+                    errors.append(f"CA证书文件不存在: {cls.K8S_CA_CERT}")
+            else:
                 info["auth_method"] = "kubeconfig"
+                info["api_url"] = "使用kubeconfig默认配置"
 
-            # 检查CA证书文件是否存在
-            if cls.K8S_CA_CERT and not os.path.exists(cls.K8S_CA_CERT):
-                errors.append(f"CA证书文件不存在: {cls.K8S_CA_CERT}")
-        else:
-            info["auth_method"] = "kubeconfig"
-            info["api_url"] = "使用kubeconfig默认配置"
+            # 检查K8S命名空间
+            if not cls.K8S_NAMESPACE or cls.K8S_NAMESPACE.strip() == "":
+                errors.append("K8S_NAMESPACE 不能为空")
+            else:
+                # 检查命名空间格式
+                if not re.match(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', cls.K8S_NAMESPACE):
+                    warnings.append(f"K8S_NAMESPACE 格式可能不正确: {cls.K8S_NAMESPACE}")
 
-        # 检查K8S命名空间
-        if not cls.K8S_NAMESPACE or cls.K8S_NAMESPACE.strip() == "":
-            errors.append("K8S_NAMESPACE 不能为空")
-        else:
-            # 检查命名空间格式
-            if not re.match(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', cls.K8S_NAMESPACE):
-                warnings.append(f"K8S_NAMESPACE 格式可能不正确: {cls.K8S_NAMESPACE}")
-
+        # 以下配置在集群内外都需要验证
         # 检查存储类
         if not cls.K8S_STORAGE_CLASS or cls.K8S_STORAGE_CLASS.strip() == "":
             warnings.append("K8S_STORAGE_CLASS 未设置，将使用默认值")
@@ -906,6 +925,12 @@ class KubernetesManager:
         validation_errors = []
 
         try:
+            # 检查是否在K8S集群内部
+            in_k8s = os.getenv("IN_K8S", "false").lower() == "true"
+
+            if in_k8s:
+                logger.info("在Kubernetes集群内部运行，使用ServiceAccount认证")
+
             # 尝试获取K8S版本信息
             try:
                 version_info = client.VersionApi().get_code()
@@ -952,7 +977,7 @@ class KubernetesManager:
                 raise RuntimeError(f"存储类验证失败: {str(e)}")
 
             # 验证服务类型是否有效
-            valid_service_types = ["LoadBalancer", "NodePort", "ClusterIP"]
+            valid_service_types = ["LoadBalager", "NodePort", "ClusterIP"]
             if Config.K8S_SERVICE_TYPE not in valid_service_types:
                 validation_errors.append(f"服务类型无效: {Config.K8S_SERVICE_TYPE}，有效值: {', '.join(valid_service_types)}")
                 raise RuntimeError(f"服务类型无效: {Config.K8S_SERVICE_TYPE}")
@@ -6394,30 +6419,45 @@ def main():
     print(f"项目删除功能: 强制删除所有K8S资源（包括PVC），避免资源泄露")
     print(f"项目ID生成方式：md5(md5(project_name)_md5(压缩包文件))")
 
+    # 检查是否在K8S集群内部运行
+    in_k8s = os.getenv("IN_K8S", "false").lower() == "true"
+    if in_k8s:
+        print("\n=== 运行在Kubernetes集群内部 ===")
+        print("将使用ServiceAccount进行认证")
+
     # 验证K8S配置
     print("\n=== 验证Kubernetes配置 ===")
     k8s_config = Config.validate_k8s_config()
 
-    # 有任何错误或警告都退出程序
+    # 显示配置信息
+    print("配置信息:")
+    for key, value in k8s_config["info"].items():
+        print(f"  • {key}: {value}")
+
+    # 处理警告和错误
     if k8s_config["warnings"]:
-        print("警告:")
+        print("\n警告:")
         for warning in k8s_config["warnings"]:
             print(f"  ⚠ {warning}")
-        print("\nKubernetes配置存在警告，程序将退出")
-        print("请修复以上警告后重试")
-        sys.exit(1)
 
     if k8s_config["errors"]:
-        print("错误:")
+        print("\n错误:")
         for error in k8s_config["errors"]:
             print(f"  ✗ {error}")
         print("\nKubernetes配置验证失败，程序将退出")
         print("请修复以上错误后重试")
         sys.exit(1)
 
-    print("Kubernetes基础配置验证通过:")
-    for key, value in k8s_config["info"].items():
-        print(f"  ✓ {key}: {value}")
+    # 如果有警告，让用户确认是否继续
+    if k8s_config["warnings"] and not in_k8s:
+        print("\n警告: Kubernetes配置存在警告")
+        print("请确认是否继续运行（yes/no）: ")
+        user_input = input().strip().lower()
+        if user_input not in ["yes", "y"]:
+            print("程序退出")
+            sys.exit(0)
+
+    print("\n✓ Kubernetes基础配置验证通过")
 
     print("\n=== 验证HTTP配置 ===")
     http_config = Config.validate_http_config()
@@ -6490,53 +6530,6 @@ def main():
         print(f"\n✗ Kubernetes管理器初始化失败: {e}")
         print("程序将退出")
         sys.exit(1)
-
-    # 初始化任务管理器
-    try:
-        task_manager = TaskManager()
-        print("\n✓ 任务管理器初始化成功")
-    except Exception as e:
-        print(f"✗ 任务管理器初始化失败: {e}")
-        sys.exit(1)
-
-    print("\n=== 项目状态管理API已启用 ===")
-    print("  GET /api/projects/{project_id}/status - 获取项目状态")
-    print("  GET /api/projects/{project_id}/init-logs - 获取项目初始化日志")
-    print("  GET /api/projects/{project_id}/task-logs - 获取项目任务日志列表")
-
-    print("\n=== 项目异步初始化流程 ===")
-    print("  1. 上传压缩包 -> 状态: pending")
-    print("  2. 提交初始化任务 -> 状态: initializing")
-    print("  3. 执行解压、扫描文件、创建PVC、拷贝文件")
-    print("  4. 初始化成功 -> 状态: ready")
-    print("  5. 初始化失败 -> 状态: error")
-
-    print("\n=== PVC管理API已启用 ===")
-    print("  POST /api/projects/{project_id}/pvc/create - 为项目创建PVC")
-    print("  POST /api/projects/{project_id}/pvc/recreate - 重建项目PVC")
-    print("  GET /api/projects/{project_id}/pvc/status - 获取PVC状态")
-    print("  DELETE /api/projects/{project_id}/pvc - 删除项目PVC")
-
-    print("\n=== 部署监控API已启用 ===")
-    print("  GET /api/code-servers/{project_id}/deployment/status - 获取详细部署状态")
-    print("  GET /api/code-servers/{project_id}/deployment/logs - 获取所有相关日志")
-    print("  GET /api/code-servers/{project_id}/deployment/pods - 获取所有Pod信息")
-
-    print("\n=== 项目删除策略 ===")
-    print("  删除项目时强制删除所有资源:")
-    print("  - Code-Server (Deployment, Service, Ingress)")
-    print("  - PVC")
-    print("  - 本地文件 (压缩包、解压目录)")
-    print("  - 数据库记录")
-    print("  确保无资源泄露")
-
-    print("\n=== 启动服务 ===")
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8080,
-        reload=Config.DEBUG
-    )
 
 if __name__ == "__main__":
     main()
