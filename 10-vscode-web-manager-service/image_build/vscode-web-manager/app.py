@@ -861,11 +861,22 @@ class KubernetesManager:
             raise RuntimeError("Kubernetes客户端不可用")
 
         try:
+            logger.info(f"开始初始化Kubernetes客户端...")
+            logger.info(f"IN_K8S环境变量: {os.getenv('IN_K8S', '未设置')}")
+            logger.info(f"K8S_API_URL: {self.api_url}")
+            logger.info(f"K8S_NAMESPACE: {self.namespace}")
+
             if os.getenv("IN_K8S", "false").lower() == "true":
-                config.load_incluster_config()
-                logger.info("使用集群内K8S配置")
+                logger.info("检测到IN_K8S=true，尝试使用集群内配置...")
+                try:
+                    config.load_incluster_config()
+                    logger.info("✓ 使用集群内K8S配置成功")
+                except Exception as e:
+                    logger.error(f"✗ 加载集群内配置失败: {str(e)}")
+                    raise
             elif self.api_url:
                 # 使用自定义API URL和鉴权配置
+                logger.info(f"使用自定义API URL: {self.api_url}")
                 configuration = client.Configuration()
                 configuration.host = self.api_url
 
@@ -874,16 +885,21 @@ class KubernetesManager:
                     # Token认证
                     configuration.api_key['authorization'] = f"Bearer {self.api_token}"
                     configuration.api_key_prefix['authorization'] = 'Bearer'
-                    logger.info(f"使用Token认证访问K8S API: {self.api_url}")
+                    logger.info(f"使用Token认证访问K8S API")
                 elif self.api_cert and self.api_key:
                     # 证书认证
                     configuration.cert_file = self.api_cert
                     configuration.key_file = self.api_key
-                    logger.info(f"使用证书认证访问K8S API: {self.api_url}")
+                    logger.info(f"使用证书认证访问K8S API")
                 else:
                     # 尝试使用kubeconfig
                     logger.warning("自定义API URL但未提供鉴权信息，尝试使用kubeconfig")
-                    config.load_kube_config()
+                    try:
+                        config.load_kube_config()
+                        logger.info("✓ 使用kubeconfig配置成功")
+                    except Exception as e:
+                        logger.error(f"✗ 加载kubeconfig失败: {str(e)}")
+                        raise
 
                 # SSL配置
                 if self.ca_cert:
@@ -892,31 +908,77 @@ class KubernetesManager:
 
                 # 应用配置
                 client.Configuration.set_default(configuration)
-                logger.info(f"使用自定义K8S API URL: {self.api_url}")
+                logger.info(f"✓ 使用自定义K8S API URL配置成功")
             else:
                 # 默认使用kubeconfig
-                config.load_kube_config()
-                logger.info("使用kubeconfig配置")
+                logger.info("未指定API URL，尝试使用kubeconfig配置...")
+                try:
+                    config.load_kube_config()
+                    logger.info("✓ 使用kubeconfig配置成功")
+                except Exception as e:
+                    logger.error(f"✗ 加载kubeconfig失败: {str(e)}")
+                    raise
 
             # 初始化各个API客户端
-            self.core_v1 = client.CoreV1Api()
-            self.apps_v1 = client.AppsV1Api()
-            self.batch_v1 = client.BatchV1Api()
-            self.networking_v1 = client.NetworkingV1Api()
-            self.storage_v1 = client.StorageV1Api()  # 修正：使用StorageV1Api
+            logger.info("初始化Kubernetes API客户端...")
+            try:
+                self.core_v1 = client.CoreV1Api()
+                self.apps_v1 = client.AppsV1Api()
+                self.batch_v1 = client.BatchV1Api()
+                self.networking_v1 = client.NetworkingV1Api()
+                self.storage_v1 = client.StorageV1Api()
+                logger.info("✓ Kubernetes API客户端初始化成功")
+            except Exception as e:
+                logger.error(f"✗ 初始化API客户端失败: {str(e)}")
+                raise
+
             self.available = True
 
             # 验证连接
             if validate_connection:
-                self._validate_connection()
+                logger.info("开始验证Kubernetes连接...")
+                try:
+                    self._validate_connection()
+                    logger.info("✓ Kubernetes连接验证成功")
+                except Exception as e:
+                    logger.error(f"✗ Kubernetes连接验证失败: {str(e)}")
+                    raise
 
-            logger.info(f"Kubernetes客户端初始化成功，命名空间: {self.namespace}")
+            logger.info(f"✓ Kubernetes客户端初始化成功，命名空间: {self.namespace}")
+
         except Exception as e:
-            logger.error(f"Kubernetes客户端初始化失败: {e}")
+            logger.error(f"✗ Kubernetes客户端初始化失败")
+            logger.error(f"错误类型: {type(e).__name__}")
+            logger.error(f"错误信息: {str(e)}")
+
+            # 打印详细的堆栈信息
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"详细堆栈信息:\n{error_details}")
+
             self.available = False
+
+            # 根据不同的异常类型提供更详细的错误信息
+            error_message = "Kubernetes客户端初始化失败"
+            error_details = {"error_type": type(e).__name__, "error": str(e)}
+
+            # 添加特定错误信息
+            if "Unauthorized" in str(e) or "Forbidden" in str(e):
+                error_message = "Kubernetes认证失败"
+                error_details["suggestion"] = "请检查Token、证书或kubeconfig文件的权限"
+            elif "Connection refused" in str(e) or "timed out" in str(e):
+                error_message = "无法连接到Kubernetes API服务器"
+                error_details["suggestion"] = "请检查K8S_API_URL是否正确，网络是否可达"
+            elif "certificate verify failed" in str(e):
+                error_message = "SSL证书验证失败"
+                error_details["suggestion"] = "请检查K8S_CA_CERT证书或设置K8S_VERIFY_SSL=false"
+            elif "No such file or directory" in str(e):
+                error_message = "配置文件或证书文件不存在"
+                error_details["suggestion"] = "请检查证书文件路径是否正确"
+
             raise CodeServerError(
-                message="Kubernetes客户端初始化失败",
-                details={"error": str(e), "api_url": self.api_url},
+                message=error_message,
+                details=error_details,
                 status_code=500
             )
 
@@ -6424,6 +6486,9 @@ def main():
     if in_k8s:
         print("\n=== 运行在Kubernetes集群内部 ===")
         print("将使用ServiceAccount进行认证")
+        print(f"命名空间: {Config.K8S_NAMESPACE}")
+        print(f"存储类: {Config.K8S_STORAGE_CLASS}")
+        print(f"服务类型: {Config.K8S_SERVICE_TYPE}")
 
     # 验证K8S配置
     print("\n=== 验证Kubernetes配置 ===")
@@ -6491,10 +6556,22 @@ def main():
             print("\n=== 严格验证Kubernetes连接和配置 ===")
             try:
                 print("正在连接Kubernetes集群...")
+                print("如果连接失败，请检查以下配置：")
+                if in_k8s:
+                    print("1. 确保ServiceAccount有足够权限")
+                    print("2. 确保命名空间存在")
+                    print("3. 确保存储类存在")
+                else:
+                    print("1. 确保Kubernetes集群正在运行")
+                    print("2. 确保kubeconfig文件正确配置")
+                    print("3. 确保指定的命名空间存在")
+                    print("4. 确保指定的存储类存在")
+                    print("5. 确保有足够权限")
+
                 k8s_manager = KubernetesManager(validate_connection=True)
 
-                print("✓ Kubernetes连接成功")
-                print(f"  集群版本: {k8s_manager.core_v1.api_client.configuration.host}")
+                print("\n✓ Kubernetes连接成功")
+                print(f"  集群版本: 已连接")
                 print(f"  命名空间: {k8s_manager.namespace} (已存在)")
                 print(f"  存储类: {k8s_manager.storage_class} (已存在)")
                 print(f"  服务类型: {Config.K8S_SERVICE_TYPE}")
@@ -6509,27 +6586,67 @@ def main():
                 except:
                     pass
 
+            except CodeServerError as e:
+                print(f"\n✗ Kubernetes连接或配置验证失败: {e.message}")
+                print(f"\n错误详情:")
+                if e.details:
+                    for key, value in e.details.items():
+                        print(f"  {key}: {value}")
+
+                print(f"\n状态码: {e.status_code}")
+                print(f"\n请检查以下配置:")
+
+                if in_k8s:
+                    print("1. 确保ServiceAccount有足够权限")
+                    print("2. 确保命名空间存在且可访问")
+                    print("3. 确保存储类存在")
+                    print("4. 检查Pod的ServiceAccount配置")
+                else:
+                    print("1. 确保Kubernetes集群正在运行")
+                    print("2. 确保kubeconfig文件正确配置（默认~/.kube/config）")
+                    print("3. 确保指定的命名空间存在")
+                    print("4. 确保指定的存储类存在")
+                    print("5. 确保有足够权限创建资源")
+
+                print("\n常见问题解决:")
+                print("1. 检查网络连接: ping <k8s-api-server>")
+                print("2. 检查证书: openssl s_client -connect <k8s-api-server>:6443")
+                print("3. 检查kubectl配置: kubectl cluster-info")
+                print("4. 检查权限: kubectl auth can-i create deployment")
+
+                sys.exit(1)
             except Exception as e:
                 print(f"\n✗ Kubernetes连接或配置验证失败: {str(e)}")
-                print("\n详细错误信息:")
-                print("-" * 50)
-                print(str(e))
-                print("-" * 50)
-                print("\n请检查以下配置:")
-                print("1. 确保Kubernetes集群正在运行")
-                print("2. 确保~/.kube/config文件正确配置")
-                print("3. 确保指定的命名空间存在")
-                print("4. 确保指定的存储类存在")
-                print("5. 确保ServiceAccount有足够权限")
+                print(f"\n错误类型: {type(e).__name__}")
+
+                import traceback
+                print(f"\n详细堆栈信息:")
+                print("-" * 80)
+                traceback.print_exc()
+                print("-" * 80)
+
                 sys.exit(1)
         else:
-            print("\n错误: kubernetes-client 未安装，程序将退出")
+            print("\n警告: kubernetes-client 未安装")
             print("如需使用Code-Server功能，请安装: pip install kubernetes")
-            sys.exit(1)
+            print("程序将继续运行，但K8S功能不可用")
+            k8s_manager = None
     except Exception as e:
         print(f"\n✗ Kubernetes管理器初始化失败: {e}")
         print("程序将退出")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
+
+    # 初始化任务管理器
+    try:
+        task_manager = TaskManager()
+        print("\n✓ 任务管理器初始化成功")
+    except Exception as e:
+        print(f"✗ 任务管理器初始化失败: {e}")
+        sys.exit(1)
+
+    # 后续代码保持不变...
 
 if __name__ == "__main__":
     main()
