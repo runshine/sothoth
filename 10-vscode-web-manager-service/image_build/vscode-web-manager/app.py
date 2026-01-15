@@ -1039,7 +1039,7 @@ class KubernetesManager:
                 raise RuntimeError(f"存储类验证失败: {str(e)}")
 
             # 验证服务类型是否有效
-            valid_service_types = ["LoadBalager", "NodePort", "ClusterIP"]
+            valid_service_types = ["LoadBalancer", "NodePort", "ClusterIP"]
             if Config.K8S_SERVICE_TYPE not in valid_service_types:
                 validation_errors.append(f"服务类型无效: {Config.K8S_SERVICE_TYPE}，有效值: {', '.join(valid_service_types)}")
                 raise RuntimeError(f"服务类型无效: {Config.K8S_SERVICE_TYPE}")

@@ -9,21 +9,49 @@ kind: ClusterRole
 metadata:
   name: vscode-web-manager-role
 rules:
-  - apiGroups: [""]
-    resources: ["pods", "services", "persistentvolumeclaims", "persistentvolumes", "namespaces"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # 允许管理Deployment
   - apiGroups: ["apps"]
-    resources: ["deployments", "statefulsets", "replicasets"]
+    resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["batch"]
-    resources: ["jobs", "cronjobs"]
+  # 允许管理Service
+  - apiGroups: [""]
+    resources: ["services"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # 允许管理Ingress
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # 允许管理Pod（用于日志和状态检查）
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # 允许管理PVC
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # 允许管理Job（用于文件拷贝和解压）
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # 允许查看节点信息（用于NodePort服务）
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list"]
+  # 允许查看命名空间（用于验证）
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  # 允许查看存储类（用于验证）
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list"]
+  # 允许查看事件（用于调试）
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
