@@ -4,9 +4,10 @@ set -e
 
 ARCH="$(uname -m)"
 OS="linux"
-WORKSPACE="$1"
-UPSTREAM="$2"
-TARGET_DIR="$3"
+WORKSPACE=""
+UPSTREAM=""
+TARGET_DIR=""
+FORCE_DOWNLOAD=""
 
 unset http_proxy
 unset https_proxy
@@ -14,6 +15,58 @@ unset HTTP_PROXY
 unset HTTPS_PROXY
 
 ulimit -n 65535
+
+# 参数解析函数
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -w|--workspace)
+                WORKSPACE="$2"
+                shift 2
+                ;;
+            -u|--upstream)
+                UPSTREAM="$2"
+                shift 2
+                ;;
+            -t|--target-dir)
+                TARGET_DIR="$2"
+                shift 2
+                ;;
+            -f|--force)
+                FORCE_DOWNLOAD="true"
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                echo "$(date): 未知参数: $1" >&2
+                echo "使用 -h 或 --help 查看帮助信息" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# 显示帮助信息
+show_help() {
+    echo "用法: $0 [选项]"
+    echo ""
+    echo "选项:"
+    echo "  -w, --workspace <工作空间>    设置工作空间ID"
+    echo "  -u, --upstream <上游地址>      设置上游服务器地址 (格式: host:port)"
+    echo "  -t, --target-dir <目标目录>    设置目标安装目录"
+    echo "  -f, --force                    强制重新下载文件"
+    echo "  -h, --help                    显示此帮助信息"
+    echo ""
+    echo "示例:"
+    echo "  $0 -w my-workspace -u server.example.com:8080 -t /opt/sothoth"
+    echo "  $0 --workspace my-workspace --upstream server.example.com:8080 --target-dir /opt/sothoth"
+}
+
+# 解析命令行参数
+parse_args "$@"
 
 if [ "$ARCH" = "armv7l" ] || [ "$ARCH" = "armv7" ] || [ "$ARCH" = "armv8l" ];then
   if [ "x$(cat /proc/self/maps | grep ld-linux-armhf)" != "x" ];then
@@ -124,11 +177,14 @@ download_script_file(){
   fi
 }
 
+# 参数检查
 if [ "x${WORKSPACE}" = "x" ] || [ "x${UPSTREAM}" = "x" ] || [ "x${TARGET_DIR}" = "x" ];then
-  echo "$(date): bootstrap script args check failed"
-  echo "$(date): WORKSPACE=${WORKSPACE}"
-  echo "$(date): UPSTREAM=${UPSTREAM}"
-  echo "$(date): TARGET_DIR=${TARGET_DIR}"
+  echo "$(date): 参数检查失败" >&2
+  echo "$(date): WORKSPACE=${WORKSPACE}" >&2
+  echo "$(date): UPSTREAM=${UPSTREAM}" >&2
+  echo "$(date): TARGET_DIR=${TARGET_DIR}" >&2
+  echo "" >&2
+  show_help
   exit 255
 fi
 
@@ -213,7 +269,6 @@ else
   echo "$(date): not find systemd, unable enable autoboot, start it maunal: $ROOT_DIR/bin/sothothv2_agent -config $ROOT_DIR/config/sothothv2_agent.ini"
   "$ROOT_DIR/bin/sothothv2_agent" -config "$ROOT_DIR/config/sothothv2_agent.ini"
 fi
-
 
 exit 0
 

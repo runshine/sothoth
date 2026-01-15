@@ -4,8 +4,11 @@ metadata:
   name: mysql-cluster-service
   namespace: default
   annotations:
-    metallb.universe.tf/allow-shared-ip: "true"  # 可选：允许IP共享
+    metallb.io/allow-shared-ip: "shared-192.168.12.90"   # 可选：允许IP共享
 spec:
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
   type: LoadBalancer
   selector:
     component: mysqlrouter
