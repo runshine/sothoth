@@ -368,43 +368,10 @@ class ProjectTaskLog(Base):
 
 
 # ============ 数据库连接 ============
-# 创建数据库URL，确保密码正确编码
-def create_database_url():
-    """创建安全的数据库URL"""
-    db_url = Config.DATABASE_URL
-
-    # 如果是MySQL连接，确保密码正确编码
-    if db_url.startswith("mysql"):
-        try:
-            # 解析URL
-            from sqlalchemy.engine.url import make_url
-            url = make_url(db_url)
-
-            # 如果密码需要编码，重新构建URL
-            if url.password:
-                # 重新编码密码
-                encoded_password = quote_plus(url.password)
-
-                # 重建URL
-                url = make_url(
-                    f"mysql+pymysql://{url.username}:{encoded_password}@{url.host}:{3306 if url.port is None else url.port}/{url.database}"
-                )
-
-                # 添加查询参数
-                if url.query:
-                    # 保留原有的查询参数
-                    query_str = '&'.join([f"{k}={v}" for k, v in url.query.items()])
-                    return str(url) + f"?{query_str}"
-                else:
-                    return str(url) + "?ssl=false"
-        except Exception as e:
-            print(f"数据库URL解析失败，使用原始URL: {e}")
-
-    return db_url
 
 # 使用安全的数据库URL
-safe_database_url = create_database_url()
-print(f"使用数据库URL: {safe_database_url.split('@')[0]}@{safe_database_url.split('@')[1] if '@' in safe_database_url else safe_database_url}")
+safe_database_url = Config.DATABASE_URL
+print(f"使用数据库URL: {safe_database_url}")
 
 engine = create_engine(
     safe_database_url,  # 使用安全的URL
@@ -414,8 +381,9 @@ engine = create_engine(
     pool_pre_ping=True,  # 添加连接健康检查
     echo=Config.DEBUG,   # 调试模式下显示SQL
     connect_args={
-        "ssl": {"ssl_disabled": True} if "ssl=false" in safe_database_url.lower() else {}
-    } if safe_database_url.startswith("mysql") else {}
+        'ssl': False,
+        'connect_timeout': 10
+    } if safe_database_url.startswith("mysql") else {"check_same_thread": False}
     # SQLite的连接参数保持不变
     # connect_args={"check_same_thread": False} if safe_database_url.startswith("sqlite") else {}
 )
