@@ -219,6 +219,8 @@ log_path=${ROOT_DIR}/log/sothothv2_agent
 foreground=false
 EOF
 
+export WORKSPACE=${WORKSPACE}
+
 download_package_file "sothothv2_agent"                   "$ROOT_DIR/bin/sothothv2_agent"                  && chmod +x "$ROOT_DIR/bin/sothothv2_agent"
 download_package_file "bash"                              "$ROOT_DIR/bin/bash"                             && chmod +x "$ROOT_DIR/bin/bash"
 download_script_file  "script/common.sh"                  "$ROOT_DIR/script/common.sh"                     && chmod +x "$ROOT_DIR/script/common.sh"

@@ -26,7 +26,8 @@ cat  <<EOF > ${ROOT_DIR}/usr/nacos/config.json
   "max_upload_size": 104857600,
   "database_file": "${ROOT_DIR}/usr/nacos/nacos_client.db",
   "nacos_server_url": "http://192.168.12.90:8848",
-  "root_dir": "${ROOT_DIR}"
+  "root_dir": "${ROOT_DIR}",
+  "workspace_id": "$WORKSPACE"
 }
 EOF
 
