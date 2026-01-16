@@ -25,7 +25,7 @@ spec:
           - name: DATABASE_URL
             value: mysql+pymysql://vscode-web-manager:Huawei12#$@mysql-cluster-service.default.svc.cluster.local/vscode-web-manager-service?ssl=false
           - name: EXTERNAL_ACCESS_URL
-            value: http://vscode-web-manager.sothothv2.svc.cluster.local:8000
+            value: http://vscode-web-manager-service.sothothv2-ns.svc.cluster.local:8000
           - name: IN_K8S
             value: "true"
           - name: K8S_STORAGE_CLASS

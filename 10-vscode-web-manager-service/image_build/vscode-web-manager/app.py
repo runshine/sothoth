@@ -1498,25 +1498,42 @@ class KubernetesManager:
                                     name=pod.metadata.name,
                                     namespace=self.namespace,
                                     container="download-extract",
-                                    tail_lines=30
+                                    tail_lines=50  # 获取更多日志用于记录
                                 )
-                                logger.info(f"下载解压任务日志(最后30行):\n{log_content}")
-                        except:
-                            pass
+                                logger.info(f"下载解压任务成功日志(最后50行):\n{log_content}")
+                        except Exception as log_error:
+                            logger.warning(f"获取成功日志失败: {log_error}")
 
                         return True
 
                     elif job_status.status.failed:
                         logger.error(f"下载解压任务失败: {job_name}")
 
-                        # 获取失败原因和日志
-                        error_details = []
+                        # 详细记录失败信息
+                        error_details = {
+                            "project_id": project_id,
+                            "job_name": job_name,
+                            "download_url": download_url,
+                            "pvc_name": pvc_name,
+                            "archive_filename": archive_filename,
+                            "archive_size": file_size,
+                            "error_timestamp": datetime.now(timezone.utc).isoformat()
+                        }
+
+                        pods_details = []
                         pods = self.core_v1.list_namespaced_pod(
                             namespace=self.namespace,
                             label_selector=f"job-name={job_name}"
                         )
 
                         for pod in pods.items:
+                            pod_detail = {
+                                "pod_name": pod.metadata.name,
+                                "pod_status": pod.status.phase,
+                                "creation_timestamp": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else None,
+                                "containers": []
+                            }
+
                             try:
                                 pod_status = self.core_v1.read_namespaced_pod_status(
                                     name=pod.metadata.name, namespace=self.namespace
@@ -1524,43 +1541,104 @@ class KubernetesManager:
 
                                 if pod_status.status.container_statuses:
                                     for container in pod_status.status.container_statuses:
+                                        container_detail = {
+                                            "container_name": container.name,
+                                            "ready": container.ready,
+                                            "restart_count": container.restart_count,
+                                            "image": container.image
+                                        }
+
                                         if container.state.terminated and container.state.terminated.exit_code != 0:
+                                            container_detail.update({
+                                                "exit_code": container.state.terminated.exit_code,
+                                                "reason": container.state.terminated.reason,
+                                                "message": container.state.terminated.message,
+                                                "started_at": container.state.terminated.started_at.isoformat() if container.state.terminated.started_at else None,
+                                                "finished_at": container.state.terminated.finished_at.isoformat() if container.state.terminated.finished_at else None
+                                            })
+
                                             # 获取容器日志
                                             try:
                                                 log_content = self.core_v1.read_namespaced_pod_log(
                                                     name=pod.metadata.name,
                                                     namespace=self.namespace,
                                                     container=container.name,
-                                                    tail_lines=100
+                                                    tail_lines=200  # 获取更多日志用于诊断
                                                 )
-                                                error_details.append({
-                                                    "pod": pod.metadata.name,
-                                                    "container": container.name,
-                                                    "exit_code": container.state.terminated.exit_code,
-                                                    "reason": container.state.terminated.reason,
-                                                    "message": container.state.terminated.message,
-                                                    "logs": log_content
-                                                })
-                                            except:
-                                                error_details.append({
-                                                    "pod": pod.metadata.name,
-                                                    "container": container.name,
-                                                    "exit_code": container.state.terminated.exit_code,
-                                                    "reason": container.state.terminated.reason,
-                                                    "message": container.state.terminated.message
-                                                })
-                            except:
-                                continue
+                                                container_detail["logs"] = log_content
 
+                                                # 记录关键错误信息
+                                                error_lines = []
+                                                for line in log_content.split('\n'):
+                                                    line_lower = line.lower()
+                                                    if any(keyword in line_lower for keyword in ['error', 'failed', 'exit', 'failed to', 'unable to', 'cannot']):
+                                                        error_lines.append(line.strip())
+
+                                                if error_lines:
+                                                    container_detail["error_lines"] = error_lines[:10]  # 只保留前10个错误行
+
+                                            except Exception as log_error:
+                                                container_detail["log_error"] = str(log_error)
+
+                                        elif container.state.waiting:
+                                            container_detail.update({
+                                                "state": "waiting",
+                                                "reason": container.state.waiting.reason,
+                                                "message": container.state.waiting.message
+                                            })
+
+                                        pod_detail["containers"].append(container_detail)
+                            except Exception as pod_error:
+                                pod_detail["pod_error"] = str(pod_error)
+
+                            pods_details.append(pod_detail)
+
+                        error_details["pods"] = pods_details
+
+                        # 获取Job事件信息
+                        try:
+                            events = self.core_v1.list_namespaced_event(
+                                namespace=self.namespace,
+                                field_selector=f"involvedObject.name={job_name},involvedObject.kind=Job"
+                            )
+
+                            job_events = []
+                            for event in events.items[:10]:  # 只取最近10个事件
+                                job_events.append({
+                                    "type": event.type,
+                                    "reason": event.reason,
+                                    "message": event.message,
+                                    "count": event.count,
+                                    "first_timestamp": event.first_timestamp.isoformat() if event.first_timestamp else None,
+                                    "last_timestamp": event.last_timestamp.isoformat() if event.last_timestamp else None
+                                })
+
+                            if job_events:
+                                error_details["job_events"] = job_events
+                        except Exception as event_error:
+                            error_details["events_error"] = str(event_error)
+
+                        # 记录详细的错误信息到日志
+                        logger.error(f"PVC拷贝失败详细信息:")
+                        logger.error(f"项目ID: {project_id}")
+                        logger.error(f"Job名称: {job_name}")
+                        logger.error(f"下载URL: {download_url}")
+                        logger.error(f"PVC名称: {pvc_name}")
+                        logger.error(f"压缩包: {archive_filename} ({file_size} 字节)")
+
+                        for pod_detail in pods_details:
+                            logger.error(f"Pod: {pod_detail['pod_name']}, 状态: {pod_detail['pod_status']}")
+                            for container in pod_detail.get('containers', []):
+                                if 'exit_code' in container:
+                                    logger.error(f"  容器 {container['container_name']}: 退出代码 {container['exit_code']}, 原因: {container.get('reason', '未知')}")
+                                    if 'error_lines' in container:
+                                        for error_line in container['error_lines']:
+                                            logger.error(f"    错误: {error_line}")
+
+                        # 抛出详细的错误信息
                         raise CodeServerError(
                             message="通过HTTP下载并解压文件到PVC失败",
-                            details={
-                                "project_id": project_id,
-                                "job_name": job_name,
-                                "download_url": download_url,
-                                "pvc_name": pvc_name,
-                                "errors": error_details
-                            },
+                            details=error_details,
                             status_code=500
                         )
 
@@ -1568,30 +1646,45 @@ class KubernetesManager:
                     logger.warning(f"获取任务状态失败: {e}")
                     continue
 
+            # 如果超时，记录详细错误
+            timeout_details = {
+                "project_id": project_id,
+                "job_name": job_name,
+                "download_url": download_url,
+                "pvc_name": pvc_name,
+                "archive_filename": archive_filename,
+                "timeout_seconds": max_wait_time,
+                "last_known_status": last_status,
+                "error_timestamp": datetime.now(timezone.utc).isoformat()
+            }
+
+            logger.error(f"PVC拷贝任务超时: {timeout_details}")
+
             raise CodeServerError(
                 message="下载解压文件超时",
-                details={
-                    "project_id": project_id,
-                    "job_name": job_name,
-                    "download_url": download_url,
-                    "pvc_name": pvc_name,
-                    "timeout_seconds": max_wait_time
-                },
+                details=timeout_details,
                 status_code=504
             )
 
         except CodeServerError:
+            # 重新抛出，保留原有异常
             raise
         except Exception as e:
             logger.error(f"创建下载解压任务失败: {e}")
+
+            # 记录创建任务时的错误
+            creation_error_details = {
+                "project_id": project_id,
+                "archive_path": archive_path,
+                "pvc_name": pvc_name,
+                "error_type": type(e).__name__,
+                "error": str(e),
+                "error_timestamp": datetime.now(timezone.utc).isoformat()
+            }
+
             raise CodeServerError(
                 message="创建文件下载解压任务失败",
-                details={
-                    "project_id": project_id,
-                    "archive_path": archive_path,
-                    "pvc_name": pvc_name,
-                    "error": str(e)
-                },
+                details=creation_error_details,
                 status_code=500
             )
 
@@ -2760,6 +2853,73 @@ def delete_project_task(project_id: str, user_id: int):
             task_logger.info("Code-Server数据库记录删除成功")
         else:
             task_logger.info("未发现Code-Server")
+
+        # 步骤1.5: 清理可能残留的初始化PVC的Job（新增）
+        task_logger.info("步骤1.5: 检查并清理可能残留的初始化PVC的Job")
+        if K8S_AVAILABLE:
+            try:
+                k8s = KubernetesManager(validate_connection=False)
+                if k8s.available:
+                    # 查找与项目相关的Job
+                    job_name_prefix = f"extract-{project_id[:8]}"
+                    job_name_prefix = re.sub(r'[^a-z0-9-]', '-', job_name_prefix.lower())
+
+                    try:
+                        # 查找所有job
+                        all_jobs = k8s.batch_v1.list_namespaced_job(
+                            namespace=k8s.namespace,
+                            label_selector=f"project-id={project_id}"
+                        )
+
+                        for job in all_jobs.items:
+                            job_name = job.metadata.name
+                            task_logger.info(f"发现相关Job: {job_name}")
+
+                            try:
+                                # 删除Job
+                                k8s.batch_v1.delete_namespaced_job(
+                                    name=job_name,
+                                    namespace=k8s.namespace,
+                                    propagation_policy="Background"  # 同时删除相关的Pod
+                                )
+                                task_logger.info(f"已删除Job: {job_name}")
+
+                                # 等待Job删除完成
+                                for i in range(10):
+                                    time.sleep(1)
+                                    try:
+                                        k8s.batch_v1.read_namespaced_job(
+                                            name=job_name,
+                                            namespace=k8s.namespace
+                                        )
+                                    except ApiException as e:
+                                        if e.status == 404:
+                                            task_logger.info(f"Job删除确认: {job_name}")
+                                            break
+                                        else:
+                                            task_logger.warning(f"检查Job状态失败: {e}")
+                                    except Exception as e:
+                                        task_logger.warning(f"检查Job状态异常: {str(e)}")
+
+                            except ApiException as e:
+                                if e.status == 404:
+                                    task_logger.info(f"Job已不存在: {job_name}")
+                                else:
+                                    task_logger.warning(f"删除Job失败: {job_name}, 错误: {e}")
+                            except Exception as e:
+                                task_logger.warning(f"删除Job异常: {job_name}, 错误: {str(e)}")
+
+                    except ApiException as e:
+                        if e.status != 404:
+                            task_logger.warning(f"查询Job列表失败: {e}")
+                    except Exception as e:
+                        task_logger.warning(f"查询Job列表异常: {str(e)}")
+                else:
+                    task_logger.warning("Kubernetes客户端不可用，跳过Job清理")
+            except Exception as e:
+                task_logger.warning(f"Kubernetes客户端初始化失败，跳过Job清理: {str(e)}")
+        else:
+            task_logger.warning("Kubernetes功能不可用，跳过Job清理")
 
         # 步骤2: 删除PVC（如果存在）
         task_logger.info("步骤2: 检查并删除PVC")
