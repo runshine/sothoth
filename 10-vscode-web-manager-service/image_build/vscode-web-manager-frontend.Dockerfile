@@ -16,6 +16,8 @@ COPY . .
 # 构建应用
 RUN npm run build
 
+RUN ls -lRt /app/dist
+
 # 运行阶段 - 使用nginx
 FROM nginx:alpine
 
