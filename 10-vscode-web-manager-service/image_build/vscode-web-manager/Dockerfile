@@ -26,7 +26,7 @@ COPY . .
 RUN mkdir -p /data/uploads /data/projects /data/archives
 
 # 暴露端口
-EXPOSE 8000
+EXPOSE 8080
 
 # 启动命令
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "app.py"]

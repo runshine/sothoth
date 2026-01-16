@@ -67,28 +67,7 @@ data:
                 proxy_buffering on;
                 proxy_request_buffering on;
             }
-    
-            # /packages 前缀提供静态文件服务
-            location /packages/ {
-                alias /data/;
-                autoindex on;
-    
-                # 安全设置：防止目录遍历
-                # internal;
-    
-                # 缓存设置
-                expires 1h;
-                add_header Cache-Control "public, immutable";
-    
-                # 安全头部
-                add_header X-Content-Type-Options nosniff;
-                add_header X-Frame-Options DENY;
-                add_header X-XSS-Protection "1; mode=block";
-    
-                # 如果文件不存在返回404
-                try_files $uri $uri/ =404;
-            }
-    
+          
             # 处理React Router的路由问题（主应用）
             location / {
                 try_files $uri $uri/ /index.html;

@@ -6646,7 +6646,45 @@ def main():
         print(f"✗ 任务管理器初始化失败: {e}")
         sys.exit(1)
 
-    # 后续代码保持不变...
+    print("\n=== 项目状态管理API已启用 ===")
+    print("  GET /api/projects/{project_id}/status - 获取项目状态")
+    print("  GET /api/projects/{project_id}/init-logs - 获取项目初始化日志")
+    print("  GET /api/projects/{project_id}/task-logs - 获取项目任务日志列表")
+
+    print("\n=== 项目异步初始化流程 ===")
+    print("  1. 上传压缩包 -> 状态: pending")
+    print("  2. 提交初始化任务 -> 状态: initializing")
+    print("  3. 执行解压、扫描文件、创建PVC、拷贝文件")
+    print("  4. 初始化成功 -> 状态: ready")
+    print("  5. 初始化失败 -> 状态: error")
+
+    print("\n=== PVC管理API已启用 ===")
+    print("  POST /api/projects/{project_id}/pvc/create - 为项目创建PVC")
+    print("  POST /api/projects/{project_id}/pvc/recreate - 重建项目PVC")
+    print("  GET /api/projects/{project_id}/pvc/status - 获取PVC状态")
+    print("  DELETE /api/projects/{project_id}/pvc - 删除项目PVC")
+
+    print("\n=== 部署监控API已启用 ===")
+    print("  GET /api/code-servers/{project_id}/deployment/status - 获取详细部署状态")
+    print("  GET /api/code-servers/{project_id}/deployment/logs - 获取所有相关日志")
+    print("  GET /api/code-servers/{project_id}/deployment/pods - 获取所有Pod信息")
+
+    print("\n=== 项目删除策略 ===")
+    print("  删除项目时强制删除所有资源:")
+    print("  - Code-Server (Deployment, Service, Ingress)")
+    print("  - PVC")
+    print("  - 本地文件 (压缩包、解压目录)")
+    print("  - 数据库记录")
+    print("  确保无资源泄露")
+
+    print("\n=== 启动服务 ===")
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8080,
+        reload=Config.DEBUG
+    )
+
 
 if __name__ == "__main__":
     main()
