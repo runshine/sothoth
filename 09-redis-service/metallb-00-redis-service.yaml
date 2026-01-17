@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-service
+  namespace: sothothv2-ns
+  annotations:
+    metallb.io/allow-shared-ip: "shared-192.168.12.90"   # 可选：允许IP共享
+spec:
+  ipFamilies:
+    - IPv4
+  ipFamilyPolicy: SingleStack
+  type: LoadBalancer
+  selector:
+    app: redis-service
+  ports:
+    - port: 6379
+      targetPort: 6379
+      protocol: TCP
+  # 关键：在spec中指定loadBalancerIP
+  loadBalancerIP: "192.168.12.90"  # 必须在static-ips-pool范围内
+
+
+
