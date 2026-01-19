@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
     # 编译工具链
     gcc g++ clang llvm \
     # 调试工具
-    gdb lldb strace ltrace \
+    gdb lldb strace \
     # 系统工具
     procps psmisc htop net-tools iproute2 \
     # Python环境
