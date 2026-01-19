@@ -1,0 +1,4 @@
+elasticsearch>=8.0.0
+python-json-logger>=2.0.0
+cachetools>=5.0.0
+prometheus-client>=0.14.0

@@ -29,7 +29,7 @@ RUN apt-get update && apt-get install -y \
 
 # 安装Python依赖
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
 # 创建工作目录
 WORKDIR ${WORKDIR}

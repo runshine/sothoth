@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  tetragon-monitor:
+    image: ghcr.io/runshine/tetragon-monitor:latest  #
+    container_name: tetragon-monitor
+    privileged: true
+    network_mode: host  # 需要主机网络来监控所有进程
+    pid: host  # 共享PID命名空间
+    cap_add:
+      - SYS_ADMIN
+      - NET_ADMIN
+      - SYS_PTRACE
+      - BPF
+    volumes:
+      # 挂载BPF文件系统和内核调试文件系统
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      # 挂载主机根目录以监控所有文件访问
+      - /:/rootfs:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # 持久化存储
+      - tetragon-data:/var/run/tetragon
+      - tetragon-logs:/var/log/tetragon
+    environment:
+      # Tetragon配置
+      - TETRAGON_LOG_LEVEL=${TETRAGON_LOG_LEVEL:-info}
+      - EVENTS_INTERVAL_MS=${EVENTS_INTERVAL_MS:-100}
+
+      # 去重配置
+      - DEDUP_ENABLED=${DEDUP_ENABLED:-true}
+      - DEDUP_WINDOW_MINUTES=${DEDUP_WINDOW_MINUTES:-5}
+      - CACHE_MAX_SIZE=${CACHE_MAX_SIZE:-10000}
+
+      # Elasticsearch配置
+      - ES_ENABLED=${ES_ENABLED:-false}
+      - ES_HOST=${ES_HOST:-elasticsearch}
+      - ES_PORT=${ES_PORT:-9200}
+      - ES_SCHEME=${ES_SCHEME:-http}
+      - ES_USER=${ES_USER:-}
+      - ES_PASSWORD=${ES_PASSWORD:-}
+      - ES_INDEX=${ES_INDEX:-tetragon-events}
+      - ES_VERIFY_CERTS=${ES_VERIFY_CERTS:-false}
+      - ES_CA_CERTS=${ES_CA_CERTS:-}
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  tetragon-data:
+  tetragon-logs:
