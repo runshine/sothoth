@@ -31,7 +31,8 @@ spec:
           - name: K8S_STORAGE_CLASS
             value: nfs-storage-192.168.13.66
           - name: K8S_CODE_SERVER_IMAGE
-            value: linuxserver/code-server:latest
+#            value: linuxserver/code-server:latest
+            value: lubcorzexc/deepsight-codeserver:latest
           - name: K8S_DEFAULT_STORAGE_SIZE
             value: 100Gi
         volumeMounts:

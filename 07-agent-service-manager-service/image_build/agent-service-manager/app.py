@@ -2,6 +2,7 @@
 """
 WEB API服务器 - Docker Compose服务管理中心
 增强版本：修复分布式锁问题，增强连接检查
+支持多种压缩格式：.zip, .tar, .tar.gz, .tgz, .tar.bz2, .tbz, .tbz2, .tar.xz, .txz
 """
 
 import os
@@ -29,6 +30,8 @@ from urllib.parse import urlparse
 import base64
 import io
 from flask import send_file, redirect
+import tarfile
+import traceback
 
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
@@ -96,7 +99,7 @@ class DatabaseConnection:
 
                 self.connection = sqlite3.connect(db_path, check_same_thread=False)
                 self.connection.row_factory = sqlite3.Row
-                self.logger.info(f"SQLite数据库连接成功: {db_path}")
+                #self.logger.info(f"SQLite数据库连接成功: {db_path}")
                 return True
 
             else:
@@ -689,6 +692,25 @@ class RedisManager:
 
 # ===================== 配置和常量 =====================
 
+# 支持的压缩格式
+SUPPORTED_FORMATS = [
+    '.zip', '.tar', '.tar.gz', '.tgz',
+    '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz'
+]
+
+# 压缩文件扩展名映射
+COMPRESSION_EXT_MAPPING = {
+    '.zip': 'zip',
+    '.tar': 'tar',
+    '.tar.gz': 'gz',
+    '.tgz': 'gz',
+    '.tar.bz2': 'bz2',
+    '.tbz': 'bz2',
+    '.tbz2': 'bz2',
+    '.tar.xz': 'xz',
+    '.txz': 'xz'
+}
+
 DEFAULT_CONFIG = {
     'port': 18080,
     'host': '0.0.0.0',
@@ -711,7 +733,7 @@ DEFAULT_CONFIG = {
     'nacos_namespace': 'public',
     'agent_api_port': 11187,
     'agent_auth_token': 'default_token_change_me',
-    'refresh_interval': 60,
+    'refresh_interval': 30,
     'max_workers': 10,
     'upload_max_size': 100 * 1024 * 1024,
     'token_expiration': 24 * 3600,
@@ -721,6 +743,20 @@ DEFAULT_CONFIG = {
     'lock_timeout': 30,
     'max_task_logs': 1000,
     'task_log_retention_days': 7,
+    'supported_formats': SUPPORTED_FORMATS,  # 添加支持的格式列表
+    # ===================== 超时配置 =====================
+    'agent_api_timeouts': {
+        'default': (10, 30),           # 默认：连接10秒，读取30秒
+        'health_check': (5, 10),       # 健康检查：连接5秒，读取10秒
+        'deploy_create': (10, 60),     # 创建服务：连接10秒，读取60秒
+        'deploy_start': (10, 300),     # 启动服务：连接10秒，读取300秒（5分钟）
+        'deploy_stop': (10, 120),      # 停止服务：连接10秒，读取120秒
+        'deploy_delete': (10, 60),     # 删除服务：连接10秒，读取60秒
+        'undeploy': (10, 180),         # 卸载服务：连接10秒，读取180秒
+        'file_upload': (10, 600),      # 文件上传：连接10秒，读取600秒（10分钟）
+        'stream': (10, 3600),          # 流式响应：连接10秒，读取3600秒（1小时）
+        'proxy': (10, 300),            # 代理请求：连接10秒，读取300秒
+    },
 }
 
 # ===================== 连接检查工具 =====================
@@ -885,152 +921,1075 @@ class TaskInfo:
             data['completed_at'] = self.completed_at.isoformat()
         return data
 
-# ===================== 模板管理器 =====================
-
-class TemplateManager:
-    """服务模板管理器"""
-
-    def __init__(self, templates_root: str, db_manager: DatabaseManager):
-        self.templates_root = Path(templates_root)
-        self.db = db_manager
-        self.templates_root.mkdir(parents=True, exist_ok=True)
-        self.logger = logging.getLogger(__name__)
-
-    def create_template(self, name: str, description: str, template_type: str,
-                        file_content: bytes, filename: str, created_by: str) -> Tuple[bool, str]:
-        try:
-            existing = self.db.fetch_one(
-                "SELECT id FROM service_templates WHERE name = %s"
-                if self.db.db_type == 'mysql' else
-                "SELECT id FROM service_templates WHERE name = ?",
-                (name,)
-            )
-            if existing:
-                return False, f"模板名称 '{name}' 已存在"
-
-            template_dir = self.templates_root / name
-            template_dir.mkdir(parents=True, exist_ok=False)
-
-            file_path = template_dir / filename
-
-            if template_type == 'yaml':
-                try:
-                    yaml_content = file_content.decode('utf-8')
-                    parsed = yaml.safe_load(yaml_content)
-                    if not parsed or 'services' not in parsed:
-                        shutil.rmtree(template_dir)
-                        return False, "YAML文件必须包含services部分"
-
-                    with open(file_path, 'wb') as f:
-                        f.write(file_content)
-
-                except yaml.YAMLError as e:
-                    shutil.rmtree(template_dir)
-                    return False, f"YAML格式错误: {e}"
-
-            elif template_type == 'zip':
-                with open(file_path, 'wb') as f:
-                    f.write(file_content)
-
-                try:
-                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                        zip_ref.extractall(template_dir)
-
-                    yaml_files = list(template_dir.rglob('service.yaml'))
-                    yaml_files.extend(list(template_dir.rglob('docker-compose.yaml')))
-                    yaml_files.extend(list(template_dir.rglob('docker-compose.yml')))
-
-                    if not yaml_files:
-                        shutil.rmtree(template_dir)
-                        return False, "ZIP文件中未找到service.yaml或docker-compose.yaml文件"
-
-                except zipfile.BadZipFile:
-                    shutil.rmtree(template_dir)
-                    return False, "无效的ZIP文件"
-
-            else:
-                shutil.rmtree(template_dir)
-                return False, f"不支持的模板类型: {template_type}"
-
-            self.db.execute_query(
-                "INSERT INTO service_templates (name, description, type, file_path, created_by, created_at, updated_at) "
-                "VALUES (%s, %s, %s, %s, %s, NOW(), NOW())"
-                if self.db.db_type == 'mysql' else
-                "INSERT INTO service_templates (name, description, type, file_path, created_by, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
-                (name, description, template_type, str(file_path), created_by)
-            )
-
-            self.logger.info(f"模板 '{name}' 创建成功")
-            return True, f"模板 '{name}' 创建成功"
-
-        except Exception as e:
-            self.logger.error(f"创建模板失败: {str(e)}")
-            template_dir = self.templates_root / name
-            if template_dir.exists():
-                shutil.rmtree(template_dir, ignore_errors=True)
-            return False, f"创建模板失败: {str(e)}"
-
-    def get_template(self, name: str) -> Optional[Dict]:
-        return self.db.fetch_one(
-            "SELECT * FROM service_templates WHERE name = %s"
-            if self.db.db_type == 'mysql' else
-            "SELECT * FROM service_templates WHERE name = ?",
-            (name,)
-        )
-
-    def list_templates(self, page: int = 1, per_page: int = 20) -> Tuple[List[Dict], int]:
-        offset = (page - 1) * per_page
-
-        if self.db.db_type == 'mysql':
-            templates = self.db.fetch_all(
-                "SELECT * FROM service_templates ORDER BY updated_at DESC LIMIT %s OFFSET %s",
-                (per_page, offset)
-            )
-            count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM service_templates")
-        else:
-            templates = self.db.fetch_all(
-                "SELECT * FROM service_templates ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-                (per_page, offset)
-            )
-            count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM service_templates")
-
-        total = count_result['count'] if count_result else 0
-        return templates, total
-
-    def delete_template(self, name: str) -> Tuple[bool, str]:
-        try:
-            template = self.get_template(name)
-            if not template:
-                return False, f"模板 '{name}' 不存在"
-
-            template_dir = self.templates_root / name
-            if template_dir.exists():
-                shutil.rmtree(template_dir, ignore_errors=True)
-
-            self.db.execute_query(
-                "DELETE FROM service_templates WHERE name = %s"
-                if self.db.db_type == 'mysql' else
-                "DELETE FROM service_templates WHERE name = ?",
-                (name,)
-            )
-
-            self.logger.info(f"模板 '{name}' 删除成功")
-            return True, f"模板 '{name}' 删除成功"
-        except Exception as e:
-            self.logger.error(f"删除模板失败: {str(e)}")
-            return False, f"删除模板失败: {str(e)}"
-
-# ===================== 模板管理器（完整增强版） =====================
+# ===================== 模板管理器（完整增强版，支持多种压缩格式） =====================
 
 class EnhancedTemplateManager:
-    """完整增强版模板管理器"""
+    """完整增强版模板管理器，支持多种压缩格式"""
 
-    def __init__(self, templates_root: str, db_manager: DatabaseManager):
+    def __init__(self, templates_root: str, db_manager: DatabaseManager, supported_formats: List[str] = None):
         self.templates_root = Path(templates_root)
         self.db = db_manager
         self.templates_root.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger(__name__)
+
+        # 设置支持的格式
+        self.supported_formats = supported_formats or SUPPORTED_FORMATS
+        self.compression_map = COMPRESSION_EXT_MAPPING
+
+        self.logger.info(f"模板管理器初始化，支持格式: {', '.join(self.supported_formats)}")
+
+    # 新增方法：获取模板目录下指定文件的内容
+    def get_template_file_by_path(self, template_name: str, file_path: str,
+                                  encoding: str = 'utf-8') -> Tuple[bool, Union[str, bytes], str, Dict]:
+        """
+        获取模板目录下指定文件的内容
+
+        Args:
+            template_name: 模板名称
+            file_path: 相对路径（相对于模板目录）
+            encoding: 文本文件编码
+
+        Returns:
+            (success, content_or_error, content_type, file_info)
+        """
+        try:
+            # 检查模板是否存在
+            template = self.get_template(template_name)
+            if not template:
+                return False, f"模板 '{template_name}' 不存在", "text/plain", {}
+
+            # 获取模板目录
+            template_dir = self.templates_root / template_name
+            file_path = template_dir / file_path
+            if not template_dir.exists():
+                return False, f"模板目录不存在: {template_dir}", "text/plain", {}
+
+            # 构建完整路径，防止路径遍历攻击
+            safe_path = self._get_safe_path(template_dir, file_path)
+            if not safe_path:
+                return False, f"无效的文件路径: {file_path}", "text/plain", {}
+
+            # 检查文件是否存在
+            if not safe_path.exists() or not safe_path.is_file():
+                return False, f"文件不存在: {file_path}", "text/plain", {}
+
+            # 获取文件信息
+            stat_info = safe_path.stat()
+            file_info = {
+                'name': safe_path.name,
+                'path': str(safe_path.relative_to(template_dir)),
+                'size': stat_info.st_size,
+                'created_time': datetime.fromtimestamp(stat_info.st_ctime).isoformat(),
+                'modified_time': datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
+                'is_directory': False
+            }
+
+            # 确定内容类型
+            content_type, is_text = self._get_file_type(safe_path)
+            file_info['content_type'] = content_type
+            file_info['is_text'] = is_text
+
+            # 读取文件内容
+            try:
+                if is_text:
+                    with open(safe_path, 'r', encoding=encoding) as f:
+                        content = f.read()
+                else:
+                    with open(safe_path, 'rb') as f:
+                        content = f.read()
+            except Exception as e:
+                return False, f"读取文件失败: {str(e)}", "text/plain", file_info
+
+            return True, content, content_type, file_info
+
+        except Exception as e:
+            self.logger.error(f"获取模板文件失败: {str(e)}", exc_info=True)
+            return False, f"获取文件失败: {str(e)}", "text/plain", {}
+
+    # 新增方法：更新模板目录下指定文件的内容
+    def update_template_file(self, template_name: str, file_path: str, content: Union[str, bytes],
+                             encoding: str = 'utf-8', updated_by: str = 'system') -> Tuple[bool, str, Dict]:
+        """
+        更新模板目录下指定文件的内容，并更新原始压缩文件（如果存在）
+
+        Args:
+            template_name: 模板名称
+            file_path: 相对路径（相对于模板目录）
+            content: 文件内容（字符串或字节）
+            encoding: 文本文件编码
+            updated_by: 更新者
+
+        Returns:
+            (success, message, update_info)
+        """
+        try:
+            # 检查模板是否存在
+            template = self.get_template(template_name)
+            if not template:
+                return False, f"模板 '{template_name}' 不存在", {}
+
+            template_type = template['type']
+            template_dir = self.templates_root / template_name
+            file_path = template_dir / file_path
+            if not template_dir.exists():
+                return False, f"模板目录不存在: {template_dir}", {}
+
+            # 构建完整路径，防止路径遍历攻击
+            safe_path = self._get_safe_path(template_dir, file_path)
+            if not safe_path:
+                return False, f"无效的文件路径: {file_path}", {}
+
+            # 确保父目录存在
+            safe_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # 备份原文件（如果存在）
+            backup_info = {}
+            if safe_path.exists():
+                backup_path = safe_path.with_suffix(f'{safe_path.suffix}.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
+                shutil.copy2(safe_path, backup_path)
+                backup_info['backup_file'] = str(backup_path.relative_to(template_dir))
+
+            # 写入新内容
+            try:
+                if isinstance(content, str):
+                    with open(safe_path, 'w', encoding=encoding) as f:
+                        f.write(content)
+                    file_size = len(content.encode(encoding))
+                elif isinstance(content, bytes):
+                    with open(safe_path, 'wb') as f:
+                        f.write(content)
+                    file_size = len(content)
+                else:
+                    return False, f"不支持的内容类型: {type(content)}", {}
+            except Exception as e:
+                return False, f"写入文件失败: {str(e)}", {}
+
+            # 获取更新后的文件信息
+            stat_info = safe_path.stat()
+            update_info = {
+                'template_name': template_name,
+                'file_path': str(safe_path.relative_to(template_dir)),
+                'file_size': file_size,
+                'modified_time': datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
+                'updated_by': updated_by,
+                'updated_at': datetime.now().isoformat(),
+                'backup_info': backup_info
+            }
+
+            # 如果是YAML文件，验证其格式
+            if safe_path.suffix.lower() in ['.yaml', '.yml']:
+                try:
+                    with open(safe_path, 'r', encoding='utf-8') as f:
+                        yaml_content = f.read()
+
+                    is_valid, error_msg = self.validate_yaml_content(yaml_content, template_type, safe_path.name)
+                    if not is_valid:
+                        # 恢复备份
+                        if backup_info.get('backup_file'):
+                            backup_full_path = template_dir / backup_info['backup_file']
+                            if backup_full_path.exists():
+                                shutil.copy2(backup_full_path, safe_path)
+                                safe_path.unlink()
+
+                        return False, f"YAML格式验证失败: {error_msg}", {}
+
+                    update_info['yaml_valid'] = True
+                except Exception as e:
+                    self.logger.warning(f"YAML验证失败: {str(e)}")
+            # 如果模板是压缩格式，需要更新原始压缩文件
+            if template_type == 'archive':
+                archive_updated, archive_message = self._update_archive_file(template_name, safe_path, updated_by)
+                update_info['archive_updated'] = archive_updated
+                update_info['archive_message'] = archive_message
+
+                if not archive_updated:
+                    self.logger.warning(f"更新压缩文件失败: {archive_message}")
+
+            # 更新模板元数据
+            metadata = template.get('metadata', {})
+            if 'updated_files' not in metadata:
+                metadata['updated_files'] = []
+
+            metadata['updated_files'].append({
+                'file_path': str(safe_path.relative_to(template_dir)),
+                'updated_at': datetime.now().isoformat(),
+                'updated_by': updated_by,
+                'file_size': file_size
+            })
+
+            # 限制更新的文件记录数量
+            if len(metadata['updated_files']) > 50:
+                metadata['updated_files'] = metadata['updated_files'][-50:]
+
+            # 更新数据库
+            metadata_json = json.dumps(metadata)
+            if self.db.db_type == 'mysql':
+                self.db.execute_query(
+                    "UPDATE service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    (metadata_json, template_name)
+                )
+            else:
+                self.db.execute_query(
+                    "UPDATE service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    (metadata_json, template_name)
+                )
+
+            self.logger.info(f"模板文件更新成功: {template_name}/{file_path}, 大小: {file_size} 字节")
+            return True, f"文件更新成功", update_info
+
+        except Exception as e:
+            self.logger.error(f"更新模板文件失败: {str(e)}", exc_info=True)
+            return False, f"更新文件失败: {str(e)}", {}
+
+    # 新增方法：更新压缩文件中的对应文件
+    def _update_archive_file(self, template_name: str, updated_file: Path, updated_by: str) -> Tuple[bool, str]:
+        """更新压缩文件中的对应文件"""
+        try:
+            template = self.get_template(template_name)
+            if not template or template['type'] != 'archive':
+                return False, "不是压缩模板"
+
+            archive_path = Path(template['file_path'])
+            if not archive_path.exists():
+                return False, f"原始压缩文件不存在: {archive_path}"
+
+            template_dir = self.templates_root / template_name
+            relative_path = updated_file.relative_to(template_dir)
+
+            # 备份原压缩文件
+            backup_path = archive_path.with_suffix(f'{archive_path.suffix}.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
+            shutil.copy2(archive_path, backup_path)
+
+            # 获取文件扩展名以确定压缩格式
+            filename = archive_path.name.lower()
+
+            if filename.endswith('.zip'):
+                # 更新ZIP文件
+                success = self._update_zip_file(archive_path, updated_file, relative_path)
+            elif any(filename.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz']):
+                # 更新TAR文件
+                success = self._update_tar_file(archive_path, updated_file, relative_path)
+            else:
+                return False, f"不支持的压缩格式: {filename}"
+
+            if success:
+                # 更新元数据
+                metadata = template.get('metadata', {})
+                if 'archive_updates' not in metadata:
+                    metadata['archive_updates'] = []
+
+                metadata['archive_updates'].append({
+                    'file': str(relative_path),
+                    'updated_at': datetime.now().isoformat(),
+                    'updated_by': updated_by,
+                    'backup_file': backup_path.name
+                })
+
+                # 限制记录数量
+                if len(metadata['archive_updates']) > 20:
+                    metadata['archive_updates'] = metadata['archive_updates'][-20:]
+
+                self.logger.info(f"压缩文件更新成功: {template_name}, 文件: {relative_path}")
+                return True, f"压缩文件更新成功，备份: {backup_path.name}"
+            else:
+                # 恢复备份
+                if backup_path.exists():
+                    shutil.copy2(backup_path, archive_path)
+                return False, "更新压缩文件失败"
+
+        except Exception as e:
+            self.logger.error(f"更新压缩文件失败: {str(e)}", exc_info=True)
+            return False, f"更新压缩文件失败: {str(e)}"
+
+    # 新增方法：更新ZIP文件中的单个文件
+    def _update_zip_file(self, zip_path: Path, updated_file: Path, relative_path: Path) -> bool:
+        """更新ZIP文件中的单个文件"""
+        try:
+            # 创建临时目录
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_zip = Path(temp_dir) / 'updated.zip'
+
+                # 创建新的ZIP文件
+                with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as new_zip:
+                    # 复制原ZIP中除了要更新的文件外的所有文件
+                    with zipfile.ZipFile(zip_path, 'r') as old_zip:
+                        for item in old_zip.infolist():
+                            # 如果是我们要更新的文件，跳过
+                            if item.filename == str(relative_path):
+                                continue
+
+                            # 读取并写入其他文件
+                            with old_zip.open(item.filename) as f:
+                                content = f.read()
+                                new_zip.writestr(item, content)
+
+                    # 添加更新的文件
+                    new_zip.write(updated_file, str(relative_path))
+
+                # 替换原ZIP文件
+                shutil.copy2(temp_zip, zip_path)
+                return True
+
+        except Exception as e:
+            self.logger.error(f"更新ZIP文件失败: {str(e)}")
+            return False
+
+    # 新增方法：更新TAR文件中的单个文件
+    def _update_tar_file(self, tar_path: Path, updated_file: Path, relative_path: Path) -> bool:
+        """更新TAR文件中的单个文件"""
+        try:
+            # 获取压缩模式
+            filename = tar_path.name.lower()
+            mode = 'r'
+            if filename.endswith('.gz') or filename.endswith('.tgz'):
+                mode = 'r:gz'
+            elif filename.endswith('.bz2') or filename.endswith('.tbz') or filename.endswith('.tbz2'):
+                mode = 'r:bz2'
+            elif filename.endswith('.xz') or filename.endswith('.txz'):
+                mode = 'r:xz'
+
+            write_mode = mode.replace('r:', 'w:') if ':' in mode else 'w'
+
+            # 创建临时目录
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_tar = Path(temp_dir) / 'updated.tar'
+
+                # 创建新的TAR文件
+                with tarfile.open(temp_tar, write_mode) as new_tar:
+                    # 复制原TAR中除了要更新的文件外的所有文件
+                    with tarfile.open(tar_path, mode) as old_tar:
+                        for item in old_tar.getmembers():
+                            # 如果是我们要更新的文件，跳过
+                            if item.name == str(relative_path):
+                                continue
+
+                            # 提取并重新添加文件
+                            try:
+                                extracted = old_tar.extractfile(item)
+                                if extracted:
+                                    # 创建TarInfo对象
+                                    tar_info = tarfile.TarInfo(name=item.name)
+                                    tar_info.size = item.size
+                                    tar_info.mtime = item.mtime
+                                    tar_info.mode = item.mode
+                                    tar_info.type = item.type
+
+                                    # 添加文件到新TAR
+                                    new_tar.addfile(tar_info, extracted)
+                            except Exception as e:
+                                self.logger.warning(f"处理TAR文件项 {item.name} 失败: {e}")
+                                continue
+
+                    # 添加更新的文件
+                    new_tar.add(updated_file, arcname=str(relative_path))
+
+                # 替换原TAR文件
+                shutil.copy2(temp_tar, tar_path)
+                return True
+
+        except Exception as e:
+            self.logger.error(f"更新TAR文件失败: {str(e)}")
+            return False
+
+    # 新增方法：删除模板目录下的指定文件
+    def delete_template_file(self, template_name: str, file_path: str, deleted_by: str = 'system') -> Tuple[bool, str, Dict]:
+        """
+        删除模板目录下指定文件，并更新原始压缩文件（如果存在）
+
+        Args:
+            template_name: 模板名称
+            file_path: 相对路径（相对于模板目录）
+            deleted_by: 删除者
+
+        Returns:
+            (success, message, delete_info)
+        """
+        try:
+            # 检查模板是否存在
+            template = self.get_template(template_name)
+            if not template:
+                return False, f"模板 '{template_name}' 不存在", {}
+
+            template_type = template['type']
+            template_dir = self.templates_root / template_name
+            file_path = template_dir / file_path
+            if not template_dir.exists():
+                return False, f"模板目录不存在: {template_dir}", {}
+
+            # 构建完整路径，防止路径遍历攻击
+            safe_path = self._get_safe_path(template_dir, file_path)
+            if not safe_path:
+                return False, f"无效的文件路径: {file_path}", {}
+
+            # 检查文件是否存在
+            if not safe_path.exists():
+                return False, f"文件不存在: {file_path}", {}
+
+            # 如果是YAML文件，检查是否是主文件
+            if safe_path.suffix.lower() in ['.yaml', '.yml']:
+                # 检查是否是docker-compose文件
+                if safe_path.name.lower() in ['docker-compose.yaml', 'docker-compose.yml']:
+                    return False, "不能删除docker-compose文件，它是模板的核心文件", {}
+
+                # 如果是YAML模板类型且删除的是主YAML文件
+                if template_type == 'yaml' and safe_path == Path(template['file_path']):
+                    return False, "不能删除YAML模板的主文件", {}
+
+            # 如果是目录，不能删除
+            if safe_path.is_dir():
+                return False, f"不能删除目录，请使用专门的目录删除API", {}
+
+            # 获取文件信息（用于返回和记录）
+            stat_info = safe_path.stat()
+            file_info = {
+                'template_name': template_name,
+                'file_path': str(safe_path.relative_to(template_dir)),
+                'file_name': safe_path.name,
+                'file_size': stat_info.st_size,
+                'modified_time': datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
+                'deleted_by': deleted_by,
+                'deleted_at': datetime.now().isoformat()
+            }
+
+            # 删除文件
+            try:
+                safe_path.unlink()
+                self.logger.info(f"模板文件删除成功: {template_name}/{file_path}")
+            except Exception as e:
+                return False, f"删除文件失败: {str(e)}", {}
+
+            # 如果模板是压缩格式，需要更新原始压缩文件
+            if template_type == 'archive':
+                archive_updated, archive_message = self._delete_from_archive_file(template_name, safe_path, deleted_by)
+                file_info['archive_updated'] = archive_updated
+                file_info['archive_message'] = archive_message
+
+                if not archive_updated:
+                    self.logger.warning(f"从压缩文件中删除失败: {archive_message}")
+
+            # 更新模板元数据
+            metadata = template.get('metadata', {})
+            if 'deleted_files' not in metadata:
+                metadata['deleted_files'] = []
+
+            metadata['deleted_files'].append(file_info.copy())
+
+            # 限制删除的文件记录数量
+            if len(metadata['deleted_files']) > 50:
+                metadata['deleted_files'] = metadata['deleted_files'][-50:]
+
+            # 更新数据库
+            metadata_json = json.dumps(metadata)
+            if self.db.db_type == 'mysql':
+                self.db.execute_query(
+                    "UPDATE service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    (metadata_json, template_name)
+                )
+            else:
+                self.db.execute_query(
+                    "UPDATE service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    (metadata_json, template_name)
+                )
+
+            return True, f"文件删除成功", file_info
+
+        except Exception as e:
+            self.logger.error(f"删除模板文件失败: {str(e)}", exc_info=True)
+            return False, f"删除文件失败: {str(e)}", {}
+
+    # 新增方法：从压缩文件中删除对应文件
+    def _delete_from_archive_file(self, template_name: str, deleted_file: Path, deleted_by: str) -> Tuple[bool, str]:
+        """从压缩文件中删除对应文件"""
+        try:
+            template = self.get_template(template_name)
+            if not template or template['type'] != 'archive':
+                return False, "不是压缩模板"
+
+            archive_path = Path(template['file_path'])
+            if not archive_path.exists():
+                return False, f"原始压缩文件不存在: {archive_path}"
+
+            template_dir = self.templates_root / template_name
+            relative_path = deleted_file.relative_to(template_dir)
+
+            # 获取文件扩展名以确定压缩格式
+            filename = archive_path.name.lower()
+
+            if filename.endswith('.zip'):
+                # 从ZIP文件中删除
+                success = self._delete_from_zip_file(archive_path, relative_path)
+            elif any(filename.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz']):
+                # 从TAR文件中删除
+                success = self._delete_from_tar_file(archive_path, relative_path)
+            else:
+                return False, f"不支持的压缩格式: {filename}"
+
+            if success:
+                # 更新元数据
+                metadata = template.get('metadata', {})
+                if 'archive_deletions' not in metadata:
+                    metadata['archive_deletions'] = []
+
+                metadata['archive_deletions'].append({
+                    'file': str(relative_path),
+                    'deleted_at': datetime.now().isoformat(),
+                    'deleted_by': deleted_by,
+                })
+
+                # 限制记录数量
+                if len(metadata['archive_deletions']) > 20:
+                    metadata['archive_deletions'] = metadata['archive_deletions'][-20:]
+
+                self.logger.info(f"从压缩文件中删除成功: {template_name}, 文件: {relative_path}")
+                return True, f"从压缩文件中删除成功"
+            else:
+                return False, "从压缩文件中删除失败"
+
+        except Exception as e:
+            self.logger.error(f"从压缩文件中删除失败: {str(e)}", exc_info=True)
+            return False, f"从压缩文件中删除失败: {str(e)}"
+
+    # 新增方法：从ZIP文件中删除单个文件
+    def _delete_from_zip_file(self, zip_path: Path, relative_path: Path) -> bool:
+        """从ZIP文件中删除单个文件"""
+        try:
+            # 创建临时目录
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_zip = Path(temp_dir) / 'updated.zip'
+
+                # 创建新的ZIP文件（不包含要删除的文件）
+                with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as new_zip:
+                    # 复制原ZIP中除了要删除的文件外的所有文件
+                    with zipfile.ZipFile(zip_path, 'r') as old_zip:
+                        for item in old_zip.infolist():
+                            # 如果是要删除的文件，跳过
+                            if item.filename == str(relative_path):
+                                continue
+
+                            # 读取并写入其他文件
+                            with old_zip.open(item.filename) as f:
+                                content = f.read()
+                                new_zip.writestr(item, content)
+
+                # 替换原ZIP文件
+                shutil.copy2(temp_zip, zip_path)
+                return True
+
+        except Exception as e:
+            self.logger.error(f"从ZIP文件中删除失败: {str(e)}")
+            return False
+
+    # 新增方法：从TAR文件中删除单个文件
+    def _delete_from_tar_file(self, tar_path: Path, relative_path: Path) -> bool:
+        """从TAR文件中删除单个文件"""
+        try:
+            # 获取压缩模式
+            filename = tar_path.name.lower()
+            mode = 'r'
+            if filename.endswith('.gz') or filename.endswith('.tgz'):
+                mode = 'r:gz'
+            elif filename.endswith('.bz2') or filename.endswith('.tbz') or filename.endswith('.tbz2'):
+                mode = 'r:bz2'
+            elif filename.endswith('.xz') or filename.endswith('.txz'):
+                mode = 'r:xz'
+
+            write_mode = mode.replace('r:', 'w:') if ':' in mode else 'w'
+
+            # 创建临时目录
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_tar = Path(temp_dir) / 'updated.tar'
+
+                # 创建新的TAR文件（不包含要删除的文件）
+                with tarfile.open(temp_tar, write_mode) as new_tar:
+                    # 复制原TAR中除了要删除的文件外的所有文件
+                    with tarfile.open(tar_path, mode) as old_tar:
+                        for item in old_tar.getmembers():
+                            # 如果是要删除的文件，跳过
+                            if item.name == str(relative_path):
+                                continue
+
+                            # 提取并重新添加文件
+                            try:
+                                extracted = old_tar.extractfile(item)
+                                if extracted:
+                                    # 创建TarInfo对象
+                                    tar_info = tarfile.TarInfo(name=item.name)
+                                    tar_info.size = item.size
+                                    tar_info.mtime = item.mtime
+                                    tar_info.mode = item.mode
+                                    tar_info.type = item.type
+
+                                    # 添加文件到新TAR
+                                    new_tar.addfile(tar_info, extracted)
+                            except Exception as e:
+                                self.logger.warning(f"处理TAR文件项 {item.name} 失败: {e}")
+                                continue
+
+                # 替换原TAR文件
+                shutil.copy2(temp_tar, tar_path)
+                return True
+
+        except Exception as e:
+            self.logger.error(f"从TAR文件中删除失败: {str(e)}")
+            return False
+
+    # 新增方法：删除模板目录下的目录
+    def delete_template_directory(self, template_name: str, dir_path: str, deleted_by: str = 'system',
+                                  force: bool = False) -> Tuple[bool, str, Dict]:
+        """
+        删除模板目录下的指定目录
+
+        Args:
+            template_name: 模板名称
+            dir_path: 相对路径（相对于模板目录）
+            deleted_by: 删除者
+            force: 是否强制删除非空目录
+
+        Returns:
+            (success, message, delete_info)
+        """
+        try:
+            # 检查模板是否存在
+            template = self.get_template(template_name)
+            if not template:
+                return False, f"模板 '{template_name}' 不存在", {}
+
+            template_dir = self.templates_root / template_name
+            dir_path = template_dir / dir_path
+            if not template_dir.exists():
+                return False, f"模板目录不存在: {template_dir}", {}
+
+            # 构建完整路径，防止路径遍历攻击
+            safe_path = self._get_safe_path(template_dir, dir_path)
+            if not safe_path:
+                return False, f"无效的目录路径: {dir_path}", {}
+
+            # 检查目录是否存在
+            if not safe_path.exists() or not safe_path.is_dir():
+                return False, f"目录不存在: {dir_path}", {}
+
+            # 检查是否试图删除根目录
+            if safe_path == template_dir:
+                return False, "不能删除模板根目录", {}
+
+            # 检查是否包含docker-compose文件
+            for yaml_name in ['docker-compose.yaml', 'docker-compose.yml']:
+                yaml_file = safe_path / yaml_name
+                if yaml_file.exists():
+                    return False, f"目录中包含docker-compose文件，不能删除", {}
+
+            # 检查目录是否为空
+            dir_items = list(safe_path.iterdir())
+            if dir_items and not force:
+                return False, f"目录不为空，使用force=true参数强制删除", {}
+
+            # 计算目录大小
+            dir_size = sum(f.stat().st_size for f in safe_path.rglob('*') if f.is_file())
+
+            # 记录删除信息
+            delete_info = {
+                'template_name': template_name,
+                'dir_path': str(safe_path.relative_to(template_dir)),
+                'dir_name': safe_path.name,
+                'dir_size': dir_size,
+                'file_count': len([f for f in safe_path.rglob('*') if f.is_file()]),
+                'deleted_by': deleted_by,
+                'deleted_at': datetime.now().isoformat(),
+                'force': force
+            }
+
+            # 删除目录
+            try:
+                if force:
+                    shutil.rmtree(safe_path)
+                else:
+                    safe_path.rmdir()
+
+                self.logger.info(f"模板目录删除成功: {template_name}/{dir_path}")
+            except Exception as e:
+                return False, f"删除目录失败: {str(e)}", {}
+
+            # 如果模板是压缩格式，需要更新原始压缩文件
+            if template['type'] == 'archive':
+                # 需要遍历删除压缩文件中的所有相关文件
+                archive_updated, archive_message = self._delete_directory_from_archive(template_name, safe_path, deleted_by)
+                delete_info['archive_updated'] = archive_updated
+                delete_info['archive_message'] = archive_message
+
+                if not archive_updated:
+                    self.logger.warning(f"从压缩文件中删除目录失败: {archive_message}")
+
+            # 更新模板元数据
+            metadata = template.get('metadata', {})
+            if 'deleted_directories' not in metadata:
+                metadata['deleted_directories'] = []
+
+            metadata['deleted_directories'].append(delete_info.copy())
+
+            # 限制删除的目录记录数量
+            if len(metadata['deleted_directories']) > 20:
+                metadata['deleted_directories'] = metadata['deleted_directories'][-20:]
+
+            # 更新数据库
+            metadata_json = json.dumps(metadata)
+            if self.db.db_type == 'mysql':
+                self.db.execute_query(
+                    "UPDATE service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    (metadata_json, template_name)
+                )
+            else:
+                self.db.execute_query(
+                    "UPDATE service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    (metadata_json, template_name)
+                )
+
+            return True, f"目录删除成功", delete_info
+
+        except Exception as e:
+            self.logger.error(f"删除模板目录失败: {str(e)}", exc_info=True)
+            return False, f"删除目录失败: {str(e)}", {}
+
+    # 新增方法：从压缩文件中删除目录
+    def _delete_directory_from_archive(self, template_name: str, deleted_dir: Path, deleted_by: str) -> Tuple[bool, str]:
+        """从压缩文件中删除目录及其所有文件"""
+        try:
+            template = self.get_template(template_name)
+            if not template or template['type'] != 'archive':
+                return False, "不是压缩模板"
+
+            archive_path = Path(template['file_path'])
+            if not archive_path.exists():
+                return False, f"原始压缩文件不存在: {archive_path}"
+
+            template_dir = self.templates_root / template_name
+            relative_dir = deleted_dir.relative_to(template_dir)
+
+            # 获取文件扩展名以确定压缩格式
+            filename = archive_path.name.lower()
+
+            if filename.endswith('.zip'):
+                # 从ZIP文件中删除目录
+                success = self._delete_dir_from_zip_file(archive_path, relative_dir)
+            elif any(filename.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz']):
+                # 从TAR文件中删除目录
+                success = self._delete_dir_from_tar_file(archive_path, relative_dir)
+            else:
+                return False, f"不支持的压缩格式: {filename}"
+
+            if success:
+                # 更新元数据
+                metadata = template.get('metadata', {})
+                if 'archive_dir_deletions' not in metadata:
+                    metadata['archive_dir_deletions'] = []
+
+                metadata['archive_dir_deletions'].append({
+                    'directory': str(relative_dir),
+                    'deleted_at': datetime.now().isoformat(),
+                    'deleted_by': deleted_by,
+                })
+
+                # 限制记录数量
+                if len(metadata['archive_dir_deletions']) > 20:
+                    metadata['archive_dir_deletions'] = metadata['archive_dir_deletions'][-20:]
+
+                self.logger.info(f"从压缩文件中删除目录成功: {template_name}, 目录: {relative_dir}")
+                return True, f"从压缩文件中删除目录成功"
+            else:
+
+                return False, "从压缩文件中删除目录失败"
+
+        except Exception as e:
+            self.logger.error(f"从压缩文件中删除目录失败: {str(e)}", exc_info=True)
+            return False, f"从压缩文件中删除目录失败: {str(e)}"
+
+    # 新增方法：从ZIP文件中删除目录
+    def _delete_dir_from_zip_file(self, zip_path: Path, relative_dir: Path) -> bool:
+        """从ZIP文件中删除目录及其所有文件"""
+        try:
+            # 创建临时目录
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_zip = Path(temp_dir) / 'updated.zip'
+
+                # 创建新的ZIP文件（不包含要删除的目录中的文件）
+                with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as new_zip:
+                    # 复制原ZIP中除了要删除的目录外的所有文件
+                    with zipfile.ZipFile(zip_path, 'r') as old_zip:
+                        for item in old_zip.infolist():
+                            # 如果是要删除的目录中的文件，跳过
+                            if str(item.filename).startswith(str(relative_dir) + '/'):
+                                continue
+
+                            # 读取并写入其他文件
+                            with old_zip.open(item.filename) as f:
+                                content = f.read()
+                                new_zip.writestr(item, content)
+
+                # 替换原ZIP文件
+                shutil.copy2(temp_zip, zip_path)
+                return True
+
+        except Exception as e:
+            self.logger.error(f"从ZIP文件中删除目录失败: {str(e)}")
+            return False
+
+    # 新增方法：从TAR文件中删除目录
+    def _delete_dir_from_tar_file(self, tar_path: Path, relative_dir: Path) -> bool:
+        """从TAR文件中删除目录及其所有文件"""
+        try:
+            # 获取压缩模式
+            filename = tar_path.name.lower()
+            mode = 'r'
+            if filename.endswith('.gz') or filename.endswith('.tgz'):
+                mode = 'r:gz'
+            elif filename.endswith('.bz2') or filename.endswith('.tbz') or filename.endswith('.tbz2'):
+                mode = 'r:bz2'
+            elif filename.endswith('.xz') or filename.endswith('.txz'):
+                mode = 'r:xz'
+
+            write_mode = mode.replace('r:', 'w:') if ':' in mode else 'w'
+
+            # 创建临时目录
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_tar = Path(temp_dir) / 'updated.tar'
+
+                # 创建新的TAR文件（不包含要删除的目录中的文件）
+                with tarfile.open(temp_tar, write_mode) as new_tar:
+                    # 复制原TAR中除了要删除的目录外的所有文件
+                    with tarfile.open(tar_path, mode) as old_tar:
+                        for item in old_tar.getmembers():
+                            # 如果是要删除的目录中的文件，跳过
+                            if str(item.name).startswith(str(relative_dir) + '/'):
+                                continue
+
+                            # 提取并重新添加文件
+                            try:
+                                extracted = old_tar.extractfile(item)
+                                if extracted:
+                                    # 创建TarInfo对象
+                                    tar_info = tarfile.TarInfo(name=item.name)
+                                    tar_info.size = item.size
+                                    tar_info.mtime = item.mtime
+                                    tar_info.mode = item.mode
+                                    tar_info.type = item.type
+
+                                    # 添加文件到新TAR
+                                    new_tar.addfile(tar_info, extracted)
+                            except Exception as e:
+                                self.logger.warning(f"处理TAR文件项 {item.name} 失败: {e}")
+                                continue
+
+                # 替换原TAR文件
+                shutil.copy2(temp_tar, tar_path)
+                return True
+
+        except Exception as e:
+            self.logger.error(f"从TAR文件中删除目录失败: {str(e)}")
+            return False
+
+    # 新增辅助方法：获取安全的文件路径
+    def _get_safe_path(self, base_dir: Path, file_path: str) -> Optional[Path]:
+        """获取安全的文件路径，防止路径遍历攻击"""
+        try:
+            # 规范化路径
+            normalized = Path(file_path).resolve()
+            base_normalized = base_dir.resolve()
+
+            # 确保路径在基础目录内
+            try:
+                relative = normalized.relative_to(base_normalized)
+            except ValueError:
+                return None
+
+            # 防止使用..等路径遍历
+            if '..' in str(relative):
+                return None
+
+            # 构建完整路径
+            full_path = base_dir / relative
+
+            # 确保仍然是基础目录的子目录
+            if not str(full_path.resolve()).startswith(str(base_normalized)):
+                return None
+
+            return full_path
+        except Exception as e:
+            self.logger.warning(f"路径安全检查失败: {str(e)}")
+            return None
+
+    # 新增辅助方法：获取文件类型
+    def _get_file_type(self, file_path: Path) -> Tuple[str, bool]:
+        """获取文件类型和是否为文本文件"""
+        # 根据扩展名判断
+        ext = file_path.suffix.lower()
+
+        # 文本文件扩展名
+        text_extensions = {
+            '.txt', '.md', '.yml', '.yaml', '.json', '.xml', '.html', '.htm',
+            '.css', '.js', '.py', '.java', '.c', '.cpp', '.h', '.hpp',
+            '.sh', '.bash', '.bat', '.cmd', '.ps1', '.sql', '.ini', '.cfg',
+            '.conf', '.properties', '.log', '.csv', '.tsv', '.rst', '.tex'
+        }
+
+        # 特殊文件类型
+        if ext in {'.yml', '.yaml'}:
+            return 'text/yaml', True
+        elif ext == '.json':
+            return 'application/json', True
+        elif ext == '.xml':
+            return 'application/xml', True
+        elif ext == '.html' or ext == '.htm':
+            return 'text/html', True
+        elif ext == '.css':
+            return 'text/css', True
+        elif ext == '.js':
+            return 'application/javascript', True
+        elif ext in {'.py', '.java', '.c', '.cpp', '.h', '.hpp', '.sh', '.bash'}:
+            return 'text/plain', True
+
+        # 压缩文件类型
+        elif ext == '.zip':
+            return 'application/zip', False
+        elif ext == '.tar':
+            return 'application/x-tar', False
+        elif ext in {'.gz', '.tgz'}:
+            return 'application/gzip', False
+        elif ext in {'.bz2', '.tbz', '.tbz2'}:
+            return 'application/x-bzip2', False
+        elif ext in {'.xz', '.txz'}:
+            return 'application/x-xz', False
+
+        # 默认文本文件判断
+        elif ext in text_extensions:
+            return 'text/plain', True
+        else:
+            # 尝试判断是否为文本文件
+            try:
+                with open(file_path, 'rb') as f:
+                    chunk = f.read(1024)
+                    # 检查是否包含空字节（二进制文件的特征）
+                    if b'\x00' in chunk:
+                        return 'application/octet-stream', False
+                    # 尝试解码为UTF-8
+                    chunk.decode('utf-8', errors='ignore')
+                    return 'text/plain', True
+            except:
+                return 'application/octet-stream', False
+
+    # 新增方法：列出模板目录下的所有文件
+    def list_template_files(self, template_name: str, path: str = '') -> Tuple[bool, Union[List[Dict], str]]:
+        """
+        列出模板目录下的所有文件和目录
+
+        Args:
+            template_name: 模板名称
+            path: 相对路径（相对于模板目录）
+
+        Returns:
+            (success, files_or_error)
+        """
+        try:
+            # 检查模板是否存在
+            template = self.get_template(template_name)
+            if not template:
+                return False, f"模板 '{template_name}' 不存在"
+
+            # 获取模板目录
+            template_dir = self.templates_root / template_name
+            path = template_dir / path
+            if not template_dir.exists():
+                return False, f"模板目录不存在: {template_dir}"
+
+            # 构建完整路径，防止路径遍历攻击
+            if path:
+                safe_path = self._get_safe_path(template_dir, path)
+                if not safe_path:
+                    return False, f"无效的路径: {path}"
+                target_dir = safe_path
+            else:
+                target_dir = template_dir
+
+            # 确保是目录
+            if not target_dir.is_dir():
+                return False, f"不是目录: {path}"
+
+            # 列出文件和目录
+            files = []
+            try:
+                for item in target_dir.iterdir():
+                    try:
+                        stat_info = item.stat()
+                        files.append({
+                            'name': item.name,
+                            'path': str(item.relative_to(template_dir)),
+                            'size': stat_info.st_size if item.is_file() else 0,
+                            'created_time': datetime.fromtimestamp(stat_info.st_ctime).isoformat(),
+                            'modified_time': datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
+                            'is_directory': item.is_dir(),
+                            'is_file': item.is_file()
+                        })
+                    except Exception as e:
+                        self.logger.warning(f"获取文件信息失败 {item}: {str(e)}")
+                        continue
+            except Exception as e:
+                return False, f"列出文件失败: {str(e)}"
+
+            # 按目录优先排序
+            files.sort(key=lambda x: (not x['is_directory'], x['name'].lower()))
+
+            # 添加父目录（如果不是根目录）
+            if target_dir != template_dir:
+                parent_path = target_dir.parent.relative_to(template_dir)
+                files.insert(0, {
+                    'name': '..',
+                    'path': str(parent_path) if str(parent_path) != '.' else '',
+                    'size': 0,
+                    'created_time': '',
+                    'modified_time': '',
+                    'is_directory': True,
+                    'is_file': False
+                })
+
+            return True, files
+
+        except Exception as e:
+            self.logger.error(f"列出模板文件失败: {str(e)}", exc_info=True)
+            return False, f"列出文件失败: {str(e)}"
+    def _get_compression_type(self, filename: str) -> str:
+        """获取压缩文件类型"""
+        filename_lower = filename.lower()
+        for ext in self.supported_formats:
+            if filename_lower.endswith(ext):
+                if ext == '.zip':
+                    return 'zip'
+                elif ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz']:
+                    return 'tar'
+        return 'unknown'
+
+    def _extract_archive(self, file_path: Path, extract_to: Path):
+        """解压各种压缩格式"""
+        filename = file_path.name.lower()
+
+        if filename.endswith('.zip'):
+            with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_to)
+
+        elif any(filename.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz']):
+            # 确定压缩模式
+            mode = 'r'
+            if filename.endswith('.gz') or filename.endswith('.tgz'):
+                mode = 'r:gz'
+            elif filename.endswith('.bz2') or filename.endswith('.tbz') or filename.endswith('.tbz2'):
+                mode = 'r:bz2'
+            elif filename.endswith('.xz') or filename.endswith('.txz'):
+                mode = 'r:xz'
+            elif filename.endswith('.tar'):
+                mode = 'r'
+
+            with tarfile.open(file_path, mode) as tar_ref:
+                tar_ref.extractall(extract_to)
+
+        else:
+            raise ValueError(f"不支持的压缩格式: {file_path.name}")
 
     def validate_yaml_content(self, yaml_content: str, template_type: str, filename: str = None) -> Tuple[bool, str]:
         """
@@ -1038,7 +1997,7 @@ class EnhancedTemplateManager:
 
         Args:
             yaml_content: YAML内容字符串
-            template_type: 模板类型（yaml或zip）
+            template_type: 模板类型（yaml或archive）
             filename: 文件名（可选，用于错误信息）
 
         Returns:
@@ -1091,7 +2050,7 @@ class EnhancedTemplateManager:
 
     def create_template(self, name: str, description: str, template_type: str,
                         file_content: bytes, filename: str, created_by: str) -> Tuple[bool, str]:
-        """创建模板（增强版，包含格式校验和清理逻辑）"""
+        """创建模板（增强版，支持多种压缩格式）"""
         template_dir = None
         file_path = None
         db_cleanup_needed = False
@@ -1112,7 +2071,11 @@ class EnhancedTemplateManager:
             template_dir.mkdir(parents=True, exist_ok=False)
 
             file_path = template_dir / filename
-            # 在YAML部分的验证中：
+
+            # 检查文件扩展名
+            file_ext = Path(filename).suffix.lower()
+
+            # 根据模板类型处理文件
             if template_type == 'yaml':
                 try:
                     # 验证是否为有效的YAML文件
@@ -1135,29 +2098,43 @@ class EnhancedTemplateManager:
                 except Exception as e:
                     raise ValueError(str(e))
 
-            elif template_type == 'zip':
-                # 保存ZIP文件
+            elif template_type == 'archive':
+                # 保存压缩文件
                 with open(file_path, 'wb') as f:
                     f.write(file_content)
 
+                # 检查是否是支持的压缩格式
+                is_supported = False
+                for ext in self.supported_formats:
+                    if filename.lower().endswith(ext):
+                        is_supported = True
+                        break
+
+                if not is_supported:
+                    raise ValueError(f"不支持的压缩格式: {filename}，支持的格式: {', '.join(self.supported_formats)}")
+
                 try:
-                    # 解压ZIP文件
-                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                        zip_ref.extractall(template_dir)
+                    # 解压文件
+                    self._extract_archive(file_path, template_dir)
 
                     # 查找并验证YAML文件
                     yaml_files = []
                     found_yaml = None
 
                     # 首先查找特定的YAML文件
-                    for yaml_name in ['service.yaml', 'docker-compose.yaml', 'docker-compose.yml']:
+                    for yaml_name in ['docker-compose.yaml', 'docker-compose.yml']:
                         for yaml_path in template_dir.rglob(yaml_name):
                             if yaml_path.is_file():
                                 yaml_files.append(yaml_path)
 
+                    # 如果没找到标准名称，查找任何YAML文件
+                    if not yaml_files:
+                        yaml_files = list(template_dir.rglob('*.yaml'))
+                        yaml_files.extend(list(template_dir.rglob('*.yml')))
+
                     # 检查是否找到YAML文件
                     if not yaml_files:
-                        raise ValueError("ZIP文件中未找到service.yaml、docker-compose.yaml或docker-compose.yml文件")
+                        raise ValueError("压缩文件中未找到YAML文件")
 
                     # 验证每个找到的YAML文件
                     yaml_content = None
@@ -1171,7 +2148,7 @@ class EnhancedTemplateManager:
                             if is_valid:
                                 yaml_content = content
                                 found_yaml = yaml_file
-                                self.logger.info(f"在ZIP中找到有效的YAML文件: {yaml_file}")
+                                self.logger.info(f"在压缩文件中找到有效的YAML文件: {yaml_file}")
                                 break
                             else:
                                 self.logger.warning(f"文件 {yaml_file} 验证失败: {error_msg}")
@@ -1181,7 +2158,7 @@ class EnhancedTemplateManager:
 
                     # 检查是否找到有效的YAML文件
                     if not yaml_content or not found_yaml:
-                        raise ValueError("ZIP文件中未找到包含有效services部分的YAML文件")
+                        raise ValueError("压缩文件中未找到包含有效services部分的YAML文件")
 
                     # 额外验证：确保services部分不为空
                     parsed = yaml.safe_load(yaml_content)
@@ -1189,15 +2166,13 @@ class EnhancedTemplateManager:
                     if not services or len(services) == 0:
                         raise ValueError("YAML文件中的services部分不能为空")
 
-                    self.logger.info(f"ZIP模板 '{name}' 验证成功，找到有效YAML文件: {found_yaml}")
+                    self.logger.info(f"压缩模板 '{name}' 验证成功，找到有效YAML文件: {found_yaml}")
 
-                except zipfile.BadZipFile:
-                    raise ValueError("无效的ZIP文件格式")
-                except zipfile.LargeZipFile:
-                    raise ValueError("ZIP文件过大")
+                except (zipfile.BadZipFile, tarfile.ReadError) as e:
+                    raise ValueError(f"无效的压缩文件格式: {str(e)}")
                 except Exception as e:
-                    if not str(e).startswith("ZIP文件"):
-                        raise ValueError(f"ZIP文件处理失败: {str(e)}")
+                    if not str(e).startswith("压缩文件"):
+                        raise ValueError(f"压缩文件处理失败: {str(e)}")
                     else:
                         raise e
 
@@ -1210,13 +2185,12 @@ class EnhancedTemplateManager:
                 'original_filename': filename,
                 'created_by': created_by,
                 'created_at': datetime.now().isoformat(),
-                'template_type': template_type
+                'template_type': template_type,
+                'compression_type': self.compression_map.get(file_ext, 'unknown') if template_type == 'archive' else None
             }
 
-            if template_type == 'zip':
-                # 记录ZIP文件中的YAML文件信息
-                if found_yaml:
-                    metadata['main_yaml_file'] = str(found_yaml.relative_to(template_dir))
+            if template_type == 'archive' and found_yaml:
+                metadata['main_yaml_file'] = str(found_yaml.relative_to(template_dir))
 
             metadata_json = json.dumps(metadata)
 
@@ -1359,24 +2333,27 @@ class EnhancedTemplateManager:
                     yaml_content = f.read()
                     return True, yaml_content, ""
 
-            elif template_type == 'zip':
-                # 从ZIP文件中提取YAML
+            elif template_type == 'archive':
+                # 从压缩文件中提取YAML
                 template_dir = self.templates_root / name
 
                 # 查找YAML文件
                 yaml_files = []
-                for pattern in ['service.yaml', 'docker-compose.yaml', 'docker-compose.yml']:
+                for pattern in ['docker-compose.yaml', 'docker-compose.yml']:
                     yaml_files.extend(list(template_dir.rglob(pattern)))
 
                 if not yaml_files:
-                    return False, "ZIP文件中未找到YAML文件", "no_yaml_in_zip"
+                    yaml_files = list(template_dir.rglob('*.yaml'))
+                    yaml_files.extend(list(template_dir.rglob('*.yml')))
+
+                if not yaml_files:
+                    return False, "压缩文件中未找到YAML文件", "no_yaml_in_archive"
 
                 # 读取第一个YAML文件
                 yaml_file = yaml_files[0]
                 with open(yaml_file, 'r', encoding='utf-8') as f:
                     yaml_content = f.read()
                     return True, yaml_content, ""
-
 
             else:
                 return False, f"不支持的模板类型: {template_type}", "unsupported_type"
@@ -1390,7 +2367,7 @@ class EnhancedTemplateManager:
         更新模板的YAML内容
 
         对于yaml格式：直接替换原文件
-        对于zip格式：替换解压目录中的yaml文件，并重新打包
+        对于archive格式：替换解压目录中的yaml文件，并重新打包
         """
         try:
             template = self.get_template(name)
@@ -1440,17 +2417,17 @@ class EnhancedTemplateManager:
                 self.logger.info(f"YAML模板 '{name}' 更新成功，新大小: {new_size} 字节")
                 return True, f"模板 '{name}' 更新成功，备份文件: {backup_path.name}"
 
-            elif template_type == 'zip':
-                # 更新ZIP包中的YAML
-                zip_path = Path(template['file_path'])
+            elif template_type == 'archive':
+                # 更新压缩包中的YAML
+                archive_path = Path(template['file_path'])
 
-                # 备份原ZIP文件
-                backup_path = zip_path.with_suffix(f'.zip.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(zip_path, backup_path)
+                # 备份原压缩文件
+                backup_path = archive_path.with_suffix(f'.archive.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
+                shutil.copy2(archive_path, backup_path)
 
                 # 查找解压目录中的YAML文件
                 yaml_files = []
-                for pattern in ['service.yaml', 'docker-compose.yaml', 'docker-compose.yml']:
+                for pattern in ['docker-compose.yaml', 'docker-compose.yml']:
                     yaml_files.extend(list(template_dir.rglob(pattern)))
 
                 if not yaml_files:
@@ -1472,21 +2449,45 @@ class EnhancedTemplateManager:
                 with open(yaml_file, 'w', encoding='utf-8') as f:
                     f.write(yaml_content)
 
-                # 重新打包ZIP文件
-                # 先删除原ZIP文件
-                zip_path.unlink()
+                # 重新创建压缩文件
+                # 先删除原压缩文件
+                archive_path.unlink()
 
-                # 创建新ZIP文件
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for file_path in template_dir.rglob('*'):
-                        if file_path.is_file():
-                            # 计算相对路径
-                            rel_path = file_path.relative_to(template_dir)
-                            # 添加文件到ZIP
-                            zipf.write(file_path, rel_path)
+                # 创建新压缩文件（根据原文件扩展名）
+                filename = archive_path.name.lower()
+
+                if filename.endswith('.zip'):
+                    # 创建ZIP文件
+                    with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        for file_path in template_dir.rglob('*'):
+                            if file_path.is_file():
+                                # 计算相对路径
+                                rel_path = file_path.relative_to(template_dir)
+                                # 添加文件到ZIP
+                                zipf.write(file_path, rel_path)
+
+                elif any(filename.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz']):
+                    # 创建TAR文件
+                    mode = 'w'
+                    if filename.endswith('.gz') or filename.endswith('.tgz'):
+                        mode = 'w:gz'
+                    elif filename.endswith('.bz2') or filename.endswith('.tbz') or filename.endswith('.tbz2'):
+                        mode = 'w:bz2'
+                    elif filename.endswith('.xz') or filename.endswith('.txz'):
+                        mode = 'w:xz'
+                    elif filename.endswith('.tar'):
+                        mode = 'w'
+
+                    with tarfile.open(archive_path, mode) as tarf:
+                        for file_path in template_dir.rglob('*'):
+                            if file_path.is_file():
+                                # 计算相对路径
+                                rel_path = file_path.relative_to(template_dir)
+                                # 添加文件到TAR
+                                tarf.add(file_path, arcname=rel_path)
 
                 # 更新元数据
-                new_size = zip_path.stat().st_size
+                new_size = archive_path.stat().st_size
                 metadata = template.get('metadata', {})
                 metadata['file_size'] = new_size
                 metadata['last_updated_by'] = updated_by
@@ -1503,7 +2504,7 @@ class EnhancedTemplateManager:
                     (json.dumps(metadata), name)
                 )
 
-                self.logger.info(f"ZIP模板 '{name}' 更新成功，新大小: {new_size} 字节")
+                self.logger.info(f"压缩模板 '{name}' 更新成功，新大小: {new_size} 字节")
                 return True, f"模板 '{name}' 更新成功，备份文件: {backup_path.name}"
 
             else:
@@ -1538,20 +2539,45 @@ class EnhancedTemplateManager:
                 'files_in_template': []
             }
 
-            # 如果是zip类型，获取zip内的文件列表
-            if template['type'] == 'zip':
-                try:
-                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                        file_info['files_in_template'] = zip_ref.namelist()
-                        file_info['zip_info'] = {
-                            'file_count': len(zip_ref.namelist()),
-                            'compressed_size': sum(zinfo.compress_size for zinfo in zip_ref.filelist),
-                            'uncompressed_size': sum(zinfo.file_size for zinfo in zip_ref.filelist),
-                            'compression_ratio': sum(zinfo.compress_size for zinfo in zip_ref.filelist) /
-                                                 max(sum(zinfo.file_size for zinfo in zip_ref.filelist), 1)
-                        }
-                except Exception as e:
-                    self.logger.warning(f"读取ZIP文件信息失败: {e}")
+            # 如果是压缩类型，获取压缩包内的文件列表
+            if template['type'] == 'archive':
+                filename = file_path.name.lower()
+
+                if filename.endswith('.zip'):
+                    try:
+                        with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                            file_info['files_in_template'] = zip_ref.namelist()
+                            file_info['archive_info'] = {
+                                'format': 'zip',
+                                'file_count': len(zip_ref.namelist()),
+                                'compressed_size': sum(zinfo.compress_size for zinfo in zip_ref.filelist),
+                                'uncompressed_size': sum(zinfo.file_size for zinfo in zip_ref.filelist),
+                                'compression_ratio': sum(zinfo.compress_size for zinfo in zip_ref.filelist) /
+                                                     max(sum(zinfo.file_size for zinfo in zip_ref.filelist), 1)
+                            }
+                    except Exception as e:
+                        self.logger.warning(f"读取ZIP文件信息失败: {e}")
+
+                elif any(filename.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz']):
+                    try:
+                        mode = 'r'
+                        if filename.endswith('.gz') or filename.endswith('.tgz'):
+                            mode = 'r:gz'
+                        elif filename.endswith('.bz2') or filename.endswith('.tbz') or filename.endswith('.tbz2'):
+                            mode = 'r:bz2'
+                        elif filename.endswith('.xz') or filename.endswith('.txz'):
+                            mode = 'r:xz'
+
+                        with tarfile.open(file_path, mode) as tar_ref:
+                            members = tar_ref.getmembers()
+                            file_info['files_in_template'] = [m.name for m in members if m.isfile()]
+                            file_info['archive_info'] = {
+                                'format': 'tar',
+                                'file_count': len([m for m in members if m.isfile()]),
+                                'compression': mode.replace('r:', '') if ':' in mode else 'none'
+                            }
+                    except Exception as e:
+                        self.logger.warning(f"读取TAR文件信息失败: {e}")
 
             return file_info
 
@@ -1575,9 +2601,27 @@ class EnhancedTemplateManager:
             if template['type'] == 'yaml':
                 content_type = 'text/yaml'
                 file_extension = 'yaml'
-            elif template['type'] == 'zip':
-                content_type = 'application/zip'
-                file_extension = 'zip'
+            elif template['type'] == 'archive':
+                # 根据文件扩展名确定内容类型
+                filename = file_path.name.lower()
+                if filename.endswith('.zip'):
+                    content_type = 'application/zip'
+                    file_extension = 'zip'
+                elif filename.endswith('.tar'):
+                    content_type = 'application/x-tar'
+                    file_extension = 'tar'
+                elif filename.endswith('.gz') or filename.endswith('.tgz'):
+                    content_type = 'application/gzip'
+                    file_extension = 'tar.gz'
+                elif filename.endswith('.bz2') or filename.endswith('.tbz') or filename.endswith('.tbz2'):
+                    content_type = 'application/x-bzip2'
+                    file_extension = 'tar.bz2'
+                elif filename.endswith('.xz') or filename.endswith('.txz'):
+                    content_type = 'application/x-xz'
+                    file_extension = 'tar.xz'
+                else:
+                    content_type = 'application/octet-stream'
+                    file_extension = 'bin'
             else:
                 content_type = 'application/octet-stream'
                 file_extension = 'bin'
@@ -1649,7 +2693,7 @@ class EnhancedTemplateManager:
                 if template_type == 'yaml':
                     export_format = 'yaml'
                 else:
-                    export_format = 'zip'
+                    export_format = 'archive'
 
             # 根据导出格式处理
             if export_format == 'yaml':
@@ -1660,18 +2704,18 @@ class EnhancedTemplateManager:
                 else:
                     return False, message, "text/plain", ""
 
-            elif export_format == 'zip':
-                # 导出为ZIP
-                if template_type == 'zip':
+            elif export_format == 'archive':
+                # 导出为压缩文件
+                if template_type == 'archive':
                     with open(file_path, 'rb') as f:
                         content = f.read()
-                    return True, content, 'application/zip', f"{name}.zip"
+                    return True, content, self._get_content_type(file_path.name), f"{name}{Path(file_path).suffix}"
                 else:
-                    success, zip_content, content_type = self.get_template_as_zip(name, True)
+                    success, archive_content, content_type = self.get_template_as_zip(name, True)
                     if success:
-                        return True, zip_content, content_type, f"{name}.zip"
+                        return True, archive_content, content_type, f"{name}.zip"
                     else:
-                        return False, zip_content, "text/plain", ""
+                        return False, archive_content, "text/plain", ""
 
             else:
                 return False, f"不支持的导出格式: {export_format}", "text/plain", ""
@@ -1679,6 +2723,23 @@ class EnhancedTemplateManager:
         except Exception as e:
             self.logger.error(f"导出模板失败: {str(e)}")
             return False, f"导出失败: {str(e)}", "text/plain", ""
+
+    def _get_content_type(self, filename: str) -> str:
+        """根据文件名获取Content-Type"""
+        filename_lower = filename.lower()
+
+        if filename_lower.endswith('.zip'):
+            return 'application/zip'
+        elif filename_lower.endswith('.tar'):
+            return 'application/x-tar'
+        elif filename_lower.endswith('.tar.gz') or filename_lower.endswith('.tgz'):
+            return 'application/gzip'
+        elif filename_lower.endswith('.tar.bz2') or filename_lower.endswith('.tbz') or filename_lower.endswith('.tbz2'):
+            return 'application/x-bzip2'
+        elif filename_lower.endswith('.tar.xz') or filename_lower.endswith('.txz'):
+            return 'application/x-xz'
+        else:
+            return 'application/octet-stream'
 
     def list_templates(self, page: int = 1, per_page: int = 20) -> Tuple[List[Dict], int]:
         """列出所有模板（包含文件大小信息）"""
@@ -1755,11 +2816,10 @@ class EnhancedTemplateManager:
 
 class AgentManager:
     """Agent管理器"""
-
     def __init__(self, nacos_url: str, nacos_namespace: str,
                  agent_api_port: int, agent_auth_token: str,
                  db_manager: DatabaseManager, redis_manager: RedisManager,
-                 pod_id: str):
+                 pod_id: str, agent_api_timeouts: Dict = None):
         self.nacos_url = nacos_url.rstrip('/')
         self.nacos_namespace = nacos_namespace
         self.agent_api_port = agent_api_port
@@ -1767,6 +2827,20 @@ class AgentManager:
         self.db = db_manager
         self.redis_manager = redis_manager
         self.pod_id = pod_id
+
+        # 设置超时配置
+        self.timeouts = agent_api_timeouts or {
+            'default': (10, 30),
+            'health_check': (5, 10),
+            'deploy_create': (10, 60),
+            'deploy_start': (10, 300),
+            'deploy_stop': (10, 120),
+            'deploy_delete': (10, 60),
+            'undeploy': (10, 180),
+            'file_upload': (10, 600),
+            'stream': (10, 3600),
+            'proxy': (10, 300),
+        }
 
         self.agents: Dict[str, AgentInfo] = {}
         self.workspaces: Dict[str, WorkspaceInfo] = {}
@@ -2040,7 +3114,7 @@ class AgentManager:
 
         try:
             # 获取分布式锁（如果Redis不可用，会返回虚拟锁）
-            with self.redis_manager.get_lock(lock_key, timeout=60) as lock:
+            with self.redis_manager.get_lock(lock_key, timeout=30) as lock:
                 if lock.is_acquired():
                     self.logger.info(f"POD {self.pod_id} 获取到锁，开始刷新Agent列表...")
                 else:
@@ -2142,9 +3216,20 @@ class AgentManager:
     def call_agent_api(self, agent_key: str, method: str, endpoint: str,
                        data: Any = None, params: Dict = None,
                        headers: Dict = None, files: Dict = None,
-                       stream: bool = False) -> Tuple[int, Any]:
+                       stream: bool = False, timeout_type: str = 'default') -> Tuple[int, Any]:
         """
-        调用Agent API（增强版，支持文件上传）
+        调用Agent API（增强版，支持文件上传和可配置超时）
+
+        Args:
+            agent_key: Agent标识符
+            method: HTTP方法
+            endpoint: API端点
+            data: 请求数据
+            params: 查询参数
+            headers: 请求头
+            files: 上传的文件
+            stream: 是否流式响应
+            timeout_type: 超时类型，对应配置中的超时设置
         """
         agent = self.get_agent(agent_key)
         if not agent:
@@ -2152,6 +3237,14 @@ class AgentManager:
 
         try:
             url = f"http://{agent.ip_address}:{self.agent_api_port}{endpoint}"
+
+            # 获取超时设置
+            if timeout_type in self.timeouts:
+                timeout = self.timeouts[timeout_type]
+            else:
+                timeout = self.timeouts['default']
+
+            self.logger.debug(f"调用Agent API: {method} {url}, 超时设置: {timeout}, 类型: {timeout_type}")
 
             # 构建请求头
             request_headers = {
@@ -2166,7 +3259,7 @@ class AgentManager:
             request_kwargs = {
                 'headers': request_headers,
                 'params': params,
-                'timeout': (5, 30),
+                'timeout': timeout,
                 'stream': stream
             }
 
@@ -2262,11 +3355,12 @@ class AgentManager:
                 # 二进制响应
                 response_data = response.content
 
+            self.logger.debug(f"Agent API响应: 状态码={response.status_code}, 耗时={response.elapsed.total_seconds():.2f}秒")
             return response.status_code, response_data
 
         except requests.exceptions.Timeout:
-            self.logger.error(f"请求Agent {agent_key} 超时")
-            return 504, {'error': 'Request timeout to agent'}
+            self.logger.error(f"请求Agent {agent_key} 超时 (超时设置: {timeout})")
+            return 504, {'error': f'Request timeout to agent (timeout: {timeout})'}
         except requests.exceptions.ConnectionError:
             self.logger.error(f"连接Agent {agent_key} 失败")
             return 503, {'error': 'Connection failed to agent'}
@@ -2274,14 +3368,14 @@ class AgentManager:
             self.logger.error(f"调用Agent API失败: {str(e)}", exc_info=True)
             return 500, {'error': f'API call failed: {str(e)}'}
 
-# ===================== 任务管理器 =====================
+# ===================== 任务管理器（支持多种压缩格式） =====================
 
 class TaskManager:
-    """任务管理器"""
-
+    """任务管理器（支持多种压缩格式）"""
     def __init__(self, db_manager: DatabaseManager, agent_manager: AgentManager,
-                 template_manager: TemplateManager, services_root: str,
-                 redis_manager: RedisManager, pod_id: str, max_task_logs: int = 1000):
+                 template_manager: EnhancedTemplateManager, services_root: str,
+                 redis_manager: RedisManager, pod_id: str, max_task_logs: int = 1000,
+                 agent_api_timeouts: Dict = None):
         self.db = db_manager
         self.agent_manager = agent_manager
         self.template_manager = template_manager
@@ -2289,6 +3383,20 @@ class TaskManager:
         self.redis_manager = redis_manager
         self.pod_id = pod_id
         self.max_task_logs = max_task_logs
+
+        # 设置超时配置
+        self.timeouts = agent_api_timeouts or {
+            'default': (10, 30),
+            'health_check': (5, 10),
+            'deploy_create': (10, 60),
+            'deploy_start': (10, 300),
+            'deploy_stop': (10, 120),
+            'deploy_delete': (10, 60),
+            'undeploy': (10, 180),
+            'file_upload': (10, 600),
+            'stream': (10, 3600),
+            'proxy': (10, 300),
+        }
 
         self.services_root.mkdir(parents=True, exist_ok=True)
         self.executor = ThreadPoolExecutor(max_workers=5)
@@ -2440,9 +3548,26 @@ class TaskManager:
         if message:
             self._add_task_log(task_id, log_level, message)
 
+    def _get_content_type(self, filename: str) -> str:
+        """根据文件名获取Content-Type"""
+        filename_lower = filename.lower()
+
+        if filename_lower.endswith('.zip'):
+            return 'application/zip'
+        elif filename_lower.endswith('.tar'):
+            return 'application/x-tar'
+        elif filename_lower.endswith('.tar.gz') or filename_lower.endswith('.tgz'):
+            return 'application/gzip'
+        elif filename_lower.endswith('.tar.bz2') or filename_lower.endswith('.tbz') or filename_lower.endswith('.tbz2'):
+            return 'application/x-bzip2'
+        elif filename_lower.endswith('.tar.xz') or filename_lower.endswith('.txz'):
+            return 'application/x-xz'
+        else:
+            return 'application/octet-stream'
+
     def _deploy_service(self, task_id: str, service_name: str, agent_key: str,
                         template_name: str, extra_params: Dict = None):
-        """部署服务（修复模板文件获取问题）"""
+        """部署服务（支持多种压缩格式）"""
         try:
             self._update_task_status(task_id, 'running', 10, '开始部署')
 
@@ -2471,174 +3596,14 @@ class TaskManager:
             template_type = template['type']
             self._add_task_log(task_id, 'INFO', f"模板类型: {template_type}")
 
-            # 3. 根据模板类型获取YAML内容
-            self._update_task_status(task_id, 'running', 30, '获取模板内容')
-
+            # 3. 根据模板类型处理
             if template_type == 'yaml':
-                # 获取YAML内容
-                success, yaml_content, error_msg = self.template_manager.get_yaml_content(template_name)
-                if not success:
-                    self._update_task_status(task_id, 'failed', 30, f'获取YAML内容失败: {yaml_content}')
-                    return
+                # YAML模板部署
+                self._deploy_yaml_template(task_id, service_name, agent_key, template_name, extra_params)
 
-                self._add_task_log(task_id, 'INFO', f"YAML内容大小: {len(yaml_content)} 字符")
-
-                # 准备部署数据
-                data = {
-                    'name': service_name,
-                    'yaml': yaml_content
-                }
-
-                # 添加额外参数（如果有）
-                if extra_params:
-                    data.update(extra_params)
-
-                self._add_task_log(task_id, 'INFO', f"调用Agent API创建服务: {service_name}")
-
-                # 调用Agent API创建服务
-                status_code, response = self.agent_manager.call_agent_api(
-                    agent_key, 'POST', '/api/services/yaml', data
-                )
-
-                self._add_task_log(task_id, 'INFO', f"Agent响应状态码: {status_code}")
-                self._add_task_log(task_id, 'DEBUG', f"Agent响应内容: {json.dumps(response)[:200]}...")
-
-                if status_code == 201:
-                    self._update_task_status(task_id, 'running', 70, '服务创建成功，正在启动')
-
-                    # 等待几秒让服务创建完成
-                    time.sleep(2)
-
-                    self._add_task_log(task_id, 'INFO', f"启动服务: {service_name}")
-
-                    # 启动服务
-                    start_status_code, start_response = self.agent_manager.call_agent_api(
-                        agent_key, 'POST', f'/api/services/{service_name}/start', {}
-                    )
-
-                    if start_status_code == 200:
-                        self._update_task_status(task_id, 'success', 100, '服务部署成功')
-                        self._add_task_log(task_id, 'INFO', '服务部署完成')
-                    else:
-                        error_msg = f'启动服务失败: {start_response}'
-                        self._update_task_status(task_id, 'failed', 70, error_msg)
-                        self._add_task_log(task_id, 'ERROR', error_msg)
-
-                        # 尝试清理创建的服务
-                        self._add_task_log(task_id, 'WARN', '尝试清理已创建的服务')
-                        self.agent_manager.call_agent_api(
-                            agent_key, 'DELETE', f'/api/services/{service_name}', {}
-                        )
-
-                elif status_code == 409:
-                    # 服务已存在
-                    self._update_task_status(task_id, 'running', 70, '服务已存在，尝试重新创建')
-
-                    # 先停止并删除现有服务
-                    self._add_task_log(task_id, 'INFO', '停止现有服务')
-                    self.agent_manager.call_agent_api(
-                        agent_key, 'POST', f'/api/services/{service_name}/stop', {}
-                    )
-
-                    time.sleep(3)
-
-                    self._add_task_log(task_id, 'INFO', '删除现有服务')
-                    self.agent_manager.call_agent_api(
-                        agent_key, 'DELETE', f'/api/services/{service_name}', {}
-                    )
-
-                    time.sleep(2)
-
-                    # 重新创建服务
-                    self._add_task_log(task_id, 'INFO', '重新创建服务')
-                    status_code, response = self.agent_manager.call_agent_api(
-                        agent_key, 'POST', '/api/services/yaml', data
-                    )
-
-                    if status_code == 201:
-                        # 启动服务
-                        time.sleep(2)
-                        start_status_code, start_response = self.agent_manager.call_agent_api(
-                            agent_key, 'POST', f'/api/services/{service_name}/start', {}
-                        )
-
-                        if start_status_code == 200:
-                            self._update_task_status(task_id, 'success', 100, '服务重新部署成功')
-                        else:
-                            error_msg = f'重新部署后启动服务失败: {start_response}'
-                            self._update_task_status(task_id, 'failed', 70, error_msg)
-                    else:
-                        error_msg = f'重新创建服务失败: {response}'
-                        self._update_task_status(task_id, 'failed', 70, error_msg)
-
-                else:
-                    error_msg = f'创建服务失败 (HTTP {status_code}): {response}'
-                    self._update_task_status(task_id, 'failed', 30, error_msg)
-                    self._add_task_log(task_id, 'ERROR', error_msg)
-
-            elif template_type == 'zip':
-                # ZIP模板部署
-                self._update_task_status(task_id, 'running', 30, '处理ZIP模板')
-
-                # 获取模板文件路径
-                template_file = self.template_manager.get_template_file(template_name)
-                if not template_file:
-                    self._update_task_status(task_id, 'failed', 30, 'ZIP模板文件不存在')
-                    return
-
-                self._add_task_log(task_id, 'INFO', f"ZIP文件: {template_file}")
-
-                # 准备文件上传
-                with open(template_file, 'rb') as f:
-                    file_content = f.read()
-
-                # 创建文件字典（符合call_agent_api的文件格式）
-                files = {
-                    'file': ('template.zip', file_content, 'application/zip')
-                }
-
-                data = {
-                    'name': service_name
-                }
-
-                # 添加额外参数
-                if extra_params:
-                    data.update(extra_params)
-
-                self._add_task_log(task_id, 'INFO', f"上传ZIP文件到Agent")
-
-                # 调用Agent的ZIP部署接口
-                status_code, response = self.agent_manager.call_agent_api(
-                    agent_key, 'POST', '/api/services/zip', data=data, files=files
-                )
-
-                self._add_task_log(task_id, 'INFO', f"Agent响应状态码: {status_code}")
-                self._add_task_log(task_id, 'DEBUG', f"Agent响应内容: {json.dumps(response)[:200]}...")
-
-                if status_code == 201:
-                    self._update_task_status(task_id, 'running', 70, 'ZIP服务创建成功，正在启动')
-
-                    # 等待几秒让服务创建完成
-                    time.sleep(3)
-
-                    self._add_task_log(task_id, 'INFO', f"启动服务: {service_name}")
-
-                    # 启动服务
-                    start_status_code, start_response = self.agent_manager.call_agent_api(
-                        agent_key, 'POST', f'/api/services/{service_name}/start', {}
-                    )
-
-                    if start_status_code == 200:
-                        self._update_task_status(task_id, 'success', 100, 'ZIP服务部署成功')
-                        self._add_task_log(task_id, 'INFO', 'ZIP服务部署完成')
-                    else:
-                        error_msg = f'启动ZIP服务失败: {start_response}'
-                        self._update_task_status(task_id, 'failed', 70, error_msg)
-                        self._add_task_log(task_id, 'ERROR', error_msg)
-                else:
-                    error_msg = f'创建ZIP服务失败 (HTTP {status_code}): {response}'
-                    self._update_task_status(task_id, 'failed', 30, error_msg)
-                    self._add_task_log(task_id, 'ERROR', error_msg)
+            elif template_type == 'archive':
+                # 压缩模板部署（支持多种格式）
+                self._deploy_archive_template(task_id, service_name, agent_key, template_name, extra_params)
 
             else:
                 error_msg = f'不支持的模板类型: {template_type}'
@@ -2648,6 +3613,243 @@ class TaskManager:
             self.logger.error(f"部署服务失败: {str(e)}", exc_info=True)
             self._update_task_status(task_id, 'failed', 0, f'部署失败: {str(e)}')
             self._add_task_log(task_id, 'ERROR', f"异常详情: {traceback.format_exc()}")
+    def _deploy_yaml_template(self, task_id: str, service_name: str, agent_key: str,
+                              template_name: str, extra_params: Dict = None):
+        """部署YAML模板"""
+        # 获取YAML内容
+        success, yaml_content, error_msg = self.template_manager.get_yaml_content(template_name)
+        if not success:
+            self._update_task_status(task_id, 'failed', 30, f'获取YAML内容失败: {yaml_content}')
+            return
+
+        self._add_task_log(task_id, 'INFO', f"YAML内容大小: {len(yaml_content)} 字符")
+
+        # 准备部署数据
+        data = {
+            'name': service_name,
+            'yaml': yaml_content
+        }
+
+        # 添加额外参数（如果有）
+        if extra_params:
+            data.update(extra_params)
+
+        self._add_task_log(task_id, 'INFO', f"调用Agent API创建服务: {service_name}")
+
+        # 调用Agent API创建服务（使用较长的超时）
+        self._add_task_log(task_id, 'INFO', f"创建服务，超时设置: {self.timeouts['deploy_create']}")
+        status_code, response = self.agent_manager.call_agent_api(
+            agent_key, 'POST', '/api/services/yaml', data,
+            timeout_type='deploy_create'
+        )
+
+        self._add_task_log(task_id, 'INFO', f"Agent响应状态码: {status_code}")
+        self._add_task_log(task_id, 'DEBUG', f"Agent响应内容: {json.dumps(response)[:200]}...")
+
+        # 处理响应
+        if status_code == 201:
+            self._update_task_status(task_id, 'running', 70, '服务创建成功，正在启动')
+            time.sleep(2)
+
+            # 启动服务（使用更长的超时，因为可能需要下载镜像）
+            self._add_task_log(task_id, 'INFO', f"启动服务，超时设置: {self.timeouts['deploy_start']}")
+            start_status_code, start_response = self.agent_manager.call_agent_api(
+                agent_key, 'POST', f'/api/services/{service_name}/start', {},
+                timeout_type='deploy_start'
+            )
+
+            if start_status_code == 200:
+                self._update_task_status(task_id, 'success', 100, '服务部署成功')
+                self._add_task_log(task_id, 'INFO', '服务部署完成')
+            else:
+                error_msg = f'启动服务失败: {start_response}'
+                self._update_task_status(task_id, 'failed', 70, error_msg)
+                self._add_task_log(task_id, 'ERROR', error_msg)
+
+                # 尝试清理创建的服务
+                self._add_task_log(task_id, 'WARN', '尝试清理已创建的服务')
+                self._add_task_log(task_id, 'INFO', f"停止服务，超时设置: {self.timeouts['deploy_stop']}")
+                self.agent_manager.call_agent_api(
+                    agent_key, 'POST', f'/api/services/{service_name}/stop', {},
+                    timeout_type='deploy_stop'
+                )
+
+                time.sleep(2)
+
+                self._add_task_log(task_id, 'INFO', f"删除服务，超时设置: {self.timeouts['deploy_delete']}")
+                self.agent_manager.call_agent_api(
+                    agent_key, 'DELETE', f'/api/services/{service_name}', {},
+                    timeout_type='deploy_delete'
+                )
+
+        elif status_code == 409:
+            # 服务已存在，重新创建
+            self._update_task_status(task_id, 'running', 70, '服务已存在，尝试重新创建')
+            self._add_task_log(task_id, 'INFO', '停止现有服务')
+
+            # 先停止并删除现有服务
+            self.agent_manager.call_agent_api(
+                agent_key, 'POST', f'/api/services/{service_name}/stop', {},
+                timeout_type='deploy_stop'
+            )
+
+            time.sleep(3)
+
+            self._add_task_log(task_id, 'INFO', '删除现有服务')
+            self.agent_manager.call_agent_api(
+                agent_key, 'DELETE', f'/api/services/{service_name}', {},
+                timeout_type='deploy_delete'
+            )
+
+            time.sleep(2)
+
+            # 重新创建服务
+            self._add_task_log(task_id, 'INFO', '重新创建服务')
+            status_code, response = self.agent_manager.call_agent_api(
+                agent_key, 'POST', '/api/services/yaml', data,
+                timeout_type='deploy_create'
+            )
+
+            if status_code == 201:
+                # 启动服务
+                time.sleep(2)
+                start_status_code, start_response = self.agent_manager.call_agent_api(
+                    agent_key, 'POST', f'/api/services/{service_name}/start', {},
+                    timeout_type='deploy_start'
+                )
+
+                if start_status_code == 200:
+                    self._update_task_status(task_id, 'success', 100, '服务重新部署成功')
+                else:
+                    error_msg = f'重新部署后启动服务失败: {start_response}'
+                    self._update_task_status(task_id, 'failed', 70, error_msg)
+            else:
+                error_msg = f'重新创建服务失败: {response}'
+                self._update_task_status(task_id, 'failed', 70, error_msg)
+
+        else:
+            error_msg = f'创建服务失败 (HTTP {status_code}): {response}'
+            self._update_task_status(task_id, 'failed', 30, error_msg)
+            self._add_task_log(task_id, 'ERROR', error_msg)
+
+    def _deploy_archive_template(self, task_id: str, service_name: str, agent_key: str,
+                                 template_name: str, extra_params: Dict = None):
+        """部署压缩模板（支持多种格式）"""
+        self._update_task_status(task_id, 'running', 30, '处理压缩模板')
+
+        # 获取模板文件路径
+        template_file = self.template_manager.get_template_file(template_name)
+        if not template_file:
+            self._update_task_status(task_id, 'failed', 30, '压缩模板文件不存在')
+            return
+
+        self._add_task_log(task_id, 'INFO', f"压缩文件: {template_file}")
+
+        # 读取压缩文件内容
+        with open(template_file, 'rb') as f:
+            file_content = f.read()
+
+        # 获取文件扩展名
+        filename = Path(template_file).name
+
+        # 创建文件字典（符合call_agent_api的文件格式）
+        files = {
+            'file': (filename, file_content, self._get_content_type(filename))
+        }
+
+        data = {
+            'name': service_name
+        }
+
+        # 添加额外参数
+        if extra_params:
+            data.update(extra_params)
+
+        self._add_task_log(task_id, 'INFO', f"上传压缩文件到Agent: {filename}")
+
+        # 调用Agent的压缩文件部署接口（使用文件上传的超时）
+        self._add_task_log(task_id, 'INFO', f"上传文件，超时设置: {self.timeouts['file_upload']}")
+        status_code, response = self.agent_manager.call_agent_api(
+            agent_key, 'POST', '/api/services/zip', data=data, files=files,
+            timeout_type='file_upload'
+        )
+
+        self._add_task_log(task_id, 'INFO', f"Agent响应状态码: {status_code}")
+        self._add_task_log(task_id, 'DEBUG', f"Agent响应内容: {json.dumps(response)[:200]}...")
+
+        if status_code == 201:
+            self._update_task_status(task_id, 'running', 70, '压缩服务创建成功，正在启动')
+
+            # 等待几秒让服务创建完成
+            time.sleep(3)
+
+            self._add_task_log(task_id, 'INFO', f"启动服务: {service_name}")
+
+            # 启动服务（使用较长的超时）
+            self._add_task_log(task_id, 'INFO', f"启动服务，超时设置: {self.timeouts['deploy_start']}")
+            start_status_code, start_response = self.agent_manager.call_agent_api(
+                agent_key, 'POST', f'/api/services/{service_name}/start', {},
+                timeout_type='deploy_start'
+            )
+
+            if start_status_code == 200:
+                self._update_task_status(task_id, 'success', 100, '压缩服务部署成功')
+                self._add_task_log(task_id, 'INFO', '压缩服务部署完成')
+            else:
+                error_msg = f'启动压缩服务失败: {start_response}'
+                self._update_task_status(task_id, 'failed', 70, error_msg)
+                self._add_task_log(task_id, 'ERROR', error_msg)
+        else:
+            error_msg = f'创建压缩服务失败 (HTTP {status_code}): {response}'
+            self._update_task_status(task_id, 'failed', 30, error_msg)
+            self._add_task_log(task_id, 'ERROR', error_msg)
+
+    def _undeploy_service(self, task_id: str, service_name: str, agent_key: str):
+        """卸载服务"""
+        try:
+            self._update_task_status(task_id, 'running', 10, '开始卸载服务')
+
+            agent = self.agent_manager.get_agent(agent_key)
+            if not agent:
+                self._update_task_status(task_id, 'failed', 0, f'Agent {agent_key} 不存在')
+                return
+
+            self._add_task_log(task_id, 'INFO', f"目标Agent: {agent.hostname} ({agent.ip_address})")
+            self._add_task_log(task_id, 'INFO', f"服务名称: {service_name}")
+
+            # 停止服务（使用较长的超时）
+            self._add_task_log(task_id, 'INFO', '停止服务')
+            self._add_task_log(task_id, 'INFO', f"超时设置: {self.timeouts['undeploy']}")
+            stop_status_code, stop_response = self.agent_manager.call_agent_api(
+                agent_key, 'POST', f'/api/services/{service_name}/stop', {},
+                timeout_type='undeploy'
+            )
+
+            if stop_status_code not in [200, 404]:
+                self._update_task_status(task_id, 'failed', 30, f'停止服务失败: {stop_response}')
+                return
+
+            time.sleep(2)
+
+            # 删除服务
+            self._add_task_log(task_id, 'INFO', '删除服务')
+            delete_status_code, delete_response = self.agent_manager.call_agent_api(
+                agent_key, 'DELETE', f'/api/services/{service_name}', {},
+                timeout_type='undeploy'
+            )
+
+            if delete_status_code in [200, 204, 404]:
+                self._update_task_status(task_id, 'success', 100, '服务卸载成功')
+                self._add_task_log(task_id, 'INFO', '服务卸载完成')
+            else:
+                error_msg = f'删除服务失败 (HTTP {delete_status_code}): {delete_response}'
+                self._update_task_status(task_id, 'failed', 50, error_msg)
+                self._add_task_log(task_id, 'ERROR', error_msg)
+
+        except Exception as e:
+            self.logger.error(f"卸载服务失败: {str(e)}")
+            self._update_task_status(task_id, 'failed', 0, f'卸载失败: {str(e)}')
+
 
     def get_task(self, task_id: str) -> Optional[Dict]:
         task = self.db.fetch_one(
@@ -2776,16 +3978,30 @@ class TaskManager:
 class EnhancedProxyManager:
     """增强版代理管理器"""
 
-    def __init__(self, agent_manager: AgentManager):
+    def __init__(self, agent_manager: AgentManager, timeouts: Dict = None):
         self.agent_manager = agent_manager
         self.logger = logging.getLogger(__name__)
         self.session = requests.Session()
         self.session.verify = False  # 临时禁用SSL验证
 
+        # 设置超时配置
+        self.timeouts = timeouts or {
+            'default': (10, 30),
+            'health_check': (5, 10),
+            'deploy_create': (10, 60),
+            'deploy_start': (10, 300),
+            'deploy_stop': (10, 120),
+            'deploy_delete': (10, 60),
+            'undeploy': (10, 180),
+            'file_upload': (10, 600),
+            'stream': (10, 3600),
+            'proxy': (10, 300),
+        }
+
     def proxy_request(self, agent_key: str, method: str, endpoint: str,
                       request_data: Any = None, query_params: Dict = None,
                       headers: Dict = None, files: Dict = None,
-                      stream: bool = False, timeout: int = 30) -> Tuple[int, Any, Dict]:
+                      stream: bool = False, timeout: int = None) -> Tuple[int, Any, Dict]:
         """
         代理请求到指定的Agent（增强版）
         """
@@ -2818,16 +4034,37 @@ class EnhancedProxyManager:
                     if key_lower not in ['host', 'authorization', 'cookie', 'connection']:
                         request_headers[key] = value
 
+            # 确定超时时间
+            if timeout is None:
+                # 根据端点类型确定默认超时
+                if stream:
+                    timeout_tuple = self.timeouts.get('stream', (10, 3600))
+                elif files:
+                    timeout_tuple = self.timeouts.get('file_upload', (10, 600))
+                elif 'start' in endpoint.lower():
+                    timeout_tuple = self.timeouts.get('deploy_start', (10, 300))
+                elif 'stop' in endpoint.lower():
+                    timeout_tuple = self.timeouts.get('deploy_stop', (10, 120))
+                elif 'delete' in endpoint.lower():
+                    timeout_tuple = self.timeouts.get('deploy_delete', (10, 60))
+                elif 'health' in endpoint.lower():
+                    timeout_tuple = self.timeouts.get('health_check', (5, 10))
+                else:
+                    timeout_tuple = self.timeouts.get('proxy', (10, 300))
+            else:
+                # 使用指定的超时时间（秒）
+                timeout_tuple = (10, timeout)
+
             # 准备请求参数
             request_kwargs = {
                 'headers': request_headers,
                 'params': query_params,
-                'timeout': timeout,
+                'timeout': timeout_tuple,
                 'stream': stream,
                 'verify': False  # 禁用SSL验证
             }
 
-            self.logger.info(f"代理请求: {method} {url} 到Agent {agent.hostname}")
+            self.logger.info(f"代理请求: {method} {url} 到Agent {agent.hostname}, 超时: {timeout_tuple}")
 
             # 发送请求
             response = None
@@ -2861,7 +4098,7 @@ class EnhancedProxyManager:
                 else:
                     return 400, {'error': f'Unsupported method: {method}'}, {}
             except requests.exceptions.Timeout:
-                return 504, {'error': f'Request timeout to agent {agent.hostname}'}, {}
+                return 504, {'error': f'Request timeout to agent {agent.hostname} (timeout: {timeout_tuple})'}, {}
             except requests.exceptions.ConnectionError:
                 return 503, {'error': f'Connection failed to agent {agent.hostname}'}, {}
             except Exception as e:
@@ -2916,6 +4153,7 @@ class EnhancedProxyManager:
                 self.logger.error(f"处理响应失败: {str(e)}")
                 response_data = {'error': 'Failed to process response', 'status_code': response.status_code}
 
+            self.logger.debug(f"代理响应: 状态码={response.status_code}, 耗时={response.elapsed.total_seconds():.2f}秒")
             return response.status_code, response_data, response_headers
 
         except Exception as e:
@@ -2925,7 +4163,7 @@ class EnhancedProxyManager:
 # ===================== Flask应用 =====================
 
 class WebAPIServer:
-    """WEB API服务器"""
+    """WEB API服务器（支持多种压缩格式）"""
 
     def __init__(self, config: Dict):
         self.config = config
@@ -3015,10 +4253,28 @@ class WebAPIServer:
         self.auth_manager = AuthManager(self.db_manager, config['secret_key'],
                                         config.get('token_expiration', 86400))
 
-        # 7. 初始化模板管理器
-        self.template_manager = EnhancedTemplateManager(config['templates_root'], self.db_manager)
+        # 7. 初始化模板管理器（传递支持的格式）
+        supported_formats = config.get('supported_formats', SUPPORTED_FORMATS)
+        self.template_manager = EnhancedTemplateManager(
+            config['templates_root'],
+            self.db_manager,
+            supported_formats
+        )
 
-        # 8. 初始化Agent管理器
+        # 8. 初始化Agent管理器（传递超时配置）
+        agent_api_timeouts = config.get('agent_api_timeouts', {
+            'default': (10, 30),
+            'health_check': (5, 10),
+            'deploy_create': (10, 60),
+            'deploy_start': (10, 300),
+            'deploy_stop': (10, 120),
+            'deploy_delete': (10, 60),
+            'undeploy': (10, 180),
+            'file_upload': (10, 600),
+            'stream': (10, 3600),
+            'proxy': (10, 300),
+        })
+
         self.agent_manager = AgentManager(
             config['nacos_url'],
             config.get('nacos_namespace', 'public'),
@@ -3026,10 +4282,11 @@ class WebAPIServer:
             config.get('agent_auth_token', 'default_token_change_me'),
             self.db_manager,
             self.redis_manager,
-            config['pod_id']
+            config['pod_id'],
+            agent_api_timeouts
         )
 
-        # 9. 初始化任务管理器
+        # 9. 初始化任务管理器（传递超时配置）
         self.task_manager = TaskManager(
             self.db_manager,
             self.agent_manager,
@@ -3037,11 +4294,12 @@ class WebAPIServer:
             config['services_root'],
             self.redis_manager,
             config['pod_id'],
-            config.get('max_task_logs', 1000)
+            config.get('max_task_logs', 1000),
+            agent_api_timeouts
         )
 
-        # 10. 初始化代理管理器（新增）
-        self.proxy_manager = EnhancedProxyManager(self.agent_manager)
+        # 10. 初始化代理管理器（新增，传递超时配置）
+        self.proxy_manager = EnhancedProxyManager(self.agent_manager, agent_api_timeouts)
 
         # 11. 注册路由
         self._register_routes()
@@ -3058,6 +4316,8 @@ class WebAPIServer:
         self.logger.info(f"当前POD ID: {config['pod_id']}")
         self.logger.info(f"使用数据库: {config['database'].get('type', 'sqlite').upper()}")
         self.logger.info(f"Redis状态: {'已启用' if self.redis_manager.enabled else '已禁用'}")
+        self.logger.info(f"支持的压缩格式: {', '.join(supported_formats)}")
+        self.logger.info(f"Agent API超时配置: {agent_api_timeouts}")
         self.logger.info(f"代理功能: 已启用")
 
     def _setup_logger(self) -> logging.Logger:
@@ -3167,7 +4427,8 @@ class WebAPIServer:
                     'database': 'connected' if db_ok else 'disconnected',
                     'redis': 'connected' if redis_ok else 'disconnected',
                     'nacos': 'connected' if nacos_ok else 'disconnected'
-                }
+                },
+                'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
         @self.app.route('/api/system/connections', methods=['GET'])
@@ -3193,7 +4454,8 @@ class WebAPIServer:
                         'message': results['redis'][1],
                         'enabled': self.config.get('redis_enabled', True)
                     }
-                }
+                },
+                'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
         @self.app.route('/api/auth/login', methods=['POST'])
@@ -3330,16 +4592,16 @@ class WebAPIServer:
                 'message': '卸载任务已创建'
             }), 202
 
-        # ===================== 代理路由（修复版） =====================
+        # ===================== 代理路由（修复版，支持长超时） =====================
         @self.app.route('/api/proxy/<agent_key>/<path:action_path>',
                         methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
         @self.auth.login_required
         def proxy_to_agent(agent_key, action_path):
-            """将请求代理到指定的Agent（修复版）"""
+            """将请求代理到指定的Agent（修复版，支持长超时）"""
             try:
                 # 获取请求方法
                 method = request.method
-
+        
                 # 获取查询参数
                 query_params = {}
                 for key, value in request.args.items():
@@ -3349,7 +4611,7 @@ class WebAPIServer:
                         query_params[key].append(value)
                     else:
                         query_params[key] = [query_params[key], value]
-
+        
                 # 获取请求头（过滤敏感头）
                 headers_to_forward = {}
                 exclude_headers = [
@@ -3357,18 +4619,18 @@ class WebAPIServer:
                     'content-length', 'content-type', 'accept-encoding',
                     'accept', 'user-agent'
                 ]
-
+        
                 for key, value in request.headers:
                     key_lower = key.lower()
                     if key_lower not in exclude_headers:
                         headers_to_forward[key] = value
-
+        
                 # 处理请求数据 - 修复JSON解析问题
                 request_data = None
                 files_to_forward = {}
-
+        
                 content_type = request.headers.get('Content-Type', '').lower()
-
+        
                 # 检查是否是文件上传
                 if 'multipart/form-data' in content_type and request.files:
                     # 处理文件上传
@@ -3380,11 +4642,11 @@ class WebAPIServer:
                             file_storage.content_type
                         )
                         file_storage.seek(0)
-
+        
                     # 处理普通表单字段
                     if request.form:
                         request_data = dict(request.form)
-
+        
                 # 检查是否有JSON数据
                 elif 'application/json' in content_type:
                     # 安全地解析JSON，避免空请求体错误
@@ -3398,28 +4660,33 @@ class WebAPIServer:
                                 request_data = json.loads(request.data.decode('utf-8'))
                             except:
                                 request_data = request.data.decode('utf-8')
-
+        
                 # 检查普通表单数据
                 elif request.form:
                     request_data = dict(request.form)
-
+        
                 # 检查原始数据
                 elif request.data:
                     try:
                         request_data = json.loads(request.data.decode('utf-8'))
                     except:
                         request_data = request.data.decode('utf-8')
-
+        
                 # 检查是否是流式请求
                 stream = request.args.get('stream', '').lower() == 'true'
-
+        
                 # 构建endpoint
                 if not action_path.startswith('/'):
                     action_path = '/' + action_path
-
-                # 设置超时时间
-                timeout = int(request.args.get('timeout', 30))
-
+        
+                # 设置超时时间（优先使用查询参数中的timeout，否则使用默认）
+                timeout = request.args.get('timeout', None)
+                if timeout is not None:
+                    try:
+                        timeout = int(timeout)
+                    except:
+                        timeout = None
+        
                 # 调用代理管理器
                 status_code, response_data, response_headers = self.proxy_manager.proxy_request(
                     agent_key=agent_key,
@@ -3432,7 +4699,7 @@ class WebAPIServer:
                     stream=stream,
                     timeout=timeout
                 )
-
+        
                 # 处理流式响应
                 if stream and isinstance(response_data, bytes):
                     response = self.app.response_class(
@@ -3442,7 +4709,7 @@ class WebAPIServer:
                         mimetype=response_headers.get('Content-Type', 'application/octet-stream')
                     )
                     return response
-
+        
                 # 构建普通响应
                 if isinstance(response_data, bytes):
                     response = self.app.response_class(
@@ -3463,10 +4730,12 @@ class WebAPIServer:
                     response = jsonify(response_data)
                     response.status_code = status_code
                     for key, value in response_headers.items():
+                        if key.lower() == 'Content-Length'.lower():
+                            continue
                         response.headers[key] = value
-
+        
                     return response
-
+        
             except Exception as e:
                 self.logger.error(f"代理路由处理失败: {str(e)}", exc_info=True)
                 return jsonify({
@@ -3476,8 +4745,7 @@ class WebAPIServer:
                     'agent_key': agent_key,
                     'action_path': action_path
                 }), 500
-
-                # 简单代理端点 - 专门用于GET请求
+        # 简单代理端点 - 专门用于GET请求
         @self.app.route('/api/proxy_simple/<agent_key>/<path:action_path>', methods=['GET'])
         @self.auth.login_required
         def proxy_simple_to_agent(agent_key, action_path):
@@ -3551,6 +4819,8 @@ class WebAPIServer:
 
             response = jsonify(response_data)
             for key, value in response_headers.items():
+                if key.lower() == 'Content-Length'.lower():
+                    continue
                 response.headers[key] = value
             response.status_code = status_code
 
@@ -3568,6 +4838,8 @@ class WebAPIServer:
 
             response = jsonify(response_data)
             for key, value in response_headers.items():
+                if key.lower() == 'Content-Length'.lower():
+                    continue
                 response.headers[key] = value
             response.status_code = status_code
 
@@ -3652,6 +4924,8 @@ class WebAPIServer:
 
             response = jsonify(response_data)
             for key, value in response_headers.items():
+                if key.lower() == 'Content-Length'.lower():
+                    continue
                 response.headers[key] = value
             response.status_code = status_code
 
@@ -3661,22 +4935,23 @@ class WebAPIServer:
         @self.auth.login_required
         def get_proxy_info():
             """获取代理API信息"""
-            proxy_info = self.proxy_manager.get_agent_proxy_info()
-
             # 获取可用的Agent列表
             agents = self.agent_manager.list_agents()[0]
 
-            proxy_info['available_agents'] = [
-                {
-                    'key': agent['key'],
-                    'hostname': agent['hostname'],
-                    'ip_address': agent['ip_address'],
-                    'workspace': agent['workspace_id'],
-                    'status': agent['status'],
-                    'last_seen': agent.get('last_seen')
-                }
-                for agent in agents
-            ]
+            proxy_info = {
+                'available_agents': [
+                    {
+                        'key': agent['key'],
+                        'hostname': agent['hostname'],
+                        'ip_address': agent['ip_address'],
+                        'workspace': agent['workspace_id'],
+                        'status': agent['status'],
+                        'last_seen': agent.get('last_seen')
+                    }
+                    for agent in agents
+                ],
+                'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
+            }
 
             return jsonify(proxy_info)
 
@@ -3826,13 +5101,13 @@ class WebAPIServer:
                         'curl': 'curl -X GET -H "Authorization: Bearer YOUR_TOKEN" "http://server:18080/api/proxy/abc123def456/api/services/myservice/logs?tail=100"'
                     },
                     {
-                        'description': '上传ZIP文件创建服务',
+                        'description': '上传压缩文件创建服务',
                         'method': 'POST',
                         'url': '/api/proxy/abc123def456/api/services/zip',
                         'content_type': 'multipart/form-data',
                         'form_data': {
                             'name': 'myapp',
-                            'file': 'myapp.zip'
+                            'file': 'myapp.zip'  # 支持多种压缩格式
                         },
                         'curl': 'curl -X POST -H "Authorization: Bearer YOUR_TOKEN" -F "name=myapp" -F "file=@myapp.zip" http://server:18080/api/proxy/abc123def456/api/services/zip'
                     },
@@ -3853,13 +5128,14 @@ class WebAPIServer:
                     '使用 /api/proxy/test/{agent_key} 测试代理连接',
                     '文件上传需要设置 Content-Type: multipart/form-data',
                     '支持流式响应，添加 ?stream=true 参数',
-                    '所有原始请求头（除敏感头外）都会转发到Agent'
+                    '所有原始请求头（除敏感头外）都会转发到Agent',
+                    f'支持多种压缩格式: {", ".join(self.config.get("supported_formats", SUPPORTED_FORMATS))}'
                 ]
             }
 
             return jsonify(examples)
 
-        # ===================== 模板管理API（完整版） =====================
+        # ===================== 模板管理API（完整版，支持多种压缩格式） =====================
 
         @self.app.route('/api/templates', methods=['GET'])
         @self.auth.login_required
@@ -3873,26 +5149,54 @@ class WebAPIServer:
                 'templates': templates,
                 'page': page,
                 'per_page': per_page,
-                'total': total
+                'total': total,
+                'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
         @self.app.route('/api/templates', methods=['POST'])
         @self.auth.login_required
         def upload_template():
-            """上传模板"""
+            """上传模板（支持多种压缩格式）"""
             if 'file' not in request.files:
                 return jsonify({'error': '未找到文件'}), 400
 
             file = request.files['file']
             name = request.form.get('name')
             description = request.form.get('description', '')
-            template_type = request.form.get('type', 'yaml')
+            template_type = request.form.get('type', 'auto')  # 默认为自动检测
 
             if not name:
                 return jsonify({'error': '模板名称不能为空'}), 400
 
             if not file.filename:
                 return jsonify({'error': '文件名不能为空'}), 400
+
+            # 检查文件扩展名
+            filename = file.filename
+            file_ext = Path(filename).suffix.lower()
+
+            # 自动检测模板类型
+            if template_type == 'auto':
+                if file_ext in ['.yaml', '.yml']:
+                    template_type = 'yaml'
+                elif any(filename.lower().endswith(ext) for ext in self.config.get('supported_formats', SUPPORTED_FORMATS)):
+                    template_type = 'archive'
+                else:
+                    return jsonify({'error': f'不支持的文件格式: {filename}'}), 400
+
+            # 验证压缩格式
+            if template_type == 'archive':
+                is_supported = False
+                for ext in self.config.get('supported_formats', SUPPORTED_FORMATS):
+                    if filename.lower().endswith(ext):
+                        is_supported = True
+                        break
+
+                if not is_supported:
+                    return jsonify({
+                        'error': f'不支持的压缩格式: {filename}',
+                        'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
+                    }), 400
 
             # 读取文件内容
             file_content = file.read()
@@ -3901,12 +5205,17 @@ class WebAPIServer:
             current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
 
             success, message = self.template_manager.create_template(
-                name, description, template_type, file_content, file.filename,
+                name, description, template_type, file_content, filename,
                 current_user.get('username', 'admin')
             )
 
             if success:
-                return jsonify({'message': message}), 201
+                return jsonify({
+                    'message': message,
+                    'template_name': name,
+                    'template_type': template_type,
+                    'filename': filename
+                }), 201
             else:
                 return jsonify({'error': message}), 400
 
@@ -4070,8 +5379,8 @@ class WebAPIServer:
                 if file_info['type'] == 'yaml':
                     mimetype = 'text/yaml'
                     as_attachment = False
-                elif file_info['type'] == 'zip':
-                    mimetype = 'application/zip'
+                elif file_info['type'] == 'archive':
+                    mimetype = self.template_manager._get_content_type(file_path.name)
                     as_attachment = True
                 else:
                     mimetype = 'application/octet-stream'
@@ -4079,7 +5388,7 @@ class WebAPIServer:
 
                 # 确定文件名
                 if as_attachment:
-                    filename = f"{name}.{file_info['type']}"
+                    filename = f"{name}{Path(file_path).suffix}"
                 else:
                     filename = None
 
@@ -4268,86 +5577,326 @@ class WebAPIServer:
                 self.logger.error(f"批量下载模板失败: {str(e)}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/templates/docs', methods=['GET'])
+        # ===================== 新增：模板文件管理API =====================
+
+        @self.app.route('/api/templates/<name>/files', methods=['GET'])
         @self.auth.login_required
-        def get_templates_docs():
-            """获取模板API使用文档"""
-            docs = {
-                'description': '模板管理API，支持创建、查看、更新、删除和下载模板',
-                'endpoints': {
-                    'GET /api/templates': '列出所有模板（包含文件大小信息）',
-                    'POST /api/templates': '上传新模板',
-                    'GET /api/templates/{name}': '获取模板详细信息（包含文件大小）',
-                    'DELETE /api/templates/{name}': '删除模板',
-                    'GET /api/templates/{name}/yaml': '获取模板的YAML内容（支持yaml和zip格式）',
-                    'PUT /api/templates/{name}/yaml': '更新模板的YAML内容',
-                    'GET /api/templates/{name}/download': '下载模板文件',
-                    'GET /api/templates/{name}/file': '获取模板原始文件',
-                    'GET /api/templates/{name}/content': '获取模板内容（JSON格式）',
-                    'GET /api/templates/{name}/info': '获取模板详细信息（包含文件列表）',
-                    'POST /api/templates/download/batch': '批量下载模板'
-                },
-                'template_types': {
-                    'yaml': 'YAML格式的服务定义文件',
-                    'zip': 'ZIP压缩包，包含服务定义文件和其他相关文件'
-                },
-                'yaml_content_requirements': {
-                    'must_contain': 'services部分',
-                    'format': '标准的Docker Compose YAML格式'
-                },
-                'examples': {
-                    'create_template': {
-                        'method': 'POST',
-                        'url': '/api/templates',
-                        'content_type': 'multipart/form-data',
-                        'form_data': {
-                            'name': 'my-service',
-                            'description': '我的服务模板',
-                            'type': 'yaml',
-                            'file': 'service.yaml文件'
-                        }
-                    },
-                    'get_yaml_content': {
-                        'method': 'GET',
-                        'url': '/api/templates/my-service/yaml',
-                        'response': {
-                            'name': 'my-service',
-                            'yaml_content': 'version: "3"\nservices:\n  web:\n    image: nginx:latest',
-                            'status': 'success'
-                        }
-                    },
-                    'update_yaml_content': {
-                        'method': 'PUT',
-                        'url': '/api/templates/my-service/yaml',
-                        'content_type': 'application/json',
-                        'body': {
-                            'yaml_content': 'version: "3"\nservices:\n  web:\n    image: nginx:latest\n    ports:\n      - "80:80"'
-                        }
-                    },
-                    'download_template': {
-                        'method': 'GET',
-                        'url': '/api/templates/my-service/download',
-                        'query_params': {
-                            'format': 'original|yaml|zip',
-                            'as_zip': 'true|false',
-                            'include_all': 'true|false'
-                        }
-                    }
-                },
-                'size_information': {
-                    'file_size': '原始模板文件的大小（字节）',
-                    'directory_size': '模板解压后目录的总大小（字节）',
-                    'metadata': '包含文件大小和其他元数据的JSON对象'
-                },
-                'notes': [
-                    '所有API都需要认证，使用Authorization: Bearer {token}',
-                    'YAML内容更新会验证格式，确保包含services部分',
-                    'ZIP模板更新时会更新解压目录中的YAML并重新打包',
-                    '文件下载支持多种格式和打包选项'
-                ]
+        def list_template_files(name):
+            """列出模板目录下的所有文件和目录"""
+            path = request.args.get('path', '')
+
+            success, result = self.template_manager.list_template_files(name, path)
+
+            if success:
+                return jsonify({
+                    'template_name': name,
+                    'path': path,
+                    'files': result,
+                    'status': 'success'
+                })
+            else:
+                return jsonify({'error': result}), 404
+
+        @self.app.route('/api/templates/<name>/files/content', methods=['GET'])
+        @self.auth.login_required
+        def get_template_file_content(name):
+            """获取模板目录下指定文件的内容"""
+            file_path = request.args.get('path', '')
+            encoding = request.args.get('encoding', 'utf-8')
+            preview = request.args.get('preview', 'false').lower() == 'true'
+            max_size = int(request.args.get('max_size', 1024 * 1024))  # 默认1MB
+
+            if not file_path:
+                return jsonify({'error': '文件路径不能为空'}), 400
+
+            success, content, content_type, file_info = self.template_manager.get_template_file_by_path(
+                name, file_path, encoding
+            )
+
+            if not success:
+                return jsonify({'error': content}), 404
+
+            # 如果是预览模式且文件较大，进行截断
+            if preview and isinstance(content, str) and len(content) > max_size:
+                content = content[:max_size] + f"\n\n... (文件过大，已截断，完整大小: {file_info['size']} 字节)"
+                file_info['truncated'] = True
+                file_info['original_size'] = file_info['size']
+                file_info['preview_size'] = len(content)
+            elif preview and isinstance(content, bytes) and len(content) > max_size:
+                # 对于二进制文件，只返回基本信息
+                content = None
+                file_info['binary_preview'] = True
+                file_info['original_size'] = file_info['size']
+
+            response_data = {
+                'template_name': name,
+                'file_info': file_info,
+                'content_type': content_type,
+                'is_text': file_info.get('is_text', True),
+                'status': 'success'
             }
 
-            return jsonify(docs)
+            # 根据内容类型返回不同格式
+            if content is not None:
+                if isinstance(content, str):
+                    response_data['content'] = content
+                    response_data['encoding'] = encoding
+                else:
+                    # 二进制内容进行base64编码
+                    response_data['content'] = base64.b64encode(content).decode('ascii')
+                    response_data['encoding'] = 'base64'
+            else:
+                response_data['content'] = None
+
+            return jsonify(response_data)
+
+        @self.app.route('/api/templates/<name>/files/content', methods=['PUT'])
+        @self.auth.login_required
+        def update_template_file_content(name):
+            """更新模板目录下指定文件的内容"""
+            try:
+                data = request.get_json()
+                if not data:
+                    return jsonify({'error': '请求体必须为JSON'}), 400
+
+                file_path = data.get('path', '')
+                content = data.get('content', '')
+                encoding = data.get('encoding', 'utf-8')
+
+                if not file_path:
+                    return jsonify({'error': '文件路径不能为空'}), 400
+
+                if content is None:
+                    return jsonify({'error': '文件内容不能为空'}), 400
+
+                # 获取当前用户
+                current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
+                updated_by = current_user.get('username', 'admin')
+
+                # 处理内容编码
+                actual_content = content
+                content_encoding = data.get('content_encoding', '')
+
+                if content_encoding == 'base64':
+                    try:
+                        actual_content = base64.b64decode(content)
+                    except Exception as e:
+                        return jsonify({'error': f'Base64解码失败: {str(e)}'}), 400
+
+                success, message, update_info = self.template_manager.update_template_file(
+                    name, file_path, actual_content, encoding, updated_by
+                )
+
+                if success:
+                    # 获取更新后的文件信息
+                    file_success, file_content, file_content_type, file_info = self.template_manager.get_template_file_by_path(
+                        name, file_path, encoding
+                    )
+
+                    response_data = {
+                        'message': message,
+                        'update_info': update_info,
+                        'status': 'success'
+                    }
+
+                    if file_success:
+                        response_data['file_info'] = file_info
+
+                    return jsonify(response_data)
+                else:
+                    return jsonify({'error': message}), 400
+
+            except Exception as e:
+                self.logger.error(f"更新模板文件失败: {str(e)}", exc_info=True)
+                return jsonify({'error': f'更新失败: {str(e)}'}), 500
+
+        @self.app.route('/api/templates/<name>/files/download', methods=['GET'])
+        @self.auth.login_required
+        def download_template_file(name):
+            """下载模板目录下的单个文件"""
+            file_path = request.args.get('path', '')
+
+            if not file_path:
+                return jsonify({'error': '文件路径不能为空'}), 400
+
+            success, content, content_type, file_info = self.template_manager.get_template_file_by_path(
+                name, file_path, 'utf-8'
+            )
+
+            if not success:
+                return jsonify({'error': content}), 404
+
+            # 构建响应
+            if isinstance(content, str):
+                # 文本文件
+                response = self.app.response_class(
+                    response=content,
+                    status=200,
+                    mimetype=content_type,
+                    headers={
+                        'Content-Disposition': f'attachment; filename="{file_info["name"]}"',
+                        'X-File-Path': file_path,
+                        'X-Template-Name': name
+                    }
+                )
+            else:
+                # 二进制文件
+                response = self.app.response_class(
+                    response=content,
+                    status=200,
+                    mimetype=content_type,
+                    headers={
+                        'Content-Disposition': f'attachment; filename="{file_info["name"]}"',
+                        'X-File-Path': file_path,
+                        'X-Template-Name': name,
+                        'X-File-Size': str(file_info['size'])
+                    }
+                )
+
+            return response
+
+        @self.app.route('/api/templates/<name>/files/upload', methods=['POST'])
+        @self.auth.login_required
+        def upload_template_file(name):
+            """上传文件到模板目录"""
+            if 'file' not in request.files:
+                return jsonify({'error': '未找到文件'}), 400
+
+            file = request.files['file']
+            target_path = request.form.get('path', '')
+            overwrite = request.form.get('overwrite', 'false').lower() == 'true'
+
+            if not file.filename:
+                return jsonify({'error': '文件名不能为空'}), 400
+
+            # 如果没有指定路径，使用文件名
+            if not target_path:
+                target_path = file.filename
+
+            # 获取当前用户
+            current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
+            updated_by = current_user.get('username', 'admin')
+
+            # 读取文件内容
+            file_content = file.read()
+
+            # 检查文件编码（尝试作为文本文件处理）
+            try:
+                # 尝试解码为UTF-8
+                decoded_content = file_content.decode('utf-8')
+                # 如果是文本文件，使用字符串
+                content = decoded_content
+                encoding = 'utf-8'
+            except UnicodeDecodeError:
+                # 如果是二进制文件，使用字节
+                content = file_content
+                encoding = 'binary'
+
+            success, message, update_info = self.template_manager.update_template_file(
+                name, target_path, content, encoding, updated_by
+            )
+
+            if not success and not overwrite:
+                # 检查是否是文件已存在的错误
+                if "already exists" in message.lower() or "文件已存在" in message:
+                    return jsonify({
+                        'error': '文件已存在',
+                        'message': message,
+                        'suggestion': '使用 overwrite=true 参数覆盖文件'
+                    }), 409
+                else:
+                    return jsonify({'error': message}), 400
+
+            # 如果是覆盖模式，强制更新
+            if not success and overwrite:
+                # 这里可以添加强制更新的逻辑
+                # 目前我们假设update_template_file已经处理了覆盖
+                pass
+
+            if success:
+                return jsonify({
+                    'message': message,
+                    'update_info': update_info,
+                    'filename': file.filename,
+                    'path': target_path,
+                    'size': len(file_content),
+                    'status': 'success'
+                }), 201
+            else:
+                return jsonify({'error': message}), 400
+
+
+        @self.app.route('/api/templates/<name>/files', methods=['DELETE'])
+        @self.auth.login_required
+        def delete_template_file(name):
+            """删除模板目录下的指定文件"""
+            try:
+                data = request.get_json()
+                if not data:
+                    return jsonify({'error': '请求体必须为JSON'}), 400
+
+                file_path = data.get('path', '')
+                if not file_path:
+                    return jsonify({'error': '文件路径不能为空'}), 400
+
+                # 获取当前用户
+                current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
+                deleted_by = current_user.get('username', 'admin')
+
+                success, message, delete_info = self.template_manager.delete_template_file(
+                    name, file_path, deleted_by
+                )
+
+                if success:
+                    return jsonify({
+                        'message': message,
+                        'delete_info': delete_info,
+                        'status': 'success'
+                    })
+                else:
+                    return jsonify({'error': message}), 400
+
+            except Exception as e:
+                self.logger.error(f"删除模板文件失败: {str(e)}", exc_info=True)
+                return jsonify({'error': f'删除失败: {str(e)}'}), 500
+
+        @self.app.route('/api/templates/<name>/directories', methods=['DELETE'])
+        @self.auth.login_required
+        def delete_template_directory(name):
+            """删除模板目录下的指定目录"""
+            try:
+                data = request.get_json()
+                if not data:
+                    return jsonify({'error': '请求体必须为JSON'}), 400
+
+                dir_path = data.get('path', '')
+                force = data.get('force', False)
+
+                if len(dir_path) == 0:
+                    return jsonify({'error': '目录路径不能为空'}), 400
+
+                # 获取当前用户
+                current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
+                deleted_by = current_user.get('username', 'admin')
+
+                success, message, delete_info = self.template_manager.delete_template_directory(
+                    name, dir_path, deleted_by, force
+                )
+
+                if success:
+                    return jsonify({
+                        'message': message,
+                        'delete_info': delete_info,
+                        'status': 'success'
+                    })
+                else:
+                    return jsonify({'error': message}), 400
+
+            except Exception as e:
+                self.logger.error(f"删除模板目录失败: {str(e)}", exc_info=True)
+                return jsonify({'error': f'删除失败: {str(e)}'}), 500
+
+
 
     def _refresh_loop(self):
         """后台刷新循环"""
@@ -4390,7 +5939,35 @@ class WebAPIServer:
             debug=self.config['debug'],
             use_reloader=False
         )
+        
+def adjust_timeout_config(config: Dict) -> Dict:
+    """调整超时配置以确保合理性"""
+    default_timeouts = {
+        'default': (10, 30),
+        'health_check': (5, 10),
+        'deploy_create': (10, 60),
+        'deploy_start': (10, 300),
+        'deploy_stop': (10, 120),
+        'deploy_delete': (10, 60),
+        'undeploy': (10, 180),
+        'file_upload': (10, 600),
+        'stream': (10, 3600),
+        'proxy': (10, 300),
+    }
 
+    # 获取用户配置的超时设置
+    user_timeouts = config.get('agent_api_timeouts', {})
+
+    # 合并配置，用户配置优先
+    final_timeouts = default_timeouts.copy()
+    for key, value in user_timeouts.items():
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            final_timeouts[key] = tuple(value)
+        elif isinstance(value, (int, float)):
+            final_timeouts[key] = (10, int(value))
+
+    config['agent_api_timeouts'] = final_timeouts
+    return config
 # ===================== 主函数 =====================
 
 def main():
@@ -4403,6 +5980,8 @@ def main():
     parser.add_argument('--pod-id', help='POD标识符')
     parser.add_argument('--skip-connection-check', action='store_true',
                         help='跳过连接检查（用于测试）')
+    parser.add_argument('--timeout', type=int, help='全局超时时间（秒）')
+    parser.add_argument('--deploy-timeout', type=int, help='部署超时时间（秒）')
 
     args = parser.parse_args()
 
@@ -4428,6 +6007,17 @@ def main():
     if args.skip_connection_check:
         config['skip_connection_check'] = True
 
+    # 调整超时配置
+    config = adjust_timeout_config(config)
+
+    # 命令行参数覆盖配置
+    if args.timeout:
+        config['agent_api_timeouts']['default'] = (10, args.timeout)
+        config['agent_api_timeouts']['proxy'] = (10, args.timeout)
+
+    if args.deploy_timeout:
+        config['agent_api_timeouts']['deploy_start'] = (10, args.deploy_timeout)
+
     # 打印启动信息
     print("=" * 60)
     print("WEB API 服务器 - Docker Compose服务管理中心")
@@ -4435,7 +6025,11 @@ def main():
     print(f"POD ID: {config['pod_id']}")
     print(f"数据库: {config['database'].get('type', 'sqlite').upper()}")
     print(f"Redis: {'启用' if config.get('redis_enabled', True) else '禁用'}")
+    print(f"支持的压缩格式: {', '.join(config.get('supported_formats', SUPPORTED_FORMATS))}")
     print(f"监听地址: {config['host']}:{config['port']}")
+    print("\n超时配置:")
+    for key, value in config['agent_api_timeouts'].items():
+        print(f"  {key}: {value}")
     print("=" * 60)
 
     try:

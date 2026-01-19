@@ -10,7 +10,7 @@ if [ -S "${ROOT_DIR}/var/run/docker.sock" ];then
   do
     logger "stop container: $i"
     "${ROOT_DIR}/usr/bin/docker" -H "unix://${ROOT_DIR}/var/run/docker.sock" stop "$i"
-    "${ROOT_DIR}/usr/bin/docker" -H "unix://${ROOT_DIR}/var/run/docker.sock" rm "$i"
+    #"${ROOT_DIR}/usr/bin/docker" -H "unix://${ROOT_DIR}/var/run/docker.sock" rm "$i"
   done
 else
   logger "dockerd is not run, ignore stop container"

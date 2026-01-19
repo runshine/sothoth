@@ -15,7 +15,7 @@
   "nacos_namespace": "public",
   "agent_api_port": 11197,
   "agent_auth_token": "your_secure_token_here",
-  "refresh_interval": 60,
+  "refresh_interval": 30,
   "max_workers": 5,
   "upload_max_size": 104857600,
   "token_expiration": 86400,
