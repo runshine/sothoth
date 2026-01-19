@@ -4,7 +4,7 @@ metadata:
   name: agent-service-manager-service
   namespace: sothothv2-ns
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       name: agent-service-manager-service
@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: agent-service-manager
-        image: ghcr.io/runshine/agent-service-manager:latest  # 包含kubectl命令
+        image: ghcr.io/runshine/agent-service-manager:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
@@ -30,6 +30,10 @@ spec:
           limits:
             memory: "256Mi"
             cpu: "500m"
+        volumeMounts:
+          - name: agent-service-manager-service-nginx-config
+            mountPath: /app/config.json
+            subPath: config.json
         livenessProbe:
           httpGet:
             path: /api/health
@@ -80,3 +84,5 @@ spec:
           items:
             - key: nginx.conf
               path: nginx.conf
+            - key: config.json
+              path: config.json

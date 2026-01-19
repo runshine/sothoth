@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  remote-debugger:
+    image: ghcr.io/runshine/remote-command-api:latest  # 包含kubectl命令
+    container_name: remote-command-api
+    privileged: true  # 特权容器
+    restart: always
+
+    # 环境变量配置
+    environment:
+      - TIMEOUT=180
+      - PORT=8080
+      - WORKDIR=/app
+      - ALLOWED_COMMANDS=  # 留空表示允许所有（生产环境建议设置）
+
+    # 端口映射
+    ports:
+      - "12001:8080"
+    # 卷挂载 - 主机目录只读挂载
+    volumes:
+      # 主机根目录只读挂载
+      - /:/host:ro
+
+      # 核心调试目录（保持与主机一致）
+      - /proc:/proc:rw
+      - /sys:/sys:rw
+      - /dev:/dev:rw
+
+      # 临时目录
+      - /tmp:/tmp:rw
+
+    # 内核能力
+    cap_add:
+      - SYS_PTRACE  # 允许ptrace调试
+      - SYS_ADMIN   # 系统管理权限
+      - NET_ADMIN   # 网络管理权限
+      - IPC_LOCK    # IPC锁定
+
+    # 系统参数
+    sysctls:
+      - net.core.somaxconn=1024
+      - kernel.msgmax=65536
+
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+    # 安全选项（允许调试）
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+
+    # 共享命名空间（除挂载命名空间外）
+    pid: host  # 共享PID命名空间
+    network_mode: host  # 共享网络命名空间（可选）
+    ipc: host  # 共享IPC命名空间
