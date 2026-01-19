@@ -55,4 +55,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:18080/api/health || exit 1
 
 # 设置启动命令
-CMD ["python", "webapi_server.py", "--config", "config.json"]
+CMD ["python", "app.py", "--config", "config.json"]
