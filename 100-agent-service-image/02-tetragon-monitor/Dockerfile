@@ -28,7 +28,7 @@ RUN case ${TARGETARCH} in \
 RUN apk add --no-cache git
 
 # 复制go模块文件
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 # 复制源代码

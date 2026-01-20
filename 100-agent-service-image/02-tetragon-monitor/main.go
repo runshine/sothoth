@@ -1,23 +1,17 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cilium/tetragon/api/v1/tetragon"
-	"github.com/cilium/tetragon/pkg/encoder"
 	"github.com/elastic/go-elasticsearch/v8"
 	"github.com/elastic/go-elasticsearch/v8/esutil"
 	"github.com/gin-gonic/gin"
@@ -138,114 +132,82 @@ func (s *StatsCollector) GetStats() map[string]interface{} {
 
 // 在main函数中添加重试逻辑
 func connectToTetragon() {
-    maxRetries := 10
-    retryDelay := 5 * time.Second
+	maxRetries := 10
+	retryDelay := 5 * time.Second
 
-    for i := 0; i < maxRetries; i++ {
-        fmt.Printf("尝试连接Tetragon (尝试 %d/%d)...\n", i+1, maxRetries)
+	for i := 0; i < maxRetries; i++ {
+		fmt.Printf("尝试连接Tetragon (尝试 %d/%d)...\n", i+1, maxRetries)
 
-        // 检查socket文件是否存在
-        if _, err := os.Stat(config.TetragonSock); os.IsNotExist(err) {
-            fmt.Printf("Tetragon socket不存在，等待...\n")
-            time.Sleep(retryDelay)
-            continue
-        }
+		// 检查socket文件是否存在
+		if _, err := os.Stat(config.TetragonSock); os.IsNotExist(err) {
+			fmt.Printf("Tetragon socket不存在，等待...\n")
+			time.Sleep(retryDelay)
+			continue
+		}
 
-        conn, err := grpc.Dial(
-            "unix://"+config.TetragonSock,
-            grpc.WithInsecure(),
-            grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(50*1024*1024)), // 50MB
-        )
+		conn, err := grpc.Dial(
+			"unix://"+config.TetragonSock,
+			grpc.WithInsecure(),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(50*1024*1024)), // 50MB
+		)
 
-        if err != nil {
-            fmt.Printf("连接Tetragon失败: %v\n", err)
-            time.Sleep(retryDelay)
-            continue
-        }
+		if err != nil {
+			fmt.Printf("连接Tetragon失败: %v\n", err)
+			time.Sleep(retryDelay)
+			continue
+		}
 
-        defer conn.Close()
-        fmt.Println("成功连接到Tetragon")
+		defer conn.Close()
+		fmt.Println("成功连接到Tetragon")
 
-        client := tetragon.NewFineGuidanceSensorsClient(conn)
-        ctx := context.Background()
+		client := tetragon.NewFineGuidanceSensorsClient(conn)
+		ctx := context.Background()
 
-        // 获取Tetragon版本信息
-        versionResp, err := client.GetVersion(ctx, &tetragon.GetVersionRequest{})
-        if err != nil {
-            fmt.Printf("获取Tetragon版本失败: %v\n", err)
-        } else {
-            fmt.Printf("Tetragon版本: %s\n", versionResp.Version)
-        }
+		// 获取Tetragon版本信息
+		versionResp, err := client.GetVersion(ctx, &tetragon.GetVersionRequest{})
+		if err != nil {
+			fmt.Printf("获取Tetragon版本失败: %v\n", err)
+		} else {
+			fmt.Printf("Tetragon版本: %s\n", versionResp.Version)
+		}
 
-        // 开始监听事件
-        stream, err := client.GetEvents(ctx, &tetragon.GetEventsRequest{})
-        if err != nil {
-            fmt.Printf("获取事件流失败: %v\n", err)
-            time.Sleep(retryDelay)
-            continue
-        }
+		// 开始监听事件
+		stream, err := client.GetEvents(ctx, &tetragon.GetEventsRequest{})
+		if err != nil {
+			fmt.Printf("获取事件流失败: %v\n", err)
+			time.Sleep(retryDelay)
+			continue
+		}
 
-        fmt.Println("开始监听事件...")
-        eventCounter := 0
+		fmt.Println("开始监听事件...")
+		eventCounter := 0
 
-        for {
-            res, err := stream.Recv()
-            if err == io.EOF {
-                fmt.Println("Tetragon连接关闭")
-                break
-            }
-            if err != nil {
-                fmt.Printf("接收事件失败: %v\n", err)
-                break
-            }
+		for {
+			res, err := stream.Recv()
+			if err == io.EOF {
+				fmt.Println("Tetragon连接关闭")
+				break
+			}
+			if err != nil {
+				fmt.Printf("接收事件失败: %v\n", err)
+				break
+			}
 
-            eventCounter++
-            if eventCounter%1000 == 0 {
-                fmt.Printf("已处理 %d 个事件\n", eventCounter)
-            }
+			eventCounter++
+			if eventCounter%1000 == 0 {
+				fmt.Printf("已处理 %d 个事件\n", eventCounter)
+			}
 
-            go processEvent(res)
-        }
+			go processEvent(res)
+		}
 
-        // 如果连接断开，重试
-        fmt.Println("连接断开，尝试重新连接...")
-        time.Sleep(retryDelay)
-    }
+		// 如果连接断开，重试
+		fmt.Println("连接断开，尝试重新连接...")
+		time.Sleep(retryDelay)
+	}
 
-    fmt.Println("达到最大重试次数，退出")
-    os.Exit(1)
-}
-
-// 添加进程信息获取函数
-func getTetragonPIDs() {
-    // 从docker compose获取tetragon容器PID
-    cmd := exec.Command("docker", "inspect", "-f", "{{.State.Pid}}", "tetragon")
-    output, err := cmd.Output()
-    if err == nil {
-        var pid int
-        fmt.Sscanf(strings.TrimSpace(string(output)), "%d", &pid)
-        if pid > 0 {
-            selfPIDs[pid] = true
-            fmt.Printf("检测到Tetragon容器PID: %d\n", pid)
-        }
-    }
-
-    // 从主机进程查找
-    cmd = exec.Command("pgrep", "-f", "tetragon")
-    output, err = cmd.Output()
-    if err == nil {
-        lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-        for _, line := range lines {
-            if pidStr := strings.TrimSpace(line); pidStr != "" {
-                var pid int
-                fmt.Sscanf(pidStr, "%d", &pid)
-                if pid > 0 && !selfPIDs[pid] {
-                    selfPIDs[pid] = true
-                    fmt.Printf("检测到Tetragon进程PID: %d\n", pid)
-                }
-            }
-        }
-    }
+	fmt.Println("达到最大重试次数，退出")
+	os.Exit(1)
 }
 
 func main() {
@@ -305,15 +267,15 @@ func initConfig() error {
 		return fmt.Errorf("解析配置文件失败: %v", err)
 	}
 
-    // 检查必要的环境变量
-    if config.ESEndpoint == "" {
-        return fmt.Errorf("ES_ENDPOINT环境变量必须设置")
-    }
+	// 检查必要的环境变量
+	if config.ESEndpoint == "" {
+		return fmt.Errorf("ES_ENDPOINT环境变量必须设置")
+	}
 
-    // 检查socket文件
-    if _, err := os.Stat(config.TetragonSock); err != nil {
-        fmt.Printf("警告: Tetragon socket文件不存在: %s\n", config.TetragonSock)
-    }
+	// 检查socket文件
+	if _, err := os.Stat(config.TetragonSock); err != nil {
+		fmt.Printf("警告: Tetragon socket文件不存在: %s\n", config.TetragonSock)
+	}
 
 	return nil
 }
@@ -383,7 +345,11 @@ func initDedupManager() {
 					Enabled: true,
 					KeyFunc: func(data interface{}) string {
 						event := data.(*tetragon.ProcessExec)
-						return fmt.Sprintf("%s:%s", event.Process.Binary, strings.Join(event.Process.Arguments, " "))
+						// ProcessExec 的 Arguments 是单个字符串
+						return fmt.Sprintf("exec:%d:%s:%s",
+							event.Process.Pid.Value,
+							event.Process.Binary,
+							event.Process.Arguments)
 					},
 				},
 				EventFileOp: {
@@ -394,7 +360,10 @@ func initDedupManager() {
 						args := event.GetArgs()
 						for _, arg := range args {
 							if arg.GetFileArg() != nil {
-								return fmt.Sprintf("%s:%s", arg.GetFileArg().Path, event.FunctionName)
+								return fmt.Sprintf("file:%d:%s:%s",
+									event.Process.Pid.Value,
+									arg.GetFileArg().Path,
+									event.FunctionName)
 							}
 						}
 						return ""
@@ -405,7 +374,9 @@ func initDedupManager() {
 					KeyFunc: func(data interface{}) string {
 						event := data.(*tetragon.ProcessKprobe)
 						// 网络连接信息
-						return event.FunctionName
+						return fmt.Sprintf("net:%d:%s",
+							event.Process.Pid.Value,
+							event.FunctionName)
 					},
 				},
 				// 其他事件类型的去重规则...
@@ -431,39 +402,6 @@ func initESClient() error {
 	// 测试连接
 	_, err = esClient.Info()
 	return err
-}
-
-func connectToTetragon() {
-	conn, err := grpc.Dial("unix://"+config.TetragonSock, grpc.WithInsecure())
-	if err != nil {
-		fmt.Printf("连接Tetragon失败: %v\n", err)
-		return
-	}
-	defer conn.Close()
-
-	client := tetragon.NewFineGuidanceSensorsClient(conn)
-
-	ctx := context.Background()
-	req := &tetragon.GetEventsRequest{}
-
-	stream, err := client.GetEvents(ctx, req)
-	if err != nil {
-		fmt.Printf("获取事件流失败: %v\n", err)
-		return
-	}
-
-	for {
-		res, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			fmt.Printf("接收事件失败: %v\n", err)
-			continue
-		}
-
-		go processEvent(res)
-	}
 }
 
 func processEvent(event *tetragon.GetEventsResponse) {
@@ -520,36 +458,36 @@ func classifyKprobeEvent(kprobe *tetragon.ProcessKprobe) EventType {
 	// 根据函数名分类事件类型
 	switch {
 	case strings.Contains(functionName, "open") ||
-		 strings.Contains(functionName, "read") ||
-		 strings.Contains(functionName, "write") ||
-		 strings.Contains(functionName, "close"):
+		strings.Contains(functionName, "read") ||
+		strings.Contains(functionName, "write") ||
+		strings.Contains(functionName, "close"):
 		return EventFileOp
 	case strings.Contains(functionName, "connect") ||
-		 strings.Contains(functionName, "accept") ||
-		 strings.Contains(functionName, "bind") ||
-		 strings.Contains(functionName, "listen"):
+		strings.Contains(functionName, "accept") ||
+		strings.Contains(functionName, "bind") ||
+		strings.Contains(functionName, "listen"):
 		return EventNetwork
 	case strings.Contains(functionName, "cap_") ||
-		 strings.Contains(functionName, "setuid") ||
-		 strings.Contains(functionName, "setgid"):
+		strings.Contains(functionName, "setuid") ||
+		strings.Contains(functionName, "setgid"):
 		return EventCapability
 	case strings.Contains(functionName, "clone") ||
-		 strings.Contains(functionName, "unshare"):
+		strings.Contains(functionName, "unshare"):
 		return EventNamespace
 	case strings.Contains(functionName, "kill") ||
-		 strings.Contains(functionName, "tkill"):
+		strings.Contains(functionName, "tkill"):
 		return EventSignal
 	case strings.Contains(functionName, "init_module") ||
-		 strings.Contains(functionName, "finit_module"):
+		strings.Contains(functionName, "finit_module"):
 		return EventKernelModule
 	case strings.Contains(functionName, "execve"):
 		return EventPrivilegeEsc
 	case strings.Contains(functionName, "mount") ||
-		 strings.Contains(functionName, "umount"):
+		strings.Contains(functionName, "umount"):
 		return EventFilesystemMount
 	case strings.Contains(functionName, "mmap") ||
-		 strings.Contains(functionName, "brk") ||
-		 strings.Contains(functionName, "mprotect"):
+		strings.Contains(functionName, "brk") ||
+		strings.Contains(functionName, "mprotect"):
 		return EventMemory
 	default:
 		return EventSyscall
@@ -680,12 +618,12 @@ func buildESDocument(eventType EventType, data interface{}) map[string]interface
 	switch d := data.(type) {
 	case *tetragon.ProcessExec:
 		doc["process"] = map[string]interface{}{
-			"pid":         d.Process.Pid.Value,
-			"binary":      d.Process.Binary,
-			"arguments":   d.Process.Arguments,
-			"cwd":         d.Process.Cwd,
-			"uid":         d.Process.Uid.Value,
-			"parent_pid":  d.Parent.Pid.Value,
+			"pid":        d.Process.Pid.Value,
+			"binary":     d.Process.Binary,
+			"arguments":  d.Process.Arguments,
+			"cwd":        d.Process.Cwd,
+			"uid":        d.Process.Uid.Value,
+			"parent_pid": d.Parent.Pid.Value,
 		}
 	case *tetragon.ProcessKprobe:
 		doc["process"] = map[string]interface{}{
