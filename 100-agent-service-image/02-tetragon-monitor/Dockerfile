@@ -25,6 +25,8 @@ RUN case ${TARGETARCH} in \
         *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
     esac
 
+RUN apk add --no-cache git
+
 # 复制go模块文件
 COPY go.mod ./
 RUN go mod download
