@@ -95,7 +95,7 @@ class Config:
     K8S_NAMESPACE = os.getenv("K8S_NAMESPACE", "vscode")
     K8S_STORAGE_CLASS = os.getenv("K8S_STORAGE_CLASS", "nfs-client")
     K8S_CODE_SERVER_IMAGE = os.getenv("K8S_CODE_SERVER_IMAGE", "linuxserver/code-server:latest")
-    K8S_SERVICE_TYPE = os.getenv("K8S_SERVICE_TYPE", "LoadBalancer")
+    K8S_SERVICE_TYPE = os.getenv("K8S_SERVICE_TYPE", "ClusterIP")
     K8S_SERVICE_PORT = int(os.getenv("K8S_SERVICE_PORT", "80"))
     K8S_CONTAINER_PORT = int(os.getenv("K8S_CONTAINER_PORT", "8443"))
     # PVC存储大小配置
