@@ -1,0 +1,27 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "process-exec-all"
+  annotations:
+    description: "监控所有进程执行，记录完整参数和父进程信息"
+spec:
+  # 监控进程执行事件（包含完整参数和父进程信息）
+  tracepoints:
+    - subsystem: "syscalls"
+      event: "sys_enter_execve"
+      args:
+        - index: 0
+          type: "string"       # 可执行文件路径
+#        - index: 1
+#          type: "string[]"     # 命令行参数数组
+#        - index: 2
+#          type: "string[]"     # 环境变量数组
+
+
+
+    # 监控进程执行完成事件
+    - subsystem: "syscalls"
+      event: "sys_exit_execve"
+      args:
+        - index: 0
+          type: "int32"         # 返回值（成功/失败）

@@ -1,0 +1,272 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "monitor-filesystem-mounts"
+spec:
+  kprobes:
+    # 1. 监控mount系统调用
+    - call: "__x64_sys_mount"
+      syscall: true
+      args:
+        - index: 0  # dev_name
+          type: "string"
+        - index: 1  # dir_name (挂载点)
+          type: "string"
+        - index: 2  # type (文件系统类型)
+          type: "string"
+        - index: 3  # flags (挂载标志)
+          type: "unsigned long"
+        - index: 4  # data (额外数据)
+          type: "string"
+
+    # 2. 监控umount系统调用
+    - call: "__x64_sys_umount"
+      syscall: true
+      args:
+        - index: 0  # name (挂载点)
+          type: "string"
+        - index: 1  # flags (卸载标志)
+          type: "int"
+
+    # 3. 监控umount2系统调用（支持更多选项）
+    - call: "__x64_sys_umount2"
+      syscall: true
+      args:
+        - index: 0  # name (挂载点)
+          type: "string"
+        - index: 1  # flags (卸载标志)
+          type: "int"
+
+    # 4. 监控pivot_root系统调用（改变root文件系统）
+    - call: "__x64_sys_pivot_root"
+      syscall: true
+      args:
+        - index: 0  # new_root
+          type: "string"
+        - index: 1  # put_old
+          type: "string"
+
+    # 5. 监控chroot系统调用（改变进程根目录）
+    - call: "__x64_sys_chroot"
+      syscall: true
+      args:
+        - index: 0  # filename (新根目录)
+          type: "string"
+
+    # 6. 监控mount_setattr系统调用（用于改变挂载属性）
+    - call: "__x64_sys_mount_setattr"
+      syscall: true
+      args:
+        - index: 0  # dfd
+          type: "int"
+        - index: 1  # path
+          type: "string"
+        - index: 2  # flags
+          type: "unsigned int"
+
+    # 7. 监控move_mount系统调用（移动挂载点）
+    - call: "__x64_sys_move_mount"
+      syscall: true
+      args:
+        - index: 0  # from_dfd
+          type: "int"
+        - index: 1  # from_pathname
+          type: "string"
+        - index: 2  # to_dfd
+          type: "int"
+        - index: 3  # to_pathname
+          type: "string"
+        - index: 4  # flags
+          type: "unsigned int"
+
+    # 8. 监控open_tree系统调用（获取挂载点的文件描述符）
+    - call: "__x64_sys_open_tree"
+      syscall: true
+      args:
+        - index: 0  # dfd
+          type: "int"
+        - index: 1  # filename
+          type: "string"
+        - index: 2  # flags
+          type: "unsigned int"
+
+    # 9. 监控fsopen系统调用（准备新文件系统上下文）
+    - call: "__x64_sys_fsopen"
+      syscall: true
+      args:
+        - index: 0  # fs_name
+          type: "string"
+        - index: 1  # flags
+          type: "unsigned int"
+
+    # 10. 监控fsmount系统调用（从上下文创建挂载）
+    - call: "__x64_sys_fsmount"
+      syscall: true
+      args:
+        - index: 0  # fsfd
+          type: "int"
+        - index: 1  # flags
+          type: "unsigned int"
+        - index: 2  # attr_flags
+          type: "unsigned int"
+
+  selectors:
+    # 选择器1：监控所有挂载操作，记录详细信息
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/mount"
+            - "/usr/bin/umount"
+            - "/usr/bin/fusermount"
+            - "/sbin/mount.*"
+      matchActions:
+        - action: Post
+        - action: GenerateMetric
+          argMetric: "mount_operation"
+      matchArgs:
+        - index: 3  # mount flags
+          operator: "Mask"
+          values:
+            - "MS_RDONLY"      # 0x1
+            - "MS_NOSUID"      # 0x2
+            - "MS_NODEV"       # 0x4
+            - "MS_NOEXEC"      # 0x8
+            - "MS_SYNCHRONOUS" # 0x10
+            - "MS_REMOUNT"     # 0x20
+            - "MS_MANDLOCK"    # 0x40
+            - "MS_NOATIME"     # 0x400
+            - "MS_NODIRATIME"  # 0x800
+            - "MS_BIND"        # 0x1000
+            - "MS_MOVE"        # 0x2000
+            - "MS_REC"         # 0x4000
+            - "MS_SILENT"      # 0x8000
+            - "MS_SHARED"      # 0x100000
+            - "MS_PRIVATE"     # 0x40000
+            - "MS_SLAVE"       # 0x80000
+            - "MS_UNBINDABLE"  # 0x20000
+      kprobes:
+        - call: "__x64_sys_mount"
+
+    # 选择器2：监控敏感文件系统的挂载
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/mount"
+            - "/usr/bin/umount"
+      matchActions:
+        - action: Sigkill
+      matchArgs:
+        - index: 2  # filesystem type
+          operator: "In"
+          values:
+            - "proc"
+            - "sysfs"
+            - "devtmpfs"
+            - "securityfs"
+            - "tmpfs"
+            - "debugfs"
+            - "tracefs"
+            - "cgroup"
+            - "cgroup2"
+            - "nsfs"
+            - "mqueue"
+            - "ramfs"
+            - "hugetlbfs"
+            - "autofs"
+            - "devpts"
+            - "overlay"
+            - "fuse"
+            - "fuse.*"
+      kprobes:
+        - call: "__x64_sys_mount"
+
+    # 选择器3：监控敏感目录的挂载
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/mount"
+            - "/usr/bin/umount"
+            - "/sbin/mount.*"
+      matchActions:
+        - action: Post
+          argError: true
+        - action: Alert
+          argName: "sensitive_mount"
+      matchArgs:
+        - index: 1  # mount point
+          operator: "Prefix"
+          values:
+            - "/"
+            - "/etc"
+            - "/usr"
+            - "/var"
+            - "/opt"
+            - "/home"
+            - "/root"
+            - "/tmp"
+            - "/dev"
+            - "/proc"
+            - "/sys"
+            - "/run"
+      kprobes:
+        - call: "__x64_sys_mount"
+
+    # 选择器4：监控设备挂载（潜在容器逃逸风险）
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/mount"
+      matchActions:
+        - action: Sigkill
+      matchArgs:
+        - index: 0  # device name
+          operator: "Prefix"
+          values:
+            - "/dev/"
+      kprobes:
+        - call: "__x64_sys_mount"
+
+    # 选择器5：监控chroot操作
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/sbin/chroot"
+            - "/usr/bin/chroot"
+      matchActions:
+        - action: Post
+        - action: Alert
+          argName: "chroot_operation"
+      kprobes:
+        - call: "__x64_sys_chroot"
+
+    # 选择器6：监控pivot_root操作（容器相关）
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/pivot_root"
+      matchActions:
+        - action: Post
+        - action: Alert
+          argName: "pivot_root_operation"
+      matchArgs:
+        - index: 0  # new_root
+          operator: "Prefix"
+          values:
+            - "/"
+      kprobes:
+        - call: "__x64_sys_pivot_root"
+
+    # 选择器7：监控overlayfs挂载（容器逃逸常见）
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/mount"
+      matchActions:
+        - action: Sigkill
+      matchArgs:
+        - index: 2  # filesystem type
+          operator: "Equal"
+          values:
+            - "overlay"
+      kprobes:
+        - call: "__x64_sys_mount"

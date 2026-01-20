@@ -1,0 +1,72 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "detailed-filesystem-monitoring"
+spec:
+  tracepoints:
+    # 监控vfork系统调用，fork可能导致挂载传播
+    - subsystem: "syscalls"
+      event: "sys_enter_vfork"
+
+  kprobes:
+    # 监控mount命名空间相关操作
+    - call: "mnt_want_write"
+      args:
+        - index: 0
+          type: "path"
+
+    - call: "mnt_drop_write"
+      args:
+        - index: 0
+          type: "path"
+
+    # 监控文件系统挂载的procfs接口访问
+    - call: "proc_mounts_show"
+      args:
+        - index: 0
+          type: "seq_file"
+
+  selectors:
+    # 监控mount命名空间克隆
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/docker"
+            - "/usr/bin/containerd"
+            - "/usr/bin/podman"
+            - "/usr/bin/runc"
+            - "/usr/bin/crun"
+      matchActions:
+        - action: Post
+        - action: GenerateMetric
+          argMetric: "namespace_clone"
+      matchArgs:
+        - index: 0
+          operator: "Mask"
+          values:
+            - "CLONE_NEWNS"  # 0x00020000
+      tracepoints:
+        - subsystem: "syscalls"
+          event: "sys_enter_vfork"
+
+    # 输出配置到外部系统
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/mount"
+            - "/usr/bin/umount"
+      matchActions:
+        - action: Post
+        - action: OutputEvent
+          argOutput: "stdout"
+        - action: OutputEvent
+          argOutput: "fluentd"
+          argFluentd:
+            host: "fluentd.default.svc.cluster.local"
+            port: 24224
+            tag: "tetragon.mount"
+      kprobes:
+        - call: "__x64_sys_mount"
+        - call: "__x64_sys_umount"
+        - call: "__x64_sys_umount2"
+        - call: "__x64_sys_chroot"

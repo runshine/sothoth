@@ -1,0 +1,62 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "monitor-filesystem-mount"
+spec:
+  kprobes:
+    # 监控mount系统调用
+    - call: "__x64_sys_mount"
+      syscall: true
+      args:
+        - index: 0  # dev_name
+          type: "string"
+        - index: 1  # dir_name
+          type: "string"
+        - index: 2  # type
+          type: "string"
+        - index: 3  # flags
+          type: "unsigned long"
+        - index: 4  # data
+          type: "string"
+    # 监控umount系统调用
+    - call: "__x64_sys_umount"
+      syscall: true
+      args:
+        - index: 0  # name
+          type: "string"
+        - index: 1  # flags
+          type: "int"
+    # 监控umount2系统调用（提供更多控制）
+    - call: "__x64_sys_umount2"
+      syscall: true
+      args:
+        - index: 0  # name
+          type: "string"
+        - index: 1  # flags
+          type: "int"
+    # 监控mount_setattr系统调用（用于改变挂载属性）
+    - call: "__x64_sys_mount_setattr"
+      syscall: true
+      args:
+        - index: 0  # dfd
+          type: "int"
+        - index: 1  # path
+          type: "string"
+        - index: 2  # flags
+          type: "unsigned int"
+        - index: 3  # uattr
+          type: "mount_attr"
+        - index: 4  # usize
+          type: "unsigned int"
+  selectors:
+    # 选择器：我们可以通过匹配条件来过滤事件，例如只监控特定进程或排除特定进程
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/mount"
+            - "/usr/bin/umount"
+            - "/usr/bin/umount2"
+        # 这里我们排除一些常见的文件系统操作工具，避免监控这些工具本身（如果需要监控这些工具，可以去掉这个排除列表）
+      matchActions:
+        - action: Post
+        # 可以添加其他action，比如输出到日志、发出警报等

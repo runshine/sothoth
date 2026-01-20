@@ -7,7 +7,7 @@ source_manager.py - 源码管理系统单文件版本
 2. 删除项目时默认删除所有相关资源（文件和Code-Server）
 3. 启动时检测K8S先关的配置是否正确，不正确需要报错并退出
 4. 修复Kubernetes连接验证中的API调用错误
-5. 修改project_id生成方式为md5(md5(project_name)_md5(上传的压缩包))
+5. 修改project_id生成方式为md5(md5(project_name)_md5(上传的压缩包)_time)
 6. 修改PVC创建逻辑：项目创建时立即创建PVC并拷贝文件
 7. 修改Code-Server创建逻辑：直接使用已有的PVC
 8. 修改Code-Server删除逻辑：保留PVC，只删除运行资源
@@ -119,7 +119,7 @@ class Config:
     # 调试模式
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-    EXTERNAL_ACCESS_URL = os.getenv("EXTERNAL_ACCESS_URL", "http://vscode-service.sothothv2.svc.cluster.local:8000")
+    EXTERNAL_ACCESS_URL = os.getenv("EXTERNAL_ACCESS_URL", "http://vscode-service.sothothv2-ns.svc.cluster.local:8000")
     ARCHIVE_DOWNLOAD_TOKEN = os.getenv("ARCHIVE_DOWNLOAD_TOKEN", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     ARCHIVE_DOWNLOAD_TIMEOUT = int(os.getenv("ARCHIVE_DOWNLOAD_TIMEOUT", "1200"))
 
@@ -537,11 +537,11 @@ class FileUtils:
 
     @staticmethod
     def generate_project_id(project_name: str, file_md5: str) -> str:
-        """生成项目ID：md5(md5(project_name)_file_md5)"""
+        """生成项目ID：md5(md5(project_name)_file_md5_time)"""
         # 计算项目名的MD5
         name_md5 = hashlib.md5(project_name.encode()).hexdigest()
         # 拼接字符串：name_md5_file_md5
-        combined_str = f"{name_md5}_{file_md5}"
+        combined_str = f"{name_md5}_{file_md5}_{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         # 对拼接后的字符串计算MD5
         return hashlib.md5(combined_str.encode()).hexdigest()
 
@@ -1228,14 +1228,10 @@ class KubernetesManager:
                     namespace=self.namespace,
                     label_selector=f"job-name={job_name}"
                 )
-                if existing_jobs.items:
+                if existing_jobs:
                     logger.info(f"解压任务已存在: {job_name}")
                     # 检查任务状态
-                    job = existing_jobs.items[0]
-                    if job.status.succeeded:
-                        logger.info(f"解压任务已成功完成: {job_name}")
-                        return True
-                    elif job.status.failed:
+                    if not existing_jobs.items:
                         logger.info(f"解压任务已失败，重新创建: {job_name}")
                         # 删除失败的任务
                         self.batch_v1.delete_namespaced_job(
@@ -1244,8 +1240,21 @@ class KubernetesManager:
                             propagation_policy="Background"
                         )
                     else:
-                        logger.info(f"解压任务正在进行中: {job_name}")
-                        return True
+                        job = existing_jobs.items[0]
+                        if job.status.succeeded:
+                            logger.info(f"解压任务已成功完成: {job_name}")
+                            return True
+                        elif job.status.failed:
+                            logger.info(f"解压任务已失败，重新创建: {job_name}")
+                            # 删除失败的任务
+                            self.batch_v1.delete_namespaced_job(
+                                name=job_name,
+                                namespace=self.namespace,
+                                propagation_policy="Background"
+                            )
+                        else:
+                            logger.info(f"解压任务正在进行中: {job_name}")
+                            return True
             except:
                 pass
 
@@ -1273,8 +1282,6 @@ class KubernetesManager:
             # 解压命令
             extract_command = f"""
             # 安装必要的工具
-            echo "安装curl和必要的解压工具..."
-            apk add --no-cache curl tar gzip bzip2 unzip
             
             # 创建临时目录
             mkdir -p /temp
@@ -1413,7 +1420,7 @@ class KubernetesManager:
                             restart_policy="OnFailure",  # 失败时重启
                             containers=[client.V1Container(
                                 name="download-extract",
-                                image="alpine:latest",
+                                image="ghcr.io/runshine/vpn-monitor:latest",
                                 command=["/bin/sh", "-c"],
                                 args=[extract_command],
                                 env=env_vars,
@@ -4962,7 +4969,7 @@ async def recreate_project_pvc(
         raise HTTPException(status_code=404, detail="项目不存在")
 
     # 检查项目状态是否为就绪
-    if project.status != Config.PROJECT_STATUS_READY:
+    if project.status != Config.PROJECT_STATUS_READY and project.status  != Config.PROJECT_STATUS_ERROR:
         raise HTTPException(
             status_code=400,
             detail=f"项目状态为 {project.status}，无法重建PVC。请等待项目初始化完成。"
@@ -6639,7 +6646,7 @@ def main():
     print(f"项目状态管理: {', '.join([Config.PROJECT_STATUS_PENDING, Config.PROJECT_STATUS_INITIALIZING, Config.PROJECT_STATUS_READY, Config.PROJECT_STATUS_ERROR, Config.PROJECT_STATUS_DELETING])}")
     print(f"项目异步初始化: 上传后自动提交初始化任务")
     print(f"项目删除功能: 强制删除所有K8S资源（包括PVC），避免资源泄露")
-    print(f"项目ID生成方式：md5(md5(project_name)_md5(压缩包文件))")
+    print(f"项目ID生成方式：md5(md5(project_name)_md5(压缩包文件)_time)")
 
     # 检查是否在K8S集群内部运行
     in_k8s = os.getenv("IN_K8S", "false").lower() == "true"

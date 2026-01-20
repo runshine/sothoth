@@ -1,0 +1,107 @@
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "process-capability-changes"
+spec:
+  # 监控进程凭证变化事件
+  tracepoints:
+    - subsystem: "syscalls"
+      event: "sys_enter_capset"
+      # 通过capset系统调用监控capability变化
+      args:
+        - index: 0
+          type: "cap_user_header_t"
+        - index: 1
+          type: "cap_user_data_t"
+  kprobes:
+    # 监控setuid/setgid相关系统调用，这些也会影响capabilities
+    - call: "__sys_setuid"
+      syscall: true
+      args:
+        - index: 0
+          type: "uid_t"
+    - call: "__sys_setgid"
+      syscall: true
+      args:
+        - index: 0
+          type: "gid_t"
+    - call: "__sys_setreuid"
+      syscall: true
+      args:
+        - index: 0
+          type: "uid_t"
+        - index: 1
+          type: "uid_t"
+    - call: "__sys_setregid"
+      syscall: true
+      args:
+        - index: 0
+          type: "gid_t"
+        - index: 1
+          type: "gid_t"
+    - call: "__sys_setresuid"
+      syscall: true
+      args:
+        - index: 0
+          type: "uid_t"
+        - index: 1
+          type: "uid_t"
+        - index: 2
+          type: "uid_t"
+    - call: "__sys_setresgid"
+      syscall: true
+      args:
+        - index: 0
+          type: "gid_t"
+        - index: 1
+          type: "gid_t"
+        - index: 2
+          type: "gid_t"
+    # 监控prctl系统调用，用于设置进程capabilities
+    - call: "__x64_sys_prctl"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"
+  selectors:
+    # 选择器1：监控capset系统调用，获取详细的capability信息
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/bash"
+            - "/usr/bin/sh"
+      matchActions:
+        - action: FollowFD
+          argFd: 0
+          argName: 0
+        - action: UnfollowFD
+          argFd: 0
+          argName: 0
+      matchArgs:
+        - index: 0
+          operator: "Equal"
+          values:
+            - "1"  # _LINUX_CAPABILITY_VERSION_1
+      tracepoint:
+        subsystem: "syscalls"
+        event: "sys_enter_capset"
+    # 选择器2：监控所有权限相关系统调用
+    - matchBinaries:
+        - operator: "NotIn"
+          values:
+            - "/usr/bin/bash"
+            - "/usr/bin/sh"
+      matchActions:
+        - action: Sigkill
+      matchArgs:
+        - index: 0
+          operator: "Equal"
+          values:
+            - "0"  # 监控root用户执行的权限变更
+      kprobes:
+        - call: "__sys_setuid"
+        - call: "__sys_setgid"
+        - call: "__sys_setreuid"
+        - call: "__sys_setregid"
+        - call: "__sys_setresuid"
+        - call: "__sys_setresgid"

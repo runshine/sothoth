@@ -1,0 +1,60 @@
+# policies/process-exec-all.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "docker-process-exec-all"
+spec:
+  # 监控所有进程执行事件
+  tracepoints:
+    - subsystem: "syscalls"
+      event: "sys_enter_execve"
+      args:
+        - index: 0
+          type: "string"
+        - index: 1
+          type: "string[]"
+        - index: 2
+          type: "string[]"
+      selectors:
+        # 选择器1：捕获所有进程执行
+        - matchActions:
+            - action: Post
+          # 输出所有进程信息
+          matchActions:
+            - action: Post
+              argPID: true
+              argPPID: true
+              argUID: true
+              argEUID: true
+              argGID: true
+              argEGID: true
+              argComm: true
+              argFilename: true
+              argPath: true
+              argCwd: true
+              argTTY: true
+              argArgs: true
+              argEnvs: true
+              argCap: true
+              argNSPID: true
+              argRetval: true
+              argError: true
+          # 记录进程创建时间
+          matchActions:
+            - action: FollowFD
+              argFd: 0
+              argFilename: true
+              argTime: true
+
+    # 监控进程退出事件
+    - subsystem: "syscalls"
+      event: "sys_exit_execve"
+      args:
+        - index: 0
+          type: "long"
+      selectors:
+        - matchActions:
+            - action: Post
+              argRetval: true
+              argDuration: true
+              argExitCode: true
