@@ -26,7 +26,7 @@ RUN case ${TARGETARCH} in \
     esac
 
 # 复制go模块文件
-COPY go.mod go.sum ./
+COPY go.mod ./
 RUN go mod download
 
 # 复制源代码
