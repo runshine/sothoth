@@ -119,7 +119,7 @@ class Config:
     # 调试模式
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-    EXTERNAL_ACCESS_URL = os.getenv("EXTERNAL_ACCESS_URL", "http://vscode-service.sothothv2-ns.svc.cluster.local:8000")
+    EXTERNAL_ACCESS_URL = os.getenv("EXTERNAL_ACCESS_URL", "http://vscode-web-manager-service.sothothv2-ns.svc.cluster.local:8000")
     ARCHIVE_DOWNLOAD_TOKEN = os.getenv("ARCHIVE_DOWNLOAD_TOKEN", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     ARCHIVE_DOWNLOAD_TIMEOUT = int(os.getenv("ARCHIVE_DOWNLOAD_TIMEOUT", "1200"))
 
