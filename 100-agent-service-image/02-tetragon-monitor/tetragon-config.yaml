@@ -1,0 +1,886 @@
+# tetragon-config.yaml
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: "comprehensive-security-monitoring"
+  annotations:
+    description: "Comprehensive security monitoring with deduplication support"
+    version: "2.0.0"
+    author: "Security Team"
+    created: "2024-01-01"
+spec:
+  # ========== 进程执行监控 ==========
+  processExec:
+    - call: "execve"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # filename
+        - index: 1
+          type: "string[]"  # argv
+        - index: 2
+          type: "string[]"  # envp
+      returnArg:
+        type: "int"
+      return: true
+      selectors:
+        - matchActions:
+            - action: post
+            - action: followFd
+              argFd: 0
+              argName: 0
+        matchBinaries:
+          - operator: "NotIn"
+            values:
+              - "/usr/bin/tetragon"
+              - "/usr/bin/tetragon-monitor"
+              - "/usr/lib/systemd/systemd"
+              - "/sbin/init"
+
+    - call: "execveat"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # dirfd
+        - index: 1
+          type: "string"  # pathname
+        - index: 2
+          type: "string[]"  # argv
+        - index: 3
+          type: "string[]"  # envp
+        - index: 4
+          type: "int"  # flags
+
+    # ========== 进程创建监控 ==========
+    - call: "clone"
+      syscall: true
+      args:
+        - index: 0
+          type: "unsigned long"  # flags
+        - index: 1
+          type: "void*"  # stack
+        - index: 2
+          type: "pid_t*"  # parent_tid
+        - index: 3
+          type: "pid_t*"  # child_tid
+        - index: 4
+          type: "unsigned long"  # tls
+      returnArg:
+        type: "int"
+      return: true
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "fork"
+      syscall: true
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "vfork"
+      syscall: true
+      selectors:
+        - matchActions:
+            - action: post
+
+  # ========== 文件操作监控 ==========
+  fileOperations:
+    # 文件打开
+    - call: "open"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # filename
+        - index: 1
+          type: "int"  # flags
+        - index: 2
+          type: "mode_t"  # mode
+      returnArg:
+        type: "int"
+      return: true
+      selectors:
+        - matchArgs:
+            - index: 0
+              operator: "NotPrefix"
+              values:
+                - "/proc/"
+                - "/sys/"
+                - "/dev/"
+          matchActions:
+            - action: post
+        matchBinaries:
+          - operator: "NotIn"
+            values:
+              - "/usr/bin/tetragon"
+              - "/usr/bin/tetragon-monitor"
+
+    - call: "openat"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # dirfd
+        - index: 1
+          type: "string"  # pathname
+        - index: 2
+          type: "int"  # flags
+        - index: 3
+          type: "mode_t"  # mode
+
+    # 文件读取
+    - call: "read"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # fd
+        - index: 1
+          type: "void*"  # buf
+        - index: 2
+          type: "size_t"  # count
+      selectors:
+        - matchArgs:
+            - index: 2
+              operator: "GreaterThan"
+              value: 1024  # 只记录大于1KB的读取
+          matchActions:
+            - action: post
+        matchBinaries:
+          - operator: "In"
+            values:
+              - "/usr/bin/*"
+              - "/bin/*"
+              - "/sbin/*"
+              - "/usr/sbin/*"
+
+    # 文件写入
+    - call: "write"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # fd
+        - index: 1
+          type: "void*"  # buf
+        - index: 2
+          type: "size_t"  # count
+      selectors:
+        - matchArgs:
+            - index: 2
+              operator: "GreaterThan"
+              value: 1024  # 只记录大于1KB的写入
+          matchActions:
+            - action: post
+
+    # 文件关闭
+    - call: "close"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # fd
+      selectors:
+        - matchActions:
+            - action: post
+
+    # 文件删除
+    - call: "unlink"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # pathname
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "unlinkat"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # dirfd
+        - index: 1
+          type: "string"  # pathname
+        - index: 2
+          type: "int"  # flags
+
+    # 文件重命名
+    - call: "rename"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # oldpath
+        - index: 1
+          type: "string"  # newpath
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "renameat"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # olddirfd
+        - index: 1
+          type: "string"  # oldpath
+        - index: 2
+          type: "int"  # newdirfd
+        - index: 3
+          type: "string"  # newpath
+
+    # 文件权限修改
+    - call: "chmod"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # pathname
+        - index: 1
+          type: "mode_t"  # mode
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "fchmod"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # fd
+        - index: 1
+          type: "mode_t"  # mode
+
+    # 文件所有权修改
+    - call: "chown"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # pathname
+        - index: 1
+          type: "uid_t"  # owner
+        - index: 2
+          type: "gid_t"  # group
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "fchown"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # fd
+        - index: 1
+          type: "uid_t"  # owner
+        - index: 2
+          type: "gid_t"  # group
+
+    # 文件链接
+    - call: "link"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # oldpath
+        - index: 1
+          type: "string"  # newpath
+
+    - call: "symlink"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # target
+        - index: 1
+          type: "string"  # linkpath
+
+  # ========== 网络活动监控 ==========
+  networkActivity:
+    # 网络连接
+    - call: "connect"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # sockfd
+        - index: 1
+          type: "sockaddr"  # addr
+        - index: 2
+          type: "int"  # addrlen
+      returnArg:
+        type: "int"
+      return: true
+      selectors:
+        - matchActions:
+            - action: post
+        matchBinaries:
+          - operator: "NotIn"
+            values:
+              - "/usr/bin/tetragon"
+              - "/usr/bin/tetragon-monitor"
+
+    # 接受连接
+    - call: "accept"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # sockfd
+        - index: 1
+          type: "sockaddr"  # addr
+        - index: 2
+          type: "int*"  # addrlen
+      returnArg:
+        type: "int"
+      return: true
+
+    - call: "accept4"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # sockfd
+        - index: 1
+          type: "sockaddr"  # addr
+        - index: 2
+          type: "int*"  # addrlen
+        - index: 3
+          type: "int"  # flags
+
+    # 绑定地址
+    - call: "bind"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # sockfd
+        - index: 1
+          type: "sockaddr"  # addr
+        - index: 2
+          type: "int"  # addrlen
+
+    # 监听连接
+    - call: "listen"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # sockfd
+        - index: 1
+          type: "int"  # backlog
+
+    # 创建socket
+    - call: "socket"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # domain
+        - index: 1
+          type: "int"  # type
+        - index: 2
+          type: "int"  # protocol
+      selectors:
+        - matchArgs:
+            - index: 0
+              operator: "Equal"
+              values:
+                - 2  # AF_INET
+                - 10 # AF_INET6
+          matchActions:
+            - action: post
+
+    # 发送数据
+    - call: "sendto"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # sockfd
+        - index: 1
+          type: "void*"  # buf
+        - index: 2
+          type: "size_t"  # len
+        - index: 3
+          type: "int"  # flags
+        - index: 4
+          type: "sockaddr"  # dest_addr
+        - index: 5
+          type: "int"  # addrlen
+      selectors:
+        - matchArgs:
+            - index: 2
+              operator: "GreaterThan"
+              value: 1024  # 只记录大于1KB的发送
+
+    # 接收数据
+    - call: "recvfrom"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # sockfd
+        - index: 1
+          type: "void*"  # buf
+        - index: 2
+          type: "size_t"  # len
+        - index: 3
+          type: "int"  # flags
+        - index: 4
+          type: "sockaddr"  # src_addr
+        - index: 5
+          type: "int*"  # addrlen
+
+  # ========== 敏感系统调用监控 ==========
+  syscalls:
+    # 进程跟踪
+    - call: "ptrace"
+      syscall: true
+      args:
+        - index: 0
+          type: "enum"  # request
+          values:
+            - 0  # PTRACE_TRACEME
+            - 1  # PTRACE_PEEKTEXT
+            - 2  # PTRACE_PEEKDATA
+            - 3  # PTRACE_PEEKUSER
+            - 4  # PTRACE_POKETEXT
+            - 5  # PTRACE_POKEDATA
+            - 6  # PTRACE_POKEUSER
+            - 7  # PTRACE_CONT
+            - 8  # PTRACE_KILL
+            - 9  # PTRACE_SINGLESTEP
+        - index: 1
+          type: "pid_t"  # pid
+        - index: 2
+          type: "void*"  # addr
+        - index: 3
+          type: "void*"  # data
+      selectors:
+        - matchActions:
+            - action: post
+
+    # 进程间通信
+    - call: "process_vm_readv"
+      syscall: true
+      args:
+        - index: 0
+          type: "pid_t"  # pid
+        - index: 1
+          type: "iovec*"  # lvec
+        - index: 2
+          type: "unsigned long"  # liovcnt
+        - index: 3
+          type: "iovec*"  # rvec
+        - index: 4
+          type: "unsigned long"  # riovcnt
+        - index: 5
+          type: "unsigned long"  # flags
+
+    - call: "process_vm_writev"
+      syscall: true
+      args:
+        - index: 0
+          type: "pid_t"  # pid
+        - index: 1
+          type: "iovec*"  # lvec
+        - index: 2
+          type: "unsigned long"  # liovcnt
+        - index: 3
+          type: "iovec*"  # rvec
+        - index: 4
+          type: "unsigned long"  # riovcnt
+        - index: 5
+          type: "unsigned long"  # flags
+
+    # 共享内存
+    - call: "shmat"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # shmid
+        - index: 1
+          type: "void*"  # shmaddr
+        - index: 2
+          type: "int"  # shmflg
+
+    - call: "shmdt"
+      syscall: true
+      args:
+        - index: 0
+          type: "void*"  # shmaddr
+
+    # 内存映射
+    - call: "mprotect"
+      syscall: true
+      args:
+        - index: 0
+          type: "void*"  # addr
+        - index: 1
+          type: "size_t"  # len
+        - index: 2
+          type: "int"  # prot
+      selectors:
+        - matchArgs:
+            - index: 2
+              operator: "Equal"
+              values:
+                - 7  # PROT_READ|PROT_WRITE|PROT_EXEC
+          matchActions:
+            - action: post
+
+  # ========== 能力变化监控 ==========
+  capabilityChanges:
+    - call: "capset"
+      syscall: true
+      args:
+        - index: 0
+          type: "cap_user_header_t"  # header
+        - index: 1
+          type: "cap_user_data_t"  # data
+      selectors:
+        - matchActions:
+            - action: post
+
+    # 特权操作
+    - call: "setuid"
+      syscall: true
+      args:
+        - index: 0
+          type: "uid_t"  # uid
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "setgid"
+      syscall: true
+      args:
+        - index: 0
+          type: "gid_t"  # gid
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "setreuid"
+      syscall: true
+      args:
+        - index: 0
+          type: "uid_t"  # ruid
+        - index: 1
+          type: "uid_t"  # euid
+
+    - call: "setregid"
+      syscall: true
+      args:
+        - index: 0
+          type: "gid_t"  # rgid
+        - index: 1
+          type: "gid_t"  # egid
+
+    - call: "setresuid"
+      syscall: true
+      args:
+        - index: 0
+          type: "uid_t"  # ruid
+        - index: 1
+          type: "uid_t"  # euid
+        - index: 2
+          type: "uid_t"  # suid
+
+    - call: "setresgid"
+      syscall: true
+      args:
+        - index: 0
+          type: "gid_t"  # rgid
+        - index: 1
+          type: "gid_t"  # egid
+        - index: 2
+          type: "gid_t"  # sgid
+
+  # ========== 命名空间变化监控 ==========
+  namespaceChanges:
+    - call: "unshare"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # flags
+      selectors:
+        - matchArgs:
+            - index: 0
+              operator: "Mask"
+              values:
+                - 0x00020000  # CLONE_NEWUSER
+                - 0x02000000  # CLONE_NEWCGROUP
+                - 0x00040000  # CLONE_NEWIPC
+                - 0x02000000  # CLONE_NEWNET
+                - 0x00000000  # CLONE_NEWNS (mount namespace)
+                - 0x20000000  # CLONE_NEWPID
+                - 0x00000100  # CLONE_NEWUTS
+          matchActions:
+            - action: post
+
+    - call: "setns"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # fd
+        - index: 1
+          type: "int"  # nstype
+
+    # 创建命名空间
+    - call: "clone"
+      syscall: true
+      args:
+        - index: 0
+          type: "unsigned long"  # flags
+      selectors:
+        - matchArgs:
+            - index: 0
+              operator: "Mask"
+              values:
+                - 0x00020000  # CLONE_NEWUSER
+                - 0x02000000  # CLONE_NEWCGROUP
+          matchActions:
+            - action: post
+
+  # ========== 信号传递监控 ==========
+  signalDelivery:
+    - call: "kill"
+      syscall: true
+      args:
+        - index: 0
+          type: "pid_t"  # pid
+        - index: 1
+          type: "int"  # sig
+      selectors:
+        - matchArgs:
+            - index: 1
+              operator: "In"
+              values:
+                - 9   # SIGKILL
+                - 15  # SIGTERM
+                - 2   # SIGINT
+                - 3   # SIGQUIT
+                - 1   # SIGHUP
+          matchActions:
+            - action: post
+
+    - call: "tkill"
+      syscall: true
+      args:
+        - index: 0
+          type: "pid_t"  # tid
+        - index: 1
+          type: "int"  # sig
+
+    - call: "tgkill"
+      syscall: true
+      args:
+        - index: 0
+          type: "pid_t"  # tgid
+        - index: 1
+          type: "pid_t"  # tid
+        - index: 2
+          type: "int"  # sig
+
+  # ========== 进程退出监控 ==========
+  processExit:
+    - call: "exit"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # status
+      selectors:
+        - matchActions:
+            - action: post
+        matchBinaries:
+          - operator: "NotIn"
+            values:
+              - "/usr/bin/tetragon"
+              - "/usr/bin/tetragon-monitor"
+
+    - call: "exit_group"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # status
+      selectors:
+        - matchActions:
+            - action: post
+
+  # ========== 内核模块加载监控 ==========
+  kernelModuleLoading:
+    - call: "init_module"
+      syscall: true
+      args:
+        - index: 0
+          type: "void*"  # module_image
+        - index: 1
+          type: "unsigned long"  # len
+        - index: 2
+          type: "string"  # param_values
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "finit_module"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # fd
+        - index: 1
+          type: "string"  # param_values
+        - index: 2
+          type: "int"  # flags
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "delete_module"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # name
+        - index: 1
+          type: "int"  # flags
+      selectors:
+        - matchActions:
+            - action: post
+
+  # ========== 特权提升监控 ==========
+  privilegeEscalation:
+    # 监控SUID/SGID二进制文件的执行
+    - call: "execve"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # filename
+      selectors:
+        - matchActions:
+            - action: followFd
+              argFd: 0
+              argName: 0
+            - action: post
+        matchBinaries:
+          - operator: "In"
+            values:
+              - "/bin/su"
+              - "/bin/sudo"
+              - "/usr/bin/su"
+              - "/usr/bin/sudo"
+              - "/usr/local/bin/su"
+              - "/usr/local/bin/sudo"
+
+  # ========== 文件系统挂载监控 ==========
+  filesystemMount:
+    - call: "mount"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # source
+        - index: 1
+          type: "string"  # target
+        - index: 2
+          type: "string"  # filesystemtype
+        - index: 3
+          type: "unsigned long"  # mountflags
+        - index: 4
+          type: "void*"  # data
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "umount"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # target
+        - index: 1
+          type: "int"  # flags
+      selectors:
+        - matchActions:
+            - action: post
+
+    - call: "umount2"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # target
+        - index: 1
+          type: "int"  # flags
+
+  # ========== 内存相关事件监控 ==========
+  memoryEvents:
+    # 内存映射
+    - call: "mmap"
+      syscall: true
+      args:
+        - index: 0
+          type: "void*"  # addr
+        - index: 1
+          type: "size_t"  # length
+        - index: 2
+          type: "int"  # prot
+        - index: 3
+          type: "int"  # flags
+        - index: 4
+          type: "int"  # fd
+        - index: 5
+          type: "off_t"  # offset
+      selectors:
+        - matchArgs:
+            - index: 2
+              operator: "Equal"
+              values:
+                - 7  # PROT_READ|PROT_WRITE|PROT_EXEC
+          matchActions:
+            - action: post
+
+    # 解除内存映射
+    - call: "munmap"
+      syscall: true
+      args:
+        - index: 0
+          type: "void*"  # addr
+        - index: 1
+          type: "size_t"  # length
+
+    # 内存分配
+    - call: "brk"
+      syscall: true
+      args:
+        - index: 0
+          type: "void*"  # addr
+
+    # 共享内存
+    - call: "shmget"
+      syscall: true
+      args:
+        - index: 0
+          type: "key_t"  # key
+        - index: 1
+          type: "size_t"  # size
+        - index: 2
+          type: "int"  # shmflg
+
+  # ========== 其他安全相关事件 ==========
+  securityEvents:
+    # 时间修改
+    - call: "settimeofday"
+      syscall: true
+      args:
+        - index: 0
+          type: "timeval*"  # tv
+        - index: 1
+          type: "timezone*"  # tz
+
+    # 系统信息修改
+    - call: "sethostname"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # name
+        - index: 1
+          type: "size_t"  # len
+
+    - call: "setdomainname"
+      syscall: true
+      args:
+        - index: 0
+          type: "string"  # name
+        - index: 1
+          type: "size_t"  # len
+
+    # 调度优先级
+    - call: "setpriority"
+      syscall: true
+      args:
+        - index: 0
+          type: "int"  # which
+        - index: 1
+          type: "int"  # who
+        - index: 2
+          type: "int"  # prio

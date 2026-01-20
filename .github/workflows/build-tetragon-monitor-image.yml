@@ -36,12 +36,5 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push tetragon-monitor-image
-        uses: docker/build-push-action@v5
-        with:
-          context: 100-agent-service-image/02-tetragon-monitor/
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
-          push: true
-          tags: |
-            runshine0819/tetragon-monitor:latest
-            ghcr.io/runshine/tetragon-monitor:latest
-          file: 100-agent-service-image/02-tetragon-monitor/Dockerfile
+        run: |
+          cd 100-agent-service-image/02-tetragon-monitor/ && bash build-multi-arch.sh

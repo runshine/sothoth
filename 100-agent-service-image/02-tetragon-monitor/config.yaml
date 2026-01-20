@@ -1,0 +1,94 @@
+# config.yaml
+api:
+  host: "0.0.0.0"
+  port: 8080
+  auth_enabled: true
+  api_key: "${API_KEY:-change-me}"
+
+elasticsearch:
+  url: "${ES_URL}"
+  username: "${ES_USERNAME}"
+  password: "${ES_PASSWORD}"
+  cloud_id: "${ES_CLOUD_ID}"
+  api_key: "${ES_API_KEY}"
+  index_prefix: "tetragon-events"
+  max_retries: 3
+  timeout: "30s"
+
+tetragon:
+  grpc_address: "${TETRAGON_GRPC_ADDRESS:-127.0.0.1:54321}"
+  reconnect_interval: "5s"
+  max_message_size: 52428800  # 50MB
+
+processing:
+  worker_count: "${WORKER_COUNT:-10}"
+  batch_size: "${BATCH_SIZE:-1000}"
+  flush_interval: "${FLUSH_INTERVAL:-5s}"
+  queue_size: "${QUEUE_SIZE:-100000}"
+
+deduplication:
+  enabled: "${DEDUP_ENABLED:-true}"
+  default_window: "${DEDUP_WINDOW:-5m}"
+  # 事件类型配置
+  events:
+    process_execution:
+      enabled: true
+      window: "5m"
+      strategy: "per_process"
+      max_cache_size: 100000
+
+    file_open:
+      enabled: true
+      window: "2m"
+      strategy: "per_operation"
+      max_cache_size: 50000
+
+    network_connect:
+      enabled: true
+      window: "3m"
+      strategy: "per_target"
+      max_cache_size: 30000
+
+    process_exit:
+      enabled: false
+      strategy: "none"
+
+    capability_change:
+      enabled: true
+      window: "10m"
+      strategy: "composite"
+      max_cache_size: 10000
+
+monitoring:
+  # 排除自身进程
+  filter_self_processes: "${FILTER_SELF_PROCESSES:-true}"
+
+  # 排除的进程模式
+  exclude_patterns: "${EXCLUDE_PATTERNS:-}"
+
+  # 启用的事件类型
+  enabled_events:
+    - "process_execution"
+    - "process_exit"
+    - "file_open"
+    - "file_read"
+    - "file_write"
+    - "network_connect"
+    - "signal_delivery"
+    - "capability_change"
+    - "namespace_change"
+    - "kernel_module_load"
+    - "privilege_escalation"
+    - "filesystem_mount"
+
+logging:
+  level: "${LOG_LEVEL:-info}"
+  format: "json"
+  output_path: "/app/logs/tetragon-monitor.log"
+  max_size: 100  # MB
+  max_backups: 10
+  max_age: 30   # days
+
+host_info:
+  config_path: "${CONFIG_FILE_PATH:-/sothothv2/config/sothothv2_agent.ini}"
+  interface_name: "br-sothoth"

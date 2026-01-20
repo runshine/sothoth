@@ -1,48 +1,76 @@
-# 基于Tetragon构建监控镜像
-FROM quay.io/cilium/tetragon:latest as tetragon
+# 构建阶段
+FROM --platform=$BUILDPLATFORM golang:1.19-alpine AS builder
 
-# 构建阶段：安装Python和依赖
-FROM python:3.11-slim
+ARG TARGETARCH
+ARG TARGETVARIANT
+ARG TARGETPLATFORM
 
-# 安装必要的工具
-RUN apt-get update && apt-get install -y \
-    curl \
-    jq \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
-
-# 复制Tetragon二进制文件
-COPY --from=tetragon /usr/bin/tetragon /usr/bin/tetragon
-COPY --from=tetragon /usr/bin/tetra /usr/bin/tetra
-
-# 创建应用目录
 WORKDIR /app
 
-# 复制Python去重和上传脚本
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt --break-system-packages
+# 设置环境变量用于构建
+ENV GO111MODULE=on \
+    CGO_ENABLED=0 \
+    GOOS=linux
 
-COPY deduplicator.py .
-COPY es_uploader.py .
-COPY entrypoint.sh .
-RUN chmod +x entrypoint.sh
+# 根据目标架构设置GOARCH和GOARM
+RUN case ${TARGETARCH} in \
+        arm) \
+            case ${TARGETVARIANT} in \
+                6) export GOARCH=arm GOARM=6 ;; \
+                7) export GOARCH=arm GOARM=7 ;; \
+                *) export GOARCH=arm GOARM=6 ;; \
+            esac ;; \
+        arm64) export GOARCH=arm64 ;; \
+        amd64) export GOARCH=amd64 ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac
 
-# 创建数据目录
-RUN mkdir -p /var/run/tetragon /var/log/tetragon
+# 复制go模块文件
+COPY go.mod go.sum ./
+RUN go mod download
 
-# 环境变量
-ENV TETRAGON_LOG_LEVEL=info \
-    ES_ENABLED=false \
-    ES_HOST=localhost \
-    ES_PORT=9200 \
-    ES_USER=elastic \
-    ES_PASSWORD=elastic \
-    ES_INDEX=tetragon-events \
-    DEDUP_ENABLED=true \
-    DEDUP_WINDOW_MINUTES=5 \
-    CACHE_MAX_SIZE=10000 \
-    EVENTS_INTERVAL_MS=100
+# 复制源代码
+COPY main.go .
 
-EXPOSE 54321
+# 构建应用
+RUN go build -a -installsuffix cgo -ldflags="-w -s" -o tetragon-monitor .
 
-CMD ["./entrypoint.sh"]
+# 运行阶段 - 使用多架构基础镜像
+FROM --platform=$TARGETPLATFORM alpine:3.17
+
+# 添加必要的工具
+RUN apk add --no-cache \
+    tzdata \
+    ca-certificates \
+    iproute2 \
+    wget \
+    curl \
+    && update-ca-certificates
+
+# 创建工作目录
+WORKDIR /app
+
+# 复制可执行文件
+COPY --from=builder /app/tetragon-monitor .
+
+# 设置时区为上海
+ENV TZ=Asia/Shanghai
+
+# 创建必要的目录
+RUN mkdir -p /sothothv2/config
+
+# 设置默认环境变量
+ENV TETRAGON_SOCK=/var/run/tetragon/tetragon.sock \
+    ES_ENDPOINT=http://elasticsearch:9200 \
+    ES_INDEX_PREFIX=tetragon-events \
+    GIN_MODE=release
+
+# 暴露API端口
+EXPOSE 8080
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# 启动命令
+CMD ["./tetragon-monitor"]

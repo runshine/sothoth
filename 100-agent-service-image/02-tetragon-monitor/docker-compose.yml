@@ -1,53 +1,87 @@
 version: '3.8'
 
 services:
-  tetragon-monitor:
-    image: ghcr.io/runshine/tetragon-monitor:latest  #
-    container_name: tetragon-monitor
-    privileged: true
-    network_mode: host  # 需要主机网络来监控所有进程
-    pid: host  # 共享PID命名空间
-    cap_add:
-      - SYS_ADMIN
-      - NET_ADMIN
-      - SYS_PTRACE
-      - BPF
-    volumes:
-      # 挂载BPF文件系统和内核调试文件系统
-      - /sys/kernel/debug:/sys/kernel/debug:rw
-      - /sys/fs/bpf:/sys/fs/bpf:rw
-      # 挂载主机根目录以监控所有文件访问
-      - /:/rootfs:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      # 持久化存储
-      - tetragon-data:/var/run/tetragon
-      - tetragon-logs:/var/log/tetragon
-    environment:
-      # Tetragon配置
-      - TETRAGON_LOG_LEVEL=${TETRAGON_LOG_LEVEL:-info}
-      - EVENTS_INTERVAL_MS=${EVENTS_INTERVAL_MS:-100}
-
-      # 去重配置
-      - DEDUP_ENABLED=${DEDUP_ENABLED:-true}
-      - DEDUP_WINDOW_MINUTES=${DEDUP_WINDOW_MINUTES:-5}
-      - CACHE_MAX_SIZE=${CACHE_MAX_SIZE:-10000}
-
-      # Elasticsearch配置
-      - ES_ENABLED=${ES_ENABLED:-false}
-      - ES_HOST=${ES_HOST:-elasticsearch}
-      - ES_PORT=${ES_PORT:-9200}
-      - ES_SCHEME=${ES_SCHEME:-http}
-      - ES_USER=${ES_USER:-}
-      - ES_PASSWORD=${ES_PASSWORD:-}
-      - ES_INDEX=${ES_INDEX:-tetragon-events}
-      - ES_VERIFY_CERTS=${ES_VERIFY_CERTS:-false}
-      - ES_CA_CERTS=${ES_CA_CERTS:-}
+  tetragon:
+    image: quay.io/cilium/tetragon:v0.10.0
+    container_name: tetragon
     restart: unless-stopped
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      # BPF相关挂载
+      - /sys/kernel/btf/vmlinux:/var/lib/tetragon/btf:ro
+      # 配置文件
+      - ./tetragon-config.yaml:/etc/tetragon/tetragon.tp.yaml:ro
+      - ./tetragon-config.yaml:/etc/tetragon/tetragon.yaml:ro
+      # 运行时目录
+      - /var/run/tetragon:/var/run/tetragon
+      # 挂载主机目录用于监控工具读取配置
+      - /sothothv2/config:/sothothv2/config:ro
+    command:
+      - "/usr/bin/tetragon"
+      - "--export-filename=/var/run/tetragon/tetragon.log"
+      - "--server-address=unix:///var/run/tetragon/tetragon.sock"
+      - "--config-file=/etc/tetragon/tetragon.tp.yaml"
+    environment:
+      - TETRAGON_DEBUG=false
+    deploy:
+      resources:
+        limits:
+          memory: "1G"
+          cpus: "1"
+        reservations:
+          memory: "512M"
+          cpus: "0.5"
+    healthcheck:
+      test: ["CMD", "tetra", "getevents", "--server-address", "unix:///var/run/tetragon/tetragon.sock", "--timeout", "5s"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  monitor:
+    build: .
+    image: local/tetragon-monitor:latest
+    container_name: tetragon-monitor
+    restart: unless-stopped
+    depends_on:
+      tetragon:
+        condition: service_started
+    network_mode: host
+    volumes:
+      # 共享Tetragon的socket
+      - /var/run/tetragon:/var/run/tetragon
+      # 挂载主机配置目录
+      - /sothothv2/config:/sothothv2/config:ro
+      # 挂载主机网卡信息
+      - /sys/class/net:/sys/class/net:ro
+    environment:
+      - ES_ENDPOINT=${ES_ENDPOINT}
+      - ES_USERNAME=${ES_USERNAME}
+      - ES_PASSWORD=${ES_PASSWORD}
+      - ES_INDEX_PREFIX=${ES_INDEX_PREFIX:-tetragon-events}
+      - TETRAGON_SOCK=/var/run/tetragon/tetragon.sock
+      - GIN_MODE=release
+      - GOARCH=${GOARCH}
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          memory: "512M"
+          cpus: "0.5"
+        reservations:
+          memory: "256M"
+          cpus: "0.25"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-volumes:
-  tetragon-data:
-  tetragon-logs:
