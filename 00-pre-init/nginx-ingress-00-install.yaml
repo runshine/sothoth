@@ -341,7 +341,6 @@ metadata:
     app.kubernetes.io/name: ingress-nginx
     app.kubernetes.io/part-of: ingress-nginx
     app.kubernetes.io/version: 1.14.1
-    metallb.io/allow-shared-ip: "shared-192.168.12.90"  # 可选：允许IP共享
   name: ingress-nginx-controller
   namespace: ingress-nginx
 spec:

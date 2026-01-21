@@ -11,26 +11,26 @@ data:
     
     echo "$(date): === FRR Route Reflector Election ==="
     
-    # 方法1：尝试从flannel.1接口获取IP
-    if ip link show flannel.1 >/dev/null 2>&1; then
-      FLANNEL_IP=$(ip -4 addr show flannel.1 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    # 方法1：尝试从flannel.1234接口获取IP
+    if ip link show flannel.1234 >/dev/null 2>&1; then
+      FLANNEL_IP=$(ip -4 addr show flannel.1234 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
       if [ ! -z "$FLANNEL_IP" ]; then
-        echo "$(date): Got flannel.1 IP: $FLANNEL_IP"
+        echo "$(date): Got flannel.1234 IP: $FLANNEL_IP"
         # 提取第三个数字
         THIRD_OCTET=$(echo $FLANNEL_IP | cut -d. -f3)
         if [ "$THIRD_OCTET" = "0" ]; then
           echo "ROLE=route-reflector" > /etc/frr/frr-role
-          echo "$(date): I am Route Reflector (flannel.1 IP: $FLANNEL_IP, third octet is 0)"
+          echo "$(date): I am Route Reflector (flannel.1234 IP: $FLANNEL_IP, third octet is 0)"
         else
           echo "ROLE=client" > /etc/frr/frr-role
-          echo "$(date): I am Client (flannel.1 IP: $FLANNEL_IP, third octet is $THIRD_OCTET)"
+          echo "$(date): I am Client (flannel.1234 IP: $FLANNEL_IP, third octet is $THIRD_OCTET)"
         fi
       else
-        echo "$(date): WARNING: flannel.1 exists but has no IP"
+        echo "$(date): WARNING: flannel.1234 exists but has no IP"
       fi
     fi
     
-    # 方法2：如果flannel.1没有IP，尝试从cni0接口或路由表推断Pod CIDR
+    # 方法2：如果flannel.1234没有IP，尝试从cni0接口或路由表推断Pod CIDR
     if [ ! -f /etc/frr/frr-role ]; then
       # 尝试从cni0获取Pod CIDR
       if ip link show cni0 >/dev/null 2>&1; then
@@ -58,24 +58,24 @@ data:
       NODE_NUM=$(echo $NODE_NAME | grep -o '[0-9]\+$' || echo "1")
     
       if [ "$NODE_NUM" = "1" ]; then
-        echo "$(date): ROLE=route-reflector" > /etc/frr/frr-role
+        echo "ROLE=route-reflector" > /etc/frr/frr-role
         echo "$(date): I am Route Reflector (fallback: node $NODE_NAME)"
       else
-        echo "$(date): ROLE=client" > /etc/frr/frr-role
+        echo "ROLE=client" > /etc/frr/frr-role
         echo "$(date): I am Client (fallback: node $NODE_NAME)"
       fi
     fi
     
-    # 计算flannel.1 IP（如果还没获取到）
+    # 计算flannel.1234 IP（如果还没获取到）
     if [ -f /etc/frr/frr-role ] && [ -z "$FLANNEL_IP" ]; then
       source /etc/frr/frr-role
       if [ "$ROLE" = "route-reflector" ]; then
-        # RR的flannel.1 IP固定为10.42.0.1
+        # RR的flannel.1234 IP固定为10.42.0.1
         echo "FLANNEL_IP=10.42.0.0" >> /etc/frr/frr-role
         echo "RR_FLANNEL_IP=10.42.0.0" >> /etc/frr/frr-role
       else
-        # 客户端尝试获取自己的flannel.1 IP
-        CLIENT_IP=$(ip -4 addr show flannel.1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+        # 客户端尝试获取自己的flannel.1234 IP
+        CLIENT_IP=$(ip -4 addr show flannel.1234 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
         if [ ! -z "$CLIENT_IP" ]; then
           echo "FLANNEL_IP=$CLIENT_IP" >> /etc/frr/frr-role
         fi
@@ -99,9 +99,9 @@ data:
     
     source /etc/frr/frr-role
     
-    # 获取flannel.1 IP，如果还没有则计算
+    # 获取flannel.1234 IP，如果还没有则计算
     if [ -z "$FLANNEL_IP" ]; then
-      FLANNEL_IP=$(ip -4 addr show flannel.1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+      FLANNEL_IP=$(ip -4 addr show flannel.1234 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
       if [ -z "$FLANNEL_IP" ] && [ "$ROLE" = "route-reflector" ]; then
         FLANNEL_IP="10.42.0.0"
       fi
@@ -114,7 +114,7 @@ data:
     cp /etc/tmp-frr/* /etc/frr/ 
     
     echo "$(date): Generating FRR configuration for role: $ROLE"
-    echo "$(date): Local flannel.1 IP: $FLANNEL_IP"
+    echo "$(date): Local flannel.1234 IP: $FLANNEL_IP"
    
     if [ "$ROLE" = "route-reflector" ]; then
       # 生成路由反射器配置
@@ -133,7 +133,7 @@ data:
     ! 为每个客户端配置路由反射
     neighbor RR-CLIENTS peer-group
     neighbor RR-CLIENTS remote-as 65000
-    neighbor RR-CLIENTS update-source flannel.1
+    neighbor RR-CLIENTS update-source flannel.1234
     neighbor RR-CLIENTS route-reflector-client
     neighbor RR-CLIENTS soft-reconfiguration inbound
     neighbor RR-CLIENTS timers 3 10
@@ -171,7 +171,7 @@ data:
     ! 连接到路由反射器
     neighbor $RR_FLANNEL_IP remote-as 65000
     neighbor $RR_FLANNEL_IP description "Route-Reflector"
-    neighbor $RR_FLANNEL_IP update-source flannel.1
+    neighbor $RR_FLANNEL_IP update-source flannel.1234
     neighbor $RR_FLANNEL_IP timers 3 10
     !
     ! 网络通告

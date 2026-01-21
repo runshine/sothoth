@@ -18,21 +18,28 @@ spec:
     spec:
       hostNetwork: true
       serviceAccountName: frr
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
       initContainers:
         - name: frr-init
-          image: alpine:3.14
+          image: ghcr.io/runshine/vpn-monitor:latest
+          imagePullPolicy: IfNotPresent
           command: ["sh", "-c"]
           args:
             - |
               # 安装必要的工具
               sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories
-              apk add --no-cache iproute2 bash grep
               
-              # 等待flannel.1接口就绪
-              echo "$(date): Waiting for flannel.1 interface..."
+              # 等待flannel.1234接口就绪
+              echo "$(date): Waiting for flannel.1234 interface..."
               for i in $(seq 1 30); do
-                if ip link show flannel.1 >/dev/null 2>&1; then
-                  echo "flannel.1 interface found"
+                if ip link show flannel.1234 >/dev/null 2>&1; then
+                  echo "flannel.1234 interface found"
                   break
                 fi
                 sleep 2
@@ -57,7 +64,8 @@ spec:
               readOnly: true
       containers:
         - name: frr
-          image: frrouting/frr:v8.4.1
+          image: quay.io/frrouting/frr:10.2.5
+          imagePullPolicy: IfNotPresent
           securityContext:
             privileged: true
             capabilities:

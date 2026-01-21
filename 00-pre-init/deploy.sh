@@ -21,3 +21,6 @@ do
     kubectl apply -f ${file}
   fi
 done
+
+#如果发现有节点带有node.kubernetes.io/exclude-from-external-load-balancers标签，需要将其移除。
+#kubectl label nodes k8s-controller node.kubernetes.io/exclude-from-external-load-balancers-
