@@ -119,7 +119,7 @@ class Config:
     # 调试模式
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-    EXTERNAL_ACCESS_URL = os.getenv("EXTERNAL_ACCESS_URL", "http://vscode-web-manager-service.sothothv2-ns.svc.cluster.local:8000")
+    EXTERNAL_ACCESS_URL = os.getenv("EXTERNAL_ACCESS_URL", "http://vscode-web-manager.sothothv2-ns.svc.cluster.local")
     ARCHIVE_DOWNLOAD_TOKEN = os.getenv("ARCHIVE_DOWNLOAD_TOKEN", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     ARCHIVE_DOWNLOAD_TIMEOUT = int(os.getenv("ARCHIVE_DOWNLOAD_TIMEOUT", "1200"))
 
@@ -1868,7 +1868,7 @@ class KubernetesManager:
                                 break
                             elif ingress.hostname:
                                 access_info["hostname"] = ingress.hostname
-                                access_info["url"] = f"http://{ingress.hostname}:{Config.K8S_SERVICE_PORT}"
+                                access_info["url"] = f"https://{ingress.hostname}:{Config.K8S_SERVICE_PORT}"
                                 break
                     except ApiException:
                         continue
@@ -3705,7 +3705,7 @@ def create_code_server_task(project_id: str, user_id: int, password: str = None,
                                     code_server.access_url = f"http://{ingress.ip}:{code_server.service_port}"
                                     break
                                 elif ingress.hostname:
-                                    code_server.access_url = f"http://{ingress.hostname}:{code_server.service_port}"
+                                    code_server.access_url = f"https://{ingress.hostname}:{code_server.service_port}"
                                     break
                         except:
                             continue
@@ -3731,7 +3731,7 @@ def create_code_server_task(project_id: str, user_id: int, password: str = None,
                             code_server.access_url = f"NodePort: {node_port}"
 
                 elif service.spec.type == "ClusterIP":
-                    code_server.access_url = f"http://{svc_name}.{k8s.namespace}.svc.cluster.local:{code_server.service_port}"
+                    code_server.access_url = f"https://{svc_name}.{k8s.namespace}.svc.cluster.local:{code_server.service_port}"
 
                 logger.info(f"获取Service信息: {svc_name}, 访问URL: {code_server.access_url}")
             except ApiException as e:
@@ -3859,7 +3859,7 @@ def create_code_server_task(project_id: str, user_id: int, password: str = None,
             try:
                 host = k8s.create_ingress(project_id)
                 if host:
-                    code_server.access_url = f"http://{host}"
+                    code_server.access_url = f"https://{host}"
                     db.commit()
             except Exception as e:
                 logger.warning(f"创建Ingress失败: {e}")
