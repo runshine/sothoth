@@ -7,3 +7,7 @@ pyyaml
 redis
 psutils
 pymysql
+cryptography
+werkzeug
+redis
+requests
