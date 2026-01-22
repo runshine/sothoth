@@ -14,7 +14,7 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - elasticsearch.sothothv2.com
+        - cloudbeaver.sothothv2.com
       secretName: wildcard-sothothv2.com-tls
   rules:
     - host: cloudbeaver.sothothv2.com

@@ -14,7 +14,7 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - elasticsearch.sothothv2.com
+        - nacos.sothothv2.com
       secretName: wildcard-sothothv2.com-tls
   rules:
     - host: nacos.sothothv2.com
