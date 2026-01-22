@@ -1951,6 +1951,12 @@ class KubernetesManager:
                     }
                 ),
                 spec=client.V1IngressSpec(
+                    ingressClassName = "nginx",
+                    tls = [client.V1IngressTLS(
+                        hosts=[host],
+                        secretName="wildcard-sothothv2.com-tls"
+                    )]
+                    ,
                     rules=[client.V1IngressRule(
                         host=host,
                         http=client.V1HTTPIngressRuleValue(
