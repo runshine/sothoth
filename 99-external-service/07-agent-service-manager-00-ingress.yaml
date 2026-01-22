@@ -12,6 +12,10 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts:
+        - elasticsearch.sothothv2.com
+      secretName: wildcard-sothothv2.com-tls
   rules:
     - host: agent.sothothv2.com
       http:
