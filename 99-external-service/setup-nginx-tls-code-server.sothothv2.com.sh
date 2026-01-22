@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # 设置变量
-DOMAIN="sothothv2.com"
+DOMAIN="code-server.sothothv2.com"
 WILDCARD_DOMAIN="*.${DOMAIN}"
 SECRET_NAME="wildcard-${DOMAIN}-tls"
-NAMESPACE="sothothv2-ns"
+NAMESPACE="vscode"
 CERT_DIR="./certs"
 DAYS=3650
 
@@ -89,17 +89,6 @@ openssl x509 -in ${CERT_DIR}/${DOMAIN}.cert -text -noout | grep -A1 "Subject Alt
 
 echo -e "\n=== 3. 创建 Kubernetes TLS Secret ==="
 # 删除现有 secret（如果存在）
-kubectl delete secret ${SECRET_NAME} -n ${NAMESPACE} 2>/dev/null || true
-
-# 创建新的 TLS secret
-kubectl create secret tls ${SECRET_NAME} \
-  --namespace ${NAMESPACE} \
-  --key ${CERT_DIR}/${DOMAIN}.key \
-  --cert ${CERT_DIR}/${DOMAIN}-fullchain.crt
-
-echo "Secret '${SECRET_NAME}' 已在命名空间 '${NAMESPACE}' 中创建"
-
-NAMESPACE="vscode"
 kubectl delete secret ${SECRET_NAME} -n ${NAMESPACE} 2>/dev/null || true
 
 # 创建新的 TLS secret

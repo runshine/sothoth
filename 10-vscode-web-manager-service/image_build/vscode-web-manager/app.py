@@ -1954,7 +1954,7 @@ class KubernetesManager:
                     ingress_class_name = "nginx",
                     tls = [client.V1IngressTLS(
                         hosts=[host],
-                        secret_name="wildcard-sothothv2.com-tls"
+                        secret_name="wildcard-code-server.sothothv2.com-tls"
                     )]
                     ,
                     rules=[client.V1IngressRule(
