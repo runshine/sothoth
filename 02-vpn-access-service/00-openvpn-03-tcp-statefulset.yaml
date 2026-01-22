@@ -1,0 +1,104 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vpn-access-openvpn-tcp
+  namespace: sothothv2-ns
+spec:
+  serviceName: vpn-access-openvpn-tcp
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vpn-access-openvpn-tcp
+  minReadySeconds: 1
+  template:
+    metadata:
+      labels:
+        app: vpn-access-openvpn-tcp
+    spec:
+      # 亲和性设置 - 避免同一应用的所有副本都在同一节点
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - vpn-access-openvpn-tcp
+                topologyKey: kubernetes.io/hostname
+
+      # 容器定义
+      containers:
+        # tcp容器
+        - name: openvpn-tcp
+          image: kylemanna/openvpn:latest
+          imagePullPolicy: IfNotPresent
+          command: [ '/script/entrypoint.sh' ]
+          env:
+            - name: TCP_MODE
+              value: "true"
+            - name: NET_ADDRESS
+              value: 200.64.0.0/16
+          ports:
+            - containerPort: 11194
+              name: server
+              protocol: TCP
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: vpn-access-openvpn-script-config
+              mountPath: /script
+            - name: vpn-access-openvpn-certfile-config
+              mountPath: /etc/openvpn
+            - name: vpn-access-openvpn-ccdfile-config
+              mountPath: /etc/openvpn/ccd
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+          livenessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - /script/healthcheck.sh
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - /bin/bash
+                - /script/healthcheck.sh
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+
+      # 卷定义
+      volumes:
+        - name: vpn-access-openvpn-script-config
+          configMap:
+            name: vpn-access-openvpn-script-config
+            defaultMode: 0755
+
+        - name: vpn-access-openvpn-certfile-config
+          configMap:
+            name: vpn-access-openvpn-certfile-config
+            defaultMode: 0555
+
+        - name: vpn-access-openvpn-ccdfile-config
+          configMap:
+            name: vpn-access-openvpn-ccdfile-config
+            defaultMode: 0555
+
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice

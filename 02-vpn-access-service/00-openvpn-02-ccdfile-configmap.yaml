@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vpn-access-openvpn-ccdfile-config
+  namespace: sothothv2-ns
+data:
+  NONE_EXIST_CLIENT: |
+    ifconfig-push 200.64.0.5 255.255.255.0

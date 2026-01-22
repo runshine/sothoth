@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudbeaver
+  namespace: sothothv2-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: cloudbeaver
+  template:
+    metadata:
+      labels:
+        name: cloudbeaver
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: cloudbeaver
+          image: dbeaver/cloudbeaver:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8978
+          volumeMounts:
+            - name: cloudbeaver-storage
+              mountPath: /opt/cloudbeaver/workspace
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /status
+              port: 8978
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /status
+              port: 8978
+            initialDelaySeconds: 10
+            periodSeconds: 60
+
+      volumes:
+        - name: cloudbeaver-storage
+          persistentVolumeClaim:
+            claimName: cloudbeaver-local-path-pvc

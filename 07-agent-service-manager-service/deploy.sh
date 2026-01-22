@@ -12,3 +12,4 @@ do
   fi
 done
 
+echo "done"

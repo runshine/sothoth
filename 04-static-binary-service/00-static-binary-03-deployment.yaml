@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: static-binary
+  namespace: sothothv2-ns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      name: static-binary
+  template:
+    metadata:
+      labels:
+        name: static-binary
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: static-binary-manager
+        image: ghcr.io/runshine/static-binary-manager:latest  # 包含kubectl命令
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+          - name: MYSQL_SERVER_ADDRESS
+            value: mysql+pymysql://static-binary:Huawei12%23%24@mysql.sothothv2-ns.svc.cluster.local/static-binary?ssl=false
+          - name: PACKAGE_ROOT_DIR
+            value: /data
+        volumeMounts:
+        - name: shared-package-storage
+          mountPath: /data
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+      - name: nginx
+        image: ghcr.io/runshine/static-binary-manager-frontend:latest
+        imagePullPolicy: Always
+        ports:
+          - containerPort: 80
+        volumeMounts:
+          - name: static-binary-nginx-config
+            mountPath: /etc/nginx/nginx.conf
+            subPath: nginx.conf
+          - name: shared-package-storage
+            mountPath: /data
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        # 资源限制
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+
+      volumes:
+      - name: shared-package-storage
+        persistentVolumeClaim:
+          claimName: static-binary-nfs-pvc  # 引用PVC
+      - name: static-binary-nginx-config
+        configMap:
+          name: static-binary-nginx-config
+          items:
+            - key: nginx.conf
+              path: nginx.conf

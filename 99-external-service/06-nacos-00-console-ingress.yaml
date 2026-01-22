@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nacos-ingress
+  namespace: sothothv2-ns
+  annotations:
+    # 启用 HTTPS 重定向（如果需要）
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # 如果需要 websocket 支持
+    nginx.ingress.kubernetes.io/websocket-services: "nacos"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: nacos.sothothv2.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: nacos
+                port:
+                  number: 8080

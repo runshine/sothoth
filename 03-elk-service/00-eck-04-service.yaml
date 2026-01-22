@@ -1,0 +1,31 @@
+### auto generate
+#apiVersion: v1
+#kind: Service
+#metadata:
+#  name: elk-kibana
+#  namespace: sothothv2-ns
+#spec:
+#  type: ClusterIP   # 或者不写，默认是ClusterIP
+#  selector:
+#    common.k8s.elastic.co/type: "kibana"
+#    kibana.k8s.elastic.co/name: "kibana"
+#  ports:
+#    - port: 80
+#      targetPort: 5601
+#      protocol: TCP
+#---
+#apiVersion: v1
+#kind: Service
+#metadata:
+#  name: elk-elasticsearch
+#  namespace: sothothv2-ns
+#spec:
+#  type: ClusterIP   # 或者不写，默认是ClusterIP
+#  selector:
+#    common.k8s.elastic.co/type: "elasticsearch"
+#    elasticsearch.k8s.elastic.co/cluster-name: "elasticsearch"
+#    elasticsearch.k8s.elastic.co/statefulset-name: "elasticsearch-es-elasticsearch"
+#  ports:
+#    - port: 80
+#      targetPort: 9200
+#      protocol: TCP

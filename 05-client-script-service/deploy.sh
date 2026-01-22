@@ -11,5 +11,3 @@ do
   fi
 done
 
-
-./deploy_resource.sh --dir ./resource --pvc sothothv2-client-script-service-nfs-pvc --namespace sothothv2-ns

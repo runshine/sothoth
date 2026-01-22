@@ -5,7 +5,7 @@ set -e
 
 # 配置参数
 LOCAL_DIR="./resource"
-PVC_NAME="sothothv2-client-script-service-nfs-pvc"
+PVC_NAME="client-script-nfs-pvc"
 POD_NAME="copy-pod-$(date +%s)"
 NAMESPACE="sothothv2-ns"  # 根据实际情况修改命名空间
 MOUNT_PATH="/data"

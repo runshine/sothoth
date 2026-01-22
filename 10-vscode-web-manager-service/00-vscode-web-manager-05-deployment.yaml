@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vscode-web-manager
+  namespace: sothothv2-ns
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      name: vscode-web-manager
+  template:
+    metadata:
+      labels:
+        name: vscode-web-manager
+    spec:
+      serviceAccountName: vscode-web-manager
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: vscode-web-manager
+        image: ghcr.io/runshine/vscode-web-manager:latest  # 包含kubectl命令
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+          - name: DATABASE_URL
+            value: mysql+pymysql://vscode-web-manager:Huawei12%23%24@mysql.sothothv2-ns.svc.cluster.local/vscode-web-manager?ssl=false
+          - name: EXTERNAL_ACCESS_URL
+            value: http://vscode-web-manager.sothothv2-ns.svc.cluster.local
+          - name: IN_K8S
+            value: "true"
+          - name: K8S_STORAGE_CLASS
+            value: nfs-storage-192.168.13.66
+          - name: K8S_CODE_SERVER_IMAGE
+#            value: linuxserver/code-server:latest
+            value: lubcorzexc/deepsight-codeserver:latest
+          - name: K8S_DEFAULT_STORAGE_SIZE
+            value: 100Gi
+        volumeMounts:
+        - name: shared-code-storage
+          mountPath: /data
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+
+      - name: nginx
+        image: ghcr.io/runshine/vscode-web-manager-frontend:latest
+        imagePullPolicy: Always
+        ports:
+          - containerPort: 80
+        volumeMounts:
+          - name: vscode-web-manager-nginx-config
+            mountPath: /etc/nginx/nginx.conf
+            subPath: nginx.conf
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        # 资源限制
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+
+      volumes:
+      - name: shared-code-storage
+        persistentVolumeClaim:
+          claimName: vscode-manager-nfs-pvc  # 引用PVC
+      - name: vscode-web-manager-nginx-config
+        configMap:
+          name: vscode-web-manager-nginx-config
+          items:
+            - key: nginx.conf
+              path: nginx.conf

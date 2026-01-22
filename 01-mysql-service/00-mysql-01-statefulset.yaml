@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: sothothv2-ns
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  minReadySeconds: 1
+  template:
+    metadata:
+      labels:
+        app: mysql
+        tier: mysql
+    spec:
+      # 容器定义
+      containers:
+        # tcp容器
+        - name: mysql
+          image: mysql:9.5.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              value: Huawei12#$
+            - name: MYSQL_ROOT_HOST
+              value: "%"
+          ports:
+            - containerPort: 3306
+              name: server
+              protocol: TCP
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "2048Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: mysql-local-path-pvc
+              mountPath: /var/lib/mysql
+          livenessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-uroot", "-pHuawei12#$"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command: ["mysqladmin", "ping", "-uroot", "-pHuawei12#$"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+
+      # 卷定义
+      volumes:
+        - name: mysql-local-path-pvc
+          persistentVolumeClaim:
+            claimName: mysql-local-path-pvc  # 引用PVC

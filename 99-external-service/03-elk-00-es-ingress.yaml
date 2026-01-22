@@ -1,0 +1,32 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: elasticsearch-ingress
+  namespace: sothothv2-ns
+  annotations:
+    # 启用 HTTPS 重定向（如果需要）
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # 如果需要 websocket 支持
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "off"
+    nginx.ingress.kubernetes.io/proxy-ssl-name: "elasticsearch-es-http.sothothv2-ns.svc.cluster.local"
+    nginx.ingress.kubernetes.io/proxy-ssl-server-name: "on"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - elasticsearch.sothothv2.com
+      secretName: wildcard-sothothv2.com-tls
+  rules:
+    - host: elasticsearch.sothothv2.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: elasticsearch-es-http
+                port:
+                  number: 9200

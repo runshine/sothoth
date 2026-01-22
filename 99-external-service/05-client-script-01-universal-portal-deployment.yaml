@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: universal-portal-nginx-proxy
+  namespace: sothothv2-ns
+  labels:
+    app: universal-portal-nginx-proxy
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: universal-portal-nginx-proxy
+  template:
+    metadata:
+      labels:
+        app: universal-portal-nginx-proxy
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.21-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: universal-portal-nginx-proxy-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: universal-portal-nginx-proxy-config
+          configMap:
+            name: universal-portal-nginx-proxy-config
+            items:
+              - key: nginx.conf
+                path: nginx.conf

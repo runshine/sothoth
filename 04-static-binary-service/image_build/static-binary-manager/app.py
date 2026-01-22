@@ -39,7 +39,7 @@ app = Flask(__name__)
 CORS(app)
 
 #mysql://app_user:YourAppPassword123!@192.168.12.90/app_database
-#mysql://mysql-cluster-service.default.svc.cluster.local/
+#mysql://mysql-cluster.default.svc.cluster.local/
 #MYSQL_SERVER_ADDRESS=mysql://static-binary:Huawei12#$@192.168.12.90/static-binary-service;PACKAGE_ROOT_DIR=/data
 MYSQL_SERVER_ADDRESS=os.environ['MYSQL_SERVER_ADDRESS']
 PACKAGE_ROOT_DIR=os.environ['PACKAGE_ROOT_DIR']
