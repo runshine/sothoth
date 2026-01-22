@@ -4,7 +4,7 @@ metadata:
   name: vscode-web-manager
   namespace: sothothv2-ns
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       name: vscode-web-manager

@@ -25,7 +25,7 @@ cat  <<EOF > ${ROOT_DIR}/usr/nacos/config.json
   "docker_socket": "unix://${ROOT_DIR}/var/run/docker.sock",
   "max_upload_size": 104857600,
   "database_file": "${ROOT_DIR}/usr/nacos/nacos_client.db",
-  "nacos_server_url": "http://192.168.12.90:8848",
+  "nacos_server_url": "http://nacos.sothothv2-ns.svc.cluster.local:8848",
   "root_dir": "${ROOT_DIR}",
   "workspace_id": "$WORKSPACE"
 }
