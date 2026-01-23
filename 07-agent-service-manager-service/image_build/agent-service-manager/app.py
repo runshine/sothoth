@@ -670,12 +670,12 @@ class RedisManager:
                 self.logger = logging.getLogger(__name__)
 
             def acquire(self, *args, **kwargs) -> bool:
-                self.logger.debug(f"虚拟锁已获取: {self.lock_key}")
+                #self.logger.debug(f"虚拟锁已获取: {self.lock_key}")
                 self._acquired = True
                 return True
 
             def release(self) -> bool:
-                self.logger.debug(f"虚拟锁已释放: {self.lock_key}")
+                #self.logger.debug(f"虚拟锁已释放: {self.lock_key}")
                 self._acquired = False
                 return True
 
@@ -777,8 +777,9 @@ class ConnectionChecker:
             return False, f"数据库连接检查失败: {str(e)}"
 
     @staticmethod
-    def check_nacos(nacos_url: str, namespace: str = 'public') -> Tuple[bool, str]:
-        """检查Nacos连接"""
+    def check_nacos(nacos_url: str, namespace: str = 'public',
+                    username: str = None, password: str = None) -> Tuple[bool, str]:
+        """检查Nacos连接（支持v3 API认证）"""
         try:
             url = f"{nacos_url.rstrip('/')}/nacos/v1/ns/service/list"
             params = {
@@ -787,9 +788,22 @@ class ConnectionChecker:
                 'namespaceId': namespace
             }
 
-            response = requests.get(url, params=params, timeout=10)
+            # 准备认证信息
+            auth = None
+            if username and password:
+                auth = (username, password)
+
+            response = requests.get(url, params=params, timeout=10, auth=auth)
             if response.status_code == 200:
                 return True, "Nacos连接正常"
+            elif response.status_code == 401:
+                # 尝试使用v3 API
+                v3_url = f"{nacos_url.rstrip('/')}/nacos/v3/ns/service/list"
+                v3_response = requests.get(v3_url, params=params, timeout=10, auth=auth)
+                if v3_response.status_code == 200:
+                    return True, "Nacos v3 API连接正常"
+                else:
+                    return False, f"Nacos v3 API连接失败: HTTP {v3_response.status_code}"
             else:
                 return False, f"Nacos连接失败: HTTP {response.status_code}"
 
@@ -827,7 +841,9 @@ class ConnectionChecker:
         # 检查Nacos（必须连接）
         nacos_result = ConnectionChecker.check_nacos(
             config.get('nacos_url', ''),
-            config.get('nacos_namespace', 'public')
+            config.get('nacos_namespace', 'public'),
+            config.get('nacos_username'),
+            config.get('nacos_password')
         )
         results['nacos'] = nacos_result
 
@@ -839,7 +855,6 @@ class ConnectionChecker:
             results['redis'] = (True, "Redis已禁用")
 
         return results
-
 # ===================== 数据类定义 =====================
 
 @dataclass
@@ -2819,7 +2834,8 @@ class AgentManager:
     def __init__(self, nacos_url: str, nacos_namespace: str,
                  agent_api_port: int, agent_auth_token: str,
                  db_manager: DatabaseManager, redis_manager: RedisManager,
-                 pod_id: str, agent_api_timeouts: Dict = None):
+                 pod_id: str, agent_api_timeouts: Dict = None,
+                 nacos_username: str = None, nacos_password: str = None):  # 新增参数
         self.nacos_url = nacos_url.rstrip('/')
         self.nacos_namespace = nacos_namespace
         self.agent_api_port = agent_api_port
@@ -2827,6 +2843,13 @@ class AgentManager:
         self.db = db_manager
         self.redis_manager = redis_manager
         self.pod_id = pod_id
+
+        # 新增：Nacos认证信息
+        self.nacos_username = nacos_username
+        self.nacos_password = nacos_password
+        self.nacos_auth = None
+        if self.nacos_username and self.nacos_password:
+            self.nacos_auth = (self.nacos_username, self.nacos_password)
 
         # 设置超时配置
         self.timeouts = agent_api_timeouts or {
@@ -2853,6 +2876,11 @@ class AgentManager:
 
         # 从数据库加载Agent状态
         self._load_agents_from_db()
+        # 新增：缓存nacos-client的uuid值
+        self.nacos_client_uuid_cache = {}
+        self.nacos_client_cache_time = 0
+        self.nacos_client_cache_ttl = 60  # 缓存60秒
+
 
     def _test_nacos_connection(self) -> bool:
         """测试Nacos连接"""
@@ -2965,22 +2993,200 @@ class AgentManager:
 
         return workspace_id, hostname, ip_address
 
-
-    def _is_ip_address(self, s: str) -> bool:
-        import socket
+    def _get_agent_key(self, hostname: str, ip_address: str, service_name: str) -> Optional[str]:
+        """
+        从nacos service中获取agent_key
+        根据服务名称获取对应的集群，然后从该集群的metadata中获取key为uuid的值
+        如果获取不到，则不认为是一个有效的agent，忽略即可
+        """
         try:
-            socket.inet_aton(s)
-            return True
-        except socket.error:
-            try:
-                socket.inet_pton(socket.AF_INET6, s)
-                return True
-            except socket.error:
-                return False
+            # 检查缓存
+            current_time = time.time()
+            cache_key = f"{service_name}_nacos-client"
+            if current_time - self.nacos_client_cache_time < self.nacos_client_cache_ttl:
+                uuid_value = self.nacos_client_uuid_cache.get(cache_key)
+                if uuid_value:
+                    self.logger.debug(f"使用缓存的uuid: {uuid_value} for service: {service_name}")
+                    return uuid_value
 
-    def _get_agent_key(self, hostname: str, ip_address: str) -> str:
-        key_str = f"{hostname}-{ip_address}"
-        return hashlib.md5(key_str.encode()).hexdigest()
+            # 方法1: 尝试使用新的API路径
+            try:
+                # 新的API路径: /v3/admin/ns/service
+                url = f"{self.nacos_url}/nacos/v3/admin/ns/service"
+                params = {
+                    'serviceName': service_name,  # 使用agent的服务名称
+                    'groupName': 'DEFAULT_GROUP',
+                    'namespaceId': self.nacos_namespace
+                }
+
+                # 使用认证信息
+                response = requests.get(url, params=params, timeout=5, auth=self.nacos_auth)
+
+                if response.status_code == 200:
+                    service_data = response.json()
+                    self.logger.debug(f"使用新API获取服务 {service_name} 成功")
+
+                    # 尝试解析新的API返回格式，查找名为nacos-client的集群
+                    uuid_value = self._parse_nacos_v3_response_for_cluster(service_data, 'nacos-client')
+                    if uuid_value:
+                        # 更新缓存
+                        self.nacos_client_uuid_cache[cache_key] = uuid_value
+                        self.nacos_client_cache_time = current_time
+
+                        #self.logger.debug(f"从服务 {service_name} 的nacos-client集群获取到uuid: {uuid_value}")
+                        return uuid_value
+                    else:
+                        self.logger.debug(f"服务 {service_name} 中没有找到名为nacos-client的集群")
+
+            except Exception as e:
+                self.logger.debug(f"使用新API获取服务 {service_name} 失败: {str(e)}")
+
+            # 方法2: 尝试使用实例列表API（指定集群名称）
+            try:
+                # 实例列表API，可以指定集群名称
+                url = f"{self.nacos_url}/nacos/v1/ns/instance/list"
+                params = {
+                    'serviceName': service_name,
+                    'groupName': 'DEFAULT_GROUP',
+                    'namespaceId': self.nacos_namespace,
+                    'clusters': 'nacos-client'  # 指定集群名称
+                }
+
+                # 使用认证信息
+                response = requests.get(url, params=params, timeout=5, auth=self.nacos_auth)
+
+                if response.status_code == 200:
+                    instances_data = response.json()
+
+                    # 查找实例的metadata
+                    if 'hosts' in instances_data and instances_data['hosts']:
+                        for instance in instances_data['hosts']:
+                            if 'metadata' in instance:
+                                uuid_value = instance['metadata'].get('uuid')
+                                if uuid_value:
+                                    # 更新缓存
+                                    self.nacos_client_uuid_cache[cache_key] = uuid_value
+                                    self.nacos_client_cache_time = current_time
+
+                                    self.logger.debug(f"从服务 {service_name} 的nacos-client集群实例获取到uuid: {uuid_value}")
+                                    return uuid_value
+
+                        self.logger.debug(f"服务 {service_name} 的nacos-client集群实例中没有找到uuid")
+                    else:
+                        self.logger.debug(f"服务 {service_name} 没有nacos-client集群的实例")
+                else:
+                    self.logger.debug(f"获取服务 {service_name} 的实例列表失败: HTTP {response.status_code}")
+
+            except Exception as e:
+                self.logger.debug(f"使用实例列表API获取服务 {service_name} 失败: {str(e)}")
+
+            # 方法3: 尝试使用旧API路径（如果新API不可用）
+            try:
+                url = f"{self.nacos_url}/v1/ns/service"
+                params = {
+                    'serviceName': service_name,
+                    'groupName': 'DEFAULT_GROUP',
+                    'namespaceId': self.nacos_namespace
+                }
+
+                # 使用认证信息
+                response = requests.get(url, params=params, timeout=5, auth=self.nacos_auth)
+
+                if response.status_code == 200:
+                    service_data = response.json()
+                    self.logger.debug(f"使用旧API获取服务 {service_name} 成功")
+
+                    # 查找名为nacos-client的集群
+                    if 'hosts' in service_data and service_data['hosts']:
+                        for host in service_data['hosts']:
+                            # 检查集群名称是否为nacos-client
+                            cluster_name = host.get('clusterName', '')
+                            if cluster_name == 'nacos-client' and 'metadata' in host:
+                                metadata = host['metadata']
+                                uuid_value = metadata.get('uuid')
+
+                                if uuid_value:
+                                    # 更新缓存
+                                    self.nacos_client_uuid_cache[cache_key] = uuid_value
+                                    self.nacos_client_cache_time = current_time
+
+                                    self.logger.debug(f"从服务 {service_name} 的nacos-client集群获取到uuid: {uuid_value}")
+                                    return uuid_value
+
+                        self.logger.debug(f"服务 {service_name} 中没有找到名为nacos-client的集群")
+                    else:
+                        self.logger.debug(f"服务 {service_name} 没有找到集群信息")
+                else:
+                    self.logger.debug(f"获取服务 {service_name} 失败: HTTP {response.status_code}")
+
+            except Exception as e:
+                self.logger.debug(f"使用旧API获取服务 {service_name} 失败: {str(e)}")
+
+        except requests.exceptions.ConnectionError:
+            self.logger.debug("连接Nacos失败，无法获取服务信息")
+        except requests.exceptions.Timeout:
+            self.logger.debug("获取服务信息超时")
+        except Exception as e:
+            self.logger.debug(f"获取服务信息异常: {str(e)}")
+
+        # 如果获取不到uuid，打印调试信息并返回None
+        self.logger.debug(f"无法从服务 {service_name} 的nacos-client集群获取有效的uuid，忽略agent: {hostname}-{ip_address}")
+        return None
+
+    def _parse_nacos_v3_response_for_cluster(self, service_data: Dict, cluster_name: str) -> Optional[str]:
+        """
+        解析Nacos v3 API的响应，查找指定集群名称的metadata中的uuid
+        """
+        try:
+            # 尝试不同的响应格式
+            if isinstance(service_data, dict):
+                # 格式1: 直接包含service字段
+                if 'service' in service_data:
+                    service = service_data['service']
+                    if 'clusters' in service and service['clusters']:
+                        for cluster in service['clusters']:
+                            if cluster.get('name') == cluster_name and 'metadata' in cluster:
+                                uuid_value = cluster['metadata'].get('uuid')
+                                if uuid_value:
+                                    return uuid_value
+
+                # 格式2: 包含data字段
+                if 'data' in service_data:
+                    data = service_data['data']
+                    if isinstance(data, dict) and 'clusters' in data and data['clusters']:
+                        for cluster in data['clusters']:
+                            if cluster.get('name') == cluster_name and 'metadata' in cluster:
+                                uuid_value = cluster['metadata'].get('uuid')
+                                if uuid_value:
+                                    return uuid_value
+
+                # 格式3: 直接是集群列表
+                if 'clusters' in service_data and service_data['clusters']:
+                    for cluster in service_data['clusters']:
+                        if cluster.get('name') == cluster_name and 'metadata' in cluster:
+                            uuid_value = cluster['metadata'].get('uuid')
+                            if uuid_value:
+                                return uuid_value
+
+                # 格式4: 尝试查找任何包含metadata的字段
+                for key, value in service_data.items():
+                    if isinstance(value, dict):
+                        result = self._parse_nacos_v3_response_for_cluster(value, cluster_name)
+                        if result:
+                            return result
+                    elif isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict):
+                                result = self._parse_nacos_v3_response_for_cluster(item, cluster_name)
+                                if result:
+                                    return result
+
+            self.logger.debug(f"无法从响应中找到集群 {cluster_name} 的uuid，响应格式: {service_data}")
+            return None
+
+        except Exception as e:
+            self.logger.debug(f"解析Nacos v3响应失败: {str(e)}")
+            return None
 
     def _fetch_nacos_services(self) -> List[Dict]:
         try:
@@ -2991,10 +3197,28 @@ class AgentManager:
                 'namespaceId': self.nacos_namespace
             }
 
-            response = requests.get(url, params=params, timeout=10)
+            # 使用认证信息
+            response = requests.get(url, params=params, timeout=10, auth=self.nacos_auth)
             if response.status_code == 200:
                 data = response.json()
                 return data.get('doms', [])
+            elif response.status_code == 401:
+                # 尝试v3 API
+                v3_url = f"{self.nacos_url}/nacos/v3/ns/service/list"
+                v3_response = requests.get(v3_url, params=params, timeout=10, auth=self.nacos_auth)
+                if v3_response.status_code == 200:
+                    v3_data = v3_response.json()
+                    # 解析v3 API返回格式
+                    if 'data' in v3_data and 'list' in v3_data['data']:
+                        return [service['name'] for service in v3_data['data']['list']]
+                    elif 'list' in v3_data:
+                        return [service['name'] for service in v3_data['list']]
+                    else:
+                        self.logger.error(f"Nacos v3 API返回格式异常: {v3_data}")
+                        return []
+                else:
+                    self.logger.error(f"获取Nacos服务列表失败 (v3): {v3_response.status_code}")
+                    return []
             else:
                 self.logger.error(f"获取Nacos服务列表失败: {response.status_code}")
                 return []
@@ -3011,6 +3235,12 @@ class AgentManager:
 
     def _check_agent_status(self, agent: AgentInfo) -> bool:
         try:
+            # 首先检查是否有有效的agent_key
+            if not agent.key:
+                self.logger.debug(f"Agent {agent.full_name} 没有有效的agent_key，跳过状态检查")
+                agent.status = 'invalid'
+                return False
+
             url = f"http://{agent.ip_address}:{self.agent_api_port}/api/health"
             headers = {'X-Auth-Token': self.agent_auth_token}
 
@@ -3050,6 +3280,239 @@ class AgentManager:
         except Exception:
             agent.status = 'error'
             return False
+
+    def refresh_agents(self):
+        """刷新Agent列表（使用分布式锁确保只有一个POD执行刷新）"""
+        lock_key = "agent_refresh_lock"
+
+        try:
+            # 获取分布式锁（如果Redis不可用，会返回虚拟锁）
+            with self.redis_manager.get_lock(lock_key, timeout=30) as lock:
+                if lock.is_acquired():
+                    pass
+                else:
+                    self.logger.warning(f"POD {self.pod_id} 无法获取锁，跳过本次刷新...")
+                    return
+
+                services = self._fetch_nacos_services()
+                new_agents = {}
+
+                for service in services:
+                    result = self._parse_agent_name(service)
+                    if result:
+                        workspace_id, hostname, ip_address = result
+
+                        # 使用新方法获取agent_key，传入service_name
+                        agent_key = self._get_agent_key(hostname, ip_address, service)
+
+                        # 如果没有获取到有效的agent_key，跳过这个agent
+                        if not agent_key:
+                            self.logger.debug(f"跳过无效的agent: {hostname} ({ip_address}), 服务: {service}")
+                            continue
+
+                        agent = AgentInfo(
+                            key=agent_key,
+                            ip_address=ip_address,
+                            hostname=hostname,
+                            workspace_id=workspace_id,
+                            full_name=service,
+                            status='unknown',
+                            pod_id=self.pod_id
+                        )
+
+                        self._check_agent_status(agent)
+                        self._save_agent_to_db(agent)
+                        new_agents[agent_key] = agent
+
+                with self.lock:
+                    for key, new_agent in new_agents.items():
+                        self.agents[key] = new_agent
+                        self._update_workspace(new_agent.workspace_id, key)
+
+                    removed_keys = [k for k in self.agents.keys() if k not in new_agents]
+                    for key in removed_keys:
+                        del self.agents[key]
+
+                self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个有效Agent")
+
+        except Exception as e:
+            self.logger.error(f"刷新Agent列表异常: {str(e)}")
+
+    def cleanup_offline_agents(self) -> Tuple[bool, str, Dict]:
+        """
+        清除全部掉线的agent
+
+        Returns:
+            (success, message, cleanup_info)
+        """
+        try:
+            # 获取分布式锁，确保只有一个POD执行清理
+            lock_key = "agent_cleanup_lock"
+            with self.redis_manager.get_lock(lock_key, timeout=60) as lock:
+                if lock.is_acquired():
+                    self.logger.info("成功获取清理锁，开始清除掉线agent")
+                else:
+                    self.logger.warning("无法获取清理锁，跳过本次清理")
+                    return False, "其他POD正在执行清理操作，请稍后重试", {}
+
+                # 查询所有掉线的agent
+                if self.db.db_type == 'mysql':
+                    offline_agents = self.db.fetch_all('''
+                                                       SELECT agent_key, hostname, ip_address, workspace_id, status,
+                                                              last_seen, updated_at
+                                                       FROM agent_status
+                                                       WHERE status IN ('offline', 'error', 'timeout', 'unknown')
+                                                         AND updated_at < NOW() - INTERVAL 5 MINUTE
+                                                       ORDER BY updated_at ASC
+                                                       ''')
+                else:
+                    offline_agents = self.db.fetch_all('''
+                                                       SELECT agent_key, hostname, ip_address, workspace_id, status,
+                                                              last_seen, updated_at
+                                                       FROM agent_status
+                                                       WHERE status IN ('offline', 'error', 'timeout', 'unknown')
+                                                         AND updated_at < datetime('now', '-5 minutes')
+                                                       ORDER BY updated_at ASC
+                                                       ''')
+
+                if not offline_agents:
+                    return True, "没有需要清理的掉线agent", {
+                        'cleaned_count': 0,
+                        'offline_count': 0,
+                        'timestamp': datetime.now().isoformat()
+                    }
+
+                self.logger.info(f"找到 {len(offline_agents)} 个掉线agent需要清理")
+
+                # 记录清理信息
+                cleaned_agents = []
+                cleaned_count = 0
+
+                with self.lock:
+                    # 删除数据库中的掉线agent记录
+                    for agent_data in offline_agents:
+                        agent_key = agent_data['agent_key']
+
+                        try:
+                            # 从数据库中删除
+                            if self.db.db_type == 'mysql':
+                                self.db.execute_query(
+                                    "DELETE FROM agent_status WHERE agent_key = %s",
+                                    (agent_key,)
+                                )
+                            else:
+                                self.db.execute_query(
+                                    "DELETE FROM agent_status WHERE agent_key = ?",
+                                    (agent_key,)
+                                )
+
+                            # 从内存中移除
+                            if agent_key in self.agents:
+                                del self.agents[agent_key]
+
+                            # 从工作空间中移除
+                            for workspace in self.workspaces.values():
+                                if agent_key in workspace.agents:
+                                    workspace.agents.remove(agent_key)
+
+                            # 记录清理的agent信息
+                            cleaned_agents.append({
+                                'agent_key': agent_key,
+                                'hostname': agent_data['hostname'],
+                                'ip_address': agent_data['ip_address'],
+                                'workspace_id': agent_data['workspace_id'],
+                                'status': agent_data['status'],
+                                'last_seen': agent_data['last_seen'].isoformat() if agent_data['last_seen'] else None,
+                                'cleaned_at': datetime.now().isoformat()
+                            })
+                            cleaned_count += 1
+
+                            self.logger.info(f"已清理掉线agent: {agent_key} ({agent_data['hostname']})")
+
+                        except Exception as e:
+                            self.logger.error(f"清理agent {agent_key} 失败: {str(e)}")
+                            continue
+
+                # 更新工作空间统计
+                for workspace_id, workspace in self.workspaces.items():
+                    # 重新计算在线agent数量
+                    online_count = 0
+                    for agent_key in workspace.agents:
+                        agent = self.agents.get(agent_key)
+                        if agent and agent.status == 'online':
+                            online_count += 1
+
+                    workspace.agent_count = len(workspace.agents)
+                    workspace.online_agents = online_count
+                    workspace.last_refresh = datetime.now()
+
+                # 准备清理信息
+                cleanup_info = {
+                    'cleaned_count': cleaned_count,
+                    'offline_count': len(offline_agents),
+                    'timestamp': datetime.now().isoformat(),
+                    'pod_id': self.pod_id,
+                    'cleaned_agents': cleaned_agents,
+                    'remaining_agents': len(self.agents),
+                    'workspace_count': len(self.workspaces)
+                }
+
+                self.logger.info(f"清理完成: 已清理 {cleaned_count} 个掉线agent")
+                return True, f"成功清理 {cleaned_count} 个掉线agent", cleanup_info
+
+        except Exception as e:
+            self.logger.error(f"清除掉线agent失败: {str(e)}", exc_info=True)
+            return False, f"清理失败: {str(e)}", {}
+
+    def get_offline_agents_count(self) -> Tuple[int, int]:
+        """
+        获取掉线agent的统计信息
+
+        Returns:
+            (offline_count, total_count)
+        """
+        try:
+            # 获取总agent数
+            if self.db.db_type == 'mysql':
+                total_result = self.db.fetch_one(
+                    "SELECT COUNT(*) as count FROM agent_status"
+                )
+                offline_result = self.db.fetch_one('''
+                                                   SELECT COUNT(*) as count FROM agent_status
+                                                   WHERE status IN ('offline', 'error', 'timeout', 'unknown')
+                                                     AND updated_at < NOW() - INTERVAL 5 MINUTE
+                                                   ''')
+            else:
+                total_result = self.db.fetch_one(
+                    "SELECT COUNT(*) as count FROM agent_status"
+                )
+                offline_result = self.db.fetch_one('''
+                                                   SELECT COUNT(*) as count FROM agent_status
+                                                   WHERE status IN ('offline', 'error', 'timeout', 'unknown')
+                                                     AND updated_at < datetime('now', '-5 minutes')
+                                                   ''')
+
+            total_count = total_result['count'] if total_result else 0
+            offline_count = offline_result['count'] if offline_result else 0
+
+            return offline_count, total_count
+
+        except Exception as e:
+            self.logger.error(f"获取掉线agent统计失败: {str(e)}")
+            return 0, 0
+
+    def _is_ip_address(self, s: str) -> bool:
+        import socket
+        try:
+            socket.inet_aton(s)
+            return True
+        except socket.error:
+            try:
+                socket.inet_pton(socket.AF_INET6, s)
+                return True
+            except socket.error:
+                return False
+
 
     def _save_agent_to_db(self, agent: AgentInfo):
         try:
@@ -3107,56 +3570,6 @@ class AgentManager:
 
         except Exception as e:
             self.logger.error(f"保存Agent状态到数据库失败: {str(e)}")
-
-    def refresh_agents(self):
-        """刷新Agent列表（使用分布式锁确保只有一个POD执行刷新）"""
-        lock_key = "agent_refresh_lock"
-
-        try:
-            # 获取分布式锁（如果Redis不可用，会返回虚拟锁）
-            with self.redis_manager.get_lock(lock_key, timeout=30) as lock:
-                if lock.is_acquired():
-                    self.logger.info(f"POD {self.pod_id} 获取到锁，开始刷新Agent列表...")
-                else:
-                    self.logger.warning(f"POD {self.pod_id} 无法获取锁，跳过本次刷新...")
-                    return
-
-                services = self._fetch_nacos_services()
-                new_agents = {}
-
-                for service in services:
-                    result = self._parse_agent_name(service)
-                    if result:
-                        workspace_id, hostname, ip_address = result
-                        agent_key = self._get_agent_key(hostname, ip_address)
-
-                        agent = AgentInfo(
-                            key=agent_key,
-                            ip_address=ip_address,
-                            hostname=hostname,
-                            workspace_id=workspace_id,
-                            full_name=service,
-                            status='unknown',
-                            pod_id=self.pod_id
-                        )
-
-                        self._check_agent_status(agent)
-                        self._save_agent_to_db(agent)
-                        new_agents[agent_key] = agent
-
-                with self.lock:
-                    for key, new_agent in new_agents.items():
-                        self.agents[key] = new_agent
-                        self._update_workspace(new_agent.workspace_id, key)
-
-                    removed_keys = [k for k in self.agents.keys() if k not in new_agents]
-                    for key in removed_keys:
-                        del self.agents[key]
-
-                self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个Agent")
-
-        except Exception as e:
-            self.logger.error(f"刷新Agent列表异常: {str(e)}")
 
     def get_workspace(self, workspace_id: str) -> Optional[WorkspaceInfo]:
         with self.lock:
@@ -4283,7 +4696,9 @@ class WebAPIServer:
             self.db_manager,
             self.redis_manager,
             config['pod_id'],
-            agent_api_timeouts
+            agent_api_timeouts,
+            config.get('nacos_username'),  # 新增：Nacos用户名
+            config.get('nacos_password')   # 新增：Nacos密码
         )
 
         # 9. 初始化任务管理器（传递超时配置）
@@ -4504,6 +4919,228 @@ class WebAPIServer:
         def refresh_agents():
             self.agent_manager.refresh_agents()
             return jsonify({'message': 'Agent列表刷新完成'})
+
+        # 在_register_routes方法中添加以下路由
+        @self.app.route('/api/agents/cleanup', methods=['POST'])
+        @self.auth.login_required
+        def cleanup_offline_agents():
+            """清除全部掉线的agent"""
+            try:
+                # 检查用户权限（只有管理员可以执行清理）
+                current_user = self.auth.current_user()
+                if current_user.get('role') != 'admin':
+                    return jsonify({
+                        'error': '权限不足',
+                        'message': '只有管理员可以执行清理操作'
+                    }), 403
+
+                # 获取清理参数
+                data = request.get_json() or {}
+                dry_run = data.get('dry_run', False)  # 是否模拟运行
+                force = data.get('force', False)      # 是否强制清理（不检查时间）
+
+                # 先获取统计信息
+                offline_count, total_count = self.agent_manager.get_offline_agents_count()
+
+                if offline_count == 0:
+                    return jsonify({
+                        'message': '没有需要清理的掉线agent',
+                        'offline_count': 0,
+                        'total_count': total_count,
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                if dry_run:
+                    # 模拟运行，只返回统计信息
+                    return jsonify({
+                        'message': f'模拟清理：找到 {offline_count} 个掉线agent（超过5分钟未更新）',
+                        'dry_run': True,
+                        'offline_count': offline_count,
+                        'total_count': total_count,
+                        'would_clean': True,
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+                # 执行清理操作
+                success, message, cleanup_info = self.agent_manager.cleanup_offline_agents()
+
+                if success:
+                    return jsonify({
+                        'message': message,
+                        'success': True,
+                        'cleanup_info': cleanup_info,
+                        'offline_count_before': offline_count,
+                        'total_count_before': total_count,
+                        'timestamp': datetime.now().isoformat()
+                    })
+                else:
+                    return jsonify({
+                        'error': message,
+                        'success': False,
+                        'timestamp': datetime.now().isoformat()
+                    }), 500
+
+            except Exception as e:
+                self.logger.error(f"清理掉线agent API失败: {str(e)}", exc_info=True)
+                return jsonify({
+                    'error': '清理操作失败',
+                    'message': str(e),
+                    'timestamp': datetime.now().isoformat()
+                }), 500
+
+        @self.app.route('/api/agents/stats', methods=['GET'])
+        @self.auth.login_required
+        def get_agent_stats():
+            """获取agent统计信息"""
+            try:
+                # 获取各种状态的agent数量
+                if self.db_manager.db_type == 'mysql':
+                    status_stats = self.db_manager.fetch_all('''
+                                                             SELECT
+                                                                 status,
+                                                                 COUNT(*) as count,
+                            MAX(last_seen) as last_seen_max,
+                            MIN(last_seen) as last_seen_min
+                                                             FROM agent_status
+                                                             GROUP BY status
+                                                             ORDER BY count DESC
+                                                             ''')
+                else:
+                    status_stats = self.db_manager.fetch_all('''
+                                                             SELECT
+                                                                 status,
+                                                                 COUNT(*) as count,
+                            MAX(last_seen) as last_seen_max,
+                            MIN(last_seen) as last_seen_min
+                                                             FROM agent_status
+                                                             GROUP BY status
+                                                             ORDER BY count DESC
+                                                             ''')
+
+                # 获取工作空间统计
+                if self.db_manager.db_type == 'mysql':
+                    workspace_stats = self.db_manager.fetch_all('''
+                                                                SELECT
+                                                                    workspace_id,
+                                                                    COUNT(*) as agent_count,
+                                                                    SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online_count,
+                                                                    MAX(updated_at) as last_updated
+                                                                FROM agent_status
+                                                                GROUP BY workspace_id
+                                                                ORDER BY agent_count DESC
+                                                                ''')
+                else:
+                    workspace_stats = self.db_manager.fetch_all('''
+                                                                SELECT
+                                                                    workspace_id,
+                                                                    COUNT(*) as agent_count,
+                                                                    SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online_count,
+                                                                    MAX(updated_at) as last_updated
+                                                                FROM agent_status
+                                                                GROUP BY workspace_id
+                                                                ORDER BY agent_count DESC
+                                                                ''')
+
+                # 计算掉线agent（超过5分钟未更新）
+                offline_count, total_count = self.agent_manager.get_offline_agents_count()
+
+                stats = {
+                    'timestamp': datetime.now().isoformat(),
+                    'summary': {
+                        'total_agents': total_count,
+                        'offline_agents': offline_count,
+                        'workspace_count': len(workspace_stats),
+                        'status_distribution': {
+                            item['status']: item['count'] for item in status_stats
+                        }
+                    },
+                    'status_details': status_stats,
+                    'workspace_details': workspace_stats,
+                    'cleanup_info': {
+                        'can_cleanup': offline_count > 0,
+                        'offline_count': offline_count,
+                        'suggested_action': 'POST /api/agents/cleanup 清理掉线agent'
+                    }
+                }
+
+                return jsonify(stats)
+
+            except Exception as e:
+                self.logger.error(f"获取agent统计信息失败: {str(e)}")
+                return jsonify({
+                    'error': '获取统计信息失败',
+                    'message': str(e)
+                }), 500
+
+        @self.app.route('/api/agents/<agent_key>/status', methods=['PUT'])
+        @self.auth.login_required
+        def update_agent_status(agent_key):
+            """手动更新agent状态"""
+            try:
+                # 检查用户权限
+                current_user = self.auth.current_user()
+                if current_user.get('role') != 'admin':
+                    return jsonify({
+                        'error': '权限不足',
+                        'message': '只有管理员可以手动更新agent状态'
+                    }), 403
+
+                data = request.get_json()
+                if not data:
+                    return jsonify({'error': '请求体必须为JSON'}), 400
+
+                status = data.get('status')
+                if status not in ['online', 'offline', 'error', 'timeout', 'unknown']:
+                    return jsonify({'error': '无效的状态值'}), 400
+
+                # 检查agent是否存在
+                if self.db_manager.db_type == 'mysql':
+                    agent = self.db_manager.fetch_one(
+                        "SELECT * FROM agent_status WHERE agent_key = %s",
+                        (agent_key,)
+                    )
+                else:
+                    agent = self.db_manager.fetch_one(
+                        "SELECT * FROM agent_status WHERE agent_key = ?",
+                        (agent_key,)
+                    )
+
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} 不存在'}), 404
+
+                # 更新agent状态
+                if self.db_manager.db_type == 'mysql':
+                    self.db_manager.execute_query('''
+                                                  UPDATE agent_status
+                                                  SET status = %s, updated_at = NOW()
+                                                  WHERE agent_key = %s
+                                                  ''', (status, agent_key))
+                else:
+                    self.db_manager.execute_query('''
+                                                  UPDATE agent_status
+                                                  SET status = ?, updated_at = datetime('now')
+                                                  WHERE agent_key = ?
+                                                  ''', (status, agent_key))
+
+                # 更新内存中的agent状态
+                agent_info = self.agent_manager.get_agent(agent_key)
+                if agent_info:
+                    agent_info.status = status
+                    agent_info.last_seen = datetime.now()
+
+                self.logger.info(f"手动更新agent {agent_key} 状态为 {status}")
+
+                return jsonify({
+                    'message': f'Agent {agent_key} 状态已更新为 {status}',
+                    'agent_key': agent_key,
+                    'new_status': status,
+                    'updated_at': datetime.now().isoformat(),
+                    'updated_by': current_user.get('username', 'admin')
+                })
+
+            except Exception as e:
+                self.logger.error(f"更新agent状态失败: {str(e)}")
+                return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/tasks', methods=['GET'])
         @self.auth.login_required

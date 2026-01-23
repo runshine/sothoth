@@ -6,6 +6,7 @@ set -e
 # kubectl create -f https://download.elastic.co/downloads/eck/3.2.0/crds.yaml
 # kubectl apply -f https://download.elastic.co/downloads/eck/3.2.0/operator.yaml
 
+./setup-tls-nginx.sh
 
 for file in ./*;
 do

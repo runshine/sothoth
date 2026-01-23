@@ -13,6 +13,8 @@
   "redis_enabled": true,
   "nacos_url": "http://192.168.12.90:8848",
   "nacos_namespace": "public",
+  "nacos_username": "nacos",
+  "nacos_password": "nacos",
   "agent_api_port": 11197,
   "agent_auth_token": "your_secure_token_here",
   "refresh_interval": 30,
