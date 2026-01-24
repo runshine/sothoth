@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: new-api-nfs-storage-pvc
+  namespace: sothothv2-ns
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: nfs-storage-192.168.13.66
+  resources:
+    requests:
+      storage: 10Gi

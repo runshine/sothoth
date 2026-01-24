@@ -29,4 +29,4 @@ RUN mkdir -p /data/uploads /data/projects /data/archives
 EXPOSE 8080
 
 # 启动命令
-CMD ["python", "app.py"]
+CMD ["python", "main.py"]

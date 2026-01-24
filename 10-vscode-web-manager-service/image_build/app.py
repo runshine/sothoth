@@ -1,21 +1,3 @@
-"""
-source_manager.py - 源码管理系统单文件版本
-优化错误处理：将Code-Server相关API的错误信息返回给客户端
-
-更新内容：
-1. 增强KubernetesManager支持自定义鉴权配置（Token认证、证书认证）
-2. 删除项目时默认删除所有相关资源（文件和Code-Server）
-3. 启动时检测K8S先关的配置是否正确，不正确需要报错并退出
-4. 修复Kubernetes连接验证中的API调用错误
-5. 修改project_id生成方式为md5(md5(project_name)_md5(上传的压缩包)_time)
-6. 修改PVC创建逻辑：项目创建时立即创建PVC并拷贝文件
-7. 修改Code-Server创建逻辑：直接使用已有的PVC
-8. 修改Code-Server删除逻辑：保留PVC，只删除运行资源
-9. 新增重建PVC的API
-10. 源码项目异步初始化，定义项目状态，提供状态查询和日志查询接口
-11. 删除项目时强制删除所有K8S资源（包括PVC），避免资源泄露
-"""
-
 import os
 import sys
 import time
@@ -37,29 +19,6 @@ import base64
 import re
 from kubernetes.stream import stream
 from urllib.parse import quote_plus  # 添加这行
-
-# ============ Kubernetes API 配置示例 ============
-"""
-Kubernetes API 配置示例：
-
-1. 使用Token认证：
-   export K8S_API_URL="https://your-k8s-api-server:6443"
-   export K8S_API_TOKEN="your-bearer-token-here"
-   export K8S_VERIFY_SSL="false"  # 如果使用自签名证书
-
-2. 使用证书认证：
-   export K8S_API_URL="https://your-k8s-api-server:6443"
-   export K8S_API_CERT="/path/to/client.crt"
-   export K8S_API_KEY="/path/to/client.key"
-   export K8S_CA_CERT="/path/to/ca.crt"  # 可选
-
-3. 集群内配置：
-   export IN_K8S="true"
-   # 自动使用ServiceAccount token
-
-4. 使用kubeconfig：
-   # 不设置K8S_API_URL，自动使用~/.kube/config
-"""
 
 # ============ 配置 ============
 class Config:
@@ -93,7 +52,7 @@ class Config:
     K8S_CA_CERT = os.getenv("K8S_CA_CERT", None)
     K8S_VERIFY_SSL = os.getenv("K8S_VERIFY_SSL", "true").lower() == "true"
     K8S_NAMESPACE = os.getenv("K8S_NAMESPACE", "vscode")
-    K8S_STORAGE_CLASS = os.getenv("K8S_STORAGE_CLASS", "nfs-client")
+    K8S_STORAGE_CLASS = os.getenv("K8S_STORAGE_CLASS", "nfs-storage-192.168.13.66")
     K8S_CODE_SERVER_IMAGE = os.getenv("K8S_CODE_SERVER_IMAGE", "linuxserver/code-server:latest")
     K8S_SERVICE_TYPE = os.getenv("K8S_SERVICE_TYPE", "ClusterIP")
     K8S_SERVICE_PORT = int(os.getenv("K8S_SERVICE_PORT", "80"))
@@ -6650,9 +6609,6 @@ def main():
     print(f"下载功能已启用，最大下载大小: {Config.MAX_DOWNLOAD_SIZE // (1024*1024)}MB")
     print(f"Code-Server错误处理已优化，错误信息将返回给客户端")
     print(f"项目状态管理: {', '.join([Config.PROJECT_STATUS_PENDING, Config.PROJECT_STATUS_INITIALIZING, Config.PROJECT_STATUS_READY, Config.PROJECT_STATUS_ERROR, Config.PROJECT_STATUS_DELETING])}")
-    print(f"项目异步初始化: 上传后自动提交初始化任务")
-    print(f"项目删除功能: 强制删除所有K8S资源（包括PVC），避免资源泄露")
-    print(f"项目ID生成方式：md5(md5(project_name)_md5(压缩包文件)_time)")
 
     # 检查是否在K8S集群内部运行
     in_k8s = os.getenv("IN_K8S", "false").lower() == "true"
@@ -6818,37 +6774,6 @@ def main():
     except Exception as e:
         print(f"✗ 任务管理器初始化失败: {e}")
         sys.exit(1)
-
-    print("\n=== 项目状态管理API已启用 ===")
-    print("  GET /api/projects/{project_id}/status - 获取项目状态")
-    print("  GET /api/projects/{project_id}/init-logs - 获取项目初始化日志")
-    print("  GET /api/projects/{project_id}/task-logs - 获取项目任务日志列表")
-
-    print("\n=== 项目异步初始化流程 ===")
-    print("  1. 上传压缩包 -> 状态: pending")
-    print("  2. 提交初始化任务 -> 状态: initializing")
-    print("  3. 执行解压、扫描文件、创建PVC、拷贝文件")
-    print("  4. 初始化成功 -> 状态: ready")
-    print("  5. 初始化失败 -> 状态: error")
-
-    print("\n=== PVC管理API已启用 ===")
-    print("  POST /api/projects/{project_id}/pvc/create - 为项目创建PVC")
-    print("  POST /api/projects/{project_id}/pvc/recreate - 重建项目PVC")
-    print("  GET /api/projects/{project_id}/pvc/status - 获取PVC状态")
-    print("  DELETE /api/projects/{project_id}/pvc - 删除项目PVC")
-
-    print("\n=== 部署监控API已启用 ===")
-    print("  GET /api/code-servers/{project_id}/deployment/status - 获取详细部署状态")
-    print("  GET /api/code-servers/{project_id}/deployment/logs - 获取所有相关日志")
-    print("  GET /api/code-servers/{project_id}/deployment/pods - 获取所有Pod信息")
-
-    print("\n=== 项目删除策略 ===")
-    print("  删除项目时强制删除所有资源:")
-    print("  - Code-Server (Deployment, Service, Ingress)")
-    print("  - PVC")
-    print("  - 本地文件 (压缩包、解压目录)")
-    print("  - 数据库记录")
-    print("  确保无资源泄露")
 
     print("\n=== 启动服务 ===")
     uvicorn.run(
