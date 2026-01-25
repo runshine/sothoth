@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
-from config import Config
+from config import Config, get_codewiki_env_vars, validate_codewiki_config, get_dynamic_env_vars
 from utils.errors import CodeServerError
 
 logger = logging.getLogger(__name__)
@@ -912,6 +912,7 @@ class KubernetesManager:
                             containers=[self.client.V1Container(
                                 name="code-server",
                                 image=Config.K8S_CODE_SERVER_IMAGE,
+                                image_pull_policy=Config.K8S_CODE_SERVER_PULL_POLICY,
                                 ports=[self.client.V1ContainerPort(container_port=Config.K8S_CONTAINER_PORT)],
                                 env=[
                                     self.client.V1EnvVar(name="PASSWORD", value=password),
@@ -920,6 +921,9 @@ class KubernetesManager:
                                     self.client.V1EnvVar(name="TZ", value="Asia/Shanghai"),
                                     self.client.V1EnvVar(name="PROJECT_ID", value=project_id),
                                     self.client.V1EnvVar(name="SUDO_PASSWORD", value=password)
+                                ] + [
+                                    self.client.V1EnvVar(name=key, value=value)
+                                    for key, value in get_dynamic_env_vars("code_server").items()
                                 ],
                                 volume_mounts=[self.client.V1VolumeMount(
                                     name="workspace",
@@ -1391,7 +1395,7 @@ class KubernetesManager:
             return {
                 "name": deploy_name,
                 "namespace": self.namespace,
-                "replicas": deployment.status.replicas if deployment.status else 0,
+                "replicas": getattr(deployment.status, 'replicas', 0) or getattr(deployment.status, 'replicas', 0) or 0,
                 "ready_replicas": deployment.status.ready_replicas if deployment.status else 0,
                 "available_replicas": deployment.status.available_replicas if deployment.status else 0,
                 "pods": pod_info,
@@ -1535,6 +1539,428 @@ class KubernetesManager:
                 details={
                     "project_id": project_id,
                     "pvc_name": pvc_name,
+                    "error": str(e)
+                },
+                status_code=500
+            )
+
+    # ==================== CodeWiki 相关方法 ====================
+
+    def generate_codewiki_resource_name(self, project_id: str, resource_type: str) -> str:
+        """生成CodeWiki资源名称"""
+        short_id = project_id[:8]
+        name = f"codewiki-{resource_type}-{short_id}".lower()
+        name = re.sub(r'[^a-z0-9-]', '-', name)
+        return name[:63].strip('-')
+
+    def _get_codewiki_env_vars(self):
+        """
+        获取从YAML配置读取的CodeWiki配置环境变量
+
+        Returns:
+            包含V1EnvVar对象的列表
+        """
+        env_vars = []
+        codewiki_config = get_codewiki_env_vars()
+
+        for env_name, value in codewiki_config.items():
+            env_vars.append(self.client.V1EnvVar(name=env_name, value=value))
+            logger.info(f"CodeWiki配置: {env_name}={value[:20]}..." if len(value) > 20 else f"CodeWiki配置: {env_name}={value}")
+
+        return env_vars
+
+    def create_codewiki_deployment(self, project_id: str, pvc_name: str, api_key: str = None,
+                                   cpu_limit: str = "1000m", memory_limit: str = "2048Mi") -> str:
+        """创建CodeWiki Deployment"""
+        if not self.available:
+            raise CodeServerError(
+                message="Kubernetes客户端不可用",
+                details={"project_id": project_id},
+                status_code=503
+            )
+
+        deploy_name = self.generate_codewiki_resource_name(project_id, "deploy")
+
+        try:
+            deployment = self.client.V1Deployment(
+                api_version="apps/v1",
+                kind="Deployment",
+                metadata=self.client.V1ObjectMeta(
+                    name=deploy_name,
+                    namespace=self.namespace,
+                    labels={
+                        "app": "codewiki",
+                        "project-id": project_id,
+                        "managed-by": "source-manager"
+                    }
+                ),
+                spec=self.client.V1DeploymentSpec(
+                    replicas=1,
+                    selector=self.client.V1LabelSelector(
+                        match_labels={"app": "codewiki", "project-id": project_id}
+                    ),
+                    template=self.client.V1PodTemplateSpec(
+                        metadata=self.client.V1ObjectMeta(
+                            labels={"app": "codewiki", "project-id": project_id}
+                        ),
+                        spec=self.client.V1PodSpec(
+                            containers=[self.client.V1Container(
+                                name="codewiki",
+                                image=Config.K8S_CODEWIKI_IMAGE,
+                                image_pull_policy=Config.K8S_CODEWIKI_PULL_POLICY,
+                                ports=[self.client.V1ContainerPort(container_port=Config.K8S_CODEWIKI_CONTAINER_PORT)],
+                                # 从文件读取CodeWiki配置（必需的环境变量）
+                                env=[
+                                    # 基础环境变量
+                                    self.client.V1EnvVar(name="PROJECT_ID", value=project_id),
+                                    self.client.V1EnvVar(name="PUID", value="1000"),
+                                    self.client.V1EnvVar(name="PGID", value="1000"),
+                                    self.client.V1EnvVar(name="TZ", value="Asia/Shanghai"),
+                                    self.client.V1EnvVar(name="ROOT_PATH", value="/codewiki"),
+                                ] + self._get_codewiki_env_vars() + [
+                                    self.client.V1EnvVar(name=key, value=value)
+                                    for key, value in get_dynamic_env_vars("codewiki").items()
+                                ],
+                                volume_mounts=[self.client.V1VolumeMount(
+                                    name="workspace",
+                                    mount_path="/config/workspace"
+                                )],
+                                resources=self.client.V1ResourceRequirements(
+                                    requests={
+                                        "cpu": "500m",
+                                        "memory": "1024Mi"
+                                    },
+                                    limits={
+                                        "cpu": cpu_limit,
+                                        "memory": memory_limit
+                                    }
+                                ),
+                                readiness_probe=self.client.V1Probe(
+                                    http_get=self.client.V1HTTPGetAction(
+                                        path="/codewiki/health",
+                                        port=Config.K8S_CODEWIKI_CONTAINER_PORT,
+                                        scheme="HTTP"
+                                    ),
+                                    initial_delay_seconds=10,
+                                    period_seconds=5,
+                                    timeout_seconds=1,
+                                    success_threshold=1,
+                                    failure_threshold=3
+                                ),
+                                liveness_probe=self.client.V1Probe(
+                                    http_get=self.client.V1HTTPGetAction(
+                                        path="/codewiki/health",
+                                        port=Config.K8S_CODEWIKI_CONTAINER_PORT,
+                                        scheme="HTTP"
+                                    ),
+                                    initial_delay_seconds=30,
+                                    period_seconds=10,
+                                    timeout_seconds=1,
+                                    success_threshold=1,
+                                    failure_threshold=3
+                                )
+                            )],
+                            volumes=[self.client.V1Volume(
+                                name="workspace",
+                                persistent_volume_claim=self.client.V1PersistentVolumeClaimVolumeSource(
+                                    claim_name=pvc_name
+                                )
+                            )]
+                        )
+                    )
+                )
+            )
+
+            self.apps_v1.create_namespaced_deployment(
+                namespace=self.namespace, body=deployment
+            )
+            logger.info(f"创建CodeWiki Deployment: {deploy_name}")
+            return deploy_name
+        except self.ApiException as e:
+            if e.status == 409:
+                logger.warning(f"CodeWiki Deployment已存在: {deploy_name}")
+                return deploy_name
+            logger.error(f"创建CodeWiki Deployment失败: {e}")
+            raise CodeServerError(
+                message="创建CodeWiki Deployment失败",
+                details={
+                    "project_id": project_id,
+                    "deployment_name": deploy_name,
+                    "error": str(e)
+                },
+                status_code=500
+            )
+
+    def create_codewiki_service(self, project_id: str) -> Dict[str, Any]:
+        """创建CodeWiki Service"""
+        if not self.available:
+            raise CodeServerError(
+                message="Kubernetes客户端不可用",
+                details={"project_id": project_id},
+                status_code=503
+            )
+
+        svc_name = self.generate_codewiki_resource_name(project_id, "svc")
+
+        try:
+            service = self.client.V1Service(
+                metadata=self.client.V1ObjectMeta(
+                    name=svc_name,
+                    namespace=self.namespace,
+                    labels={
+                        "app": "codewiki",
+                        "project-id": project_id,
+                        "managed-by": "source-manager"
+                    }
+                ),
+                spec=self.client.V1ServiceSpec(
+                    type=Config.K8S_SERVICE_TYPE,
+                    selector={"app": "codewiki", "project-id": project_id},
+                    ports=[self.client.V1ServicePort(
+                        port=Config.K8S_CODEWIKI_SERVICE_PORT,
+                        target_port=Config.K8S_CODEWIKI_CONTAINER_PORT,
+                        name="http"
+                    )]
+                )
+            )
+
+            svc = self.core_v1.create_namespaced_service(namespace=self.namespace, body=service)
+            logger.info(f"创建CodeWiki Service: {svc_name}")
+
+            access_info = {
+                "name": svc_name,
+                "port": Config.K8S_CODEWIKI_SERVICE_PORT,
+                "type": Config.K8S_SERVICE_TYPE
+            }
+
+            if Config.K8S_SERVICE_TYPE == "ClusterIP":
+                access_info["cluster_ip"] = svc.spec.cluster_ip
+                access_info["url"] = f"http://{svc_name}.{self.namespace}.svc.cluster.local:{Config.K8S_CODEWIKI_SERVICE_PORT}/codewiki"
+
+            return access_info
+        except self.ApiException as e:
+            if e.status == 409:
+                logger.warning(f"CodeWiki Service已存在: {svc_name}")
+                return {"name": svc_name}
+            logger.error(f"创建CodeWiki Service失败: {e}")
+            raise CodeServerError(
+                message="创建CodeWiki Service失败",
+                details={
+                    "project_id": project_id,
+                    "service_name": svc_name,
+                    "error": str(e)
+                },
+                status_code=500
+            )
+
+    def delete_codewiki_runtime_resources(self, project_id: str) -> Dict[str, Any]:
+        """删除CodeWiki运行时资源（Deployment, Service），但不删除PVC"""
+        if not self.available:
+            raise CodeServerError(
+                message="Kubernetes客户端不可用",
+                details={"project_id": project_id},
+                status_code=503
+            )
+
+        results = {}
+        errors = []
+
+        # 删除Service
+        svc_name = self.generate_codewiki_resource_name(project_id, "svc")
+        try:
+            self.core_v1.delete_namespaced_service(
+                name=svc_name, namespace=self.namespace
+            )
+            results["service"] = {"deleted": True, "name": svc_name}
+        except self.ApiException as e:
+            if e.status != 404:
+                errors.append({"resource": "service", "name": svc_name, "error": str(e), "status": e.status})
+                results["service"] = {"deleted": False, "error": str(e)}
+
+        # 删除Deployment
+        deploy_name = self.generate_codewiki_resource_name(project_id, "deploy")
+        try:
+            self.apps_v1.delete_namespaced_deployment(
+                name=deploy_name, namespace=self.namespace
+            )
+            results["deployment"] = {"deleted": True, "name": deploy_name}
+        except self.ApiException as e:
+            if e.status != 404:
+                errors.append({"resource": "deployment", "name": deploy_name, "error": str(e), "status": e.status})
+                results["deployment"] = {"deleted": False, "error": str(e)}
+
+        if errors:
+            raise CodeServerError(
+                message="删除CodeWiki Kubernetes资源时发生错误",
+                details={
+                    "project_id": project_id,
+                    "errors": errors,
+                    "results": results
+                },
+                status_code=500
+            )
+
+        return results
+
+    def scale_codewiki_deployment(self, project_id: str, replica: int) -> bool:
+        """调整CodeWiki Deployment副本数"""
+        if not self.available:
+            raise CodeServerError(
+                message="Kubernetes客户端不可用",
+                details={"project_id": project_id},
+                status_code=503
+            )
+
+        deploy_name = self.generate_codewiki_resource_name(project_id, "deploy")
+
+        try:
+            deployment = self.apps_v1.read_namespaced_deployment(
+                name=deploy_name, namespace=self.namespace
+            )
+            deployment.spec.replica = replica
+            self.apps_v1.replace_namespaced_deployment(
+                name=deploy_name, namespace=self.namespace, body=deployment
+            )
+            logger.info(f"调整CodeWiki Deployment {deploy_name} 副本数为: {replica}")
+            return True
+        except self.ApiException as e:
+            if e.status == 404:
+                raise CodeServerError(
+                    message="CodeWiki Deployment不存在",
+                    details={
+                        "project_id": project_id,
+                        "deployment_name": deploy_name
+                    },
+                    status_code=404
+                )
+            logger.error(f"调整CodeWiki Deployment副本数失败: {e}")
+            raise CodeServerError(
+                message="调整CodeWiki Deployment副本数失败",
+                details={
+                    "project_id": project_id,
+                    "deployment_name": deploy_name,
+                    "replica": replica,
+                    "error": str(e)
+                },
+                status_code=500
+            )
+
+    def get_codewiki_deployment_status(self, project_id: str) -> Dict[str, Any]:
+        """获取CodeWiki Deployment状态"""
+        if not self.available:
+            raise CodeServerError(
+                message="Kubernetes客户端不可用",
+                details={"project_id": project_id},
+                status_code=503
+            )
+
+        deploy_name = self.generate_codewiki_resource_name(project_id, "deploy")
+
+        try:
+            deployment = self.apps_v1.read_namespaced_deployment(
+                name=deploy_name, namespace=self.namespace
+            )
+
+            pods = self.core_v1.list_namespaced_pod(
+                namespace=self.namespace,
+                label_selector=f"app=codewiki,project-id={project_id}"
+            )
+
+            pod_info = []
+            for pod in pods.items[:3]:
+                pod_info.append({
+                    "name": pod.metadata.name,
+                    "status": pod.status.phase,
+                    "ip": pod.status.pod_ip,
+                    "node": pod.spec.node_name
+                })
+
+            return {
+                "name": deploy_name,
+                "namespace": self.namespace,
+                "replica": getattr(deployment.status, 'replica', 0) or getattr(deployment.status, 'replicas', 0) or 0,
+                "ready_replica": deployment.status.ready_replica if deployment.status else 0,
+                "available_replica": deployment.status.available_replica if deployment.status else 0,
+                "pods": pod_info,
+                "conditions": [
+                    {
+                        "type": cond.type,
+                        "status": cond.status,
+                        "reason": cond.reason,
+                        "message": cond.message
+                    }
+                    for cond in (deployment.status.conditions if deployment.status else [])
+                ]
+            }
+        except self.ApiException as e:
+            if e.status == 404:
+                raise CodeServerError(
+                    message="CodeWiki Deployment不存在",
+                    details={
+                        "project_id": project_id,
+                        "deployment_name": deploy_name
+                    },
+                    status_code=404
+                )
+            logger.error(f"获取CodeWiki Deployment状态失败: {e}")
+            raise CodeServerError(
+                message="获取CodeWiki Deployment状态失败",
+                details={
+                    "project_id": project_id,
+                    "deployment_name": deploy_name,
+                    "error": str(e)
+                },
+                status_code=500
+            )
+
+    def get_codewiki_service_info(self, project_id: str) -> Dict[str, Any]:
+        """获取CodeWiki Service信息"""
+        if not self.available:
+            raise CodeServerError(
+                message="Kubernetes客户端不可用",
+                details={"project_id": project_id},
+                status_code=503
+            )
+
+        svc_name = self.generate_codewiki_resource_name(project_id, "svc")
+
+        try:
+            service = self.core_v1.read_namespaced_service(
+                name=svc_name, namespace=self.namespace
+            )
+
+            info = {
+                "name": svc_name,
+                "namespace": self.namespace,
+                "type": service.spec.type,
+                "cluster_ip": service.spec.cluster_ip,
+                "ports": [
+                    {
+                        "name": port.name,
+                        "port": port.port,
+                        "target_port": port.target_port,
+                        "node_port": port.node_port
+                    }
+                    for port in service.spec.ports
+                ]
+            }
+            return info
+        except self.ApiException as e:
+            if e.status == 404:
+                raise CodeServerError(
+                    message="CodeWiki Service不存在",
+                    details={
+                        "project_id": project_id,
+                        "service_name": svc_name
+                    },
+                    status_code=404
+                )
+            logger.error(f"获取CodeWiki Service信息失败: {e}")
+            raise CodeServerError(
+                message="获取CodeWiki Service信息失败",
+                details={
+                    "project_id": project_id,
+                    "service_name": svc_name,
                     "error": str(e)
                 },
                 status_code=500

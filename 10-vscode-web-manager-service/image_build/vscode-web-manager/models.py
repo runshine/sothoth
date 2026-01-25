@@ -78,6 +78,29 @@ class CodeServer(Base):
     owner = relationship("User", backref="code_servers")
     project = relationship("Project", backref="code_server", uselist=False)
 
+class CodeWiki(Base):
+    """CodeWiki文档生成服务模型"""
+    __tablename__ = "code_wikis"
+    id = Column(String(64), primary_key=True, index=True)
+    project_id = Column(String(64), ForeignKey("projects.id", ondelete="CASCADE"), unique=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    deployment_name = Column(String(100))
+    service_name = Column(String(100))
+    service_ip = Column(String(100))
+    service_port = Column(Integer, default=8080)
+    access_url = Column(String(500))
+    status = Column(String(20), default="pending")  # pending, creating, running, stopped, error, deleting
+    pod_name = Column(String(100))
+    pod_status = Column(String(50))
+    cpu_limit = Column(String(20), default="1000m")
+    memory_limit = Column(String(20), default="2048Mi")
+    api_key = Column(String(200))  # CodeWiki API密钥
+    created_at = Column(DateTime, server_default=func.now())
+    started_at = Column(DateTime)
+    stopped_at = Column(DateTime)
+    owner = relationship("User", backref="code_wikis")
+    project = relationship("Project", backref="code_wiki", uselist=False)
+
 class ProjectTaskLog(Base):
     __tablename__ = "project_task_logs"
     id = Column(Integer, primary_key=True, index=True)

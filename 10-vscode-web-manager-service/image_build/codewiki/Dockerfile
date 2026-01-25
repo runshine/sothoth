@@ -28,7 +28,7 @@ COPY app/ ./app/
 # 设置环境变量
 ENV PYTHONPATH=/app
 ENV LOG_LEVEL=INFO
-ENV DATABASE_URL=sqlite:////app/data/codewiki.db
+ENV DATABASE_URL=sqlite+aiosqlite:////app/data/codewiki.db
 ENV LOGS_DIR=/app/logs
 
 # 暴露端口

@@ -25,6 +25,9 @@ COPY . .
 # 创建必要的目录
 RUN mkdir -p /data/uploads /data/projects /data/archives
 
+# 复制配置文件
+COPY config.yaml /data/config.yaml
+
 # 暴露端口
 EXPOSE 8080
 

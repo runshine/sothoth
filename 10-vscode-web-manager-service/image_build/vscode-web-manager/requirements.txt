@@ -11,3 +11,5 @@ PyJWT
 cryptography
 python-magic
 bcrypt==4.0.1
+httpx>=0.24.0
+pyyaml>=6.0

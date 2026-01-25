@@ -92,7 +92,11 @@ def create_code_server_task(project_id: str, user_id: int, password: str = None,
                 name=deploy_name, namespace=k8s.namespace
             )
             deployment_exists = True
-            deployment_replicas = deployment.spec.replicas if deployment.spec.replicas is not None else 0
+            # 使用getattr安全获取replica属性
+            deployment_replicas = getattr(deployment.status, 'replicas', None)
+            if deployment_replicas is None:
+                deployment_replicas = getattr(deployment.status, 'replicas', 0)
+            deployment_replicas = deployment_replicas if deployment_replicas is not None else 0
             logger.info(f"Deployment已存在: {deploy_name}, 副本数: {deployment_replicas}")
         except k8s.ApiException as e:
             if e.status == 404:

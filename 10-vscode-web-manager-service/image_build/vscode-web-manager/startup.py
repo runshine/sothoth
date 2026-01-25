@@ -16,11 +16,105 @@ k8s_manager: Optional[KubernetesManager] = None
 task_manager_instance: Optional[TaskManager] = None  # 重命名以避免命名冲突
 
 
+def print_config_summary():
+    """打印配置文件摘要"""
+    from config import YAML_CONFIG, get_yaml_config
+    import os
+
+    print("\n" + "=" * 60)
+    print("配置文件参数")
+    print("=" * 60)
+
+    # 数据库配置
+    db_type = get_yaml_config("database", "type", default="sqlite")
+    db_url = get_yaml_config("database", "mysql_url", default="")
+    print(f"\n[数据库]")
+    print(f"  类型: {db_type}")
+    print(f"  MySQL URL: {db_url if db_url else '(未配置，使用SQLite)'}")
+
+    # 安全配置
+    secret_key = get_yaml_config("security", "secret_key", default="")
+    print(f"\n[安全配置]")
+    print(f"  JWT密钥: {'已设置' if secret_key and secret_key != 'your-secret-key-change-in-production' else '使用默认值'}")
+
+    # Kubernetes配置
+    print(f"\n[Kubernetes]")
+    print(f"  集群内运行: {get_yaml_config('kubernetes', 'in_k8s', default=False)}")
+    print(f"  命名空间: {get_yaml_config('kubernetes', 'namespace', default='vscode')}")
+    print(f"  存储类: {get_yaml_config('kubernetes', 'storage_class', default='')}")
+    print(f"  服务类型: {get_yaml_config('kubernetes', 'service_type', default='ClusterIP')}")
+
+    # HTTP配置
+    print(f"\n[HTTP配置]")
+    print(f"  外部访问地址: {get_yaml_config('http', 'external_access_url', default='')}")
+
+    # 存储配置
+    print(f"\n[存储配置]")
+    print(f"  基础目录: {get_yaml_config('storage', 'base_dir', default='/data')}")
+    print(f"  最大文件大小: {get_yaml_config('storage', 'max_file_size_mb', default=1024)}MB")
+    print(f"  最大下载大小: {get_yaml_config('storage', 'max_download_size_mb', default=100)}MB")
+
+    # CodeWiki配置
+    print(f"\n[CodeWiki配置]")
+    codewiki_config = get_yaml_config("codewiki", default={})
+    if codewiki_config:
+        api_key = codewiki_config.get("api_key", "")
+        base_url = codewiki_config.get("base_url", "")
+        main_model = codewiki_config.get("main_model", "")
+        cluster_model = codewiki_config.get("cluster_model", "")
+        fallback_model = codewiki_config.get("fallback_model", "")
+        print(f"  API密钥: {'已设置' if api_key and api_key != 'YOUR_API_KEY' else '未设置'}")
+        print(f"  Base URL: {base_url if base_url else '未设置'}")
+        print(f"  主模型: {main_model if main_model else '未设置'}")
+        print(f"  集群模型: {cluster_model if cluster_model else '未设置'}")
+        print(f"  降级模型: {fallback_model if fallback_model else '未设置'}")
+    else:
+        print("  未配置")
+
+    # 动态环境变量配置
+    print(f"\n[动态环境变量配置]")
+    from config import validate_dynamic_env_config, get_dynamic_env_vars
+    dyn_config = validate_dynamic_env_config()
+    if dyn_config["global_vars"]:
+        print(f"  全局环境变量: {len(dyn_config['global_vars'])} 个")
+        for key, value in dyn_config["global_vars"].items():
+            display_value = value if len(str(value)) <= 50 else f"{str(value)[:50]}..."
+            print(f"    {key}={display_value}")
+    else:
+        print("  全局环境变量: 未配置")
+
+    if dyn_config["code_server_vars"]:
+        print(f"  Code-Server环境变量: {len(dyn_config['code_server_vars'])} 个")
+        for key, value in dyn_config["code_server_vars"].items():
+            display_value = value if len(str(value)) <= 50 else f"{str(value)[:50]}..."
+            print(f"    {key}={display_value}")
+    else:
+        print("  Code-Server环境变量: 未配置")
+
+    if dyn_config["codewiki_vars"]:
+        print(f"  CodeWiki环境变量: {len(dyn_config['codewiki_vars'])} 个")
+        for key, value in dyn_config["codewiki_vars"].items():
+            display_value = value if len(str(value)) <= 50 else f"{str(value)[:50]}..."
+            print(f"    {key}={display_value}")
+    else:
+        print("  CodeWiki环境变量: 未配置")
+
+    if dyn_config["warnings"]:
+        for warning in dyn_config["warnings"]:
+            print(f"  ⚠ {warning}")
+
+    print(f"\n配置文件路径: {os.path.abspath('config.yaml')}")
+    print("=" * 60)
+
+
 def init_system():
     """初始化系统"""
     global k8s_manager, task_manager_instance  # 声明全局变量
 
-    print(f"启动 {Config.APP_NAME} v{Config.VERSION}")
+    # 打印配置文件摘要
+    print_config_summary()
+
+    print(f"\n启动 {Config.APP_NAME} v{Config.VERSION}")
     print(f"数据库: {Config.DATABASE_URL}")
     print(f"存储目录: {Config.BASE_DIR}")
     print(f"API地址: http://0.0.0.0:8080")
@@ -93,6 +187,30 @@ def init_system():
     print("✓ HTTP基础配置验证通过")
     print(f"  外部访问地址: {Config.EXTERNAL_ACCESS_URL}")
     print(f"  下载超时时间: {Config.ARCHIVE_DOWNLOAD_TIMEOUT}秒")
+
+    # 验证CodeWiki配置（必需）
+    print("\n=== 验证CodeWiki配置 ===")
+    from config import validate_codewiki_config
+    codewiki_config = validate_codewiki_config()
+
+    if codewiki_config["errors"]:
+        print("错误: CodeWiki必需配置缺失")
+        for error in codewiki_config["errors"]:
+            print(f"  ✗ {error}")
+        print("\n请在 config.yaml 的 codewiki 部分配置以下参数:")
+        print("  - api_key: Claude API密钥")
+        print("  - base_url: API基础URL (例如: https://api.anthropic.com)")
+        print("  - main_model: 主模型 (例如: claude-sonnet-4)")
+        print("  - cluster_model: 集群模型 (例如: claude-sonnet-4)")
+        print("  - fallback_model: 降级模型 (例如: glm-4p5)")
+        print("\nCodeWiki配置验证失败，程序将退出")
+        sys.exit(1)
+
+    if codewiki_config["warnings"]:
+        for warning in codewiki_config["warnings"]:
+            print(f"  ⚠ {warning}")
+
+    print("✓ CodeWiki配置验证通过")
 
     # 检查JWT库
     if not Config.JWT_AVAILABLE:

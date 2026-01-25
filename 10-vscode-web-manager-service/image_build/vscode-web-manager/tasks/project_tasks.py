@@ -12,12 +12,13 @@ from sqlalchemy.orm import Session
 
 from config import Config
 from database import SessionLocal
-from models import Project, ProjectFile, ProjectTaskLog, CodeServer
+from models import Project, ProjectFile, ProjectTaskLog, CodeServer, CodeWiki
 from utils.file_utils import FileUtils
 from utils.task_logger import TaskLogger
 from utils.errors import ProjectError, CodeServerError
 from managers.kubernetes_manager import KubernetesManager
 from tasks.code_server_tasks import delete_code_server_task
+from tasks.codewiki_tasks import delete_codewiki_task
 
 logger = logging.getLogger(__name__)
 
@@ -398,6 +399,37 @@ def delete_project_task(project_id: str, user_id: int):
         else:
             task_logger.info("未发现Code-Server")
 
+        # 步骤1.5: 删除CodeWiki（如果存在）- 项目删除时强制删除
+        task_logger.info("步骤1.5: 检查并删除CodeWiki")
+        code_wiki = db.query(CodeWiki).filter(CodeWiki.project_id == project_id).first()
+
+        if code_wiki:
+            task_logger.info(f"发现CodeWiki，状态: {code_wiki.status}")
+
+            # 检查K8S是否可用
+            try:
+                from kubernetes import client
+                k8s_available = True
+            except ImportError:
+                k8s_available = False
+
+            if k8s_available:
+                try:
+                    # 使用专门的CodeWiki删除任务
+                    delete_codewiki_task(project_id)
+                    task_logger.info("CodeWiki删除成功")
+                except Exception as e:
+                    task_logger.warning(f"删除CodeWiki失败: {str(e)}")
+            else:
+                task_logger.warning("Kubernetes功能不可用，跳过CodeWiki资源删除")
+
+            # 删除数据库记录
+            db.delete(code_wiki)
+            db.commit()
+            task_logger.info("CodeWiki数据库记录删除成功")
+        else:
+            task_logger.info("未发现CodeWiki")
+
         # 步骤2: 删除PVC（如果存在）
         task_logger.info("步骤2: 检查并删除PVC")
         if project.pvc_name:
@@ -496,6 +528,7 @@ def delete_project_task(project_id: str, user_id: int):
             "message": "项目删除成功",
             "deleted_resources": {
                 "code_server": code_server is not None,
+                "code_wiki": code_wiki is not None,
                 "pvc": project.pvc_name is not None,
                 "archive_file": project.archive_path is not None,
                 "extract_dir": project.extract_path is not None

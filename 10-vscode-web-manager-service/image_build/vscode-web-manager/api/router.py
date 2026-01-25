@@ -14,6 +14,7 @@ from api.routes import (
     projects_router,
     pvc_router,
     code_servers_router,
+    codewiki_router,
     tasks_router,
     files_router,
     health_router
@@ -27,6 +28,7 @@ api_router.include_router(auth_router, tags=["认证"])
 api_router.include_router(projects_router, tags=["项目管理"])
 api_router.include_router(pvc_router, tags=["PVC管理"])
 api_router.include_router(code_servers_router, tags=["Code-Server管理"])
+api_router.include_router(codewiki_router, tags=["CodeWiki管理"])
 api_router.include_router(tasks_router, tags=["任务管理"])
 api_router.include_router(files_router, tags=["文件下载"])
 api_router.include_router(health_router, tags=["健康检查"])
