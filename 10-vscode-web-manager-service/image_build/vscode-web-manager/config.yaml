@@ -1,0 +1,124 @@
+# vscode-web-manager 配置文件
+# 所有配置项从本文件读取
+
+# ============ 数据库配置 ============
+database:
+  # 支持: sqlite, mysql
+  type: "sqlite"
+  # SQLite文件路径
+  sqlite_path: "./source_manager.db"
+  # MySQL连接字符串 (示例: mysql+pymysql://user:password@host/dbname)
+  mysql_url: ""
+
+# ============ 安全配置 ============
+security:
+  # JWT密钥，生产环境必须修改
+  secret_key: "your-secret-key-change-in-production"
+  # JWT算法
+  algorithm: "HS256"
+  # Token过期时间（分钟）
+  access_token_expire_minutes: 60
+
+# ============ Kubernetes配置 ============
+kubernetes:
+  # 是否在K8S集群内部运行
+  in_k8s: false
+  # API服务器地址 (集群外部运行时需要设置)
+  api_url: ""
+  # API Token (可选，用于集群外部认证）
+  api_token: ""
+  # 命名空间
+  namespace: "vscode"
+  # 存储类
+  storage_class: "nfs-storage-192.168.13.66"
+  # 服务类型: ClusterIP, NodePort, LoadBalancer
+  service_type: "ClusterIP"
+  # 服务端口
+  service_port: 80
+  # Code-Server镜像
+  code_server_image: "linuxserver/code-server:latest"
+  # Code-Server镜像拉取策略: Always(每次都拉取), IfNotPresent(本地不存在时拉取), Never(从不拉取)
+  code_server_pull_policy: "Always"
+  # CodeWiki镜像
+  codewiki_image: "ghcr.io/runshine/codewiki:latest"
+  # CodeWiki镜像拉取策略: Always(每次都拉取), IfNotPresent(本地不存在时拉取), Never(从不拉取)
+  codewiki_pull_policy: "Always"
+  # 默认存储大小
+  default_storage_size: "5Gi"
+
+# ============ HTTP配置 ============
+http:
+  # 外部访问地址
+  external_access_url: "http://vscode-web-manager.sothothv2-ns.svc.cluster.local"
+  # 归档下载Token
+  archive_download_token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  # 归档下载超时（秒）
+  archive_download_timeout: 1200
+
+# ============ 文件存储配置 ============
+storage:
+  # 基础目录
+  base_dir: "/data"
+  # 上传目录
+  upload_dir: "uploads"
+  # 归档目录
+  archive_dir: "archives"
+  # 项目目录
+  projects_dir: "projects"
+  # 下载目录
+  downloads_dir: "downloads"
+  # 任务日志目录
+  task_log_dir: "task_logs"
+  # 最大文件大小（MB）
+  max_file_size_mb: 1024
+  # 最大下载大小（MB）
+  max_download_size_mb: 100
+
+# ============ CodeWiki 配置 ============
+# 用于Claude API认证和模型配置
+codewiki:
+  # Claude API密钥（必需）
+  api_key: "YOUR_API_KEY"
+  # API基础URL（必需）
+  base_url: "https://api.anthropic.com"
+  # 主模型（用于日常代码分析和对话）
+  main_model: "claude-sonnet-4"
+  # 集群模型（用于大规模代码库分析）
+  cluster_model: "claude-sonnet-4"
+  # 降级模型（主模型不可用时的备选）
+  fallback_model: "glm-4p5"
+
+# ============ 动态环境变量配置 ============
+# 这些环境变量会被注入到 code-server 和 codewiki 的 Pod 中
+# 每个服务的环境变量是独立的，通过服务名称区分
+# 格式：环境变量名: 值
+dynamic_env:
+  # 注入到所有服务的公共环境变量
+  global:
+    # 示例：自定义时区
+    TZ: "Asia/Shanghai"
+    # 示例：日志级别
+    LOG_LEVEL: "info"
+    # 示例：自定义应用配置
+    CUSTOM_APP_NAME: "vscode-manager"
+
+  # 注入到 code-server 的环境变量
+  code_server:
+    # 示例：自定义代码服务器配置
+    # CUSTOM_CODE_SERVER_VAR: "custom-value"
+    # 示例：启用某些特性
+    ENABLE_FEATURE_X: "true"
+    # 示例：API端点配置
+    API_ENDPOINT: "http://api-service:8080"
+
+  # 注入到 codewiki 的环境变量
+  codewiki:
+    # 示例：自定义配置
+    # CUSTOM_CODEWIKI_VAR: "custom-value"
+    # 示例：超时配置
+    REQUEST_TIMEOUT: "30"
+    # 示例：缓存配置
+    CACHE_ENABLED: "true"
+
+# ============ 调试配置 ============
+debug: false
