@@ -80,7 +80,7 @@ async def execute_codewiki_task(
 
     # 创建日志文件
     log_file = f"logs/{task_id}.log"
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
 
     try:
         # 构建codewiki命令
