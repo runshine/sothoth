@@ -5,7 +5,7 @@ on:
       - 'v2.*'
     paths:
       - .github/workflows/build-codewiki-image.yml
-      - 10-vscode-web-manager-service/image_build/codewiki/*
+      - 10-vscode-web-manager-service/image_build/codewiki/**
 jobs:
   build-remote-command-api-image:
     runs-on: ubuntu-latest
