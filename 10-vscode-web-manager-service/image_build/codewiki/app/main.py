@@ -26,6 +26,16 @@ async def lifespan(app: FastAPI):
     # 启动时
     logger.info("Starting CodeWiki API Server...")
 
+    # 打印所有环境变量（用于调试）
+    logger.info("=" * 60)
+    logger.info("[Environment Variables Debug]")
+    logger.info("=" * 60)
+
+    # 打印DATABASE_URL
+    database_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/codewiki.db")
+    logger.info(f"  DATABASE_URL: {database_url}")
+    logger.info("=" * 60)
+
     # 初始化数据库
     await database.init_db()
 
