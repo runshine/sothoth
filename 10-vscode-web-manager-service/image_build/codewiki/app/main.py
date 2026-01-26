@@ -34,10 +34,35 @@ async def lifespan(app: FastAPI):
     # 打印DATABASE_URL
     database_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/codewiki.db")
     logger.info(f"  DATABASE_URL: {database_url}")
+
+    # 从环境变量读取Claude配置（环境变量为大写）
+    claude_config = {
+        "api_key": os.getenv("CLAUDE_API_KEY", ""),
+        "base_url": os.getenv("CLAUDE_BASE_URL", "https://api.anthropic.com"),
+        "main_model": os.getenv("CLAUDE_MAIN_MODEL", "claude-sonnet-4"),
+        "cluster_model": os.getenv("CLAUDE_CLUSTER_MODEL", "claude-sonnet-4"),
+        "fallback_model": os.getenv("CLAUDE_FALLBACK_MODEL", "glm-4p5"),
+    }
+    logger.info(f"  CLAUDE_API_KEY: {'***' if claude_config['api_key'] else '(not set)'}")
+    logger.info(f"  CLAUDE_BASE_URL: {claude_config['base_url']}")
+    logger.info(f"  CLAUDE_MAIN_MODEL: {claude_config['main_model']}")
+    logger.info(f"  CLAUDE_CLUSTER_MODEL: {claude_config['cluster_model']}")
+    logger.info(f"  CLAUDE_FALLBACK_MODEL: {claude_config['fallback_model']}")
     logger.info("=" * 60)
 
     # 初始化数据库
     await database.init_db()
+
+    # 首次配置：如果环境变量中有Claude配置，则写入数据库
+    if claude_config["api_key"]:
+        logger.info("[Initial Config] Setting Claude configuration from environment variables...")
+        async with database.AsyncSessionLocal() as db:
+            for key, value in claude_config.items():
+                if value:
+                    await models.Config.set(db, key, value)
+        logger.info("[Initial Config] Claude configuration saved successfully")
+    else:
+        logger.info("[Initial Config] No CLAUDE_API_KEY found, skipping initial configuration")
 
     # 启动任务管理器
     await tasks.TaskManager.init()

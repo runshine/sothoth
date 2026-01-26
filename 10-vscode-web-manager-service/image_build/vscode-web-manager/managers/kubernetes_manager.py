@@ -1553,22 +1553,6 @@ class KubernetesManager:
         name = re.sub(r'[^a-z0-9-]', '-', name)
         return name[:63].strip('-')
 
-    def _get_codewiki_env_vars(self):
-        """
-        获取从YAML配置读取的CodeWiki配置环境变量
-
-        Returns:
-            包含V1EnvVar对象的列表
-        """
-        env_vars = []
-        codewiki_config = get_codewiki_env_vars()
-
-        for env_name, value in codewiki_config.items():
-            env_vars.append(self.client.V1EnvVar(name=env_name, value=value))
-            logger.info(f"CodeWiki配置: {env_name}={value[:20]}..." if len(value) > 20 else f"CodeWiki配置: {env_name}={value}")
-
-        return env_vars
-
     def create_codewiki_deployment(self, project_id: str, pvc_name: str, api_key: str = None,
                                    cpu_limit: str = "1000m", memory_limit: str = "2048Mi") -> str:
         """创建CodeWiki Deployment"""
@@ -1609,7 +1593,7 @@ class KubernetesManager:
                                 image=Config.K8S_CODEWIKI_IMAGE,
                                 image_pull_policy=Config.K8S_CODEWIKI_PULL_POLICY,
                                 ports=[self.client.V1ContainerPort(container_port=Config.K8S_CODEWIKI_CONTAINER_PORT)],
-                                # 从文件读取CodeWiki配置（必需的环境变量）
+                                # 从YAML配置读取的CodeWiki环境变量（key为大写）
                                 env=[
                                     # 基础环境变量
                                     self.client.V1EnvVar(name="PROJECT_ID", value=project_id),
@@ -1617,7 +1601,12 @@ class KubernetesManager:
                                     self.client.V1EnvVar(name="PGID", value="1000"),
                                     self.client.V1EnvVar(name="TZ", value="Asia/Shanghai"),
                                     self.client.V1EnvVar(name="ROOT_PATH", value="/codewiki"),
-                                ] + self._get_codewiki_env_vars() + [
+                                ] + [
+                                    # 从YAML配置文件codewiki部分读取的配置（key已转为大写）
+                                    self.client.V1EnvVar(name=key, value=value)
+                                    for key, value in get_codewiki_env_vars().items()
+                                ] + [
+                                    # 动态环境变量（保持原样）
                                     self.client.V1EnvVar(name=key, value=value)
                                     for key, value in get_dynamic_env_vars("codewiki").items()
                                 ],
