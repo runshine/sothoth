@@ -30,10 +30,10 @@ class KubernetesManager:
             raise RuntimeError("Kubernetes客户端不可用")
 
         try:
-            logger.info(f"开始初始化Kubernetes客户端...")
-            logger.info(f"IN_K8S环境变量: {os.getenv('IN_K8S', '未设置')}")
-            logger.info(f"K8S_API_URL: {self.api_url}")
-            logger.info(f"K8S_NAMESPACE: {self.namespace}")
+            # logger.info(f"开始初始化Kubernetes客户端...")
+            # logger.info(f"IN_K8S环境变量: {os.getenv('IN_K8S', '未设置')}")
+            # logger.info(f"K8S_API_URL: {self.api_url}")
+            # logger.info(f"K8S_NAMESPACE: {self.namespace}")
 
             # 导入kubernetes模块
             from kubernetes import client, config
@@ -43,10 +43,10 @@ class KubernetesManager:
             self.ApiException = ApiException
 
             if os.getenv("IN_K8S", "false").lower() == "true":
-                logger.info("检测到IN_K8S=true，尝试使用集群内配置...")
+                # logger.info("检测到IN_K8S=true，尝试使用集群内配置...")
                 try:
                     config.load_incluster_config()
-                    logger.info("✓ 使用集群内K8S配置成功")
+                    # logger.info("✓ 使用集群内K8S配置成功")
                 except Exception as e:
                     logger.error(f"✗ 加载集群内配置失败: {str(e)}")
                     raise
@@ -87,23 +87,23 @@ class KubernetesManager:
                 logger.info(f"✓ 使用自定义K8S API URL配置成功")
             else:
                 # 默认使用kubeconfig
-                logger.info("未指定API URL，尝试使用kubeconfig配置...")
+                # logger.info("未指定API URL，尝试使用kubeconfig配置...")
                 try:
                     config.load_kube_config()
-                    logger.info("✓ 使用kubeconfig配置成功")
+                    # logger.info("✓ 使用kubeconfig配置成功")
                 except Exception as e:
                     logger.error(f"✗ 加载kubeconfig失败: {str(e)}")
                     raise
 
             # 初始化各个API客户端
-            logger.info("初始化Kubernetes API客户端...")
+            # logger.info("初始化Kubernetes API客户端...")
             try:
                 self.core_v1 = client.CoreV1Api()
                 self.apps_v1 = client.AppsV1Api()
                 self.batch_v1 = client.BatchV1Api()
                 self.networking_v1 = client.NetworkingV1Api()
                 self.storage_v1 = client.StorageV1Api()
-                logger.info("✓ Kubernetes API客户端初始化成功")
+                # logger.info("✓ Kubernetes API客户端初始化成功")
             except Exception as e:
                 logger.error(f"✗ 初始化API客户端失败: {str(e)}")
                 raise
@@ -120,7 +120,7 @@ class KubernetesManager:
                     logger.error(f"✗ Kubernetes连接验证失败: {str(e)}")
                     raise
 
-            logger.info(f"✓ Kubernetes客户端初始化成功，命名空间: {self.namespace}")
+            # logger.info(f"✓ Kubernetes客户端初始化成功，命名空间: {self.namespace}")
 
         except Exception as e:
             logger.error(f"✗ Kubernetes客户端初始化失败")
