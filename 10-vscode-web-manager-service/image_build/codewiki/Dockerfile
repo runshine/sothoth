@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y \
     git \
     nodejs \
     npm \
-    curl \
+    curl vim \
     && rm -rf /var/lib/apt/lists/*
 
 # 设置工作目录

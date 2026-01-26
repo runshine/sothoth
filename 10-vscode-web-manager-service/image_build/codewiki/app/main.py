@@ -1,5 +1,7 @@
 # app/main.py
+import json
 import os
+import subprocess
 import uuid
 import asyncio
 from pathlib import Path
@@ -35,40 +37,57 @@ async def lifespan(app: FastAPI):
     database_url = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/codewiki.db")
     logger.info(f"  DATABASE_URL: {database_url}")
 
-    # 从环境变量读取Claude配置（环境变量为大写）
-    claude_config = {
-        "api_key": os.getenv("CLAUDE_API_KEY", ""),
-        "base_url": os.getenv("CLAUDE_BASE_URL", "https://api.anthropic.com"),
-        "main_model": os.getenv("CLAUDE_MAIN_MODEL", "claude-sonnet-4"),
-        "cluster_model": os.getenv("CLAUDE_CLUSTER_MODEL", "claude-sonnet-4"),
-        "fallback_model": os.getenv("CLAUDE_FALLBACK_MODEL", "glm-4p5"),
+    # 从环境变量读取Codewiki配置（环境变量为大写）
+    codewiki_config = {
+        "version": "1.0",
+        "api_key": os.getenv("CODEWIKI_API_KEY", ""),
+        "base_url": os.getenv("CODEWIKI_BASE_URL", "https://192.168.12.90:3000"),
+        "main_model": os.getenv("CODEWIKI_MAIN_MODEL", "minimax/minimax-m2.1"),
+        "cluster_model": os.getenv("CODEWIKI_CLUSTER_MODEL", "minimax/minimax-m2.1"),
+        "fallback_model": os.getenv("CODEWIKI_FALLBACK_MODEL", "minimax/minimax-m2.1"),
+        "default_output": "doc",
+        "max_tokens": 110000,
+        "max_token_per_module": 120000,
+        "max_token_per_leaf_module": 60000,
+        "max_depth": 4
     }
-    logger.info(f"  CLAUDE_API_KEY: {'***' if claude_config['api_key'] else '(not set)'}")
-    logger.info(f"  CLAUDE_BASE_URL: {claude_config['base_url']}")
-    logger.info(f"  CLAUDE_MAIN_MODEL: {claude_config['main_model']}")
-    logger.info(f"  CLAUDE_CLUSTER_MODEL: {claude_config['cluster_model']}")
-    logger.info(f"  CLAUDE_FALLBACK_MODEL: {claude_config['fallback_model']}")
+    logger.info(f"  CODEWIKI_API_KEY: {'***' if codewiki_config['api_key'] else '(not set)'}")
+    logger.info(f"  CODEWIKI_BASE_URL: {codewiki_config['base_url']}")
+    logger.info(f"  CODEWIKI_MAIN_MODEL: {codewiki_config['main_model']}")
+    logger.info(f"  CODEWIKI_CLUSTER_MODEL: {codewiki_config['cluster_model']}")
+    logger.info(f"  CODEWIKI_FALLBACK_MODEL: {codewiki_config['fallback_model']}")
     logger.info("=" * 60)
 
     # 初始化数据库
     await database.init_db()
 
-    # 首次配置：如果环境变量中有Claude配置，则写入数据库
-    if claude_config["api_key"]:
-        logger.info("[Initial Config] Setting Claude configuration from environment variables...")
+    # 首次配置：如果环境变量中codewiki配置，则写入数据库
+    if codewiki_config["api_key"]:
+        logger.info("[Initial Config] Setting codewiki configuration from environment variables...")
         async with database.AsyncSessionLocal() as db:
-            for key, value in claude_config.items():
+            for key, value in codewiki_config.items():
                 if value:
                     await models.Config.set(db, key, value)
-        logger.info("[Initial Config] Claude configuration saved successfully")
+        logger.info("[Initial Config] codewiki configuration saved successfully")
     else:
-        logger.info("[Initial Config] No CLAUDE_API_KEY found, skipping initial configuration")
+        logger.info("[Initial Config] No CODEWIKI_API_KEY found, skipping initial configuration")
+
+    os.chdir("/config/workspace")
+    try:
+        if not os.path.exists("/root/.codewiki/config.json"):
+            os.makedirs("/root/.codewiki")
+        with open("/root/.codewiki/config.json", "w", encoding="utf-8") as f:
+            json.dump(codewiki_config, f, indent=4)
+        os.popen("codewiki config set --api-key " + codewiki_config["api_key"]).readlines()
+        logger.info("[Initial Config] Config Code Wiki Success")
+    except Exception as e:
+        logger.error(e)
+
 
     # 启动任务管理器
     await tasks.TaskManager.init()
 
     yield
-
     # 关闭时
     logger.info("Shutting down CodeWiki API Server...")
     await tasks.TaskManager.shutdown()
