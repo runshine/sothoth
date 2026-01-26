@@ -55,8 +55,7 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
 RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-RUN curl \. "$HOME/.nvm/nvm.sh"
-RUN nvm install 24
+RUN . "$HOME/.nvm/nvm.sh" & nvm install 24
 RUN node -v
 RUN npm -v
 RUN npm install -g @anthropic-ai/claude-code
