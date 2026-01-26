@@ -56,9 +56,10 @@ RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
 RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 RUN bash -c ". $HOME/.nvm/nvm.sh && nvm install 24 "
-RUN node -v
-RUN npm -v
-RUN npm install -g @anthropic-ai/claude-code
+RUN bash -c ". $HOME/.nvm/nvm.sh && node -v"
+RUN bash -c ". $HOME/.nvm/nvm.sh && npm -v"
+RUN bash -c ". $HOME/.nvm/nvm.sh && npm install -g @anthropic-ai/claude-code"
+RUN echo ". $HOME/.nvm/nvm.sh" >> /root/.bashrc
 
 # 创建工作目录
 WORKDIR ${WORKDIR}
