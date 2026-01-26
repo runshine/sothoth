@@ -22,10 +22,33 @@ RUN apt-get update && apt-get install -y \
     # Python环境
     python3 python3-pip python3-dev \
     # 其他实用工具
-    jq tree tmux less file ttyd nohup\
+    jq tree tmux less file\
     # 清理缓存
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
+
+# 根据架构下载ttyd（适配GitHub Actions多架构构建）
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        curl -L "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64" -o /tmp/ttyd; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+        curl -L "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.aarch64" -o /tmp/ttyd; \
+    elif [ "$TARGETARCH" = "arm" ]; then \
+        if [ "$TARGETVARIANT" = "v7" ]; then \
+            curl -L "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.armhf" -o /tmp/ttyd; \
+        elif [ "$TARGETVARIANT" = "v5" ]; then \
+            curl -L "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.armel" -o /tmp/ttyd; \
+        else \
+            curl -L "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.armhf" -o /tmp/ttyd; \
+        fi; \
+    else \
+        echo "Unsupported architecture: $TARGETARCH" && exit 1; \
+    fi && \
+    chmod +x /tmp/ttyd && \
+    mv /tmp/ttyd /usr/bin/ttyd && \
+    echo "Downloaded ttyd for architecture: $TARGETARCH $TARGETVARIANT"
 
 # 安装Python依赖
 COPY requirements.txt .
@@ -36,7 +59,7 @@ RUN curl \. "$HOME/.nvm/nvm.sh"
 RUN nvm install 24
 RUN node -v
 RUN npm -v
-RUn npm install -g @anthropic-ai/claude-code
+RUN npm install -g @anthropic-ai/claude-code
 
 # 创建工作目录
 WORKDIR ${WORKDIR}
