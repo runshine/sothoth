@@ -41,6 +41,8 @@ kubernetes:
   code_server_pull_policy: "Always"
   # CodeWiki镜像
   codewiki_image: "ghcr.io/runshine/codewiki:latest"
+  codewiki_container_port: 8080
+  codewiki_service_port: 8080
   # CodeWiki镜像拉取策略: Always(每次都拉取), IfNotPresent(本地不存在时拉取), Never(从不拉取)
   codewiki_pull_policy: "Always"
   # 默认存储大小

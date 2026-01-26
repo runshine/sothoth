@@ -190,8 +190,8 @@ class Config:
                                      os.getenv("K8S_CODEWIKI_SERVICE_PORT", "8080"))
     K8S_CONTAINER_PORT = int(get_yaml_config("kubernetes", "container_port", default=8443) or
                              os.getenv("K8S_CONTAINER_PORT", "8443"))
-    K8S_CODEWIKI_CONTAINER_PORT = int(get_yaml_config("kubernetes", "codewiki_container_port", default=8000) or
-                                       os.getenv("K8S_CODEWIKI_CONTAINER_PORT", "8000"))
+    K8S_CODEWIKI_CONTAINER_PORT = int(get_yaml_config("kubernetes", "codewiki_container_port", default=8080) or
+                                       os.getenv("K8S_CODEWIKI_CONTAINER_PORT", "8080"))
     K8S_DEFAULT_STORAGE_SIZE = get_yaml_config("kubernetes", "default_storage_size", default="5Gi") or \
                                os.getenv("K8S_DEFAULT_STORAGE_SIZE", "5Gi")
 

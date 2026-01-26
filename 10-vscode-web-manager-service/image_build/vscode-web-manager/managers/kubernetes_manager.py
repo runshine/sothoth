@@ -1879,8 +1879,8 @@ class KubernetesManager:
                 "name": deploy_name,
                 "namespace": self.namespace,
                 "replica": getattr(deployment.status, 'replica', 0) or getattr(deployment.status, 'replicas', 0) or 0,
-                "ready_replica": deployment.status.ready_replica if deployment.status else 0,
-                "available_replica": deployment.status.available_replica if deployment.status else 0,
+                "ready_replicas": deployment.status.ready_replicas if deployment.status else 0,
+                "available_replicas": deployment.status.available_replicas if deployment.status else 0,
                 "pods": pod_info,
                 "conditions": [
                     {
