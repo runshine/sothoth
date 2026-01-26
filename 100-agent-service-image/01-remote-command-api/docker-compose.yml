@@ -13,6 +13,9 @@ services:
       - PORT=8080
       - WORKDIR=/app
       - ALLOWED_COMMANDS=  # 留空表示允许所有（生产环境建议设置）
+      - ANTHROPIC_BASE_URL="http://192.168.12.90:3000"
+      - ANTHROPIC_AUTH_TOKEN="sk-u8yhUikiUX1tyQlG7Zt7T6DLqPbIbRMx6N1k1eQGbdDH72pw"
+      - ANTHROPIC_MODEL="minimax/minimax-m2.1"
 
     # 端口映射
     ports:
