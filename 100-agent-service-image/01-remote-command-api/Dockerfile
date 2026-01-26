@@ -6,7 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # 设置环境变量
 ENV TIMEOUT=180
-ENV PORT=8080
+ENV PORT=20001
 ENV WORKDIR=/app
 
 # 安装基础工具和编译环境
@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y \
     # Python环境
     python3 python3-pip python3-dev \
     # 其他实用工具
-    jq tree tmux less file \
+    jq tree tmux less file ttyd nohup\
     # 清理缓存
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -30,6 +30,13 @@ RUN apt-get update && apt-get install -y \
 # 安装Python依赖
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
+
+RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+RUN curl \. "$HOME/.nvm/nvm.sh"
+RUN nvm install 24
+RUN node -v
+RUN npm -v
+RUn npm install -g @anthropic-ai/claude-code
 
 # 创建工作目录
 WORKDIR ${WORKDIR}
