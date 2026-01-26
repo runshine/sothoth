@@ -5,7 +5,7 @@ on:
       - 'v2.*'
     paths:
       - .github/workflows/build-tetragon-monitor-image.yml
-      - 100-agent-service-image/02-tetragon-monitor/*
+      - 100-agent-service-image/02-tetragon-monitor/**
 jobs:
   build-tetragon-monitor-image:
     runs-on: ubuntu-latest

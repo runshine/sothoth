@@ -5,7 +5,7 @@ on:
       - 'v2.*'
     paths:
       - .github/workflows/build-vpn-monitor-image.yml
-      - 02-vpn-access-service/image_build/vpn-monitor/*
+      - 02-vpn-access-service/image_build/vpn-monitor/**
 jobs:
   build-vpn-monitor-image:
     runs-on: ubuntu-latest

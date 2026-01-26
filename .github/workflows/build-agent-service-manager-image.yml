@@ -5,8 +5,8 @@ on:
       - 'v2.*'
     paths:
       - .github/workflows/build-agent-service-manager-image.yml
-      - 07-agent-service-manager-service/image_build/agent-service-manager/*
-      - 07-agent-service-manager-service/image_build/agent-service-manager-frontend/*
+      - 07-agent-service-manager-service/image_build/agent-service-manager/**
+      - 07-agent-service-manager-service/image_build/agent-service-manager-frontend/**
       - 07-agent-service-manager-service/image_build/agent-service-manager-frontend.Dockerfile
 jobs:
   build-agent-service-manager-image:

@@ -5,8 +5,8 @@ on:
       - 'v2.*'
     paths:
       - .github/workflows/build-vscode-web-manager-image.yml
-      - 10-vscode-web-manager-service/image_build/vscode-web-manager/*
-      - 10-vscode-web-manager-service/image_build/vscode-web-manager-frontend/*
+      - 10-vscode-web-manager-service/image_build/vscode-web-manager/**
+      - 10-vscode-web-manager-service/image_build/vscode-web-manager-frontend/**
       - 10-vscode-web-manager-service/image_build/vscode-web-manager-frontend.Dockerfile
 jobs:
   build-vscode-web-manager-image:

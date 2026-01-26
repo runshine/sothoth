@@ -5,7 +5,7 @@ on:
       - 'v2.*'
     paths:
       - .github/workflows/build-remote-command-api-image.yml
-      - 100-agent-service-image/01-remote-command-api/*
+      - 100-agent-service-image/01-remote-command-api/**
 jobs:
   build-remote-command-api-image:
     runs-on: ubuntu-latest
