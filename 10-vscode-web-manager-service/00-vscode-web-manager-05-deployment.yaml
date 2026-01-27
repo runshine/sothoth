@@ -35,6 +35,8 @@ spec:
             value: lubcorzexc/deepsight-codeserver:latest
           - name: K8S_DEFAULT_STORAGE_SIZE
             value: 100Gi
+          - name: VSCODE_INGRESS_DOMAIN
+            value: code-server.sothothv2.com
         volumeMounts:
         - name: shared-code-storage
           mountPath: /data

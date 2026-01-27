@@ -90,7 +90,7 @@ data:
     up "/script/server_up.sh"
     reneg-sec 0
     push "route 200.64.0.0 255.255.0.0"
-    #push "route 10.42.0.0 255.255.0.0"
+    push "route 10.42.0.0 255.255.0.0"
     push "route 10.96.0.0 255.240.0.0"
     client-config-dir /etc/openvpn/ccd
     EOF
