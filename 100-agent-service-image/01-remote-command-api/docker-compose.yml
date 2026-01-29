@@ -40,11 +40,6 @@ services:
       - NET_ADMIN   # 网络管理权限
       - IPC_LOCK    # IPC锁定
 
-    # 系统参数
-    sysctls:
-      - net.core.somaxconn=1024
-      - kernel.msgmax=65536
-
     # 资源限制
     deploy:
       resources:
@@ -52,7 +47,7 @@ services:
           cpus: '2'
           memory: 2G
         reservations:
-          cpus: '0.5'
+          cpus: '1'
           memory: 512M
 
     # 安全选项（允许调试）

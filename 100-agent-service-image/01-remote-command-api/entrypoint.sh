@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 入口脚本
-set -e
+#set -e
 
 echo "=========================================="
 echo "Remote Command Executor Container"
