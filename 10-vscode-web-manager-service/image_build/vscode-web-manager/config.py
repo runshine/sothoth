@@ -195,6 +195,10 @@ class Config:
     K8S_DEFAULT_STORAGE_SIZE = get_yaml_config("kubernetes", "default_storage_size", default="5Gi") or \
                                os.getenv("K8S_DEFAULT_STORAGE_SIZE", "5Gi")
 
+    # ============ VSCODE Ingress 配置 ============
+    VSCODE_INGRESS_DOMAIN = get_yaml_config("vscode", "ingress_domain", default="code-server.sothothv2.com") or \
+                            os.getenv("VSCODE_INGRESS_DOMAIN", "code-server.sothothv2.com")
+
     # ============ 文件限制 ============
     MAX_FILE_SIZE = int(get_yaml_config("storage", "max_file_size_mb", default=1024) or 1024) * 1024 * 1024
     MAX_DOWNLOAD_SIZE = int(get_yaml_config("storage", "max_download_size_mb", default=100) or 100) * 1024 * 1024

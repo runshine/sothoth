@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 安装CodeWiki
-RUN pip install git+https://github.com/FSoft-AI4Code/CodeWiki.git
+RUN pip install git+https://github.com/runshine/CodeWiki.git
 
 # 创建必要的目录
 RUN mkdir -p /config/workspace /app/logs /app/data

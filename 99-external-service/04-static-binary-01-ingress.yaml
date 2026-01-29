@@ -10,6 +10,8 @@ metadata:
     nginx.ingress.kubernetes.io/websocket-services: "static-binary"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # 支持最大10G文件上传
+    nginx.ingress.kubernetes.io/proxy-body-size: "10240m"
 spec:
   ingressClassName: nginx
   tls:

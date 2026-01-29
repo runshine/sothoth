@@ -1123,7 +1123,7 @@ class KubernetesManager:
         svc_name = self.generate_resource_name(project_id, "svc")
 
         if not host:
-            host = f"{project_id[:8]}.{os.getenv('VSCODE_INGRESS_DOMAIN', 'code-server.sothothv2.com')}"
+            host = f"{project_id[:8]}.{Config.VSCODE_INGRESS_DOMAIN}"
 
         try:
             ingress = self.client.V1Ingress(

@@ -57,6 +57,11 @@ http:
   # 归档下载超时（秒）
   archive_download_timeout: 3600
 
+# ============ VSCODE Ingress 配置 ============
+vscode:
+  # Code-Server Ingress 域名后缀
+  ingress_domain: "code-server.sothothv2.com"
+
 # ============ 文件存储配置 ============
 storage:
   # 基础目录

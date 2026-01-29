@@ -36,7 +36,7 @@ cat  <<EOF > ${ROOT_DIR}/service_config/99_nacos_client_service.json
 {
   "name": "nacos_client",
   "description": "nacos_client service",
-  "start_cmd": "ROOT_DIR=$ROOT_DIR UPSTREAM_SERVER=${UPSTREAM_SERVER} ${ROOT_DIR}/usr/bin/python ${ROOT_DIR}/usr/nacos/nacos_client.py -c ${ROOT_DIR}/usr/nacos/config.json",
+  "start_cmd": "${ROOT_DIR}/usr/bin/python ${ROOT_DIR}/usr/nacos/nacos_client.py -c ${ROOT_DIR}/usr/nacos/config.json",
   "pid_file": "${ROOT_DIR}/var/run/nacos_client.pid",
   "stdout_log": "${ROOT_DIR}/var/log/monitor_nacos_client_stdout.log",
   "stderr_log": "${ROOT_DIR}/var/log/monitor_nacos_client_stderr.log",
@@ -45,6 +45,6 @@ cat  <<EOF > ${ROOT_DIR}/service_config/99_nacos_client_service.json
   "check_interval": 30,
   "max_failures": 2,
   "depends_on": [],
-  "shell": true
+  "shell": false
 }
 EOF

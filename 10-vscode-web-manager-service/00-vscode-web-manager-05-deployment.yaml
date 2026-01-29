@@ -22,19 +22,6 @@ spec:
         ports:
         - containerPort: 8080
         env:
-          - name: DATABASE_URL
-            value: mysql+pymysql://vscode-web-manager:Huawei12%23%24@mysql.sothothv2-ns.svc.cluster.local/vscode-web-manager?ssl=false
-          - name: EXTERNAL_ACCESS_URL
-            value: http://vscode-web-manager.sothothv2-ns.svc.cluster.local
-          - name: IN_K8S
-            value: "true"
-          - name: K8S_STORAGE_CLASS
-            value: nfs-storage-192.168.13.66
-          - name: K8S_CODE_SERVER_IMAGE
-#            value: linuxserver/code-server:latest
-            value: lubcorzexc/deepsight-codeserver:latest
-          - name: K8S_DEFAULT_STORAGE_SIZE
-            value: 100Gi
           - name: VSCODE_INGRESS_DOMAIN
             value: code-server.sothothv2.com
         volumeMounts:
