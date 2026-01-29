@@ -42,7 +42,7 @@ class KubernetesManager:
             self.config = config
             self.ApiException = ApiException
 
-            if os.getenv("IN_K8S", "false").lower() == "true":
+            if Config.IN_K8S:
                 # logger.info("检测到IN_K8S=true，尝试使用集群内配置...")
                 try:
                     config.load_incluster_config()
@@ -164,7 +164,7 @@ class KubernetesManager:
 
         try:
             # 检查是否在K8S集群内部
-            in_k8s = os.getenv("IN_K8S", "false").lower() == "true"
+            in_k8s = Config.IN_K8S
 
             if in_k8s:
                 logger.info("在Kubernetes集群内部运行，使用ServiceAccount认证")

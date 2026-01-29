@@ -128,7 +128,7 @@ def init_system():
     print(f"项目ID生成方式：md5(md5(project_name)_md5(压缩包文件)_time)")
 
     # 检查是否在K8S集群内部运行
-    in_k8s = os.getenv("IN_K8S", "false").lower() == "true"
+    in_k8s = Config.IN_K8S
     if in_k8s:
         print("\n=== 运行在Kubernetes集群内部 ===")
         print("将使用ServiceAccount进行认证")
