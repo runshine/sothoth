@@ -54,12 +54,17 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
-RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
-RUN bash -c ". $HOME/.nvm/nvm.sh && nvm install 24 "
-RUN bash -c ". $HOME/.nvm/nvm.sh && node -v"
-RUN bash -c ". $HOME/.nvm/nvm.sh && npm -v"
-RUN bash -c ". $HOME/.nvm/nvm.sh && npm install -g @anthropic-ai/claude-code"
-RUN echo ". $HOME/.nvm/nvm.sh" >> /root/.bashrc
+RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
+        apt install node npm \
+    else \
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash \
+        bash -c ". $HOME/.nvm/nvm.sh && nvm install 24 " \
+        bash -c ". $HOME/.nvm/nvm.sh && node -v" \
+        bash -c ". $HOME/.nvm/nvm.sh && npm -v" \
+        bash -c ". $HOME/.nvm/nvm.sh && npm install -g @anthropic-ai/claude-code" \
+        echo ". $HOME/.nvm/nvm.sh" >> /root/.bashrc \
+    fi
+
 
 # 创建工作目录
 WORKDIR ${WORKDIR}
