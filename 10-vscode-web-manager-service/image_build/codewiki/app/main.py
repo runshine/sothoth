@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
     codewiki_config = {
         "version": "1.0",
         "api_key": os.getenv("CODEWIKI_API_KEY", ""),
-        "base_url": os.getenv("CODEWIKI_BASE_URL", "https://192.168.12.90:3000"),
+        "base_url": os.getenv("CODEWIKI_BASE_URL", "https://192.168.12.90:3000/v1"),
         "main_model": os.getenv("CODEWIKI_MAIN_MODEL", "minimax/minimax-m2.1"),
         "cluster_model": os.getenv("CODEWIKI_CLUSTER_MODEL", "minimax/minimax-m2.1"),
         "fallback_model": os.getenv("CODEWIKI_FALLBACK_MODEL", "minimax/minimax-m2.1"),

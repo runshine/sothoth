@@ -87,7 +87,7 @@ codewiki:
   # Claude API密钥（必需）
   api_key: "sk-u8yhUikiUX1tyQlG7Zt7T6DLqPbIbRMx6N1k1eQGbdDH72pw"
   # API基础URL（必需）
-  base_url: "http://192.168.12.90:3000"
+  base_url: "http://192.168.12.90:3000/v1"
   # 主模型（用于日常代码分析和对话）
   main_model: "minimax/minimax-m2.1"
   # 集群模型（用于大规模代码库分析）
