@@ -47,7 +47,7 @@ metadata:
   namespace: sothothv2-ns
 spec:
   serviceName: nacos-headless
-  replicas: 3
+  replicas: 1
   template:
     metadata:
       labels:
@@ -120,8 +120,10 @@ spec:
               value: "8848"
             - name: PREFER_HOST_MODE
               value: "hostname"
+            - name: MODE
+              value: "standalone"
             - name: NACOS_SERVERS
-              value: "nacos-0.nacos-headless.sothothv2-ns.svc.cluster.local:8848 nacos-1.nacos-headless.sothothv2-ns.svc.cluster.local:8848 nacos-2.nacos-headless.sothothv2-ns.svc.cluster.local:8848"
+              value: "nacos-0.nacos-headless.sothothv2-ns.svc.cluster.local:8848"
             - name: NACOS_AUTH_TOKEN
               value: c2Znc2FkZmFzZmFzZmFzZGZhc2Zhc2RmMTIzMjE0MjMzNGVkc2Z2c2Rmc2RmYXNmYXNkZg==
             - name: NACOS_AUTH_IDENTITY_KEY
@@ -133,3 +135,98 @@ spec:
   selector:
     matchLabels:
       app: nacos
+
+#---
+#apiVersion: apps/v1
+#kind: StatefulSet
+#metadata:
+#  name: nacos
+#  namespace: sothothv2-ns
+#spec:
+#  serviceName: nacos-headless
+#  replicas: 3
+#  template:
+#    metadata:
+#      labels:
+#        app: nacos
+#      annotations:
+#        pod.alpha.kubernetes.io/initialized: "true"
+#    spec:
+#      affinity:
+#        podAntiAffinity:
+#          requiredDuringSchedulingIgnoredDuringExecution:
+#            - labelSelector:
+#                matchExpressions:
+#                  - key: "app"
+#                    operator: In
+#                    values:
+#                      - nacos
+#              topologyKey: "kubernetes.io/hostname"
+#      containers:
+#        - name: nacos
+#          imagePullPolicy: Always
+#          image: nacos/nacos-server:latest
+#          resources:
+#            requests:
+#              memory: "2Gi"
+#              cpu: "500m"
+#          ports:
+#            - containerPort: 8848
+#              name: client
+#            - containerPort: 9848
+#              name: client-rpc
+#            - containerPort: 9849
+#              name: raft-rpc
+#            - containerPort: 7848
+#              name: old-raft-rpc
+#            - containerPort: 8080
+#              name: console
+#          env:
+#            - name: NACOS_REPLICAS
+#              value: "3"
+#            - name: MYSQL_SERVICE_HOST
+#              valueFrom:
+#                configMapKeyRef:
+#                  name: nacos-cm
+#                  key: mysql.host
+#            - name: MYSQL_SERVICE_DB_NAME
+#              valueFrom:
+#                configMapKeyRef:
+#                  name: nacos-cm
+#                  key: mysql.db.name
+#            - name: MYSQL_SERVICE_PORT
+#              valueFrom:
+#                configMapKeyRef:
+#                  name: nacos-cm
+#                  key: mysql.port
+#            - name: MYSQL_SERVICE_USER
+#              valueFrom:
+#                configMapKeyRef:
+#                  name: nacos-cm
+#                  key: mysql.user
+#            - name: MYSQL_SERVICE_PASSWORD
+#              valueFrom:
+#                configMapKeyRef:
+#                  name: nacos-cm
+#                  key: mysql.password
+#            - name: SPRING_DATASOURCE_PLATFORM
+#              value: "mysql"
+#            - name: NACOS_SERVER_PORT
+#              value: "8848"
+#            - name: NACOS_APPLICATION_PORT
+#              value: "8848"
+#            - name: PREFER_HOST_MODE
+#              value: "hostname"
+#            - name: NACOS_SERVERS
+#              value: "nacos-0.nacos-headless.sothothv2-ns.svc.cluster.local:8848 nacos-1.nacos-headless.sothothv2-ns.svc.cluster.local:8848 nacos-2.nacos-headless.sothothv2-ns.svc.cluster.local:8848"
+#            - name: NACOS_AUTH_TOKEN
+#              value: c2Znc2FkZmFzZmFzZmFzZGZhc2Zhc2RmMTIzMjE0MjMzNGVkc2Z2c2Rmc2RmYXNmYXNkZg==
+#            - name: NACOS_AUTH_IDENTITY_KEY
+#              value: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaass
+#            - name: NACOS_AUTH_IDENTITY_VALUE
+#              value: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+#            - name: MYSQL_SERVICE_DB_PARAM
+#              value: characterEncoding=utf8&connectTimeout=1000&socketTimeout=3000&autoReconnect=true&useSSL=false&allowPublicKeyRetrieval=true
+#  selector:
+#    matchLabels:
+#      app: nacos
