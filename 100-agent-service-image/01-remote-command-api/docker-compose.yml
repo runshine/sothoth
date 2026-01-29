@@ -10,7 +10,7 @@ services:
     # 环境变量配置
     environment:
       - TIMEOUT=180
-      - PORT=8080
+      - PORT=20001
       - WORKDIR=/app
       - ALLOWED_COMMANDS=  # 留空表示允许所有（生产环境建议设置）
       - ANTHROPIC_BASE_URL="http://192.168.12.90:3000"
@@ -19,7 +19,8 @@ services:
 
     # 端口映射
     ports:
-      - "12001:8080"
+      - "20001:20001"
+      - "20002:20002"
     # 卷挂载 - 主机目录只读挂载
     volumes:
       # 主机根目录只读挂载

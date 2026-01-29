@@ -9,6 +9,9 @@ ENV TIMEOUT=180
 ENV PORT=20001
 ENV WORKDIR=/app
 
+# 创建工作目录
+WORKDIR ${WORKDIR}
+
 # 安装基础工具和编译环境
 RUN apt-get update && apt-get install -y \
     # 基础工具
@@ -55,7 +58,7 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
-        apt-get install -y node npm \
+        apt-get install -y nodejs npm ;\
     else \
         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash ; \
         bash -c ". $HOME/.nvm/nvm.sh && nvm install 24" ; \
@@ -65,9 +68,6 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
         echo ". $HOME/.nvm/nvm.sh" >> /root/.bashrc ;\
     fi
 
-
-# 创建工作目录
-WORKDIR ${WORKDIR}
 
 # 复制应用代码
 COPY app.py .
