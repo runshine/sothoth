@@ -97,6 +97,8 @@ async def execute_codewiki_task(
         # 添加其他选项
         cmd.extend(["--verbose"])  # 启用详细日志
 
+        cmd.extend(["--github-pages"])
+
         # 设置工作目录
         workspace_dir = "/config/workspace"
         if folder and folder != ".":
