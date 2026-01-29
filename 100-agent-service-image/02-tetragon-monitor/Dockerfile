@@ -16,6 +16,7 @@ ENV GO111MODULE=on \
 RUN case ${TARGETARCH} in \
         arm) \
             case ${TARGETVARIANT} in \
+                5) export GOARCH=arm GOARM=5 ;; \
                 6) export GOARCH=arm GOARM=6 ;; \
                 7) export GOARCH=arm GOARM=7 ;; \
                 *) export GOARCH=arm GOARM=6 ;; \
@@ -29,10 +30,13 @@ RUN apk add --no-cache git
 
 # 复制go模块文件
 COPY go.mod go.sum ./
-RUN go mod download
 
 # 复制源代码
 COPY main.go .
+
+RUN go mod tidy
+
+RUN go mod download
 
 # 构建应用
 RUN go build -a -installsuffix cgo -ldflags="-w -s" -o tetragon-monitor .
