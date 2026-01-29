@@ -42,7 +42,7 @@ services:
 
   monitor:
     build: .
-    image: local/tetragon-monitor:latest
+    image: ghcr.io/runshine/tetragon-monitor:latest
     container_name: tetragon-monitor
     restart: unless-stopped
     depends_on:
