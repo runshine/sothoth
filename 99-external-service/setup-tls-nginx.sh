@@ -1,18 +1,46 @@
 #!/bin/bash
 
-# 设置变量
+# 设置 TLS 证书和 Kubernetes Secret 的函数
+setup_tls_secret() {
+    local domain="$1"
+    local namespace="$2"
+    local secret_name="wildcard-${domain//\*./}.tls"
 
+    echo "正在设置 ${domain} 的 TLS 证书和 Secret..."
 
+    # 生成 TLS 证书
+    ./setup-tls-cert.sh "${domain}"
 
-./setup-tls-cert.sh '*.sothothv2.com'
-kubectl delete secret wildcard-sothothv2.com-tls -n sothothv2-ns 2>/dev/null || true
-kubectl create secret tls wildcard-sothothv2.com-tls --namespace sothothv2-ns --key 'certs/*.sothothv2.com.key' --cert 'certs/*.sothothv2.com.crt'
-echo "Secret 'wildcard-sothothv2.com-tls' 已在命名空间 'sothothv2-ns' 中创建"
+    cat "certs/${domain}.crt" "certs/ca.crt" > "certs/${domain}_fullchain.crt"
 
-./setup-tls-cert.sh '*.code-server.sothothv2.com'
-kubectl delete secret wildcard-code-server.sothothv2.com-tls -n vscode 2>/dev/null || true
-kubectl create secret tls wildcard-code-server.sothothv2.com-tls --namespace vscode --key 'certs/*.code-server.sothothv2.com.key' --cert 'certs/*.code-server.sothothv2.com.crt'
-echo "Secret 'wildcard-code-server.sothothv2.com-tls' 已在命名空间 'vscode' 中创建"
+    # 删除已存在的 Secret（如果存在）
+    kubectl delete secret "${secret_name}" -n "${namespace}" 2>/dev/null || true
 
+    # 创建新的 TLS Secret
+    kubectl create secret tls "${secret_name}" \
+        --namespace "${namespace}" \
+        --key "certs/${domain}.key" \
+        --cert "certs/${domain}_fullchain.crt"
 
-echo -e "\n=== 设置完成！ ==="
+    echo "Secret '${secret_name}' 已在命名空间 '${namespace}' 中创建"
+    echo "---"
+}
+
+# 主函数
+main() {
+    echo "开始设置 TLS 证书和 Kubernetes Secrets..."
+    echo ""
+
+    # 设置第一个域
+    setup_tls_secret "*.sothothv2.com" "sothothv2-ns"
+
+    # 设置第二个域
+    setup_tls_secret "*.code-server.sothothv2.com" "vscode"
+
+    echo -e "\n=== 设置完成！ ==="
+}
+
+# 检查是否直接运行脚本（而不是被 source）
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main
+fi
