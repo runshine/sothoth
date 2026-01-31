@@ -4,7 +4,7 @@
 setup_tls_secret() {
     local domain="$1"
     local namespace="$2"
-    local secret_name="wildcard-${domain//\*./}.tls"
+    local secret_name="$3"
 
     echo "正在设置 ${domain} 的 TLS 证书和 Secret..."
 
@@ -32,10 +32,10 @@ main() {
     echo ""
 
     # 设置第一个域
-    setup_tls_secret "*.sothothv2.com" "sothothv2-ns"
+    setup_tls_secret "*.sothothv2.com" "sothothv2-ns" "wildcard-sothothv2.com-tls"
 
     # 设置第二个域
-    setup_tls_secret "*.code-server.sothothv2.com" "vscode"
+    setup_tls_secret "*.code-server.sothothv2.com" "vscode" "wildcard-code-server.sothothv2.com-tls"
 
     echo -e "\n=== 设置完成！ ==="
 }
