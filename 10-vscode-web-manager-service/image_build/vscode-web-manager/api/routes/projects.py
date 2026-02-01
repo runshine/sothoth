@@ -13,7 +13,7 @@ from sqlalchemy import func
 
 from config import Config
 from database import get_db
-from models import Project, ProjectFile, ProjectTaskLog, CodeServer
+from models import Project, ProjectTaskLog, CodeServer
 from utils.auth_utils import get_current_user
 from utils.file_utils import FileUtils
 from api.dependencies import TaskManagerDep  # 修正导入
@@ -150,15 +150,8 @@ async def list_projects(
 
     if search:
         search_pattern = f"%{search}%"
-        # 搜索项目名或文件名
-        file_project_ids = db.query(ProjectFile).filter(
-            ProjectFile.file_name.like(search_pattern)
-        ).distinct().subquery()
-
-        query = query.filter(
-            (Project.name.like(search_pattern)) |
-            (Project.id.in_(file_project_ids))
-        )
+        # 搜索项目名（文件名搜索需要遍历解压目录，暂时跳过）
+        query = query.filter(Project.name.like(search_pattern))
 
     if status:
         query = query.filter(Project.status == status)
@@ -207,10 +200,19 @@ async def get_project(
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
 
-    # 获取文件列表（如果项目已初始化）
+    # 获取文件列表（如果项目已初始化）- 从文件系统实时获取
     files = []
-    if project.status == Config.PROJECT_STATUS_READY:
-        files = db.query(ProjectFile).filter(ProjectFile.project_id == project_id).all()
+    if project.status == Config.PROJECT_STATUS_READY and project.extract_path and os.path.exists(project.extract_path):
+        files_info = FileUtils.scan_files(project.extract_path)
+        files = [
+            {
+                "path": f["path"],
+                "name": f["name"],
+                "size": f["size"],
+                "type": f["type"]
+            }
+            for f in files_info
+        ]
 
     # 获取Code-Server信息
     code_server = db.query(CodeServer).filter(CodeServer.project_id == project_id).first()
@@ -247,15 +249,7 @@ async def get_project(
             "created_at": project.created_at,
             "initialized_at": project.initialized_at
         },
-        "files": [
-            {
-                "path": f.file_path,
-                "name": f.file_name,
-                "size": f.file_size,
-                "type": f.file_type
-            }
-            for f in files
-        ] if files else [],
+        "files": files if files else [],
         "code_server": {
             "status": code_server.status if code_server else None,
             "access_url": code_server.access_url if code_server else None,

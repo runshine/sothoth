@@ -32,10 +32,10 @@ main() {
     echo ""
 
     # 设置第一个域
-    setup_tls_secret "*.sothothv2.com" "sothothv2-ns" "wildcard-sothothv2.com-tls"
+    setup_tls_secret "*.sothothv2.com"             "sothothv2-ns" "wildcard-sothothv2.com-tls"
 
     # 设置第二个域
-    setup_tls_secret "*.code-server.sothothv2.com" "vscode" "wildcard-code-server.sothothv2.com-tls"
+    setup_tls_secret "*.code-server.sothothv2.com" "vscode" "      wildcard-code-server.sothothv2.com-tls"
 
     echo -e "\n=== 设置完成！ ==="
 }

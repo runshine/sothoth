@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from config import Config
 from database import SessionLocal
-from models import Project, ProjectFile, ProjectTaskLog, CodeServer, CodeWiki
+from models import Project, ProjectTaskLog, CodeServer, CodeWiki
 from utils.file_utils import FileUtils
 from utils.task_logger import TaskLogger
 from utils.errors import ProjectError, CodeServerError
@@ -108,27 +108,8 @@ def initialize_project_task(project_id: str, archive_path: str, storage_size: st
         project.extract_path = extract_dir
         task_logger.info("文件解压到本地目录成功")
 
-        # 步骤2: 扫描文件
-        task_logger.info("步骤2: 扫描文件")
-        files_info = FileUtils.scan_files(extract_dir)
-        total_size = sum(f["size"] for f in files_info)
-
-        # 保存文件信息到数据库
-        for file_info in files_info:
-            db_file = ProjectFile(
-                project_id=project_id,
-                file_path=file_info["path"],
-                file_name=file_info["name"],
-                file_size=file_info["size"],
-                file_type=file_info["type"]
-            )
-            db.add(db_file)
-
-        project.file_count = len(files_info)
-        project.total_size = total_size
-        db.commit()
-
-        task_logger.info(f"扫描完成: 共 {len(files_info)} 个文件，总大小 {total_size} 字节")
+        # 跳过步骤2: 不扫描文件，不创建数据库记录
+        task_logger.info("步骤2: 跳过文件扫描（不创建数据库记录）")
 
         # 步骤3: 创建PVC并拷贝文件
         if create_pvc:
@@ -499,15 +480,7 @@ def delete_project_task(project_id: str, user_id: int):
             except Exception as e:
                 task_logger.warning(f"清理临时下载文件失败: {str(e)}")
 
-        # 步骤4: 删除项目文件记录
-        task_logger.info("步骤4: 删除项目文件记录")
-        try:
-            db.query(ProjectFile).filter(ProjectFile.project_id == project_id).delete()
-            task_logger.info("项目文件记录删除成功")
-        except Exception as e:
-            task_logger.warning(f"删除项目文件记录失败: {str(e)}")
-
-        # 步骤5: 删除项目任务日志记录
+        # 步骤4: 删除项目任务日志记录
         task_logger.info("步骤5: 删除项目任务日志记录")
         try:
             db.query(ProjectTaskLog).filter(ProjectTaskLog.project_id == project_id).delete()

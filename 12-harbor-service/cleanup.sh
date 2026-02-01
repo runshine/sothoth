@@ -5,6 +5,7 @@ set -e
 
 echo "开始清理应用服务..."
 
+helm uninstall harbor -n harbor-ns
 
 files=( ./* )
 len=${#files[@]}
@@ -15,6 +16,7 @@ for (( i=len-1; i>=0; i-- )); do
     echo "start process: $file"
     kubectl delete -f ${file} --ignore-not-found
   fi
+
 done
 
 
