@@ -59,12 +59,15 @@ RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
         apt-get update && apt-get install -y nodejs npm && apt-get clean && rm -rf /var/lib/apt/lists/* ;\
+        npm install -g @anthropic-ai/claude-code ; \
+        npm install -g opencode-ai@latest ; \
     else \
         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash ; \
         bash -c ". $HOME/.nvm/nvm.sh && nvm install 24" ; \
         bash -c ". $HOME/.nvm/nvm.sh && node -v" ; \
         bash -c ". $HOME/.nvm/nvm.sh && npm -v" ; \
         bash -c ". $HOME/.nvm/nvm.sh && npm install -g @anthropic-ai/claude-code" ; \
+        bash -c ". $HOME/.nvm/nvm.sh && npm install -g @opencode-ai@latest" ; \
         echo ". $HOME/.nvm/nvm.sh" >> /root/.bashrc ;\
     fi
 
