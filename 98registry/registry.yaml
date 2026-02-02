@@ -1,0 +1,83 @@
+# 定义命名空间（可选，若不想使用默认default，可创建专属命名空间，删除则使用default）
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: registry-ns
+  labels:
+    app: docker-registry
+---
+# 持久化存储声明（PVC），绑定指定NFS StorageClass
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: registry-pvc
+  namespace: registry-ns # 与上面命名空间保持一致，若删除命名空间则去掉该行
+spec:
+  accessModes:
+    - ReadWriteMany # NFS 支持多节点读写，替换原有的ReadWriteOnce，更灵活
+  storageClassName: "nfs-storage-192.168.13.66" # 关键：添加你的指定StorageClass
+  resources:
+    requests:
+      storage: 10Gi # 存储大小，可根据你的需求调整（如50Gi）
+---
+# Deployment 部署 registry 应用
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: docker-registry
+  namespace: registry-ns # 与上面命名空间保持一致，若删除命名空间则去掉该行
+  labels:
+    app: docker-registry
+spec:
+  replicas: 1 # 单副本即可，若需多副本，因使用NFS共享存储，可直接增加副本数（如2）
+  selector:
+    matchLabels:
+      app: docker-registry
+  template:
+    metadata:
+      labels:
+        app: docker-registry
+    spec:
+      containers:
+      - name: docker-registry
+        image: registry:2 # 官方稳定镜像
+        imagePullPolicy: IfNotPresent # 本地无镜像时再拉取
+        ports:
+        - containerPort: 5000 # registry 默认端口
+        volumeMounts:
+        - name: registry-storage
+          mountPath: /var/lib/registry # 挂载容器内的默认数据存储目录
+        # 可选：配置健康检查，提高可用性
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: registry-storage
+        persistentVolumeClaim:
+          claimName: registry-pvc # 绑定上面创建的PVC
+---
+# Service 暴露 registry 服务，方便访问
+apiVersion: v1
+kind: Service
+metadata:
+  name: docker-registry-service
+  namespace: registry-ns # 与上面命名空间保持一致，若删除命名空间则去掉该行
+  labels:
+    app: docker-registry
+spec:
+  type: NodePort # 集群内外可访问（通过节点IP+NodePort）
+  selector:
+    app: docker-registry # 匹配Deployment的Pod标签
+  ports:
+  - port: 5000 # Service 端口
+    targetPort: 5000 # 对应容器端口
+    nodePort: 30500 # 固定节点端口（可选，范围30000-32767，不指定则k8s自动分配）
