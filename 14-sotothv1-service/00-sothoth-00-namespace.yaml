@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sothoth
+  labels:
+    name: sothoth
+    environment: production
