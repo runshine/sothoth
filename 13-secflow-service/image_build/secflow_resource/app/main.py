@@ -14,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from sqlalchemy import text
 from starlette.responses import StreamingResponse
 
 # 配置日志

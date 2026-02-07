@@ -40,7 +40,7 @@ EXPOSE 10002
 
 # 健康检查（端口在运行时从配置读取）
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD python -c "import yaml; import subprocess; port=yaml.safe_load(open('/app/config.yaml'))['app'].get('port',10002); subprocess.run(['curl','-f',f'http://localhost:{port}/health'])" || exit 1
+    CMD python -c "import yaml; import subprocess; port=yaml.safe_load(open('/app/config.yaml'))['app'].get('port',10002); subprocess.run(['curl','-f',f'http://localhost:{port}/api/resource/health'])" || exit 1
 
 # 启动命令
 CMD ["python", "/app/start.py"]
