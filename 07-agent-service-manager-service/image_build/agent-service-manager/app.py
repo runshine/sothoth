@@ -33,12 +33,26 @@ from flask import send_file, redirect
 import tarfile
 import traceback
 
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+import threading
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
+import base64
+import requests
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
-from flask_httpauth import HTTPTokenAuth
-from werkzeug.security import generate_password_hash, check_password_hash
-import jwt
-import base64
 import io
 import zipfile
 import shutil
@@ -248,37 +262,7 @@ class DatabaseManager:
     def init_database(self):
         """初始化数据库（创建表和索引）"""
         with self.get_connection() as db:
-            # 创建用户表
-            if self.db_type == 'mysql':
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS users (
-                                                                id INT AUTO_INCREMENT PRIMARY KEY,
-                                                                username VARCHAR(100) UNIQUE NOT NULL,
-                               password_hash VARCHAR(255) NOT NULL,
-                               role VARCHAR(20) NOT NULL DEFAULT 'user',
-                               email VARCHAR(100),
-                               full_name VARCHAR(100),
-                               is_active TINYINT DEFAULT 1,
-                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                               last_login TIMESTAMP NULL,
-                               INDEX idx_users_username (username),
-                               INDEX idx_users_role (role)
-                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                           ''')
-            else:  # sqlite
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS users (
-                                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                                username TEXT UNIQUE NOT NULL,
-                                                                password_hash TEXT NOT NULL,
-                                                                role TEXT NOT NULL DEFAULT 'user',
-                                                                email TEXT,
-                                                                full_name TEXT,
-                                                                is_active INTEGER DEFAULT 1,
-                                                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                                last_login TIMESTAMP
-                           )
-                           ''')
+            # 创建服务模板表
 
             # 创建服务模板表
             if self.db_type == 'mysql':
@@ -321,7 +305,7 @@ class DatabaseManager:
                                task_type VARCHAR(20) NOT NULL,
                                service_name VARCHAR(100) NOT NULL,
                                agent_key VARCHAR(32) NOT NULL,
-                               workspace_id VARCHAR(100),
+                               project_id VARCHAR(100),
                                status VARCHAR(20) NOT NULL DEFAULT 'pending',
                                progress INT DEFAULT 0,
                                message TEXT,
@@ -332,7 +316,7 @@ class DatabaseManager:
                                INDEX idx_tasks_task_id (task_id),
                                INDEX idx_tasks_status (status),
                                INDEX idx_tasks_agent_key (agent_key),
-                               INDEX idx_tasks_workspace (workspace_id),
+                               INDEX idx_tasks_project (project_id),
                                INDEX idx_tasks_created (created_at)
                                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
@@ -344,7 +328,7 @@ class DatabaseManager:
                                                                 task_type TEXT NOT NULL,
                                                                 service_name TEXT NOT NULL,
                                                                 agent_key TEXT NOT NULL,
-                                                                workspace_id TEXT,
+                                                                project_id TEXT,
                                                                 status TEXT NOT NULL DEFAULT 'pending',
                                                                 progress INTEGER DEFAULT 0,
                                                                 message TEXT,
@@ -399,7 +383,7 @@ class DatabaseManager:
                                                                        agent_key VARCHAR(32) UNIQUE NOT NULL,
                                ip_address VARCHAR(45) NOT NULL,
                                hostname VARCHAR(100) NOT NULL,
-                               workspace_id VARCHAR(100) NOT NULL,
+                               project_id VARCHAR(100) NOT NULL,
                                full_name VARCHAR(255) NOT NULL,
                                status VARCHAR(20) NOT NULL DEFAULT 'unknown',
                                last_seen TIMESTAMP NULL,
@@ -408,7 +392,7 @@ class DatabaseManager:
                                pod_id VARCHAR(100),
                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                                INDEX idx_agent_status_key (agent_key),
-                               INDEX idx_agent_status_workspace (workspace_id),
+                               INDEX idx_agent_status_project (project_id),
                                INDEX idx_agent_status_updated (updated_at)
                                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
@@ -419,7 +403,7 @@ class DatabaseManager:
                                                                        agent_key TEXT UNIQUE NOT NULL,
                                                                        ip_address TEXT NOT NULL,
                                                                        hostname TEXT NOT NULL,
-                                                                       workspace_id TEXT NOT NULL,
+                                                                       project_id TEXT NOT NULL,
                                                                        full_name TEXT NOT NULL,
                                                                        status TEXT NOT NULL DEFAULT 'unknown',
                                                                        last_seen TIMESTAMP,
@@ -430,19 +414,8 @@ class DatabaseManager:
                            )
                            ''')
                 # 为SQLite创建索引
-                db.execute('CREATE INDEX IF NOT EXISTS idx_agent_status_workspace ON agent_status(workspace_id)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_agent_status_project ON agent_status(project_id)')
 
-            # 创建默认管理员用户（如果不存在）
-            existing = db.fetch_one("SELECT COUNT(*) as count FROM users WHERE username = 'admin'")
-            if existing and existing['count'] == 0:
-                admin_hash = generate_password_hash('admin123')
-                db.execute('''
-                           INSERT INTO users (username, password_hash, role, email, full_name)
-                           VALUES (%s, %s, 'admin', 'admin@example.com', 'Administrator')
-                           ''' if self.db_type == 'mysql' else '''
-                                                               INSERT INTO users (username, password_hash, role, email, full_name)
-                                                               VALUES (?, ?, 'admin', 'admin@example.com', 'Administrator')
-                                                               ''', ('admin', admin_hash))
 
             self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}）")
 
@@ -858,8 +831,8 @@ class ConnectionChecker:
 # ===================== 数据类定义 =====================
 
 @dataclass
-class WorkspaceInfo:
-    """工作空间信息"""
+class ProjectInfo:
+    """项目信息"""
     id: str
     agent_count: int = 0
     online_agents: int = 0
@@ -879,7 +852,7 @@ class AgentInfo:
     key: str
     ip_address: str
     hostname: str
-    workspace_id: str
+    project_id: str
     full_name: str
     status: str = 'unknown'
     last_seen: Optional[datetime] = None
@@ -917,7 +890,7 @@ class TaskInfo:
     task_type: str
     service_name: str
     agent_key: str
-    workspace_id: str = ''
+    project_id: str = ''
     status: str = 'pending'
     progress: int = 0
     message: str = ''
@@ -2866,7 +2839,7 @@ class AgentManager:
         }
 
         self.agents: Dict[str, AgentInfo] = {}
-        self.workspaces: Dict[str, WorkspaceInfo] = {}
+        self.projects: Dict[str, ProjectInfo] = {}
         self.lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
 
@@ -2913,7 +2886,7 @@ class AgentManager:
                         key=agent_data['agent_key'],
                         ip_address=agent_data['ip_address'],
                         hostname=agent_data['hostname'],
-                        workspace_id=agent_data['workspace_id'],
+                        project_id=agent_data['project_id'],
                         full_name=agent_data['full_name'],
                         status=agent_data['status'],
                         pod_id=agent_data['pod_id']
@@ -2935,44 +2908,44 @@ class AgentManager:
                             agent.services = agent_data['services']
 
                     self.agents[agent.key] = agent
-                    self._update_workspace(agent.workspace_id, agent.key)
+                    self._update_project(agent.project_id, agent.key)
 
                 self.logger.info(f"从数据库加载了 {len(agents_data)} 个Agent状态")
 
         except Exception as e:
             self.logger.error(f"从数据库加载Agent状态失败: {str(e)}")
 
-    def _update_workspace(self, workspace_id: str, agent_key: str):
-        if workspace_id not in self.workspaces:
-            self.workspaces[workspace_id] = WorkspaceInfo(
-                id=workspace_id,
+    def _update_project(self, project_id: str, agent_key: str):
+        if project_id not in self.projects:
+            self.projects[project_id] = ProjectInfo(
+                id=project_id,
                 last_refresh=datetime.now()
             )
 
-        workspace = self.workspaces[workspace_id]
-        if agent_key not in workspace.agents:
-            workspace.agents.append(agent_key)
+        project = self.projects[project_id]
+        if agent_key not in project.agents:
+            project.agents.append(agent_key)
 
         online_count = 0
-        for key in workspace.agents:
+        for key in project.agents:
             agent = self.agents.get(key)
             if agent and agent.status == 'online':
                 online_count += 1
 
-        workspace.agent_count = len(workspace.agents)
-        workspace.online_agents = online_count
-        workspace.last_refresh = datetime.now()
+        project.agent_count = len(project.agents)
+        project.online_agents = online_count
+        project.last_refresh = datetime.now()
 
     def _parse_agent_name(self, service_name: str) -> Optional[Tuple[str, str, str]]:
-        # 找到第一个连字符，它分隔 workspace_id 和 hostname
+        # 找到第一个连字符，它分隔 project_id 和 hostname
         first_dash = service_name.find('-')
         if first_dash == -1:
             return None
 
-        workspace_id = service_name[:first_dash]
+        project_id = service_name[:first_dash]
 
-        # 确保 workspace_id 不为空且不包含连字符
-        if not workspace_id or '-' in workspace_id:
+        # 确保 project_id 不为空且不包含连字符
+        if not project_id or '-' in project_id:
             return None
 
         # 找到最后一个连字符，它分隔 hostname 和 IP
@@ -2991,7 +2964,7 @@ class AgentManager:
         if not self._is_ip_address(ip_address):
             return None
 
-        return workspace_id, hostname, ip_address
+        return project_id, hostname, ip_address
 
     def _get_agent_key(self, hostname: str, ip_address: str, service_name: str) -> Optional[str]:
         """
@@ -3300,7 +3273,7 @@ class AgentManager:
                 for service in services:
                     result = self._parse_agent_name(service)
                     if result:
-                        workspace_id, hostname, ip_address = result
+                        project_id, hostname, ip_address = result
 
                         # 使用新方法获取agent_key，传入service_name
                         agent_key = self._get_agent_key(hostname, ip_address, service)
@@ -3314,7 +3287,7 @@ class AgentManager:
                             key=agent_key,
                             ip_address=ip_address,
                             hostname=hostname,
-                            workspace_id=workspace_id,
+                            project_id=project_id,
                             full_name=service,
                             status='unknown',
                             pod_id=self.pod_id
@@ -3327,7 +3300,7 @@ class AgentManager:
                 with self.lock:
                     for key, new_agent in new_agents.items():
                         self.agents[key] = new_agent
-                        self._update_workspace(new_agent.workspace_id, key)
+                        self._update_project(new_agent.project_id, key)
 
                     removed_keys = [k for k in self.agents.keys() if k not in new_agents]
                     for key in removed_keys:
@@ -3338,42 +3311,51 @@ class AgentManager:
         except Exception as e:
             self.logger.error(f"刷新Agent列表异常: {str(e)}")
 
-    def cleanup_offline_agents(self) -> Tuple[bool, str, Dict]:
+    def cleanup_offline_agents(self, project_id: str = None) -> Tuple[bool, str, Dict]:
         """
-        清除全部掉线的agent
+        清除指定project下掉线的agent
+
+        Args:
+            project_id: 项目ID，如果为None则清理所有项目的掉线agent
 
         Returns:
             (success, message, cleanup_info)
         """
         try:
             # 获取分布式锁，确保只有一个POD执行清理
-            lock_key = "agent_cleanup_lock"
+            lock_key = f"agent_cleanup_lock_{project_id}" if project_id else "agent_cleanup_lock"
             with self.redis_manager.get_lock(lock_key, timeout=60) as lock:
                 if lock.is_acquired():
-                    self.logger.info("成功获取清理锁，开始清除掉线agent")
+                    self.logger.info(f"成功获取清理锁，开始清除{('project ' + project_id) if project_id else '全部'}掉线agent")
                 else:
                     self.logger.warning("无法获取清理锁，跳过本次清理")
                     return False, "其他POD正在执行清理操作，请稍后重试", {}
 
+                # 构建查询条件
+                if project_id:
+                    where_clause = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                    where_clause_sqlite = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+                else:
+                    where_clause = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                    where_clause_sqlite = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+
                 # 查询所有掉线的agent
                 if self.db.db_type == 'mysql':
-                    offline_agents = self.db.fetch_all('''
-                                                       SELECT agent_key, hostname, ip_address, workspace_id, status,
+                    offline_agents = self.db.fetch_all(f'''
+                                                       SELECT agent_key, hostname, ip_address, project_id, status,
                                                               last_seen, updated_at
                                                        FROM agent_status
-                                                       WHERE status IN ('offline', 'error', 'timeout', 'unknown')
-                                                         AND updated_at < NOW() - INTERVAL 5 MINUTE
+                                                       {where_clause}
                                                        ORDER BY updated_at ASC
-                                                       ''')
+                                                       ''', (project_id,) if project_id else None)
                 else:
-                    offline_agents = self.db.fetch_all('''
-                                                       SELECT agent_key, hostname, ip_address, workspace_id, status,
+                    offline_agents = self.db.fetch_all(f'''
+                                                       SELECT agent_key, hostname, ip_address, project_id, status,
                                                               last_seen, updated_at
                                                        FROM agent_status
-                                                       WHERE status IN ('offline', 'error', 'timeout', 'unknown')
-                                                         AND updated_at < datetime('now', '-5 minutes')
+                                                       {where_clause_sqlite}
                                                        ORDER BY updated_at ASC
-                                                       ''')
+                                                       ''', (project_id,) if project_id else None)
 
                 if not offline_agents:
                     return True, "没有需要清理的掉线agent", {
@@ -3411,16 +3393,16 @@ class AgentManager:
                                 del self.agents[agent_key]
 
                             # 从工作空间中移除
-                            for workspace in self.workspaces.values():
-                                if agent_key in workspace.agents:
-                                    workspace.agents.remove(agent_key)
+                            for project in self.projects.values():
+                                if agent_key in project.agents:
+                                    project.agents.remove(agent_key)
 
                             # 记录清理的agent信息
                             cleaned_agents.append({
                                 'agent_key': agent_key,
                                 'hostname': agent_data['hostname'],
                                 'ip_address': agent_data['ip_address'],
-                                'workspace_id': agent_data['workspace_id'],
+                                'project_id': agent_data['project_id'],
                                 'status': agent_data['status'],
                                 'last_seen': agent_data['last_seen'].isoformat() if agent_data['last_seen'] else None,
                                 'cleaned_at': datetime.now().isoformat()
@@ -3433,18 +3415,18 @@ class AgentManager:
                             self.logger.error(f"清理agent {agent_key} 失败: {str(e)}")
                             continue
 
-                # 更新工作空间统计
-                for workspace_id, workspace in self.workspaces.items():
+                # 更新项目统计
+                for project_id, project in self.projects.items():
                     # 重新计算在线agent数量
                     online_count = 0
-                    for agent_key in workspace.agents:
+                    for agent_key in project.agents:
                         agent = self.agents.get(agent_key)
                         if agent and agent.status == 'online':
                             online_count += 1
 
-                    workspace.agent_count = len(workspace.agents)
-                    workspace.online_agents = online_count
-                    workspace.last_refresh = datetime.now()
+                    project.agent_count = len(project.agents)
+                    project.online_agents = online_count
+                    project.last_refresh = datetime.now()
 
                 # 准备清理信息
                 cleanup_info = {
@@ -3454,7 +3436,7 @@ class AgentManager:
                     'pod_id': self.pod_id,
                     'cleaned_agents': cleaned_agents,
                     'remaining_agents': len(self.agents),
-                    'workspace_count': len(self.workspaces)
+                    'project_count': len(self.projects)
                 }
 
                 self.logger.info(f"清理完成: 已清理 {cleaned_count} 个掉线agent")
@@ -3464,33 +3446,47 @@ class AgentManager:
             self.logger.error(f"清除掉线agent失败: {str(e)}", exc_info=True)
             return False, f"清理失败: {str(e)}", {}
 
-    def get_offline_agents_count(self) -> Tuple[int, int]:
+    def get_offline_agents_count(self, project_id: str = None) -> Tuple[int, int]:
         """
         获取掉线agent的统计信息
+
+        Args:
+            project_id: 项目ID，如果为None则统计所有项目
 
         Returns:
             (offline_count, total_count)
         """
         try:
+            # 构建过滤条件
+            project_filter = ""
+            params = []
+            if project_id:
+                project_filter = " WHERE project_id = %s"
+                params.append(project_id)
+
             # 获取总agent数
             if self.db.db_type == 'mysql':
                 total_result = self.db.fetch_one(
-                    "SELECT COUNT(*) as count FROM agent_status"
+                    f"SELECT COUNT(*) as count FROM agent_status{project_filter}",
+                    tuple(params) if params else None
                 )
-                offline_result = self.db.fetch_one('''
-                                                   SELECT COUNT(*) as count FROM agent_status
-                                                   WHERE status IN ('offline', 'error', 'timeout', 'unknown')
-                                                     AND updated_at < NOW() - INTERVAL 5 MINUTE
-                                                   ''')
+                offline_filter = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                offline_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM agent_status{offline_filter}",
+                    tuple(params) if params else None
+                )
             else:
+                placeholders = "?" * len(params) if params else ""
+                project_filter_sql = f" WHERE project_id = {placeholders}" if project_id else ""
                 total_result = self.db.fetch_one(
-                    "SELECT COUNT(*) as count FROM agent_status"
+                    f"SELECT COUNT(*) as count FROM agent_status{project_filter_sql}",
+                    tuple(params) if params else None
                 )
-                offline_result = self.db.fetch_one('''
-                                                   SELECT COUNT(*) as count FROM agent_status
-                                                   WHERE status IN ('offline', 'error', 'timeout', 'unknown')
-                                                     AND updated_at < datetime('now', '-5 minutes')
-                                                   ''')
+                offline_filter_sql = f" WHERE project_id = {placeholders} AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+                offline_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM agent_status{offline_filter_sql}",
+                    tuple(params) if params else None
+                )
 
             total_count = total_result['count'] if total_result else 0
             offline_count = offline_result['count'] if offline_result else 0
@@ -3523,13 +3519,13 @@ class AgentManager:
             if self.db.db_type == 'mysql':
                 self.db.execute_query('''
                                       INSERT INTO agent_status
-                                      (agent_key, ip_address, hostname, workspace_id, full_name, status,
+                                      (agent_key, ip_address, hostname, project_id, full_name, status,
                                        last_seen, system_info, services, pod_id, updated_at)
                                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                                           ON DUPLICATE KEY UPDATE
                                                                ip_address = VALUES(ip_address),
                                                                hostname = VALUES(hostname),
-                                                               workspace_id = VALUES(workspace_id),
+                                                               project_id = VALUES(project_id),
                                                                full_name = VALUES(full_name),
                                                                status = VALUES(status),
                                                                last_seen = VALUES(last_seen),
@@ -3541,7 +3537,7 @@ class AgentManager:
                                           agent.key,
                                           agent.ip_address,
                                           agent.hostname,
-                                          agent.workspace_id,
+                                          agent.project_id,
                                           agent.full_name,
                                           agent.status,
                                           last_seen_str,
@@ -3552,14 +3548,14 @@ class AgentManager:
             else:
                 self.db.execute_query('''
                     INSERT OR REPLACE INTO agent_status 
-                    (agent_key, ip_address, hostname, workspace_id, full_name, status, 
+                    (agent_key, ip_address, hostname, project_id, full_name, status, 
                      last_seen, system_info, services, pod_id, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 ''', (
                     agent.key,
                     agent.ip_address,
                     agent.hostname,
-                    agent.workspace_id,
+                    agent.project_id,
                     agent.full_name,
                     agent.status,
                     last_seen_str,
@@ -3571,22 +3567,22 @@ class AgentManager:
         except Exception as e:
             self.logger.error(f"保存Agent状态到数据库失败: {str(e)}")
 
-    def get_workspace(self, workspace_id: str) -> Optional[WorkspaceInfo]:
+    def get_project(self, project_id: str) -> Optional[ProjectInfo]:
         with self.lock:
-            return self.workspaces.get(workspace_id)
+            return self.projects.get(project_id)
 
-    def list_workspaces(self) -> List[Dict]:
+    def list_projects(self) -> List[Dict]:
         with self.lock:
-            return [workspace.to_dict() for workspace in self.workspaces.values()]
+            return [project.to_dict() for project in self.projects.values()]
 
-    def get_workspace_agents(self, workspace_id: str) -> List[Dict]:
+    def get_project_agents(self, project_id: str) -> List[Dict]:
         with self.lock:
-            workspace = self.workspaces.get(workspace_id)
-            if not workspace:
+            project = self.projects.get(project_id)
+            if not project:
                 return []
 
             agents = []
-            for agent_key in workspace.agents:
+            for agent_key in project.agents:
                 agent = self.agents.get(agent_key)
                 if agent:
                     agents.append(agent.to_dict())
@@ -3598,15 +3594,15 @@ class AgentManager:
             return self.agents.get(key)
 
     def list_agents(self, page: int = 1, per_page: int = 20,
-                    workspace_id: str = None) -> Tuple[List[Dict], int]:
+                    project_id: str = None) -> Tuple[List[Dict], int]:
         with self.lock:
-            if workspace_id:
-                workspace = self.workspaces.get(workspace_id)
-                if not workspace:
+            if project_id:
+                project = self.projects.get(project_id)
+                if not project:
                     return [], 0
 
                 agents_list = []
-                for agent_key in workspace.agents:
+                for agent_key in project.agents:
                     agent = self.agents.get(agent_key)
                     if agent:
                         agents_list.append(agent)
@@ -3838,26 +3834,29 @@ class TaskManager:
             self.logger.error(f"清理过期任务日志失败: {str(e)}")
 
     def create_task(self, task_type: str, service_name: str, agent_key: str,
-                    template_name: str = None, extra_params: Dict = None) -> str:
+                    template_name: str = None, extra_params: Dict = None,
+                    project_id: str = None) -> str:
         task_id = str(uuid.uuid4())
 
-        agent = self.agent_manager.get_agent(agent_key)
-        workspace_id = agent.workspace_id if agent else ''
+        # Use provided project_id or get from agent
+        if not project_id:
+            agent = self.agent_manager.get_agent(agent_key)
+            project_id = agent.project_id if agent else ''
 
         if self.db.db_type == 'mysql':
             self.db.execute_query('''
                                   INSERT INTO tasks
-                                  (task_id, task_type, service_name, agent_key, workspace_id,
+                                  (task_id, task_type, service_name, agent_key, project_id,
                                    status, progress, message, created_at, pod_id)
                                   VALUES (%s, %s, %s, %s, %s, 'pending', 0, '', NOW(), %s)
-                                  ''', (task_id, task_type, service_name, agent_key, workspace_id, self.pod_id))
+                                  ''', (task_id, task_type, service_name, agent_key, project_id, self.pod_id))
         else:
             self.db.execute_query('''
                                   INSERT INTO tasks
-                                  (task_id, task_type, service_name, agent_key, workspace_id,
+                                  (task_id, task_type, service_name, agent_key, project_id,
                                    status, progress, message, created_at, pod_id)
                                   VALUES (?, ?, ?, ?, ?, 'pending', 0, '', datetime('now'), ?)
-                                  ''', (task_id, task_type, service_name, agent_key, workspace_id, self.pod_id))
+                                  ''', (task_id, task_type, service_name, agent_key, project_id, self.pod_id))
 
         # 添加任务日志
         self._add_task_log(task_id, 'INFO', f"任务创建: {task_type} {service_name} on agent {agent_key}")
@@ -4316,7 +4315,7 @@ class TaskManager:
 
     def list_tasks(self, page: int = 1, per_page: int = 20,
                    task_type: str = None, status: str = None,
-                   workspace_id: str = None, agent_key: str = None) -> Tuple[List[Dict], int]:
+                   project_id: str = None, agent_key: str = None) -> Tuple[List[Dict], int]:
         query = "SELECT * FROM tasks WHERE 1=1"
         params = []
 
@@ -4330,10 +4329,10 @@ class TaskManager:
             query += "%s" if self.db.db_type == 'mysql' else "?"
             params.append(status)
 
-        if workspace_id:
-            query += " AND workspace_id = "
+        if project_id:
+            query += " AND project_id = "
             query += "%s" if self.db.db_type == 'mysql' else "?"
-            params.append(workspace_id)
+            params.append(project_id)
 
         if agent_key:
             query += " AND agent_key = "
@@ -4591,9 +4590,6 @@ class WebAPIServer:
         self.app.config['MAX_CONTENT_LENGTH'] = config['upload_max_size']
         CORS(self.app)
 
-        # 3. 初始化认证
-        self.auth = HTTPTokenAuth(scheme='Bearer')
-
         # 4. 初始化Redis管理器
         self.redis_manager = RedisManager(
             config.get('redis_url', 'redis://localhost:6379/0'),
@@ -4604,67 +4600,6 @@ class WebAPIServer:
         self.db_manager = DatabaseManager(config['database'])
 
 
-        # 6. 初始化认证管理器
-        from werkzeug.security import generate_password_hash
-        import jwt
-
-        class AuthManager:
-            def __init__(self, db_manager, secret_key, token_expiration=86400):
-                self.db = db_manager
-                self.secret_key = secret_key
-                self.token_expiration = token_expiration
-
-            def authenticate(self, username, password):
-                user = self.db.fetch_one(
-                    "SELECT * FROM users WHERE username = %s AND is_active = 1"
-                    if self.db.db_type == 'mysql' else
-                    "SELECT * FROM users WHERE username = ? AND is_active = 1",
-                    (username,)
-                )
-
-                if user and check_password_hash(user['password_hash'], password):
-                    if self.db.db_type == 'mysql':
-                        self.db.execute_query(
-                            "UPDATE users SET last_login = NOW() WHERE id = %s",
-                            (user['id'],)
-                        )
-                    else:
-                        self.db.execute_query(
-                            "UPDATE users SET last_login = datetime('now') WHERE id = ?",
-                            (user['id'],)
-                        )
-
-                    token = jwt.encode({
-                        'user_id': user['id'],
-                        'username': user['username'],
-                        'role': user['role'],
-                        'exp': datetime.utcnow().timestamp() + self.token_expiration
-                    }, self.secret_key, algorithm='HS256')
-
-                    return {
-                        'token': token,
-                        'user': {
-                            'id': user['id'],
-                            'username': user['username'],
-                            'role': user['role'],
-                            'email': user['email'],
-                            'full_name': user['full_name']
-                        }
-                    }
-
-                return None
-
-            def verify_token(self, token):
-                try:
-                    payload = jwt.decode(token, self.secret_key, algorithms=['HS256'])
-                    return payload
-                except jwt.ExpiredSignatureError:
-                    return None
-                except jwt.InvalidTokenError:
-                    return None
-
-        self.auth_manager = AuthManager(self.db_manager, config['secret_key'],
-                                        config.get('token_expiration', 86400))
 
         # 7. 初始化模板管理器（传递支持的格式）
         supported_formats = config.get('supported_formats', SUPPORTED_FORMATS)
@@ -4719,12 +4654,7 @@ class WebAPIServer:
         # 11. 注册路由
         self._register_routes()
 
-        # 12. 设置认证回调
-        @self.auth.verify_token
-        def verify_token(token):
-            return self._verify_token(token)
-
-        # 13. 后台刷新线程
+        # 12. 后台刷新线程
         self.refresh_thread = None
         self.should_stop = False
 
@@ -4796,16 +4726,10 @@ class WebAPIServer:
 
         self.logger.info("所有启动连接检查完成")
 
-    def _verify_token(self, token: str) -> Optional[Dict]:
-        payload = self.auth_manager.verify_token(token)
-        if payload:
-            return payload
-        return None
-
     def _register_routes(self):
         """注册路由"""
 
-        @self.app.route('/api/health', methods=['GET'])
+        @self.app.route('/api/agent/health', methods=['GET'])
         def health_check():
             """健康检查端点"""
             db_ok = False
@@ -4846,9 +4770,8 @@ class WebAPIServer:
                 'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
-        @self.app.route('/api/system/connections', methods=['GET'])
-        @self.auth.login_required
-        def get_connections():
+        @self.app.route('/api/agent/system/connections', methods=['GET'])
+        def get_connection():
             """获取连接状态"""
             results = ConnectionChecker.check_all_connections(self.config)
 
@@ -4873,80 +4796,60 @@ class WebAPIServer:
                 'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
-        @self.app.route('/api/auth/login', methods=['POST'])
-        def login():
-            data = request.get_json()
-            if not data or 'username' not in data or 'password' not in data:
-                return jsonify({'error': '用户名和密码不能为空'}), 400
-
-            result = self.auth_manager.authenticate(data['username'], data['password'])
-            if result:
-                return jsonify(result)
-            else:
-                return jsonify({'error': '用户名或密码错误'}), 401
-
-        @self.app.route('/api/auth/profile', methods=['GET'])
-        @self.auth.login_required
-        def get_profile():
-            return jsonify(self.auth.current_user())
-
-        @self.app.route('/api/workspaces', methods=['GET'])
-        @self.auth.login_required
-        def list_workspaces():
-            workspaces = self.agent_manager.list_workspaces()
+        @self.app.route('/api/agent/projects', methods=['GET'])
+        def list_projects():
+            projects = self.agent_manager.list_projects()
             return jsonify({
-                'workspaces': workspaces,
-                'total': len(workspaces)
+                'projects': projects,
+                'total': len(projects)
             })
 
-        @self.app.route('/api/agents', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agents', methods=['GET'])
         def list_agents():
             page = int(request.args.get('page', 1))
             per_page = int(request.args.get('per_page', 20))
-            workspace_id = request.args.get('workspace_id')
+            project_id = request.args.get('project_id')
 
-            agents, total = self.agent_manager.list_agents(page, per_page, workspace_id)
+            # project_id is required
+            if not project_id:
+                return jsonify({'error': 'project_id parameter is required'}), 400
+
+            agents, total = self.agent_manager.list_agents(page, per_page, project_id)
             return jsonify({
                 'agents': agents,
                 'page': page,
                 'per_page': per_page,
-                'total': total
+                'total': total,
+                'project_id': project_id
             })
 
-        @self.app.route('/api/agents/refresh', methods=['POST'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agents/refresh', methods=['POST'])
         def refresh_agents():
             self.agent_manager.refresh_agents()
             return jsonify({'message': 'Agent列表刷新完成'})
 
         # 在_register_routes方法中添加以下路由
-        @self.app.route('/api/agents/cleanup', methods=['POST'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agents/cleanup', methods=['POST'])
         def cleanup_offline_agents():
-            """清除全部掉线的agent"""
+            """清除指定project下掉线的agent"""
             try:
-                # 检查用户权限（只有管理员可以执行清理）
-                current_user = self.auth.current_user()
-                if current_user.get('role') != 'admin':
-                    return jsonify({
-                        'error': '权限不足',
-                        'message': '只有管理员可以执行清理操作'
-                    }), 403
-
                 # 获取清理参数
                 data = request.get_json() or {}
+                project_id = data.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
                 dry_run = data.get('dry_run', False)  # 是否模拟运行
                 force = data.get('force', False)      # 是否强制清理（不检查时间）
 
-                # 先获取统计信息
-                offline_count, total_count = self.agent_manager.get_offline_agents_count()
+                # 先获取统计信息（按project过滤）
+                offline_count, total_count = self.agent_manager.get_offline_agents_count(project_id)
 
                 if offline_count == 0:
                     return jsonify({
                         'message': '没有需要清理的掉线agent',
                         'offline_count': 0,
                         'total_count': total_count,
+                        'project_id': project_id,
                         'timestamp': datetime.now().isoformat()
                     })
 
@@ -4958,11 +4861,12 @@ class WebAPIServer:
                         'offline_count': offline_count,
                         'total_count': total_count,
                         'would_clean': True,
+                        'project_id': project_id,
                         'timestamp': datetime.now().isoformat()
                     })
 
-                # 执行清理操作
-                success, message, cleanup_info = self.agent_manager.cleanup_offline_agents()
+                # 执行清理操作（按project过滤）
+                success, message, cleanup_info = self.agent_manager.cleanup_offline_agents(project_id)
 
                 if success:
                     return jsonify({
@@ -4971,12 +4875,14 @@ class WebAPIServer:
                         'cleanup_info': cleanup_info,
                         'offline_count_before': offline_count,
                         'total_count_before': total_count,
+                        'project_id': project_id,
                         'timestamp': datetime.now().isoformat()
                     })
                 else:
                     return jsonify({
                         'error': message,
                         'success': False,
+                        'project_id': project_id,
                         'timestamp': datetime.now().isoformat()
                     }), 500
 
@@ -4988,12 +4894,16 @@ class WebAPIServer:
                     'timestamp': datetime.now().isoformat()
                 }), 500
 
-        @self.app.route('/api/agents/stats', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agents/stats', methods=['GET'])
         def get_agent_stats():
             """获取agent统计信息"""
             try:
-                # 获取各种状态的agent数量
+                # Get project_id from query parameter
+                project_id = request.args.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+
+                # 获取各种状态的agent数量 (filtered by project_id)
                 if self.db_manager.db_type == 'mysql':
                     status_stats = self.db_manager.fetch_all('''
                                                              SELECT
@@ -5002,9 +4912,10 @@ class WebAPIServer:
                             MAX(last_seen) as last_seen_max,
                             MIN(last_seen) as last_seen_min
                                                              FROM agent_status
+                                                             WHERE project_id = %s
                                                              GROUP BY status
                                                              ORDER BY count DESC
-                                                             ''')
+                                                             ''', (project_id,))
                 else:
                     status_stats = self.db_manager.fetch_all('''
                                                              SELECT
@@ -5013,53 +4924,53 @@ class WebAPIServer:
                             MAX(last_seen) as last_seen_max,
                             MIN(last_seen) as last_seen_min
                                                              FROM agent_status
+                                                             WHERE project_id = ?
                                                              GROUP BY status
                                                              ORDER BY count DESC
-                                                             ''')
+                                                             ''', (project_id,))
 
-                # 获取工作空间统计
+                # 计算掉线agent（超过5分钟未更新）for this project
                 if self.db_manager.db_type == 'mysql':
-                    workspace_stats = self.db_manager.fetch_all('''
-                                                                SELECT
-                                                                    workspace_id,
-                                                                    COUNT(*) as agent_count,
-                                                                    SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online_count,
-                                                                    MAX(updated_at) as last_updated
-                                                                FROM agent_status
-                                                                GROUP BY workspace_id
-                                                                ORDER BY agent_count DESC
-                                                                ''')
+                    offline_result = self.db_manager.fetch_one('''
+                                                               SELECT COUNT(*) as count FROM agent_status
+                                                               WHERE project_id = %s
+                                                               AND status IN ('offline', 'error', 'timeout', 'unknown')
+                                                               AND updated_at < NOW() - INTERVAL 5 MINUTE
+                                                               ''', (project_id,))
+                    total_result = self.db_manager.fetch_one(
+                        "SELECT COUNT(*) as count FROM agent_status WHERE project_id = %s",
+                        (project_id,)
+                    )
                 else:
-                    workspace_stats = self.db_manager.fetch_all('''
-                                                                SELECT
-                                                                    workspace_id,
-                                                                    COUNT(*) as agent_count,
-                                                                    SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) as online_count,
-                                                                    MAX(updated_at) as last_updated
-                                                                FROM agent_status
-                                                                GROUP BY workspace_id
-                                                                ORDER BY agent_count DESC
-                                                                ''')
+                    offline_result = self.db_manager.fetch_one('''
+                                                               SELECT COUNT(*) as count FROM agent_status
+                                                               WHERE project_id = ?
+                                                               AND status IN ('offline', 'error', 'timeout', 'unknown')
+                                                               AND updated_at < datetime('now', '-5 minutes')
+                                                               ''', (project_id,))
+                    total_result = self.db_manager.fetch_one(
+                        "SELECT COUNT(*) as count FROM agent_status WHERE project_id = ?",
+                        (project_id,)
+                    )
 
-                # 计算掉线agent（超过5分钟未更新）
-                offline_count, total_count = self.agent_manager.get_offline_agents_count()
+                total_count = total_result['count'] if total_result else 0
+                offline_count = offline_result['count'] if offline_result else 0
 
                 stats = {
                     'timestamp': datetime.now().isoformat(),
+                    'project_id': project_id,
                     'summary': {
                         'total_agents': total_count,
                         'offline_agents': offline_count,
-                        'workspace_count': len(workspace_stats),
                         'status_distribution': {
                             item['status']: item['count'] for item in status_stats
                         }
                     },
                     'status_details': status_stats,
-                    'workspace_details': workspace_stats,
                     'cleanup_info': {
                         'can_cleanup': offline_count > 0,
                         'offline_count': offline_count,
-                        'suggested_action': 'POST /api/agents/cleanup 清理掉线agent'
+                        'suggested_action': 'POST /api/agent/agents/cleanup 清理掉线agent'
                     }
                 }
 
@@ -5072,19 +4983,10 @@ class WebAPIServer:
                     'message': str(e)
                 }), 500
 
-        @self.app.route('/api/agents/<agent_key>/status', methods=['PUT'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agents/<agent_key>/status', methods=['PUT'])
         def update_agent_status(agent_key):
             """手动更新agent状态"""
             try:
-                # 检查用户权限
-                current_user = self.auth.current_user()
-                if current_user.get('role') != 'admin':
-                    return jsonify({
-                        'error': '权限不足',
-                        'message': '只有管理员可以手动更新agent状态'
-                    }), 403
-
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -5092,6 +4994,11 @@ class WebAPIServer:
                 status = data.get('status')
                 if status not in ['online', 'offline', 'error', 'timeout', 'unknown']:
                     return jsonify({'error': '无效的状态值'}), 400
+
+                # Get project_id from request body
+                project_id = data.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
 
                 # 检查agent是否存在
                 if self.db_manager.db_type == 'mysql':
@@ -5107,6 +5014,10 @@ class WebAPIServer:
 
                 if not agent:
                     return jsonify({'error': f'Agent {agent_key} 不存在'}), 404
+
+                # Verify the agent belongs to the requested project
+                if agent.get('project_id') != project_id:
+                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
 
                 # 更新agent状态
                 if self.db_manager.db_type == 'mysql':
@@ -5133,48 +5044,74 @@ class WebAPIServer:
                 return jsonify({
                     'message': f'Agent {agent_key} 状态已更新为 {status}',
                     'agent_key': agent_key,
+                    'project_id': project_id,
                     'new_status': status,
                     'updated_at': datetime.now().isoformat(),
-                    'updated_by': current_user.get('username', 'admin')
+                    'updated_by': 'system'
                 })
 
             except Exception as e:
                 self.logger.error(f"更新agent状态失败: {str(e)}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/tasks', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/task', methods=['GET'])
         def list_tasks():
             page = int(request.args.get('page', 1))
             per_page = int(request.args.get('per_page', 20))
             task_type = request.args.get('type')
             status = request.args.get('status')
-            workspace_id = request.args.get('workspace_id')
+            project_id = request.args.get('project_id')
             agent_key = request.args.get('agent_key')
 
+            # project_id is required
+            if not project_id:
+                return jsonify({'error': 'project_id parameter is required'}), 400
+
             tasks, total = self.task_manager.list_tasks(
-                page, per_page, task_type, status, workspace_id, agent_key
+                page, per_page, task_type, status, project_id, agent_key
             )
 
             return jsonify({
                 'tasks': tasks,
                 'page': page,
                 'per_page': per_page,
-                'total': total
+                'total': total,
+                'project_id': project_id
             })
 
-        @self.app.route('/api/tasks/<task_id>', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/task/<task_id>', methods=['GET'])
         def get_task(task_id):
+            # Get project_id from query parameter
+            project_id = request.args.get('project_id')
+            if not project_id:
+                return jsonify({'error': 'project_id parameter is required'}), 400
+
             task = self.task_manager.get_task(task_id)
-            if task:
-                return jsonify(task)
-            else:
+            if not task:
                 return jsonify({'error': '任务不存在'}), 404
 
-        @self.app.route('/api/tasks/<task_id>/logs', methods=['GET'])
-        @self.auth.login_required
+            # Verify the task belongs to the requested project
+            if task.get('project_id') != project_id:
+                return jsonify({'error': f'Task {task_id} does not belong to project {project_id}'}), 403
+
+            # Include project_id in response
+            task['requested_project_id'] = project_id
+            return jsonify(task)
+
+        @self.app.route('/api/agent/task/<task_id>/logs', methods=['GET'])
         def get_task_logs(task_id):
+            # Get project_id from query parameter
+            project_id = request.args.get('project_id')
+            if not project_id:
+                return jsonify({'error': 'project_id parameter is required'}), 400
+
+            # Verify the task belongs to the requested project
+            task = self.task_manager.get_task(task_id)
+            if not task:
+                return jsonify({'error': '任务不存在'}), 404
+            if task.get('project_id') != project_id:
+                return jsonify({'error': f'Task {task_id} does not belong to project {project_id}'}), 403
+
             page = int(request.args.get('page', 1))
             per_page = int(request.args.get('per_page', 100))
 
@@ -5183,56 +5120,94 @@ class WebAPIServer:
             return jsonify({
                 'logs': logs,
                 'task_id': task_id,
+                'project_id': project_id,
                 'page': page,
                 'per_page': per_page,
                 'total': total
             })
 
-        @self.app.route('/api/tasks/<task_id>', methods=['DELETE'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/task/<task_id>', methods=['DELETE'])
         def delete_task(task_id):
+            # Get project_id from query parameter
+            project_id = request.args.get('project_id')
+            if not project_id:
+                return jsonify({'error': 'project_id parameter is required'}), 400
+
+            # Verify the task belongs to the requested project
+            task = self.task_manager.get_task(task_id)
+            if not task:
+                return jsonify({'error': '任务不存在'}), 404
+            if task.get('project_id') != project_id:
+                return jsonify({'error': f'Task {task_id} does not belong to project {project_id}'}), 403
+
             if self.task_manager.delete_task(task_id):
-                return jsonify({'message': '任务删除成功'})
+                return jsonify({
+                    'message': '任务删除成功',
+                    'task_id': task_id,
+                    'project_id': project_id
+                })
             else:
                 return jsonify({'error': '任务删除失败'}), 500
 
-        @self.app.route('/api/tasks/deploy', methods=['POST'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/task/deploy', methods=['POST'])
         def deploy_service():
             data = request.get_json()
             if not data or 'service_name' not in data or 'agent_key' not in data or 'template_name' not in data:
                 return jsonify({'error': '服务名称、Agent和模板名称不能为空'}), 400
 
+            project_id = data.get('project_id')
+            if not project_id:
+                return jsonify({'error': 'project_id不能为空'}), 400
+
+            # Validate that agent belongs to the project
+            agent = self.agent_manager.get_agent(data['agent_key'])
+            if not agent:
+                return jsonify({'error': f"Agent {data['agent_key']} 不存在"}), 404
+            if agent.project_id != project_id:
+                return jsonify({'error': f"Agent {data['agent_key']} 不属于项目 {project_id}"}), 403
+
             task_id = self.task_manager.create_task(
                 'deploy', data['service_name'], data['agent_key'],
-                data['template_name'], data.get('extra_params')
+                data['template_name'], data.get('extra_params'), project_id
             )
 
             return jsonify({
                 'task_id': task_id,
-                'message': '部署任务已创建'
+                'message': '部署任务已创建',
+                'project_id': project_id
             }), 202
 
-        @self.app.route('/api/tasks/undeploy', methods=['POST'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/task/undeploy', methods=['POST'])
         def undeploy_service():
             data = request.get_json()
             if not data or 'service_name' not in data or 'agent_key' not in data:
                 return jsonify({'error': '服务名称和Agent不能为空'}), 400
 
+            project_id = data.get('project_id')
+            if not project_id:
+                return jsonify({'error': 'project_id不能为空'}), 400
+
+            # Validate that agent belongs to the project
+            agent = self.agent_manager.get_agent(data['agent_key'])
+            if not agent:
+                return jsonify({'error': f"Agent {data['agent_key']} 不存在"}), 404
+            if agent.project_id != project_id:
+                return jsonify({'error': f"Agent {data['agent_key']} 不属于项目 {project_id}"}), 403
+
             task_id = self.task_manager.create_task(
-                'undeploy', data['service_name'], data['agent_key']
+                'undeploy', data['service_name'], data['agent_key'],
+                None, None, project_id
             )
 
             return jsonify({
                 'task_id': task_id,
-                'message': '卸载任务已创建'
+                'message': '卸载任务已创建',
+                'project_id': project_id
             }), 202
 
         # ===================== 代理路由（修复版，支持长超时） =====================
-        @self.app.route('/api/proxy/<agent_key>/<path:action_path>',
+        @self.app.route('/api/agent/proxy/<agent_key>/<path:action_path>',
                         methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
-        @self.auth.login_required
         def proxy_to_agent(agent_key, action_path):
             """将请求代理到指定的Agent（修复版，支持长超时）"""
             try:
@@ -5383,8 +5358,7 @@ class WebAPIServer:
                     'action_path': action_path
                 }), 500
         # 简单代理端点 - 专门用于GET请求
-        @self.app.route('/api/proxy_simple/<agent_key>/<path:action_path>', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/proxy_simple/<agent_key>/<path:action_path>', methods=['GET'])
         def proxy_simple_to_agent(agent_key, action_path):
             """简单代理到指定的Agent（仅GET请求）"""
             try:
@@ -5428,9 +5402,8 @@ class WebAPIServer:
                 self.logger.error(f"简单代理失败: {str(e)}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/<agent_key>/<path:action_path>',
+        @self.app.route('/api/agent/agent/<agent_key>/<path:action_path>',
                         methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
-        @self.auth.login_required
         def agent_proxy_simple(agent_key, action_path):
             """简化版代理路由，自动添加/api前缀"""
             # 确保action_path以/开头
@@ -5444,8 +5417,7 @@ class WebAPIServer:
             # 重定向到通用代理
             return proxy_to_agent(agent_key, action_path)
 
-        @self.app.route('/api/agent/<agent_key>/system/info', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agent/<agent_key>/system/info', methods=['GET'])
         def agent_system_info(agent_key):
             """获取Agent的系统信息（快捷方式）"""
             status_code, response_data, response_headers = self.proxy_manager.proxy_request(
@@ -5463,8 +5435,7 @@ class WebAPIServer:
 
             return response
 
-        @self.app.route('/api/agent/<agent_key>/services', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agent/<agent_key>/services', methods=['GET'])
         def agent_services(agent_key):
             """获取Agent的服务列表（快捷方式）"""
             status_code, response_data, response_headers = self.proxy_manager.proxy_request(
@@ -5483,8 +5454,7 @@ class WebAPIServer:
             return response
 
         # 代理调试端点
-        @self.app.route('/api/proxy/debug/<agent_key>', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/proxy/debug/<agent_key>', methods=['GET'])
         def debug_agent_proxy(agent_key):
             """调试Agent代理连接"""
             try:
@@ -5549,8 +5519,7 @@ class WebAPIServer:
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/<agent_key>/health', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agent/<agent_key>/health', methods=['GET'])
         def agent_health(agent_key):
             """获取Agent的健康状态（快捷方式）"""
             status_code, response_data, response_headers = self.proxy_manager.proxy_request(
@@ -5568,8 +5537,7 @@ class WebAPIServer:
 
             return response
 
-        @self.app.route('/api/proxy/info', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/proxy/info', methods=['GET'])
         def get_proxy_info():
             """获取代理API信息"""
             # 获取可用的Agent列表
@@ -5581,7 +5549,7 @@ class WebAPIServer:
                         'key': agent['key'],
                         'hostname': agent['hostname'],
                         'ip_address': agent['ip_address'],
-                        'workspace': agent['workspace_id'],
+                        'project': agent['project_id'],
                         'status': agent['status'],
                         'last_seen': agent.get('last_seen')
                     }
@@ -5592,8 +5560,7 @@ class WebAPIServer:
 
             return jsonify(proxy_info)
 
-        @self.app.route('/api/proxy/test/<agent_key>', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/proxy/test/<agent_key>', methods=['GET'])
         def test_proxy_connection(agent_key):
             """测试代理连接"""
             try:
@@ -5624,11 +5591,15 @@ class WebAPIServer:
                     'timestamp': datetime.now().isoformat()
                 }), 500
 
-        @self.app.route('/api/agents/<agent_key>', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/agents/<agent_key>', methods=['GET'])
         def get_agent_by_key(agent_key):
             """根据agent_key获取Agent信息"""
             try:
+                # Get project_id from query parameter
+                project_id = request.args.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+
                 # 从数据库查询Agent
                 if self.db_manager.db_type == 'mysql':
                     agent_data = self.db_manager.fetch_one(
@@ -5645,54 +5616,76 @@ class WebAPIServer:
                     # 尝试从内存中获取
                     agent = self.agent_manager.get_agent(agent_key)
                     if agent:
-                        return jsonify(agent.to_dict())
+                        agent_data = agent.to_dict()
                     else:
                         return jsonify({'error': f'Agent {agent_key} not found'}), 404
+                else:
+                    # 转换数据格式
+                    agent_data = {
+                        'key': agent_data['agent_key'],
+                        'ip_address': agent_data['ip_address'],
+                        'hostname': agent_data['hostname'],
+                        'project_id': agent_data['project_id'],
+                        'full_name': agent_data['full_name'],
+                        'status': agent_data['status'],
+                        'pod_id': agent_data['pod_id']
+                    }
 
-                # 转换数据格式
-                agent_info = {
-                    'key': agent_data['agent_key'],
-                    'ip_address': agent_data['ip_address'],
-                    'hostname': agent_data['hostname'],
-                    'workspace_id': agent_data['workspace_id'],
-                    'full_name': agent_data['full_name'],
-                    'status': agent_data['status'],
-                    'pod_id': agent_data['pod_id']
-                }
+                # Verify the agent belongs to the requested project
+                if agent_data.get('project_id') != project_id:
+                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
 
-                if agent_data['last_seen']:
-                    if isinstance(agent_data['last_seen'], str):
-                        agent_info['last_seen'] = agent_data['last_seen']
+                # Add additional fields if from database
+                if 'last_seen' in agent_data:
+                    pass
+                else:
+                    # Fetch from database for additional fields
+                    if self.db_manager.db_type == 'mysql':
+                        full_data = self.db_manager.fetch_one(
+                            "SELECT * FROM agent_status WHERE agent_key = %s",
+                            (agent_key,)
+                        )
                     else:
-                        agent_info['last_seen'] = agent_data['last_seen'].isoformat()
+                        full_data = self.db_manager.fetch_one(
+                            "SELECT * FROM agent_status WHERE agent_key = ?",
+                            (agent_key,)
+                        )
+                    if full_data:
+                        if full_data['last_seen']:
+                            if isinstance(full_data['last_seen'], str):
+                                agent_data['last_seen'] = full_data['last_seen']
+                            else:
+                                agent_data['last_seen'] = full_data['last_seen'].isoformat()
 
-                if agent_data['system_info']:
-                    if isinstance(agent_data['system_info'], str):
-                        try:
-                            agent_info['system_info'] = json.loads(agent_data['system_info'])
-                        except:
-                            agent_info['system_info'] = agent_data['system_info']
-                    else:
-                        agent_info['system_info'] = agent_data['system_info']
+                        if full_data['system_info']:
+                            if isinstance(full_data['system_info'], str):
+                                try:
+                                    agent_data['system_info'] = json.loads(full_data['system_info'])
+                                except:
+                                    agent_data['system_info'] = full_data['system_info']
+                            else:
+                                agent_data['system_info'] = full_data['system_info']
 
-                if agent_data['services']:
-                    if isinstance(agent_data['services'], str):
-                        try:
-                            agent_info['services'] = json.loads(agent_data['services'])
-                        except:
-                            agent_info['services'] = agent_data['services']
-                    else:
-                        agent_info['services'] = agent_data['services']
+                        if full_data['services']:
+                            if isinstance(full_data['services'], str):
+                                try:
+                                    agent_data['services'] = json.loads(full_data['services'])
+                                except:
+                                    agent_data['services'] = full_data['services']
+                            else:
+                                agent_data['services'] = full_data['services']
 
-                return jsonify(agent_info)
+                # Include project_id in response
+                agent_data['requested_project_id'] = project_id
+
+                return jsonify(agent_data)
 
             except Exception as e:
                 self.logger.error(f"获取Agent信息失败: {str(e)}")
                 return jsonify({'error': str(e)}), 500
 
         # 在_register_routes方法中添加示例文档端点
-        @self.app.route('/api/proxy/examples', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/proxy/examples', methods=['GET'])
         def get_proxy_examples():
             """获取代理使用示例"""
             examples = {
@@ -5716,53 +5709,53 @@ class WebAPIServer:
                     {
                         'description': '获取Agent系统信息',
                         'method': 'GET',
-                        'url': '/api/proxy/abc123def456/api/system/info',
-                        'curl': 'curl -X GET -H "Authorization: Bearer YOUR_TOKEN" http://server:18080/api/proxy/abc123def456/api/system/info'
+                        'url': '/api/agent/proxy/abc123def456/api/system/info',
+                        'curl': 'curl -X GET -H "Authorization: Bearer YOUR_TOKEN" http://server:18080/api/agent/proxy/abc123def456/api/system/info'
                     },
                     {
                         'description': '获取Agent服务列表',
                         'method': 'GET',
-                        'url': '/api/proxy/abc123def456/api/services',
-                        'curl': 'curl -X GET -H "Authorization: Bearer YOUR_TOKEN" http://server:18080/api/proxy/abc123def456/api/services'
+                        'url': '/api/agent/proxy/abc123def456/api/services',
+                        'curl': 'curl -X GET -H "Authorization: Bearer YOUR_TOKEN" http://server:18080/api/agent/proxy/abc123def456/api/services'
                     },
                     {
                         'description': '启动Agent上的服务',
                         'method': 'POST',
-                        'url': '/api/proxy/abc123def456/api/services/myservice/start',
-                        'curl': 'curl -X POST -H "Authorization: Bearer YOUR_TOKEN" http://server:18080/api/proxy/abc123def456/api/services/myservice/start'
+                        'url': '/api/agent/proxy/abc123def456/api/services/myservice/start',
+                        'curl': 'curl -X POST -H "Authorization: Bearer YOUR_TOKEN" http://server:18080/api/agent/proxy/abc123def456/api/services/myservice/start'
                     },
                     {
                         'description': '获取服务日志',
                         'method': 'GET',
-                        'url': '/api/proxy/abc123def456/api/services/myservice/logs?tail=100',
-                        'curl': 'curl -X GET -H "Authorization: Bearer YOUR_TOKEN" "http://server:18080/api/proxy/abc123def456/api/services/myservice/logs?tail=100"'
+                        'url': '/api/agent/proxy/abc123def456/api/services/myservice/logs?tail=100',
+                        'curl': 'curl -X GET -H "Authorization: Bearer YOUR_TOKEN" "http://server:18080/api/agent/proxy/abc123def456/api/services/myservice/logs?tail=100"'
                     },
                     {
                         'description': '上传压缩文件创建服务',
                         'method': 'POST',
-                        'url': '/api/proxy/abc123def456/api/services/zip',
+                        'url': '/api/agent/proxy/abc123def456/api/services/zip',
                         'content_type': 'multipart/form-data',
                         'form_data': {
                             'name': 'myapp',
                             'file': 'myapp.zip'  # 支持多种压缩格式
                         },
-                        'curl': 'curl -X POST -H "Authorization: Bearer YOUR_TOKEN" -F "name=myapp" -F "file=@myapp.zip" http://server:18080/api/proxy/abc123def456/api/services/zip'
+                        'curl': 'curl -X POST -H "Authorization: Bearer YOUR_TOKEN" -F "name=myapp" -F "file=@myapp.zip" http://server:18080/api/agent/proxy/abc123def456/api/services/zip'
                     },
                     {
                         'description': '从YAML创建服务',
                         'method': 'POST',
-                        'url': '/api/proxy/abc123def456/api/services/yaml',
+                        'url': '/api/agent/proxy/abc123def456/api/services/yaml',
                         'content_type': 'application/json',
                         'body': {
                             'name': 'myservice',
                             'yaml': 'version: "3"\nservices:\n  web:\n    image: nginx:latest'
                         },
-                        'curl': 'curl -X POST -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -d \'{"name":"myservice","yaml":"version: \\"3\\"\\nservices:\\n  web:\\n    image: nginx:latest"}\' http://server:18080/api/proxy/abc123def456/api/services/yaml'
+                        'curl': 'curl -X POST -H "Authorization: Bearer YOUR_TOKEN" -H "Content-Type: application/json" -d \'{"name":"myservice","yaml":"version: \\"3\\"\\nservices:\\n  web:\\n    image: nginx:latest"}\' http://server:18080/api/agent/proxy/abc123def456/api/services/yaml'
                     }
                 ],
                 'tips': [
-                    '使用 /api/proxy/info 获取所有可用Agent',
-                    '使用 /api/proxy/test/{agent_key} 测试代理连接',
+                    '使用 /api/agent/proxy/info 获取所有可用Agent',
+                    '使用 /api/agent/proxy/test/{agent_key} 测试代理连接',
                     '文件上传需要设置 Content-Type: multipart/form-data',
                     '支持流式响应，添加 ?stream=true 参数',
                     '所有原始请求头（除敏感头外）都会转发到Agent',
@@ -5774,8 +5767,7 @@ class WebAPIServer:
 
         # ===================== 模板管理API（完整版，支持多种压缩格式） =====================
 
-        @self.app.route('/api/templates', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates', methods=['GET'])
         def list_templates():
             """列出所有模板（包含文件大小信息）"""
             page = int(request.args.get('page', 1))
@@ -5790,8 +5782,7 @@ class WebAPIServer:
                 'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
-        @self.app.route('/api/templates', methods=['POST'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates', methods=['POST'])
         def upload_template():
             """上传模板（支持多种压缩格式）"""
             if 'file' not in request.files:
@@ -5839,11 +5830,9 @@ class WebAPIServer:
             file_content = file.read()
 
             # 获取当前用户
-            current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
-
             success, message = self.template_manager.create_template(
                 name, description, template_type, file_content, filename,
-                current_user.get('username', 'admin')
+                'system'
             )
 
             if success:
@@ -5856,8 +5845,7 @@ class WebAPIServer:
             else:
                 return jsonify({'error': message}), 400
 
-        @self.app.route('/api/templates/<name>', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>', methods=['GET'])
         def get_template_detail(name):
             """获取模板详细信息（包含文件大小）"""
             template = self.template_manager.get_template(name)
@@ -5887,8 +5875,7 @@ class WebAPIServer:
             else:
                 return jsonify({'error': '模板不存在'}), 404
 
-        @self.app.route('/api/templates/<name>/yaml', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/yaml', methods=['GET'])
         def get_template_yaml(name):
             """获取模板的YAML内容"""
             success, content, message = self.template_manager.get_yaml_content(name)
@@ -5906,8 +5893,7 @@ class WebAPIServer:
                     'status': 'failed'
                 }), 400
 
-        @self.app.route('/api/templates/<name>/yaml', methods=['PUT'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/yaml', methods=['PUT'])
         def update_template_yaml(name):
             """更新模板的YAML内容"""
             data = request.get_json()
@@ -5918,11 +5904,8 @@ class WebAPIServer:
             if not yaml_content:
                 return jsonify({'error': 'YAML内容不能为空'}), 400
 
-            # 获取当前用户
-            current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
-
             success, message = self.template_manager.update_yaml_content(
-                name, yaml_content, current_user.get('username', 'admin')
+                name, yaml_content, 'system'
             )
 
             if success:
@@ -5936,8 +5919,7 @@ class WebAPIServer:
             else:
                 return jsonify({'error': message}), 400
 
-        @self.app.route('/api/templates/<name>/download', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/download', methods=['GET'])
         def download_template(name):
             """下载模板文件"""
             try:
@@ -5997,8 +5979,7 @@ class WebAPIServer:
                 self.logger.error(f"模板下载失败: {str(e)}", exc_info=True)
                 return jsonify({'error': f'下载失败: {str(e)}'}), 500
 
-        @self.app.route('/api/templates/<name>/file', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/file', methods=['GET'])
         def get_template_file(name):
             """获取模板原始文件"""
             try:
@@ -6042,8 +6023,7 @@ class WebAPIServer:
                 self.logger.error(f"获取模板文件失败: {str(e)}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/templates/<name>/content', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/content', methods=['GET'])
         def get_template_content(name):
             """获取模板内容（JSON格式）"""
             try:
@@ -6085,8 +6065,7 @@ class WebAPIServer:
                 self.logger.error(f"获取模板内容失败: {str(e)}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/templates/<name>/info', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/info', methods=['GET'])
         def get_template_info(name):
             """获取模板详细信息（包含文件列表）"""
             try:
@@ -6132,8 +6111,7 @@ class WebAPIServer:
                 self.logger.error(f"获取模板信息失败: {str(e)}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/templates/<name>', methods=['DELETE'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>', methods=['DELETE'])
         def delete_template(name):
             """删除模板"""
             success, message = self.template_manager.delete_template(name)
@@ -6143,8 +6121,7 @@ class WebAPIServer:
             else:
                 return jsonify({'error': message}), 400
 
-        @self.app.route('/api/templates/download/batch', methods=['POST'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/download/batch', methods=['POST'])
         def download_templates_batch():
             """批量下载模板"""
             try:
@@ -6216,8 +6193,7 @@ class WebAPIServer:
 
         # ===================== 新增：模板文件管理API =====================
 
-        @self.app.route('/api/templates/<name>/files', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/files', methods=['GET'])
         def list_template_files(name):
             """列出模板目录下的所有文件和目录"""
             path = request.args.get('path', '')
@@ -6234,8 +6210,7 @@ class WebAPIServer:
             else:
                 return jsonify({'error': result}), 404
 
-        @self.app.route('/api/templates/<name>/files/content', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/files/content', methods=['GET'])
         def get_template_file_content(name):
             """获取模板目录下指定文件的内容"""
             file_path = request.args.get('path', '')
@@ -6287,8 +6262,7 @@ class WebAPIServer:
 
             return jsonify(response_data)
 
-        @self.app.route('/api/templates/<name>/files/content', methods=['PUT'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/files/content', methods=['PUT'])
         def update_template_file_content(name):
             """更新模板目录下指定文件的内容"""
             try:
@@ -6306,10 +6280,6 @@ class WebAPIServer:
                 if content is None:
                     return jsonify({'error': '文件内容不能为空'}), 400
 
-                # 获取当前用户
-                current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
-                updated_by = current_user.get('username', 'admin')
-
                 # 处理内容编码
                 actual_content = content
                 content_encoding = data.get('content_encoding', '')
@@ -6319,6 +6289,9 @@ class WebAPIServer:
                         actual_content = base64.b64decode(content)
                     except Exception as e:
                         return jsonify({'error': f'Base64解码失败: {str(e)}'}), 400
+
+                # 获取当前用户
+                updated_by = 'system'
 
                 success, message, update_info = self.template_manager.update_template_file(
                     name, file_path, actual_content, encoding, updated_by
@@ -6347,8 +6320,7 @@ class WebAPIServer:
                 self.logger.error(f"更新模板文件失败: {str(e)}", exc_info=True)
                 return jsonify({'error': f'更新失败: {str(e)}'}), 500
 
-        @self.app.route('/api/templates/<name>/files/download', methods=['GET'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/files/download', methods=['GET'])
         def download_template_file(name):
             """下载模板目录下的单个文件"""
             file_path = request.args.get('path', '')
@@ -6392,8 +6364,7 @@ class WebAPIServer:
 
             return response
 
-        @self.app.route('/api/templates/<name>/files/upload', methods=['POST'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/files/upload', methods=['POST'])
         def upload_template_file(name):
             """上传文件到模板目录"""
             if 'file' not in request.files:
@@ -6411,8 +6382,7 @@ class WebAPIServer:
                 target_path = file.filename
 
             # 获取当前用户
-            current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
-            updated_by = current_user.get('username', 'admin')
+            updated_by = 'system'
 
             # 读取文件内容
             file_content = file.read()
@@ -6463,8 +6433,7 @@ class WebAPIServer:
                 return jsonify({'error': message}), 400
 
 
-        @self.app.route('/api/templates/<name>/files', methods=['DELETE'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/files', methods=['DELETE'])
         def delete_template_file(name):
             """删除模板目录下的指定文件"""
             try:
@@ -6477,8 +6446,7 @@ class WebAPIServer:
                     return jsonify({'error': '文件路径不能为空'}), 400
 
                 # 获取当前用户
-                current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
-                deleted_by = current_user.get('username', 'admin')
+                deleted_by = 'system'
 
                 success, message, delete_info = self.template_manager.delete_template_file(
                     name, file_path, deleted_by
@@ -6497,8 +6465,7 @@ class WebAPIServer:
                 self.logger.error(f"删除模板文件失败: {str(e)}", exc_info=True)
                 return jsonify({'error': f'删除失败: {str(e)}'}), 500
 
-        @self.app.route('/api/templates/<name>/directories', methods=['DELETE'])
-        @self.auth.login_required
+        @self.app.route('/api/agent/templates/<name>/directories', methods=['DELETE'])
         def delete_template_directory(name):
             """删除模板目录下的指定目录"""
             try:
@@ -6513,8 +6480,7 @@ class WebAPIServer:
                     return jsonify({'error': '目录路径不能为空'}), 400
 
                 # 获取当前用户
-                current_user = self.auth.current_user() if hasattr(self.auth, 'current_user') else {'username': 'admin'}
-                deleted_by = current_user.get('username', 'admin')
+                deleted_by = 'system'
 
                 success, message, delete_info = self.template_manager.delete_template_directory(
                     name, dir_path, deleted_by, force

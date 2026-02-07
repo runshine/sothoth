@@ -1,0 +1,15 @@
+# SecFlow Menu Service 配置文件
+
+# 服务配置
+host: "0.0.0.0"      # 服务监听地址
+port: 10003           # 服务监听端口
+debug: false         # 调试模式
+
+# 心跳超时配置（秒）
+heartbeat_timeout: 120.0
+
+# 清理过期服务间隔（秒）
+cleanup_interval: 30
+
+# 日志配置
+log_level: "INFO"

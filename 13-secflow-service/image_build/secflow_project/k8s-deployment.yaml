@@ -1,0 +1,191 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-project-config
+  namespace: secflow
+data:
+  config.yaml: |
+    # SecFlow Project Management Service Configuration
+
+    # Database Configuration (MySQL)
+    database:
+      host: "10.112.2.4"
+      port: 3306
+      username: "root"
+      password: "password"
+      name: "sothoth"
+      table_prefix: "secflow_project_"
+      pool_size: 10
+      max_overflow: 20
+
+    # Auth Service Configuration
+    auth_service:
+      host: "auth-service.default.svc.cluster.local"
+      port: 8080
+      validate_token_path: "/api/auth/validate-human-token"
+      timeout: 10
+
+    # Menu Registration Center Configuration
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-menu-service.secflow.svc.cluster.local:5000"
+      service_id: "secflow-project"
+      service_name: "项目管理服务"
+      host: "0.0.0.0"
+      port: 8080
+      maturity: "已上线"
+      description: "提供项目的创建、查询、删除、修改等功能"
+      api_prefix: "/api/project"
+      menu:
+        id: "project-manage"
+        path: "/project"
+        icon: "folder"
+        order: 2
+        # 一级菜单
+        level1:
+          name: "系统管理"
+          name_en: "System"
+        # 二级菜单
+        level2:
+          name: "用户管理"
+          name_en: "User Management"
+        # 三级菜单（可选）
+        level3:
+          name: "项目管理"
+          name_en: "Project Management"
+
+    # Kubernetes Configuration
+    kubernetes:
+      in_cluster: true
+      connection_timeout: 30
+
+    # Application Configuration
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+
+    # Logging Configuration
+    logging:
+      level: "INFO"
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: secflow-project-secret
+  namespace: secflow
+type: Opaque
+stringData:
+  # 数据库密码（根据实际修改）
+  database-password: "password"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-project-service
+  namespace: secflow
+  labels:
+    app: secflow-project-service
+    version: v1
+spec:
+  replica: 3
+  selector:
+    matchLabels:
+      app: secflow-project-service
+  template:
+    metadata:
+      labels:
+        app: secflow-project-service
+        version: v1
+    spec:
+      serviceAccountName: secflow-project-sa
+      containers:
+        - name: secflow-project
+          image: registry.example.com/secflow-project-service:v1.0.0
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+              name: http
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+          env:
+            - name: CONFIG_PATH
+              value: /app/config/config.yaml
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: config
+          configMap:
+            name: secflow-project-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-project-service
+  namespace: secflow
+  labels:
+    app: secflow-project-service
+spec:
+  type: ClusterIP
+  selector:
+    app: secflow-project-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: secflow-project-sa
+  namespace: secflow
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: secflow-project-role
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["namespaces/status"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: secflow-project-binding
+subjects:
+  - kind: ServiceAccount
+    name: secflow-project-sa
+    namespace: secflow
+roleRef:
+  kind: ClusterRole
+  name: secflow-project-role
+  apiGroup: rbac.authorization.k8s.io

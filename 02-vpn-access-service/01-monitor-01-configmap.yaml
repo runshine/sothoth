@@ -241,7 +241,8 @@ data:
           # 发现当前状态
           declare -A current_state_str
           eval "declare -A current_state_str=$(discover_and_process_vpn_pods)"
-  
+          
+          log "current_state_str: ${current_state_str[@]}"
           # 转换字符串为关联数组
           declare -A current_state
           for key in "${!current_state_str[@]}"; do

@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-menu-config
+  namespace: secflow-ns
+  labels:
+    app: secflow-menu
+data:
+  config.yaml: |
+    # SecFlow Menu Service 配置文件
+
+    # 服务配置
+    host: "0.0.0.0"      # 服务监听地址
+    port: 5000           # 服务监听端口
+    debug: false         # 调试模式
+
+    # 心跳超时配置（秒）
+    heartbeat_timeout: 30.0
+
+    # 清理过期服务间隔（秒）
+    cleanup_interval: 10
+
+    # 日志配置
+    log_level: "INFO"

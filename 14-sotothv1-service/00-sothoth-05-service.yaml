@@ -9,7 +9,7 @@ spec:
     name: "sothoth-server"
   ports:
     - port: 80
-      targetPort: 80
+      targetPort: 9000
       protocol: TCP
 
 

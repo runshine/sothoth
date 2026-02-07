@@ -1,0 +1,8 @@
+# nginx-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: claude-code-router-config
+  namespace: sothothv2-ns
+data:
+  config.json: |

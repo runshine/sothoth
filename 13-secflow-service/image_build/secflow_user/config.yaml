@@ -1,0 +1,51 @@
+# SecFlow-User 配置文件
+
+# 数据库配置（MySQL）
+database:
+  host: "192.168.12.90"
+  port: 3306
+  username: "secflow"
+  password: "Huawei12#$"
+  name: "secflow"
+  charset: "utf8mb4"
+
+# 应用配置
+app:
+  host: "0.0.0.0"
+  port: 10000
+  debug: false
+
+# JWT配置
+jwt:
+  secret_key: "secflow-secret-key-change-in-production"
+  algorithm: "HS256"
+  access_token_expire_minutes: 1440  # 24小时
+
+# 服务注册配置
+registry:
+  enabled: true
+  menu_service_url: "http://192.168.12.44:10003"
+  service_id: "secflow-user"
+  service_name: "用户服务"
+  host: "0.0.0.0"
+  port: 10000
+  maturity: "已上线"
+  description: "用户管理与认证微服务"
+  api_prefix: "/api/auth"
+  menu:
+    id: "user-manage"
+    path: "/user-manage"
+    icon: "user"
+    order: 1
+    # 一级菜单
+    level1:
+      name: "系统管理"
+      name_en: "System"
+    # 二级菜单
+    level2:
+      name: "用户管理"
+      name_en: "User Management"
+    # 三级菜单（可选）
+    level3:
+      name: null
+      name_en: null
