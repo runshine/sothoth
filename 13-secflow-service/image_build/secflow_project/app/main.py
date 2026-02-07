@@ -104,20 +104,6 @@ setup_exception_handlers(app)
 app.include_router(router)
 
 
-# 健康检查
-@app.get("/health")
-async def health_check():
-    """健康检查接口"""
-    return {"status": "ok", "service": "secflow-project-service"}
-
-
-# 就绪检查
-@app.get("/ready")
-async def ready_check():
-    """就绪检查接口"""
-    return {"status": "ready"}
-
-
 if __name__ == "__main__":
     import uvicorn
 

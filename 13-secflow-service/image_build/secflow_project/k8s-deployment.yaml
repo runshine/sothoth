@@ -123,7 +123,7 @@ spec:
               memory: 512Mi
           livenessProbe:
             httpGet:
-              path: /health
+              path: /api/project/health
               port: 8080
             initialDelaySeconds: 10
             periodSeconds: 30
@@ -131,7 +131,7 @@ spec:
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /ready
+              path: /api/project/ready
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 10

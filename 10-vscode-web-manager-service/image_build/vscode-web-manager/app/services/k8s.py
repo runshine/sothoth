@@ -193,21 +193,21 @@ class K8SService:
 
             # 如果请求中提供了环境变量，使用请求中的值，否则使用配置中的值
             if code_server_env:
-                final_code_server_env["PUID"] = str(code_server_env.get("PUID", cs_env_config.PUID))
-                final_code_server_env["PGID"] = str(code_server_env.get("PGID", cs_env_config.PGID))
-                final_code_server_env["TZ"] = code_server_env.get("TZ", cs_env_config.TZ)
-                final_code_server_env["DEFAULT_WORKSPACE"] = code_server_env.get("DEFAULT_WORKSPACE", cs_env_config.DEFAULT_WORKSPACE)
-                final_code_server_env["PWA_APPNAME"] = code_server_env.get("PWA_APPNAME", cs_env_config.PWA_APPNAME)
+                final_code_server_env["PUID"] = str(code_server_env.get("PUID", cs_env_config.get("PUID", 1000)))
+                final_code_server_env["PGID"] = str(code_server_env.get("PGID", cs_env_config.get("PGID", 1000)))
+                final_code_server_env["TZ"] = code_server_env.get("TZ", cs_env_config.get("TZ", "Asia/Shanghai"))
+                final_code_server_env["DEFAULT_WORKSPACE"] = code_server_env.get("DEFAULT_WORKSPACE", cs_env_config.get("DEFAULT_WORKSPACE", "/config/workspace"))
+                final_code_server_env["PWA_APPNAME"] = code_server_env.get("PWA_APPNAME", cs_env_config.get("PWA_APPNAME", "code-server"))
 
                 # 密码：优先使用请求中的，其次是配置中的，最后随机生成
                 if code_server_env.get("HASHED_PASSWORD"):
                     final_code_server_env["HASHED_PASSWORD"] = code_server_env["HASHED_PASSWORD"]
                 elif code_server_env.get("PASSWORD"):
                     final_code_server_env["PASSWORD"] = code_server_env["PASSWORD"]
-                elif cs_env_config.HASHED_PASSWORD:
-                    final_code_server_env["HASHED_PASSWORD"] = cs_env_config.HASHED_PASSWORD
-                elif cs_env_config.PASSWORD:
-                    final_code_server_env["PASSWORD"] = cs_env_config.PASSWORD
+                elif cs_env_config.get("HASHED_PASSWORD"):
+                    final_code_server_env["HASHED_PASSWORD"] = cs_env_config["HASHED_PASSWORD"]
+                elif cs_env_config.get("PASSWORD"):
+                    final_code_server_env["PASSWORD"] = cs_env_config["PASSWORD"]
                 else:
                     final_code_server_env["PASSWORD"] = secrets.token_urlsafe(16)
 
@@ -216,41 +216,41 @@ class K8SService:
                     final_code_server_env["SUDO_PASSWORD_HASH"] = code_server_env["SUDO_PASSWORD_HASH"]
                 elif code_server_env.get("SUDO_PASSWORD"):
                     final_code_server_env["SUDO_PASSWORD"] = code_server_env["SUDO_PASSWORD"]
-                elif cs_env_config.SUDO_PASSWORD_HASH:
-                    final_code_server_env["SUDO_PASSWORD_HASH"] = cs_env_config.SUDO_PASSWORD_HASH
-                elif cs_env_config.SUDO_PASSWORD:
-                    final_code_server_env["SUDO_PASSWORD"] = cs_env_config.SUDO_PASSWORD
+                elif cs_env_config.get("SUDO_PASSWORD_HASH"):
+                    final_code_server_env["SUDO_PASSWORD_HASH"] = cs_env_config["SUDO_PASSWORD_HASH"]
+                elif cs_env_config.get("SUDO_PASSWORD"):
+                    final_code_server_env["SUDO_PASSWORD"] = cs_env_config["SUDO_PASSWORD"]
                 else:
                     final_code_server_env["SUDO_PASSWORD"] = secrets.token_urlsafe(16)
 
                 # 代理域名
-                proxy_domain = code_server_env.get("PROXY_DOMAIN", cs_env_config.PROXY_DOMAIN)
+                proxy_domain = code_server_env.get("PROXY_DOMAIN", cs_env_config.get("PROXY_DOMAIN"))
                 if proxy_domain:
                     final_code_server_env["PROXY_DOMAIN"] = proxy_domain
             else:
                 # 使用配置中的值
-                final_code_server_env["PUID"] = str(cs_env_config.PUID)
-                final_code_server_env["PGID"] = str(cs_env_config.PGID)
-                final_code_server_env["TZ"] = cs_env_config.TZ
-                final_code_server_env["DEFAULT_WORKSPACE"] = cs_env_config.DEFAULT_WORKSPACE
-                final_code_server_env["PWA_APPNAME"] = cs_env_config.PWA_APPNAME
+                final_code_server_env["PUID"] = str(cs_env_config.get("PUID", 1000))
+                final_code_server_env["PGID"] = str(cs_env_config.get("PGID", 1000))
+                final_code_server_env["TZ"] = cs_env_config.get("TZ", "Asia/Shanghai")
+                final_code_server_env["DEFAULT_WORKSPACE"] = cs_env_config.get("DEFAULT_WORKSPACE", "/config/workspace")
+                final_code_server_env["PWA_APPNAME"] = cs_env_config.get("PWA_APPNAME", "code-server")
 
-                if cs_env_config.HASHED_PASSWORD:
-                    final_code_server_env["HASHED_PASSWORD"] = cs_env_config.HASHED_PASSWORD
-                elif cs_env_config.PASSWORD:
-                    final_code_server_env["PASSWORD"] = cs_env_config.PASSWORD
+                if cs_env_config.get("HASHED_PASSWORD"):
+                    final_code_server_env["HASHED_PASSWORD"] = cs_env_config["HASHED_PASSWORD"]
+                elif cs_env_config.get("PASSWORD"):
+                    final_code_server_env["PASSWORD"] = cs_env_config["PASSWORD"]
                 else:
                     final_code_server_env["PASSWORD"] = secrets.token_urlsafe(16)
 
-                if cs_env_config.SUDO_PASSWORD_HASH:
-                    final_code_server_env["SUDO_PASSWORD_HASH"] = cs_env_config.SUDO_PASSWORD_HASH
-                elif cs_env_config.SUDO_PASSWORD:
-                    final_code_server_env["SUDO_PASSWORD"] = cs_env_config.SUDO_PASSWORD
+                if cs_env_config.get("SUDO_PASSWORD_HASH"):
+                    final_code_server_env["SUDO_PASSWORD_HASH"] = cs_env_config["SUDO_PASSWORD_HASH"]
+                elif cs_env_config.get("SUDO_PASSWORD"):
+                    final_code_server_env["SUDO_PASSWORD"] = cs_env_config["SUDO_PASSWORD"]
                 else:
                     final_code_server_env["SUDO_PASSWORD"] = secrets.token_urlsafe(16)
 
-                if cs_env_config.PROXY_DOMAIN:
-                    final_code_server_env["PROXY_DOMAIN"] = cs_env_config.PROXY_DOMAIN
+                if cs_env_config.get("PROXY_DOMAIN"):
+                    final_code_server_env["PROXY_DOMAIN"] = cs_env_config["PROXY_DOMAIN"]
 
             # 构建完整的环境变量列表
             env = []

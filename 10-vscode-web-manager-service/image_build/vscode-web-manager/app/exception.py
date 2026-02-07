@@ -3,6 +3,7 @@ Code Server Manager - 自定义异常
 """
 
 from fastapi import HTTPException, status
+from fastapi.responses import JSONResponse
 
 
 class AppException(HTTPException):
@@ -43,16 +44,28 @@ def setup_exception_handlers(app):
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(request, exc):
-        return {"error": "Not Found", "detail": exc.detail}
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "Not Found", "detail": exc.detail}
+        )
 
     @app.exception_handler(ValidationError)
     async def validation_error_handler(request, exc):
-        return {"error": "Validation Error", "detail": exc.detail}
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "Validation Error", "detail": exc.detail}
+        )
 
     @app.exception_handler(ConflictError)
     async def conflict_error_handler(request, exc):
-        return {"error": "Conflict", "detail": exc.detail}
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "Conflict", "detail": exc.detail}
+        )
 
     @app.exception_handler(InternalError)
     async def internal_error_handler(request, exc):
-        return {"error": "Internal Server Error", "detail": exc.detail}
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "Internal Server Error", "detail": exc.detail}
+        )

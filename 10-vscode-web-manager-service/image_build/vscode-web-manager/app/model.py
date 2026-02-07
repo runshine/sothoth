@@ -75,6 +75,10 @@ class CodeServer(Base):
     # 访问信息
     access_url = Column(String(256))
 
+    # 环境变量配置
+    custom_env = Column(JSON, default=dict)          # 自定义环境变量
+    code_server_env = Column(JSON, default=dict)     # Code Server镜像环境变量配置
+
     # 元数据
     description = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -96,6 +100,8 @@ class CodeServer(Base):
             "ingress_name": self.ingress_name,
             "pod_name": self.pod_name,
             "access_url": self.access_url,
+            "custom_env": self.custom_env or {},
+            "code_server_env": self.code_server_env or {},
             "description": self.description,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

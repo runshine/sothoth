@@ -186,10 +186,10 @@ class TaskManager:
         code_server_id = params.get("code_server_id")
         namespace = params.get("namespace")
         name = params.get("name")
-        custom_env = params.get("custom_env", {})
+        custom_env = params.get("custom_env") or {}
         # 注入PROJECT_ID环境变量
         custom_env["PROJECT_ID"] = task.project_id
-        code_server_env = params.get("code_server_env", {})
+        code_server_env = params.get("code_server_env") or {}
         image = params.get("image")  # 获取自定义镜像参数
 
         k8s_service = get_k8s_service()

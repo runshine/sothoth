@@ -203,7 +203,9 @@ async def create_code_server(
             "pvc_name": p.pvc_name,
             "mount_path": p.mount_path,
             "storage_size": p.storage_size
-        } for p in request.output_pvcs]
+        } for p in request.output_pvcs],
+        custom_env=request.custom_env or {},
+        code_server_env=request.code_server_env or {}
     )
     db.add(code_server)
     db.commit()

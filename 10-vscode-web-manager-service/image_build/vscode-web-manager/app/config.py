@@ -55,6 +55,14 @@ class CodeServerConfig(BaseModel):
     service_port: int = 80
     container_port: int = 8080
     env: Dict[str, str] = Field(default_factory=dict)
+    # Code Server镜像专属环境变量配置
+    code_server_env: Dict[str, Any] = Field(default_factory=lambda: {
+        "PUID": 1000,
+        "PGID": 1000,
+        "TZ": "Asia/Shanghai",
+        "DEFAULT_WORKSPACE": "/config/workspace",
+        "PWA_APPNAME": "code-server"
+    })
     resources: Dict[str, Dict[str, str]] = Field(default_factory=lambda: {
         "requests": {"cpu": "100m", "memory": "256Mi"},
         "limits": {"cpu": "1000m", "memory": "2Gi"}

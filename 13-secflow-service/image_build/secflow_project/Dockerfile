@@ -33,7 +33,7 @@ EXPOSE 8080
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/api/project/health || exit 1
 
 # 启动命令
 CMD ["python", "-m", "app.main"]

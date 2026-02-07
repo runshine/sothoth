@@ -38,6 +38,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/project", tags=["Projects"])
 
 
+# 健康检查
+@router.get("/health")
+async def health_check():
+    """健康检查接口"""
+    return {"status": "ok", "service": "secflow-project-service"}
+
+
+# 就绪检查
+@router.get("/ready")
+async def ready_check():
+    """就绪检查接口"""
+    return {"status": "ready"}
+
+
 def generate_project_id(name: str) -> str:
     """
     生成16位MD5项目ID

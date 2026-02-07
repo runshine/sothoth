@@ -50,6 +50,8 @@ class CodeServerCreateRequest(BaseModel):
     custom_env: Optional[Dict[str, str]] = Field(None, description="自定义环境变量")
     # Code Server专属环境变量
     code_server_env: Optional[Dict[str, Any]] = Field(None, description="Code Server镜像环境变量配置（PUID, PGID, TZ, PASSWORD, SUDO_PASSWORD等）")
+    # 自定义镜像
+    image: Optional[str] = Field(None, description="自定义镜像地址，使用特定镜像创建Code Server")
 
 
 class CodeServerDeleteRequest(BaseModel):
