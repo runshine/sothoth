@@ -17,16 +17,14 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: sothoth-server
-        image: openjdk:17.0.2-jdk
+        image: ultramangaia/gaiasec-env:server
         imagePullPolicy: Always
         ports:
-        - containerPort: 9000
+        - containerPort: 8000
         workingDir: /app
-        command: ["/bin/sh", "-c"]
-        args: ["java -jar sothoth-server-1.0-SNAPSHOT.jar"]
         volumeMounts:
         - name: file-cache-storage
-          mountPath: /app/
+          mountPath: /app/file-cache
         resources:
           requests:
             memory: "1024Mi"
@@ -41,7 +39,7 @@ spec:
           - name: MYSQL_ROOT_PASSWORD
             value: root123
           - name: MYSQL_DATABASE
-            value: sothoth
+            value: gaiasec
           - name: MYSQL_USER
             value: sa
           - name: MYSQL_PASSWORD
