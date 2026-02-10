@@ -7,3 +7,6 @@
 [submodule "07-agent-service-manager-service/image_build/agent-service-manager-frontend"]
 	path = 07-agent-service-manager-service/image_build/agent-service-manager-frontend
 	url = https://github.com/runshine/agent-service-manager-frontend.git
+[submodule "13-secflow-service/image_build/secflow-frontend"]
+	path = 13-secflow-service/image_build/secflow-frontend
+	url = https://github.com/runshine/SecFlowFrontend.git

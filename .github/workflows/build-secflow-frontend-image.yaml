@@ -1,0 +1,58 @@
+name: build-secflow-frontend-image
+on:
+  push:
+    branches:
+      - 'v2.*'
+    paths:
+      - .github/workflows/build-secflow-frontend-image.yml
+      - 13-secflow-service/image_build/secflow-frontend/**
+jobs:
+  build-secflow-frontend-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+
+      - name: clean to default
+        run: sed -i 's/https:\/\/secflow.819819.xyz//g'   ./13-secflow-service/image_build/secflow-frontend/api/base.ts
+
+      - name: cat base.ts
+        run: cat ./13-secflow-service/image_build/secflow-frontend/api/base.ts
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push build-secflow-frontend-image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            runshine0819/secflow-frontend:latest
+            ghcr.io/runshine/secflow-frontend:latest
+          file: ./13-secflow-service/image_build/secflow-frontend/docker/docker.txt
+
+
+

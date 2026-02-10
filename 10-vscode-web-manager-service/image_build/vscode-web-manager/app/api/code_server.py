@@ -425,22 +425,37 @@ async def get_code_server_logs(
     if not server:
         raise NotFoundError("Code Server", name)
 
-    if not server.pod_name:
-        raise ValidationError("Code Server没有运行中的Pod")
+    if not server.deployment_name:
+        raise ValidationError("Code Server没有关联的Deployment")
 
     k8s_service = get_k8s_service()
+
+    # 实时获取当前运行的Pod（处理Pod重建后的情况）
+    pod_info = k8s_service.get_pod_by_deployment(server.namespace, server.deployment_name)
+    if not pod_info:
+        raise ValidationError("Code Server没有运行中的Pod")
+
+    current_pod_name = pod_info.get("name")
+    if not current_pod_name:
+        raise ValidationError("无法获取Pod名称")
+
     logs = k8s_service.get_pod_logs(
-        server.namespace, server.pod_name, container=container, tail_lines=tail_lines
+        server.namespace, current_pod_name, container=container, tail_lines=tail_lines
     )
 
     if logs is None:
-        raise NotFoundError("Pod日志", server.pod_name)
+        raise NotFoundError("Pod日志", current_pod_name)
+
+    # 如果Pod名称有变化，更新数据库
+    if server.pod_name != current_pod_name:
+        server.pod_name = current_pod_name
+        db.commit()
 
     return CodeServerLogsResponse(
         code_server_id=server.id,
         code_server_name=server.name,
         namespace=server.namespace,
-        pod_name=server.pod_name,
+        pod_name=current_pod_name,
         container=container,
         logs=logs
     )
