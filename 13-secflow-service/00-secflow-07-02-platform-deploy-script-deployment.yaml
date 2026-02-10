@@ -4,7 +4,7 @@ metadata:
   name: secflow-platform-deploy-script
   namespace: secflow-ns
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       name: secflow-platform-deploy-script

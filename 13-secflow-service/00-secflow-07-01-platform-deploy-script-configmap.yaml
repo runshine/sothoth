@@ -19,8 +19,8 @@ data:
                         '"$http_user_agent" "$http_x_forwarded_for"'
                         ' proxy_to: "$upstream_addr"';
     
-        access_log /var/log/nginx/access.log main;
-        error_log /var/log/nginx/error.log warn;
+        access_log /var/log/nginx/access_out.log main;
+        error_log /var/log/nginx/error_out.log warn;
     
         # 开启gzip压缩
         gzip on;

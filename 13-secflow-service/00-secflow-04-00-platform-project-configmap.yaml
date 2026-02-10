@@ -18,7 +18,7 @@ data:
       max_overflow: 20
     # Auth Service Configuration
     auth_service:
-      host: "sec-platform-auth"
+      host: "secflow-platform-auth"
       port: 80
       validate_token_path: "/api/auth/validate-human-token"
       timeout: 10
