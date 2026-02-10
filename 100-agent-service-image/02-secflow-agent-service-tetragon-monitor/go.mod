@@ -1,6 +1,6 @@
 module tetragon-monitor
 
-go 1.22
+go 1.25
 
 require (
 	github.com/cilium/tetragon v1.6.0
