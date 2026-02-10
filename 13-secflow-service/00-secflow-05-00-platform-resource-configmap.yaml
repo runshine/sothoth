@@ -23,7 +23,7 @@ data:
       debug: false
       upload_dir: "/data/uploads"
       temp_dir: "/data/temp"
-      download_base_url: "http://secflow-platform-resource"
+      download_base_url: "http://secflow-platform-resource.secflow-ns.svc.cluster.local"
     # Auth Service Configuration (for token validation)
     auth_service:
       base_url: "http://secflow-platform-auth"
