@@ -5,6 +5,7 @@ on:
       - 'v2.*'
     paths:
       - .github/workflows/build-secflow-frontend-image.yaml
+      - 13-secflow-service/image_build/secflow-frontend
       - 13-secflow-service/image_build/secflow-frontend/**
 jobs:
   build-secflow-frontend-image:
