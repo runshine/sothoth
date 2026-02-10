@@ -4,7 +4,7 @@ metadata:
   name: secflow-platform-resource
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       name: secflow-platform-resource
@@ -25,6 +25,8 @@ spec:
         - name: secflow-platform-menu-config
           mountPath: /app/config.yaml
           subPath: config.yaml
+        - name: secflow-platform-resource-data-nfs-pvc
+          mountPath: /data
         resources:
           requests:
             memory: "128Mi"
@@ -46,6 +48,9 @@ spec:
           periodSeconds: 30
 
       volumes:
+      - name: secflow-platform-resource-data-nfs-pvc
+        persistentVolumeClaim:
+          claimName: secflow-platform-resource-data-nfs-pvc  # 引用PVC
       - name: secflow-platform-menu-config
         configMap:
           name: secflow-platform-menu-config

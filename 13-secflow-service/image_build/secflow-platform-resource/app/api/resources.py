@@ -104,7 +104,7 @@ def get_upload_dir() -> str:
     """获取上传目录。"""
     config = get_config()
     app_config = config.get("app", {})
-    return app_config.get("upload_dir", "/tmp/uploads")
+    return app_config.get("upload_dir", "/data/uploads")
 
 
 # ============ 资源上传接口（文件上传模式） ============

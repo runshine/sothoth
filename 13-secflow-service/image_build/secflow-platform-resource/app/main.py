@@ -199,7 +199,7 @@ def init_services(config: dict):
 
     # 初始化任务管理器
     task_config = config.get("task", {})
-    task_log_dir = task_config.get("log_dir", "/app/task_log")
+    task_log_dir = task_config.get("log_dir", "/data/task_log")
     Path(task_log_dir).mkdir(parents=True, exist_ok=True)
     init_task_manager(
         log_dir=task_log_dir,

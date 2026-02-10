@@ -21,8 +21,8 @@ data:
       host: "0.0.0.0"
       port: 8080
       debug: false
-      upload_dir: "/tmp/uploads"
-      temp_dir: "/tmp/temp"
+      upload_dir: "/data/uploads"
+      temp_dir: "/data/temp"
       download_base_url: "http://secflow-platform-resource"
     # Auth Service Configuration (for token validation)
     auth_service:
@@ -54,7 +54,7 @@ data:
     # Async Task Configuration
     task:
       # 任务日志目录
-      log_dir: "/tmp/task_log"
+      log_dir: "/data/task_log"
       # 任务日志保留天数
       log_retention_days: 7
       # 最大并发任务数

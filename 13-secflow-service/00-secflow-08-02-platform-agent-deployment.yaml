@@ -24,6 +24,8 @@ spec:
         - name: secflow-platform-agent-config
           mountPath: /app/config.json
           subPath: config.json
+        - name: secflow-platform-agent-nfs-pvc
+          mountPath: /data
         resources:
           requests:
             memory: "128Mi"
@@ -45,6 +47,9 @@ spec:
           periodSeconds: 30
 
       volumes:
+      - name: secflow-platform-agent-nfs-pvc
+        persistentVolumeClaim:
+          claimName: secflow-platform-agent-nfs-pvc  # 引用PVC
       - name: secflow-platform-agent-config
         configMap:
           name: secflow-platform-agent-config
