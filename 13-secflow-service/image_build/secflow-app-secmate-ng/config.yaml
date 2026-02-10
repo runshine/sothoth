@@ -1,4 +1,4 @@
-# Code Server Manager 配置文件
+# SecMate-NG Manager 配置文件
 
 # 应用配置
 app:
@@ -16,11 +16,11 @@ database:
   username: "secflow"
   password: "Huawei12#$"
   name: "secflow"
-  table_prefix: "secflow_app_code_server_"
+  table_prefix: "secflow_app_secmate_ng_"
   pool_size: 10
   max_overflow: 20
   # SQLite配置（当type为sqlite时使用）
-  path: "./codeserver_manager.db"
+  path: "./SecMateNG_manager.db"
 
 # Kubernetes配置
 kubernetes:
@@ -30,8 +30,8 @@ kubernetes:
   kubeconfig: null
   connection_timeout: 30
 
-# Code Server配置
-code_server:
+# SecMate-NG配置
+secmate_ng:
   # 默认镜像
   image: "ghcr.io/skiyer/deepsight:latest"
   # 镜像拉取策略: Always, IfNotPresent, Never
@@ -40,7 +40,7 @@ code_server:
   service_type: "ClusterIP"
   # 服务端口
   service_port: 80
-  # 容器端口（code-server默认端口）
+  # 容器端口（secmate-ng默认端口）
   container_port: 8080
   # 默认环境变量
   env:
@@ -53,9 +53,9 @@ code_server:
     ANTHROPIC_DEFAULT_HAIKU_MODEL: "minimax/minimax-m2.1"
     API_TIMEOUT_MS: "3000000"
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
-  # code-server 镜像环境变量配置
-  # 参考: https://docs.linuxserver.io/images/docker-code-server/
-  code_server_env:
+  # secmate-ng 镜像环境变量配置
+  # 参考: https://docs.linuxserver.io/images/docker-secmate-ng/
+  secmate_ng_env:
     # 用户ID
     PUID: 1000
     # 组ID
@@ -75,7 +75,7 @@ code_server:
     # 默认工作空间
     DEFAULT_WORKSPACE: "/config/workspace"
     # PWA应用名称
-    PWA_APPNAME: "code-server"
+    PWA_APPNAME: "secmate-ng"
   # 资源限制
   resources:
     requests:
@@ -97,9 +97,9 @@ pvc:
 # Ingress配置
 ingress:
   # 基础域名
-  base_domain: "code-server.sothothv2.com"
+  base_domain: "secmate-ng.sothothv2.com"
   # TLS证书Secret名称
-  tls_secret_name: "wildcard-code-server.sothothv2.com-tls"
+  tls_secret_name: "wildcard-secmate-ng.sothothv2.com-tls"
   # Ingress Class名称
   ingress_class: "nginx"
   # 是否启用TLS
@@ -123,16 +123,16 @@ logging:
 registry:
   enabled: true
   menu_service_url: "http://192.168.12.44:10003"
-  service_id: "vscode-web-manager"
-  service_name: "VSCode Web管理器"
+  service_id: "secmate-ng-web-manager"
+  service_name: "secmate-ng Web管理器"
   host: "0.0.0.0"
   port: 10004
   maturity: "开发中"  # 可选: 已上线、开发中、规划中
-  description: "VSCode Web实例管理微服务"
-  api_prefix: "/api/code-server"
+  description: "secmate-ng Web实例管理微服务"
+  api_prefix: "/api/secmate-ng"
   menu:
-    id: "vscode-web-manager"
-    path: "/vscode-web-manager"
+    id: "secmate-ng-web-manager"
+    path: "/secmate-ng-web-manager"
     icon: "code"
     order: 10
     # 一级菜单
@@ -141,8 +141,8 @@ registry:
       name_en: "DevTools"
     # 二级菜单
     level2:
-      name: "VSCode Web"
-      name_en: "VSCode Web"
+      name: "secmate-ng Web"
+      name_en: "secmate-ng Web"
     # 三级菜单（可选）
     level3:
       name: null

@@ -1,5 +1,5 @@
 """
-Code Server Manager - 主入口
+SecMate-NG Manager - 主入口
 """
 
 import logging
@@ -18,7 +18,7 @@ from app.exception import setup_exception_handlers
 from app.model import init_database
 from app.services.k8s import get_k8s_service
 from app.services.task_manager import get_task_manager
-from app.api.code_server import router as code_server_router
+from app.api.secmate_ng import router as secmate_ng_router
 
 # 配置日志
 logging.basicConfig(
@@ -127,7 +127,7 @@ async def periodic_register():
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时执行
-    logger.info("正在启动Code Server Manager服务...")
+    logger.info("正在启动SecMate-NG Manager服务...")
 
     # 加载配置
     try:
@@ -176,12 +176,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"菜单服务注册失败: {e}")
 
-    logger.info("Code Server Manager服务启动成功")
+    logger.info("SecMate-NG Manager服务启动成功")
 
     yield
 
     # 关闭时执行
-    logger.info("正在关闭Code Server Manager服务...")
+    logger.info("正在关闭SecMate-NG Manager服务...")
 
     # 停止任务管理器
     try:
@@ -194,8 +194,8 @@ async def lifespan(app: FastAPI):
 
 # 创建FastAPI应用
 app = FastAPI(
-    title="Code Server Manager",
-    description="提供Code Server实例的创建、销毁、重建、状态查询、日志查看等功能",
+    title="SecMate-NG Manager",
+    description="提供SecMate-NG实例的创建、销毁、重建、状态查询、日志查看等功能",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -213,7 +213,7 @@ app.add_middleware(
 setup_exception_handlers(app)
 
 # 注册路由
-app.include_router(code_server_router)
+app.include_router(secmate_ng_router)
 
 
 if __name__ == "__main__":

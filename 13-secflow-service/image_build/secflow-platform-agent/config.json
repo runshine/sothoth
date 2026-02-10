@@ -1,13 +1,17 @@
 {
-  "port": 8080,
+  "port": 8080 ,
   "host": "0.0.0.0",
   "debug": true,
   "secret_key": "dev-secret-key-change-in-production",
   "services_root": "./services",
   "templates_root": "./templates",
   "database": {
-    "type": "sqlite",
-    "path": "webapi_server.db"
+    "type": "mysql",
+    "host": "192.168.12.90",
+    "port": 3306,
+    "user": "secflow",
+    "password": "Huawei12#$",
+    "database": "secflow"
   },
   "redis_url": "redis://192.168.12.90:6379/agent-service-manager-service",
   "redis_enabled": true,
