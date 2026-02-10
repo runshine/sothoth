@@ -46,7 +46,7 @@ jobs:
       - name: Build and push build-secflow-frontend-image
         uses: docker/build-push-action@v5
         with:
-          context: ./
+          context: ./13-secflow-service/image_build/secflow-frontend/
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
