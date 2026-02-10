@@ -267,7 +267,7 @@ class DatabaseManager:
             # 创建服务模板表
             if self.db_type == 'mysql':
                 db.execute('''
-                           CREATE TABLE IF NOT EXISTS service_templates (
+                           CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
                                                                             id INT AUTO_INCREMENT PRIMARY KEY,
                                                                             name VARCHAR(100) UNIQUE NOT NULL,
                                description TEXT,
@@ -283,7 +283,7 @@ class DatabaseManager:
                            ''')
             else:
                 db.execute('''
-                           CREATE TABLE IF NOT EXISTS service_templates (
+                           CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
                                                                             id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                                             name TEXT UNIQUE NOT NULL,
                                                                             description TEXT,
@@ -299,7 +299,7 @@ class DatabaseManager:
             # 创建任务表
             if self.db_type == 'mysql':
                 db.execute('''
-                           CREATE TABLE IF NOT EXISTS tasks (
+                           CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
                                                                 id INT AUTO_INCREMENT PRIMARY KEY,
                                                                 task_id VARCHAR(36) UNIQUE NOT NULL,
                                task_type VARCHAR(20) NOT NULL,
@@ -322,7 +322,7 @@ class DatabaseManager:
                            ''')
             else:
                 db.execute('''
-                           CREATE TABLE IF NOT EXISTS tasks (
+                           CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
                                                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                                 task_id TEXT UNIQUE NOT NULL,
                                                                 task_type TEXT NOT NULL,
@@ -339,14 +339,14 @@ class DatabaseManager:
                            )
                            ''')
                 # 为SQLite创建索引
-                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON tasks(task_id)')
-                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)')
-                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_agent_key ON tasks(agent_key)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON secflow_agent_tasks(task_id)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON secflow_agent_tasks(status)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_agent_key ON secflow_agent_tasks(agent_key)')
 
             # 创建任务日志表
             if self.db_type == 'mysql':
                 db.execute('''
-                           CREATE TABLE IF NOT EXISTS task_logs (
+                           CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
                                                                     id INT AUTO_INCREMENT PRIMARY KEY,
                                                                     log_id VARCHAR(36) UNIQUE NOT NULL,
                                task_id VARCHAR(36) NOT NULL,
@@ -356,12 +356,12 @@ class DatabaseManager:
                                pod_id VARCHAR(100),
                                INDEX idx_logs_task_id (task_id),
                                INDEX idx_logs_timestamp (timestamp),
-                               FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+                               FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
                                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
             else:
                 db.execute('''
-                           CREATE TABLE IF NOT EXISTS task_logs (
+                           CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
                                                                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                                     log_id TEXT UNIQUE NOT NULL,
                                                                     task_id TEXT NOT NULL,
@@ -369,16 +369,16 @@ class DatabaseManager:
                                                                     message TEXT NOT NULL,
                                                                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                                                                     pod_id TEXT,
-                                                                    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
+                                                                    FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
                                )
                            ''')
                 # 为SQLite创建索引
-                db.execute('CREATE INDEX IF NOT EXISTS idx_logs_task_id ON task_logs(task_id)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_logs_task_id ON secflow_agent_task_logs(task_id)')
 
             # 创建Agent状态表（用于多POD状态同步）
             if self.db_type == 'mysql':
                 db.execute('''
-                           CREATE TABLE IF NOT EXISTS agent_status (
+                           CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
                                                                        id INT AUTO_INCREMENT PRIMARY KEY,
                                                                        agent_key VARCHAR(32) UNIQUE NOT NULL,
                                ip_address VARCHAR(45) NOT NULL,
@@ -391,14 +391,14 @@ class DatabaseManager:
                                services JSON,
                                pod_id VARCHAR(100),
                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                               INDEX idx_agent_status_key (agent_key),
-                               INDEX idx_agent_status_project (project_id),
-                               INDEX idx_agent_status_updated (updated_at)
+                               INDEX idx_secflow_agent_agent_status_key (agent_key),
+                               INDEX idx_secflow_agent_agent_status_project (project_id),
+                               INDEX idx_secflow_agent_agent_status_updated (updated_at)
                                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
             else:
                 db.execute('''
-                           CREATE TABLE IF NOT EXISTS agent_status (
+                           CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
                                                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                                        agent_key TEXT UNIQUE NOT NULL,
                                                                        ip_address TEXT NOT NULL,
@@ -414,7 +414,7 @@ class DatabaseManager:
                            )
                            ''')
                 # 为SQLite创建索引
-                db.execute('CREATE INDEX IF NOT EXISTS idx_agent_status_project ON agent_status(project_id)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_secflow_agent_agent_status_project ON secflow_agent_agent_status(project_id)')
 
 
             self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}）")
@@ -714,7 +714,7 @@ DEFAULT_CONFIG = {
     'log_file': './webapi_server.log',
     'pod_id': os.environ.get('POD_NAME', 'webapi-server-1'),
     'lock_timeout': 30,
-    'max_task_logs': 1000,
+    'max_secflow_agent_task_logs': 1000,
     'task_log_retention_days': 7,
     'supported_formats': SUPPORTED_FORMATS,  # 添加支持的格式列表
     # ===================== 超时配置 =====================
@@ -1113,12 +1113,12 @@ class EnhancedTemplateManager:
             metadata_json = json.dumps(metadata)
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    "UPDATE service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
                     (metadata_json, template_name)
                 )
             else:
                 self.db.execute_query(
-                    "UPDATE service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (metadata_json, template_name)
                 )
 
@@ -1370,12 +1370,12 @@ class EnhancedTemplateManager:
             metadata_json = json.dumps(metadata)
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    "UPDATE service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
                     (metadata_json, template_name)
                 )
             else:
                 self.db.execute_query(
-                    "UPDATE service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (metadata_json, template_name)
                 )
 
@@ -1622,12 +1622,12 @@ class EnhancedTemplateManager:
             metadata_json = json.dumps(metadata)
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    "UPDATE service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
                     (metadata_json, template_name)
                 )
             else:
                 self.db.execute_query(
-                    "UPDATE service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (metadata_json, template_name)
                 )
 
@@ -2046,9 +2046,9 @@ class EnhancedTemplateManager:
         try:
             # 检查模板名称是否已存在
             existing = self.db.fetch_one(
-                "SELECT id FROM service_templates WHERE name = %s"
+                "SELECT id FROM secflow_agent_service_templates WHERE name = %s"
                 if self.db.db_type == 'mysql' else
-                "SELECT id FROM service_templates WHERE name = ?",
+                "SELECT id FROM secflow_agent_service_templates WHERE name = ?",
                 (name,)
             )
             if existing:
@@ -2185,13 +2185,13 @@ class EnhancedTemplateManager:
             # 插入数据库记录
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    "INSERT INTO service_templates (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
+                    "INSERT INTO secflow_agent_service_templates (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
                     "VALUES (%s, %s, %s, %s, %s, NOW(), NOW(), %s)",
                     (name, description, template_type, str(file_path), created_by, metadata_json)
                 )
             else:
                 self.db.execute_query(
-                    "INSERT INTO service_templates (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
+                    "INSERT INTO secflow_agent_service_templates (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
                     "VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)",
                     (name, description, template_type, str(file_path), created_by, metadata_json)
                 )
@@ -2215,9 +2215,9 @@ class EnhancedTemplateManager:
                 if db_cleanup_needed:
                     self.logger.info(f"清理数据库记录: {name}")
                     self.db.execute_query(
-                        "DELETE FROM service_templates WHERE name = %s"
+                        "DELETE FROM secflow_agent_service_templates WHERE name = %s"
                         if self.db.db_type == 'mysql' else
-                        "DELETE FROM service_templates WHERE name = ?",
+                        "DELETE FROM secflow_agent_service_templates WHERE name = ?",
                         (name,)
                     )
 
@@ -2236,9 +2236,9 @@ class EnhancedTemplateManager:
     def get_template(self, name: str) -> Optional[Dict]:
         """获取模板信息（包含元数据）"""
         template = self.db.fetch_one(
-            "SELECT * FROM service_templates WHERE name = %s"
+            "SELECT * FROM secflow_agent_service_templates WHERE name = %s"
             if self.db.db_type == 'mysql' else
-            "SELECT * FROM service_templates WHERE name = ?",
+            "SELECT * FROM secflow_agent_service_templates WHERE name = ?",
             (name,)
         )
 
@@ -2396,9 +2396,9 @@ class EnhancedTemplateManager:
                 metadata['last_updated_at'] = datetime.now().isoformat()
 
                 self.db.execute_query(
-                    "UPDATE service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s"
+                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s"
                     if self.db.db_type == 'mysql' else
-                    "UPDATE service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (json.dumps(metadata), name)
                 )
 
@@ -2486,9 +2486,9 @@ class EnhancedTemplateManager:
                 metadata['directory_size'] = dir_size
 
                 self.db.execute_query(
-                    "UPDATE service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s"
+                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s"
                     if self.db.db_type == 'mysql' else
-                    "UPDATE service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (json.dumps(metadata), name)
                 )
 
@@ -2735,16 +2735,16 @@ class EnhancedTemplateManager:
 
         if self.db.db_type == 'mysql':
             templates = self.db.fetch_all(
-                "SELECT * FROM service_templates ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                "SELECT * FROM secflow_agent_service_templates ORDER BY updated_at DESC LIMIT %s OFFSET %s",
                 (per_page, offset)
             )
-            count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM service_templates")
+            count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM secflow_agent_service_templates")
         else:
             templates = self.db.fetch_all(
-                "SELECT * FROM service_templates ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                "SELECT * FROM secflow_agent_service_templates ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                 (per_page, offset)
             )
-            count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM service_templates")
+            count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM secflow_agent_service_templates")
 
         total = count_result['count'] if count_result else 0
 
@@ -2788,9 +2788,9 @@ class EnhancedTemplateManager:
                 shutil.rmtree(template_dir, ignore_errors=True)
 
             self.db.execute_query(
-                "DELETE FROM service_templates WHERE name = %s"
+                "DELETE FROM secflow_agent_service_templates WHERE name = %s"
                 if self.db.db_type == 'mysql' else
-                "DELETE FROM service_templates WHERE name = ?",
+                "DELETE FROM secflow_agent_service_templates WHERE name = ?",
                 (name,)
             )
 
@@ -2874,11 +2874,11 @@ class AgentManager:
             with self.lock:
                 if self.db.db_type == 'mysql':
                     agents_data = self.db.fetch_all(
-                        "SELECT * FROM agent_status WHERE updated_at > NOW() - INTERVAL 5 MINUTE"
+                        "SELECT * FROM secflow_agent_agent_status WHERE updated_at > NOW() - INTERVAL 5 MINUTE"
                     )
                 else:
                     agents_data = self.db.fetch_all(
-                        "SELECT * FROM agent_status WHERE updated_at > datetime('now', '-5 minutes')"
+                        "SELECT * FROM secflow_agent_agent_status WHERE updated_at > datetime('now', '-5 minutes')"
                     )
 
                 for agent_data in agents_data:
@@ -3206,7 +3206,7 @@ class AgentManager:
             self.logger.error(f"获取Nacos服务列表异常: {str(e)}")
             return []
 
-    def _check_agent_status(self, agent: AgentInfo) -> bool:
+    def _check_secflow_agent_agent_status(self, agent: AgentInfo) -> bool:
         try:
             # 首先检查是否有有效的agent_key
             if not agent.key:
@@ -3293,7 +3293,7 @@ class AgentManager:
                             pod_id=self.pod_id
                         )
 
-                        self._check_agent_status(agent)
+                        self._check_secflow_agent_agent_status(agent)
                         self._save_agent_to_db(agent)
                         new_agents[agent_key] = agent
 
@@ -3344,7 +3344,7 @@ class AgentManager:
                     offline_agents = self.db.fetch_all(f'''
                                                        SELECT agent_key, hostname, ip_address, project_id, status,
                                                               last_seen, updated_at
-                                                       FROM agent_status
+                                                       FROM secflow_agent_agent_status
                                                        {where_clause}
                                                        ORDER BY updated_at ASC
                                                        ''', (project_id,) if project_id else None)
@@ -3352,7 +3352,7 @@ class AgentManager:
                     offline_agents = self.db.fetch_all(f'''
                                                        SELECT agent_key, hostname, ip_address, project_id, status,
                                                               last_seen, updated_at
-                                                       FROM agent_status
+                                                       FROM secflow_agent_agent_status
                                                        {where_clause_sqlite}
                                                        ORDER BY updated_at ASC
                                                        ''', (project_id,) if project_id else None)
@@ -3379,12 +3379,12 @@ class AgentManager:
                             # 从数据库中删除
                             if self.db.db_type == 'mysql':
                                 self.db.execute_query(
-                                    "DELETE FROM agent_status WHERE agent_key = %s",
+                                    "DELETE FROM secflow_agent_agent_status WHERE agent_key = %s",
                                     (agent_key,)
                                 )
                             else:
                                 self.db.execute_query(
-                                    "DELETE FROM agent_status WHERE agent_key = ?",
+                                    "DELETE FROM secflow_agent_agent_status WHERE agent_key = ?",
                                     (agent_key,)
                                 )
 
@@ -3467,24 +3467,24 @@ class AgentManager:
             # 获取总agent数
             if self.db.db_type == 'mysql':
                 total_result = self.db.fetch_one(
-                    f"SELECT COUNT(*) as count FROM agent_status{project_filter}",
+                    f"SELECT COUNT(*) as count FROM secflow_agent_agent_status{project_filter}",
                     tuple(params) if params else None
                 )
                 offline_filter = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
                 offline_result = self.db.fetch_one(
-                    f"SELECT COUNT(*) as count FROM agent_status{offline_filter}",
+                    f"SELECT COUNT(*) as count FROM secflow_agent_agent_status{offline_filter}",
                     tuple(params) if params else None
                 )
             else:
                 placeholders = "?" * len(params) if params else ""
                 project_filter_sql = f" WHERE project_id = {placeholders}" if project_id else ""
                 total_result = self.db.fetch_one(
-                    f"SELECT COUNT(*) as count FROM agent_status{project_filter_sql}",
+                    f"SELECT COUNT(*) as count FROM secflow_agent_agent_status{project_filter_sql}",
                     tuple(params) if params else None
                 )
                 offline_filter_sql = f" WHERE project_id = {placeholders} AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
                 offline_result = self.db.fetch_one(
-                    f"SELECT COUNT(*) as count FROM agent_status{offline_filter_sql}",
+                    f"SELECT COUNT(*) as count FROM secflow_agent_agent_status{offline_filter_sql}",
                     tuple(params) if params else None
                 )
 
@@ -3518,7 +3518,7 @@ class AgentManager:
 
             if self.db.db_type == 'mysql':
                 self.db.execute_query('''
-                                      INSERT INTO agent_status
+                                      INSERT INTO secflow_agent_agent_status
                                       (agent_key, ip_address, hostname, project_id, full_name, status,
                                        last_seen, system_info, services, pod_id, updated_at)
                                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
@@ -3547,7 +3547,7 @@ class AgentManager:
                                       ))
             else:
                 self.db.execute_query('''
-                    INSERT OR REPLACE INTO agent_status 
+                    INSERT OR REPLACE INTO secflow_agent_agent_status 
                     (agent_key, ip_address, hostname, project_id, full_name, status, 
                      last_seen, system_info, services, pod_id, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
@@ -3783,7 +3783,7 @@ class TaskManager:
     """任务管理器（支持多种压缩格式）"""
     def __init__(self, db_manager: DatabaseManager, agent_manager: AgentManager,
                  template_manager: EnhancedTemplateManager, services_root: str,
-                 redis_manager: RedisManager, pod_id: str, max_task_logs: int = 1000,
+                 redis_manager: RedisManager, pod_id: str, max_secflow_agent_task_logs: int = 1000,
                  agent_api_timeouts: Dict = None):
         self.db = db_manager
         self.agent_manager = agent_manager
@@ -3791,7 +3791,7 @@ class TaskManager:
         self.services_root = Path(services_root)
         self.redis_manager = redis_manager
         self.pod_id = pod_id
-        self.max_task_logs = max_task_logs
+        self.max_secflow_agent_task_logs = max_secflow_agent_task_logs
 
         # 设置超时配置
         self.timeouts = agent_api_timeouts or {
@@ -3819,12 +3819,12 @@ class TaskManager:
             cutoff_date = (datetime.now() - timedelta(days=7)).isoformat()
             if self.db.db_type == 'mysql':
                 self.db.execute_query('''
-                                      DELETE FROM task_logs
+                                      DELETE FROM secflow_agent_task_logs
                                       WHERE timestamp < %s
                                       ''', (cutoff_date,))
             else:
                 self.db.execute_query('''
-                                      DELETE FROM task_logs
+                                      DELETE FROM secflow_agent_task_logs
                                       WHERE timestamp < ?
                                       ''', (cutoff_date,))
 
@@ -3886,39 +3886,39 @@ class TaskManager:
 
             if self.db.db_type == 'mysql':
                 self.db.execute_query('''
-                                      INSERT INTO task_logs
+                                      INSERT INTO secflow_agent_task_logs
                                           (log_id, task_id, level, message, timestamp, pod_id)
                                       VALUES (%s, %s, %s, %s, NOW(), %s)
                                       ''', (log_id, task_id, level, message, self.pod_id))
 
                 # 限制日志数量
                 self.db.execute_query('''
-                    DELETE tl FROM task_logs tl
+                    DELETE tl FROM secflow_agent_task_logs tl
                     JOIN (
-                        SELECT id FROM task_logs 
+                        SELECT id FROM secflow_agent_task_logs 
                         WHERE task_id = %s 
                         ORDER BY timestamp DESC 
                         LIMIT 1 OFFSET %s
                     ) t ON tl.id = t.id
-                ''', (task_id, self.max_task_logs))
+                ''', (task_id, self.max_secflow_agent_task_logs))
 
             else:
                 self.db.execute_query('''
-                                      INSERT INTO task_logs
+                                      INSERT INTO secflow_agent_task_logs
                                           (log_id, task_id, level, message, timestamp, pod_id)
                                       VALUES (?, ?, ?, ?, datetime('now'), ?)
                                       ''', (log_id, task_id, level, message, self.pod_id))
 
                 # 限制日志数量
                 self.db.execute_query('''
-                                      DELETE FROM task_logs
+                                      DELETE FROM secflow_agent_task_logs
                                       WHERE id IN (
-                                          SELECT id FROM task_logs
+                                          SELECT id FROM secflow_agent_task_logs
                                           WHERE task_id = ?
                                           ORDER BY timestamp DESC
                                           LIMIT -1 OFFSET ?
                                           )
-                                      ''', (task_id, self.max_task_logs))
+                                      ''', (task_id, self.max_secflow_agent_task_logs))
 
         except Exception as e:
             self.logger.error(f"添加任务日志失败: {str(e)}")
@@ -4265,48 +4265,48 @@ class TaskManager:
 
     def get_task(self, task_id: str) -> Optional[Dict]:
         task = self.db.fetch_one(
-            "SELECT * FROM tasks WHERE task_id = %s"
+            "SELECT * FROM secflow_agent_tasks WHERE task_id = %s"
             if self.db.db_type == 'mysql' else
-            "SELECT * FROM tasks WHERE task_id = ?",
+            "SELECT * FROM secflow_agent_tasks WHERE task_id = ?",
             (task_id,)
         )
 
         if task:
             log_count = self.db.fetch_one(
-                "SELECT COUNT(*) as count FROM task_logs WHERE task_id = %s"
+                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = %s"
                 if self.db.db_type == 'mysql' else
-                "SELECT COUNT(*) as count FROM task_logs WHERE task_id = ?",
+                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = ?",
                 (task_id,)
             )
             task['log_count'] = log_count['count'] if log_count else 0
 
         return task
 
-    def get_task_logs(self, task_id: str, page: int = 1, per_page: int = 100) -> Tuple[List[Dict], int]:
+    def get_secflow_agent_task_logs(self, task_id: str, page: int = 1, per_page: int = 100) -> Tuple[List[Dict], int]:
         offset = (page - 1) * per_page
 
         if self.db.db_type == 'mysql':
             logs = self.db.fetch_all('''
-                                     SELECT * FROM task_logs
+                                     SELECT * FROM secflow_agent_task_logs
                                      WHERE task_id = %s
                                      ORDER BY timestamp ASC
                                          LIMIT %s OFFSET %s
                                      ''', (task_id, per_page, offset))
 
             count_result = self.db.fetch_one(
-                "SELECT COUNT(*) as count FROM task_logs WHERE task_id = %s",
+                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = %s",
                 (task_id,)
             )
         else:
             logs = self.db.fetch_all('''
-                                     SELECT * FROM task_logs
+                                     SELECT * FROM secflow_agent_task_logs
                                      WHERE task_id = ?
                                      ORDER BY timestamp ASC
                                          LIMIT ? OFFSET ?
                                      ''', (task_id, per_page, offset))
 
             count_result = self.db.fetch_one(
-                "SELECT COUNT(*) as count FROM task_logs WHERE task_id = ?",
+                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = ?",
                 (task_id,)
             )
 
@@ -4316,7 +4316,7 @@ class TaskManager:
     def list_tasks(self, page: int = 1, per_page: int = 20,
                    task_type: str = None, status: str = None,
                    project_id: str = None, agent_key: str = None) -> Tuple[List[Dict], int]:
-        query = "SELECT * FROM tasks WHERE 1=1"
+        query = "SELECT * FROM secflow_agent_tasks WHERE 1=1"
         params = []
 
         if task_type:
@@ -4354,7 +4354,7 @@ class TaskManager:
 
         for task in tasks:
             log_count = self.db.fetch_one(
-                "SELECT COUNT(*) as count FROM task_logs WHERE task_id = " +
+                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = " +
                 ("%s" if self.db.db_type == 'mysql' else "?"),
                 (task['task_id'],)
             )
@@ -4366,13 +4366,13 @@ class TaskManager:
         try:
             if self.db.db_type == 'mysql':
                 self.db.execute_transaction([
-                    ("DELETE FROM task_logs WHERE task_id = %s", (task_id,)),
-                    ("DELETE FROM tasks WHERE task_id = %s", (task_id,))
+                    ("DELETE FROM secflow_agent_task_logs WHERE task_id = %s", (task_id,)),
+                    ("DELETE FROM secflow_agent_tasks WHERE task_id = %s", (task_id,))
                 ])
             else:
                 self.db.execute_transaction([
-                    ("DELETE FROM task_logs WHERE task_id = ?", (task_id,)),
-                    ("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+                    ("DELETE FROM secflow_agent_task_logs WHERE task_id = ?", (task_id,)),
+                    ("DELETE FROM secflow_agent_tasks WHERE task_id = ?", (task_id,))
                 ])
 
             future = self.active_tasks.pop(task_id, None)
@@ -4644,7 +4644,7 @@ class WebAPIServer:
             config['services_root'],
             self.redis_manager,
             config['pod_id'],
-            config.get('max_task_logs', 1000),
+            config.get('max_secflow_agent_task_logs', 1000),
             agent_api_timeouts
         )
 
@@ -4911,7 +4911,7 @@ class WebAPIServer:
                                                                  COUNT(*) as count,
                             MAX(last_seen) as last_seen_max,
                             MIN(last_seen) as last_seen_min
-                                                             FROM agent_status
+                                                             FROM secflow_agent_agent_status
                                                              WHERE project_id = %s
                                                              GROUP BY status
                                                              ORDER BY count DESC
@@ -4923,7 +4923,7 @@ class WebAPIServer:
                                                                  COUNT(*) as count,
                             MAX(last_seen) as last_seen_max,
                             MIN(last_seen) as last_seen_min
-                                                             FROM agent_status
+                                                             FROM secflow_agent_agent_status
                                                              WHERE project_id = ?
                                                              GROUP BY status
                                                              ORDER BY count DESC
@@ -4932,24 +4932,24 @@ class WebAPIServer:
                 # 计算掉线agent（超过5分钟未更新）for this project
                 if self.db_manager.db_type == 'mysql':
                     offline_result = self.db_manager.fetch_one('''
-                                                               SELECT COUNT(*) as count FROM agent_status
+                                                               SELECT COUNT(*) as count FROM secflow_agent_agent_status
                                                                WHERE project_id = %s
                                                                AND status IN ('offline', 'error', 'timeout', 'unknown')
                                                                AND updated_at < NOW() - INTERVAL 5 MINUTE
                                                                ''', (project_id,))
                     total_result = self.db_manager.fetch_one(
-                        "SELECT COUNT(*) as count FROM agent_status WHERE project_id = %s",
+                        "SELECT COUNT(*) as count FROM secflow_agent_agent_status WHERE project_id = %s",
                         (project_id,)
                     )
                 else:
                     offline_result = self.db_manager.fetch_one('''
-                                                               SELECT COUNT(*) as count FROM agent_status
+                                                               SELECT COUNT(*) as count FROM secflow_agent_agent_status
                                                                WHERE project_id = ?
                                                                AND status IN ('offline', 'error', 'timeout', 'unknown')
                                                                AND updated_at < datetime('now', '-5 minutes')
                                                                ''', (project_id,))
                     total_result = self.db_manager.fetch_one(
-                        "SELECT COUNT(*) as count FROM agent_status WHERE project_id = ?",
+                        "SELECT COUNT(*) as count FROM secflow_agent_agent_status WHERE project_id = ?",
                         (project_id,)
                     )
 
@@ -4984,7 +4984,7 @@ class WebAPIServer:
                 }), 500
 
         @self.app.route('/api/agent/agents/<agent_key>/status', methods=['PUT'])
-        def update_agent_status(agent_key):
+        def update_secflow_agent_agent_status(agent_key):
             """手动更新agent状态"""
             try:
                 data = request.get_json()
@@ -5003,12 +5003,12 @@ class WebAPIServer:
                 # 检查agent是否存在
                 if self.db_manager.db_type == 'mysql':
                     agent = self.db_manager.fetch_one(
-                        "SELECT * FROM agent_status WHERE agent_key = %s",
+                        "SELECT * FROM secflow_agent_agent_status WHERE agent_key = %s",
                         (agent_key,)
                     )
                 else:
                     agent = self.db_manager.fetch_one(
-                        "SELECT * FROM agent_status WHERE agent_key = ?",
+                        "SELECT * FROM secflow_agent_agent_status WHERE agent_key = ?",
                         (agent_key,)
                     )
 
@@ -5022,13 +5022,13 @@ class WebAPIServer:
                 # 更新agent状态
                 if self.db_manager.db_type == 'mysql':
                     self.db_manager.execute_query('''
-                                                  UPDATE agent_status
+                                                  UPDATE secflow_agent_agent_status
                                                   SET status = %s, updated_at = NOW()
                                                   WHERE agent_key = %s
                                                   ''', (status, agent_key))
                 else:
                     self.db_manager.execute_query('''
-                                                  UPDATE agent_status
+                                                  UPDATE secflow_agent_agent_status
                                                   SET status = ?, updated_at = datetime('now')
                                                   WHERE agent_key = ?
                                                   ''', (status, agent_key))
@@ -5072,7 +5072,7 @@ class WebAPIServer:
             )
 
             return jsonify({
-                'tasks': tasks,
+                'secflow_agent_tasks': tasks,
                 'page': page,
                 'per_page': per_page,
                 'total': total,
@@ -5099,7 +5099,7 @@ class WebAPIServer:
             return jsonify(task)
 
         @self.app.route('/api/agent/task/<task_id>/logs', methods=['GET'])
-        def get_task_logs(task_id):
+        def get_secflow_agent_task_logs(task_id):
             # Get project_id from query parameter
             project_id = request.args.get('project_id')
             if not project_id:
@@ -5115,7 +5115,7 @@ class WebAPIServer:
             page = int(request.args.get('page', 1))
             per_page = int(request.args.get('per_page', 100))
 
-            logs, total = self.task_manager.get_task_logs(task_id, page, per_page)
+            logs, total = self.task_manager.get_secflow_agent_task_logs(task_id, page, per_page)
 
             return jsonify({
                 'logs': logs,
@@ -5603,12 +5603,12 @@ class WebAPIServer:
                 # 从数据库查询Agent
                 if self.db_manager.db_type == 'mysql':
                     agent_data = self.db_manager.fetch_one(
-                        "SELECT * FROM agent_status WHERE agent_key = %s",
+                        "SELECT * FROM secflow_agent_agent_status WHERE agent_key = %s",
                         (agent_key,)
                     )
                 else:
                     agent_data = self.db_manager.fetch_one(
-                        "SELECT * FROM agent_status WHERE agent_key = ?",
+                        "SELECT * FROM secflow_agent_agent_status WHERE agent_key = ?",
                         (agent_key,)
                     )
 
@@ -5642,12 +5642,12 @@ class WebAPIServer:
                     # Fetch from database for additional fields
                     if self.db_manager.db_type == 'mysql':
                         full_data = self.db_manager.fetch_one(
-                            "SELECT * FROM agent_status WHERE agent_key = %s",
+                            "SELECT * FROM secflow_agent_agent_status WHERE agent_key = %s",
                             (agent_key,)
                         )
                     else:
                         full_data = self.db_manager.fetch_one(
-                            "SELECT * FROM agent_status WHERE agent_key = ?",
+                            "SELECT * FROM secflow_agent_agent_status WHERE agent_key = ?",
                             (agent_key,)
                         )
                     if full_data:

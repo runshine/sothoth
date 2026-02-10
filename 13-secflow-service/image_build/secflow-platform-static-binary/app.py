@@ -77,7 +77,7 @@ db = SQLAlchemy(app)
 
 class Package(db.Model):
     """软件包信息表"""
-    __tablename__ = 'packages'
+    __tablename__ = 'secflow_static_binary_packages'
 
     id = db.Column(db.String(64), primary_key=True, comment='MD5哈希值作为唯一ID')
     name = db.Column(db.String(100), nullable=False, index=True, comment='软件包名称')
@@ -106,10 +106,10 @@ class Package(db.Model):
 
 class PackageFile(db.Model):
     """软件包文件记录表"""
-    __tablename__ = 'package_files'
+    __tablename__ = 'secflow_static_binary_package_files'
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    package_id = db.Column(db.String(64), db.ForeignKey('packages.id', ondelete='CASCADE'), nullable=False, index=True)
+    package_id = db.Column(db.String(64), db.ForeignKey('secflow_static_binary_packages.id', ondelete='CASCADE'), nullable=False, index=True)
     file_path = db.Column(db.String(1000), nullable=False, comment='文件相对路径')
     file_name = db.Column(db.String(255), nullable=False, comment='文件名')
     file_size = db.Column(db.BigInteger, nullable=False, comment='文件大小(字节)')
@@ -1502,8 +1502,8 @@ def delete_all_packages():
             deleted_count += 1
 
         # 清空数据库（使用原生SQL确保效率）
-        db.session.execute(db.text('DELETE FROM package_files'))
-        db.session.execute(db.text('DELETE FROM packages'))
+        db.session.execute(db.text('DELETE FROM secflow_static_binary_package_files'))
+        db.session.execute(db.text('DELETE FROM secflow_static_binary_packages'))
         db.session.commit()
 
         # 清空原始包目录
