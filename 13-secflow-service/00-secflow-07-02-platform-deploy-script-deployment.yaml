@@ -25,7 +25,7 @@ spec:
           mountPath: /app/config.yaml
           subPath: config.yaml
         - name: secflow-platform-deploy-script-nfs-pvc
-          mountPath: /data
+          mountPath: /app/resource
         resources:
           requests:
             memory: "128Mi"

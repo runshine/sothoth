@@ -5,79 +5,43 @@ metadata:
   namespace: secflow-ns
 data:
   config.yaml: |
-    # SecFlow Project Management Service Configuration
-    # Database Configuration (MySQL)
-    database:
-      host: "mysql.sothothv2-ns.svc.cluster.local"
-      port: 3306
-      username: "secflow"
-      password: "Huawei12#$"
-      name: "secflow"
-      table_prefix: "secflow_"
-      pool_size: 10
-      max_overflow: 20
-    # Auth Service Configuration
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+    
+    # File Root Directory Configuration
+    file_root: "/app/resource"
+    
+    # Auth Service Configuration (call external auth service)
     auth_service:
       host: "secflow-platform-auth"
       port: 80
       validate_token_path: "/api/auth/validate-human-token"
       timeout: 10
-      # Token缓存配置
       token_cache_enabled: true
       token_cache_ttl_minutes: 15
+    
     # Menu Registration Center Configuration
     registry:
       enabled: true
       menu_service_url: "http://secflow-platform-menu"
-      service_id: "secflow-platform-project"
-      service_name: "项目管理服务"
-      host: "secflow-platform-project"
+      service_id: "secflow-platform-deploy-script"
+      service_name: "部署脚本管理服务"
+      host: "0.0.0.0"
       port: 80
       maturity: "已上线"
-      description: "提供项目的创建、查询、删除、修改等功能"
-      api_prefix: "/api/project"
+      description: "提供部署脚本的文件管理功能"
+      api_prefix: "/api/deploy-script"
       menu:
-        id: "project-manage"
-        path: "/project"
-        icon: "folder"
-        order: 2
-        # 一级菜单
+        id: "deploy-script-manage"
+        path: "/deploy-script"
+        icon: "code"
+        order: 10
         level1:
-          name: "系统管理"
-          name_en: "System"
-        # 二级菜单
+          name: "系统工具"
+          name_en: "System Tools"
         level2:
-          name: "用户管理"
-          name_en: "User Management"
-        # 三级菜单（可选）
-        level3:
-          name: "项目管理"
-          name_en: "Project Management"
-    # Kubernetes Configuration
-    kubernetes:
-      # true: 在K8S集群内运行，使用serviceaccount
-      # false: 集群外调试，使用kubeconfig
-      in_cluster: true
-      # Kubeconfig路径（集群外调试时使用）
-      kubeconfig: "/home/runshine/.kube/config"
-      # 连接超时时间（秒）
-      connection_timeout: 30
-    # TLS Secret Configuration
-    # 用于在项目的K8S Namespace中创建TLS Secret
-    tls_secret:
-      # TLS Secret名称（所有项目的TLS Secret名称都相同）
-      name: "wildcard-code-server.sothothv2.com-tls"
-      # FullChain CRT文件路径（包含完整证书链）
-      crt_file: "./full_chain.crt"
-      # 私钥文件路径
-      key_file: "./full_chain.key"
-    # Application Configuration
-    app:
-      host: "0.0.0.0"
-      port: 8080
-      debug: false
-    # Logging Configuration
-    logging:
-      level: "INFO"
-      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
+          name: "部署脚本"
+          name_en: "Deploy Scripts"
+    
