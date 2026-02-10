@@ -28,6 +28,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/app/code-server", tags=["Code Server Manager"])
 
 
+# ============ Health Check ============
+
+@router.get("/health")
+async def health_check():
+    """
+    健康检查接口
+
+    - 检查服务是否正常运行
+    - 返回服务状态信息
+    """
+    return {
+        "status": "ok",
+        "service": "code-server-manager"
+    }
+
+
 # ============ Helper Functions ============
 
 def get_code_server_by_name(db: Session, project_id: str, name: str) -> Optional[CodeServer]:
@@ -156,6 +172,22 @@ def make_task_response(task: Task) -> TaskResponse:
         started_at=task.started_at.isoformat() if task.started_at else None,
         completed_at=task.completed_at.isoformat() if task.completed_at else None
     )
+
+
+# ============ Health Check ============
+
+@router.get("/health")
+async def health_check():
+    """
+    健康检查接口
+
+    - 检查服务是否正常运行
+    - 返回服务状态信息
+    """
+    return {
+        "status": "ok",
+        "service": "code-server-manager"
+    }
 
 
 # ============ Code Server CRUD ============

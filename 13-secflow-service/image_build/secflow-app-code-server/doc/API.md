@@ -16,6 +16,7 @@
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| **GET** | `/health` | 健康检查接口（带路由前缀） |
 | **POST** | `/projects/{project_id}/code-servers` | 创建Code Server实例 |
 | **DELETE** | `/projects/{project_id}/code-servers` | 删除Code Server实例 |
 | **POST** | `/projects/{project_id}/code-servers/restart` | 重建Code Server |
@@ -33,13 +34,25 @@
 
 ### 1. Health Check
 
-#### GET /health
-健康检查端点。
+#### GET /api/app/code-server/health
+健康检查端点（带路由前缀）。
 
 **Response:**
 ```json
 {
-  "status": "healthy"
+  "status": "ok",
+  "service": "code-server-manager"
+}
+```
+
+#### GET /health
+健康检查端点（根路径，不带路由前缀）。
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "service": "code-server-manager"
 }
 ```
 
