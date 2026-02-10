@@ -1,56 +1,7 @@
-# 创建三个 Service 和对应的 Endpoints
 apiVersion: v1
 kind: Service
 metadata:
-  name: external-auth
-  namespace: secflow-ns
-spec:
-  type: ClusterIP
-  ports:
-  - port: 80
-    targetPort: 10000
-    protocol: TCP
----
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: external-auth
-  namespace: secflow-ns
-subsets:
-  - addresses:
-      - ip: 192.168.12.44
-    ports:
-      - port: 10000
-        protocol: TCP
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: external-project
-  namespace: secflow-ns
-spec:
-  type: ClusterIP
-  ports:
-  - port: 80
-    targetPort: 10001
-    protocol: TCP
----
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: external-project
-  namespace: secflow-ns
-subsets:
-  - addresses:
-      - ip: 192.168.12.44
-    ports:
-      - port: 10001
-        protocol: TCP
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: external-resource
+  name: external-menu
   namespace: secflow-ns
 spec:
   type: ClusterIP
@@ -62,7 +13,7 @@ spec:
 apiVersion: v1
 kind: Endpoints
 metadata:
-  name: external-resource
+  name: external-menu
   namespace: secflow-ns
 subsets:
   - addresses:
@@ -72,10 +23,11 @@ subsets:
         protocol: TCP
 
 ---
+
 apiVersion: v1
 kind: Service
 metadata:
-  name: external-menu
+  name: external-auth
   namespace: secflow-ns
 spec:
   type: ClusterIP
@@ -87,7 +39,7 @@ spec:
 apiVersion: v1
 kind: Endpoints
 metadata:
-  name: external-menu
+  name: external-auth
   namespace: secflow-ns
 subsets:
   - addresses:
@@ -95,11 +47,13 @@ subsets:
     ports:
       - port: 10003
         protocol: TCP
+
 ---
+
 apiVersion: v1
 kind: Service
 metadata:
-  name: external-vscode
+  name: external-project
   namespace: secflow-ns
 spec:
   type: ClusterIP
@@ -111,7 +65,7 @@ spec:
 apiVersion: v1
 kind: Endpoints
 metadata:
-  name: external-vscode
+  name: external-project
   namespace: secflow-ns
 subsets:
   - addresses:
@@ -119,15 +73,85 @@ subsets:
     ports:
       - port: 10004
         protocol: TCP
+
 ---
+
 apiVersion: v1
 kind: Service
 metadata:
-  name: static-binary-proxy
+  name: external-resource
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 10005
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: external-resource
+  namespace: secflow-ns
+subsets:
+  - addresses:
+      - ip: 192.168.12.44
+    ports:
+      - port: 10005
+        protocol: TCP
+
+---
+
+#apiVersion: v1
+#kind: Service
+#metadata:
+#  name: static-binary-proxy
+#  namespace: secflow-ns  # 与 Ingress 相同的命名空间
+#spec:
+#  type: ExternalName
+#  externalName: static-binary.sothothv2-ns.svc.cluster.local
+#  ports:
+#  - port: 80
+#    targetPort: 80
+#    protocol: TCP
+#    name: http
+#---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-static-binary
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 10006
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: external-static-binary
+  namespace: secflow-ns
+subsets:
+  - addresses:
+      - ip: 192.168.12.44
+    ports:
+      - port: 10006
+        protocol: TCP
+
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: client-script-proxy
   namespace: secflow-ns  # 与 Ingress 相同的命名空间
 spec:
   type: ExternalName
-  externalName: static-binary.sothothv2-ns.svc.cluster.local
+  externalName: client-script.secflow-ns.svc.cluster.local
   ports:
   - port: 80
     targetPort: 80
@@ -135,8 +159,6 @@ spec:
     name: http
 
 ---
-
-
 apiVersion: v1
 kind: Service
 metadata:
@@ -146,7 +168,7 @@ spec:
   type: ClusterIP
   ports:
   - port: 80
-    targetPort: 8080
+    targetPort: 10008
     protocol: TCP
 ---
 apiVersion: v1
@@ -158,25 +180,35 @@ subsets:
   - addresses:
       - ip: 192.168.12.44
     ports:
-      - port: 8080
+      - port: 10008
         protocol: TCP
-
-
-
 ---
+
+
+
 apiVersion: v1
 kind: Service
 metadata:
-  name: client-script-proxy
-  namespace: secflow-ns  # 与 Ingress 相同的命名空间
+  name: external-vscode
+  namespace: secflow-ns
 spec:
-  type: ExternalName
-  externalName: client-script.sothothv2-ns.svc.cluster.local
+  type: ClusterIP
   ports:
   - port: 80
-    targetPort: 80
+    targetPort: 10100
     protocol: TCP
-    name: http
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: external-vscode
+  namespace: secflow-ns
+subsets:
+  - addresses:
+      - ip: 192.168.12.44
+    ports:
+      - port: 10100
+        protocol: TCP
 
 ---
 apiVersion: networking.k8s.io/v1
@@ -198,7 +230,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-  - host: secflow.sothothv2.com
+  - host: secflow-dev.sothothv2.com
     http:
       paths:
       - path: /api/auth

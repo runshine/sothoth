@@ -28,7 +28,7 @@ registry:
   service_id: "secflow-project"
   service_name: "项目管理服务"
   host: "0.0.0.0"
-  port: 10001
+  port: 10004
   maturity: "已上线"
   description: "提供项目的创建、查询、删除、修改等功能"
   api_prefix: "/api/project"

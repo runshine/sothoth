@@ -3,7 +3,7 @@
 # 应用配置
 app:
   host: "0.0.0.0"
-  port: 10004
+  port: 10011
   debug: false
 
 # 数据库配置 (支持 mysql 和 sqlite)

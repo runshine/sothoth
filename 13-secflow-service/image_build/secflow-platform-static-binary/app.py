@@ -6,10 +6,14 @@
 
 import os
 import re
+import sys
 import hashlib
 import zipfile
 import tarfile
 import shutil
+import asyncio
+import atexit
+import signal
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -21,16 +25,26 @@ from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from sqlalchemy import or_, func
 
+# 导入配置和注册服务
+from config import load_config, get_config
+from registry import get_registry_service
 
+# ==================== 加载配置 ====================
+try:
+    config = load_config()
+    logger = logging.getLogger(__name__)
+    logger.info("配置加载成功")
+except Exception as e:
+    print(f"加载配置失败: {e}", file=sys.stderr)
+    sys.exit(1)
 
 # ==================== 日志配置 ====================
 logging.basicConfig(
-    level=logging.DEBUG,  # 设置日志级别
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=getattr(logging, config.logging.level),
+    format=config.logging.format,
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-# 使用示例
 logger = logging.getLogger(__name__)
 
 # ==================== Flask应用初始化 ====================
@@ -38,19 +52,14 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-#mysql://app_user:YourAppPassword123!@192.168.12.90/app_database
-#mysql://mysql-cluster.default.svc.cluster.local/
-#MYSQL_SERVER_ADDRESS=mysql://static-binary:Huawei12#$@192.168.12.90/static-binary-service;PACKAGE_ROOT_DIR=/data
-MYSQL_SERVER_ADDRESS=os.environ['MYSQL_SERVER_ADDRESS']
-PACKAGE_ROOT_DIR=os.environ['PACKAGE_ROOT_DIR']
-
-logger.info("MYSQL_SERVER_ADDRESS: {}".format(MYSQL_SERVER_ADDRESS))
-logger.info("PACKAGE_ROOT_DIR: {}".format(PACKAGE_ROOT_DIR))
+# 使用配置文件中的值
+logger.info("DATABASE_URL: {}".format(config.database.url))
+logger.info("STORAGE_FOLDER: {}".format(config.storage.storage_folder))
 
 # 配置
-app.config['SECRET_KEY'] = 'your-secret-key-change-this'
+app.config['SECRET_KEY'] = config.app.secret_key
 
-app.config['SQLALCHEMY_DATABASE_URI'] = MYSQL_SERVER_ADDRESS
+app.config['SQLALCHEMY_DATABASE_URI'] = config.database.url
 # 明确设置引擎选项禁用SSL
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     'pool_pre_ping': True,
@@ -61,10 +70,10 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
     }
 }
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['UPLOAD_FOLDER'] = '/tmp/uploads'  # 临时上传目录
-app.config['STORAGE_FOLDER'] = PACKAGE_ROOT_DIR  # 永久存储目录
-app.config['ORIGINAL_PACKAGE_FOLDER'] = os.path.join(PACKAGE_ROOT_DIR, 'original_packages')  # 原始包存储目录
-app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB最大上传
+app.config['UPLOAD_FOLDER'] = config.storage.upload_folder  # 临时上传目录
+app.config['STORAGE_FOLDER'] = config.storage.storage_folder  # 永久存储目录
+app.config['ORIGINAL_PACKAGE_FOLDER'] = config.storage.original_package_folder  # 原始包存储目录
+app.config['MAX_CONTENT_LENGTH'] = config.storage.max_content_length  # 最大上传限制
 
 # 创建必要的目录
 for folder in [app.config['UPLOAD_FOLDER'], app.config['STORAGE_FOLDER'], app.config['ORIGINAL_PACKAGE_FOLDER']]:
@@ -1671,8 +1680,63 @@ def init_database():
         print("数据库表创建完成")
 
 
+# ==================== 菜单注册服务 ====================
+
+async def setup_registry():
+    """设置Menu注册中心"""
+    try:
+        registry_service = get_registry_service()
+        await registry_service.start()
+        logger.info("Menu注册服务启动成功")
+    except Exception as e:
+        logger.warning(f"Menu注册服务启动失败: {e}，服务将继续运行")
+
+
+async def shutdown_registry():
+    """关闭Menu注册中心"""
+    try:
+        registry_service = get_registry_service()
+        await registry_service.stop()
+        logger.info("Menu注册服务已停止")
+    except Exception as e:
+        logger.warning(f"Menu注册服务停止失败: {e}")
+
+
+# 注册程序退出时的清理操作
+def cleanup(signum=None, frame=None):
+    """清理操作"""
+    logger.info("正在执行清理操作...")
+    try:
+        # 使用事件循环执行异步清理
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(shutdown_registry())
+        loop.close()
+    except Exception as e:
+        logger.error(f"清理操作失败: {e}")
+    sys.exit(0)
+
+
+# 注册信号处理
+signal.signal(signal.SIGTERM, cleanup)
+signal.signal(signal.SIGINT, cleanup)
+atexit.register(lambda: asyncio.run(shutdown_registry()) if get_registry_service() else None)
+
+
+# ==================== 启动应用 ====================
+
 if __name__ == '__main__':
     # 初始化数据库
     init_database()
+
+    # 启动Menu注册服务
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(setup_registry())
+        loop.close()
+    except Exception as e:
+        logger.warning(f"注册服务启动失败: {e}，服务将继续运行")
+
     # 启动Flask应用
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host=config.app.host, port=config.app.port, debug=config.app.debug)
