@@ -14,7 +14,7 @@ from aiofiles import os as aio_os
 
 from app.config import get_config
 from app.exception import NotFoundError, ValidationError, UnauthorizedError
-from app.service.auth import get_auth_service, TokenInvalidError
+from app.services.auth import get_auth_service, TokenInvalidError
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ def validate_path(file_root: Path, path: str) -> Path:
 
 async def get_current_user(
     authorization: Optional[str] = Header(None)
-) -> dict:
+) -> Optional[dict]:
     """
     获取当前用户（认证）
 
@@ -67,11 +67,17 @@ async def get_current_user(
         authorization: Authorization header
 
     Returns:
-        用户信息
+        用户信息，如果认证禁用则返回None
 
     Raises:
-        UnauthorizedError: 未授权
+        UnauthorizedError: 未授权（认证启用时）
     """
+    config = get_config()
+
+    # 如果认证被禁用，直接返回None
+    if not config.auth_service.enabled:
+        return None
+
     if not authorization:
         raise UnauthorizedError("缺少Authorization头")
 
@@ -111,6 +117,57 @@ async def ready_check():
 
 # ============ 文件列表 ============
 
+@router.get("/files{path:path}/content")
+async def read_file(
+    path: str = "",
+    current_user: Optional[dict] = Depends(get_current_user)
+):
+    """
+    查看文件内容
+
+    支持可选认证
+
+    Args:
+        path: 文件路径，相对于根目录
+
+    Returns:
+        文件内容（文本或二进制）
+    """
+    file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
+    file_path = validate_path(file_root, path)
+
+    if not file_path.exists():
+        raise NotFoundError("文件", path)
+
+    if file_path.is_dir():
+        raise ValidationError("这是目录，请使用列出目录接口")
+
+    # 判断是否为文本文件
+    text_extensions = {'.txt', '.sh', '.py', '.yaml', '.yml', '.json', '.xml', '.md', '.html', '.css', '.js'}
+    is_text = file_path.suffix.lower() in text_extensions
+
+    if is_text:
+        # 返回文本内容
+        async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            content = await f.read()
+        return PlainTextResponse(
+            content=content,
+            media_type="text/plain; charset=utf-8"
+        )
+    else:
+        # 返回二进制流
+        async with aiofiles.open(file_path, 'rb') as f:
+            content = await f.read()
+
+        return StreamingResponse(
+            iter([content]),
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'}
+        )
+
+
 @router.get("/files{path:path}")
 async def list_directory(
     path: str = "",
@@ -128,6 +185,8 @@ async def list_directory(
         目录下的文件和子目录列表
     """
     file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
     dir_path = validate_path(file_root, path)
 
     if not dir_path.exists():
@@ -159,57 +218,6 @@ async def list_directory(
     }
 
 
-# ============ 查看文件内容 ============
-
-@router.get("/files{path:path}/content")
-async def read_file(
-    path: str = "",
-    current_user: Optional[dict] = Depends(get_current_user)
-):
-    """
-    查看文件内容
-
-    支持可选认证
-
-    Args:
-        path: 文件路径，相对于根目录
-
-    Returns:
-        文件内容（文本或二进制）
-    """
-    file_root = get_file_root()
-    file_path = validate_path(file_root, path)
-
-    if not file_path.exists():
-        raise NotFoundError("文件", path)
-
-    if file_path.is_dir():
-        raise ValidationError("这是目录，请使用列出目录接口")
-
-    # 判断是否为文本文件
-    text_extensions = {'.txt', '.sh', '.py', '.yaml', '.yml', '.json', '.xml', '.md', '.html', '.css', '.js'}
-    is_text = file_path.suffix.lower() in text_extension
-
-    if is_text:
-        # 返回文本内容
-        async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            content = await f.read()
-        return PlainTextResponse(
-            content=content,
-            media_type="text/plain; charset=utf-8"
-        )
-    else:
-        # 返回二进制流
-        async with aiofiles.open(file_path, 'rb') as f:
-            content = await f.read()
-
-        return StreamingResponse(
-            iter([content]),
-            media_type="application/octet-stream",
-            headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'}
-        )
-
-
 # ============ 下载文件 ============
 
 @router.get("/file{path:path}/download")
@@ -227,6 +235,8 @@ async def download_file(
         文件下载流
     """
     file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
     file_path = validate_path(file_root, path)
 
     if not file_path.exists():
@@ -276,7 +286,7 @@ async def upload_file(
     async with aiofiles.open(target_path, 'wb') as f:
         await f.write(content)
 
-    logger.info(f"用户 {current_user.get('id')} 上传文件: {target_path}")
+    logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 上传文件: {target_path}")
 
     return {
         "message": "文件上传成功",
@@ -291,8 +301,8 @@ async def upload_file(
 @router.put("/file{path:path}")
 async def edit_file(
     path: str = "",
-    content: str = Body(..., description="文件内容"),
-    current_user: dict = Depends(get_current_user)
+    content: str = Body("", description="文件内容"),
+    current_user: Optional[dict] = Depends(get_current_user)
 ):
     """
     编辑文件（需要认证）
@@ -305,6 +315,8 @@ async def edit_file(
         编辑结果
     """
     file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
     file_path = validate_path(file_root, path)
 
     if not file_path.exists():
@@ -317,7 +329,7 @@ async def edit_file(
     async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
         await f.write(content)
 
-    logger.info(f"用户 {current_user.get('id')} 编辑文件: {file_path}")
+    logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 编辑文件: {file_path}")
 
     return {
         "message": "文件编辑成功",
@@ -351,10 +363,10 @@ async def delete_file(
     if target_path.is_dir():
         import shutil
         shutil.rmtree(target_path)
-        logger.info(f"用户 {current_user.get('id')} 删除目录: {target_path}")
+        logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 删除目录: {target_path}")
     else:
         target_path.unlink()
-        logger.info(f"用户 {current_user.get('id')} 删除文件: {target_path}")
+        logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 删除文件: {target_path}")
 
     return {
         "message": "删除成功",
@@ -387,7 +399,7 @@ async def create_directory(
     # 创建目录
     dir_path.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"用户 {current_user.get('id')} 创建目录: {dir_path}")
+    logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 创建目录: {dir_path}")
 
     return {
         "message": "目录创建成功",
@@ -428,12 +440,12 @@ async def rename_file(
 
     # 新路径
     new_path = old_path.parent / new_name
-    new_path = validate_path(file_root, "/" + str(new_path.relative_to(file_root))
+    new_path = validate_path(file_root, "/" + str(new_path.relative_to(file_root)))
 
     # 执行重命名
     old_path.rename(new_path)
 
-    logger.info(f"用户 {current_user.get('id')} 重命名: {old_path} -> {new_path}")
+    logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 重命名: {old_path} -> {new_path}")
 
     return {
         "message": "重命名成功",
@@ -481,7 +493,7 @@ async def batch_upload(
             "size": len(content),
         })
 
-    logger.info(f"用户 {current_user.get('id')} 批量上传 {len(files)} 个文件到: {target_dir}")
+    logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 批量上传 {len(files)} 个文件到: {target_dir}")
 
     return {
         "message": f"成功上传 {len(files)} 个文件",

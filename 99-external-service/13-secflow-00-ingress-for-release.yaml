@@ -71,6 +71,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/deploy-script
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-deploy-script
+            port:
+              number: 80
+
       - path: /api/app/code-server
         pathType: Prefix
         backend:
@@ -79,31 +87,3 @@ spec:
             port:
               number: 80
 
----
-
-
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: secflow-deploy-script-ingress
-  namespace: secflow-ns
-  annotations:
-    nginx.ingress.kubernetes.io/rewrite-target: /script/$1
-    nginx.ingress.kubernetes.io/use-regex: "true"
-    nginx.ingress.kubernetes.io/proxy-body-size: "10240m"
-    nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: secflow.sothothv2.com
-    http:
-      paths:
-      - path: /api/deploy-script/(.*)
-        pathType: ImplementationSpecific
-        backend:
-          service:
-            name: secflow-platform-deploy-script
-            port:
-              number: 80

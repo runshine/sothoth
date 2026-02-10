@@ -1,5 +1,5 @@
 {
-  "port": 8080 ,
+  "port": 10008 ,
   "host": "0.0.0.0",
   "debug": true,
   "secret_key": "dev-secret-key-change-in-production",

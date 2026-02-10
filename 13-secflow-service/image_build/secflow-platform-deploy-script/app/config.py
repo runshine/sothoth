@@ -19,6 +19,7 @@ class AppConfig(BaseModel):
 
 class AuthServiceConfig(BaseModel):
     """认证服务配置"""
+    enabled: bool = True
     host: str = "localhost"
     port: int = 10000
     validate_token_path: str = "/api/auth/validate-human-token"
@@ -101,9 +102,9 @@ def load_config(config_path: Optional[str] = None) -> Config:
         # 从环境变量读取
         env_config_path = os.environ.get("SECFLOW_CONFIG_PATH")
         if env_config_path:
-            possible_path.insert(0, env_config_path)
+            possible_paths.insert(0, env_config_path)
 
-        for path in possible_path:
+        for path in possible_paths:
             if os.path.exists(path):
                 config_path = path
                 break

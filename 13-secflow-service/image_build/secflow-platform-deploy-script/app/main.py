@@ -14,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api.files import router
 from app.config import load_config, get_config
 from app.exception import setup_exception_handlers
-from app.service.registry import get_registry_service
+from app.services.registry import get_registry_service
 
 # 配置日志
 logging.basicConfig(
