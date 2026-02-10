@@ -29,7 +29,7 @@ data:
     # Kubernetes配置
     kubernetes:
       # 是否在K8S集群内运行
-      in_cluster: false
+      in_cluster: true
       # kubeconfig路径（集群外运行时使用，null表示使用默认~/.kube/config）
       kubeconfig: null
       connection_timeout: 30

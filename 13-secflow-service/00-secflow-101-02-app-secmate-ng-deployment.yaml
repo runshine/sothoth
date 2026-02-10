@@ -13,6 +13,7 @@ spec:
       labels:
         name: secflow-app-secmate-ng
     spec:
+      serviceAccountName: secflow-app-secmate-ng-serviceaccount
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-secmate-ng

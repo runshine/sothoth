@@ -13,6 +13,7 @@ spec:
       labels:
         name: secflow-app-code-server
     spec:
+      serviceAccountName: secflow-app-code-server-serviceaccount
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-code-server
