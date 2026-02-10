@@ -1,19 +1,161 @@
-# nginx-config.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: secflow-platform-menu-config
+  name: secflow-platform-project-config
   namespace: secflow-ns
 data:
   config.yaml: |
-    # SecFlow Menu Service 配置文件
-    # 服务配置
-    host: "0.0.0.0"      # 服务监听地址
-    port: 8080           # 服务监听端口
-    debug: false         # 调试模式
-    # 心跳超时配置（秒）
-    heartbeat_timeout: 120.0
-    # 清理过期服务间隔（秒）
-    cleanup_interval: 30
-    # 日志配置
-    log_level: "INFO"
+    # SecFlow Project Management Service Configuration
+    # Database Configuration (MySQL)
+    database:
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+      table_prefix: "secflow_"
+      pool_size: 10
+      max_overflow: 20
+    # Auth Service Configuration
+    auth_service:
+      host: "sec-platform-auth"
+      port: 80
+      validate_token_path: "/api/auth/validate-human-token"
+      timeout: 10
+      # Token缓存配置
+      token_cache_enabled: true
+      token_cache_ttl_minutes: 15
+    # Menu Registration Center Configuration
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu"
+      service_id: "secflow-platform-project"
+      service_name: "项目管理服务"
+      host: "secflow-platform-project"
+      port: 80
+      maturity: "已上线"
+      description: "提供项目的创建、查询、删除、修改等功能"
+      api_prefix: "/api/project"
+      menu:
+        id: "project-manage"
+        path: "/project"
+        icon: "folder"
+        order: 2
+        # 一级菜单
+        level1:
+          name: "系统管理"
+          name_en: "System"
+        # 二级菜单
+        level2:
+          name: "用户管理"
+          name_en: "User Management"
+        # 三级菜单（可选）
+        level3:
+          name: "项目管理"
+          name_en: "Project Management"
+    # Kubernetes Configuration
+    kubernetes:
+      # true: 在K8S集群内运行，使用serviceaccount
+      # false: 集群外调试，使用kubeconfig
+      in_cluster: true
+      # Kubeconfig路径（集群外调试时使用）
+      kubeconfig: "/home/runshine/.kube/config"
+      # 连接超时时间（秒）
+      connection_timeout: 30
+    # TLS Secret Configuration
+    # 用于在项目的K8S Namespace中创建TLS Secret
+    tls_secret:
+      # TLS Secret名称（所有项目的TLS Secret名称都相同）
+      name: "wildcard-code-server.sothothv2.com-tls"
+      # FullChain CRT文件路径（包含完整证书链）
+      crt_file: "./full_chain.crt"
+      # 私钥文件路径
+      key_file: "./full_chain.key"
+    # Application Configuration
+    app:
+      host: "0.0.0.0"
+      port: 10001
+      debug: false
+    # Logging Configuration
+    logging:
+      level: "INFO"
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+  full_chain.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIEDzCCAvegAwIBAgIUXZsAjLKgD1biJp+WYuLYSleCj6kwDQYJKoZIhvcNAQEL
+    BQAwajELMAkGA1UEBhMCQ04xDjAMBgNVBAgMBVN0YXRlMQ0wCwYDVQQHDARDaXR5
+    MRUwEwYDVQQKDAxPcmdhbml6YXRpb24xDTALBgNVBAsMBFVuaXQxFjAUBgNVBAMM
+    DXNvdGhvdGh2Mi5jb20wHhcNMjYwMTIyMTUxOTI4WhcNMzYwMTIwMTUxOTI4WjB4
+    MQswCQYDVQQGEwJDTjEOMAwGA1UECAwFU3RhdGUxDTALBgNVBAcMBENpdHkxFTAT
+    BgNVBAoMDE9yZ2FuaXphdGlvbjENMAsGA1UECwwEVW5pdDEkMCIGA1UEAwwbKi5j
+    b2RlLXNlcnZlci5zb3Rob3RodjIuY29tMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A
+    MIIBCgKCAQEA0MlAEQA27KNLMPYlvVGdj+va3bl3xyKqoV7YoTNiefSeoKW0k7Se
+    wMULBF1VLBXX0K1UGS+otugn5tKsirdaooqKvYSBeRjuH0NH2bSTQ4vdcsqL6w/L
+    AjFb+37ULxh3uRRZSdZTZW4N8wMYlhxREenZ3l2OLFE3zxYohJPKmz2WEGpRclTd
+    hr/N83eIVPcYfOBXVYJZjFXWdWPhSQuYTrMENsk26YSi3PBZ3yQARBKEORtjKoFw
+    1sOI8W57mD3NEFdZnCNCkhQ4+Vyfq1lbFMiEx7P+aXEr27N0OjA//YhQvGGfhXXv
+    v6Z3h6wpWJh9omeaq4Oo/2PYhtpWiIbdxQIDAQABo4GeMIGbMB8GA1UdIwQYMBaA
+    FPsAlN+JIG3KM50EaR0hn2LtUnCQMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgTwMEEG
+    A1UdEQQ6MDiCGyouY29kZS1zZXJ2ZXIuc290aG90aHYyLmNvbYIZY29kZS1zZXJ2
+    ZXIuc290aG90aHYyLmNvbTAdBgNVHQ4EFgQUgJ9dJqfboN2aFUVBQgssrY0w2tQw
+    DQYJKoZIhvcNAQELBQADggEBAAez9PIr8AgTrERw78AjbhQlEERs15Feey3poDCe
+    XG7t3x4ow5V6eLhzMl2fWZ/dfy+CrCY5RmiWK6oEh0w3uwp+peH5pH4z7yBYjFcR
+    jU+myxiw0RfxwxOewlfzASLR0QkCZST+59OBl1Tjnx5QOrD53YOSRnD8X6qr7e3j
+    ssg/hC7XZE0Yzo2d2ffCBiZHgMhunFpgwfqlSZZHN3Mi+9F5OCw8vhq6ek8lec1f
+    QMaZSS3xYxxwW31LPh50XFtDw21BPbgqYUpZxjUzK8SH7HJWV761OXM2Tec0xsJa
+    J2EYLMTDkxjoemoI4as5ycSHvvnzo79ohD0vjni+1VNQGwM=
+    -----END CERTIFICATE-----
+    -----BEGIN CERTIFICATE-----
+    MIIDtTCCAp2gAwIBAgIUbenKXFgAwGeYqq0q2c5e1o8JIc8wDQYJKoZIhvcNAQEL
+    BQAwajELMAkGA1UEBhMCQ04xDjAMBgNVBAgMBVN0YXRlMQ0wCwYDVQQHDARDaXR5
+    MRUwEwYDVQQKDAxPcmdhbml6YXRpb24xDTALBgNVBAsMBFVuaXQxFjAUBgNVBAMM
+    DXNvdGhvdGh2Mi5jb20wHhcNMjYwMTIyMTUxOTI3WhcNMzYwMTIwMTUxOTI3WjBq
+    MQswCQYDVQQGEwJDTjEOMAwGA1UECAwFU3RhdGUxDTALBgNVBAcMBENpdHkxFTAT
+    BgNVBAoMDE9yZ2FuaXphdGlvbjENMAsGA1UECwwEVW5pdDEWMBQGA1UEAwwNc290
+    aG90aHYyLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBALKt5lMs
+    Gp2jJlIhGF9bhB6EAxx0wEwEIletY21iEFN1NsQvZBHD5jsDh/3PeaEYdUDnKjj9
+    ZL05jy5shjKxH07rje1j1tKdDrtjQf/flYLZfH7QSvggwAn8spZu+nw9lV2ATSWu
+    O+erEpaEzD7eJ+FLXJszcrEHWY1DZdIOjif9m+YcUrQHYTjasIkUw+BhIZXjXiUz
+    AQmyUkSvYDuYXIl3KNjLlp5m5g7msbzSklXli0ERfLis8ELyE82JheIReridJ9IU
+    eJ4B+hszsOKcByZkFzVCzXe4gMqqUutIE5kM1TYbsz6byH/Z5jMiscctKcCo/kK+
+    NPmT+1REF0gB8GECAwEAAaNTMFEwHQYDVR0OBBYEFPsAlN+JIG3KM50EaR0hn2Lt
+    UnCQMB8GA1UdIwQYMBaAFPsAlN+JIG3KM50EaR0hn2LtUnCQMA8GA1UdEwEB/wQF
+    MAMBAf8wDQYJKoZIhvcNAQELBQADggEBAAxtvSsB0yf8eVQztOUrcaOFxfvxurpc
+    QlI/MMrP660s85Hp6MSdNzAPqm7tAbmwxcUn+WGjvt9yCBbeFPvAhxeWS3/ApmMe
+    M8K9og/sq8iE+9EUMaEDALwn1hxUsntqhvYpJnp2HxF8iSi9ynVkz7/S+bGO1ERC
+    aNhEQBHT0pMuwXx63ddOItWiXd4VPAZVf95puj35+L2LouQ9ujIRVDhJA//+EJBz
+    Dl8LaglOEZUMggazgZndZqHv+DRMMJ104agMBZsJ5xDEyuHuCRQURI6KEf0fIJgy
+    YDcjJ2cKwaUEI3R8X4uO7cZNAGsLZI8C+DnGqD8TKQB6lIzfVEtvIFc=
+    -----END CERTIFICATE-----
+
+  full_chain.key: | 
+    -----BEGIN PRIVATE KEY-----
+    MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDQyUARADbso0sw
+    9iW9UZ2P69rduXfHIqqhXtihM2J59J6gpbSTtJ7AxQsEXVUsFdfQrVQZL6i26Cfm
+    0qyKt1qiioq9hIF5GO4fQ0fZtJNDi91yyovrD8sCMVv7ftQvGHe5FFlJ1lNlbg3z
+    AxiWHFER6dneXY4sUTfPFiiEk8qbPZYQalFyVN2Gv83zd4hU9xh84FdVglmMVdZ1
+    Y+FJC5hOswQ2yTbphKLc8FnfJABEEoQ5G2MqgXDWw4jxbnuYPc0QV1mcI0KSFDj5
+    XJ+rWVsUyITHs/5pcSvbs3Q6MD/9iFC8YZ+Fde+/pneHrClYmH2iZ5qrg6j/Y9iG
+    2laIht3FAgMBAAECggEAMdX72iMCOTlgEwuKJhazZJ1gZIDnB4wtjO+6Bz5f8OrU
+    K1XqVMBuDWbrMotBr5B2L3wUASAIZkJjddwPLdxGwNoPdF3K1tg9zI4PejZ5WUvr
+    G8GfpMfkBf24rj8PkD9HopCqIG8NgH5Ey58PURNowX0fkU2lCEyJpP9tw/mQCL47
+    g0UwcFOQQfuPkECtR4eZLp2MXJ9eTf8/JHDObvgCDPKX1+4ZdH4Gj823W4alpmUV
+    JYkXo4j081lt8u5HAAQVC0hNuz2p7esLGY4pUHXWVOEv6hZW7QvOhKk6C0IAYreA
+    lgb0fa9eo/B/8fy/MtNYWGpL+dWnFKZOMx8nTr3deQKBgQD8uYjD39A1WalyeTrY
+    Z/SM2nkbCnSuYqaUGCme77jzB/85DByqPzM3y1YkWm22e2Pwk19otyLr/SowmmBc
+    hQM7Q9XUs33HnUEKK/gghKowmBacIBHtO5xgqueyahwhixAkTU5BsO4A2d0S9Q2D
+    pp/SgcEkuK/GEBXs6VADYO1GKQKBgQDTffDUjxG6o5i8UdtbRV67yvGJGVZSW10M
+    RnC4MB30Vvqbn0qHn5hjRQQsU1fdMavQgrSXP6zRJXGr9W9Wjz6ghXKwMn+uzIj3
+    v80k4m6X8bUqKb31+WovATHUZ1BeNZgI/siBS3HSsArH2K/aFQTk8te0V3QI3ReV
+    TuShqry2PQKBgBuYVqqsoZtxsuLhAd/nWfiXUmn1dlAkTXQWP1Uvb855rRCZlfew
+    9vK8rSdDCH/IcV0veleAx7tk5VpxQNxZWcT63zpebvmA3j0yF+HVGpA7yxw5FDwH
+    KkgT4UDF/VRcTuLn3gemPhaxs0YCo/sgEot1x5Uu5WKHFx3LTAVSbBYhAoGAS2TT
+    LMNP+6wEb+Xyf+gL7IBdeJVqu3NMiWq3FkI4+3jiYAX6KL0RMxpQcYjIgtcJPAzM
+    Wjrd3bUuf7HAHih0l/7asstdzy+lCET82dBKwqns/nng+UYPv2/6lpC6CsuqRlKl
+    ocoGaqhNP48UqXbixsd3dBfVCq/ej2CPir52BbUCgYEAqAiFXkedlUUO9uA2o6Hf
+    vfNBhHrC6uNgEo2ZEnP/xMnRqlDqorOiV0NnirrmAToCCbpk6bA/tV/w1sI6GVUb
+    c/MjHSr08oDy0cNtCuymx5imu77y4Wo2A58/3KXHZC+qG7xzYcvoCjUMv5Yilz2C
+    rf506G2fN7wqz59tk+KNw0g=
+    -----END PRIVATE KEY-----
+  

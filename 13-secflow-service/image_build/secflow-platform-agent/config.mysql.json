@@ -1,0 +1,31 @@
+{
+  "port": 8080,
+  "host": "0.0.0.0",
+  "debug": false,
+  "secret_key": "production-secret-key-change-this",
+  "services_root": "/data/services",
+  "templates_root": "/data/templates",
+  "database": {
+    "type": "mysql",
+    "host": "mysql-service",
+    "port": 3306,
+    "user": "webapi",
+    "password": "your-secure-password",
+    "database": "webapi"
+  },
+  "redis_url": "redis://192.168.12.90:6379/agent-service-manager-service",
+  "nacos_url": "http://192.168.12.90:8848",
+  "nacos_namespace": "public",
+  "agent_api_port": 11197,
+  "agent_auth_token": "your_secure_token_here",
+  "refresh_interval": 60,
+  "max_workers": 10,
+  "upload_max_size": 104857600,
+  "token_expiration": 86400,
+  "log_level": "INFO",
+  "log_file": "/tmp/webapi_server.log",
+  "pod_id": "webapi-server-1",
+  "lock_timeout": 30,
+  "max_task_logs": 10000,
+  "task_log_retention_days": 30
+}

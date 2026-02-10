@@ -1,29 +1,35 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: secflow-platform-menu
+  name: secflow-platform-project
   namespace: secflow-ns
 spec:
   replicas: 1
   selector:
     matchLabels:
-      name: secflow-platform-menu
+      name: secflow-platform-project
   template:
     metadata:
       labels:
-        name: secflow-platform-menu
+        name: secflow-platform-project
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
-      - name: secflow-platform-menu
-        image: ghcr.io/runshine/secflow-platform-menu:latest  # 包含kubectl命令
+      - name: secflow-platform-project
+        image: ghcr.io/runshine/secflow-platform-project:latest  # 包含kubectl命令
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
         volumeMounts:
-        - name: secflow-platform-menu-config
+        - name: secflow-platform-project-config
           mountPath: /app/config.yaml
           subPath: config.yaml
+        - name: secflow-platform-project-config
+          mountPath: /app/full_chain.crt
+          subPath: full_chain.crt
+        - name: secflow-platform-project-config
+          mountPath: /app/full_chain.key
+          subPath: full_chain.key
         resources:
           requests:
             memory: "128Mi"
@@ -33,21 +39,25 @@ spec:
             cpu: "500m"
         livenessProbe:
           httpGet:
-            path: /api/menu/health
+            path: /api/project/health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
         readinessProbe:
           httpGet:
-            path: /api/menu/health
+            path: /api/project/health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
 
       volumes:
-      - name: secflow-platform-menu-config
+      - name: secflow-platform-project-config
         configMap:
-          name: secflow-platform-menu-config
+          name: secflow-platform-project-config
           items:
             - key: config.yaml
               path: config.yaml
+            - key: full_chain.crt
+              path: full_chain.crt
+            - key: full_chain.key
+              path: full_chain.key

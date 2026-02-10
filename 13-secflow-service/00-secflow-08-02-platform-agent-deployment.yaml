@@ -1,29 +1,29 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: secflow-platform-auth
+  name: secflow-platform-agent
   namespace: secflow-ns
 spec:
   replicas: 1
   selector:
     matchLabels:
-      name: secflow-platform-auth
+      name: secflow-platform-agent
   template:
     metadata:
       labels:
-        name: secflow-platform-auth
+        name: secflow-platform-agent
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
-      - name: secflow-platform-auth
-        image: ghcr.io/runshine/secflow-platform-auth:latest  # 包含kubectl命令
+      - name: secflow-platform-agent
+        image: ghcr.io/runshine/secflow-platform-agent:latest  # 包含kubectl命令
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
         volumeMounts:
-        - name: secflow-platform-auth-config
-          mountPath: /app/config.yaml
-          subPath: config.yaml
+        - name: secflow-platform-agent-config
+          mountPath: /app/config.json
+          subPath: config.json
         resources:
           requests:
             memory: "128Mi"
@@ -33,21 +33,21 @@ spec:
             cpu: "500m"
         livenessProbe:
           httpGet:
-            path: /api/auth/health
+            path: /api/agent/health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
         readinessProbe:
           httpGet:
-            path: /api/auth/health
+            path: /api/agent/health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
 
       volumes:
-      - name: secflow-platform-auth-config
+      - name: secflow-platform-agent-config
         configMap:
-          name: secflow-platform-auth-config
+          name: secflow-platform-agent-config
           items:
-            - key: config.yaml
-              path: config.yaml
+            - key: config.json
+              path: config.json

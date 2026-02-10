@@ -1,4 +1,3 @@
-# nginx-config.yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -6,14 +5,87 @@ metadata:
   namespace: secflow-ns
 data:
   config.yaml: |
-    # SecFlow Menu Service 配置文件
-    # 服务配置
-    host: "0.0.0.0"      # 服务监听地址
-    port: 8080           # 服务监听端口
-    debug: false         # 调试模式
-    # 心跳超时配置（秒）
-    heartbeat_timeout: 120.0
-    # 清理过期服务间隔（秒）
-    cleanup_interval: 30
-    # 日志配置
-    log_level: "INFO"
+    # secflow-input-management Configuration
+
+    # Database Configuration (MySQL)
+    database:
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+      pool_size: 10
+      max_overflow: 20
+    # Application Configuration
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+      upload_dir: "/tmp/uploads"
+      temp_dir: "/tmp/temp"
+      download_base_url: "http://secflow-platform-resource"
+    # Auth Service Configuration (for token validation)
+    auth_service:
+      base_url: "http://secflow-platform-auth"
+      validate_token_path: "/api/auth/validate-human-token"
+      timeout: 10
+      # Token缓存有效期（秒），默认15分钟
+      # 在缓存有效期内，同一Token的验证请求将直接从缓存返回，不再请求auth服务
+      token_cache_ttl: 900
+    # Secflow Project Service Configuration (for project validation)
+    project_service:
+      base_url: "http://secflow-platform-project"
+      get_project_path: "/api/project"
+      timeout: 10
+    # Kubernetes Configuration
+    k8s:
+      # 连接方式: "kubeconfig" (集群外) 或 "incluster" (集群内)
+      connection_mode: "incluster"
+      # kubeconfig文件路径 (仅当connection_mode为kubeconfig时使用)
+      kubeconfig_path: "/home/runshine/.kube/config"
+      # 默认的存储类名称
+      storage_class_name: "nfs-storage-192.168.13.66"
+      # PVC大小模板 (单位: Gi)
+      pvc_size: 10
+      # POD超时时间 (秒)
+      pod_timeout: 300
+      # 资源复制超时 (秒)
+      resource_copy_timeout: 1800
+    # Async Task Configuration
+    task:
+      # 任务日志目录
+      log_dir: "/tmp/task_log"
+      # 任务日志保留天数
+      log_retention_days: 7
+      # 最大并发任务数
+      max_concurrent_tasks: 10
+      # 任务检查间隔 (秒)
+      check_interval: 5
+    # Menu Service Configuration (服务注册中心)
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu"
+      service_id: "secflow-platform-resource"
+      service_name: "资源管理服务"
+      host: "secflow-platform-resource"
+      port: 80
+      maturity: "已上线"
+      description: "项目输入资源管理 - 提供软件发布包、软件文档包、软件代码包的上传、查询、下载功能"
+      api_prefix: "/api/resource"
+      menu:
+        id: "resource-manage"
+        path: "/resource-manage"
+        icon: "folder"
+        order: 2
+        # 一级菜单
+        level1:
+          name: "系统管理"
+          name_en: "System"
+        # 二级菜单
+        level2:
+          name: "资源管理"
+          name_en: "Resource Management"
+        # 三级菜单（可选）
+        level3:
+          name: null
+          name_en: null
