@@ -17,6 +17,11 @@ from app.model import User, MachineToken
 router = APIRouter(tags=["认证"])
 
 
+@router.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @router.post("/login", response_model=TokenResponse)
 def login(request: LoginRequest, db: Session = Depends(get_db)):
     """

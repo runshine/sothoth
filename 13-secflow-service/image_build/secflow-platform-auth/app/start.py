@@ -202,10 +202,6 @@ def create_app():
             "docs": "/docs"
         }
 
-    @app.get("/api/auth/health")
-    def health():
-        return {"status": "ok"}
-
     return app
 
 
