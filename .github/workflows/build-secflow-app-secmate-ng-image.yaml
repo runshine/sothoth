@@ -1,4 +1,4 @@
-name: build-secflow-app-secmate-ng-image.
+name: build-secflow-app-secmate-ng-image
 on:
   push:
     branches:
