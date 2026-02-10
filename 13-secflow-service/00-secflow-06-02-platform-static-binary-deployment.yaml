@@ -2,9 +2,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: secflow-platform-static-binary
-  namespace: sothothv2-ns
+  namespace: secflow-ns
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       name: secflow-platform-static-binary

@@ -202,7 +202,7 @@ def create_app():
             "docs": "/docs"
         }
 
-    @app.get("/health")
+    @app.get("/api/auth/health")
     def health():
         return {"status": "ok"}
 
