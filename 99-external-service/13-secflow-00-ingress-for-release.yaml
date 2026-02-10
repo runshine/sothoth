@@ -20,6 +20,13 @@ spec:
   - host: secflow.sothothv2.com
     http:
       paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-frontend
+            port:
+              number: 80
       - path: /api/menu
         pathType: Prefix
         backend:
