@@ -15,11 +15,17 @@ COPY requirements.txt .
 # 安装Python依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 复制配置文件
+COPY config.yaml /app/
+
+# 复制启动脚本
+COPY app/start.py /app/app/
+
 # 复制应用代码
-COPY . .
+COPY app/ /app/app/
 
 # 暴露端口 (默认8080，可在config.yaml中配置)
 EXPOSE 8080
 
 # 启动命令 (所有参数从 config.yaml 读取)
-CMD ["python", "app/main.py"]
+CMD ["python", "/app/app/start.py"]
