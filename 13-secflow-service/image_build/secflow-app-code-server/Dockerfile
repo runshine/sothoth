@@ -18,9 +18,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 复制配置文件
 COPY config.yaml /app/
 
-# 复制启动脚本
-COPY app/start.py /app/app/
-
 # 复制应用代码
 COPY app/ /app/app/
 
