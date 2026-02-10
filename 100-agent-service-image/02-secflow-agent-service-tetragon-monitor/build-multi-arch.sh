@@ -40,8 +40,8 @@ echo "开始构建多架构镜像..."
 
 docker buildx build \
     --platform ${PLATFORMS} \
-    --tag runshine0819/tetragon-monitor:latest \
-    --tag ghcr.io/runshine/tetragon-monitor:latest \
+    --tag runshine0819/secflow-agent-service-tetragon-monitor:latest \
+    --tag ghcr.io/runshine/secflow-agent-service-tetragon-monitor:latest \
     --build-arg VERSION=${VERSION} \
     --build-arg BUILD_DATE=${BUILD_DATE} \
     --build-arg COMMIT_SHA=${COMMIT_SHA} \

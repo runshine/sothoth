@@ -1,13 +1,13 @@
-name: build-remote-command-api-image
+name: build-secflow-agent-service-tetragon-monitor-image
 on:
   push:
     branches:
       - 'v2.*'
     paths:
-      - .github/workflows/build-remote-command-api-image.yml
-      - 100-agent-service-image/01-remote-command-api/**
+      - build-secflow-agent-service-tetragon-monitor-image.yaml
+      - 100-agent-service-image/02-secflow-agent-service-tetragon-monitor/**
 jobs:
-  build-remote-command-api-image:
+  build-secflow-agent-service-tetragon-monitor-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,13 +35,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push remote-command-api-image
-        uses: docker/build-push-action@v5
-        with:
-          context: 100-agent-service-image/01-remote-command-api/
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
-          push: true
-          tags: |
-            runshine0819/remote-command-api:latest
-            ghcr.io/runshine/remote-command-api:latest
-          file: 100-agent-service-image/01-remote-command-api/Dockerfile
+      - name: Build and push secflow-agent-service-tetragon-monitor-image
+        run: |
+          cd 100-agent-service-image/02-secflow-agent-service-tetragon-monitor/ && bash build-multi-arch.sh

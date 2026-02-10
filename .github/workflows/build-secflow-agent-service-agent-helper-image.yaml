@@ -1,13 +1,13 @@
-name: build-tetragon-monitor-image
+name: build-secflow-agent-service-agent-helper-image
 on:
   push:
     branches:
       - 'v2.*'
     paths:
-      - .github/workflows/build-tetragon-monitor-image.yml
-      - 100-agent-service-image/02-tetragon-monitor/**
+      - build-secflow-agent-service-agent-helper-image.yaml
+      - 100-agent-service-image/01-secflow-agent-service-agent-helper/**
 jobs:
-  build-tetragon-monitor-image:
+  build-secflow-agent-service-agent-helper-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -35,6 +35,13 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push tetragon-monitor-image
-        run: |
-          cd 100-agent-service-image/02-tetragon-monitor/ && bash build-multi-arch.sh
+      - name: Build and push secflow-agent-service-agent-helper-image
+        uses: docker/build-push-action@v5
+        with:
+          context: 100-agent-service-image/01-secflow-agent-service-agent-helper/
+          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
+          push: true
+          tags: |
+            runshine0819/secflow-agent-service-agent-helper:latest
+            ghcr.io/runshine/secflow-agent-service-agent-helper:latest
+          file: 100-agent-service-image/01-secflow-agent-service-agent-helper/Dockerfile

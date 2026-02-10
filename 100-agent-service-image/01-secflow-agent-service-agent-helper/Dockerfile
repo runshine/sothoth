@@ -59,6 +59,7 @@ RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
 RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
         apt-get update && apt-get install -y nodejs npm && apt-get clean && rm -rf /var/lib/apt/lists/* ;\
+        bash -c ". $HOME/.nvm/nvm.sh ; curl -fsSL https://bun.com/install | bash" \
         npm install -g @anthropic-ai/claude-code ; \
         npm install -g opencode-ai@latest ; \
     else \
