@@ -12,52 +12,52 @@ http://{host}:{port}/api/agent
 
 ## API Endpoints Summary
 
-| Category | Endpoint | Method | Description |
-|----------|----------|--------|-------------|
-| Health | `/health` | GET | 服务健康检查 |
-| Health | `/system/connections` | GET | 获取连接状态 |
-| Health | `/system/external-agent-ips` | GET | 获取外部Agent接入IP列表 |
-| Project | `/projects` | GET | 列出所有项目 |
-| Agent | `/agents` | GET | 列出指定项目下的所有 Agent |
-| Agent | `/agents/refresh` | POST | 刷新 Agent 列表 |
-| Agent | `/agents/cleanup` | POST | 清理掉线 Agent |
-| Agent | `/agents/stats` | GET | 获取指定项目的 Agent 统计信息 |
-| Agent | `/agents/<agent_key>/status` | PUT | 更新指定项目下 Agent 状态 |
-| Agent | `/agents/<agent_key>` | GET | 获取指定项目下的单个 Agent 信息 |
-| Task | `/task` | GET | 列出指定项目下的所有任务 |
-| Task | `/task/<task_id>` | GET | 获取指定项目下的任务详情 |
-| Task | `/task/<task_id>/logs` | GET | 获取指定项目下的任务日志 |
-| Task | `/task/<task_id>` | DELETE | 删除指定项目下的任务 |
-| Task | `/task/deploy` | POST | 创建部署任务（需指定 project_id）|
-| Task | `/task/undeploy` | POST | 创建卸载任务（需指定 project_id）|
-| Proxy | `/proxy/<agent_key>/<path:action_path>` | GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD | 代理请求到 Agent |
-| Proxy | `/proxy_simple/<agent_key>/<path:action_path>` | GET | 简单代理（仅 GET） |
-| Proxy | `/agent/<agent_key>/<path:action_path>` | GET, POST, PUT, DELETE, PATCH | 简化版代理 |
-| Proxy | `/agent/<agent_key>/system/info` | GET | 获取 Agent 系统信息 |
-| Proxy | `/agent/<agent_key>/services` | GET | 获取 Agent 服务列表 |
-| Proxy | `/agent/<agent_key>/health` | GET | 获取 Agent 健康状态 |
-| Proxy | `/proxy/debug/<agent_key>` | GET | 调试 Agent 代理连接 |
-| Proxy | `/proxy/info` | GET | 获取代理 API 信息 |
-| Proxy | `/proxy/test/<agent_key>` | GET | 测试代理连接 |
-| Proxy | `/proxy/examples` | GET | 获取代理使用示例 |
-| Template | `/templates` | GET | 列出所有模板（全局共享，无需 project_id）|
-| Template | `/templates` | POST | 上传模板（全局共享，无需 project_id）|
-| Template | `/templates/<name>` | GET | 获取模板详情（全局共享）|
-| Template | `/templates/<name>/yaml` | GET | 获取模板 YAML 内容 |
-| Template | `/templates/<name>/yaml` | PUT | 更新模板 YAML 内容 |
-| Template | `/templates/<name>/download` | GET | 下载模板 |
-| Template | `/templates/<name>/file` | GET | 获取模板原始文件 |
-| Template | `/templates/<name>/content` | GET | 获取模板内容（JSON 格式）|
-| Template | `/templates/<name>/info` | GET | 获取模板信息 |
-| Template | `/templates/<name>` | DELETE | 删除模板 |
-| Template | `/templates/download/batch` | POST | 批量下载模板 |
-| Template | `/templates/<name>/files` | GET | 列出模板文件 |
-| Template | `/templates/<name>/files/content` | GET | 获取模板文件内容 |
-| Template | `/templates/<name>/files/content` | PUT | 更新模板文件内容 |
-| Template | `/templates/<name>/files/download` | GET | 下载模板文件 |
-| Template | `/templates/<name>/files/upload` | POST | 上传文件到模板 |
-| Template | `/templates/<name>/files` | DELETE | 删除模板文件 |
-| Template | `/templates/<name>/directories` | DELETE | 删除模板目录 |
+| Category | Endpoint | Method | Description                |
+|----------|----------|--------|----------------------------|
+| Health | `/health` | GET | 服务健康检查                     |
+| Health | `/system/connections` | GET | 获取连接状态                     |
+| Health | `/system/external-agent-ips` | GET | 获取外部Agent接入IP列表            |
+| Project | `/projects` | GET | 列出所/有项目                    |
+| Agent | `/agents` | GET | 列出指定项目下的所有 Agent           |
+| Agent | `/agents/refresh` | POST | 刷新 Agent 列表                |
+| Agent | `/agents/cleanup` | POST | 清理掉线 Agent                 |
+| Agent | `/agents/stats` | GET | 获取指定项目的 Agent 统计信息         |
+| Agent | `/agents/<agent_key>/status` | PUT | 更新指定项目下 Agent 状态           |
+| Agent | `/agents/<agent_key>` | GET | 获取指定项目下的单个 Agent 信息        |
+| Task | `/task` | GET | 列出指定项目下的所有任务               |
+| Task | `/task/<task_id>` | GET | 获取指定项目下的任务详情               |
+| Task | `/task/<task_id>/logs` | GET | 获取指定项目下的任务日志               |
+| Task | `/task/<task_id>` | DELETE | 删除指定项目下的任务                 |
+| Task | `/task/deploy` | POST | 创建部署任务（需指定 project_id）     |
+| Task | `/task/undeploy` | POST | 创建卸载任务（需指定 project_id）     |
+| Proxy | `/proxy/<agent_key>/<path:action_path>` | GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD | 代理请求到 Agent                |
+| Proxy | `/proxy_simple/<agent_key>/<path:action_path>` | GET | 简单代理（仅 GET）                |
+| Proxy | `/agent/<agent_key>/<path:action_path>` | GET, POST, PUT, DELETE, PATCH | 简化版代理                      |
+| Proxy | `/agent/<agent_key>/system/info` | GET | 获取 Agent 系统信息              |
+| Proxy | `/agent/<agent_key>/services` | GET | 获取 Agent 服务列表              |
+| Proxy | `/agent/<agent_key>/health` | GET | 获取 Agent 健康状态              |
+| Proxy | `/proxy/debug/<agent_key>` | GET | 调试 Agent 代理连接              |
+| Proxy | `/proxy/info` | GET | 获取代理 API 信息                |
+| Proxy | `/proxy/test/<agent_key>` | GET | 测试代理连接                     |
+| Proxy | `/proxy/examples` | GET | 获取代理使用示例                   |
+| Template | `/templates` | GET | 列出所有模板（全局共享，无需 project_id） |
+| Template | `/templates` | POST | 上传模板（全局共享，无需 project_id）   |
+| Template | `/templates/<name>` | GET | 获取模板详情（全局共享）               |
+| Template | `/templates/<name>/yaml` | GET | 获取模板 YAML 内容               |
+| Template | `/templates/<name>/yaml` | PUT | 更新模板 YAML 内容               |
+| Template | `/templates/<name>/download` | GET | 下载模板                       |
+| Template | `/templates/<name>/file` | GET | 获取模板原始文件                   |
+| Template | `/templates/<name>/content` | GET | 获取模板内容（JSON 格式）            |
+| Template | `/templates/<name>/info` | GET | 获取模板信息                     |
+| Template | `/templates/<name>` | DELETE | 删除模板                       |
+| Template | `/templates/download/batch` | POST | 批量下载模板                     |
+| Template | `/templates/<name>/files` | GET | 列出模板文件                     |
+| Template | `/templates/<name>/files/content` | GET | 获取模板文件内容                   |
+| Template | `/templates/<name>/files/content` | PUT | 更新模板文件内容                   |
+| Template | `/templates/<name>/files/download` | GET | 下载模板文件                     |
+| Template | `/templates/<name>/files/upload` | POST | 上传文件到模板                    |
+| Template | `/templates/<name>/files` | DELETE | 删除模板文件                     |
+| Template | `/templates/<name>/directories` | DELETE | 删除模板目录                     |
 
 ---
 
