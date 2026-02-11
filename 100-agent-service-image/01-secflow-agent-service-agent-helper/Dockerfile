@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y \
     # Python环境
     python3 python3-pip python3-dev \
     # 其他实用工具
-    jq tree tmux less file\
+    jq tree tmux less file unzip\
     # 清理缓存
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
