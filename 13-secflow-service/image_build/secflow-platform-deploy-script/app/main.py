@@ -93,10 +93,10 @@ setup_exception_handlers(app)
 # 注册路由
 app.include_router(router)
 
-# 注册静态资源服务 - /script 路径对应 resource/script 目录
-script_dir = Path(__file__).parent.parent / "resource" / "script"
-if script_dir.exists():
-    app.mount("/script", StaticFiles(directory=str(script_dir)), name="script")
+# 注册静态资源服务 - /script 路径对应 resource 根目录
+resource_dir = Path(__file__).parent.parent / "resource"
+if resource_dir.exists():
+    app.mount("/script", StaticFiles(directory=str(resource_dir)), name="script")
 
 
 if __name__ == "__main__":
