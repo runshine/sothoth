@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Body, UploadFile, File
+from pydantic import BaseModel
 from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
 import aiofiles
 from aiofiles import os as aio_os
@@ -19,6 +20,10 @@ from app.services.auth import get_auth_service, TokenInvalidError
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/deploy-script", tags=["DeployScript"])
+
+
+class EditFileRequest(BaseModel):
+    content: str = ""
 
 
 def get_file_root() -> Path:
@@ -275,6 +280,8 @@ async def upload_file(
         上传结果
     """
     file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
     target_path = validate_path(file_root, path)
 
     # 如果目标不存在，尝试创建
@@ -301,7 +308,7 @@ async def upload_file(
 @router.put("/file{path:path}")
 async def edit_file(
     path: str = "",
-    content: str = Body("", description="文件内容"),
+    request: EditFileRequest = Body(...),
     current_user: Optional[dict] = Depends(get_current_user)
 ):
     """
@@ -319,15 +326,16 @@ async def edit_file(
     file_root = file_root.resolve()
     file_path = validate_path(file_root, path)
 
-    if not file_path.exists():
-        raise NotFoundError("文件", path)
-
     if file_path.is_dir():
         raise ValidationError("不能编辑目录")
 
+    # 如果文件不存在且父目录不存在，则创建父目录
+    if not file_path.exists() and not file_path.parent.exists():
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+
     # 写入新内容
     async with aiofiles.open(file_path, 'w', encoding='utf-8') as f:
-        await f.write(content)
+        await f.write(request.content)
 
     logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 编辑文件: {file_path}")
 
@@ -354,6 +362,8 @@ async def delete_file(
         删除结果
     """
     file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
     target_path = validate_path(file_root, path)
 
     if not target_path.exists():
@@ -391,6 +401,8 @@ async def create_directory(
         创建结果
     """
     file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
     dir_path = validate_path(file_root, path)
 
     if dir_path.exists():
@@ -433,6 +445,8 @@ async def rename_file(
         raise ValidationError("新名称不能包含路径分隔符")
 
     file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
     old_path = validate_path(file_root, path)
 
     if not old_path.exists():
@@ -473,6 +487,8 @@ async def batch_upload(
         上传结果列表
     """
     file_root = get_file_root()
+    # Resolve to absolute path to avoid relative/absolute path mismatch
+    file_root = file_root.resolve()
     target_dir = validate_path(file_root, path)
 
     # 确保目标目录存在
