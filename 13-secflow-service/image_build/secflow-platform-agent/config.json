@@ -30,5 +30,6 @@
   "pod_id": "local-dev",
   "lock_timeout": 30,
   "max_task_logs": 1000,
-  "task_log_retention_days": 7
+  "task_log_retention_days": 7,
+  "external_agent_ips": []
 }

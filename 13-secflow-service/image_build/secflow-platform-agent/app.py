@@ -4884,6 +4884,16 @@ class WebAPIServer:
                 'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
+        @self.app.route('/api/agent/system/external-agent-ips', methods=['GET'])
+        def get_external_agent_ips():
+            """获取外部Agent接入IP列表"""
+            external_ips = self.config.get('external_agent_ips', [])
+            return jsonify({
+                'external_agent_ips': external_ips,
+                'count': len(external_ips),
+                'timestamp': datetime.now().isoformat()
+            })
+
         @self.app.route('/api/agent/projects', methods=['GET'])
         def list_projects():
             projects = self.agent_manager.list_projects()

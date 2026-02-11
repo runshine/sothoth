@@ -34,5 +34,6 @@ data:
       "pod_id": "webapi-server-1",
       "lock_timeout": 30,
       "max_task_logs": 10000,
-      "task_log_retention_days": 30
+      "task_log_retention_days": 30,
+      "external_agent_ips": ["192.168.12.90"]
     }

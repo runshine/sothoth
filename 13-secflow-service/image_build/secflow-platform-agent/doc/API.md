@@ -16,6 +16,7 @@ http://{host}:{port}/api/agent
 |----------|----------|--------|-------------|
 | Health | `/health` | GET | 服务健康检查 |
 | Health | `/system/connections` | GET | 获取连接状态 |
+| Health | `/system/external-agent-ips` | GET | 获取外部Agent接入IP列表 |
 | Project | `/projects` | GET | 列出所有项目 |
 | Agent | `/agents` | GET | 列出指定项目下的所有 Agent |
 | Agent | `/agents/refresh` | POST | 刷新 Agent 列表 |
@@ -111,6 +112,38 @@ http://{host}:{port}/api/agent
     }
   },
   "supported_formats": [".zip", ".tar.gz", ".tar", ".tgz"]
+}
+```
+
+---
+
+#### GET /system/external-agent-ips
+
+获取外部Agent接入IP列表。该列表从配置文件中读取，用于标识允许接入的外部Agent IP地址。
+
+**Response:**
+```json
+{
+  "external_agent_ips": ["192.168.1.100", "192.168.1.101", "10.0.0.50"],
+  "count": 3,
+  "timestamp": "2024-01-01T00:00:00"
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `external_agent_ips` | array | 外部Agent接入IP列表 |
+| `count` | int | IP地址数量 |
+| `timestamp` | string | 响应时间戳 |
+
+**Configuration:**
+
+在 `config.json` 中配置外部Agent IP列表：
+```json
+{
+  "external_agent_ips": ["192.168.1.100", "192.168.1.101", "10.0.0.50"]
 }
 ```
 
