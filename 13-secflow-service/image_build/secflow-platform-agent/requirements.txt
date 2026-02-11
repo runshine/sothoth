@@ -11,3 +11,4 @@ cryptography
 werkzeug
 redis
 requests
+DBUtils

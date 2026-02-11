@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-platform-access
+  namespace: sothothv2-ns
+  labels:
+    app: secflow-platform-access
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: secflow-platform-access
+  template:
+    metadata:
+      labels:
+        app: secflow-platform-access
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.21-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: secflow-platform-access-nginx-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: secflow-platform-access-nginx-config
+          configMap:
+            name: secflow-platform-access-nginx-config
+            items:
+              - key: nginx.conf
+                path: nginx.conf

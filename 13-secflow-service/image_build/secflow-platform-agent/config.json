@@ -25,7 +25,7 @@
   "max_workers": 5,
   "upload_max_size": 104857600,
   "token_expiration": 86400,
-  "log_level": "DEBUG",
+  "log_level": "INFO",
   "log_file": "/tmp/webapi_server.log",
   "pod_id": "local-dev",
   "lock_timeout": 30,
