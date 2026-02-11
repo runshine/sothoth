@@ -247,22 +247,28 @@ class DatabaseConnection:
     def fetch_one(self, query: str, params: tuple = ()):
         """获取单条记录"""
         cursor = self.connection.cursor()
-        cursor.execute(query, params)
-        result = cursor.fetchone()
+        try:
+            cursor.execute(query, params)
+            result = cursor.fetchone()
 
-        if self.db_type == 'sqlite' and result:
-            return dict(result)
-        return result
+            if self.db_type == 'sqlite' and result:
+                return dict(result)
+            return result
+        finally:
+            cursor.close()
 
     def fetch_all(self, query: str, params: tuple = ()):
         """获取所有记录"""
         cursor = self.connection.cursor()
-        cursor.execute(query, params)
-        results = cursor.fetchall()
+        try:
+            cursor.execute(query, params)
+            results = cursor.fetchall()
 
-        if self.db_type == 'sqlite':
-            return [dict(row) for row in results]
-        return results
+            if self.db_type == 'sqlite':
+                return [dict(row) for row in results]
+            return results
+        finally:
+            cursor.close()
 
     def get_lastrowid(self):
         """获取最后插入的ID"""
@@ -305,197 +311,200 @@ class DatabaseConnection:
             self.close()
 
 class DatabaseManager:
-    """数据库管理器（支持MySQL和SQLite）- 持久化连接"""
+    """数据库管理器（支持MySQL和SQLite）- 使用连接池"""
 
     def __init__(self, db_config: Dict):
         self.db_config = db_config
         self.db_type = db_config.get('type', 'sqlite')
         self.logger = logging.getLogger(__name__)
-        self._db = DatabaseConnection(self.db_config, use_pool=True)
 
-        # 初始化数据库连接和表结构
-        if not self._db.connect():
-            raise ConnectionError(f"数据库连接失败，请检查配置: {db_config}")
+        # 初始化连接池（但不存储连接）
+        # 首次使用时从连接池获取
+        self._init_connection_pool()
 
+        # 初始化数据库表结构
         self.init_database()
-        self.logger.info(f"数据库持久化连接已建立 ({self.db_type})")
+        self.logger.info(f"数据库连接池已初始化 ({self.db_type})")
 
-    def test_connection(self) -> bool:
-        """测试数据库连接"""
-        return self._db.test_connection()
+    def _init_connection_pool(self):
+        """预初始化连接池"""
+        conn = DatabaseConnection(self.db_config, use_pool=True)
+        conn.connect()  # 这会初始化连接池
+        conn.close()    # 立即归还，以后每次从池中获取
 
     def get_connection(self) -> DatabaseConnection:
-        """获取数据库连接（持久化连接）"""
-        # 检查连接是否有效，如果失效则重连
-        if not self._db.test_connection():
-            self.logger.warning("数据库连接已失效，正在重新连接...")
-            if not self._db.connect():
-                raise ConnectionError(f"无法重新连接到{self.db_type}数据库")
-        return self._db
+        """获取独立的数据库连接（线程安全）"""
+        conn = DatabaseConnection(self.db_config, use_pool=True)
+        if not conn.connect():
+            raise ConnectionError(f"无法从连接池获取{self.db_type}数据库连接")
+        return conn
 
     def close(self):
-        """关闭持久化数据库连接"""
-        if self._db:
-            self._db.close()
-            self.logger.info("数据库持久化连接已关闭")
+        """关闭连接池（通常在应用退出时调用）"""
+        if DatabaseConnection._mysql_pool:
+            DatabaseConnection._mysql_pool.close()
+            self.logger.info("数据库连接池已关闭")
 
     def init_database(self):
-        """初始化数据库（创建表和索引）- 使用持久化连接"""
-        db = self._db  # 直接使用持久化连接，不通过 get_connection()
+        """初始化数据库（创建表和索引）"""
+        conn = self.get_connection()
+        try:
+            db = conn
+            # 创建服务模板表
+            if self.db_type == 'mysql':
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
+                                                                            id INT AUTO_INCREMENT PRIMARY KEY,
+                                                                            name VARCHAR(100) UNIQUE NOT NULL,
+                               description TEXT,
+                               type VARCHAR(20) NOT NULL,
+                               file_path TEXT NOT NULL,
+                               created_by VARCHAR(100),
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               metadata JSON,
+                               INDEX idx_templates_name (name),
+                               INDEX idx_templates_updated (updated_at)
+                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
+                                                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                            name TEXT UNIQUE NOT NULL,
+                                                                            description TEXT,
+                                                                            type TEXT NOT NULL,
+                                                                            file_path TEXT NOT NULL,
+                                                                            created_by TEXT,
+                                                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                            metadata TEXT
+                           )
+                           ''')
 
-        # 创建服务模板表
-        if self.db_type == 'mysql':
-            db.execute('''
-                       CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
-                                                                        id INT AUTO_INCREMENT PRIMARY KEY,
-                                                                        name VARCHAR(100) UNIQUE NOT NULL,
-                           description TEXT,
-                           type VARCHAR(20) NOT NULL,
-                           file_path TEXT NOT NULL,
-                           created_by VARCHAR(100),
-                           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                           metadata JSON,
-                           INDEX idx_templates_name (name),
-                           INDEX idx_templates_updated (updated_at)
-                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                       ''')
-        else:
-            db.execute('''
-                       CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
-                                                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                                        name TEXT UNIQUE NOT NULL,
-                                                                        description TEXT,
-                                                                        type TEXT NOT NULL,
-                                                                        file_path TEXT NOT NULL,
-                                                                        created_by TEXT,
-                                                                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                                        metadata TEXT
-                       )
-                       ''')
-
-        # 创建任务表
-        if self.db_type == 'mysql':
-            db.execute('''
-                       CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
-                                                            id INT AUTO_INCREMENT PRIMARY KEY,
-                                                            task_id VARCHAR(36) UNIQUE NOT NULL,
-                           task_type VARCHAR(20) NOT NULL,
-                           service_name VARCHAR(100) NOT NULL,
-                           agent_key VARCHAR(32) NOT NULL,
-                           project_id VARCHAR(100),
-                           status VARCHAR(20) NOT NULL DEFAULT 'pending',
-                           progress INT DEFAULT 0,
-                           message TEXT,
-                           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                           started_at TIMESTAMP NULL,
-                           completed_at TIMESTAMP NULL,
-                           pod_id VARCHAR(100),
-                           INDEX idx_tasks_task_id (task_id),
-                           INDEX idx_tasks_status (status),
-                           INDEX idx_tasks_agent_key (agent_key),
-                           INDEX idx_tasks_project (project_id),
-                           INDEX idx_tasks_created (created_at)
-                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                       ''')
-        else:
-            db.execute('''
-                       CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
-                                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                            task_id TEXT UNIQUE NOT NULL,
-                                                            task_type TEXT NOT NULL,
-                                                            service_name TEXT NOT NULL,
-                                                            agent_key TEXT NOT NULL,
-                                                            project_id TEXT,
-                                                            status TEXT NOT NULL DEFAULT 'pending',
-                                                            progress INTEGER DEFAULT 0,
-                                                            message TEXT,
-                                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                            started_at TIMESTAMP,
-                                                            completed_at TIMESTAMP,
-                                                            pod_id TEXT
-                       )
-                       ''')
-            # 为SQLite创建索引
-            db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON secflow_agent_tasks(task_id)')
-            db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON secflow_agent_tasks(status)')
-            db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_agent_key ON secflow_agent_tasks(agent_key)')
-
-        # 创建任务日志表
-        if self.db_type == 'mysql':
-            db.execute('''
-                       CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
+            # 创建任务表
+            if self.db_type == 'mysql':
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
                                                                 id INT AUTO_INCREMENT PRIMARY KEY,
-                                                                log_id VARCHAR(36) UNIQUE NOT NULL,
-                           task_id VARCHAR(36) NOT NULL,
-                           level VARCHAR(10) NOT NULL DEFAULT 'INFO',
-                           message TEXT NOT NULL,
-                           timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                           pod_id VARCHAR(100),
-                           INDEX idx_logs_task_id (task_id),
-                           INDEX idx_logs_timestamp (timestamp),
-                           FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
-                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                       ''')
-        else:
-            db.execute('''
-                       CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
+                                                                task_id VARCHAR(36) UNIQUE NOT NULL,
+                               task_type VARCHAR(20) NOT NULL,
+                               service_name VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(32) NOT NULL,
+                               project_id VARCHAR(100),
+                               status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                               progress INT DEFAULT 0,
+                               message TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               started_at TIMESTAMP NULL,
+                               completed_at TIMESTAMP NULL,
+                               pod_id VARCHAR(100),
+                               INDEX idx_tasks_task_id (task_id),
+                               INDEX idx_tasks_status (status),
+                               INDEX idx_tasks_agent_key (agent_key),
+                               INDEX idx_tasks_project (project_id),
+                               INDEX idx_tasks_created (created_at)
+                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
                                                                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                                log_id TEXT UNIQUE NOT NULL,
-                                                                task_id TEXT NOT NULL,
-                                                                level TEXT NOT NULL DEFAULT 'INFO',
-                                                                message TEXT NOT NULL,
-                                                                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                                pod_id TEXT,
-                                                                FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
+                                                                task_id TEXT UNIQUE NOT NULL,
+                                                                task_type TEXT NOT NULL,
+                                                                service_name TEXT NOT NULL,
+                                                                agent_key TEXT NOT NULL,
+                                                                project_id TEXT,
+                                                                status TEXT NOT NULL DEFAULT 'pending',
+                                                                progress INTEGER DEFAULT 0,
+                                                                message TEXT,
+                                                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                started_at TIMESTAMP,
+                                                                completed_at TIMESTAMP,
+                                                                pod_id TEXT
                            )
-                       ''')
-            # 为SQLite创建索引
-            db.execute('CREATE INDEX IF NOT EXISTS idx_logs_task_id ON secflow_agent_task_logs(task_id)')
+                           ''')
+                # 为SQLite创建索引
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON secflow_agent_tasks(task_id)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON secflow_agent_tasks(status)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_agent_key ON secflow_agent_tasks(agent_key)')
 
-        # 创建Agent状态表（用于多POD状态同步）
-        if self.db_type == 'mysql':
-            db.execute('''
-                       CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
-                                                                   id INT AUTO_INCREMENT PRIMARY KEY,
-                                                                   agent_key VARCHAR(32) UNIQUE NOT NULL,
-                           ip_address VARCHAR(45) NOT NULL,
-                           hostname VARCHAR(100) NOT NULL,
-                           project_id VARCHAR(100) NOT NULL,
-                           full_name VARCHAR(255) NOT NULL,
-                           status VARCHAR(20) NOT NULL DEFAULT 'unknown',
-                           last_seen TIMESTAMP NULL,
-                           system_info JSON,
-                           services JSON,
-                           pod_id VARCHAR(100),
-                           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                           INDEX idx_secflow_agent_agent_status_key (agent_key),
-                           INDEX idx_secflow_agent_agent_status_project (project_id),
-                           INDEX idx_secflow_agent_agent_status_updated (updated_at)
-                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                       ''')
-        else:
-            db.execute('''
-                       CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
-                                                                   id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                                   agent_key TEXT UNIQUE NOT NULL,
-                                                                   ip_address TEXT NOT NULL,
-                                                                   hostname TEXT NOT NULL,
-                                                                   project_id TEXT NOT NULL,
-                                                                   full_name TEXT NOT NULL,
-                                                                   status TEXT NOT NULL DEFAULT 'unknown',
-                                                                   last_seen TIMESTAMP,
-                                                                   system_info TEXT,
-                                                                   services TEXT,
-                                                                   pod_id TEXT,
-                                                                   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                           )
-                       ''')
-            # 为SQLite创建索引
-            db.execute('CREATE INDEX IF NOT EXISTS idx_secflow_agent_agent_status_project ON secflow_agent_agent_status(project_id)')
+            # 创建任务日志表
+            if self.db_type == 'mysql':
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
+                                                                    id INT AUTO_INCREMENT PRIMARY KEY,
+                                                                    log_id VARCHAR(36) UNIQUE NOT NULL,
+                               task_id VARCHAR(36) NOT NULL,
+                               level VARCHAR(10) NOT NULL DEFAULT 'INFO',
+                               message TEXT NOT NULL,
+                               timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               pod_id VARCHAR(100),
+                               INDEX idx_logs_task_id (task_id),
+                               INDEX idx_logs_timestamp (timestamp),
+                               FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
+                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
+                                                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                    log_id TEXT UNIQUE NOT NULL,
+                                                                    task_id TEXT NOT NULL,
+                                                                    level TEXT NOT NULL DEFAULT 'INFO',
+                                                                    message TEXT NOT NULL,
+                                                                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                    pod_id TEXT,
+                                                                    FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
+                               )
+                           ''')
+                # 为SQLite创建索引
+                db.execute('CREATE INDEX IF NOT EXISTS idx_logs_task_id ON secflow_agent_task_logs(task_id)')
 
-        self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}）")
+            # 创建Agent状态表（用于多POD状态同步）
+            if self.db_type == 'mysql':
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
+                                                                       id INT AUTO_INCREMENT PRIMARY KEY,
+                                                                       agent_key VARCHAR(32) UNIQUE NOT NULL,
+                               ip_address VARCHAR(45) NOT NULL,
+                               hostname VARCHAR(100) NOT NULL,
+                               project_id VARCHAR(100) NOT NULL,
+                               full_name VARCHAR(255) NOT NULL,
+                               status VARCHAR(20) NOT NULL DEFAULT 'unknown',
+                               last_seen TIMESTAMP NULL,
+                               system_info JSON,
+                               services JSON,
+                               pod_id VARCHAR(100),
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               INDEX idx_secflow_agent_agent_status_key (agent_key),
+                               INDEX idx_secflow_agent_agent_status_project (project_id),
+                               INDEX idx_secflow_agent_agent_status_updated (updated_at)
+                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
+                                                                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                       agent_key TEXT UNIQUE NOT NULL,
+                                                                       ip_address TEXT NOT NULL,
+                                                                       hostname TEXT NOT NULL,
+                                                                       project_id TEXT NOT NULL,
+                                                                       full_name TEXT NOT NULL,
+                                                                       status TEXT NOT NULL DEFAULT 'unknown',
+                                                                       last_seen TIMESTAMP,
+                                                                       system_info TEXT,
+                                                                       services TEXT,
+                                                                       pod_id TEXT,
+                                                                       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                               )
+                           ''')
+                # 为SQLite创建索引
+                db.execute('CREATE INDEX IF NOT EXISTS idx_secflow_agent_agent_status_project ON secflow_agent_agent_status(project_id)')
+
+            self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}）")
+        finally:
+            conn.close()
 
     def execute_query(self, query: str, params: tuple = ()):
         """执行查询 - 使用持久化连接"""
@@ -2825,7 +2834,7 @@ class EnhancedTemplateManager:
             )
             count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM secflow_agent_service_templates")
 
-        total = count_result['count'] if count_result else 0
+        total = count_result.get('count', 0) if count_result else 0
 
         # 为每个模板添加文件大小信息
         for template in templates:
@@ -4389,7 +4398,7 @@ class TaskManager:
                 (task_id,)
             )
 
-        total = count_result['count'] if count_result else 0
+        total = count_result.get('count', 0) if count_result else 0
         return logs, total
 
     def list_tasks(self, page: int = 1, per_page: int = 20,
@@ -4422,7 +4431,7 @@ class TaskManager:
 
         count_query = query.replace("SELECT *", "SELECT COUNT(*) as count")
         count_result = self.db.fetch_one(count_query, tuple(params))
-        total = count_result['count'] if count_result else 0
+        total = count_result.get('count', 0) if count_result else 0
 
         query += " LIMIT "
         query += "%s OFFSET %s" if self.db.db_type == 'mysql' else "? OFFSET ?"
