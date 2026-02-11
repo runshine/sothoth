@@ -1,0 +1,472 @@
+import logging
+import os
+import threading
+from typing import Dict, List, Any, Optional, Tuple, Union
+
+# ===================== 数据库抽象层 =====================
+
+try:
+    import pymysql
+    MYSQL_AVAILABLE = True
+except ImportError:
+    MYSQL_AVAILABLE = False
+
+try:
+    from DBUtils.PooledDB import PooledDB
+    POOLDB_AVAILABLE = True
+except ImportError:
+    try:
+        from dbutils.pooled_db import PooledDB
+        POOLDB_AVAILABLE = True
+    except ImportError:
+        POOLDB_AVAILABLE = False
+
+
+import sqlite3
+
+class DatabaseConnection:
+    """数据库连接抽象类 - 支持连接池"""
+
+    # 类级别的连接池缓存
+    _mysql_pool = None
+    _pool_lock = threading.Lock()
+
+    def __init__(self, db_config: Dict, use_pool: bool = True):
+        self.db_config = db_config
+        self.db_type = db_config.get('type', 'sqlite')
+        self.use_pool = use_pool and self.db_type == 'mysql'
+        self.logger = logging.getLogger(__name__)
+        self.connection = None
+        self._is_pooled = False
+
+    def _init_mysql_pool(self) -> bool:
+        """初始化MySQL连接池"""
+        if DatabaseConnection._mysql_pool is not None:
+            return True
+
+        with DatabaseConnection._pool_lock:
+            if DatabaseConnection._mysql_pool is not None:
+                return True
+
+            if not POOLDB_AVAILABLE:
+                self.logger.warning("DBUtils未安装，使用普通连接。建议安装: pip install DBUtils")
+                return False
+
+            try:
+                DatabaseConnection._mysql_pool = PooledDB(
+                    creator=pymysql,
+                    host=self.db_config.get('host', 'localhost'),
+                    port=self.db_config.get('port', 3306),
+                    user=self.db_config.get('user', 'root'),
+                    password=self.db_config.get('password', ''),
+                    database=self.db_config.get('database', 'webapi'),
+                    charset='utf8mb4',
+                    cursorclass=pymysql.cursors.DictCursor,
+                    autocommit=False,
+                    mincached=2,      # 最小空闲连接数
+                    maxcached=5,      # 最大空闲连接数
+                    maxshared=0,      # 最大共享连接数
+                    maxconnections=20, # 最大连接数
+                    blocking=True,     # 连接池满时等待
+                    maxusage=None,     # 不限制连接使用次数
+                    setsession=[],     # 初始化会话设置
+                    ping=1,            # 每次使用前ping，失效则重连
+                )
+                self.logger.info("MySQL连接池初始化成功")
+                return True
+            except Exception as e:
+                self.logger.error(f"MySQL连接池初始化失败: {str(e)}")
+                return False
+
+    def connect(self) -> bool:
+        """建立数据库连接（从连接池获取或新建）"""
+        try:
+            if self.connection is not None:
+                return True
+
+            if self.db_type == 'mysql':
+                if not MYSQL_AVAILABLE:
+                    self.logger.error("pymysql未安装，请使用 'pip install pymysql' 安装")
+                    return False
+
+                # 尝试使用连接池
+                if self.use_pool and self._init_mysql_pool():
+                    self.connection = DatabaseConnection._mysql_pool.connection()
+                    self._is_pooled = True
+                    self.logger.debug("从连接池获取MySQL连接")
+                else:
+                    # 回退到普通连接
+                    self.connection = pymysql.connect(
+                        host=self.db_config.get('host', 'localhost'),
+                        port=self.db_config.get('port', 3306),
+                        user=self.db_config.get('user', 'root'),
+                        password=self.db_config.get('password', ''),
+                        database=self.db_config.get('database', 'webapi'),
+                        charset='utf8mb4',
+                        cursorclass=pymysql.cursors.DictCursor,
+                        autocommit=False,
+                        connect_timeout=10
+                    )
+                    self.logger.debug("新建MySQL连接")
+                return True
+
+            elif self.db_type == 'sqlite':
+                db_path = self.db_config.get('path', './webapi_server.db')
+                db_dir = os.path.dirname(db_path)
+                if db_dir:
+                    os.makedirs(db_dir, exist_ok=True)
+
+                self.connection = sqlite3.connect(db_path, check_same_thread=False)
+                self.connection.row_factory = sqlite3.Row
+                return True
+
+            else:
+                self.logger.error(f"不支持的数据库类型: {self.db_type}")
+                return False
+
+        except pymysql.Error as e:
+            self.logger.error(f"MySQL数据库连接失败: {str(e)}")
+            return False
+        except sqlite3.Error as e:
+            self.logger.error(f"SQLite数据库连接失败: {str(e)}")
+            return False
+        except Exception as e:
+            self.logger.error(f"数据库连接失败: {str(e)}")
+            return False
+
+    def test_connection(self) -> bool:
+        """测试数据库连接是否正常（不关闭连接）"""
+        try:
+            if not self.connect():
+                return False
+            cursor = self.connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+            return True
+        except Exception as e:
+            self.logger.error(f"数据库连接测试失败: {str(e)}")
+            return False
+
+    def close(self):
+        """关闭数据库连接（回收到连接池或真正关闭）"""
+        if self.connection:
+            try:
+                if self._is_pooled:
+                    # 连接池的连接会自动回收到池中
+                    self.connection.close()
+                    self.logger.debug("归还MySQL连接到连接池")
+                else:
+                    self.connection.close()
+            except:
+                pass
+            finally:
+                self.connection = None
+                self._is_pooled = False
+
+    def execute(self, query: str, params: tuple = ()):
+        """执行SQL语句"""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(query, params)
+            self.connection.commit()
+            return cursor
+        except Exception as e:
+            self.connection.rollback()
+            raise e
+
+    def executemany(self, query: str, params_list: List[tuple]):
+        """批量执行SQL语句"""
+        cursor = self.connection.cursor()
+        try:
+            cursor.executemany(query, params_list)
+            self.connection.commit()
+            return cursor
+        except Exception as e:
+            self.connection.rollback()
+            raise e
+
+    def fetch_one(self, query: str, params: tuple = ()):
+        """获取单条记录"""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(query, params)
+            result = cursor.fetchone()
+
+            if self.db_type == 'sqlite' and result:
+                return dict(result)
+            return result
+        finally:
+            cursor.close()
+
+    def fetch_all(self, query: str, params: tuple = ()):
+        """获取所有记录"""
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(query, params)
+            results = cursor.fetchall()
+
+            if self.db_type == 'sqlite':
+                return [dict(row) for row in results]
+            return results
+        finally:
+            cursor.close()
+
+    def get_lastrowid(self):
+        """获取最后插入的ID"""
+        if self.db_type == 'mysql':
+            return self.connection.cursor().lastrowid
+        else:  # sqlite
+            return self.connection.cursor().lastrowid
+
+    def table_exists(self, table_name: str) -> bool:
+        """检查表是否存在"""
+        try:
+            if self.db_type == 'mysql':
+                query = """
+                        SELECT COUNT(*) as count FROM information_schema.tables
+                        WHERE table_schema = DATABASE() AND table_name = %s \
+                        """
+                result = self.fetch_one(query, (table_name,))
+                return result['count'] > 0 if result else False
+
+            elif self.db_type == 'sqlite':
+                query = "SELECT name FROM sqlite_master WHERE type='table' AND name=?"
+                result = self.fetch_one(query, (table_name,))
+                return result is not None
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"检查表是否存在失败: {str(e)}")
+            return False
+
+    def __enter__(self):
+        if not self.connect():
+            raise ConnectionError(f"无法连接到{self.db_type}数据库")
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # 只有在非连接池模式下才关闭连接
+        # 连接池模式会将连接归还给池，不需要手动关闭
+        if not self._is_pooled:
+            self.close()
+
+class DatabaseManager:
+    """数据库管理器（支持MySQL和SQLite）- 使用连接池"""
+
+    def __init__(self, db_config: Dict):
+        self.db_config = db_config
+        self.db_type = db_config.get('type', 'sqlite')
+        self.logger = logging.getLogger(__name__)
+
+        # 初始化连接池（但不存储连接）
+        # 首次使用时从连接池获取
+        self._init_connection_pool()
+
+        # 初始化数据库表结构
+        self.init_database()
+        self.logger.info(f"数据库连接池已初始化 ({self.db_type})")
+
+    def _init_connection_pool(self):
+        """预初始化连接池"""
+        conn = DatabaseConnection(self.db_config, use_pool=True)
+        conn.connect()  # 这会初始化连接池
+        conn.close()    # 立即归还，以后每次从池中获取
+
+    def get_connection(self) -> DatabaseConnection:
+        """获取独立的数据库连接（线程安全）"""
+        conn = DatabaseConnection(self.db_config, use_pool=True)
+        if not conn.connect():
+            raise ConnectionError(f"无法从连接池获取{self.db_type}数据库连接")
+        return conn
+
+    def close(self):
+        """关闭连接池（通常在应用退出时调用）"""
+        if DatabaseConnection._mysql_pool:
+            DatabaseConnection._mysql_pool.close()
+            self.logger.info("数据库连接池已关闭")
+
+    def init_database(self):
+        """初始化数据库（创建表和索引）"""
+        conn = self.get_connection()
+        try:
+            db = conn
+            # 创建服务模板表
+            if self.db_type == 'mysql':
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
+                                                                            id INT AUTO_INCREMENT PRIMARY KEY,
+                                                                            name VARCHAR(100) UNIQUE NOT NULL,
+                               description TEXT,
+                               type VARCHAR(20) NOT NULL,
+                               file_path TEXT NOT NULL,
+                               created_by VARCHAR(100),
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               metadata JSON,
+                               INDEX idx_templates_name (name),
+                               INDEX idx_templates_updated (updated_at)
+                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
+                                                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                            name TEXT UNIQUE NOT NULL,
+                                                                            description TEXT,
+                                                                            type TEXT NOT NULL,
+                                                                            file_path TEXT NOT NULL,
+                                                                            created_by TEXT,
+                                                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                            metadata TEXT
+                           )
+                           ''')
+
+            # 创建任务表
+            if self.db_type == 'mysql':
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
+                                                                id INT AUTO_INCREMENT PRIMARY KEY,
+                                                                task_id VARCHAR(36) UNIQUE NOT NULL,
+                               task_type VARCHAR(20) NOT NULL,
+                               service_name VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(32) NOT NULL,
+                               project_id VARCHAR(100),
+                               status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                               progress INT DEFAULT 0,
+                               message TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               started_at TIMESTAMP NULL,
+                               completed_at TIMESTAMP NULL,
+                               pod_id VARCHAR(100),
+                               INDEX idx_tasks_task_id (task_id),
+                               INDEX idx_tasks_status (status),
+                               INDEX idx_tasks_agent_key (agent_key),
+                               INDEX idx_tasks_project (project_id),
+                               INDEX idx_tasks_created (created_at)
+                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
+                                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                task_id TEXT UNIQUE NOT NULL,
+                                                                task_type TEXT NOT NULL,
+                                                                service_name TEXT NOT NULL,
+                                                                agent_key TEXT NOT NULL,
+                                                                project_id TEXT,
+                                                                status TEXT NOT NULL DEFAULT 'pending',
+                                                                progress INTEGER DEFAULT 0,
+                                                                message TEXT,
+                                                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                started_at TIMESTAMP,
+                                                                completed_at TIMESTAMP,
+                                                                pod_id TEXT
+                           )
+                           ''')
+                # 为SQLite创建索引
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON secflow_agent_tasks(task_id)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON secflow_agent_tasks(status)')
+                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_agent_key ON secflow_agent_tasks(agent_key)')
+
+            # 创建任务日志表
+            if self.db_type == 'mysql':
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
+                                                                    id INT AUTO_INCREMENT PRIMARY KEY,
+                                                                    log_id VARCHAR(36) UNIQUE NOT NULL,
+                               task_id VARCHAR(36) NOT NULL,
+                               level VARCHAR(10) NOT NULL DEFAULT 'INFO',
+                               message TEXT NOT NULL,
+                               timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               pod_id VARCHAR(100),
+                               INDEX idx_logs_task_id (task_id),
+                               INDEX idx_logs_timestamp (timestamp),
+                               FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
+                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
+                                                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                    log_id TEXT UNIQUE NOT NULL,
+                                                                    task_id TEXT NOT NULL,
+                                                                    level TEXT NOT NULL DEFAULT 'INFO',
+                                                                    message TEXT NOT NULL,
+                                                                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                                                    pod_id TEXT,
+                                                                    FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
+                               )
+                           ''')
+                # 为SQLite创建索引
+                db.execute('CREATE INDEX IF NOT EXISTS idx_logs_task_id ON secflow_agent_task_logs(task_id)')
+
+            # 创建Agent状态表（用于多POD状态同步）
+            if self.db_type == 'mysql':
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
+                                                                       id INT AUTO_INCREMENT PRIMARY KEY,
+                                                                       agent_key VARCHAR(32) UNIQUE NOT NULL,
+                               ip_address VARCHAR(45) NOT NULL,
+                               hostname VARCHAR(100) NOT NULL,
+                               project_id VARCHAR(100) NOT NULL,
+                               full_name VARCHAR(255) NOT NULL,
+                               status VARCHAR(20) NOT NULL DEFAULT 'unknown',
+                               last_seen TIMESTAMP NULL,
+                               system_info JSON,
+                               services JSON,
+                               pod_id VARCHAR(100),
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               INDEX idx_secflow_agent_agent_status_key (agent_key),
+                               INDEX idx_secflow_agent_agent_status_project (project_id),
+                               INDEX idx_secflow_agent_agent_status_updated (updated_at)
+                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute('''
+                           CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
+                                                                       id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                                                       agent_key TEXT UNIQUE NOT NULL,
+                                                                       ip_address TEXT NOT NULL,
+                                                                       hostname TEXT NOT NULL,
+                                                                       project_id TEXT NOT NULL,
+                                                                       full_name TEXT NOT NULL,
+                                                                       status TEXT NOT NULL DEFAULT 'unknown',
+                                                                       last_seen TIMESTAMP,
+                                                                       system_info TEXT,
+                                                                       services TEXT,
+                                                                       pod_id TEXT,
+                                                                       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                               )
+                           ''')
+                # 为SQLite创建索引
+                db.execute('CREATE INDEX IF NOT EXISTS idx_secflow_agent_agent_status_project ON secflow_agent_agent_status(project_id)')
+
+            self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}）")
+        finally:
+            conn.close()
+
+    def execute_query(self, query: str, params: tuple = ()):
+        """执行查询 - 使用持久化连接"""
+        db = self.get_connection()
+        return db.execute(query, params)
+
+    def execute_transaction(self, queries: List[Tuple[str, tuple]]):
+        """执行事务（多个查询）- 使用持久化连接"""
+        db = self.get_connection()
+        try:
+            for query, params in queries:
+                db.execute(query, params)
+        except Exception as e:
+            raise e
+
+    def fetch_one(self, query: str, params: tuple = ()):
+        """获取单条记录 - 使用持久化连接"""
+        db = self.get_connection()
+        return db.fetch_one(query, params)
+
+    def fetch_all(self, query: str, params: tuple = ()):
+        """获取所有记录 - 使用持久化连接"""
+        db = self.get_connection()
+        return db.fetch_all(query, params)
