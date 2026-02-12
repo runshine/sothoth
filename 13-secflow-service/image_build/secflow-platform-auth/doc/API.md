@@ -37,7 +37,7 @@ SecFlow-User 是一个基于 FastAPI 构建的用户认证微服务，提供完�
 | 4 | 认证接口 | POST | `/api/auth/validate-machine-token` | 验证机机Token有效性 | 无需认证 |
 | 5 | 认证接口 | GET | `/api/auth/machine-tokens` | 获取所有机机Token列表 | 机机Token |
 | 6 | 认证接口 | DELETE | `/api/auth/machine-tokens/{token_id}` | 删除指定机机Token | 机机Token |
-| 7 | 用户接口 | GET | `/api/auth/users` | 获取用户列表 | 机机Token |
+| 7 | 用户接口 | GET | `/api/auth/user_list` | 获取用户列表 | 机机Token |
 | 8 | 用户接口 | POST | `/api/auth/users` | 创建新用户 | 机机Token |
 | 9 | 用户接口 | GET | `/api/auth/users/{user_id}` | 获取单个用户详情 | 机机Token |
 | 10 | 用户接口 | PUT | `/api/auth/users/{user_id}` | 更新用户信息 | 机机Token |
@@ -293,7 +293,7 @@ Authorization: Bearer <machine_token>
 
 #### 3.2.1 获取用户列表
 
-**接口**: `GET /api/auth/users`
+**接口**: `GET /api/auth/user_list`
 
 **认证要求**: 机机Token
 

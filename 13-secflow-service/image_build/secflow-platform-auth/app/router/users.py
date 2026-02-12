@@ -19,7 +19,7 @@ from app.model import User, Role, UserSession
 router = APIRouter(tags=["用户管理"])
 
 
-@router.get("", response_model=List[UserResponse])
+@router.get("/user_list", response_model=List[UserResponse])
 def list_users(db: Session = Depends(get_db)):
     """获取用户列表"""
     users = db.query(User).all()
