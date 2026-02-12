@@ -63,7 +63,7 @@ task:
 # Menu Service Configuration (服务注册中心)
 registry:
   enabled: true
-  menu_service_url: "http://192.168.12.44:10003"
+  menu_service_url: "http://secflow-platform-menu:80"
   service_id: "secflow-resource"
   service_name: "资源管理服务"
   host: "0.0.0.0"

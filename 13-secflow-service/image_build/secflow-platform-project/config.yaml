@@ -24,7 +24,7 @@ auth_service:
 # Menu Registration Center Configuration
 registry:
   enabled: true
-  menu_service_url: "http://192.168.12.44:10003"
+  menu_service_url: "http://secflow-platform-menu:80"
   service_id: "secflow-project"
   service_name: "项目管理服务"
   host: "0.0.0.0"

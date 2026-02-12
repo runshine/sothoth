@@ -122,7 +122,7 @@ logging:
 # 服务注册配置
 registry:
   enabled: true
-  menu_service_url: "http://192.168.12.44:10003"
+  menu_service_url: "http://secflow-platform-menu:80"
   service_id: "secflow-app-secmate-ng"
   service_name: "secmate-ng Web管理器"
   host: "0.0.0.0"
