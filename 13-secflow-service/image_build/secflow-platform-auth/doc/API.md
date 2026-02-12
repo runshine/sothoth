@@ -46,12 +46,17 @@ SecFlow-User 是一个基于 FastAPI 构建的用户认证微服务，提供完�
 | 13 | 用户接口 | PUT | `/api/auth/users/{user_id}/role` | 覆盖绑定用户角色 | 机机Token |
 | 14 | 用户接口 | POST | `/api/auth/users/{user_id}/role/add` | 增量添加用户角色 | 机机Token |
 | 15 | 用户接口 | DELETE | `/api/auth/users/{user_id}/role` | 移除用户角色 | 机机Token |
-| 16 | 角色接口 | GET | `/api/auth/role` | 获取角色列表 | 机机Token |
-| 17 | 角色接口 | POST | `/api/auth/role` | 创建新角色 | 机机Token |
-| 18 | 角色接口 | GET | `/api/auth/role/{role_id}` | 获取单个角色详情 | 机机Token |
-| 19 | 角色接口 | PUT | `/api/auth/role/{role_id}` | 更新角色信息 | 机机Token |
-| 20 | 角色接口 | DELETE | `/api/auth/role/{role_id}` | 删除角色 | 机机Token |
-| 21 | 健康检查 | GET | `/api/auth/health` | 服务健康检查 | 无需认证 |
+| 16 | 用户接口 | POST | `/api/auth/users/{user_id}/password` | 修改指定用户密码 | 机机Token |
+| 17 | 用户接口 | POST | `/api/auth/users/password/self` | 当前用户修改自己的密码 | 人机Token |
+| 18 | 用户接口 | GET | `/api/auth/users/sessions/online` | 获取在线用户列表 | 机机Token |
+| 19 | 用户接口 | GET | `/api/auth/users/{user_id}/sessions` | 获取指定用户的会话列表 | 机机Token |
+| 20 | 用户接口 | DELETE | `/api/auth/users/{user_id}/sessions` | 撤销用户所有会话（踢下线） | 机机Token |
+| 21 | 角色接口 | GET | `/api/auth/role` | 获取角色列表 | 机机Token |
+| 22 | 角色接口 | POST | `/api/auth/role` | 创建新角色 | 机机Token |
+| 23 | 角色接口 | GET | `/api/auth/role/{role_id}` | 获取单个角色详情 | 机机Token |
+| 24 | 角色接口 | PUT | `/api/auth/role/{role_id}` | 更新角色信息 | 机机Token |
+| 25 | 角色接口 | DELETE | `/api/auth/role/{role_id}` | 删除角色 | 机机Token |
+| 26 | 健康检查 | GET | `/api/auth/health` | 服务健康检查 | 无需认证 |
 
 ### 2.2 接口分类统计
 
@@ -444,6 +449,143 @@ Authorization: Bearer <machine_token>
 ```json
 {
   "role_ids": [2]
+}
+```
+
+---
+
+#### 3.2.10 修改指定用户密码
+
+**接口**: `POST /api/auth/users/{user_id}/password`
+
+**认证要求**: 机机Token
+
+**说明**: 管理员修改指定用户的密码，需要验证旧密码
+
+**请求参数**:
+```json
+{
+  "old_password": "current_password",
+  "new_password": "new_password123"
+}
+```
+
+**响应成功**:
+```json
+{
+  "message": "密码已修改"
+}
+```
+
+**错误响应**:
+```json
+{
+  "detail": "旧密码错误"
+}
+```
+
+---
+
+#### 3.2.11 当前用户修改自己的密码
+
+**接口**: `POST /api/auth/users/password/self`
+
+**认证要求**: 人机Token
+
+**说明**: 当前登录用户修改自己的密码
+
+**请求头**:
+```
+Authorization: Bearer <human_token>
+```
+
+**请求参数**:
+```json
+{
+  "old_password": "current_password",
+  "new_password": "new_password123"
+}
+```
+
+**响应成功**:
+```json
+{
+  "message": "密码已修改"
+}
+```
+
+**错误响应**:
+```json
+{
+  "detail": "旧密码错误"
+}
+```
+
+---
+
+#### 3.2.12 获取在线用户列表
+
+**接口**: `GET /api/auth/users/sessions/online`
+
+**认证要求**: 机机Token
+
+**说明**: 获取当前所有在线用户列表（登录状态为active且未过期的会话）
+
+**响应成功**:
+```json
+[
+  {
+    "user_id": 1,
+    "username": "admin",
+    "role": ["admin"],
+    "ip_address": "192.168.1.100",
+    "user_agent": "Mozilla/5.0 ...",
+    "login_at": "2024-01-01T00:00:00",
+    "last_active_at": "2024-01-01T12:00:00"
+  }
+]
+```
+
+---
+
+#### 3.2.13 获取指定用户的会话列表
+
+**接口**: `GET /api/auth/users/{user_id}/sessions`
+
+**认证要求**: 机机Token
+
+**说明**: 获取指定用户的所有活跃和过期会话
+
+**响应成功**:
+```json
+[
+  {
+    "id": 1,
+    "token_jti": "550e8400-e29b-41d4-a716-446655440000",
+    "ip_address": "192.168.1.100",
+    "user_agent": "Mozilla/5.0 ...",
+    "status": "active",
+    "created_at": "2024-01-01T00:00:00",
+    "last_active_at": "2024-01-01T12:00:00",
+    "expires_at": "2024-01-02T00:00:00"
+  }
+]
+```
+
+---
+
+#### 3.2.14 撤销用户所有会话（踢下线）
+
+**接口**: `DELETE /api/auth/users/{user_id}/sessions`
+
+**认证要求**: 机机Token
+
+**说明**: 将指定用户的所有活跃会话标记为revoked，使其Token失效
+
+**响应成功**:
+```json
+{
+  "message": "已撤销用户 admin 的所有会话"
 }
 ```
 

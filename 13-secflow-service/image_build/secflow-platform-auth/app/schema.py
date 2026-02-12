@@ -133,6 +133,47 @@ class UserRoleResponse(BaseModel):
         from_attributes = True
 
 
+# ============ 在线用户/会话模式 ============
+
+class UserSessionResponse(BaseModel):
+    """用户会话响应模式"""
+    id: int
+    user_id: int
+    username: str
+    ip_address: Optional[str]
+    user_agent: Optional[str]
+    status: str
+    created_at: datetime
+    last_active_at: datetime
+    expires_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class OnlineUserResponse(BaseModel):
+    """在线用户响应模式"""
+    user_id: int
+    username: str
+    role: List[str]
+    ip_address: Optional[str]
+    user_agent: Optional[str]
+    login_at: datetime
+    last_active_at: datetime
+
+
+class ChangePasswordRequest(BaseModel):
+    """修改密码请求模式"""
+    old_password: str
+    new_password: str
+
+
+class ChangeOwnPasswordRequest(BaseModel):
+    """用户修改自己密码请求模式"""
+    old_password: str
+    new_password: str
+
+
 # ============ 通用模式 ============
 
 class Message(BaseModel):

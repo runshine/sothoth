@@ -61,3 +61,21 @@ class MachineToken(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     expires_at = Column(DateTime(timezone=True), nullable=True)  # null表示永不过期
+
+
+class UserSession(Base):
+    """用户会话模型 - 用于追踪在线用户"""
+    __tablename__ = "secflow_user_session"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("secflow_user_users.id"), nullable=False, index=True)
+    token_jti = Column(String(100), unique=True, index=True, nullable=True)  # JWT的jti标识
+    ip_address = Column(String(45))  # 支持IPv6
+    user_agent = Column(String(500))
+    status = Column(String(20), default="active")  # active, expired, revoked
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_active_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+    # 关联用户
+    user = relationship("User", backref="sessions")

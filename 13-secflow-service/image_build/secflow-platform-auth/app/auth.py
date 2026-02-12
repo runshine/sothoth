@@ -89,3 +89,93 @@ def create_human_token(db: Session, username: str, password: str) -> Optional[Us
     if not user.is_active:
         return None
     return user
+
+
+def generate_token_jti() -> str:
+    """生成Token唯一标识符 (JWT ID)"""
+    import uuid
+    return str(uuid.uuid4())
+
+
+def create_human_token_with_session(db: Session, username: str, password: str,
+                                    ip_address: Optional[str] = None,
+                                    user_agent: Optional[str] = None) -> Optional[dict]:
+    """
+    用户登录并创建会话
+
+    返回包含用户对象和token信息的字典
+    """
+    from app.model import UserSession
+
+    user = db.query(User).filter(User.username == username).first()
+    if not user:
+        return None
+    if not verify_password(password, user.hashed_password):
+        return None
+    if not user.is_active:
+        return None
+
+    # 生成token jti
+    token_jti = generate_token_jti()
+
+    # 计算过期时间
+    expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    expires_at = datetime.utcnow() + expires_delta
+
+    # 创建JWT token
+    access_token = create_access_token(
+        data={
+            "sub": str(user.id),
+            "username": user.username,
+            "type": "human",
+            "jti": token_jti  # 添加JWT ID用于会话追踪
+        },
+        expires_delta=expires_delta
+    )
+
+    # 创建用户会话记录
+    user_session = UserSession(
+        user_id=user.id,
+        token_jti=token_jti,
+        ip_address=ip_address,
+        user_agent=user_agent,
+        status="active",
+        expires_at=expires_at
+    )
+    db.add(user_session)
+    db.commit()
+
+    return {
+        "user": user,
+        "access_token": access_token,
+        "token_jti": token_jti,
+        "expires_at": expires_at
+    }
+
+
+def revoke_user_session(db: Session, token_jti: str) -> bool:
+    """撤销用户会话"""
+    from app.model import UserSession
+    session = db.query(UserSession).filter(UserSession.token_jti == token_jti).first()
+    if session:
+        session.status = "revoked"
+        db.commit()
+        return True
+    return False
+
+
+def cleanup_expired_sessions(db: Session) -> int:
+    """清理过期的会话，返回清理数量"""
+    from app.model import UserSession
+    expired_sessions = db.query(UserSession).filter(
+        UserSession.expires_at < datetime.utcnow(),
+        UserSession.status == "active"
+    ).all()
+
+    count = 0
+    for session in expired_sessions:
+        session.status = "expired"
+        count += 1
+
+    db.commit()
+    return count

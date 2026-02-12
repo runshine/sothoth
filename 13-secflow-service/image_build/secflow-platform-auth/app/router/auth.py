@@ -2,12 +2,12 @@
 
 from typing import List, Optional
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, status, Header
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
 from sqlalchemy.orm import Session
 import secrets
 
 from app.database import get_db
-from app.auth import create_access_token, decode_access_token, verify_machine_token, create_human_token
+from app.auth import create_access_token, decode_access_token, verify_machine_token, create_human_token, create_human_token_with_session
 from app.schema import (
     LoginRequest, TokenResponse, MachineTokenRequest, MachineTokenCreate,
     MachineTokenResponse, Message, UserResponse
@@ -23,33 +23,35 @@ def health():
 
 
 @router.post("/login", response_model=TokenResponse)
-def login(request: LoginRequest, db: Session = Depends(get_db)):
+def login(request: LoginRequest, request_obj: Request, db: Session = Depends(get_db)):
     """
     用户登录，获取人机Token
 
     通过用户名密码换取JWT Token，有效期24小时
+    同时创建用户会话用于追踪在线状态
     """
-    user = create_human_token(db, request.username, request.password)
-    if not user:
+    # 获取客户端信息
+    ip_address = request_obj.client.host if request_obj.client else None
+    user_agent = request_obj.headers.get("user-agent")
+
+    # 使用新的带会话创建功能的登录方法
+    result = create_human_token_with_session(
+        db=db,
+        username=request.username,
+        password=request.password,
+        ip_address=ip_address,
+        user_agent=user_agent
+    )
+
+    if not result:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="用户名或密码错误",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # 创建token，包含用户ID和用户名
-    access_token_expires = timedelta(minutes=1440)  # 24小时
-    access_token = create_access_token(
-        data={
-            "sub": str(user.id),
-            "username": user.username,
-            "type": "human"
-        },
-        expires_delta=access_token_expires
-    )
-
     return {
-        "access_token": access_token,
+        "access_token": result["access_token"],
         "token_type": "bearer",
         "expires_in": 86400  # 24小时 = 86400秒
     }
