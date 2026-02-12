@@ -29,7 +29,7 @@ spec:
         - name: secflow-platform-static-binary-nfs-pvc
           mountPath: /data
         - name: secflow-platform-static-binary-nfs-pvc
-          mountPath: /python-docker/config.yaml
+          mountPath: /app/config.yaml
         resources:
           requests:
             memory: "128Mi"

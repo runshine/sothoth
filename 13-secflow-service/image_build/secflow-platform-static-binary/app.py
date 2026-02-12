@@ -14,6 +14,7 @@ import shutil
 import asyncio
 import atexit
 import signal
+import argparse
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -29,10 +30,30 @@ from sqlalchemy import or_, func
 from config import load_config, get_config
 from registry import get_registry_service
 
+
+# ==================== 命令行参数解析 ====================
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='多架构软件包管理系统')
+    parser.add_argument(
+        '-c', '--config',
+        dest='config_path',
+        type=str,
+        help='配置文件路径 (例如: /path/to/config.yaml)',
+        default=None
+    )
+    return parser.parse_args()
+
+
 # ==================== 加载配置 ====================
 try:
-    config = load_config()
+    args = parse_args()
+    config = load_config(config_path=args.config_path)
     logger = logging.getLogger(__name__)
+    if args.config_path:
+        logger.info(f"从指定路径加载配置: {args.config_path}")
+    else:
+        logger.info("使用默认配置文件")
     logger.info("配置加载成功")
 except Exception as e:
     print(f"加载配置失败: {e}", file=sys.stderr)
