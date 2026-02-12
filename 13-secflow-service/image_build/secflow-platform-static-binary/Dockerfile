@@ -1,6 +1,6 @@
 FROM python:3.11-alpine
 
-WORKDIR /python-docker
+WORKDIR /app
 
 #sudo apt install default-libmysqlclient-dev
 # 安装编译依赖
