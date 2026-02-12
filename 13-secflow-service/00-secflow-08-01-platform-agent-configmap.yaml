@@ -20,8 +20,8 @@ data:
         "password": "Huawei12#$",
         "database": "secflow"
       },
-      "redis_url": "redis://192.168.12.90:6379/agent-service-manager-service",
-      "nacos_url": "http://192.168.12.90:8848",
+      "redis_url": "redis://redis.sothothv2-ns.svc.cluster.local:6379/agent-service-manager-service",
+      "nacos_url": "http://nacos.sothothv2-ns.svc.cluster.local:8848",
       "nacos_namespace": "public",
       "agent_api_port": 11197,
       "agent_auth_token": "your_secure_token_here",
