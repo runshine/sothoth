@@ -28,8 +28,9 @@ spec:
         volumeMounts:
         - name: secflow-platform-static-binary-nfs-pvc
           mountPath: /data
-        - name: secflow-platform-static-binary-nfs-pvc
+        - name: secflow-platform-static-binary-nginx-config
           mountPath: /app/config.yaml
+          subPath: config.yaml
         resources:
           requests:
             memory: "128Mi"
