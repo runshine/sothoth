@@ -14,7 +14,7 @@ from app.model import Role, User
 router = APIRouter(tags=["角色管理"])
 
 
-@router.get("", response_model=List[RoleResponse])
+@router.get("/role_list", response_model=List[RoleResponse])
 def list_role(db: Session = Depends(get_db)):
     """获取角色列表"""
     roles = db.query(Role).all()

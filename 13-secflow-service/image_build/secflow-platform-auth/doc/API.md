@@ -51,7 +51,7 @@ SecFlow-User 是一个基于 FastAPI 构建的用户认证微服务，提供完�
 | 18 | 用户接口 | GET | `/api/auth/users/sessions/online` | 获取在线用户列表 | 机机Token |
 | 19 | 用户接口 | GET | `/api/auth/users/{user_id}/sessions` | 获取指定用户的会话列表 | 机机Token |
 | 20 | 用户接口 | DELETE | `/api/auth/users/{user_id}/sessions` | 撤销用户所有会话（踢下线） | 机机Token |
-| 21 | 角色接口 | GET | `/api/auth/role` | 获取角色列表 | 机机Token |
+| 21 | 角色接口 | GET | `/api/auth/role_list` | 获取角色列表 | 机机Token |
 | 22 | 角色接口 | POST | `/api/auth/role` | 创建新角色 | 机机Token |
 | 23 | 角色接口 | GET | `/api/auth/role/{role_id}` | 获取单个角色详情 | 机机Token |
 | 24 | 角色接口 | PUT | `/api/auth/role/{role_id}` | 更新角色信息 | 机机Token |
@@ -73,6 +73,7 @@ SecFlow-User 是一个基于 FastAPI 构建的用户认证微服务，提供完�
 | 认证接口 | 6个 | 登录、Token申请与验证 |
 | 用户接口 | 9个 | 用户CRUD及角色绑定管理 |
 | 角色接口 | 5个 | 角色CRUD管理 |
+| 机机Token管理 | 8个 | 机机Token的增删查改、启用/禁用、重新生成 |
 | 健康检查 | 1个 | 服务状态检查 |
 
 ## 3. 快速开始
@@ -603,7 +604,7 @@ Authorization: Bearer <human_token>
 
 #### 3.3.1 获取角色列表
 
-**接口**: `GET /api/auth/role`
+**接口**: `GET /api/auth/role_list`
 
 **认证要求**: 机机Token
 
@@ -682,7 +683,166 @@ Authorization: Bearer <human_token>
 
 ---
 
-### 3.4 健康检查
+### 3.4 机机Token管理接口
+
+#### 3.4.1 获取机机Token列表
+
+**接口**: `GET /api/auth/machine-tokens`
+
+**认证要求**: 机机Token
+
+**响应**:
+```json
+[
+  {
+    "id": 1,
+    "machine_code": "server-001",
+    "description": "API Server",
+    "is_active": true,
+    "created_at": "2024-01-01T00:00:00",
+    "expires_at": null
+  }
+]
+```
+
+---
+
+#### 3.4.2 获取机机Token详情
+
+**接口**: `GET /api/auth/machine-tokens/{token_id}`
+
+**认证要求**: 机机Token
+
+**响应**:
+```json
+{
+  "id": 1,
+  "token": "xAbC123...",
+  "machine_code": "server-001",
+  "description": "API Server",
+  "is_active": true,
+  "created_at": "2024-01-01T00:00:00",
+  "expires_at": null
+}
+```
+
+---
+
+#### 3.4.3 创建机机Token
+
+**接口**: `POST /api/auth/machine-tokens`
+
+**认证要求**: 机机Token
+
+**请求参数**:
+```json
+{
+  "machine_code": "server-002",
+  "description": "New Server",
+  "expires_at": "2025-12-31T23:59:59"
+}
+```
+
+**响应**:
+```json
+{
+  "id": 2,
+  "token": "yZxW987...",
+  "machine_code": "server-002",
+  "description": "New Server",
+  "is_active": true,
+  "created_at": "2024-01-01T00:00:00",
+  "expires_at": "2025-12-31T23:59:59"
+}
+```
+
+---
+
+#### 3.4.4 更新机机Token
+
+**接口**: `PUT /api/auth/machine-tokens/{token_id}`
+
+**认证要求**: 机机Token
+
+**请求参数**:
+```json
+{
+  "description": "Updated Description",
+  "expires_at": "2026-12-31T23:59:59"
+}
+```
+
+---
+
+#### 3.4.5 删除机机Token
+
+**接口**: `DELETE /api/auth/machine-tokens/{token_id}`
+
+**认证要求**: 机机Token
+
+**响应成功**:
+```json
+{
+  "message": "Token已删除"
+}
+```
+
+---
+
+#### 3.4.6 启用机机Token
+
+**接口**: `POST /api/auth/machine-tokens/{token_id}/enable`
+
+**认证要求**: 机机Token
+
+**响应成功**:
+```json
+{
+  "message": "Token已启用"
+}
+```
+
+---
+
+#### 3.4.7 禁用机机Token
+
+**接口**: `POST /api/auth/machine-tokens/{token_id}/disable`
+
+**认证要求**: 机机Token
+
+**响应成功**:
+```json
+{
+  "message": "Token已禁用"
+}
+```
+
+---
+
+#### 3.4.8 重新生成机机Token
+
+**接口**: `POST /api/auth/machine-tokens/{token_id}/regenerate`
+
+**认证要求**: 机机Token
+
+**说明**: 为指定机器重新生成Token值，旧Token将失效
+
+**响应**:
+```json
+{
+  "id": 1,
+  "token": "newTokenValue...",
+  "machine_code": "server-001",
+  "description": "API Server",
+  "is_active": true,
+  "created_at": "2024-01-01T00:00:00",
+  "expires_at": null
+}
+```
+
+---
+
+### 3.5 健康检查
 
 **接口**: `GET /health`
 
