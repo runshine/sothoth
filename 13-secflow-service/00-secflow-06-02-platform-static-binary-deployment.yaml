@@ -28,6 +28,8 @@ spec:
         volumeMounts:
         - name: secflow-platform-static-binary-nfs-pvc
           mountPath: /data
+        - name: secflow-platform-static-binary-nfs-pvc
+          mountPath: /python-docker/config.yaml
         resources:
           requests:
             memory: "128Mi"
@@ -90,3 +92,5 @@ spec:
           items:
             - key: nginx.conf
               path: nginx.conf
+            - key: config.yaml
+              path: config.yaml

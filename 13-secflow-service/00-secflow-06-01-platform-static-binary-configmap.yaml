@@ -4,6 +4,70 @@ metadata:
   name: secflow-platform-static-binary-nginx-config
   namespace: secflow-ns
 data:
+  config.yaml: |
+    # SecFlow Static Binary Service Configuration
+    # Database Configuration (MySQL)
+    database:
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+      table_prefix: "secflow_"
+      pool_size: 10
+      max_overflow: 20
+    # Auth Service Configuration
+    auth_service:
+      host: "secflow-platform-auth"
+      port: 10000
+      validate_token_path: "/api/auth/validate-human-token"
+      timeout: 10
+      token_cache_enabled: true
+      token_cache_ttl_minutes: 15
+    # Menu Registration Center Configuration
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu:80"
+      service_id: "secflow-static-binary"
+      service_name: "静态二进制包服务"
+      host: "0.0.0.0"
+      port: 8080
+      maturity: "已上线"
+      description: "提供静态二进制软件包的上传、解析、存储、管理、校验和下载功能"
+      api_prefix: "/api/static-binary"
+      menu:
+        id: "static-binary"
+        path: "/static-binary"
+        icon: "package"
+        order: 4
+        # 一级菜单
+        level1:
+          name: "资源管理"
+          name_en: "Resources"
+        # 二级菜单
+        level2:
+          name: "软件仓"
+          name_en: "Software Repository"
+        # 三级菜单（可选）
+        level3:
+          name: "静态二进制包"
+          name_en: "Static Binary Packages"
+    # Storage Configuration
+    storage:
+      root_dir: "/data"
+      upload_folder: "/tmp/uploads"
+      max_content_length: 2147483648  # 2GB
+    # Application Configuration
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+      secret_key: "your-secret-key-change-this-in-production"
+    # Logging Configuration
+    logging:
+      level: "INFO"
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
   nginx.conf: |
     events {
         worker_connections 1024;
