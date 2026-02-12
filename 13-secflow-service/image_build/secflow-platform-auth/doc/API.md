@@ -37,7 +37,7 @@ SecFlow-User 是一个基于 FastAPI 构建的用户认证微服务，提供完�
 | 4 | 认证接口 | POST | `/api/auth/validate-machine-token` | 验证机机Token有效性 | 无需认证 |
 | 5 | 认证接口 | GET | `/api/auth/machine-tokens` | 获取所有机机Token列表 | 机机Token |
 | 6 | 认证接口 | DELETE | `/api/auth/machine-tokens/{token_id}` | 删除指定机机Token | 机机Token |
-| 7 | 用户接口 | GET | `/api/auth/user_list` | 获取用户列表 | 机机Token |
+| 7 | 用户接口 | GET | `/api/auth/users/user_list` | 获取用户列表 | 机机Token |
 | 8 | 用户接口 | POST | `/api/auth/users` | 创建新用户 | 机机Token |
 | 9 | 用户接口 | GET | `/api/auth/users/{user_id}` | 获取单个用户详情 | 机机Token |
 | 10 | 用户接口 | PUT | `/api/auth/users/{user_id}` | 更新用户信息 | 机机Token |
@@ -56,7 +56,15 @@ SecFlow-User 是一个基于 FastAPI 构建的用户认证微服务，提供完�
 | 23 | 角色接口 | GET | `/api/auth/role/{role_id}` | 获取单个角色详情 | 机机Token |
 | 24 | 角色接口 | PUT | `/api/auth/role/{role_id}` | 更新角色信息 | 机机Token |
 | 25 | 角色接口 | DELETE | `/api/auth/role/{role_id}` | 删除角色 | 机机Token |
-| 26 | 健康检查 | GET | `/api/auth/health` | 服务健康检查 | 无需认证 |
+| 26 | 机机Token管理 | GET | `/api/auth/machine-tokens` | 获取机机Token列表 | 机机Token |
+| 27 | 机机Token管理 | GET | `/api/auth/machine-tokens/{token_id}` | 获取机机Token详情 | 机机Token |
+| 28 | 机机Token管理 | POST | `/api/auth/machine-tokens` | 创建机机Token | 机机Token |
+| 29 | 机机Token管理 | PUT | `/api/auth/machine-tokens/{token_id}` | 更新机机Token | 机机Token |
+| 30 | 机机Token管理 | DELETE | `/api/auth/machine-tokens/{token_id}` | 删除机机Token | 机机Token |
+| 31 | 机机Token管理 | POST | `/api/auth/machine-tokens/{token_id}/enable` | 启用机机Token | 机机Token |
+| 32 | 机机Token管理 | POST | `/api/auth/machine-tokens/{token_id}/disable` | 禁用机机Token | 机机Token |
+| 33 | 机机Token管理 | POST | `/api/auth/machine-tokens/{token_id}/regenerate` | 重新生成机机Token | 机机Token |
+| 34 | 健康检查 | GET | `/api/auth/health` | 服务健康检查 | 无需认证 |
 
 ### 2.2 接口分类统计
 
@@ -293,7 +301,7 @@ Authorization: Bearer <machine_token>
 
 #### 3.2.1 获取用户列表
 
-**接口**: `GET /api/auth/user_list`
+**接口**: `GET /api/auth/users/user_list`
 
 **认证要求**: 机机Token
 

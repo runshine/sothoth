@@ -103,6 +103,12 @@ class MachineTokenCreate(BaseModel):
     expires_at: Optional[datetime] = None  # null表示永不过期
 
 
+class MachineTokenUpdate(BaseModel):
+    """更新机机Token模式"""
+    description: Optional[str] = None
+    expires_at: Optional[datetime] = None  # null表示永不过期
+
+
 class MachineTokenResponse(BaseModel):
     """机机Token响应模式"""
     id: int
@@ -111,6 +117,14 @@ class MachineTokenResponse(BaseModel):
     is_active: bool
     created_at: datetime
     expires_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class MachineTokenDetailResponse(MachineTokenResponse):
+    """机机Token详细响应模式（包含Token值）"""
+    token: str
 
     class Config:
         from_attributes = True

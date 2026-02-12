@@ -16,7 +16,7 @@ from app.schema import (
 )
 from app.model import User, Role, UserSession
 
-router = APIRouter(tags=["用户管理"])
+router = APIRouter(tags=["用户管理"], prefix="/users")
 
 
 @router.get("/user_list", response_model=List[UserResponse])

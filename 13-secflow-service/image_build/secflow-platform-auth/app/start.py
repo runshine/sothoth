@@ -187,12 +187,13 @@ def create_app():
     )
 
     # 路由导入
-    from app.router import auth, users, role_router
+    from app.router import auth, users, role_router, machine_tokens_router
 
     # 注册路由
     app.include_router(auth.router, prefix="/api/auth")
     app.include_router(users.router, prefix="/api/auth")
     app.include_router(role_router, prefix="/api/auth")
+    app.include_router(machine_tokens_router, prefix="/api/auth")
 
     @app.get("/")
     def root():
