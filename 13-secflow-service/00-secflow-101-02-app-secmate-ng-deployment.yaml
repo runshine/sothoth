@@ -22,7 +22,7 @@ spec:
         ports:
         - containerPort: 8080
         volumeMounts:
-        - name: secflow-app-secmate-ng
+        - name: secflow-app-secmate-ng-config
           mountPath: /app/config.yaml
           subPath: config.yaml
         resources:
