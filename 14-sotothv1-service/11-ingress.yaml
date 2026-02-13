@@ -33,7 +33,7 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: backend-server
+            name: nginx-server
             port:
               number: 80
       - path: /assets
