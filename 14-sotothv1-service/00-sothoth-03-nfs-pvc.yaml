@@ -5,8 +5,8 @@ metadata:
   namespace: sothoth
 spec:
   accessModes:
-    - ReadWriteOnce
-  storageClassName: local-path
+    - ReadWriteMany
+  storageClassName: nfs-storage-192.168.13.66
   resources:
     requests:
       storage: 10Gi

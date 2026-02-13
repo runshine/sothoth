@@ -1,12 +1,12 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: sothoth-nfs-pvc
+  name: mysql-pvc
   namespace: sothoth
 spec:
-  storageClassName: nfs-storage-192.168.13.66
   accessModes:
     - ReadWriteMany
   resources:
     requests:
       storage: 10Gi
+  storageClassName: nfs-storage-192.168.13.66

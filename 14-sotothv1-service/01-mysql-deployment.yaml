@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: sothoth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        imagePullPolicy: Always
+        env:
+          - name: MYSQL_ROOT_PASSWORD
+            value: root123
+          - name: MYSQL_DATABASE
+            value: gaiasec
+          - name: MYSQL_USER
+            value: sa
+          - name: MYSQL_PASSWORD
+            value: qq123456
+        volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+        ports:
+          - containerPort: 3306
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "1"
+          limits:
+            memory: "1024Mi"
+            cpu: "2"
+      volumes:
+      - name: mysql-storage
+        persistentVolumeClaim:
+          claimName: mysql-pvc
