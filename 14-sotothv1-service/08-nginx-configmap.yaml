@@ -1,0 +1,115 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: sothoth
+data:
+  nginx.conf: |
+    worker_processes 1;
+
+    events {
+      worker_connections 1024;
+    }
+
+    http {
+      include /etc/nginx/mime.types;
+      default_type application/octet-stream;
+
+      sendfile on;
+      keepalive_timeout 65;
+      client_max_body_size 100M;
+
+      upstream backend {
+        server backend-server:80;
+      }
+
+      upstream frontend {
+        server frontend-server:80;
+      }
+
+      server {
+        listen 80;
+        server_name localhost;
+
+        # 插件目录请求直接从本地文件系统提供
+        location /plugins/ {
+          root /usr/share/nginx/html;
+          autoindex on;
+        }
+
+        # 文件上传路径设置为无限制大小
+        location /remote/filesystem/upload {
+          client_max_body_size 0;
+          proxy_pass http://backend;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # API上传路径设置为无限制大小
+        location /api/upload {
+          client_max_body_size 0;
+          proxy_pass http://backend;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location = / {
+          proxy_pass http://frontend/index.html;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # 静态资源请求转发到前端服务
+        location /assets/ {
+          proxy_pass http://frontend;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # WebSocket 请求转发到后端服务
+        location /ws {
+          proxy_pass http://backend;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # Audit 请求转发到后端服务（支持 WebSocket）
+        location /audit/ {
+          proxy_pass http://backend;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade $http_upgrade;
+          proxy_set_header Connection "upgrade";
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # 默认所有请求转发到后端服务
+        location / {
+          proxy_pass http://backend;
+          proxy_set_header Host $host;
+          proxy_set_header X-Real-IP $remote_addr;
+          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        error_page 500 502 503 504 /50x.html;
+        location = /50x.html {
+          root /usr/share/nginx/html;
+        }
+      }
+    }

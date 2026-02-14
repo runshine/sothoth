@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-server
+  namespace: sothoth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-server
+  template:
+    metadata:
+      labels:
+        app: backend-server
+    spec:
+      serviceAccountName: sothoth-server
+      dnsPolicy: ClusterFirst
+      containers:
+      - name: backend-server
+        image: ultramangaia/gaiasec-env:backend
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+        - containerPort: 5005
+        workingDir: /app
+        env:
+        - name: SERVER_PORT
+          value: "8000"
+        - name: SPRING_DATASOURCE_URL
+          value: "jdbc:mysql://mysql:3306/gaiasec?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true"
+        - name: SPRING_DATASOURCE_USERNAME
+          value: "sa"
+        - name: SPRING_DATASOURCE_PASSWORD
+          value: "qq123456"
+        volumeMounts:
+        - name: file-cache-storage
+          mountPath: /app/file-cache
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8000
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8000
+          initialDelaySeconds: 90
+          periodSeconds: 30
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "1024Mi"
+            cpu: "2"
+          limits:
+            memory: "2048Mi"
+            cpu: "8"
+      volumes:
+      - name: file-cache-storage
+        persistentVolumeClaim:
+          claimName: sothoth-nfs-pvc

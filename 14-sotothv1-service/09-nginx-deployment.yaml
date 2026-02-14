@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-server
+  namespace: sothoth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx-server
+  template:
+    metadata:
+      labels:
+        app: nginx-server
+    spec:
+      containers:
+      - name: nginx-server
+        image: nginx:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        - name: shared-storage
+          mountPath: /usr/share/nginx/html/plugins
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "0.5"
+          limits:
+            memory: "512Mi"
+            cpu: "1"
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: nginx-config
+      - name: shared-storage
+        persistentVolumeClaim:
+          claimName: sothoth-local-pvc

@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-server
+  namespace: sothoth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend-server
+  template:
+    metadata:
+      labels:
+        app: frontend-server
+    spec:
+      containers:
+      - name: frontend-server
+        image: ultramangaia/gaiasec-env:frontend
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: shared-storage
+          mountPath: /app/file-cache
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "0.5"
+          limits:
+            memory: "512Mi"
+            cpu: "1"
+      volumes:
+      - name: shared-storage
+        persistentVolumeClaim:
+          claimName: sothoth-local-pvc
