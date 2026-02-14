@@ -1,13 +1,13 @@
-name: build-secflow-app-code-server-image
+name: build-secflow-platform-workflow-image.
 on:
   push:
     branches:
       - 'v2.*'
     paths:
-      - .github/workflows/build-secflow-app-code-server-image.yml
-      - 13-secflow-service/image_build/secflow-app-code-server/**
+      - .github/workflows/build-secflow-platform-workflow-image.yml
+      - 13-secflow-service/image_build/secflow-platform-workflow/**
 jobs:
-  build-secflow-app-code-server-image:
+  build-secflow-platform-workflow-image:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -39,15 +39,15 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push build-secflow-app-code-server-image
+      - name: Build and push build-secflow-platform-workflow-image
         uses: docker/build-push-action@v5
         with:
-          context: 13-secflow-service/image_build/secflow-app-code-server/
+          context: 13-secflow-service/image_build/secflow-platform-workflow/
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            runshine0819/secflow-app-code-server:latest
-            ghcr.io/runshine/secflow-app-code-server:latest
-            runshine0819/secflow-app-code-server:${{ steps.date.outputs.date_tag }}
-            ghcr.io/runshine/secflow-app-code-server:${{ steps.date.outputs.date_tag }}
-          file: 13-secflow-service/image_build/secflow-app-code-server/Dockerfile
+            runshine0819/secflow-platform-workflow:latest
+            ghcr.io/runshine/secflow-platform-workflow:latest
+            runshine0819/secflow-platform-workflow:${{ steps.date.outputs.date_tag }}
+            ghcr.io/runshine/secflow-platform-workflow:${{ steps.date.outputs.date_tag }}
+          file: 13-secflow-service/image_build/secflow-platform-workflow/Dockerfile

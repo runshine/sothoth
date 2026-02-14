@@ -193,6 +193,30 @@ subsets:
       - port: 10008
         protocol: TCP
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-platform-workflow
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 10009
+    protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: secflow-platform-workflow
+  namespace: secflow-ns
+subsets:
+  - addresses:
+      - ip: 192.168.12.44
+    ports:
+      - port: 10009
+        protocol: TCP
+---
 #
 #
 #
@@ -393,3 +417,10 @@ spec:
             port:
               number: 80
 
+      - path: /api/workflow
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-workflow
+            port:
+              number: 80
