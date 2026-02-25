@@ -1,0 +1,65 @@
+# SecFlow Workflow Service Configuration
+
+# Database Configuration (MySQL)
+database:
+  host: "192.168.12.90"
+  port: 3306
+  username: "secflow"
+  password: "Huawei12#$"
+  name: "secflow"
+  table_prefix: "secflow_workflow_"
+  pool_size: 10
+  max_overflow: 20
+
+# Auth Service Configuration
+auth_service:
+  enabled: false  # Set to false to disable authentication (for development/testing only)
+  host: "192.168.12.44"
+  port: 10000
+  validate_token_path: "/api/auth/validate-human-token"
+  timeout: 10
+  token_cache_enabled: true
+  token_cache_ttl_minutes: 15
+
+# Menu Registration Center Configuration
+registry:
+  enabled: true
+  menu_service_url: "http://secflow-platform-menu:80"
+  service_id: "secflow-workflow"
+  service_name: "工作流编排服务"
+  host: "0.0.0.0"
+  port: 10005
+  maturity: "开发中"
+  description: "提供应用模板、JOB模板和工作流编排管理功能"
+  api_prefix: "/api/workflow"
+  menu:
+    id: "workflow-manage"
+    path: "/workflow"
+    icon: "workflow"
+    order: 5
+    level1:
+      name: "系统管理"
+      name_en: "System"
+    level2:
+      name: "编排管理"
+      name_en: "Orchestration"
+    level3:
+      name: "工作流编排"
+      name_en: "Workflow"
+
+# Kubernetes Configuration
+kubernetes:
+  connection_mode: "kubeconfig"  # "incluster" or "kubeconfig"
+  kubeconfig_path: "/home/runshine/.kube/config"
+  connection_timeout: 30
+
+# Application Configuration
+app:
+  host: "0.0.0.0"
+  port: 10009
+  debug: false
+
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

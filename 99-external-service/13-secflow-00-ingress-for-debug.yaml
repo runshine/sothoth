@@ -421,6 +421,6 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: secflow-app-workflow
+            name: secflow-platform-workflow
             port:
               number: 80
