@@ -15,7 +15,6 @@ flowchart TB
         subgraph APILayer["API 层 (FastAPI)"]
             AppTemplateAPI["/api/workflow/app-templates<br/>应用模板管理"]
             JobTemplateAPI["/api/workflow/job-templates<br/>JOB模板管理"]
-            WorkflowTemplateAPI["/api/workflow/workflow-templates<br/>工作流模板管理"]
             WorkflowInstanceAPI["/api/workflow/workflow-instances<br/>工作流实例管理"]
         end
 
@@ -30,7 +29,6 @@ flowchart TB
             DB[(Database<br/>数据库)]
             AppTemplateModel["AppTemplate<br/>(应用模板模型)"]
             JobTemplateModel["JobTemplate<br/>(JOB模板模型)"]
-            WorkflowTemplateModel["WorkflowTemplate<br/>(工作流模板模型)"]
             WorkflowInstanceModel["WorkflowInstance<br/>(工作流实例模型)"]
             WorkflowNodeInstanceModel["WorkflowNodeInstance<br/>(工作流节点实例模型)"]
         end
@@ -45,7 +43,6 @@ flowchart TB
     %% API层连接
     AppTemplateAPI --> AppTemplateModel
     JobTemplateAPI --> JobTemplateModel
-    WorkflowTemplateAPI --> WorkflowTemplateModel
     WorkflowInstanceAPI --> WorkflowInstanceModel
     WorkflowInstanceAPI --> WorkflowNodeInstanceModel
 
@@ -60,7 +57,6 @@ flowchart TB
     %% 认证流程
     AppTemplateAPI -.->|"JWT Token验证"| AuthServiceClient
     JobTemplateAPI -.->|"JWT Token验证"| AuthServiceClient
-    WorkflowTemplateAPI -.->|"JWT Token验证"| AuthServiceClient
     WorkflowInstanceAPI -.->|"JWT Token验证"| AuthServiceClient
 
     classDef external fill:#e1f5fe,stroke:#01579b,stroke-width:2px
@@ -69,9 +65,9 @@ flowchart TB
     classDef data fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
 
     class AuthService,MenuService,K8SCluster,MySQL external
-    class AppTemplateAPI,JobTemplateAPI,WorkflowTemplateAPI,WorkflowInstanceAPI api
+    class AppTemplateAPI,JobTemplateAPI,WorkflowInstanceAPI api
     class AuthServiceClient,RegistryService,K8SClient,WorkflowEngine service
-    class DB,AppTemplateModel,JobTemplateModel,WorkflowTemplateModel,WorkflowInstanceModel,WorkflowNodeInstanceModel data
+    class DB,AppTemplateModel,JobTemplateModel,WorkflowInstanceModel,WorkflowNodeInstanceModel data
 ```
 
 ---
@@ -86,10 +82,7 @@ flowchart LR
     end
 
     subgraph Workflow["工作流编排"]
-        C[工作流模板<br/>WorkflowTemplate] -->|"包含"| C1[Nodes节点定义]
-        C -->|"包含"| C2[Edges边连接]
-
-        D[工作流实例<br/>WorkflowInstance] -->|"运行时创建"| D1[Node Instances<br/>节点实例]
+        D[工作流实例<br/>WorkflowInstance] -->|"运行时创建"| D1[Node Instance<br/>节点实例]
         D -->|"状态"| D2[PENDING/RUNNING/<br/>SUCCEEDED/FAILED/<br/>STOPPED]
     end
 
@@ -97,10 +90,10 @@ flowchart LR
         E[WorkflowEngine] -->|"拓扑排序"| E1[依赖分析]
         E -->|"并发执行"| E2[批量启动节点]
         E -->|"状态同步"| E3[K8S状态同步]
+        E -->|"超时检测"| E4[超时管理]
     end
 
-    Templates -->|被引用| Workflow
-    Workflow -->|驱动| Execution
+    Templates -->|驱动| Execution
 ```
 
 ---
@@ -116,7 +109,7 @@ erDiagram
         string scope "global/project"
         string project_id
         json containers "多容器配置: env_vars, volume_mounts, input_*, output_*, resources"
-        json service_ports
+        json service_port
         int replicas
         string created_by
         datetime created_at
@@ -137,24 +130,10 @@ erDiagram
         datetime updated_at
     }
 
-    WORKFLOW_TEMPLATE {
-        string id PK
-        string name
-        string description
-        string scope "global/project"
-        string project_id
-        json nodes "节点定义: template_id, input_*, output_*, resources"
-        json edges "边连接定义"
-        string created_by
-        datetime created_at
-        datetime updated_at
-    }
-
     WORKFLOW_INSTANCE {
         string id PK
         string name
         string description
-        string template_id FK
         string project_id
         string status "pending/running/succeeded/failed/stopped"
         string run_mode "once/persistent"
@@ -164,8 +143,8 @@ erDiagram
         boolean is_active
         int run_count
         datetime last_run_at
-        json nodes "节点配置覆盖"
-        json edges "边配置覆盖"
+        json nodes "节点配置: template_id, input_*, output_*, resources"
+        json edges "边连接定义"
         datetime started_at
         datetime finished_at
         string message
@@ -185,19 +164,19 @@ erDiagram
         string k8s_resource_name
         string k8s_resource_type "Deployment/Job"
         string service_name
-        json depends_on
-        json input_env_vars "输入环境变量依赖 (指定source_node_id)"
-        json input_volume_mounts "输入挂载依赖 (指定source_node_id)"
+        int timeout_seconds "节点超时时间(秒)"
+        json depends_on "前置依赖节点ID列表"
+        json env_vars "环境变量(用于满足模板依赖)"
+        json volume_mounts "挂载(用于满足模板依赖)"
         datetime started_at
         datetime finished_at
         string message
         datetime created_at
     }
 
-    WORKFLOW_TEMPLATE ||--o{ WORKFLOW_INSTANCE : "实例化"
     WORKFLOW_INSTANCE ||--o{ WORKFLOW_NODE_INSTANCE : "包含"
-    APP_TEMPLATE ||--o{ WORKFLOW_TEMPLATE : "被引用"
-    JOB_TEMPLATE ||--o{ WORKFLOW_TEMPLATE : "被引用"
+    APP_TEMPLATE ||--o{ WORKFLOW_NODE_INSTANCE : "被引用"
+    JOB_TEMPLATE ||--o{ WORKFLOW_NODE_INSTANCE : "被引用"
 ```
 
 ---
@@ -221,12 +200,11 @@ sequenceDiagram
     User->>API: POST /{id}/start (启动工作流)
     API->>WE: 初始化引擎
     WE->>DB: 加载实例和节点
-    WE->>WE: 构建依赖图
     WE->>WE: 检测循环依赖
     WE->>DB: 更新状态 RUNNING
 
-    loop 拓扑执行
-        WE->>WE: 获取就绪节点
+    loop 拓扑执行循环
+        WE->>WE: 获取就绪节点(依赖已满足)
         par 并发启动节点
             WE->>K8S: 创建 Deployment/Job
             K8S->>K8SCluster: 创建 K8S 资源
@@ -237,18 +215,19 @@ sequenceDiagram
         K8S->>K8SCluster: 查询资源状态
         K8SCluster-->>K8S: 返回状态
         K8S-->>WE: 返回状态
-        WE->>DB: 更新节点状态
+
+        alt 节点成功完成
+            WE->>DB: 更新节点状态 SUCCEEDED
+        else 应用就绪
+            WE->>DB: 更新节点状态 SUCCEEDED (就绪=成功)
+        else 节点失败
+            WE->>WE: 等待其他节点超时
+            WE->>DB: 更新节点状态 FAILED
+        end
     end
 
     WE->>DB: 更新实例状态 SUCCEEDED/FAILED
     API-->>User: 返回执行结果
-
-    User->>API: GET /{id}/nodes/{id}/logs (查看日志)
-    API->>K8S: 获取 Pod 日志
-    K8S->>K8SCluster: 查询 Pod
-    K8SCluster-->>K8S: 返回日志
-    K8S-->>API: 返回日志
-    API-->>User: 返回日志内容
 ```
 
 ---
@@ -267,11 +246,6 @@ sequenceDiagram
 | | `GET /api/workflow/job-templates/{id}` | 获取模板详情 |
 | | `PUT /api/workflow/job-templates/{id}` | 更新模板 |
 | | `DELETE /api/workflow/job-templates/{id}` | 删除模板 |
-| **工作流模板** | `GET /api/workflow/workflow-templates` | 列出工作流模板 |
-| | `POST /api/workflow/workflow-templates` | 创建工作流模板 |
-| | `GET /api/workflow/workflow-templates/{id}` | 获取模板详情 |
-| | `PUT /api/workflow/workflow-templates/{id}` | 更新模板 |
-| | `DELETE /api/workflow/workflow-templates/{id}` | 删除模板 |
 | **工作流实例** | `GET /api/workflow/workflow-instances` | 列出工作流实例 |
 | | `POST /api/workflow/workflow-instances` | 创建工作流实例 |
 | | `GET /api/workflow/workflow-instances/{id}` | 获取实例详情 |
@@ -282,8 +256,14 @@ sequenceDiagram
 | | `POST /api/workflow/workflow-instances/{id}/activate` | 激活持久化工作流 |
 | | `POST /api/workflow/workflow-instances/{id}/deactivate` | 停用持久化工作流 |
 | | `DELETE /api/workflow/workflow-instances/{id}` | 删除实例 |
+| **工作流节点** | `POST /api/workflow/workflow-instances/{id}/nodes` | 创建工作流节点 |
+| | `GET /api/workflow/workflow-instances/{id}/nodes` | 列表工作流节点 |
+| | `GET /api/workflow/workflow-instances/{id}/nodes/{node_id}` | 获取节点详情 |
+| | `PUT /api/workflow/workflow-instances/{id}/nodes/{node_id}` | 更新工作流节点 |
+| | `DELETE /api/workflow/workflow-instances/{id}/nodes/{node_id}` | 删除工作流节点 |
+| **工作流边** | `POST /api/workflow/workflow-instances/{id}/edges` | 更新工作流边 |
 | | `GET /api/workflow/workflow-instances/{id}/nodes/{id}/logs` | 获取节点日志 |
-| **触发器** | `POST /api/workflow/workflow-instances/triggers/{id}` | HTTP触发工作流 |
+| **触发器** | `POST /api/workflow/workflow-instances/trigger/{id}` | HTTP触发工作流 |
 
 ---
 
@@ -347,11 +327,13 @@ flowchart TB
 ## 核心特性
 
 1. **多容器支持**: 应用模板和JOB模板都支持多容器配置
-2. **工作流编排**: 基于DAG拓扑排序的并发执行引擎
-3. **依赖管理**:
-   - 支持环境变量传递 (`input_env_vars`)
-   - 支持PVC共享挂载 (`input_volume_mounts`)
-   - 支持PVC子目录挂载 (`sub_path`)
+2. **工作流编排**:
+   - 拓扑排序执行：前置节点成功后才执行后续节点
+   - 一对多并行：前置节点成功后，后续多个节点可并行执行
+3. **模板依赖校验**:
+   - 创建节点时自动校验是否满足模板的环境变量依赖 (`input_env_vars`)
+   - 创建节点时自动校验是否满足模板的挂载依赖 (`input_volume_mounts`)
+   - 不满足时返回具体未满足的依赖详情
 4. **资源管理**:
    - 支持定义最小资源请求 (`requests`)
    - 支持定义资源限制 (`limits`)
@@ -364,8 +346,16 @@ flowchart TB
    - **HTTP触发 (http)**: 通过HTTP请求自动触发工作流
    - 支持激活/停用控制
 7. **状态同步**: 实时同步K8S资源状态到数据库
-8. **权限控制**: 基于JWT Token的用户认证和权限检查
-9. **服务注册**: 自动向菜单中心注册服务并发送心跳
+8. **节点状态管理**:
+   - **应用模板(APP)**: Deployment就绪时标记为SUCCEEDED（就绪=成功）
+   - **任务模板(JOB)**: 状态与K8S Job状态保持一致
+9. **超时管理**:
+   - 应用模板：超时时间=从启动到就绪的时间（不含镜像拉取）
+   - 任务模板：超时时间=整个任务执行时间（不含镜像拉取）
+   - 默认：应用模板300秒(5分钟)，任务模板3600秒(1小时)
+10. **工作流失败处理**: 节点失败后等待其他运行中节点完成或超时，再判定工作流失败
+11. **权限控制**: 基于JWT Token的用户认证和权限检查
+12. **服务注册**: 自动向菜单中心注册服务并发送心跳
 
 ---
 
@@ -377,12 +367,11 @@ secflow-platform-workflow/
 │   ├── api/                    # API路由层
 │   │   ├── app_templates.py    # 应用模板API
 │   │   ├── job_templates.py    # JOB模板API
-│   │   ├── workflow_templates.py   # 工作流模板API
 │   │   └── workflow_instances.py   # 工作流实例API
 │   ├── models/                 # 数据模型层
 │   │   └── database.py         # SQLAlchemy模型定义
 │   ├── schemas/                # Pydantic模式定义
-│   │   └── schemas.py          # 请求/响应模式
+│   │   └── schema.py          # 请求/响应模式
 │   ├── services/               # 业务逻辑层
 │   │   ├── auth.py             # 认证服务
 │   │   ├── registry.py         # 服务注册
@@ -395,42 +384,55 @@ secflow-platform-workflow/
 ├── config.yaml                 # 配置文件
 ├── Dockerfile                  # Docker构建文件
 ├── requirements.txt            # Python依赖
-└── ARCHITECTURE.md             # 本文档
+└── doc/
+    ├── ARCHITECTURE.md        # 本文档
+    └── API.md                # API参考文档
 ```
 
 ---
 
 ## 工作流引擎执行逻辑
 
-### 1. 依赖图构建
-- 从工作流模板的 edges 定义构建依赖关系
-- 支持节点级别的 depends_on 显式依赖
-- 使用 DFS 算法检测循环依赖
+### 1. 节点执行顺序
+- 基于拓扑排序：前置节点成功(SUCCEEDED)后才开始执行后续节点
+- 一对多并行：前置节点成功后，后续多个节点可并行执行
+- 使用依赖图(dependency_graph)管理节点间依赖关系
+- 边的source节点是target节点的前置依赖
 
-### 2. 拓扑执行
-- 计算每个节点的入度(in-degree)
-- 入度为0的节点作为起始节点
+### 2. 模板依赖校验
+- 从模板的 `containers[].input_env_vars` 获取需要的环境变量依赖
+- 从模板的 `containers[].input_volume_mounts` 获取需要的挂载依赖
+- 校验节点提供的 `env_vars` 和 `volume_mounts` 是否满足模板依赖
+- 不满足时返回具体的未满足依赖详情
+
+### 3. 拓扑执行
+- 查找所有入度(in_degree)为0的节点作为起始节点
 - 并发启动所有就绪节点
-- 等待节点完成后更新依赖图
-- 重复直到所有节点执行完毕
+- 等待至少一个节点完成后继续
+- 查找新的就绪节点（所有依赖已满足）
+- 重复执行直到所有节点完成
 
-### 3. 状态管理
+### 4. 节点状态管理
 - **PENDING**: 等待依赖满足
-- **RUNNING**: 已创建K8S资源，正在运行
+- **RUNNING**: 已创建K8S资源正在运行
 - **SUCCEEDED**: 成功完成
-- **FAILED**: 执行失败
+  - 应用模板：Deployment就绪时标记为SUCCEEDED
+  - 任务模板：Job成功完成时标记为SUCCEEDED
+- **FAILED**: 执行失败或超时
 - **STOPPED**: 被用户停止
 
-### 4. 依赖解析
-- **环境变量依赖**: 从上游节点获取服务名或输出值
-  - 模板级: `input_env_vars` (声明name)
-  - 节点级: `input_env_vars` (指定source_node_id)
-- **存储卷依赖**: 挂载上游节点创建的PVC
-  - 模板级: `input_volume_mounts` (声明mount_path)
-  - 节点级: `input_volume_mounts` (指定source_node_id)
-- **执行顺序依赖**: 等待上游节点完成后再启动
+### 5. 超时检测
+- 应用模板(APP)：超时时间=从启动到就绪的时间（默认300秒）
+- 任务模板(JOB)：超时时间=整个任务执行时间（默认3600秒）
+- 不含镜像拉取时间（从节点状态变为RUNNING后开始计算）
+- 节点创建时可指定 `timeout_seconds` 覆盖默认值
 
-### 5. 运行模式
+### 6. 工作流失败处理
+- 节点执行失败时不会立即判定工作流失败
+- 等待其他运行中的节点完成或超时
+- 所有节点状态确定后才更新工作流状态为FAILED
+
+### 7. 运行模式
 
 #### 一次性运行 (once)
 - 工作流启动后执行一次
@@ -444,7 +446,7 @@ secflow-platform-workflow/
   - **HTTP触发**: 通过 `/triggers/{id}` 端点触发
 - 节点可以是:
   - **app**: Deployment 类型，持久运行
-  - **job**: Job 类型，一次性执行
-- 执行完成后保持节点状态，等待下一次触发
+  - **job**: Job 类型一次性执行
+- 执行完成后保持节点状态等待下一次触发
 - 支持激活/停用控制 (`/activate`, `/deactivate`)
 - 记录运行次数 (`run_count`) 和最后运行时间 (`last_run_at`)

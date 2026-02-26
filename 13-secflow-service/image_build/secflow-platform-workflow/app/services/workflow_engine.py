@@ -41,7 +41,7 @@ class WorkflowEngine:
         self.reverse_graph: Dict[str, List[str]] = {}  # node_id -> [downstream_node_ids]
 
     async def initialize(self):
-        """Initialize the engine by loading instance and nodes"""
+        """Initialize the engine by loading instance and node"""
         self.instance = self.db.query(WorkflowInstance).filter(
             WorkflowInstance.id == self.instance_id
         ).first()
@@ -57,7 +57,7 @@ class WorkflowEngine:
         self._build_dependency_graph()
 
         logger.info(f"WorkflowEngine initialized for instance {self.instance_id} "
-                    f"with {len(self.nodes)} nodes")
+                    f"with {len(self.nodes)} node")
 
     def _build_dependency_graph(self):
         """
@@ -89,9 +89,9 @@ class WorkflowEngine:
 
         logger.debug(f"Dependency graph built: {self.dependency_graph}")
 
-    def detect_cycles(self) -> Optional[List[str]]:
+    def detect_cycle(self) -> Optional[List[str]]:
         """
-        Detect cycles in the dependency graph using DFS
+        Detect cycle in the dependency graph using DFS
         Returns the cycle path if found, None otherwise
         """
         WHITE, GRAY, BLACK = 0, 1, 2
@@ -155,7 +155,7 @@ class WorkflowEngine:
         """
         Check if a node's dependencies are all completed
         For Job: status must be SUCCEEDED
-        For Deployment: we consider it ready when running (health check will handle the rest)
+        For Deployment: we consider it ready when SUCCEEDED (ready check done by K8S)
         """
         deps = self.dependency_graph.get(node.node_id, [])
 
@@ -169,8 +169,8 @@ class WorkflowEngine:
                 if dep_node.status != NodeStatus.SUCCEEDED:
                     return False
             else:
-                # Deployment must be running (ready check done by K8S)
-                if dep_node.status != NodeStatus.RUNNING and dep_node.status != NodeStatus.SUCCEEDED:
+                # Deployment must be succeeded (ready check done by K8S)
+                if dep_node.status != NodeStatus.SUCCEEDED:
                     return False
 
         return True
@@ -178,6 +178,9 @@ class WorkflowEngine:
     async def sync_node_status_from_k8s(self, node: WorkflowNodeInstance):
         """
         Sync node status from K8S to database
+        For APP nodes: marks as SUCCEEDED when ready (not RUNNING)
+        For JOB nodes: status follows K8S Job status
+        Checks timeout for both node types
         """
         if not node.k8s_resource_name:
             return
@@ -188,10 +191,24 @@ class WorkflowEngine:
                     self.instance.project_id, node.k8s_resource_name
                 )
                 if status:
-                    # Deployment is ready when available_replicas == replicas
-                    if status.get("ready_replicas", 0) >= status.get("replicas", 0):
-                        if node.status != NodeStatus.RUNNING:
-                            node.status = NodeStatus.RUNNING
+                    # Check timeout
+                    if node.started_at:
+                        elapsed = (datetime.utcnow() - node.started_at).total_seconds()
+                        timeout = node.timeout_seconds or 300  # Default 5 minutes if not specified
+                        if elapsed > timeout:
+                            # Timeout - mark as failed
+                            node.status = NodeStatus.FAILED
+                            node.finished_at = datetime.utcnow()
+                            node.message = f"Deployment timeout after {elapsed:.0f}s (expected {timeout}s)"
+                            self.db.commit()
+                            return
+
+                    # Deployment is ready when available_replica == replica
+                    if status.get("ready_replica", 0) >= status.get("replica", 0):
+                        # App node is ready - mark as SUCCEEDED (not running)
+                        if node.status != NodeStatus.SUCCEEDED:
+                            node.status = NodeStatus.SUCCEEDED
+                            node.finished_at = datetime.utcnow()
                             node.message = "Deployment is ready"
                     else:
                         # Still pending (deployment exists but not ready)
@@ -202,6 +219,17 @@ class WorkflowEngine:
                     self.instance.project_id, node.k8s_resource_name
                 )
                 if status:
+                    # Check timeout
+                    if node.started_at:
+                        elapsed = (datetime.utcnow() - node.started_at).total_seconds()
+                        timeout = node.timeout_seconds or 3600  # Default 1 hour if not specified
+                        if elapsed > timeout:
+                            # Timeout - mark as failed (job still running or stuck)
+                            if status.get("status") in ["Pending", "Running"]:
+                                node.status = NodeStatus.FAILED
+                                node.finished_at = datetime.utcnow()
+                                node.message = f"Job timeout after {elapsed:.0f}s (expected {timeout}s)"
+
                     k8s_status = status.get("status", "")
                     if k8s_status == "Succeeded":
                         if node.status != NodeStatus.SUCCEEDED:
@@ -220,7 +248,7 @@ class WorkflowEngine:
             logger.error(f"Error syncing node {node.node_id} status: {e}")
 
     async def sync_all_nodes_status(self):
-        """Sync all nodes status from K8S"""
+        """Sync all node status from K8S"""
         for node in self.nodes:
             if node.status in [NodeStatus.RUNNING, NodeStatus.PENDING]:
                 await self.sync_node_status_from_k8s(node)
@@ -239,7 +267,7 @@ class WorkflowEngine:
     def _resolve_container_env_vars(self, container: Dict[str, Any], node: WorkflowNodeInstance,
                                      template: Any, global_dep_env_vars: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """
-        Resolve environment variables for a single container
+        Resolve environment variable for a single container
         Combines container fixed env_vars with dependency env_vars
         """
         env_vars = []
@@ -252,7 +280,7 @@ class WorkflowEngine:
 
         # 2. Container input env_vars (from template) - template declares name, not source_node_id
         # The actual source_node_id is specified at node instance level
-        # Skip here as global_dep_env_vars already contains all the resolved dependencies
+        # Skip here as global_dep_env_vars already contains all the resolved dependency
 
         # 3. Global input env_vars (from node instance configuration, includes resolved source_node_id)
         for dep_env in global_dep_env_vars:
@@ -265,16 +293,16 @@ class WorkflowEngine:
     def _resolve_container_volume_mounts(self, container: Dict[str, Any], node: WorkflowNodeInstance,
                                           global_mounts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Resolve volume mounts for a single container
-        Combines container fixed mounts with dependency mounts from node instance
+        Resolve volume mount for a single container
+        Combines container fixed mount with dependency mount from node instance
         """
-        mounts = []
+        mount = []
 
         # 1. Container fixed volume_mounts (from template) - known PVC at template definition
         container_mounts = container.get("volume_mounts", [])
         for vm in container_mounts:
             if vm.get("pvc_name") and vm.get("mount_path"):
-                mounts.append({
+                mount.append({
                     "pvc_name": vm["pvc_name"],
                     "mount_path": vm["mount_path"],
                     "sub_path": vm.get("sub_path"),
@@ -284,21 +312,21 @@ class WorkflowEngine:
         # 2. Container dependency volume_mounts (from template) - template only declares mount_path
         # The actual source (source_node_id) is specified at workflow node instance level
         # and already resolved in global_mounts. Template-level only declares the need.
-        # Skip here as global_mounts already contains all the resolved dependencies.
+        # Skip here as global_mounts already contains all the resolved dependency.
 
-        # 3. Global volume mounts (from node instance configuration, includes resolved dependency sources)
+        # 3. Global volume mount (from node instance configuration, includes resolved dependency sources)
         for mount in global_mounts:
             # Convert format from K8S format to internal format
             if mount.get("pvcName") and mount.get("mountPath"):
-                if not any(m["mount_path"] == mount["mountPath"] for m in mounts):
-                    mounts.append({
+                if not any(m["mount_path"] == mount["mountPath"] for m in mount):
+                    mount.append({
                         "pvc_name": mount["pvcName"],
                         "mount_path": mount["mountPath"],
                         "sub_path": mount.get("subPath"),
                         "read_only": mount.get("readOnly", False)
                     })
 
-        return mounts
+        return mount
 
     def _get_node_resources(self, node: WorkflowNodeInstance, container_resources: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """
@@ -318,10 +346,10 @@ class WorkflowEngine:
             if isinstance(container_resources, dict):
                 return container_resources
             # Handle ResourceRequirements object
-            elif hasattr(container_resources, 'requests') or hasattr(container_resources, 'limits'):
+            elif hasattr(container_resources, 'request') or hasattr(container_resources, 'limits'):
                 result = {}
-                if hasattr(container_resources, 'requests') and container_resources.requests:
-                    result["requests"] = container_resources.requests
+                if hasattr(container_resources, 'request') and container_resources.request:
+                    result["request"] = container_resources.request
                 if hasattr(container_resources, 'limits') and container_resources.limits:
                     result["limits"] = container_resources.limits
                 return result if result else None
@@ -331,12 +359,12 @@ class WorkflowEngine:
             if isinstance(node_resources, dict):
                 return node_resources
             # Handle ResourceRequirements object
-            elif hasattr(node_resources, 'requests') or hasattr(node_resources, 'limits'):
+            elif hasattr(node_resources, 'request') or hasattr(node_resources, 'limits'):
                 result = {}
-                if hasattr(node_resources, 'requests') and node_resources.requests:
-                    result["requests"] = node_resources.requests
+                if hasattr(node_resources, 'request') and node_resources.request:
+                    result["request"] = node_resources.request
                 if hasattr(node_resources, 'limits') and node_resources.limits:
-                    result["limits"] = node_resources.limits
+                    result["limit"] = node_resources.limits
                 return result if result else None
 
         return None
@@ -347,7 +375,7 @@ class WorkflowEngine:
         Returns list of container configs ready for K8S
         Supports inheriting resource requirements from task templates with node-level overrides
         """
-        # Resolve global dependency env_vars and mounts (for backward compatibility)
+        # Resolve global dependency env_vars and mount (for backward compatibility)
         global_dep_env_vars = self._resolve_global_input_env_vars(node, template)
         global_mounts = self._resolve_global_input_volume_mounts(node, template)
 
@@ -356,7 +384,7 @@ class WorkflowEngine:
         template_containers = template.containers or []
 
         for container in template_containers:
-            # Resolve env vars and mounts for this container
+            # Resolve env vars and mount for this container
             env_vars = self._resolve_container_env_vars(container, node, template, global_dep_env_vars)
             volume_mounts = self._resolve_container_volume_mounts(container, node, global_mounts)
 
@@ -412,9 +440,9 @@ class WorkflowEngine:
 
     def _resolve_global_input_volume_mounts(self, node: WorkflowNodeInstance, template: Any) -> List[Dict[str, Any]]:
         """
-        Resolve node-level input volume mounts (specifies source_node_id)
+        Resolve node-level input volume mount (specifies source_node_id)
         """
-        mounts = []
+        mount = []
 
         # Get from node instance configuration (input_volume_mounts specifies source_node_id)
         input_mounts = node.input_volume_mounts or []
@@ -431,14 +459,14 @@ class WorkflowEngine:
                 source_pvc = dep_mount.get("source_pvc_name")
 
                 if source_pvc:
-                    mounts.append({
+                    mount.append({
                         "pvcName": source_pvc,
                         "mountPath": mount_path,
                         "subPath": dep_mount.get("sub_path"),
                         "readOnly": dep_mount.get("read_only", True)
                     })
 
-        return mounts
+        return mount
 
     def _resolve_global_input_env_vars_deprecated(self, node: WorkflowNodeInstance, template: Any) -> List[Dict[str, str]]:
         """DEPRECATED: Use _resolve_global_input_env_vars instead"""
@@ -526,13 +554,13 @@ class WorkflowEngine:
                     "protocol": p.get("protocol", "TCP")
                 } for p in (template.service_ports or [])]
 
-                # Create deployment with multiple containers
+                # Create deployment with multiple container
                 success, error = self.k8s_client.create_deployment(
                     project_id=self.instance.project_id,
                     name=k8s_name,
                     containers=containers,
                     ports=ports if ports else None,
-                    replicas=template.replicas if hasattr(template, 'replicas') else 1
+                    replica=template.replica if hasattr(template, 'replica') else 1
                 )
 
                 if not success:
@@ -541,7 +569,7 @@ class WorkflowEngine:
             else:  # JOB
                 node.k8s_resource_type = "Job"
 
-                # Create job with multiple containers
+                # Create job with multiple container
                 success, error = self.k8s_client.create_job(
                     project_id=self.instance.project_id,
                     name=k8s_name,
@@ -569,14 +597,30 @@ class WorkflowEngine:
             self.db.commit()
             return False
 
+    def _get_max_remaining_timeout(self) -> float:
+        """
+        Get maximum remaining timeout among all running nodes
+        Returns the maximum time to wait for any running node
+        """
+        max_timeout = 0.0
+        for node in self.nodes:
+            if node.status == NodeStatus.RUNNING and node.started_at:
+                elapsed = (datetime.utcnow() - node.started_at).total_seconds()
+                timeout = node.timeout_seconds or (300 if node.node_type == NodeType.APP else 3600)
+                remaining = timeout - elapsed
+                if remaining > max_timeout:
+                    max_timeout = remaining
+        return max_timeout
+
     async def execute_workflow(self):
         """
         Execute workflow using topological sorting with concurrent execution
+        After any node fails, wait for remaining running nodes to timeout before workflow fails
         """
         logger.info(f"Starting workflow execution for instance {self.instance_id}")
 
-        # 1. Check for cycles
-        cycle = self.detect_cycles()
+        # 1. Check for cycle
+        cycle = self.detect_cycle()
         if cycle:
             error_msg = f"Cycle detected in workflow: {' -> '.join(cycle)}"
             logger.error(error_msg)
@@ -598,6 +642,9 @@ class WorkflowEngine:
         self.instance.status = WorkflowStatus.RUNNING
         self.db.commit()
 
+        workflow_failed = False
+        failed_node_id = None
+
         while ready:
             logger.info(f"Starting {len(ready)} ready nodes: {[n.node_id for n in ready]}")
 
@@ -618,15 +665,22 @@ class WorkflowEngine:
             # Sync status from K8S
             await self.sync_all_nodes_status()
 
-            # Check for workflow completion or failure
+            # Check for workflow completion
             if self._is_workflow_complete():
                 break
 
+            # Check if any node has failed
             if self._has_workflow_failed():
-                self.instance.status = WorkflowStatus.FAILED
-                self.db.commit()
-                logger.error(f"Workflow {self.instance_id} failed")
-                return
+                workflow_failed = True
+                # Find the first failed node
+                for node in self.nodes:
+                    if node.status == NodeStatus.FAILED:
+                        failed_node_id = node.node_id
+                        break
+                logger.warning(f"Node {failed_node_id} failed, waiting for remaining nodes to timeout...")
+                # Wait for remaining running nodes to timeout
+                await self._wait_for_remaining_timeout()
+                break
 
             # Find new ready nodes
             new_ready = []
@@ -648,9 +702,10 @@ class WorkflowEngine:
             self.instance.finished_at = datetime.utcnow()
             self.instance.message = "All nodes completed successfully"
             logger.info(f"Workflow {self.instance_id} completed successfully")
-        elif self._has_workflow_failed():
+        elif workflow_failed or self._has_workflow_failed():
             self.instance.status = WorkflowStatus.FAILED
             self.instance.finished_at = datetime.utcnow()
+            self.instance.message = f"Workflow failed: node {failed_node_id} failed"
             logger.error(f"Workflow {self.instance_id} failed")
 
         self.db.commit()
@@ -684,6 +739,42 @@ class WorkflowEngine:
             # Sync status
             await self.sync_all_nodes_status()
 
+    async def _wait_for_remaining_timeout(self):
+        """
+        Wait for all remaining running nodes to complete or timeout
+        This is called after a node failure to allow other nodes to finish or timeout
+        """
+        logger.info("Waiting for remaining nodes to complete or timeout...")
+
+        while True:
+            # Check if all running nodes are done
+            running_nodes = [node for node in self.nodes if node.status == NodeStatus.RUNNING]
+            if not running_node:
+                logger.info("All remaining nodes have completed")
+                break
+
+            # Check if any node is still running
+            any_running = any(
+                node.status == NodeStatus.RUNNING
+                for node in self.nodes
+            )
+            if not any_running:
+                break
+
+            # Sync status to detect any new completions or timeouts
+            await self.sync_all_nodes_status()
+
+            # Check if there are still running nodes
+            still_running = [node for node in self.nodes if node.status == NodeStatus.RUNNING]
+            if not still_running:
+                break
+
+            # Wait a bit before next check
+            await asyncio.sleep(5)
+
+        # Final sync
+        await self.sync_all_nodes_status()
+
     def _is_workflow_complete(self) -> bool:
         """Check if all nodes are completed (succeeded)"""
         return all(
@@ -700,7 +791,7 @@ class WorkflowEngine:
 
     def get_node_outputs(self, node_id: str) -> Dict[str, Any]:
         """
-        Get outputs from a node (service name, PVC names, etc.)
+        Get output from a node (service name, PVC names, etc.)
         """
         node = self.node_map.get(node_id)
         if not node:
@@ -714,14 +805,14 @@ class WorkflowEngine:
             "service_name": node.service_name,
         }
 
-        # Add PVC names from shared mounts
+        # Add PVC names from shared mount
         pvc_names = []
         for mount in node.shared_pvc_mounts or []:
             pvc_name = mount.get("pvc_name")
             if pvc_name and pvc_name not in pvc_names:
                 pvc_names.append(pvc_name)
 
-        # Add from dependency mounts
+        # Add from dependency mount
         for mount in node.dependency_volume_mounts or []:
             pvc_name = mount.get("source_pvc_name")
             if pvc_name and pvc_name not in pvc_names:

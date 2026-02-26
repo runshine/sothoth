@@ -12,7 +12,7 @@ from app.schemas.schemas import (
     NodeStatus,
     # Health Check
     HealthCheckConfig,
-    # Environment & Volumes
+    # Environment & Volume
     EnvVar,
     ServicePort,
     VolumeMount,
@@ -29,13 +29,13 @@ from app.schemas.schemas import (
     # Workflow
     WorkflowNodeConfig,
     WorkflowEdgeConfig,
-    WorkflowTemplateCreate,
-    WorkflowTemplateUpdate,
-    WorkflowTemplateResponse,
-    WorkflowTemplateListResponse,
     # Instance
     WorkflowInstanceCreate,
     WorkflowInstanceUpdate,
+    WorkflowNodeCreate,
+    WorkflowNodeUpdate,
+    WorkflowEdgesUpdate,
+    WorkflowEdgesUpdateRequest,
     WorkflowNodeInstanceResponse,
     WorkflowInstanceResponse,
     WorkflowInstanceListResponse,
@@ -70,12 +70,12 @@ __all__ = [
     "JobTemplateListResponse",
     "WorkflowNodeConfig",
     "WorkflowEdgeConfig",
-    "WorkflowTemplateCreate",
-    "WorkflowTemplateUpdate",
-    "WorkflowTemplateResponse",
-    "WorkflowTemplateListResponse",
     "WorkflowInstanceCreate",
     "WorkflowInstanceUpdate",
+    "WorkflowNodeCreate",
+    "WorkflowNodeUpdate",
+    "WorkflowEdgesUpdate",
+    "WorkflowEdgesUpdateRequest",
     "WorkflowNodeInstanceResponse",
     "WorkflowInstanceResponse",
     "WorkflowInstanceListResponse",

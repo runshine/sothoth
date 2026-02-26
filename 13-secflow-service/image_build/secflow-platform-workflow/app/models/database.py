@@ -170,55 +170,20 @@ class JobTemplate(Base):
         }
 
 
-# ============ Workflow Template Model ============
-
-class WorkflowTemplate(Base):
-    """Workflow Orchestration Template"""
-    __tablename__ = f"{TABLE_PREFIX}workflow_template"
-
-    id = Column(String(64), primary_key=True)
-    name = Column(String(128), nullable=False, index=True)
-    description = Column(Text)
-    scope = Column(String(20), nullable=False, default=TemplateScope.PROJECT)
-    project_id = Column(String(64), index=True)
-
-    # Workflow definition (drag-and-drop orchestration)
-    nodes = Column(JSON, nullable=False, default=[])  # Node definitions
-    edges = Column(JSON, nullable=False, default=[])  # Edge definitions (connections and PVC sharing)
-
-    # Audit field
-    created_by = Column(String(64), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-    def __repr__(self):
-        return f"<WorkflowTemplate(id={self.id}, name={self.name})>"
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": self.id,
-            "name": self.name,
-            "description": self.description,
-            "scope": self.scope,
-            "project_id": self.project_id,
-            "nodes": self.nodes,
-            "edges": self.edges,
-            "created_by": self.created_by,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
-        }
-
 
 # ============ Workflow Instance Model ============
 
 class WorkflowInstance(Base):
-    """Workflow Instance (running workflow)"""
+    """Workflow Instance (running workflow)
+
+    Nodes configurations are stored directly in the instance (no separate template).
+    Each node references an AppTemplate or JobTemplate by template_id.
+    """
     __tablename__ = f"{TABLE_PREFIX}workflow_instance"
 
     id = Column(String(64), primary_key=True)
     name = Column(String(128), nullable=False, index=True)
     description = Column(Text)
-    template_id = Column(String(64), ForeignKey(f"{TABLE_PREFIX}workflow_template.id"), nullable=False)
     project_id = Column(String(64), nullable=False, index=True)
 
     # Instance status
@@ -236,7 +201,8 @@ class WorkflowInstance(Base):
     trigger_url = Column(String(256))  # Unique trigger endpoint path
     is_active = Column(Boolean, default=True)  # Whether workflow is active (for persistent mode)
 
-    # Workflow instance definition (with node overrides)
+    # Workflow instance definition - directly stores node and edge configurations
+    # Each node references an AppTemplate or JobTemplate by template_id
     nodes = Column(JSON, nullable=False, default=[])  # Node instance configurations
     edges = Column(JSON, nullable=False, default=[])  # Edge configurations
 
@@ -260,7 +226,6 @@ class WorkflowInstance(Base):
             "id": self.id,
             "name": self.name,
             "description": self.description,
-            "template_id": self.template_id,
             "project_id": self.project_id,
             "status": self.status,
             "run_mode": self.run_mode,
@@ -301,7 +266,9 @@ class WorkflowNodeInstance(Base):
     service_name = Column(String(128))
 
     # Configuration
-    depends_on = Column(JSON, default=[])  # List of upstream node IDs
+    depends_on = Column(JSON, default=[])  # List of upstream node IDs (nodes this node depends on)
+    downstream_nodes_ids = Column(JSON, default=[])  # List of downstream node IDs (nodes that depend on this node)
+    timeout_seconds = Column(Integer)  # Timeout in seconds (excluding image pull time)
 
     # Input Dependencies (specify source_node_id at instance level)
     input_env_vars = Column(JSON, default=[])

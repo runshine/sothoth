@@ -298,26 +298,29 @@ class JobTemplateListResponse(BaseModel):
 # ============ Workflow Node Schemas ============
 
 class WorkflowNodeConfig(BaseModel):
-    """Workflow node configuration - specifies actual sources for template dependencies"""
+    """Workflow node configuration - specifies actual sources for template dependencies
+
+    Note: Different nodes have no dependency relationship, no depends_on needed.
+    The env_vars and volume_mounts are used to satisfy template's dependency requirements
+    when instantiating the template.
+    """
     node_id: str = Field(..., description="Unique node ID")
     node_type: NodeType = Field(..., description="Node type: app/job")
     template_id: str = Field(..., description="Template ID")
     name: str = Field(..., description="Node display name")
     position: Dict[str, int] = Field(default={"x": 0, "y": 0}, description="Node position in canvas")
 
-    # ============ Fixed (override template) ============
+    # Fixed (override template)
     env_vars: Optional[List[EnvVar]] = Field(None, description="Override/add fixed environment variables")
     volume_mounts: Optional[List[VolumeMount]] = Field(None, description="Override/add fixed volume mounts")
 
-    # ============ Input Dependencies (specify source_node_id) ============
-    input_env_vars: Optional[List[DependencyEnvVar]] = Field(None, description="Input env vars - specify source_node_id")
-    input_volume_mounts: Optional[List[DependencyVolumeMount]] = Field(None, description="Input volume mounts - specify source_node_id")
-
-    # ============ Resource Requirements ============
+    # Resource Requirements
     resources: Optional[ResourceRequirements] = Field(None, description="Override resource requirements")
 
-    # ============ Dependencies ============
-    depends_on: List[str] = Field(default=[], description="List of upstream node IDs this node depends on")
+    # Timeout configuration (in seconds, excluding image pull time)
+    # For app type: time from start to ready
+    # For job type: time for entire job execution
+    timeout_seconds: Optional[int] = Field(None, ge=1, description="Node execution timeout in seconds")
 
 
 class WorkflowEdgeConfig(BaseModel):
@@ -329,57 +332,21 @@ class WorkflowEdgeConfig(BaseModel):
     shared_pvc: Optional[str] = Field(None, description="PVC name to share between nodes")
 
 
-# ============ Workflow Template Schemas ============
-
-class WorkflowTemplateCreate(BaseModel):
-    """Create workflow template request"""
-    name: str = Field(..., min_length=1, max_length=128, description="Template name")
-    description: Optional[str] = Field(None, description="Template description")
-    scope: TemplateScope = Field(default=TemplateScope.PROJECT, description="Template scope")
-    project_id: Optional[str] = Field(None, description="Project ID (required for project scope)")
-    nodes: List[WorkflowNodeConfig] = Field(default=[], description="Workflow nodes")
-    edges: List[WorkflowEdgeConfig] = Field(default=[], description="Workflow edges/connections")
-
-
-class WorkflowTemplateUpdate(BaseModel):
-    """Update workflow template request"""
-    name: Optional[str] = Field(None, min_length=1, max_length=128)
-    description: Optional[str] = None
-    nodes: Optional[List[WorkflowNodeConfig]] = None
-    edges: Optional[List[WorkflowEdgeConfig]] = None
-
-
-class WorkflowTemplateResponse(BaseModel):
-    """Workflow template response"""
-    id: str
-    name: str
-    description: Optional[str]
-    scope: str
-    project_id: Optional[str]
-    nodes: List[WorkflowNodeConfig]
-    edges: List[WorkflowEdgeConfig]
-    created_by: str
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-class WorkflowTemplateListResponse(BaseModel):
-    """Workflow template list response"""
-    total: int
-    items: List[WorkflowTemplateResponse]
-
-
 # ============ Workflow Instance Schemas ============
 
 class WorkflowInstanceCreate(BaseModel):
-    """Create workflow instance request"""
+    """Create workflow instance request
+
+    Can create empty workflow (without nodes) and add nodes later.
+    Each node is an instantiation of an AppTemplate (app type) or JobTemplate (job type).
+    """
     name: str = Field(..., min_length=1, max_length=128, description="Instance name")
     description: Optional[str] = Field(None, description="Instance description")
-    template_id: str = Field(..., description="Workflow template ID")
     project_id: str = Field(..., description="Project ID")
+
+    # Workflow definition - nodes can be empty for later addition
+    nodes: List[WorkflowNodeConfig] = Field(default=[], description="Workflow nodes (can be empty)")
+    edges: List[WorkflowEdgeConfig] = Field(default=[], description="Workflow edges/connections")
 
     # Run mode: "once" (run once) or "persistent" (keep running)
     run_mode: RunMode = Field(default=RunMode.ONCE, description="Run mode: once or persistent")
@@ -396,9 +363,77 @@ class WorkflowInstanceUpdate(BaseModel):
     """Update workflow instance request"""
     name: Optional[str] = Field(None, min_length=1, max_length=128)
     description: Optional[str] = None
+    # Update all edges at once
+    edges: Optional[List[WorkflowEdgeConfig]] = Field(None, description="Update workflow edges/connections")
     # For persistent mode - enable/disable trigger
     trigger_enabled: Optional[bool] = Field(None, description="Enable/disable trigger")
     is_active: Optional[bool] = Field(None, description="Set workflow active state")
+
+
+# ============ Workflow Node Operation Schemas ============
+
+class WorkflowNodeCreate(BaseModel):
+    """Create workflow node request
+
+    Adds a node to existing workflow instance.
+    Node is instantiated from AppTemplate (app type) or JobTemplate (job type).
+
+    Note: Different nodes have no dependency relationship, no depends_on needed.
+    The env_vars and volume_mounts are used to satisfy template's dependency requirements
+    when instantiating the template.
+    """
+    node_id: str = Field(..., description="Unique node ID within the workflow")
+    node_type: NodeType = Field(..., description="Node type: app/job")
+    template_id: str = Field(..., description="App template ID or Job template ID")
+    name: str = Field(..., description="Node display name")
+    position: Dict[str, int] = Field(default={"x": 0, "y": 0}, description="Node position in canvas")
+
+    # Fixed (override template) - environment variables and volume mounts
+    # These are used to satisfy template dependencies when instantiating
+    env_vars: Optional[List[EnvVar]] = Field(None, description="Override/add fixed environment variables")
+    volume_mounts: Optional[List[VolumeMount]] = Field(None, description="Override/add fixed volume mounts")
+
+    # Resource Requirements
+    resources: Optional[ResourceRequirements] = Field(None, description="Override resource requirements")
+
+    # Timeout configuration (in seconds, excluding image pull time)
+    # For app type: time from start to ready
+    # For job type: time for entire job execution
+    timeout_seconds: Optional[int] = Field(None, ge=1, description="Node execution timeout in seconds")
+
+
+class WorkflowNodeUpdate(BaseModel):
+    """Update workflow node request
+
+    Note: Different nodes have no dependency relationship, no depends_on needed.
+    """
+    name: Optional[str] = Field(None, min_length=1, max_length=128)
+    position: Optional[Dict[str, int]] = Field(None, description="Node position in canvas")
+    # Fixed (override template)
+    env_vars: Optional[List[EnvVar]] = Field(None, description="Override/add fixed environment variables")
+    volume_mounts: Optional[List[VolumeMount]] = Field(None, description="Override/add fixed volume mounts")
+    # Resource Requirements
+    resources: Optional[ResourceRequirements] = Field(None, description="Override resource requirements")
+
+
+class WorkflowEdgesUpdate(BaseModel):
+    """Update workflow edges request
+
+    Updates edges connections between nodes.
+    """
+    edges_id: str = Field(..., description="Unique edge ID")
+    source: str = Field(..., description="Source node ID")
+    target: str = Field(..., description="Target node ID")
+    shared_pvc: Optional[str] = Field(None, description="Shared PVC name")
+
+
+class WorkflowEdgesUpdateRequest(BaseModel):
+    """Request to update workflow edges list"""
+    edges_id: Optional[str] = Field(None, description="Edge ID (for add operation)")
+    source: Optional[str] = Field(None, description="Source node ID (for add operation)")
+    target: Optional[str] = Field(None, description="Target node ID (for add operation)")
+    shared_pvc: Optional[str] = Field(None, description="Shared PVC name (for add operation)")
+    action: str = Field(..., description="Operation: add, update, delete")
 
 
 class TriggerResponse(BaseModel):
@@ -419,7 +454,9 @@ class WorkflowNodeInstanceResponse(BaseModel):
     k8s_resource_name: Optional[str]
     k8s_resource_type: Optional[str]
     depends_on: List[str]
+    downstream_node_ids: List[str]
     service_name: Optional[str]
+    timeout_seconds: Optional[int]
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
     message: Optional[str]
@@ -433,11 +470,13 @@ class WorkflowNodeInstanceResponse(BaseModel):
 
 
 class WorkflowInstanceResponse(BaseModel):
-    """Workflow instance response"""
+    """Workflow instance response
+
+    Nodes are directly stored in the instance, each referencing an AppTemplate or JobTemplate.
+    """
     id: str
     name: str
     description: Optional[str]
-    template_id: str
     project_id: str
     status: str
     run_mode: str

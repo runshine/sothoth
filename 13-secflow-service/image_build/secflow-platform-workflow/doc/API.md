@@ -16,69 +16,42 @@
 | | GET | `/api/workflow/job-templates/{template_id}` | 获取任务模板详情 |
 | | PUT | `/api/workflow/job-templates/{template_id}` | 更新任务模板 |
 | | DELETE | `/api/workflow/job-templates/{template_id}` | 删除任务模板 |
-| **Workflow Template** | POST | `/api/workflow/workflow-templates` | 创建工作流模板 |
-| | GET | `/api/workflow/workflow-templates` | 列表工作流模板 |
-| | GET | `/api/workflow/workflow-templates/{template_id}` | 获取工作流模板详情 |
-| | PUT | `/api/workflow/workflow-templates/{template_id}` | 更新工作流模板 |
-| | DELETE | `/api/workflow/workflow-templates/{template_id}` | 删除工作流模板 |
 | **Workflow Instance** | POST | `/api/workflow/workflow-instances` | 创建工作流实例 |
 | | GET | `/api/workflow/workflow-instances` | 列表工作流实例 |
 | | GET | `/api/workflow/workflow-instances/{instance_id}` | 获取工作流实例详情 |
 | | PUT | `/api/workflow/workflow-instances/{instance_id}` | 更新工作流实例 |
 | | POST | `/api/workflow/workflow-instances/{instance_id}/start` | 启动工作流 |
+| | POST | `/api/workflow/workflow-instances/{instance_id}/sync-status` | 同步工作流状态 |
 | | POST | `/api/workflow/workflow-instances/{instance_id}/stop` | 停止工作流 |
 | | POST | `/api/workflow/workflow-instances/{instance_id}/activate` | 激活持久化工作流 |
 | | POST | `/api/workflow/workflow-instances/{instance_id}/deactivate` | 停用持久化工作流 |
 | | DELETE | `/api/workflow/workflow-instances/{instance_id}` | 删除工作流实例 |
-| | GET | `/api/workflow/workflow-instances/{instance_id}/status` | 获取实例状态 |
+| **Workflow Node** | POST | `/api/workflow/workflow-instances/{instance_id}/nodes` | 创建工作流节点 |
+| | GET | `/api/workflow/workflow-instances/{instance_id}/nodes` | 列表工作流节点 |
+| | GET | `/api/workflow/workflow-instances/{instance_id}/nodes/{node_instance_id}` | 获取工作流节点详情 |
+| | PUT | `/api/workflow/workflow-instances/{instance_id}/nodes/{node_instance_id}` | 更新工作流节点 |
+| | DELETE | `/api/workflow/workflow-instances/{instance_id}/nodes/{node_instance_id}` | 删除工作流节点 |
+| **Workflow Edge** | POST | `/api/workflow/workflow-instances/{instance_id}/edges` | 更新工作流边 |
 | | GET | `/api/workflow/workflow-instances/{instance_id}/nodes/{node_id}/logs` | 获取节点日志 |
-| **Trigger** | POST | `/api/workflow/workflow-instances/triggers/{instance_id}` | HTTP触发工作流 |
+| **Trigger** | POST | `/api/workflow/trigger/{instance_id}` | HTTP触发工作流 |
 | **Health** | GET | `/api/workflow/health` | 健康检查 |
-
-### 通用参数
-
-| 参数 | 类型 | 描述 |
-|------|------|------|
-| `template_id` | string | 模板ID |
-| `instance_id` | string | 实例ID |
-| `project_id` | string | 项目ID |
-| `scope` | string | 模板范围: `global` 或 `project` |
-
-### 状态枚举
-
-| 状态 | 描述 |
-|------|------|
-| `pending` | 待执行 |
-| `running` | 运行中 |
-| `succeeded` | 成功 |
-| `failed` | 失败 |
-| `stopped` | 已停止 |
-
-### 运行模式
-
-| 模式 | 描述 |
-|------|------|
-| `once` | 一次性运行，工作流执行一次后结束 |
-| `persistent` | 持久化运行，工作流持续有效，可被多次触发 |
-
-### 触发器类型
-
-| 类型 | 描述 |
-|------|------|
-| `manual` | 手动触发，仅可通过API启动 |
-| `http` | HTTP触发，可通过HTTP请求触发工作流 |
+| | GET | `/api/workflow/ready` | 就绪检查 |
 
 ---
 
 ## Overview
 
-SecFlow Workflow Service 提供应用模板、任务模板和工作流编排管理。所有API前缀为 `/api/workflow`。
+SecFlow Workflow Service 提供应用模板、任务模板和工作流编排管理。工作流实例直接引用应用模板或任务模板，不再需要工作流模板层。所有API前缀为 `/api/workflow`。
 
 ## Base URL
 
 ```
 http://<host>:<port>/api/workflow
 ```
+
+## Service Port
+
+- 默认端口: `10005`
 
 ## Authentication
 
@@ -88,132 +61,331 @@ http://<host>:<port>/api/workflow
 Authorization: Bearer <token>
 ```
 
-Token由认证服务验证。
+Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证调用。
+
+---
+
+## Common Parameters
+
+### Path Parameters
+
+| 参数 | 类型 | 描述 |
+|------|------|------|
+| `template_id` | string | 应用模板或任务模板ID |
+| `instance_id` | string | 工作流实例ID |
+| `node_id` | string | 工作流节点ID |
+
+### Query Parameters
+
+| 参数 | 类型 | 描述 |
+|------|------|------|
+| `project_id` | string | 项目ID |
+| `scope` | string | 模板范围: `global` 或 `project` |
+| `status` | string | 状态过滤: `pending`, `running`, `succeeded`, `failed`, `stopped` |
+
+---
+
+## Enumerations
+
+### Template Scope
+
+| 值 | 描述 |
+|------|------|
+| `global` | 全局模板所有项目可见 |
+| `project` | 项目级模板仅在项目内可见 |
+
+### Image Pull Policy
+
+| 值 | 描述 |
+|------|------|
+| `Always` | 总是拉取镜像 |
+| `IfNotPresent` | 仅当不存在时拉取 |
+| `Never` | 从不拉取 |
+
+### Service Type
+
+| 值 | 描述 |
+|------|------|
+| `ClusterIP` | 集群内部服务 (默认) |
+| `LoadBalancer` | 负载均衡器类型 |
+| `NodePort` | 节点端口类型 |
+
+### Workflow Status
+
+| 值 | 描述 |
+|------|------|
+| `pending` | 待执行 |
+| `running` | 运行中 |
+| `succeeded` | 成功 |
+| `failed` | 失败 |
+| `stopped` | 已停止 |
+
+### Node Type
+
+| 值 | 描述 |
+|------|------|
+| `app` | Deployment应用 |
+| `job` | 一次性Job |
+
+### Node Status
+
+| 值 | 描述 |
+|------|------|
+| `pending` | 待执行 |
+| `running` | 运行中 |
+| `succeeded` | 成功 |
+| `failed` | 失败 |
+| `stopped` | 已停止 |
+
+**注意：**
+- 应用模板(app): Deployment就绪时节点状态变为 `succeeded`（就绪=成功），不再保持 `running`
+- 任务模板(job): 状态与K8S Job状态保持一致
+
+### Run Mode
+
+| 值 | 描述 |
+|------|------|
+| `once` | 一次性运行工作流执行一次后结束 |
+| `persistent` | 持久化运行工作流持续有效可被多次触发 |
+
+### Trigger Type
+
+| 值 | 描述 |
+|------|------|
+| `manual` | 手动触发仅可通过API启动 |
+| `http` | HTTP触发可通过HTTP请求触发工作流 |
+
+---
+
+## Common Response Schemas
+
+### SuccessResponse
+
+```json
+{
+  "message": "string"
+}
+```
+
+### ErrorResponse
+
+```json
+{
+  "code": "string",
+  "message": "string",
+  "details": {}
+}
+```
+
+### HealthResponse
+
+```json
+{
+  "status": "string",
+  "service": "string"
+}
+```
 
 ---
 
 ## App Template API
 
-管理持久化应用模板 (Deployment类型)。
+管理持久化应用模板 (Deployment类型)，支持多容器配置。
 
 ### Create App Template
 
 **POST** `/api/workflow/app-templates`
 
-创建应用模板 (支持多容器)。
+创建应用模板。
+
+**Authentication:** Required
 
 **Request Body:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| name | string | Yes | 模板名称 |
+| name | string | Yes | 模板名称 (1-128字符) |
 | description | string | No | 模板描述 |
-| scope | string | No | `global` 或 `project`，默认: `project` |
-| project_id | string | Required if scope=project | 项目ID |
-| containers | array | Yes | 容器配置列表 (至少一个) |
-| service_port | array | No | 服务端口配置 |
+| scope | string | No | 模板范围: `global`(全局) 或 `project`(项目)，默认: `project` |
+| project_id | string | Conditional | 项目ID (scope为project时必填) |
+| containers | array[ContainerConfig] | Yes | 容器配置列表 (至少一个容器) |
+| service_port | array[ServicePort] | No | K8s Service端口配置 |
 | service_name | string | No | K8s Service名称 (不指定则自动生成) |
 | create_service | boolean | No | 是否创建K8s Service默认: true |
-| service_type | string | No | Service类型: ClusterIP、LoadBalancer、NodePort |
-| replicas | integer | No | 副本数，默认: 1 |
+| service_type | string | No | Service类型: `ClusterIP`(默认), `LoadBalancer`, `NodePort` |
+| replicas | integer | No | 副本数默认: 1最小: 1 |
 
-**Container Object:**
+**ContainerConfig:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| name | string | Yes | 容器名称 |
-| image | string | Yes | 容器镜像 |
-| command | array | No | 启动命令 |
-| args | array | No | 命令参数 |
-| env_vars | array | No | 固定环境变量 `[{"name": "KEY", "value": "VALUE"}]` |
-| volume_mounts | array | No | 固定PVC挂载 (已知PVC) `[{"pvc_name": "pvc", "mount_path": "/data", "sub_path": "subdir", "read_only": false}]` |
-| input_env_vars | array | No | 输入环境变量依赖 (仅声明name，source_node_id在实例化时指定) |
-| input_volume_mounts | array | No | 输入挂载依赖 (仅声明mount_path，source_node_id在实例化时指定) |
-| privileged | boolean | No | 特权模式，默认: false |
-| image_pull_policy | string | No | `Always`, `IfNotPresent`, `Never` |
-| resources | object | No | 资源要求 (requests最小资源, limits资源限制) |
+| name | string | Yes | 容器名称 (1-128字符) |
+| image | string | Yes | 容器镜像地址 |
+| command | array[string] | No | 启动命令 |
+| args | array[string] | No | 命令参数 |
+| env_vars | array[EnvVar] | No | 固定环境变量 |
+| volume_mounts | array[VolumeMount] | No | 固定PVC挂载 |
+| input_env_vars | array[EnvVarInput] | No | 输入环境变量依赖 |
+| input_volume_mounts | array[VolumeMountInput] | No | 输入挂载依赖 |
+| privileged | boolean | No | 特权模式默认: false |
+| image_pull_policy | string | No | `Always`, `IfNotPresent`(默认), `Never` |
+| resources | object | No | 资源要求 |
 | liveness_probe | object | No | 存活探针配置 |
 | readiness_probe | object | No | 就绪探针配置 |
 
-**VolumeMount Object (固定挂载):**
+**EnvVar:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| pvc_name | string | PVC名称 (模板定义时已知) |
-| mount_path | string | 容器内挂载路径 |
-| sub_path | string | PVC子目录挂载 (可选) |
-| read_only | boolean | 只读挂载 |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | Yes | 环境变量名 |
+| value | string | Yes | 环境变量值 |
 
-**ServicePort Object (模板级 - Service端口):**
+**EnvVarInput:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| name | string | 端口名称 |
-| port | integer | Service 端口 |
-| target_port | integer | 容器目标端口 |
-| protocol | string | 协议 (默认: TCP) |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | Yes | 环境变量名 (在当前容器设置) |
+| default_value | string | No | 默认值 (当上游不可用时) |
 
-> 注意: service_ports 在模板级别定义，用于创建 Kubernetes Service。
+**VolumeMount:**
 
-**EnvVarInput Object (输入环境变量 - 模板级):**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| pvc_name | string | Yes | PVC名称 |
+| mount_path | string | Yes | 容器内挂载路径 |
+| sub_path | string | No | PVC子目录挂载 |
+| read_only | boolean | No | 只读挂载默认: false |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| name | string | 环境变量名 (在当前容器设置) |
-| default_value | string | 默认值 |
+**VolumeMountInput:**
 
-**VolumeMountInput Object (输入挂载 - 模板级):**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| mount_path | string | Yes | 容器内需要挂载的路径 |
+| sub_path | string | No | PVC子目录挂载 |
+| read_only | boolean | No | 只读挂载默认: true |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| mount_path | string | 容器内需要挂载的路径 |
-| sub_path | string | PVC子目录挂载 (可选) |
-| read_only | boolean | 只读挂载 (默认true) |
+**ServicePort:**
 
-> 注意: 输入依赖在模板中只声明需要的路径(name/mount_path)，具体的来源(source_node_id)需要在工作流模板节点配置时指定。
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | Yes | 端口名称 |
+| port | integer | Yes | Service端口 (1-65535) |
+| target_port | integer | Yes | 容器目标端口 (1-65535) |
+| protocol | string | No | 协议默认: TCP |
 
-**ResourceRequirements Object:**
+**ResourceRequirements:**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | requests | object | 最小资源请求 `{cpu: "100m", memory: "128Mi"}` |
 | limits | object | 资源限制 `{cpu: "500m", memory: "512Mi"}` |
 
-**Health Check Object:**
+**HealthCheckConfig:**
 
-| Field | Type | Description |
-|-------|------|-------------|
-| type | string | `http`, `tcp`, 或 `exec` |
-| port | integer | 健康检查端口 |
-| path | string | HTTP健康检查路径 |
-| command | array | Exec命令 |
-| initial_delay_seconds | integer | 初始延迟 |
-| period_seconds | integer | 检查周期 |
-| timeout_seconds | integer | 超时时间 |
-| failure_threshold | integer | 失败阈值 |
-| success_threshold | integer | 成功阈值 |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| type | string | Yes | 健康检查类型: `http`, `tcp`, `exec` |
+| port | integer | Conditional | 健康检查端口 (http/tcp类型必填) |
+| path | string | Conditional | HTTP健康检查路径 (http类型必填) |
+| command | array[string] | Conditional | Exec命令 (exec类型必填) |
+| initial_delay_seconds | integer | No | 初始延迟秒数默认: 10 |
+| period_seconds | integer | No | 检查周期秒数默认: 10 |
+| timeout_seconds | integer | No | 超时秒数默认: 5 |
+| failure_threshold | integer | No | 失败阈值默认: 3 |
+| success_threshold | integer | No | 成功阈值默认: 1 |
 
-**健康检查配置方式:**
+**Request Example:**
 
-可以分别为 livenessProbe 和 readinessProbe 配置健康检查：
+```json
+{
+  "name": "my-app-template",
+  "description": "My application template",
+  "scope": "project",
+  "project_id": "proj-001",
+  "containers": [
+    {
+      "name": "web-container",
+      "image": "nginx:latest",
+      "command": ["/bin/sh"],
+      "args": ["-c", "nginx -g 'daemon off;'"],
+      "env_vars": [
+        {"name": "ENV", "value": "production"}
+      ],
+      "volume_mounts": [
+        {"pvc_name": "data-pvc", "mount_path": "/data", "read_only": false}
+      ],
+      "image_pull_policy": "IfNotPresent",
+      "resources": {
+        "requests": {"cpu": "100m", "memory": "128Mi"},
+        "limit": {"cpu": "500m", "memory": "512Mi"}
+      },
+      "liveness_probe": {
+        "type": "http",
+        "path": "/healthz",
+        "port": 8080,
+        "initial_delay_seconds": 30,
+        "period_seconds": 10
+      },
+      "readiness_probe": {
+        "type": "http",
+        "path": "/ready",
+        "port": 8080,
+        "initial_delay_seconds": 5,
+        "period_seconds": 5
+      }
+    }
+  ],
+  "service_port": [
+    {"name": "http", "port": 80, "target_port": 8080}
+  ],
+  "replica": 2,
+  "create_service": true,
+  "service_type": "ClusterIP"
+}
+```
 
-1. **分别配置**: 设置 `liveness_probe` 和 `readiness_probe`
-   ```json
-   {
-     "liveness_probe": {"type": "http", "path": "/live", "port": 8080},
-     "readiness_probe": {"type": "http", "path": "/ready", "port": 8080}
-   }
-   ```
+**Response:** `201 Created`
 
-> 说明:
-> - **应用模板 (Deployment)**: 每个容器都可以配置健康检查
-> - **任务模板 (Job)**: 健康检查可选 (Job通常不需要健康检查)
+**AppTemplateResponse:**
 
-**Response:** `201 Created` - Returns AppTemplateResponse
+```json
+{
+  "id": "wf-tmpl-my-app-template-abc123",
+  "name": "my-app-template",
+  "description": "My application template",
+  "scope": "project",
+  "project_id": "proj-001",
+  "containers": [...],
+  "service_port": [...],
+  "replica": 2,
+  "service_name": "svc-my-app",
+  "create_service": true,
+  "service_type": "ClusterIP",
+  "created_by": "user-001",
+  "created_at": "2026-02-25T10:00:00",
+  "updated_at": "2026-02-25T10:00:00"
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 201 | 创建成功 |
+| 400 | 请求参数无效 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 409 | 资源冲突 |
+
+---
 
 ### List App Template
 
 **GET** `/api/workflow/app-templates`
+
+列表应用模板。
+
+**Authentication:** Required
 
 **Query Parameters:**
 
@@ -222,27 +394,149 @@ Token由认证服务验证。
 | scope | string | 按范围过滤: `global`/`project` |
 | project_id | string | 按项目ID过滤 |
 
-**Response:** Returns AppTemplateListResponse with total count and items.
+**Response:** `200 OK`
+
+**AppTemplateListResponse:**
+
+```json
+{
+  "total": 1,
+  "item": [
+    {
+      "id": "wf-tmpl-my-app-template-abc123",
+      "name": "my-app-template",
+      ...
+    }
+  ]
+}
+```
+
+---
 
 ### Get App Template
 
 **GET** `/api/workflow/app-templates/{template_id}`
 
-**Response:** Returns AppTemplateResponse
+获取应用模板详情。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| template_id | string | 模板ID |
+
+**Response:** `200 OK`
+
+**AppTemplateResponse:**
+
+```json
+{
+  "id": "wf-tmpl-my-app-template-abc123",
+  "name": "my-app-template",
+  "description": "My application template",
+  "scope": "project",
+  "project_id": "proj-001",
+  "containers": [...],
+  "service_port": [...],
+  "replica": 2,
+  "service_name": "svc-my-app",
+  "create_service": true,
+  "service_type": "ClusterIP",
+  "created_by": "user-001",
+  "created_at": "2026-02-25T10:00:00",
+  "updated_at": "2026-02-25T10:00:00"
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 获取成功 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 模板不存在 |
+
+---
 
 ### Update App Template
 
 **PUT** `/api/workflow/app-templates/{template_id}`
 
-**Request Body:** Same as create, all fields optional.
+更新应用模板。
 
-**Response:** Returns updated AppTemplateResponse
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| template_id | string | 模板ID |
+
+**Request Body:**
+
+所有创建时字段均为可选可只更新部分字段。
+
+**Request Example:**
+
+```json
+{
+  "name": "updated-name",
+  "description": "Updated description",
+  "replica": 3
+}
+```
+
+**Response:** `200 OK`
+
+**AppTemplateResponse:**
+
+```json
+{
+  "id": "wf-tmpl-my-app-template-abc123",
+  "name": "updated-name",
+  "description": "Updated description",
+  ...
+  "updated_at": "2026-02-25T11:00:00"
+}
+```
+
+---
 
 ### Delete App Template
 
-**DELETE** `/api/workflow/app-templates/{tem
+**DELETE** `/api/workflow/app-templates/{template_id}`
 
-**Response:** `200 OK` - Returns SuccessResponse
+删除应用模板。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| template_id | string | 模板ID |
+
+**Response:** `200 OK`
+
+**SuccessResponse:**
+
+```json
+{
+  "message": "App template wf-tmpl-my-app-template-abc123 deleted successfully"
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 删除成功 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 模板不存在 |
 
 ---
 
@@ -256,220 +550,383 @@ Token由认证服务验证。
 
 创建Job模板 (支持多容器)。
 
+**Authentication:** Required
+
 **Request Body:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| name | string | Yes | 模板名称 |
-| description | string | No | 描述 |
-| scope | string | No | `global` 或 `project`，默认: `project` |
-| project_id | string | Required if scope=project | 项目ID |
-| containers | array | Yes | 容器配置列表 (至少一个) |
-| ttl_seconds_after_finished | integer | No | 完成后TTL，默认: 3600 |
-| backoff_limit | integer | No | 重试次数，默认: 3 |
+| name | string | Yes | 模板名称 (1-128字符) |
+| description | string | No | 模板描述 |
+| scope | string | No | 模板范围: `global` 或 `project`，默认: `project` |
+| project_id | string | Conditional | 项目ID (scope为project时必填) |
+| containers | array[ContainerConfig] | Yes | 容器配置列表 (至少一个) |
+| ttl_seconds_after_finished | integer | No | 完成后TTL秒数默认: 3600 |
+| backoff_limit | integer | No | 重试次数默认: 3 |
 
-**Response:** `201 Created` - Returns JobTemplateResponse
+> 注意: 任务模板容器不支持健康检查 (liveness_probe, readiness_probe)。
+
+**Request Example:**
+
+```json
+{
+  "name": "my-job-template",
+  "description": "My batch job",
+  "scope": "project",
+  "project_id": "proj-001",
+  "containers": [
+    {
+      "name": "job-container",
+      "image": "my-job:latest",
+      "command": ["/bin/run.sh"],
+      "env_vars": [
+        {"name": "BATCH_SIZE", "value": "100"}
+      ]
+    }
+  ],
+  "ttl_seconds_after_finished": 1800,
+  "backoff_limit": 5
+}
+```
+
+**Response:** `201 Created`
+
+**JobTemplateResponse:**
+
+```json
+{
+  "id": "wf-tmpl-my-job-template-def456",
+  "name": "my-job-template",
+  "description": "My batch job",
+  "scope": "project",
+  "project_id": "proj-001",
+  "containers": [...],
+  "ttl_seconds_after_finished": 1800,
+  "backoff_limit": 5,
+  "created_by": "user-001",
+  "created_at": "2026-02-25T10:00:00",
+  "updated_at": "2026-02-25T10:00:00"
+}
+```
+
+---
 
 ### List Job Template
 
 **GET** `/api/workflow/job-templates`
 
-**Query Parameters:** Same as App Template
+列表任务模板。
 
-**Response:** Returns JobTemplateListResponse
+**Authentication:** Required
+
+**Query Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scope | string | 按范围过滤: `global`/`project` |
+| project_id | string | 按项目ID过滤 |
+
+**Response:** `200 OK`
+
+**JobTemplateListResponse:**
+
+```json
+{
+  "total": 1,
+  "item": [
+    {
+      "id": "wf-tmpl-my-job-template-def456",
+      "name": "my-job-template",
+      ...
+    }
+  ]
+}
+```
+
+---
 
 ### Get Job Template
 
 **GET** `/api/workflow/job-templates/{template_id}`
 
-**Response:** Returns JobTemplateResponse
+获取任务模板详情。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| template_id | string | 模板ID |
+
+**Response:** `200 OK`
+
+**JobTemplateResponse:**
+
+```json
+{
+  "id": "wf-tmpl-my-job-template-def456",
+  "name": "my-job-template",
+  "description": "My batch job",
+  "scope": "project",
+  "project_id": "proj-001",
+  "containers": [...],
+  "ttl_seconds_after_finished": 1800,
+  "backoff_limit": 5,
+  "created_by": "user-001",
+  "created_at": "2026-02-25T10:00:00",
+  "updated_at": "2026-02-25T10:00:00"
+}
+```
+
+---
 
 ### Update Job Template
 
 **PUT** `/api/workflow/job-templates/{template_id}`
 
-**Response:** Returns updated JobTemplateResponse
+更新任务模板。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| template_id | string | 模板ID |
+
+**Request Body:**
+
+所有创建时字段均为可选。
+
+**Request Example:**
+
+```json
+{
+  "ttl_seconds_after_finished": 3600
+}
+```
+
+**Response:** `200 OK`
+
+**JobTemplateResponse:**
+
+```json
+{
+  "id": "wf-tmpl-my-job-template-def456",
+  "name": "my-job-template",
+  ...
+  "ttl_seconds_after_finished": 3600,
+  "updated_at": "2026-02-25T11:00:00"
+}
+```
+
+---
 
 ### Delete Job Template
 
 **DELETE** `/api/workflow/job-templates/{template_id}`
 
-**Response:** Returns SuccessResponse
+删除任务模板。
 
----
+**Authentication:** Required
 
-## Workflow Template API
+**Path Parameters:**
 
-管理工作流编排模板，支持拖拽节点定义。
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| template_id | string | 模板ID |
 
-### Create Workflow Template
+**Response:** `200 OK`
 
-**POST** `/api/workflow/workflow-templates`
+**SuccessResponse:**
 
-**Request Body:**
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| name | string | Yes | 模板名称 |
-| description | string | No | 描述 |
-| scope | string | No | `global` 或 `project` |
-| project_id | string | Required if scope=project | 项目ID |
-| nodes | array | Yes | 工作流节点 |
-| edges | array | Yes | 工作流边/连接 |
-
-**Node Object:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| node_id | string | 唯一节点ID |
-| node_type | string | `app` 或 `job` |
-| template_id | string | 引用的模板ID |
-| name | string | 显示名称 |
-| position | object | 画布位置 `{x, y}` |
-| env_vars | array | 覆盖/添加固定环境变量 |
-| volume_mounts | array | 覆盖/添加固定PVC挂载 |
-| input_env_vars | array | 输入环境变量 (使用DependencyEnvVar，指定source_node_id) |
-| input_volume_mounts | array | 输入挂载 (使用DependencyVolumeMount，指定source_node_id) |
-| resources | object | 覆盖资源要求 |
-| depends_on | array | 上游节点依赖 |
-
-**DependencyEnvVar Object (工作流节点级 - 指定具体来源):**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| name | string | 环境变量名 (在当前容器设置) |
-| source_node_id | string | 上游节点ID |
-| default_value | string | 默认值 |
-
-**DependencyVolumeMount Object (工作流节点级 - 指定具体来源):**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| mount_path | string | 当前容器的挂载路径 |
-| sub_path | string | PVC子目录挂载 (可选) |
-| source_node_id | string | 上游节点ID |
-| source_pvc_name | string | 指定PVC名 (可选) |
-| read_only | boolean | 只读挂载 |
-
-**Edge Object:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| edge_id | string | 唯一边ID |
-| source | string | 源节点ID |
-| target | string | 目标节点ID |
-| shared_pvc | string | 共享的PVC名称 |
-
-**Response:** `201 Created` - Returns WorkflowTemplateResponse
-
-### List Workflow Template
-
-**GET** `/api/workflow/workflow-templates`
-
-**Query Parameters:** Same as App Template
-
-**Response:** Returns WorkflowTemplateListResponse
-
-### Get Workflow Template
-
-**GET** `/api/workflow/workflow-templates/{template_id}`
-
-**Response:** Returns WorkflowTemplateResponse
-
-### Update Workflow Template
-
-**PUT** `/api/workflow/workflow-templates/{template_id}`
-
-**Response:** Returns updated WorkflowTemplateResponse
-
-### Delete Workflow Template
-
-**DELETE** `/api/workflow/workflow-templates/{template_id}`
-
-**Response:** Returns SuccessResponse
+```json
+{
+  "message": "Job template wf-tmpl-my-job-template-def456 deleted successfully"
+}
+```
 
 ---
 
 ## Workflow Instance API
 
 管理工作流实例生命周期 (创建、运行、删除、日志)。
+工作流实例中的每个节点直接引用应用模板(AppTemplate)或任务模板(JobTemplate)。
+支持两种创建方式：
+1. **直接创建**: 创建实例时直接指定所有节点和边
+2. **先创建空白实例**: 先创建无节点的空白实例，然后通过节点API逐个添加节点
 
 ### Create Workflow Instance
 
 **POST** `/api/workflow/workflow-instances`
 
-创建工作流实例，支持两种运行模式：
-- **once**: 一次性运行，工作流执行一次后结束
-- **persistent**: 持久化运行，工作流持续有效，可通过触发器多次触发
+创建工作流实例。
+
+**Authentication:** Required
 
 **Request Body:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| name | string | Yes | 实例名称 |
+| name | string | Yes | 实例名称 (1-128字符) |
 | description | string | No | 描述 |
-| template_id | string | Yes | 工作流模板ID |
 | project_id | string | Yes | 项目ID |
+| nodes | array[WorkflowNodeConfig] | No | 工作流节点列表 (可为空后续通过节点API添加) |
+| edges | array[WorkflowEdgeConfig] | No | 工作流边/连接列表 |
 | run_mode | string | No | 运行模式: `once`(默认) 或 `persistent` |
 | trigger_type | string | No | 触发器类型: `manual`(默认) 或 `http` |
-| trigger_enabled | boolean | No | 是否启用触发器 (默认: false，persistent模式可用) |
-| node_configs | object | No | 节点级覆盖配置 |
+| trigger_enabled | boolean | No | 是否启用触发器默认: false |
 
-**Response:** `201 Created` - Returns WorkflowInstanceResponse
+**WorkflowNodeConfig:**
 
-### Update Workflow Instance
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| node_id | string | Yes | 唯一节点ID |
+| node_type | string | Yes | 节点类型: `app` 或 `job` |
+| template_id | string | Yes | 应用模板ID或任务模板ID |
+| name | string | Yes | 显示名称 |
+| position | object | No | 画布位置 `{x: 0, y: 0}` |
+| env_vars | array[EnvVar] | No | 覆盖/添加固定环境变量 (用于满足模板依赖) |
+| volume_mounts | array[VolumeMount] | No | 覆盖/添加固定PVC挂载 (用于满足模板依赖) |
+| resources | object | No | 覆盖资源要求 |
+| timeout_seconds | integer | No | 节点超时时间(秒): 应用模板默认300(5分钟), 任务模板默认3600(1小时), 不含镜像拉取时间 |
 
-**PUT** `/api/workflow/workflow-instances/{instance_id}`
+**注意：** 不同节点之间没有依赖关系，创建节点时不需要指定 `input_env_vars`、`input_volume_mounts` 和 `depends_on`，系统会在创建时校验是否满足模板依赖条件。
 
-更新工作流实例配置。
+**DependencyEnvVar:**
 
-**Request Body:**
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | Yes | 环境变量名 (在当前容器设置) |
+| source_node_id | string | Yes | 上游节点ID |
+| default_value | string | No | 默认值 |
 
-| Field | Type | Description |
-|-------|------|-------------|
-| name | string | 实例名称 |
-| description | string | 描述 |
-| trigger_enabled | boolean | 启用/禁用触发器 (persistent模式) |
-| is_active | boolean | 设置工作流激活状态 (persistent模式) |
+**DependencyVolumeMount:**
 
-**Response:** Returns updated WorkflowInstanceResponse
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| mount_path | string | Yes | 当前容器的挂载路径 |
+| sub_path | string | No | PVC子目录挂载 |
+| source_node_id | string | Yes | 上游节点ID |
+| source_pvc_name | string | No | 指定PVC名称 (可选) |
+| read_only | boolean | No | 只读挂载默认: true |
 
-### Activate Workflow Instance
+**WorkflowEdgeConfig:**
 
-**POST** `/api/workflow/workflow-instances/{instance_id}/activate`
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| edge_id | string | Yes | 唯一边ID |
+| source | string | Yes | 源节点ID |
+| target | string | Yes | 目标节点ID |
+| shared_pvc | string | No | 共享的PVC名称 |
 
-激活持久化工作流实例，使其可以接受触发器触发。
+**Request Example:**
 
-**Response:** Returns WorkflowInstanceResponse
+```json
+{
+  "name": "my-workflow-instance",
+  "description": "Production workflow run",
+  "project_id": "proj-001",
+  "nodes": [
+    {
+      "node_id": "node-001",
+      "node_type": "app",
+      "template_id": "wf-tmpl-app-001",
+      "name": "Frontend Service",
+      "position": {"x": 100, "y": 100},
+      "env_vars": [{"name": "API_URL", "value": "http://backend:8080"}]
+    },
+    {
+      "node_id": "node-002",
+      "node_type": "job",
+      "template_id": "wf-tmpl-job-001",
+      "name": "Data Processor",
+      "position": {"x": 100, "y": 300},
+      "depends_on": ["node-001"],
+      "input_env_vars": [
+        {"name": "SOURCE_URL", "source_node_id": "node-001", "default_value": "http://default"}
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "edge_id": "edge-001",
+      "source": "node-001",
+      "target": "node-002"
+    }
+  ],
+  "run_mode": "once",
+  "trigger_type": "manual"
+}
+```
 
-### Deactivate Workflow Instance
+**Response:** `201 Created`
 
-**POST** `/api/workflow/workflow-instances/{instance_id}/deactivate`
+**WorkflowInstanceResponse:**
 
-停用持久化工作流实例，拒绝触发器触发。
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "name": "my-workflow-instance",
+  "description": "Production workflow run",
+  "project_id": "proj-001",
+  "status": "pending",
+  "run_mode": "once",
+  "trigger_type": "manual",
+  "trigger_enabled": false,
+  "trigger_url": null,
+  "is_active": true,
+  "run_count": 0,
+  "last_run_at": null,
+  "nodes": [
+    {
+      "id": "wf-node-001-mno345",
+      "node_id": "node-001",
+      "node_type": "app",
+      "template_id": "wf-tmpl-app-001",
+      "name": "Frontend Service",
+      "status": "pending",
+      "k8s_resource_name": null,
+      "k8s_resource_type": null,
+      "depends_on": [],
+      "service_name": null,
+      "started_at": null,
+      "finished_at": null,
+      "message": null,
+      "input_env_vars": [],
+      "input_volume_mounts": [],
+      "created_at": "2026-02-25T10:00:00"
+    }
+  ],
+  "created_by": "user-001",
+  "started_at": null,
+  "finished_at": null,
+  "created_at": "2026-02-25T10:00:00",
+  "updated_at": "2026-02-25T10:00:00"
+}
+```
 
-**Response:** Returns WorkflowInstanceResponse
+**Status Codes:**
 
-### Trigger Workflow via HTTP
+| Code | Description |
+|------|-------------|
+| 201 | 创建成功 |
+| 400 | 请求参数无效 |
+| 401 | 未认证 |
+| 403 | 无权限使用模板 |
+| 404 | 模板不存在 |
+| 409 | 资源冲突 |
 
-**POST** `/api/workflow/workflow-instances/triggers/{instance_id}`
-
-通过HTTP请求触发持久化工作流实例执行。
-
-> 注意：此端点需要认证。如需无认证触发，需额外配置。
-
-**Response:** Returns SuccessResponse
-
-**触发器工作流程：**
-
-1. 创建persistent模式的工作流实例，设置 `trigger_type: "http"`, `trigger_enabled: true`
-2. 调用激活端点 `POST /activate` 使工作流处于激活状态
-3. 外部系统通过HTTP POST请求触发工作流执行
-4. 工作流执行完成后保持节点状态，等待下一次触发
+---
 
 ### List Workflow Instance
 
 **GET** `/api/workflow/workflow-instances`
+
+列表工作流实例。
+
+**Authentication:** Required
 
 **Query Parameters:**
 
@@ -477,57 +934,655 @@ Token由认证服务验证。
 |-----------|------|-------------|
 | project_id | string | 按项目ID过滤 |
 | status | string | 按状态过滤: `pending`, `running`, `succeeded`, `failed`, `stopped` |
-| template_id | string | 按模板ID过滤 |
 
-**Response:** Returns WorkflowInstanceListResponse
+**Response:** `200 OK`
+
+**WorkflowInstanceListResponse:**
+
+```json
+{
+  "total": 1,
+  "item": [
+    {
+      "id": "wf-inst-my-workflow-jkl012",
+      "name": "my-workflow-instance",
+      ...
+    }
+  ]
+}
+```
+
+---
 
 ### Get Workflow Instance
 
 **GET** `/api/workflow/workflow-instances/{instance_id}`
 
-**Response:** Returns WorkflowInstanceResponse
+获取工作流实例详情。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse:**
+
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "name": "my-workflow-instance",
+  "description": "Production workflow run",
+  "project_id": "proj-001",
+  "status": "running",
+  "run_mode": "once",
+  "trigger_type": "manual",
+  "trigger_enabled": false,
+  "trigger_url": null,
+  "is_active": true,
+  "run_count": 1,
+  "last_run_at": "2026-02-25T10:05:00",
+  "nodes": [
+    {
+      "id": "wf-node-001-mno345",
+      "node_id": "node-001",
+      "node_type": "app",
+      "template_id": "wf-tmpl-app-001",
+      "name": "Frontend Service",
+      "status": "running",
+      "k8s_resource_name": "wf-jkl012-node-001",
+      "k8s_resource_type": "Deployment",
+      "depends_on": [],
+      "service_name": "svc-wf-jkl012-node-001",
+      "started_at": "2026-02-25T10:05:00",
+      "finished_at": null,
+      "message": null,
+      "input_env_vars": [],
+      "input_volume_mounts": [],
+      "created_at": "2026-02-25T10:00:00"
+    }
+  ],
+  "created_by": "user-001",
+  "started_at": "2026-02-25T10:05:00",
+  "finished_at": null,
+  "created_at": "2026-02-25T10:00:00",
+  "updated_at": "2026-02-25T10:05:00"
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 获取成功 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
+
+---
+
+### Update Workflow Instance
+
+**PUT** `/api/workflow/workflow-instances/{instance_id}`
+
+更新工作流实例配置。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Request Body:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| name | string | 实例名称 |
+| description | string | 描述 |
+| trigger_enabled | boolean | 启用/禁用触发器 (仅persistent模式可用) |
+| is_active | boolean | 设置工作流激活状态 (仅persistent模式可用) |
+
+**Request Example:**
+
+```json
+{
+  "description": "Updated description"
+}
+```
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse:**
+
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "name": "my-workflow-instance",
+  "description": "Updated description",
+  ...
+  "updated_at": "2026-02-25T11:00:00"
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 更新成功 |
+| 400 | 请求参数无效 (如对once模式设置trigger) |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
+
+---
 
 ### Start Workflow Instance
 
 **POST** `/api/workflow/workflow-instances/{instance_id}/start`
 
-启动工作流并为每个节点创建K8S资源 (Deployment/Job 和 Service)。
+启动工作流实例。
 
-**Response:** Returns WorkflowInstanceResponse with updated status
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Description:**
+
+- 使用WorkflowEngine进行拓扑执行和依赖检查
+- 检测并防止循环依赖
+- 并发执行就绪节点
+- 处理环境变量和挂载依赖
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse:**
+
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "name": "my-workflow-instance",
+  "status": "running",
+  ...
+  "started_at": "2026-02-25T10:10:00"
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 启动成功 |
+| 400 | 状态非pending/stopped无法启动 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
+| 500 | 启动失败 |
+
+---
+
+### Sync Workflow Status
+
+**POST** `/api/workflow/workflow-instances/{instance_id}/sync-status`
+
+同步工作流实例状态。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Description:**
+
+- 从K8S获取实时状态并同步
+- 更新所有节点状态
+- 触发执行就绪节点
+- 可手动或定期调用
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse:**
+
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "status": "running",
+  "nodes": [
+    {
+      "id": "wf-node-001-mno345",
+      "status": "succeeded",
+      ...
+    }
+  ],
+  ...
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 同步成功 |
+| 400 | 状态非running无法同步 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
+| 500 | 同步失败 |
+
+---
 
 ### Stop Workflow Instance
 
 **POST** `/api/workflow/workflow-instances/{instance_id}/stop`
 
-停止所有运行中的节点并删除关联的K8S资源。
+停止工作流实例。
 
-**Response:** Returns WorkflowInstanceResponse
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Description:**
+
+- 停止所有运行中的节点
+- 删除关联的K8S资源 (Deployment/Job/Service)
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse:**
+
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "name": "my-workflow-instance",
+  "status": "stopped",
+  ...
+  "finished_at": "2026-02-25T11:30:00"
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 停止成功 |
+| 400 | 状态非running无法停止 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
+
+---
+
+### Activate Workflow Instance
+
+**POST** `/api/workflow/workflow-instances/{instance_id}/activate`
+
+激活持久化工作流实例。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Description:**
+
+- 激活持久化工作流实例使其可以接受触发器触发
+- 仅对persistent模式有效
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse:**
+
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "is_active": true,
+  ...
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 激活成功 |
+| 400 | 非persistent模式无法激活 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
+
+---
+
+### Deactivate Workflow Instance
+
+**POST** `/api/workflow/workflow-instances/{instance_id}/deactivate`
+
+停用持久化工作流实例。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Description:**
+
+- 停用持久化工作流实例拒绝触发器触发
+- 不停止运行中的工作流
+- 仅对persistent模式有效
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse:**
+
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "is_active": false,
+  ...
+}
+```
+
+---
 
 ### Delete Workflow Instance
 
 **DELETE** `/api/workflow/workflow-instances/{instance_id}`
 
-删除工作流实例及所有关联的K8S资源。
+删除工作流实例。
 
-**Response:** Returns SuccessResponse
+**Authentication:** Required
 
-### Get Instance Status
+**Path Parameters:**
 
-**GET** `/api/workflow/workflow-instances/{instance_id}/status`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
 
-从K8S获取实时状态同步。
+**Description:**
 
-**Response:**
+- 如果运行中则先停止
+- 删除所有关联的K8S资源
+- 从数据库删除实例和节点
+
+**Response:** `200 OK`
+
+**SuccessResponse:**
 
 ```json
 {
-  "instance_id": "string",
-  "status": "pending|running|succeeded|failed|stopped",
-  "nodes": [...],
-  "started_at": "datetime",
-  "finished_at": "datetime"
+  "message": "Workflow instance wf-inst-my-workflow-jkl012 deleted successfully"
 }
 ```
+
+---
+
+## Workflow Node API
+
+管理工作流实例中的节点。每个节点由应用模板(AppTemplate)或任务模板(JobTemplate)实例化而来。
+
+### Create Workflow Node
+
+**POST** `/api/workflow/workflow-instances/{instance_id}/nodes`
+
+在工作流实例中添加节点。
+
+**注意：**
+- 不同节点之间没有依赖关系，无需指定 `depends_on`
+- `env_vars` 和 `volume_mounts` 用于实例化模板时传递环境变量和挂载参数以满足模板依赖要求
+- 创建时会校验是否满足指定ID模板的依赖条件，如果不满足则返回未满足的依赖详情
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Request Body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| node_id | string | Yes | 唯一节点ID |
+| node_type | string | Yes | 节点类型: `app` 或 `job` |
+| template_id | string | Yes | 应用模板ID或任务模板ID |
+| name | string | Yes | 显示名称 |
+| position | object | No | 画布位置 `{x: 0, y: 0}` |
+| env_vars | array[EnvVar] | No | 覆盖/添加固定环境变量 (用于满足模板依赖) |
+| volume_mounts | array[VolumeMount] | No | 覆盖/添加固定PVC挂载 (用于满足模板依赖) |
+| resources | object | No | 覆盖资源要求 |
+| timeout_seconds | integer | No | 节点超时时间(秒)
+
+**Response:** `201 Created`
+
+**WorkflowNodeInstanceResponse:**
+
+```json
+{
+  "id": "wf-node-001-mno345",
+  "node_id": "node-001",
+  "node_type": "app",
+  "template_id": "wf-tmpl-app-001",
+  "name": "Frontend Service",
+  "status": "pending",
+  "k8s_resource_name": null,
+  "k8s_resource_type": null,
+  "depends_on": [],
+  "service_name": null,
+  "started_at": null,
+  "finished_at": null,
+  "message": null,
+  "input_env_vars": [],
+  "input_volume_mounts": [],
+  "created_at": "2026-02-25T10:00:00"
+}
+```
+
+**错误响应 - 依赖不满足 (400 Bad Request):**
+
+```json
+{
+  "code": "VALIDATION_ERROR",
+  "message": "Template dependency not satisfied for node node1: [...]",
+  "details": [
+    {
+      "type": "env_var",
+      "container": "main",
+      "name": "DATABASE_URL",
+      "message": "Container 'main' requires env_var 'DATABASE_URL' but not provided"
+    },
+    {
+      "type": "volume_mount",
+      "container": "main",
+      "mount_path": "/data",
+      "message": "Container 'main' requires volume_mount at '/data' but not provided"
+    }
+  ]
+}
+```
+
+---
+
+### List Workflow Nodes
+
+**GET** `/api/workflow/workflow-instances/{instance_id}/nodes`
+
+列出工作流实例中的所有节点。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Response:** `200 OK`
+
+**Response:** Array of WorkflowNodeInstanceResponse
+
+---
+
+### Get Workflow Node
+
+**GET** `/api/workflow/workflow-instances/{instance_id}/nodes/{node_instance_id}`
+
+获取工作流节点详情。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+| node_instance_id | string | 节点实例ID |
+
+**Response:** `200 OK`
+
+**WorkflowNodeInstanceResponse**
+
+---
+
+### Update Workflow Node
+
+**PUT** `/api/workflow/workflow-instances/{instance_id}/nodes/{node_instance_id}`
+
+更新工作流节点配置。
+
+**注意：** 不同节点之间没有依赖关系无需指定 `depends_on`
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+| node_instance_id | string | 节点实例ID |
+
+**Request Body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | No | 显示名称 |
+| position | object | No | 画布位置 |
+| env_vars | array[EnvVar] | No | 覆盖固定环境变量 |
+| volume_mounts | array[VolumeMount] | No | 覆盖固定PVC挂载 |
+| resources | object | No | 覆盖资源要求 |
+
+**Response:** `200 OK`
+
+**WorkflowNodeInstanceResponse**
+
+---
+
+### Delete Workflow Node
+
+**DELETE** `/api/workflow/workflow-instances/{instance_id}/nodes/{node_instance_id}`
+
+删除工作流节点。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+| node_instance_id | string | 节点实例ID |
+
+**Description:**
+
+- 节点必须处于pending或stopped状态
+- 删除节点后需要手动更新edges移除相关连线
+
+**Response:** `200 OK`
+
+**SuccessResponse:**
+
+```json
+{
+  "message": "Workflow node wf-node-001-mno345 deleted successfully"
+}
+```
+
+---
+
+## Workflow Edge API
+
+管理工作流实例中节点之间的连接线。
+
+### Update Workflow Edge
+
+**POST** `/api/workflow/workflow-instances/{instance_id}/edges`
+
+添加、更新或删除工作流边。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Request Body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| edge_id | string | Conditional | 边ID (add/update/delete操作需要) |
+| source | string | Conditional | 源节点ID (add操作需要) |
+| target | string | Conditional | 目标节点ID (add操作需要) |
+| shared_pvc | string | No | 共享PVC名称 |
+| action | string | Yes | 操作: `add`, `update`, `delete` |
+
+**Request Example (add):**
+
+```json
+{
+  "edge_id": "edge-001",
+  "source": "node-001",
+  "target": "node-002",
+  "action": "add"
+}
+```
+
+**Request Example (delete):**
+
+```json
+{
+  "edge_id": "edge-001",
+  "action": "delete"
+}
+```
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse**
+
+---
 
 ### Get Node Logs
 
@@ -535,15 +1590,98 @@ Token由认证服务验证。
 
 获取指定节点的Pod日志。
 
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+| node_id | string | 节点ID |
+
 **Query Parameters:**
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| tail_lines | integer | 行数，默认: 100，最大: 10000 |
-| previous | boolean | 获取上一个容器的日志 |
+| tail_lines | integer | 行数默认: 100最大: 10000 |
 | container | string | 多容器Pod的容器名称 |
+| previous | boolean | 获取上一个容器的日志默认: false |
+| timestamp | boolean | 包含时间戳默认: true |
 
-**Response:** Returns PodLogResponse
+**Response:** `200 OK`
+
+**PodLogResponse:**
+
+```json
+{
+  "resource_name": "wf-jkl012-node-001",
+  "pod_name": "wf-jkl012-node-001-abc123-def456",
+  "namespace": "secflow-proj-001",
+  "logs": "2026-02-25T10:05:00 Starting application...\n2026-02-25T10:05:01 Server listening on port 8080",
+  "container": "web-container",
+  "previous": false
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 获取成功 |
+| 400 | 节点未启动无法获取日志 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例或节点不存在 |
+
+---
+
+## Trigger API
+
+### Trigger Workflow via HTTP
+
+**POST** `/api/workflow/trigger/{instance_id}`
+
+通过HTTP请求触发持久化工作流实例执行。
+
+**Authentication:** Not Required (内部使用)
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Description:**
+
+- 仅对persistent模式、HTTP触发器类型有效
+- 需要trigger_enabled=true和is_active=true
+- 工作流异步执行
+
+**触发器工作流程:**
+
+1. 创建persistent模式工作流实例设置 `trigger_type: "http"`, `trigger_enabled: true`
+2. 调用激活端点 `POST /{instance_id}/activate` 使工作流处于激活状态
+3. 外部系统通过HTTP POST请求触发工作流执行
+4. 工作流执行完成后保持节点状态等待下一次触发
+
+**Response:** `200 OK`
+
+**SuccessResponse:**
+
+```json
+{
+  "message": "Workflow wf-inst-my-workflow-jkl012 triggered successfully"
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 触发成功 |
+| 400 | 触发器未启用/非激活状态/非HTTP类型/已运行中 |
+| 404 | 实例不存在 |
+| 500 | 触发失败 |
 
 ---
 
@@ -555,7 +1693,9 @@ Token由认证服务验证。
 
 健康检查端点。
 
-**Response:**
+**Authentication:** Not Required
+
+**Response:** `200 OK`
 
 ```json
 {
@@ -564,13 +1704,17 @@ Token由认证服务验证。
 }
 ```
 
+---
+
 ### Ready Check
 
 **GET** `/api/workflow/ready`
 
 就绪检查端点。
 
-**Response:**
+**Authentication:** Not Required
+
+**Response:** `200 OK`
 
 ```json
 {
@@ -580,51 +1724,7 @@ Token由认证服务验证。
 
 ---
 
-## Data Model
-
-### Template Scope
-
-- `global`: 全局模板，所有项目可见
-- `project`: 项目级模板，仅在项目内可见
-
-### Image Pull Policy
-
-- `Always`: 总是拉取镜像
-- `IfNotPresent`: 仅当不存在时拉取
-- `Never`: 从不拉取
-
-### Workflow Status
-
-- `pending`: 未启动
-- `running`: 正在执行
-- `succeeded`: 成功完成
-- `failed`: 执行失败
-- `stopped`: 用户停止
-
-### Node Type
-
-- `app`: Deployment应用
-- `job`: 一次性Job
-
-### Run Mode
-
-- `once`: 一次性运行，工作流执行一次后结束
-- `persistent`: 持久化运行，工作流持续有效，可通过触发器多次触发
-
-### Trigger Type
-
-- `manual`: 手动触发，仅可通过API手动启动
-- `http`: HTTP触发，可通过HTTP请求触发工作流执行
-
-### Service Type
-
-- `ClusterIP`: 集群内部服务 (默认)
-- `LoadBalancer`: 负载均衡器类型
-- `NodePort`: 节点端口类型
-
----
-
-## Error Response
+## Error Codes
 
 所有错误遵循以下格式:
 
@@ -714,14 +1814,39 @@ app:
 |-----------|-------------|
 | secflow_platform_workflow_app_template | 应用模板 |
 | secflow_platform_workflow_job_template | 任务模板 |
-| secflow_platform_workflow_workflow_template | 工作流模板 |
 | secflow_platform_workflow_workflow_instance | 工作流实例 |
+| secflow_platform_workflow_workflow_node_instance | 工作流节点实例 |
 
 ---
 
 ## Changelog
 
-### v2.3.0 (2026-02-24)
+### v3.1.0 (2026-02-25)
+
+- **节点状态管理优化**:
+  - 应用模板(APP): Deployment就绪时标记为SUCCEEDED（就绪=成功），不再保持RUNNING状态
+  - 任务模板(JOB): 状态与K8S Job状态保持一致
+- **超时检测**: 新增节点级别超时管理
+  - 应用模板默认超时300秒(5分钟)
+  - 任务模板默认超时3600秒(1小时)
+  - 超时时间不含镜像拉取时间（从节点启动后开始计算）
+- **工作流失败处理优化**: 节点失败后等待其他运行中节点完成或超时再判定工作流失败
+
+### v3.0.0 (2026-02-25)
+
+- **删除工作流模板**: 不再存在工作流模板这一层概念
+- **工作流实例直接引用模板**: 工作流实例中的每个节点直接引用应用模板或任务模板
+- **简化架构**: 工作流实例直接存储节点和边的配置
+
+### v2.4.0 (2026-02-25)
+
+- **API手册完整化**: 详细列出每个API的请求和响应定义
+- **新增同步状态端点**: `/workflow-instances/{instance_id}/sync-status` 用于手动同步K8S状态
+- **响应示例完善**: 为每个API添加详细的响应JSON示例
+- **字段说明细化**: 补充完整的请求/响应字段类型和描述
+- **状态码明确**: 为每个API明确HTTP状态码
+
+### v2.3.0 (2026-02-25)
 
 - **健康检查配置增强**: 应用模板和任务模板的容器现在支持分别配置 livenessProbe 和 readinessProbe
   - 新增 `liveness_probe` 字段: 单独配置存活探针
@@ -729,43 +1854,30 @@ app:
 - **健康检查作用范围调整**:
   - 应用模板 (Deployment): 每个容器都可以配置健康检查
   - 任务模板 (Job): 健康检查可选
-- **依赖对象定义修正**:
-  - 应用模板/任务模板的容器配置中使用 `EnvVarInput` 和 `VolumeMountInput` (仅声明需求，不含source_node_id)
-  - 工作流节点配置中使用 `DependencyEnvVar` 和 `DependencyVolumeMount` (包含source_node_id)
-  - 从应用模板 Container Object 说明中移除了错误的 DependencyEnvVar/DependencyVolumeMount
+- **节点依赖关系简化**:
+  - 不同节点之间没有依赖关系，创建节点时不再需要指定 `depends_on`、`input_env_vars`、`input_volume_mounts`
+  - 节点使用 `env_vars` 和 `volume_mounts` 传递环境变量和挂载参数以满足模板依赖要求
+  - 创建节点时自动校验模板依赖条件如果不满足返回未满足的依赖详情
 
 ### v2.2.0 (2026-02-14)
 
 - **运行模式**: 工作流实例支持两种运行模式
-  - `once`: 一次性运行，工作流执行一次后结束
-  - `persistent`: 持久化运行，工作流持续有效，节点可以是app(Deployment)或job(Job)
+  - `once`: 一次性运行工作流执行一次后结束
+  - `persistent`: 持久化运行工作流持续有效，节点可以是app(Deployment)或job(Job)
 - **触发器机制**:
   - 支持手动触发 (`manual`) 和 HTTP触发 (`http`)
-  - 持久化工作流可启用触发器，通过HTTP请求自动触发执行
+  - 持久化工作流可启用触发器通过HTTP请求自动触发执行
   - 提供激活/停用端点控制工作流是否接受触发
-- **依赖定义重构**:
-  - 模板级: `input_env_vars`, `input_volume_mounts` (只声明需求)
-  - 工作流节点级: `input_env_vars`, `input_volume_mounts` (指定source_node_id)
 
 ### v2.1.0 (2026-02-14)
 
-- **PVC子目录挂载**: VolumeMount 和 DependencyVolumeMount 新增 `sub_path` 字段，支持挂载PVC的子目录
-  - 例如: `sub_path: "subdir/data"` 可挂载PVC中的 `subdir/data` 目录
-- **资源要求定义**: 新增 ResourceRequirements schema，明确定义:
-  - `requests`: 最小资源请求 (CPU、内存)
-  - `limits`: 资源限制 (CPU、内存)
-- **工作流节点资源继承**: 工作流模板节点支持继承任务模板的资源配置，并可在节点级别覆盖
-  - 节点级 `resources` 字段可覆盖模板中定义的资源
-  - 支持只覆盖 requests 或 limits，或同时覆盖
+- **PVC子目录挂载**: VolumeMount 和 DependencyVolumeMount 新增 `sub_path` 字段支持挂载PVC的子目录
+- **资源要求定义**: 新增 ResourceRequirements schema 明确定义request和limit
 
 ### v2.0.0 (2024-02-13)
 
 - **多容器支持**: 应用模板和任务模板现在支持多个容器
-  - 每个容器可独立定义镜像、命令、环境变量、挂载
-  - 每个容器可定义依赖环境变量和依赖挂载 (从上游节点获取值)
-  - 健康检查仅对第一个容器生效
-- **模板结构变更**: 移除了单容器字段 (image, command, args等)，改为 `containers` 数组
-- **依赖解析增强**: 支持容器级依赖和节点级依赖的混合使用
+- **模板结构变更**: 改为 `containers` 数组
 
 ### v1.0.0 (2024-02-12)
 
