@@ -23,10 +23,219 @@ from app.schemas import (
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
 from app.services import get_k8s_client, WorkflowEngine
+from app.config import get_config
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/workflow-instances", tags=["Workflow Instances"])
+
+
+def get_k8s_client_auto():
+    """自动选择K8S客户端模式"""
+    config = get_config()
+    if config.k8s_service and config.k8s_service.enabled:
+        from app.services.k8s_service_client import get_k8s_service_client
+        return get_k8s_service_client()
+    else:
+        return get_k8s_client()
+
+
+# ============ 初始化工作流 API ============
+
+
+@router.post("/{instance_id}/initialize", response_model=WorkflowInstanceResponse)
+async def initialize_workflow_instance(
+    instance_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    初始化工作流实例
+
+    对于应用模板(AppTemplate)形成的节点:
+    - 创建节点的配置
+    - 创建对应的Deployment
+    - 如果配置了创建Service，则创建对应的Service
+    - 不创建JOB（除非可以创建JOB但不运行POD）
+
+    注意:
+    - 只初始化应用模板节点，不启动工作流
+    - 工作流状态保持为PENDING
+    - 创建完成后可通过start API启动工作流
+    """
+    instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
+
+    if not instance:
+        raise NotFoundError("Workflow instance", instance_id)
+
+    user_id = str(current_user.get("id", ""))
+    if not check_instance_permission(instance, user_id):
+        raise ForbiddenError("No permission to initialize this instance")
+
+    if instance.status != WorkflowStatus.PENDING:
+        raise ValidationError(f"Cannot initialize instance in status: {instance.status}")
+
+    k8s_client = get_k8s_client_auto()
+
+    # 验证namespace
+    if not k8s_client.ensure_namespace(instance.project_id):
+        raise InternalError(f"Namespace for project {instance.project_id} does not exist")
+
+    # 获取所有节点
+    nodes = db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.instance_id == instance_id
+    ).all()
+
+    if not nodes:
+        raise ValidationError("Workflow instance has no nodes to initialize")
+
+    initialized_nodes = []
+    errors = []
+
+    for node in nodes:
+        # 只处理应用模板节点
+        if node.node_type != NodeType.APP:
+            logger.info(f"Skipping node {node.id} (type: {node.node_type}), not an app template")
+            continue
+
+        try:
+            # 获取应用模板
+            template = db.query(AppTemplate).filter(AppTemplate.id == node.template_id).first()
+            if not template:
+                errors.append(f"App template {node.template_id} not found for node {node.id}")
+                continue
+
+            # 构建容器配置
+            containers = _build_containers_from_template(template, node)
+
+            # 生成Deployment名称
+            deployment_name = f"wf-{instance_id[:8]}-{node.node_id[:8]}"
+            node.k8s_resource_name = deployment_name
+            node.k8s_resource_type = "Deployment"
+
+            # 创建Deployment
+            success, error_msg = k8s_client.create_deployment(
+                project_id=instance.project_id,
+                name=deployment_name,
+                containers=containers,
+                ports=template.service_ports,
+                replicas=template.replicas
+            )
+
+            if not success:
+                errors.append(f"Failed to create Deployment for node {node.id}: {error_msg}")
+                continue
+
+            # 如果需要创建Service
+            if template.create_service and template.service_ports:
+                service_name = f"svc-{deployment_name}"
+                success, error_msg = k8s_client.create_service(
+                    project_id=instance.project_id,
+                    name=service_name,
+                    selector={"app": deployment_name},
+                    ports=template.service_ports,
+                    service_type=template.service_type
+                )
+
+                if success:
+                    node.service_name = service_name
+                else:
+                    logger.warning(f"Failed to create Service for node {node.id}: {error_msg}")
+
+            node.status = NodeStatus.PENDING
+            initialized_nodes.append(node.id)
+            logger.info(f"Initialized node {node.id} with Deployment {deployment_name}")
+
+        except Exception as e:
+            logger.error(f"Error initializing node {node.id}: {e}")
+            errors.append(f"Error initializing node {node.id}: {str(e)}")
+
+    db.commit()
+
+    if errors:
+        instance.message = f"Initialization completed with errors: {'; '.join(errors)}"
+    else:
+        instance.message = f"Successfully initialized {len(initialized_nodes)} app nodes"
+
+    db.commit()
+    db.refresh(instance)
+
+    logger.info(f"Initialized workflow instance {instance_id}, initialized {len(initialized_nodes)} nodes")
+    return instance
+
+
+def _build_containers_from_template(template: AppTemplate, node: WorkflowNodeInstance) -> List[Dict[str, Any]]:
+    """
+    从模板和节点配置构建容器列表
+    """
+    containers = []
+
+    # 获取模板容器配置
+    template_containers = template.containers or []
+
+    for idx, container_config in enumerate(template_containers):
+        container = {
+            "name": container_config.get("name", f"container-{idx}"),
+            "image": container_config.get("image"),
+            "image_pull_policy": container_config.get("image_pull_policy", "IfNotPresent"),
+            "command": container_config.get("command"),
+            "args": container_config.get("args"),
+            "env_vars": [],
+            "volume_mounts": [],
+            "resources": container_config.get("resources"),
+            "liveness_probe": container_config.get("liveness_probe"),
+            "readiness_probe": container_config.get("readiness_probe"),
+            "privileged": container_config.get("privileged", False),
+        }
+
+        # 合并模板的环境变量
+        template_env_vars = container_config.get("env_vars", [])
+        for e in template_env_vars:
+            container["env_vars"].append({
+                "name": e.get("name"),
+                "value": e.get("value", "")
+            })
+
+        # 添加节点级别的环境变量覆盖
+        node_env_vars = node.env_vars or []
+        for e in node_env_vars:
+            # 检查是否已存在，如果存在则覆盖
+            existing = next((x for x in container["env_vars"] if x["name"] == e.get("name")), None)
+            if existing:
+                existing["value"] = e.get("value", "")
+            else:
+                container["env_vars"].append({
+                    "name": e.get("name"),
+                    "value": e.get("value", "")
+                })
+
+        # 合并模板的卷挂载
+        template_volume_mounts = container_config.get("volume_mounts", [])
+        for vm in template_volume_mounts:
+            container["volume_mounts"].append({
+                "pvc_name": vm.get("pvc_name"),
+                "mount_path": vm.get("mount_path"),
+                "sub_path": vm.get("sub_path"),
+                "read_only": vm.get("read_only", False)
+            })
+
+        # 添加节点级别的卷挂载
+        node_volume_mounts = node.volume_mounts or []
+        for vm in node_volume_mounts:
+            container["volume_mounts"].append({
+                "pvc_name": vm.get("pvc_name"),
+                "mount_path": vm.get("mount_path"),
+                "sub_path": vm.get("sub_path"),
+                "read_only": vm.get("read_only", False)
+            })
+
+        # 节点级别的资源覆盖
+        if node.resources:
+            container["resources"] = node.resources
+
+        containers.append(container)
+
+    return containers
 
 
 def check_instance_permission(instance: WorkflowInstance, user_id: str) -> bool:
@@ -41,6 +250,8 @@ def build_node_relationships(nodes: List[WorkflowNodeInstance], edges: List[Dict
     For each edge (source -> target):
     - target node's depends_on: add source node
     - source node's downstream_node_ids: add target node
+
+    Note: Uses node.id for matching (node_id is same as id for backward compatibility)
     """
     # Initialize empty relationships
     for node in nodes:
@@ -57,14 +268,17 @@ def build_node_relationships(nodes: List[WorkflowNodeInstance], edges: List[Dict
 
         # Find target node and add source to its depends_on
         for node in nodes:
-            if node.node_id == target:
+            if node.id == target or node.node_id == target:  # Support both id and node_id
                 if source not in node.depends_on:
                     node.depends_on.append(source)
                 break
 
         # Find source node and add target to its downstream_node_ids
         for node in nodes:
-            if node.node_id == source:
+            if node.id == source or node.node_id == source:  # Support both id and node_id
+                if target not in node.downstream_node_ids:
+                    node.downstream_node_ids.append(target)
+                break
                 if target not in node.downstream_node_ids:
                     node.downstream_node_ids.append(target)
                 break
@@ -171,35 +385,35 @@ async def create_workflow_instance(
 
     # Create node instances from provided nodes
     for node_config in nodes_dict:
-        node_id = generate_id(f"{instance_id}_{node_config.get('node_id', '')}")
+        # Generate node ID - this will be both id and node_id
+        node_id = generate_id(f"{instance_id}_{node_config.get('name', 'node')}")
 
         # Get edges that have this node as target to build depends_on
         depends_on = node_config.get("depends_on", [])
-        if not depends_on:
-            # Build from edges if depends_on not explicitly set
-            for edge in edges_dict:
-                if edge.get("target") == node_config.get("node_id"):
-                    source_id = edge.get("source")
-                    if source_id and source_id not in depends_on:
-                        depends_on.append(source_id)
 
         node_instance = WorkflowNodeInstance(
             id=node_id,
             instance_id=instance_id,
-            node_id=node_config.get("node_id"),
+            node_id=node_id,  # Same as id
             node_type=NodeType.APP if node_config.get("node_type") == "app" else NodeType.JOB,
             template_id=node_config.get("template_id"),
             name=node_config.get("name", "Unnamed Node"),
             status=NodeStatus.PENDING,
+            position=node_config.get("position", {"x": 0.0, "y": 0.0}),
+            env_vars=node_config.get("env_vars", []),
+            volume_mounts=node_config.get("volume_mounts", []),
+            resources=node_config.get("resources"),
             depends_on=depends_on,
+            downstream_node_ids=[],  # Initialize empty, will be built after all nodes created
             timeout_seconds=node_config.get("timeout_seconds"),
             input_env_vars=node_config.get("input_env_vars", []),
             input_volume_mounts=node_config.get("input_volume_mounts", []),
-            downstream_node_ids=[],  # Initialize empty, will be built after all nodes created
         )
         db.add(node_instance)
 
-        # Update node_config to reflect no dependency relationship
+        # Update node_config to include the auto-generated id
+        node_config["id"] = node_id
+        node_config["node_id"] = node_id  # For backward compatibility
         node_config["depends_on"] = depends_on
         node_config["downstream_node_ids"] = []
         node_config["input_env_vars"] = node_config.get("input_env_vars", [])
@@ -335,7 +549,7 @@ async def start_workflow_instance(
 
     - Uses WorkflowEngine for topological execution with dependency checking
     - Detects and prevents cyclic dependency
-    - Concurrently executes ready node
+    - Concurrently executes ready nodes
     - Handles environment variable and mount dependencies
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
@@ -350,16 +564,14 @@ async def start_workflow_instance(
     if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.STOPPED]:
         raise ValidationError(f"Cannot start instance in status: {instance.status}")
 
-    k8s_client = get_k8s_client()
-
-    # Verify namespace exists
-    if not k8s_client.ensure_namespace(instance.project_id):
-        raise InternalError(f"Namespace for project {instance.project_id} does not exist")
-
-    # Use WorkflowEngine to execute workflow
+    # 使用WorkflowEngine来执行工作流（自动选择K8S客户端模式）
     try:
-        engine = WorkflowEngine(instance_id, db, k8s_client)
+        engine = WorkflowEngine(instance_id, db)
         await engine.initialize()
+
+        # 验证namespace
+        if not engine.k8s_client.ensure_namespace(instance.project_id):
+            raise InternalError(f"Namespace for project {instance.project_id} does not exist")
 
         # Execute workflow (this runs asynchronously)
         asyncio.create_task(engine.execute_workflow())
@@ -401,17 +613,15 @@ async def sync_workflow_status(
     if instance.status != WorkflowStatus.RUNNING:
         raise ValidationError(f"Cannot sync instance in status: {instance.status}")
 
-    k8s_client = get_k8s_client()
-
     try:
-        engine = WorkflowEngine(instance_id, db, k8s_client)
+        engine = WorkflowEngine(instance_id, db)
         await engine.initialize()
         await engine.sync_all_nodes_status()
 
-        # Check if we have ready node to execute
-        ready_node = engine.get_ready_node()
-        if ready_node:
-            for node in ready_node:
+        # Check if we have ready nodes to execute
+        ready_nodes = engine.get_ready_nodes()
+        if ready_nodes:
+            for node in ready_nodes:
                 asyncio.create_task(engine.start_node(node))
 
     except Exception as e:
@@ -445,9 +655,15 @@ async def stop_workflow_instance(
     if instance.status != WorkflowStatus.RUNNING:
         raise ValidationError(f"Cannot stop instance in status: {instance.status}")
 
-    k8s_client = get_k8s_client()
+    # 获取K8S客户端（自动选择模式）
+    config = get_config()
+    if config.k8s_service and config.k8s_service.enabled:
+        from app.services.k8s_service_client import get_k8s_service_client
+        k8s_client = get_k8s_service_client()
+    else:
+        k8s_client = get_k8s_client()
 
-    # Stop all node
+    # Stop all nodes
     nodes = db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.instance_id == instance_id
     ).all()
@@ -501,7 +717,7 @@ async def delete_workflow_instance(
 
     # Stop if running
     if instance.status == WorkflowStatus.RUNNING:
-        k8s_client = get_k8s_client()
+        k8s_client = get_k8s_client_auto()
         nodes = db.query(WorkflowNodeInstance).filter(
             WorkflowNodeInstance.instance_id == instance_id
         ).all()
@@ -563,7 +779,7 @@ async def get_node_logs(
     if not node.k8s_resource_name:
         raise ValidationError("Node has not been started yet")
 
-    k8s_client = get_k8s_client()
+    k8s_client = get_k8s_client_auto()
 
     # Get pod for the node
     if node.k8s_resource_type == "Deployment":
@@ -632,15 +848,13 @@ async def trigger_workflow_by_http(
         raise ValidationError(f"Workflow instance {instance_id} is already running")
 
     # Start workflow
-    k8s_client = get_k8s_client()
-
-    # Verify namespace exists
-    if not k8s_client.ensure_namespace(instance.project_id):
-        raise InternalError(f"Namespace for project {instance.project_id} does not exist")
-
     try:
-        engine = WorkflowEngine(instance_id, db, k8s_client)
+        engine = WorkflowEngine(instance_id, db)
         await engine.initialize()
+
+        # Verify namespace exists
+        if not engine.k8s_client.ensure_namespace(instance.project_id):
+            raise InternalError(f"Namespace for project {instance.project_id} does not exist")
 
         # Update run count and last run time
         instance.run_count += 1
@@ -777,12 +991,6 @@ async def create_workflow_node(
         if template.scope != "global" and template.created_by != user_id:
             raise ForbiddenError(f"No permission to use job template {template_id}")
 
-    # Check if node_id already exists in instance
-    existing_nodes = instance.nodes or []
-    for existing_node in existing_nodes:
-        if existing_node.get("node_id") == node_data.node_id:
-            raise ValidationError(f"Node with id {node_data.node_id} already exists in this workflow")
-
     # Validate template dependencies (env_vars and volume_mounts must satisfy template's requirements)
     unsatisfied_dependencies = validate_template_dependencies(template, node_data)
     if unsatisfied_dependencies:
@@ -791,8 +999,8 @@ async def create_workflow_node(
             details=unsatisfied_dependencies
         )
 
-    # Generate node instance ID
-    node_instance_id = generate_id(f"{instance_id}_{node_data.node_id}")
+    # Generate node instance ID - this will be both id and node_id
+    node_instance_id = generate_id(f"{instance_id}_{node_data.name}")
 
     # Convert node config to dict
     if hasattr(node_data, 'model_dump'):
@@ -807,11 +1015,15 @@ async def create_workflow_node(
     node_instance = WorkflowNodeInstance(
         id=node_instance_id,
         instance_id=instance_id,
-        node_id=node_data.node_id,
+        node_id=node_instance_id,  # Same as id
         node_type=NodeType.APP if node_type_val == "app" else NodeType.JOB,
         template_id=template_id,
         name=node_data.name,
         status=NodeStatus.PENDING,
+        position=node_data.position,
+        env_vars=[e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in (node_data.env_vars or [])],
+        volume_mounts=[vm.model_dump() if hasattr(vm, 'model_dump') else vm.dict() for vm in (node_data.volume_mounts or [])],
+        resources=node_data.resources.model_dump() if node_data.resources and hasattr(node_data.resources, 'model_dump') else (node_data.resources.dict() if node_data.resources else None),
         depends_on=depends_on,
         downstream_node_ids=[],  # Will be rebuilt from edges
         timeout_seconds=node_data.timeout_seconds,
@@ -823,10 +1035,12 @@ async def create_workflow_node(
     # Add node to instance nodes list
     node_config["status"] = NodeStatus.PENDING
     node_config["id"] = node_instance_id
+    node_config["node_id"] = node_instance_id  # For backward compatibility
     node_config["depends_on"] = depends_on
     node_config["downstream_node_ids"] = []
     node_config["input_env_vars"] = []
     node_config["input_volume_mounts"] = []
+    existing_nodes = instance.nodes or []
     existing_nodes.append(node_config)
     instance.nodes = existing_nodes
 
@@ -979,6 +1193,18 @@ async def update_workflow_node(
     # Update node instance fields
     if node_data.name is not None:
         node.name = node_data.name
+    if node_data.position is not None:
+        node.position = node_data.position
+    if node_data.env_vars is not None:
+        node.env_vars = [e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in node_data.env_vars]
+    if node_data.volume_mounts is not None:
+        node.volume_mounts = [vm.model_dump() if hasattr(vm, 'model_dump') else vm.dict() for vm in node_data.volume_mounts]
+    if node_data.resources is not None:
+        node.resources = node_data.resources.model_dump() if hasattr(node_data.resources, 'model_dump') else node_data.resources.dict()
+    if node_data.input_env_vars is not None:
+        node.input_env_vars = [iev.model_dump() if hasattr(iev, 'model_dump') else iev.dict() for iev in node_data.input_env_vars]
+    if node_data.input_volume_mounts is not None:
+        node.input_volume_mounts = [ivm.model_dump() if hasattr(ivm, 'model_dump') else ivm.dict() for ivm in node_data.input_volume_mounts]
 
     # Update node in instance nodes list
     existing_nodes = instance.nodes or []
@@ -989,13 +1215,15 @@ async def update_workflow_node(
             if node_data.position is not None:
                 existing_node["position"] = node_data.position
             if node_data.env_vars is not None:
-                existing_node["env_vars"] = node_data.env_vars
+                existing_node["env_vars"] = [e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in node_data.env_vars]
             if node_data.volume_mounts is not None:
-                existing_node["volume_mounts"] = node_data.volume_mounts
+                existing_node["volume_mounts"] = [vm.model_dump() if hasattr(vm, 'model_dump') else vm.dict() for vm in node_data.volume_mounts]
             if node_data.resources is not None:
                 existing_node["resources"] = node_data.resources.model_dump() if hasattr(node_data.resources, 'model_dump') else node_data.resources.dict()
-            # Note: Different nodes have no dependency relationship, depends_on is always empty
-            # input_env_vars and input_volume_mounts are not used in node update
+            if node_data.input_env_vars is not None:
+                existing_node["input_env_vars"] = [iev.model_dump() if hasattr(iev, 'model_dump') else iev.dict() for iev in node_data.input_env_vars]
+            if node_data.input_volume_mounts is not None:
+                existing_node["input_volume_mounts"] = [ivm.model_dump() if hasattr(ivm, 'model_dump') else ivm.dict() for ivm in node_data.input_volume_mounts]
             break
     instance.nodes = existing_nodes
 

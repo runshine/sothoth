@@ -522,10 +522,18 @@ Authorization: Bearer <token>
 
 #### 3.1 PVC列表
 
+查询指定项目的全部PVC资源。
+
 ```http
 GET /api/resource/pvcs?project_id=proj-001
 Authorization: Bearer <token>
 ```
+
+**请求参数：**
+
+| 字段 | 类型 | 位置 | 必需 | 说明 |
+|------|------|------|------|------|
+| project_id | string | query | 是 | 项目ID |
 
 **响应：**
 
@@ -534,18 +542,46 @@ Authorization: Bearer <token>
   "pvcs": [
     {
       "pvc_name": "secflow-pvc-550e8400e29b",
-      "namespace": "secflow_proj-001",
+      "namespace": "secflow-proj-001",
       "capacity": "10Gi",
       "status": "Bound",
       "storage_class": "nfs-client",
       "resource_id": 1,
       "resource_name": "package-v1.0",
       "resource_type": "software"
+    },
+    {
+      "pvc_name": "secflow-pvc-abc123def456",
+      "namespace": "secflow-proj-001",
+      "capacity": "50Gi",
+      "status": "Bound",
+      "storage_class": "nfs-client",
+      "resource_id": 2,
+      "resource_name": "task-output-storage",
+      "resource_type": "output_pvc"
     }
   ],
-  "total": 1
+  "total": 2
 }
 ```
+
+**响应字段说明：**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| pvc_name | string | PVC名称 |
+| namespace | string | PVC所在命名空间 |
+| capacity | string | PVC容量 |
+| status | string | PVC状态（Bound/Pending/Lost等） |
+| storage_class | string | 存储类名称 |
+| resource_id | int | 关联的资源ID（如有） |
+| resource_name | string | 关联的资源名称（如有） |
+| resource_type | string | 关联的资源类型（如有） |
+
+**说明：**
+- 返回项目K8S命名空间中的所有PVC
+- 如果PVC关联到本服务管理的资源，会返回资源信息
+- 支持五类资源类型：document/software/code/other/output_pvc
 
 ---
 

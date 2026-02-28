@@ -75,7 +75,8 @@ async def create_job_template(
             "privileged": container.privileged,
             "image_pull_policy": container.image_pull_policy.value if container.image_pull_policy else "IfNotPresent",
             "resources": container.resources.model_dump() if container.resources else None,
-            "health_check": container.health_check.model_dump() if container.health_check else None,
+            "liveness_probe": container.liveness_probe.model_dump() if container.liveness_probe else None,
+            "readiness_probe": container.readiness_probe.model_dump() if container.readiness_probe else None,
         }
         containers_json.append(container_dict)
 
@@ -193,7 +194,8 @@ async def update_job_template(
                 "privileged": container.privileged,
                 "image_pull_policy": container.image_pull_policy.value if container.image_pull_policy else "IfNotPresent",
                 "resources": container.resources.model_dump() if container.resources else None,
-                "health_check": container.health_check.model_dump() if container.health_check else None,
+                "liveness_probe": container.liveness_probe.model_dump() if container.liveness_probe else None,
+            "readiness_probe": container.readiness_probe.model_dump() if container.readiness_probe else None,
             }
             containers_json.append(container_dict)
         template.containers = containers_json

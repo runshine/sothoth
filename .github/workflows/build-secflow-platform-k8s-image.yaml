@@ -1,0 +1,53 @@
+name: build-secflow-platform-k8s-image.
+on:
+  push:
+    branches:
+      - 'v2.*'
+    paths:
+      - .github/workflows/build-secflow-platform-k8s-image.yml
+      - 13-secflow-service/image_build/secflow-platform-k8s/**
+jobs:
+  build-secflow-platform-k8s-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate date tag
+        id: date
+        run: echo "date_tag=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push build-secflow-platform-k8s-image
+        uses: docker/build-push-action@v5
+        with:
+          context: 13-secflow-service/image_build/secflow-platform-k8s/
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            runshine0819/secflow-platform-k8s:latest
+            ghcr.io/runshine/secflow-platform-k8s:latest
+            runshine0819/secflow-platform-k8s:${{ steps.date.outputs.date_tag }}
+            ghcr.io/runshine/secflow-platform-k8s:${{ steps.date.outputs.date_tag }}
+          file: 13-secflow-service/image_build/secflow-platform-k8s/Dockerfile

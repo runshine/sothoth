@@ -612,12 +612,14 @@ async def delete_task(
 @router.get("/pvcs", response_model=PVCListResponse)
 async def list_pvcs(
     user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
-    project_id: str = Query(..., description="项目ID")
+    project_id: str = Query(..., description="项目ID"),
+    db: Session = Depends(get_db)
 ):
     """
     查询项目的PVC列表。
 
     - 返回项目中所有关联的PVC
+    - 包含PVC对应的资源信息（如果有）
     """
     current_user, token = user_and_token
 
@@ -629,17 +631,28 @@ async def list_pvcs(
     k8s_service = get_k8s_service()
     pvcs = k8s_service.list_pvcs(project_id)
 
+    # 查询该项目下所有资源，建立 pvc_name -> resource 的映射
+    project_record = db.query(Project).filter(Project.id == project_id).first()
+    pvc_to_resource = {}
+    if project_record:
+        for resource in project_record.resources:
+            if resource.pvc_name:
+                pvc_to_resource[resource.pvc_name] = resource
+
     result = []
     for pvc in pvcs:
+        pvc_name = pvc["name"]
+        resource = pvc_to_resource.get(pvc_name)
+
         result.append(PVCInfoResponse(
-            pvc_name=pvc["name"],
+            pvc_name=pvc_name,
             namespace=pvc["namespace"],
             capacity=pvc.get("capacity", "0Gi"),
             status=pvc.get("status", "Unknown"),
             storage_class=pvc.get("storage_class", "nfs-client"),
-            resource_id=None,
-            resource_name=None,
-            resource_type=None
+            resource_id=resource.id if resource else None,
+            resource_name=resource.name if resource else None,
+            resource_type=resource.resource_type.value if resource else None
         ))
 
     return PVCListResponse(pvcs=result, total=len(result))

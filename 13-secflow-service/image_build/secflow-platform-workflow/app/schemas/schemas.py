@@ -5,7 +5,7 @@ Pydantic schemas for workflow service
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from enum import Enum
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ============ Common Enums ============
@@ -213,8 +213,8 @@ class AppTemplateUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=128)
     description: Optional[str] = None
     containers: Optional[List[ContainerConfig]] = None
-    service_ports: Optional[List[ServicePort]] = None
-    replicas: Optional[int] = Field(None, ge=1)
+    service_ports: Optional[List[ServicePort]] = Field(None, description="K8s Service port configuration")
+    replicas: Optional[int] = Field(None, ge=1, description="Number of replicas")
     service_name: Optional[str] = Field(None, description="K8s Service name")
     create_service: Optional[bool] = Field(None, description="Whether to create K8s Service")
     service_type: Optional[ServiceType] = Field(None, description="K8s Service type")
@@ -231,14 +231,31 @@ class AppTemplateResponse(BaseModel):
     service_ports: List[ServicePort]
     replicas: int
     service_name: Optional[str]
-    create_service: bool
-    service_type: str
+    # Allow None from DB (old data), will be converted to default values by validator
+    create_service: bool = True
+    service_type: str = "ClusterIP"
     created_by: str
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
+
+    @field_validator('create_service', mode='before')
+    @classmethod
+    def validate_create_service(cls, v):
+        """Handle NULL values from old data"""
+        if v is None:
+            return True
+        return v
+
+    @field_validator('service_type', mode='before')
+    @classmethod
+    def validate_service_type(cls, v):
+        """Handle NULL values from old data"""
+        if v is None:
+            return "ClusterIP"
+        return v
 
 
 class AppTemplateListResponse(BaseModel):
@@ -303,12 +320,13 @@ class WorkflowNodeConfig(BaseModel):
     Note: Different nodes have no dependency relationship, no depends_on needed.
     The env_vars and volume_mounts are used to satisfy template's dependency requirements
     when instantiating the template.
+
+    ID is auto-generated, not user-specified.
     """
-    node_id: str = Field(..., description="Unique node ID")
     node_type: NodeType = Field(..., description="Node type: app/job")
     template_id: str = Field(..., description="Template ID")
     name: str = Field(..., description="Node display name")
-    position: Dict[str, int] = Field(default={"x": 0, "y": 0}, description="Node position in canvas")
+    position: Dict[str, float] = Field(default={"x": 0.0, "y": 0.0}, description="Node position in canvas")
 
     # Fixed (override template)
     env_vars: Optional[List[EnvVar]] = Field(None, description="Override/add fixed environment variables")
@@ -381,12 +399,13 @@ class WorkflowNodeCreate(BaseModel):
     Note: Different nodes have no dependency relationship, no depends_on needed.
     The env_vars and volume_mounts are used to satisfy template's dependency requirements
     when instantiating the template.
+
+    ID is auto-generated, not user-specified.
     """
-    node_id: str = Field(..., description="Unique node ID within the workflow")
     node_type: NodeType = Field(..., description="Node type: app/job")
     template_id: str = Field(..., description="App template ID or Job template ID")
     name: str = Field(..., description="Node display name")
-    position: Dict[str, int] = Field(default={"x": 0, "y": 0}, description="Node position in canvas")
+    position: Dict[str, float] = Field(default={"x": 0.0, "y": 0.0}, description="Node position in canvas")
 
     # Fixed (override template) - environment variables and volume mounts
     # These are used to satisfy template dependencies when instantiating
@@ -408,12 +427,15 @@ class WorkflowNodeUpdate(BaseModel):
     Note: Different nodes have no dependency relationship, no depends_on needed.
     """
     name: Optional[str] = Field(None, min_length=1, max_length=128)
-    position: Optional[Dict[str, int]] = Field(None, description="Node position in canvas")
+    position: Optional[Dict[str, float]] = Field(None, description="Node position in canvas")
     # Fixed (override template)
     env_vars: Optional[List[EnvVar]] = Field(None, description="Override/add fixed environment variables")
     volume_mounts: Optional[List[VolumeMount]] = Field(None, description="Override/add fixed volume mounts")
     # Resource Requirements
     resources: Optional[ResourceRequirements] = Field(None, description="Override resource requirements")
+    # Input Dependencies (specify source_node_id at instance level)
+    input_env_vars: Optional[List[DependencyEnvVar]] = Field(None, description="Input environment variable dependencies")
+    input_volume_mounts: Optional[List[DependencyVolumeMount]] = Field(None, description="Input volume mount dependencies")
 
 
 class WorkflowEdgesUpdate(BaseModel):
@@ -444,26 +466,33 @@ class TriggerResponse(BaseModel):
 
 
 class WorkflowNodeInstanceResponse(BaseModel):
-    """Workflow node instance response"""
+    """Workflow node instance response
+
+    Note: node_id is the same as id (auto-generated, not user-specified)
+    """
     id: str
-    node_id: str
     node_type: str
     template_id: str
     name: str
     status: str
-    k8s_resource_name: Optional[str]
-    k8s_resource_type: Optional[str]
-    depends_on: List[str]
-    downstream_node_ids: List[str]
-    service_name: Optional[str]
-    timeout_seconds: Optional[int]
-    started_at: Optional[datetime]
-    finished_at: Optional[datetime]
-    message: Optional[str]
+    k8s_resource_name: Optional[str] = None
+    k8s_resource_type: Optional[str] = None
+    depends_on: List[str] = []
+    downstream_node_ids: List[str] = []
+    service_name: Optional[str] = None
+    timeout_seconds: Optional[int] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    message: Optional[str] = None
+    # Node configuration (from creation, for query and update)
+    position: Dict[str, float] = {"x": 0.0, "y": 0.0}
+    env_vars: List[EnvVar] = []
+    volume_mounts: List[VolumeMount] = []
+    resources: Optional[ResourceRequirements] = None
     # Input dependencies (specify sources)
-    input_env_vars: List[DependencyEnvVar]
-    input_volume_mounts: List[DependencyVolumeMount]
-    created_at: datetime
+    input_env_vars: List[DependencyEnvVar] = []
+    input_volume_mounts: List[DependencyVolumeMount] = []
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

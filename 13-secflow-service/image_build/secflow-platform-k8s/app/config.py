@@ -1,9 +1,10 @@
 """
-Configuration module for workflow service
+配置文件加载模块
 """
 
 import os
 import logging
+from pathlib import Path
 from typing import Optional
 
 import yaml
@@ -14,25 +15,24 @@ logger = logging.getLogger(__name__)
 
 
 class DatabaseConfig(BaseModel):
-    """Database configuration"""
+    """数据库配置"""
     host: str
     port: int
     username: str
     password: str
     name: str
-    table_prefix: str = "secflow_platform_workflow_"
+    table_prefix: str = "secflow_k8s_"  # 可配置的表前缀
     pool_size: int = 10
     max_overflow: int = 20
 
     @property
     def url(self) -> str:
-        """Generate database connection URL"""
+        """生成数据库连接URL"""
         return f"mysql+pymysql://{self.username}:{self.password}@{self.host}:{self.port}/{self.name}"
 
 
 class AuthServiceConfig(BaseModel):
-    """Auth service configuration"""
-    enabled: bool = True  # Set to False to disable authentication
+    """Auth服务配置"""
     host: str
     port: int
     validate_token_path: str = "/api/auth/validate-human-token"
@@ -42,18 +42,31 @@ class AuthServiceConfig(BaseModel):
 
     @property
     def validate_url(self) -> str:
-        """Generate token validation URL"""
+        """生成验证token的URL"""
         return f"http://{self.host}:{self.port}{self.validate_token_path}"
 
 
+class ProjectServiceConfig(BaseModel):
+    """Project服务配置"""
+    host: str
+    port: int
+    get_project_path: str = "/api/project"
+    timeout: int = 10
+
+    @property
+    def base_url(self) -> str:
+        """生成基础URL"""
+        return f"http://{self.host}:{self.port}"
+
+
 class RegistryMenuLevelConfig(BaseModel):
-    """Menu level configuration"""
+    """菜单层级配置"""
     name: Optional[str] = None
     name_en: Optional[str] = None
 
 
 class RegistryMenuConfig(BaseModel):
-    """Menu configuration"""
+    """菜单配置"""
     id: str
     path: str
     icon: Optional[str] = None
@@ -64,7 +77,7 @@ class RegistryMenuConfig(BaseModel):
 
 
 class RegistryConfig(BaseModel):
-    """Menu registration center configuration"""
+    """Menu注册中心配置"""
     enabled: bool = True
     menu_service_url: str
     service_id: str
@@ -78,45 +91,32 @@ class RegistryConfig(BaseModel):
 
 
 class KubernetesConfig(BaseModel):
-    """K8S configuration"""
-    connection_mode: str = "incluster"  # "incluster" or "kubeconfig"
-    kubeconfig_path: Optional[str] = None
+    """K8S配置"""
+    in_cluster: bool = True
+    kubeconfig: Optional[str] = None
     connection_timeout: int = 30
 
 
-class K8SServiceConfig(BaseModel):
-    """K8S微服务配置"""
-    enabled: bool = True  # 是否启用K8S微服务调用模式
-    host: str = "localhost"
-    port: int = 10010
-    timeout: int = 30
-
-    @property
-    def base_url(self) -> str:
-        """Generate K8S service base URL"""
-        return f"http://{self.host}:{self.port}/api/k8s"
-
-
 class AppConfig(BaseModel):
-    """Application configuration"""
+    """应用配置"""
     host: str = "0.0.0.0"
     port: int = 8080
     debug: bool = False
 
 
 class LoggingConfig(BaseModel):
-    """Logging configuration"""
+    """日志配置"""
     level: str = "INFO"
     format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 
 class Config(BaseModel):
-    """Main configuration class"""
+    """主配置类"""
     database: DatabaseConfig
     auth_service: AuthServiceConfig
+    project_service: ProjectServiceConfig
     registry: RegistryConfig
     kubernetes: KubernetesConfig
-    k8s_service: Optional[K8SServiceConfig] = None  # K8S微服务配置
     app: AppConfig
     logging: LoggingConfig = LoggingConfig()
 
@@ -126,13 +126,13 @@ _config: Optional[Config] = None
 
 def load_config(config_path: Optional[str] = None) -> Config:
     """
-    Load configuration file
+    加载配置文件
 
     Args:
-        config_path: Configuration file path, default is config.yaml
+        config_path: 配置文件路径，默认使用config.yaml
 
     Returns:
-        Config object
+        Config对象
     """
     global _config
 
@@ -140,31 +140,30 @@ def load_config(config_path: Optional[str] = None) -> Config:
         return _config
 
     if config_path is None:
-        # Default to environment variable or search common paths
-        config_path = os.environ.get("CONFIG_PATH")
-        if config_path is None:
-            possible_paths = [
-                "config.yaml",
-                os.path.join(os.path.dirname(__file__), "config.yaml"),
-                os.path.join(os.path.dirname(__file__), "..", "config.yaml"),
-            ]
-            for path in possible_paths:
-                if os.path.exists(path):
-                    config_path = path
-                    break
+        # 默认查找当前目录或父目录的config.yaml
+        possible_paths = [
+            "config.yaml",
+            os.path.join(os.path.dirname(__file__), "config.yaml"),
+            os.path.join(os.path.dirname(__file__), "..", "config.yaml"),
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                config_path = path
+                break
 
     if config_path is None or not os.path.exists(config_path):
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+        raise FileNotFoundError(f"配置文件未找到: {config_path}")
 
     with open(config_path, 'r', encoding='utf-8') as f:
         config_data = yaml.safe_load(f)
 
     _config = Config(**config_data)
+
     return _config
 
 
 def get_config() -> Config:
-    """Get configuration object"""
+    """获取配置对象"""
     global _config
     if _config is None:
         return load_config()
@@ -172,7 +171,7 @@ def get_config() -> Config:
 
 
 def reload_config(config_path: Optional[str] = None) -> Config:
-    """Reload configuration"""
+    """重新加载配置"""
     global _config
     _config = None
     return load_config(config_path)

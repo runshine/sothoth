@@ -47,11 +47,18 @@ registry:
       name: "工作流编排"
       name_en: "Workflow"
 
-# Kubernetes Configuration
+# Kubernetes Configuration (直接连接模式，已废弃)
 kubernetes:
   connection_mode: "kubeconfig"  # "incluster" or "kubeconfig"
   kubeconfig_path: "/home/runshine/.kube/config"
   connection_timeout: 30
+
+# K8S Service Configuration (调用K8S微服务)
+k8s_service:
+  enabled: true  # 是否启用K8S微服务调用模式
+  host: "192.168.12.44"
+  port: 10010
+  timeout: 30
 
 # Application Configuration
 app:

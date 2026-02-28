@@ -20,6 +20,7 @@
 | | GET | `/api/workflow/workflow-instances` | 列表工作流实例 |
 | | GET | `/api/workflow/workflow-instances/{instance_id}` | 获取工作流实例详情 |
 | | PUT | `/api/workflow/workflow-instances/{instance_id}` | 更新工作流实例 |
+| | POST | `/api/workflow/workflow-instances/{instance_id}/initialize` | 初始化工作流(创建Deployment) |
 | | POST | `/api/workflow/workflow-instances/{instance_id}/start` | 启动工作流 |
 | | POST | `/api/workflow/workflow-instances/{instance_id}/sync-status` | 同步工作流状态 |
 | | POST | `/api/workflow/workflow-instances/{instance_id}/stop` | 停止工作流 |
@@ -209,7 +210,7 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 | scope | string | No | 模板范围: `global`(全局) 或 `project`(项目)，默认: `project` |
 | project_id | string | Conditional | 项目ID (scope为project时必填) |
 | containers | array[ContainerConfig] | Yes | 容器配置列表 (至少一个容器) |
-| service_port | array[ServicePort] | No | K8s Service端口配置 |
+| service_ports | array[ServicePort] | No | K8s Service端口配置 |
 | service_name | string | No | K8s Service名称 (不指定则自动生成) |
 | create_service | boolean | No | 是否创建K8s Service默认: true |
 | service_type | string | No | Service类型: `ClusterIP`(默认), `LoadBalancer`, `NodePort` |
@@ -335,10 +336,10 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
       }
     }
   ],
-  "service_port": [
+  "service_ports": [
     {"name": "http", "port": 80, "target_port": 8080}
   ],
-  "replica": 2,
+  "replicas": 2,
   "create_service": true,
   "service_type": "ClusterIP"
 }
@@ -356,8 +357,8 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
   "scope": "project",
   "project_id": "proj-001",
   "containers": [...],
-  "service_port": [...],
-  "replica": 2,
+  "service_ports": [...],
+  "replicas": 2,
   "service_name": "svc-my-app",
   "create_service": true,
   "service_type": "ClusterIP",
@@ -439,8 +440,8 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
   "scope": "project",
   "project_id": "proj-001",
   "containers": [...],
-  "service_port": [...],
-  "replica": 2,
+  "service_ports": [...],
+  "replicas": 2,
   "service_name": "svc-my-app",
   "create_service": true,
   "service_type": "ClusterIP",
@@ -485,7 +486,7 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 {
   "name": "updated-name",
   "description": "Updated description",
-  "replica": 3
+  "replicas": 3
 }
 ```
 
@@ -786,7 +787,7 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 | node_type | string | Yes | 节点类型: `app` 或 `job` |
 | template_id | string | Yes | 应用模板ID或任务模板ID |
 | name | string | Yes | 显示名称 |
-| position | object | No | 画布位置 `{x: 0, y: 0}` |
+| position | object | No | 画布位置 `{x: 0.0, y: 0.0}` (浮点数) |
 | env_vars | array[EnvVar] | No | 覆盖/添加固定环境变量 (用于满足模板依赖) |
 | volume_mounts | array[VolumeMount] | No | 覆盖/添加固定PVC挂载 (用于满足模板依赖) |
 | resources | object | No | 覆盖资源要求 |
@@ -1082,6 +1083,60 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 
 ---
 
+### Initialize Workflow Instance
+
+**POST** `/api/workflow/workflow-instances/{instance_id}/initialize`
+
+初始化工作流实例（仅创建Deployment和Service，不启动工作流）。
+
+**Authentication:** Required
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| instance_id | string | 实例ID |
+
+**Description:**
+
+对于应用模板(AppTemplate)形成的节点:
+- 创建节点的配置
+- 创建对应的K8S Deployment
+- 如果配置了创建Service，则创建对应的K8S Service
+- 不创建JOB（JOB在start时创建并执行）
+
+**注意:**
+- 只初始化应用模板节点，不启动工作流执行
+- 工作流状态保持为PENDING
+- 创建完成后可通过start API启动工作流
+
+**Response:** `200 OK`
+
+**WorkflowInstanceResponse:**
+
+```json
+{
+  "id": "wf-inst-my-workflow-jkl012",
+  "name": "my-workflow-instance",
+  "status": "pending",
+  "message": "Successfully initialized 3 app nodes",
+  ...
+}
+```
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 初始化成功 |
+| 400 | 状态非pending无法初始化/无节点可初始化 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
+| 500 | 初始化失败 |
+
+---
+
 ### Start Workflow Instance
 
 **POST** `/api/workflow/workflow-instances/{instance_id}/start`
@@ -1368,7 +1423,7 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 | node_type | string | Yes | 节点类型: `app` 或 `job` |
 | template_id | string | Yes | 应用模板ID或任务模板ID |
 | name | string | Yes | 显示名称 |
-| position | object | No | 画布位置 `{x: 0, y: 0}` |
+| position | object | No | 画布位置 `{x: 0.0, y: 0.0}` (浮点数) |
 | env_vars | array[EnvVar] | No | 覆盖/添加固定环境变量 (用于满足模板依赖) |
 | volume_mounts | array[VolumeMount] | No | 覆盖/添加固定PVC挂载 (用于满足模板依赖) |
 | resources | object | No | 覆盖资源要求 |
@@ -1389,10 +1444,16 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
   "k8s_resource_name": null,
   "k8s_resource_type": null,
   "depends_on": [],
+  "downstream_node_ids": [],
   "service_name": null,
+  "timeout_seconds": null,
   "started_at": null,
   "finished_at": null,
   "message": null,
+  "position": {"x": 100.0, "y": 100.0},
+  "env_vars": [{"name": "API_URL", "value": "http://backend:8080"}],
+  "volume_mounts": [],
+  "resources": null,
   "input_env_vars": [],
   "input_volume_mounts": [],
   "created_at": "2026-02-25T10:00:00"
@@ -1440,28 +1501,34 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 
 **Response:** `200 OK`
 
-**Response:** Array of WorkflowNodeInstanceResponse
+**WorkflowNodeInstanceResponse:**
 
----
-
-### Get Workflow Node
-
-**GET** `/api/workflow/workflow-instances/{instance_id}/nodes/{node_instance_id}`
-
-获取工作流节点详情。
-
-**Authentication:** Required
-
-**Path Parameters:**
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| instance_id | string | 实例ID |
-| node_instance_id | string | 节点实例ID |
-
-**Response:** `200 OK`
-
-**WorkflowNodeInstanceResponse**
+```json
+{
+  "id": "wf-node-001-mno345",
+  "node_id": "node-001",
+  "node_type": "app",
+  "template_id": "wf-tmpl-app-001",
+  "name": "Frontend Service",
+  "status": "pending",
+  "k8s_resource_name": null,
+  "k8s_resource_type": null,
+  "depends_on": [],
+  "downstream_node_ids": [],
+  "service_name": null,
+  "timeout_seconds": null,
+  "started_at": null,
+  "finished_at": null,
+  "message": null,
+  "position": {"x": 100.0, "y": 100.0},
+  "env_vars": [{"name": "API_URL", "value": "http://backend:8080"}],
+  "volume_mounts": [],
+  "resources": {"requests": {"cpu": "100m", "memory": "128Mi"}, "limits": {"cpu": "500m", "memory": "512Mi"}},
+  "input_env_vars": [],
+  "input_volume_mounts": [],
+  "created_at": "2026-02-25T10:00:00"
+}
+```
 
 ---
 
@@ -1471,7 +1538,7 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 
 更新工作流节点配置。
 
-**注意：** 不同节点之间没有依赖关系无需指定 `depends_on`
+**注意：** 不同节点之间没有依赖关系，无需指定 `depends_on`。更新时可修改与创建时相同的配置字段。
 
 **Authentication:** Required
 
@@ -1487,14 +1554,78 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | name | string | No | 显示名称 |
-| position | object | No | 画布位置 |
-| env_vars | array[EnvVar] | No | 覆盖固定环境变量 |
-| volume_mounts | array[VolumeMount] | No | 覆盖固定PVC挂载 |
+| position | object | No | 画布位置 `{x: 0.0, y: 0.0}` |
+| env_vars | array[EnvVar] | No | 覆盖/添加固定环境变量 (用于满足模板依赖) |
+| volume_mounts | array[VolumeMount] | No | 覆盖/添加固定PVC挂载 (用于满足模板依赖) |
 | resources | object | No | 覆盖资源要求 |
+| input_env_vars | array[DependencyEnvVar] | No | 输入环境变量依赖 |
+| input_volume_mounts | array[DependencyVolumeMount] | No | 输入挂载依赖 |
+
+**Request Example:**
+
+```json
+{
+  "name": "Updated Frontend Service",
+  "position": {"x": 200.0, "y": 200.0},
+  "env_vars": [
+    {"name": "API_URL", "value": "http://new-backend:8080"},
+    {"name": "DEBUG", "value": "false"}
+  ],
+  "volume_mounts": [
+    {"pvc_name": "data-pvc", "mount_path": "/data", "read_only": false}
+  ],
+  "resources": {
+    "requests": {"cpu": "200m", "memory": "256Mi"},
+    "limits": {"cpu": "1000m", "memory": "1Gi"}
+  },
+  "input_env_vars": [
+    {"name": "SOURCE_URL", "source_node_id": "node-002", "default_value": "http://default"}
+  ],
+  "input_volume_mounts": [
+    {"mount_path": "/shared", "source_node_id": "node-002", "read_only": true}
+  ]
+}
+```
 
 **Response:** `200 OK`
 
-**WorkflowNodeInstanceResponse**
+**WorkflowNodeInstanceResponse:**
+
+```json
+{
+  "id": "wf-node-001-mno345",
+  "node_id": "node-001",
+  "node_type": "app",
+  "template_id": "wf-tmpl-app-001",
+  "name": "Updated Frontend Service",
+  "status": "pending",
+  "k8s_resource_name": null,
+  "k8s_resource_type": null,
+  "depends_on": [],
+  "downstream_node_ids": [],
+  "service_name": null,
+  "timeout_seconds": null,
+  "started_at": null,
+  "finished_at": null,
+  "message": null,
+  "position": {"x": 200.0, "y": 200.0},
+  "env_vars": [
+    {"name": "API_URL", "value": "http://new-backend:8080"},
+    {"name": "DEBUG", "value": "false"}
+  ],
+  "volume_mounts": [
+    {"pvc_name": "data-pvc", "mount_path": "/data", "sub_path": null, "read_only": false}
+  ],
+  "resources": {"requests": {"cpu": "200m", "memory": "256Mi"}, "limits": {"cpu": "1000m", "memory": "1Gi"}},
+  "input_env_vars": [
+    {"name": "SOURCE_URL", "source_node_id": "node-002", "default_value": "http://default"}
+  ],
+  "input_volume_mounts": [
+    {"mount_path": "/shared", "sub_path": null, "source_node_id": "node-002", "source_pvc_name": null, "read_only": true}
+  ],
+  "created_at": "2026-02-25T10:00:00"
+}
+```
 
 ---
 
@@ -1820,6 +1951,14 @@ app:
 ---
 
 ## Changelog
+
+### v3.2.0 (2026-02-27)
+
+- **节点依赖信息查询与更新**:
+  - 查询节点时返回创建节点时的配置信息: `position`, `env_vars`, `volume_mounts`, `resources`
+  - 更新节点时允许修改配置信息，与创建节点时可输入信息保持一致
+  - 更新节点时新增支持修改 `input_env_vars` 和 `input_volume_mounts` 字段
+- **数据库模型扩展**: `WorkflowNodeInstance` 表新增 `position`, `env_vars`, `volume_mounts`, `resources` 字段存储节点配置
 
 ### v3.1.0 (2026-02-25)
 

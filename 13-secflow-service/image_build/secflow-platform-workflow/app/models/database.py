@@ -249,12 +249,16 @@ class WorkflowInstance(Base):
 # ============ Workflow Node Instance Model ============
 
 class WorkflowNodeInstance(Base):
-    """Workflow Node Instance (runtime node)"""
+    """Workflow Node Instance (runtime node)
+
+    Note: node_id is kept for backward compatibility, but is always set to the same value as id.
+    The id is auto-generated and serves as the unique identifier for the node.
+    """
     __tablename__ = f"{TABLE_PREFIX}workflow_node_instance"
 
     id = Column(String(64), primary_key=True)
     instance_id = Column(String(64), ForeignKey(f"{TABLE_PREFIX}workflow_instance.id"), nullable=False, index=True)
-    node_id = Column(String(64), nullable=False)
+    node_id = Column(String(64), nullable=False)  # Always same as id, kept for backward compatibility
     node_type = Column(String(20), nullable=False)  # app or job
     template_id = Column(String(64), nullable=False)
     name = Column(String(128), nullable=False)
@@ -265,9 +269,15 @@ class WorkflowNodeInstance(Base):
     k8s_resource_type = Column(String(20))  # Deployment or Job
     service_name = Column(String(128))
 
-    # Configuration
+    # Configuration (saved from creation for query and update)
+    position = Column(JSON, default={"x": 0.0, "y": 0.0})  # Node position in canvas
+    env_vars = Column(JSON, default=[])  # Fixed environment variables (override template)
+    volume_mounts = Column(JSON, default=[])  # Fixed volume mounts (override template)
+    resources = Column(JSON)  # Resource requirements (override template)
+
+    # Node Dependencies (from edges)
     depends_on = Column(JSON, default=[])  # List of upstream node IDs (nodes this node depends on)
-    downstream_nodes_ids = Column(JSON, default=[])  # List of downstream node IDs (nodes that depend on this node)
+    downstream_node_ids = Column(JSON, default=[])  # List of downstream node IDs (nodes that depend on this node)
     timeout_seconds = Column(Integer)  # Timeout in seconds (excluding image pull time)
 
     # Input Dependencies (specify source_node_id at instance level)
@@ -296,7 +306,13 @@ class WorkflowNodeInstance(Base):
             "k8s_resource_name": self.k8s_resource_name,
             "k8s_resource_type": self.k8s_resource_type,
             "service_name": self.service_name,
+            "position": self.position,
+            "env_vars": self.env_vars,
+            "volume_mounts": self.volume_mounts,
+            "resources": self.resources,
             "depends_on": self.depends_on,
+            "downstream_node_ids": self.downstream_node_ids,
+            "timeout_seconds": self.timeout_seconds,
             "input_env_vars": self.input_env_vars,
             "input_volume_mounts": self.input_volume_mounts,
             "started_at": self.started_at.isoformat() if self.started_at else None,
