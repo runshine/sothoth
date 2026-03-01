@@ -6,6 +6,32 @@
 1. **直接创建**: 创建实例时直接指定所有节点和边
 2. **先创建空白实例**: 先创建无节点的空白实例，然后通过节点API逐个添加节点
 
+## 工作流状态
+
+| 状态 | 说明 |
+|------|------|
+| pending | 刚创建，未初始化 |
+| initializing | 正在初始化中（中间状态） |
+| initialized | 已初始化，Deployment/Service已创建 |
+| running | 运行中 |
+| succeeded | 执行成功 |
+| failed | 执行失败 |
+| stopped | 已停止 |
+
+**状态流转:**
+```
+pending -> initializing -> initialized (initialize)
+initialized -> running (start)
+running -> succeeded (all nodes complete) / failed (any node fails) / stopped (stop)
+stopped -> running (start again)
+stopped/initialized -> initializing -> initialized (force initialize)
+initialized/running/stopped/failed/succeeded -> pending (uninitialize)
+```
+
+**持久化模式触发器:**
+- initialized/running 状态可接受触发
+- trigger 保持 running 状态直到执行完成
+
 ## API 列表
 
 | 方法 | 端点 | 描述 |
@@ -18,6 +44,7 @@
 | POST | `/api/workflow/workflow-instances/{instance_id}/start` | 启动工作流 |
 | POST | `/api/workflow/workflow-instances/{instance_id}/sync-status` | 同步工作流状态 |
 | POST | `/api/workflow/workflow-instances/{instance_id}/stop` | 停止工作流 |
+| POST | `/api/workflow/workflow-instances/{instance_id}/uninitialize` | 反初始化工作流(删除K8S资源并重置) |
 | POST | `/api/workflow/workflow-instances/{instance_id}/activate` | 激活持久化工作流 |
 | POST | `/api/workflow/workflow-instances/{instance_id}/deactivate` | 停用持久化工作流 |
 | DELETE | `/api/workflow/workflow-instances/{instance_id}` | 删除工作流实例 |
@@ -158,7 +185,7 @@
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | project_id | string | 按项目ID过滤 |
-| status | string | 按状态过滤: `pending`, `running`, `succeeded`, `failed`, `stopped` |
+| status | string | 按状态过滤: `pending`, `initializing`, `initialized`, `running`, `stopped` |
 
 **Response:** `200 OK`
 
@@ -202,8 +229,13 @@
 |-------|------|-------------|
 | name | string | 实例名称 |
 | description | string | 描述 |
+| edges | array[WorkflowEdgeConfig] | 更新边/连接 (仅 pending 状态可修改) |
 | trigger_enabled | boolean | 启用/禁用触发器 (仅persistent模式可用) |
 | is_active | boolean | 设置工作流激活状态 (仅persistent模式可用) |
+
+**注意:**
+- `edges` 字段只能在 `pending` 状态下修改
+- 其他字段可以在 `pending`、`initialized`、`stopped` 状态下修改
 
 **Response:** `200 OK`
 
@@ -223,6 +255,20 @@
 |-----------|------|-------------|
 | instance_id | string | 实例ID |
 
+**Request Body:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| force | boolean | No | 强制重新初始化（删除已存在的资源后重新创建），默认: false |
+
+**Request Example:**
+
+```json
+{
+  "force": false
+}
+```
+
 **Description:**
 
 对于应用模板(AppTemplate)形成的节点:
@@ -231,12 +277,38 @@
 - 如果配置了创建Service，则创建对应的K8S Service
 - 不创建JOB（JOB在start时创建并执行）
 
+**初始化流程:**
+1. 接收初始化请求，将状态设置为 `initializing`
+2. 对于应用模板节点，创建 Deployment 和 Service
+3. 初始化完成后，状态变为 `initialized`
+
+**强制初始化 (force=true):**
+- 前置条件: 工作流状态为 `initialized` 或 `stopped`
+- 先删除已存在的 K8S 资源 (Deployment/Service)
+- 然后重新创建 Deployment 和 Service
+- 用于重新初始化场景
+
+**前置条件:**
+- 状态为 `pending`: 正常初始化
+- 状态为 `initialized` 或 `stopped` 且 `force=true`: 强制重新初始化
+
 **注意:**
 - 只初始化应用模板节点，不启动工作流执行
-- 工作流状态保持为PENDING
+- 初始化成功后状态变为 `initialized`
 - 创建完成后可通过start API启动工作流
+- 如果状态为 `initializing`，表示正在初始化中，不能重复调用
 
 **Response:** `200 OK`
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 初始化成功 |
+| 400 | 状态不正确或正在初始化中 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
 
 ---
 
@@ -261,6 +333,8 @@
 - 并发执行就绪节点
 - 处理环境变量和挂载依赖
 
+**前置条件:** 工作流状态为 `pending`、`initialized` 或 `stopped`
+
 **Response:** `200 OK`
 
 ---
@@ -279,6 +353,7 @@
 - 更新所有节点状态
 - 触发执行就绪节点
 - 可手动或定期调用
+- 允许在任何状态下调用，用于手动状态同步和异常状态恢复
 
 **Response:** `200 OK`
 
@@ -297,7 +372,67 @@
 - 停止所有运行中的节点
 - 删除关联的K8S资源 (Deployment/Job/Service)
 
+**前置条件:** 工作流状态为 `initialized` 或 `running`
+
+**注意:** 停止后状态变为 `stopped`
+
 **Response:** `200 OK`
+
+---
+
+## Uninitialize Workflow Instance
+
+**POST** `/api/workflow/workflow-instances/{instance_id}/uninitialize`
+
+反初始化工作流实例（删除所有K8S资源并重置状态）。
+
+**Authentication:** Required
+
+**Description:**
+
+删除工作流初始化过程中创建的所有 K8S 资源，包括但不限于：
+- **Deployment**: 应用模板节点创建的 Deployment
+- **Service**: 应用模板节点创建的 Service
+- **Job**: 任务模板节点创建的 Job
+- **其他相关资源**: 与工作流相关的所有 K8S 资源
+
+同时重置状态：
+- 清空所有节点的 K8S 资源信息（`k8s_resource_name`、`k8s_resource_type`、`service_name`）
+- 清空所有节点的时间戳（`started_at`、`finished_at`、`message`）
+- 将所有节点状态重置为 `pending`
+- 将工作流状态重置为 `pending`
+
+**前置条件:** 工作流状态为 `initialized`、`running`、`stopped`、`failed` 或 `succeeded`
+
+**用途:**
+
+- 完全重置工作流到初始状态
+- 清理所有 K8S 资源后重新配置
+- 修复初始化问题后重新开始
+- 允许重新修改节点和边配置
+
+**与 stop 的区别:**
+
+| 操作 | stop | uninitialize |
+|------|------|--------------|
+| 删除 K8S 资源 | 是 | 是 |
+| 节点最终状态 | stopped | pending |
+| 工作流最终状态 | stopped | pending |
+| 可重新修改配置 | 否 | 是 |
+| 可重新初始化 | 否（需要 force initialize） | 是（直接 initialize） |
+| 可重新初始化 | 否（需要 force initialize） | 是（直接 initialize） |
+
+**Response:** `200 OK`
+
+**Status Codes:**
+
+| Code | Description |
+|------|-------------|
+| 200 | 反初始化成功 |
+| 400 | 状态不正确 |
+| 401 | 未认证 |
+| 403 | 无权限 |
+| 404 | 实例不存在 |
 
 ---
 
@@ -313,6 +448,8 @@
 
 - 激活持久化工作流实例使其可以接受触发器触发
 - 仅对persistent模式有效
+
+**前置条件:** 工作流状态为 `initialized` 或 `stopped`
 
 **Response:** `200 OK`
 

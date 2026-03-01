@@ -5,7 +5,7 @@ Pydantic schemas for workflow service
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from enum import Enum
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ============ Common Enums ============
@@ -31,12 +31,25 @@ class ServiceType(str, Enum):
 
 
 class WorkflowStatus(str, Enum):
-    """Workflow instance status"""
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    STOPPED = "stopped"
+    """Workflow instance status
+
+    Status flow:
+    - pending -> initializing (when initialize is triggered)
+    - initializing -> initialized (after initialize completes) or failed (if init fails)
+    - initialized -> running (after start)
+    - running -> succeeded (all nodes complete) or failed (any node fails) or stopped (manual stop)
+    - stopped -> running (after start again)
+
+    For persistent mode with trigger:
+    - initialized/running -> can be triggered multiple times
+    """
+    PENDING = "pending"          # 刚创建，未初始化
+    INITIALIZING = "initializing"  # 正在初始化中
+    INITIALIZED = "initialized"  # 已初始化，Deployment/Service已创建
+    RUNNING = "running"          # 运行中
+    SUCCEEDED = "succeeded"      # 执行成功
+    FAILED = "failed"            # 执行失败
+    STOPPED = "stopped"          # 已停止
 
 
 class RunMode(str, Enum):
@@ -388,6 +401,15 @@ class WorkflowInstanceUpdate(BaseModel):
     is_active: Optional[bool] = Field(None, description="Set workflow active state")
 
 
+class WorkflowInstanceInitializeRequest(BaseModel):
+    """Initialize workflow instance request
+
+    force: If True, will delete existing K8S resources (Deployment/Service) and re-initialize.
+           If False (default), will fail if workflow is already initialized.
+    """
+    force: bool = Field(default=False, description="Force re-initialization by deleting existing resources")
+
+
 # ============ Workflow Node Operation Schemas ============
 
 class WorkflowNodeCreate(BaseModel):
@@ -451,7 +473,7 @@ class WorkflowEdgesUpdate(BaseModel):
 
 class WorkflowEdgesUpdateRequest(BaseModel):
     """Request to update workflow edges list"""
-    edges_id: Optional[str] = Field(None, description="Edge ID (for add operation)")
+    edge_id: Optional[str] = Field(None, description="Edge ID (for add/update/delete operation)")
     source: Optional[str] = Field(None, description="Source node ID (for add operation)")
     target: Optional[str] = Field(None, description="Target node ID (for add operation)")
     shared_pvc: Optional[str] = Field(None, description="Shared PVC name (for add operation)")
@@ -515,7 +537,8 @@ class WorkflowInstanceResponse(BaseModel):
     is_active: bool
     run_count: int
     last_run_at: Optional[datetime]
-    nodes: List[WorkflowNodeInstanceResponse]
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
     created_by: str
     started_at: Optional[datetime]
     finished_at: Optional[datetime]

@@ -49,21 +49,35 @@ class ImagePullPolicy:
 
 
 class WorkflowStatus:
-    """Workflow instance status"""
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    STOPPED = "stopped"
+    """Workflow instance status
+
+    Status flow:
+    - pending -> initializing (when initialize is triggered)
+    - initializing -> initialized (after initialize completes) or failed (if init fails)
+    - initialized -> running (after start)
+    - running -> succeeded (all nodes complete) or failed (any node fails) or stopped (manual stop)
+    - stopped -> running (after start again)
+
+    For persistent mode with trigger:
+    - initialized/running -> can be triggered multiple times
+    - trigger keeps workflow in running state during execution
+    """
+    PENDING = "pending"          # 刚创建，未初始化
+    INITIALIZING = "initializing"  # 正在初始化中
+    INITIALIZED = "initialized"  # 已初始化，Deployment/Service已创建
+    RUNNING = "running"          # 运行中
+    SUCCEEDED = "succeeded"      # 执行成功
+    FAILED = "failed"            # 执行失败
+    STOPPED = "stopped"          # 已停止
 
 
 class NodeStatus:
     """Workflow node instance status"""
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    STOPPED = "stopped"
+    PENDING = "pending"        # 等待执行
+    RUNNING = "running"        # 执行中
+    SUCCEEDED = "succeeded"    # 执行成功
+    FAILED = "failed"          # 执行失败
+    STOPPED = "stopped"        # 已停止
 
 
 class NodeType:

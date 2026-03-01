@@ -11,6 +11,7 @@ database:
   max_overflow: 20
 
 auth_service:
+  enabled: false  # 认证开关，设为false时跳过认证
   host: "192.168.12.44"
   port: 10000
   validate_token_path: "/api/auth/validate-human-token"

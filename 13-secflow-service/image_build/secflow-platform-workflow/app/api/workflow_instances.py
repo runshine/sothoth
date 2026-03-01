@@ -18,7 +18,7 @@ from app.schemas import (
     WorkflowInstanceCreate, WorkflowInstanceUpdate,
     WorkflowInstanceResponse, WorkflowInstanceListResponse,
     WorkflowNodeCreate, WorkflowNodeUpdate, WorkflowNodeInstanceResponse,
-    WorkflowEdgesUpdateRequest,
+    WorkflowEdgesUpdateRequest, WorkflowInstanceInitializeRequest,
     LogQueryRequest, PodLogResponse, SuccessResponse
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
@@ -46,6 +46,7 @@ def get_k8s_client_auto():
 @router.post("/{instance_id}/initialize", response_model=WorkflowInstanceResponse)
 async def initialize_workflow_instance(
     instance_id: str,
+    request: WorkflowInstanceInitializeRequest = WorkflowInstanceInitializeRequest(),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -56,12 +57,21 @@ async def initialize_workflow_instance(
     - 创建节点的配置
     - 创建对应的Deployment
     - 如果配置了创建Service，则创建对应的Service
-    - 不创建JOB（除非可以创建JOB但不运行POD）
+    - 不创建JOB（JOB在start时创建并执行）
 
     注意:
-    - 只初始化应用模板节点，不启动工作流
-    - 工作流状态保持为PENDING
+    - 只初始化应用模板节点，不启动工作流执行
+    - 初始化成功后状态变为INITIALIZED
     - 创建完成后可通过start API启动工作流
+
+    强制初始化 (force=True):
+    - 如果工作流已经初始化过（状态为INITIALIZED或STOPPED），会先删除已存在的K8S资源
+    - 然后重新创建Deployment和Service
+    - 用于重新初始化场景
+
+    前置条件:
+    - 状态为 PENDING: 正常初始化
+    - 状态为 INITIALIZED/STOPPED 且 force=True: 强制重新初始化
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -72,8 +82,23 @@ async def initialize_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to initialize this instance")
 
-    if instance.status != WorkflowStatus.PENDING:
+    # 检查状态和强制初始化参数
+    if instance.status == WorkflowStatus.INITIALIZING:
+        raise ValidationError(f"Workflow instance is already initializing, please wait")
+
+    if instance.status == WorkflowStatus.RUNNING:
+        raise ValidationError(f"Cannot initialize running instance, stop it first")
+
+    force = request.force
+
+    # 检查是否需要强制初始化
+    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
         raise ValidationError(f"Cannot initialize instance in status: {instance.status}")
+
+    if instance.status in [WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED] and not force:
+        raise ValidationError(
+            f"Workflow instance already initialized. Use force=True to re-initialize (this will delete existing resources)"
+        )
 
     k8s_client = get_k8s_client_auto()
 
@@ -81,13 +106,45 @@ async def initialize_workflow_instance(
     if not k8s_client.ensure_namespace(instance.project_id):
         raise InternalError(f"Namespace for project {instance.project_id} does not exist")
 
+    # 设置状态为正在初始化
+    instance.status = WorkflowStatus.INITIALIZING
+    instance.message = "Initializing workflow instance..."
+    db.commit()
+
     # 获取所有节点
     nodes = db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.instance_id == instance_id
     ).all()
 
     if not nodes:
+        instance.status = WorkflowStatus.PENDING
+        instance.message = "Workflow instance has no nodes to initialize"
+        db.commit()
         raise ValidationError("Workflow instance has no nodes to initialize")
+
+    # 如果强制初始化，先删除已存在的K8S资源
+    if force and instance.status in [WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
+        logger.info(f"Force initialization: deleting existing K8S resources for instance {instance_id}")
+        for node in nodes:
+            if node.k8s_resource_name:
+                try:
+                    if node.k8s_resource_type == "Deployment":
+                        k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
+                        logger.info(f"Deleted Deployment {node.k8s_resource_name} for node {node.id}")
+                        if node.service_name:
+                            k8s_client.delete_service(instance.project_id, node.service_name)
+                            logger.info(f"Deleted Service {node.service_name} for node {node.id}")
+                    elif node.k8s_resource_type == "Job":
+                        k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
+                        logger.info(f"Deleted Job {node.k8s_resource_name} for node {node.id}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete K8S resource {node.k8s_resource_name}: {e}")
+                # 清空节点资源信息
+                node.k8s_resource_name = None
+                node.k8s_resource_type = None
+                node.service_name = None
+                node.status = NodeStatus.PENDING
+        db.commit()
 
     initialized_nodes = []
     errors = []
@@ -96,6 +153,12 @@ async def initialize_workflow_instance(
         # 只处理应用模板节点
         if node.node_type != NodeType.APP:
             logger.info(f"Skipping node {node.id} (type: {node.node_type}), not an app template")
+            continue
+
+        # 跳过已经有K8S资源的节点（非强制初始化时）
+        if not force and node.k8s_resource_name:
+            logger.info(f"Skipping node {node.id}, already has resource {node.k8s_resource_name}")
+            initialized_nodes.append(node.id)
             continue
 
         try:
@@ -152,16 +215,32 @@ async def initialize_workflow_instance(
 
     db.commit()
 
-    if errors:
+    # 更新工作流状态
+    if errors and not initialized_nodes:
+        # 所有节点初始化都失败
+        instance.status = WorkflowStatus.FAILED
+        instance.message = f"Initialization failed: {'; '.join(errors)}"
+        logger.error(f"Workflow {instance_id} initialization failed: {errors}")
+    elif errors:
+        # 部分节点初始化失败，但仍有成功的节点
+        instance.status = WorkflowStatus.INITIALIZED
         instance.message = f"Initialization completed with errors: {'; '.join(errors)}"
+        logger.warning(f"Workflow {instance_id} initialized with errors: {errors}")
+    elif initialized_nodes:
+        # 全部成功
+        instance.status = WorkflowStatus.INITIALIZED
+        action = "re-initialized" if force else "initialized"
+        instance.message = f"Successfully {action} {len(initialized_nodes)} app nodes"
     else:
-        instance.message = f"Successfully initialized {len(initialized_nodes)} app nodes"
+        # 没有需要初始化的节点
+        instance.status = WorkflowStatus.PENDING
+        instance.message = "No app nodes to initialize"
 
     db.commit()
     db.refresh(instance)
 
-    logger.info(f"Initialized workflow instance {instance_id}, initialized {len(initialized_nodes)} nodes")
-    return instance
+    logger.info(f"Initialized workflow instance {instance_id}, initialized {len(initialized_nodes)} nodes, force={force}")
+    return build_instance_response(instance, db)
 
 
 def _build_containers_from_template(template: AppTemplate, node: WorkflowNodeInstance) -> List[Dict[str, Any]]:
@@ -241,6 +320,64 @@ def _build_containers_from_template(template: AppTemplate, node: WorkflowNodeIns
 def check_instance_permission(instance: WorkflowInstance, user_id: str) -> bool:
     """Check if user has permission to access workflow instance"""
     return instance.created_by == user_id
+
+
+def build_instance_response(instance: WorkflowInstance, db: Session) -> Dict[str, Any]:
+    """Build workflow instance response dict with nodes from WorkflowNodeInstance table"""
+    # Get nodes from WorkflowNodeInstance table (has runtime status)
+    node_instances = db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.instance_id == instance.id
+    ).all()
+
+    # Build nodes list for response
+    nodes_data = []
+    for node in node_instances:
+        nodes_data.append({
+            "id": node.id,
+            "node_id": node.node_id,
+            "node_type": node.node_type,
+            "template_id": node.template_id,
+            "name": node.name,
+            "status": node.status,
+            "k8s_resource_name": node.k8s_resource_name,
+            "k8s_resource_type": node.k8s_resource_type,
+            "depends_on": node.depends_on or [],
+            "downstream_node_ids": node.downstream_node_ids or [],
+            "service_name": node.service_name,
+            "timeout_seconds": node.timeout_seconds,
+            "started_at": node.started_at.isoformat() if node.started_at else None,
+            "finished_at": node.finished_at.isoformat() if node.finished_at else None,
+            "message": node.message,
+            "position": node.position or {"x": 0.0, "y": 0.0},
+            "env_vars": node.env_vars or [],
+            "volume_mounts": node.volume_mounts or [],
+            "resources": node.resources,
+            "input_env_vars": node.input_env_vars or [],
+            "input_volume_mounts": node.input_volume_mounts or [],
+            "created_at": node.created_at.isoformat() if node.created_at else None,
+        })
+
+    return {
+        "id": instance.id,
+        "name": instance.name,
+        "description": instance.description,
+        "project_id": instance.project_id,
+        "status": instance.status,
+        "run_mode": instance.run_mode,
+        "trigger_type": instance.trigger_type,
+        "trigger_enabled": instance.trigger_enabled,
+        "trigger_url": instance.trigger_url,
+        "is_active": instance.is_active,
+        "run_count": instance.run_count,
+        "last_run_at": instance.last_run_at.isoformat() if instance.last_run_at else None,
+        "nodes": nodes_data,
+        "edges": instance.edges or [],
+        "created_by": instance.created_by,
+        "started_at": instance.started_at.isoformat() if instance.started_at else None,
+        "finished_at": instance.finished_at.isoformat() if instance.finished_at else None,
+        "created_at": instance.created_at.isoformat() if instance.created_at else None,
+        "updated_at": instance.updated_at.isoformat() if instance.updated_at else None,
+    }
 
 
 def build_node_relationships(nodes: List[WorkflowNodeInstance], edges: List[Dict]) -> None:
@@ -433,7 +570,7 @@ async def create_workflow_instance(
 
     logger.info(f"Created workflow instance {instance_id} by user {user_id}, "
                 f"run_mode={instance.run_mode}, trigger_type={instance.trigger_type}, nodes={len(nodes)}")
-    return instance
+    return build_instance_response(instance, db)
 
 
 @router.get("", response_model=WorkflowInstanceListResponse)
@@ -453,9 +590,11 @@ async def list_workflow_instances(
     if status:
         query = query.filter(WorkflowInstance.status == status)
 
-    instance = query.order_by(WorkflowInstance.created_at.desc()).all()
+    instances = query.order_by(WorkflowInstance.created_at.desc()).all()
 
-    return WorkflowInstanceListResponse(total=len(instance), items=instance)
+    # Build response items using helper function
+    items = [build_instance_response(inst, db) for inst in instances]
+    return WorkflowInstanceListResponse(total=len(items), items=items)
 
 
 @router.get("/{instance_id}", response_model=WorkflowInstanceResponse)
@@ -474,7 +613,7 @@ async def get_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to access this instance")
 
-    return instance
+    return build_instance_response(instance, db)
 
 
 @router.put("/{instance_id}", response_model=WorkflowInstanceResponse)
@@ -490,6 +629,8 @@ async def update_workflow_instance(
     - Update name, description
     - Enable/disable trigger (for persistent mode)
     - Set active state (for persistent mode)
+
+    Note: 只能在 pending 状态下修改 edges（节点依赖关系），初始化后不允许修改
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -500,7 +641,12 @@ async def update_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to update this instance")
 
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.STOPPED]:
+    # 只允许在 pending 状态下修改 edges
+    if instance_data.edges is not None and instance.status != WorkflowStatus.PENDING:
+        raise ValidationError(f"Cannot update edges in status: {instance.status}. Only pending state allows modification.")
+
+    # 其他字段可以在 pending, initialized, stopped 状态下修改
+    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
         raise ValidationError(f"Cannot update instance in status: {instance.status}")
 
     # Update fields
@@ -535,7 +681,7 @@ async def update_workflow_instance(
     db.refresh(instance)
 
     logger.info(f"Updated workflow instance {instance_id}")
-    return instance
+    return build_instance_response(instance, db)
 
 
 @router.post("/{instance_id}/start", response_model=WorkflowInstanceResponse)
@@ -561,8 +707,8 @@ async def start_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to start this instance")
 
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.STOPPED]:
-        raise ValidationError(f"Cannot start instance in status: {instance.status}")
+    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
+        raise ValidationError(f"Cannot start instance in status: {instance.status}. Valid states: pending, initialized, stopped")
 
     # 使用WorkflowEngine来执行工作流（自动选择K8S客户端模式）
     try:
@@ -585,7 +731,7 @@ async def start_workflow_instance(
         raise InternalError(f"Failed to start workflow: {str(e)}")
 
     db.refresh(instance)
-    return instance
+    return build_instance_response(instance, db)
 
 
 @router.post("/{instance_id}/sync-status", response_model=WorkflowInstanceResponse)
@@ -600,6 +746,7 @@ async def sync_workflow_status(
     - Updates all node statuses from K8S
     - Triggers execution of ready node
     - Can be called periodically or manually
+    - Allowed in any status for manual status synchronization and recovery
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -610,8 +757,8 @@ async def sync_workflow_status(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to access this instance")
 
-    if instance.status != WorkflowStatus.RUNNING:
-        raise ValidationError(f"Cannot sync instance in status: {instance.status}")
+    # 允许在任何状态下同步状态，以便用户可以手动触发状态同步
+    # 这对于异常状态恢复、状态校验等场景非常有用
 
     try:
         engine = WorkflowEngine(instance_id, db)
@@ -629,7 +776,7 @@ async def sync_workflow_status(
         raise InternalError(f"Failed to sync status: {str(e)}")
 
     db.refresh(instance)
-    return instance
+    return build_instance_response(instance, db)
 
 
 @router.post("/{instance_id}/stop", response_model=WorkflowInstanceResponse)
@@ -641,7 +788,9 @@ async def stop_workflow_instance(
     """
     Stop workflow instance
 
-    - Deletes all K8S resources created for this workflow
+    - Stops all running K8S resources
+    - Can be called from INITIALIZED or RUNNING state
+    - Sets status to STOPPED
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -652,8 +801,8 @@ async def stop_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to stop this instance")
 
-    if instance.status != WorkflowStatus.RUNNING:
-        raise ValidationError(f"Cannot stop instance in status: {instance.status}")
+    if instance.status not in [WorkflowStatus.INITIALIZED, WorkflowStatus.RUNNING]:
+        raise ValidationError(f"Cannot stop instance in status: {instance.status}. Valid states: initialized, running")
 
     # 获取K8S客户端（自动选择模式）
     config = get_config()
@@ -690,7 +839,112 @@ async def stop_workflow_instance(
     db.refresh(instance)
 
     logger.info(f"Stopped workflow instance {instance_id}")
-    return instance
+    return build_instance_response(instance, db)
+
+
+@router.post("/{instance_id}/uninitialize", response_model=WorkflowInstanceResponse)
+async def uninitialize_workflow_instance(
+    instance_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    反初始化工作流实例
+
+    - 删除所有已创建的 K8S 资源（Deployment、Service、Job）
+    - 清空节点的 K8S 资源信息
+    - 将所有节点状态重置为 PENDING
+    - 将工作流状态重置为 PENDING
+
+    前置条件:
+    - 状态为 INITIALIZED、RUNNING、STOPPED、FAILED 或 SUCCEEDED
+
+    用途:
+    - 完全重置工作流到初始状态
+    - 清理所有 K8S 资源后重新配置
+    """
+    instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
+
+    if not instance:
+        raise NotFoundError("Workflow instance", instance_id)
+
+    user_id = str(current_user.get("id", ""))
+    if not check_instance_permission(instance, user_id):
+        raise ForbiddenError("No permission to uninitialize this instance")
+
+    # 检查状态 - 只能在已初始化或之后的状态下反初始化
+    valid_states = [
+        WorkflowStatus.INITIALIZED,
+        WorkflowStatus.RUNNING,
+        WorkflowStatus.STOPPED,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.SUCCEEDED
+    ]
+    if instance.status not in valid_states:
+        raise ValidationError(
+            f"Cannot uninitialize instance in status: {instance.status}. "
+            f"Valid states: initialized, running, stopped, failed, succeeded"
+        )
+
+    k8s_client = get_k8s_client_auto()
+
+    # 获取所有节点
+    nodes = db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.instance_id == instance_id
+    ).all()
+
+    deleted_count = 0
+    errors = []
+
+    for node in nodes:
+        if node.k8s_resource_name:
+            try:
+                if node.k8s_resource_type == "Deployment":
+                    # 删除 Service
+                    if node.service_name:
+                        try:
+                            k8s_client.delete_service(instance.project_id, node.service_name)
+                            logger.info(f"Deleted Service {node.service_name} for node {node.id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete Service {node.service_name}: {e}")
+                    # 删除 Deployment
+                    k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
+                    logger.info(f"Deleted Deployment {node.k8s_resource_name} for node {node.id}")
+                    deleted_count += 1
+                elif node.k8s_resource_type == "Job":
+                    k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
+                    logger.info(f"Deleted Job {node.k8s_resource_name} for node {node.id}")
+                    deleted_count += 1
+            except Exception as e:
+                error_msg = f"Failed to delete K8S resource {node.k8s_resource_name}: {e}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+
+        # 清空节点资源信息并重置状态
+        node.k8s_resource_name = None
+        node.k8s_resource_type = None
+        node.service_name = None
+        node.status = NodeStatus.PENDING
+        node.started_at = None
+        node.finished_at = None
+        node.message = None
+
+    # 重置工作流状态
+    instance.status = WorkflowStatus.PENDING
+    instance.started_at = None
+    instance.finished_at = None
+
+    if errors:
+        instance.message = f"Uninitialize completed with errors: {'; '.join(errors)}"
+        logger.warning(f"Uninitialized workflow {instance_id} with errors: {errors}")
+    else:
+        instance.message = f"Successfully uninitialized, deleted {deleted_count} K8S resources"
+        logger.info(f"Uninitialized workflow {instance_id}, deleted {deleted_count} K8S resources")
+
+    db.commit()
+    db.refresh(instance)
+
+    return build_instance_response(instance, db)
 
 
 @router.delete("/{instance_id}", response_model=SuccessResponse)
@@ -715,8 +969,8 @@ async def delete_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to delete this instance")
 
-    # Stop if running
-    if instance.status == WorkflowStatus.RUNNING:
+    # Delete K8S resources if initialized or running
+    if instance.status in [WorkflowStatus.INITIALIZED, WorkflowStatus.RUNNING]:
         k8s_client = get_k8s_client_auto()
         nodes = db.query(WorkflowNodeInstance).filter(
             WorkflowNodeInstance.instance_id == instance_id
@@ -734,7 +988,12 @@ async def delete_workflow_instance(
                 except Exception as e:
                     logger.error(f"Failed to delete K8S resource for node {node.id}: {e}")
 
-    # Delete instance (cascade will delete nodes)
+    # Delete all node instances first (foreign key constraint requires this)
+    db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.instance_id == instance_id
+    ).delete()
+
+    # Delete instance
     db.delete(instance)
     db.commit()
 
@@ -827,6 +1086,7 @@ async def trigger_workflow_by_http(
     - For persistent mode workflows with HTTP trigger enabled
     - Can be called without authentication (internal use)
     - Returns immediately, workflow runs asynchronously
+    - Valid states: initialized (can trigger), running (reject - already running), stopped (need to start first)
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -843,9 +1103,12 @@ async def trigger_workflow_by_http(
     if instance.trigger_type != "http":
         raise ValidationError(f"Workflow instance {instance_id} is not configured for HTTP trigger")
 
-    # Check if workflow can be started
+    # Check if workflow can be triggered
+    # Valid states: initialized (can trigger), stopped (can trigger)
     if instance.status == WorkflowStatus.RUNNING:
         raise ValidationError(f"Workflow instance {instance_id} is already running")
+    if instance.status == WorkflowStatus.PENDING:
+        raise ValidationError(f"Workflow instance {instance_id} is not initialized. Call initialize first.")
 
     # Start workflow
     try:
@@ -886,6 +1149,7 @@ async def activate_workflow_instance(
     Activate workflow instance (for persistent mode)
 
     - Makes the workflow instance active to accept trigger
+    - Requires workflow to be initialized or stopped
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -899,12 +1163,16 @@ async def activate_workflow_instance(
     if instance.run_mode != "persistent":
         raise ValidationError("Only persistent mode workflow can be activated")
 
+    # Workflow must be initialized or stopped to be activated
+    if instance.status not in [WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
+        raise ValidationError(f"Cannot activate instance in status: {instance.status}. Initialize first.")
+
     instance.is_active = True
     db.commit()
     db.refresh(instance)
 
     logger.info(f"Activated workflow instance {instance_id}")
-    return instance
+    return build_instance_response(instance, db)
 
 
 @router.post("/{instance_id}/deactivate", response_model=WorkflowInstanceResponse)
@@ -936,7 +1204,7 @@ async def deactivate_workflow_instance(
     db.refresh(instance)
 
     logger.info(f"Deactivated workflow instance {instance_id}")
-    return instance
+    return build_instance_response(instance, db)
 
 
 # ============ Workflow Node Operations ============
@@ -971,8 +1239,8 @@ async def create_workflow_node(
         raise ForbiddenError("No permission to add node to this instance")
 
     # Check workflow is in pending state for adding nodes
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.STOPPED]:
-        raise ValidationError(f"Cannot add node to instance in status: {instance.status}")
+    if instance.status != WorkflowStatus.PENDING:
+        raise ValidationError(f"Cannot add node to instance in status: {instance.status}. Only pending state allows modification.")
 
     # Validate template exists and user has access
     node_type_val = node_data.node_type.value if hasattr(node_data.node_type, 'value') else node_data.node_type
@@ -1043,6 +1311,10 @@ async def create_workflow_node(
     existing_nodes = instance.nodes or []
     existing_nodes.append(node_config)
     instance.nodes = existing_nodes
+
+    # Mark nodes field as modified for SQLAlchemy to detect the change
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(instance, "nodes")
 
     db.commit()
 
@@ -1169,7 +1441,10 @@ async def update_workflow_node(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Update workflow node configuration"""
+    """Update workflow node configuration
+
+    Note: 只能在 pending 状态下修改节点配置，初始化后不允许修改
+    """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
     if not instance:
@@ -1179,8 +1454,8 @@ async def update_workflow_node(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to update this instance")
 
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.STOPPED]:
-        raise ValidationError(f"Cannot update node in instance status: {instance.status}")
+    if instance.status != WorkflowStatus.PENDING:
+        raise ValidationError(f"Cannot update node in instance status: {instance.status}. Only pending state allows modification.")
 
     node = db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.id == node_instance_id,
@@ -1227,6 +1502,10 @@ async def update_workflow_node(
             break
     instance.nodes = existing_nodes
 
+    # Mark nodes field as modified for SQLAlchemy to detect the change
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(instance, "nodes")
+
     db.commit()
     db.refresh(node)
 
@@ -1241,7 +1520,10 @@ async def delete_workflow_node(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Delete workflow node"""
+    """Delete workflow node
+
+    Note: 只能在 pending 状态下删除节点，初始化后不允许删除
+    """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
     if not instance:
@@ -1251,8 +1533,8 @@ async def delete_workflow_node(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to delete node from this instance")
 
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.STOPPED]:
-        raise ValidationError(f"Cannot delete node from instance in status: {instance.status}")
+    if instance.status != WorkflowStatus.PENDING:
+        raise ValidationError(f"Cannot delete node from instance in status: {instance.status}. Only pending state allows modification.")
 
     node = db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.id == node_instance_id,
@@ -1262,13 +1544,13 @@ async def delete_workflow_node(
     if not node:
         raise NotFoundError("Workflow node", node_instance_id)
 
-    # Check if node is running
-    if node.status == NodeStatus.RUNNING:
-        raise ValidationError("Cannot delete running node, stop workflow first")
-
     # Remove node from instance nodes list
     existing_nodes = instance.nodes or []
     instance.nodes = [n for n in existing_nodes if n.get("id") != node_instance_id]
+
+    # Mark nodes field as modified for SQLAlchemy to detect the change
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(instance, "nodes")
 
     # Delete node instance
     db.delete(node)
@@ -1306,6 +1588,8 @@ async def update_workflow_edge(
     - action: "add" - add new edge
     - action: "update" - update existing edge
     - action: "delete" - delete edge
+
+    Note: 只能在 pending 状态下修改边（节点依赖关系），初始化后不允许修改
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -1316,8 +1600,8 @@ async def update_workflow_edge(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to update this instance")
 
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.STOPPED]:
-        raise ValidationError(f"Cannot update edges in instance status: {instance.status}")
+    if instance.status != WorkflowStatus.PENDING:
+        raise ValidationError(f"Cannot update edges in instance status: {instance.status}. Only pending state allows modification.")
 
     existing_edges = instance.edges or []
     action = edge_data.action
@@ -1327,9 +1611,11 @@ async def update_workflow_edge(
         if not edge_data.edge_id or not edge_data.source or not edge_data.target:
             raise ValidationError("edge_id, source, target are required for add action")
 
-        # Validate source and target nodes exist
-        existing_nodes = instance.nodes or []
-        node_ids = [n.get("node_id") for n in existing_nodes]
+        # Validate source and target nodes exist (from WorkflowNodeInstance table)
+        existing_nodes = db.query(WorkflowNodeInstance).filter(
+            WorkflowNodeInstance.instance_id == instance_id
+        ).all()
+        node_ids = [n.id for n in existing_nodes]
         if edge_data.source not in node_ids:
             raise ValidationError(f"Source node {edge_data.source} does not exist")
         if edge_data.target not in node_ids:
@@ -1341,14 +1627,14 @@ async def update_workflow_edge(
             "target": edge_data.target,
             "shared_pvc": edge_data.shared_pvc
         }
-        existing_edge.append(new_edge)
+        existing_edges.append(new_edge)
 
     elif action == "update":
         # Update existing edge
         if not edge_data.edge_id:
             raise ValidationError("edge_id is required for update action")
 
-        for edge in existing_edge:
+        for edge in existing_edges:
             if edge.get("edge_id") == edge_data.edge_id:
                 if edge_data.source is not None:
                     edge["source"] = edge_data.source
@@ -1365,11 +1651,13 @@ async def update_workflow_edge(
         if not edge_data.edge_id:
             raise ValidationError("edge_id is required for delete action")
 
-        instance.edges = [e for e in existing_edge if e.get("edge_id") != edge_data.edge_id]
+        existing_edges = [e for e in existing_edges if e.get("edge_id") != edge_data.edge_id]
     else:
         raise ValidationError(f"Invalid action: {action}. Valid actions are: add, update, delete")
 
-    instance.edges = existing_edge
+    instance.edges = existing_edges
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(instance, "edges")
     db.commit()
 
     # Rebuild node relationships (depends_on and downstream_node_ids) from updated edges
@@ -1382,10 +1670,10 @@ async def update_workflow_edge(
             node.depends_on = []
             node.downstream_node_ids = []
         # Rebuild from edges
-        build_node_relationships(all_nodes, existing_edge)
+        build_node_relationships(all_nodes, existing_edges)
         db.commit()
 
     db.refresh(instance)
 
     logger.info(f"Updated workflow edges in instance {instance_id}, action: {action}")
-    return instance
+    return build_instance_response(instance, db)

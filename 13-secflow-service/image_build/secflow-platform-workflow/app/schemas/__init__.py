@@ -32,6 +32,7 @@ from app.schemas.schemas import (
     # Instance
     WorkflowInstanceCreate,
     WorkflowInstanceUpdate,
+    WorkflowInstanceInitializeRequest,
     WorkflowNodeCreate,
     WorkflowNodeUpdate,
     WorkflowEdgesUpdate,
@@ -72,6 +73,7 @@ __all__ = [
     "WorkflowEdgeConfig",
     "WorkflowInstanceCreate",
     "WorkflowInstanceUpdate",
+    "WorkflowInstanceInitializeRequest",
     "WorkflowNodeCreate",
     "WorkflowNodeUpdate",
     "WorkflowEdgesUpdate",

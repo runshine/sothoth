@@ -211,8 +211,8 @@ class KubernetesService:
                     "ports": [{"containerPort": p.container_port} for p in (c.ports or [])],
                     "env": [{"name": e.name, "value": e.value} for e in (c.env or [])],
                     "resources": {
-                        "requests": c.resources.requests if c.resources and c.resources.request else {},
-                        "limits": c.resources.limits if c.resources and c.resources.limit else {},
+                        "requests": c.resources.requests if c.resources and c.resources.requests else {},
+                        "limits": c.resources.limits if c.resources and c.resources.limits else {},
                     } if c.resources else {}
                 }
                 for c in (pod.spec.containers or [])
@@ -333,8 +333,8 @@ class KubernetesService:
         service_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
         ports = []
@@ -713,12 +713,12 @@ class KubernetesService:
         return {
             "name": dep.metadata.name,
             "namespace": dep.metadata.namespace,
-            "label": dep.metadata.label or {},
-            "annotation": dep.metadata.annotation or {},
+            "labels": dep.metadata.labels or {},
+            "annotations": dep.metadata.annotations or {},
             "replicas": dep.spec.replicas if dep.spec else 0,
             "ready_replicas": dep.status.ready_replicas if dep.status else 0,
-            "available_replica": dep.status.available_replica if dep.status else 0,
-            "updated_replica": dep.status.updated_replica if dep.status else 0,
+            "available_replicas": dep.status.available_replicas if dep.status else 0,
+            "updated_replicas": dep.status.updated_replicas if dep.status else 0,
             "selector": dep.spec.selector.match_labels if dep.spec and dep.spec.selector else {},
             "containers": [
                 {
@@ -727,8 +727,8 @@ class KubernetesService:
                     "ports": [{"containerPort": p.container_port} for p in (c.ports or [])],
                     "env": [{"name": e.name, "value": e.value} for e in (c.env or [])],
                     "resources": {
-                        "requests": c.resources.request if c.resources and c.resources.request else {},
-                        "limits": c.resources.limit if c.resources and c.resources.limit else {},
+                        "requests": c.resources.requests if c.resources and c.resources.requests else {},
+                        "limits": c.resources.limits if c.resources and c.resources.limits else {},
                     } if c.resources else {},
                     "volume_mounts": [
                         {"name": vm.name, "mount_path": vm.mount_path}
@@ -753,8 +753,8 @@ class KubernetesService:
         deployment_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
         selector = V1LabelSelector(match_labels=spec.get("selector", {}).get("matchLabels", {}))

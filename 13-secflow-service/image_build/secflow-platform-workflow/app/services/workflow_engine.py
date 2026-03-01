@@ -206,6 +206,8 @@ class WorkflowEngine:
                     self.instance.project_id, node.k8s_resource_name
                 )
                 if status:
+                    logger.debug(f"Deployment {node.k8s_resource_name} status: {status}")
+
                     # Check timeout
                     if node.started_at:
                         elapsed = (datetime.utcnow() - node.started_at).total_seconds()
@@ -218,8 +220,14 @@ class WorkflowEngine:
                             self.db.commit()
                             return
 
-                    # Deployment is ready when available_replicas == replica
-                    if status.get("ready_replica", 0) >= status.get("replica", 0):
+                    # Deployment is ready when ready_replicas >= replicas
+                    # Note: K8S client returns ready_replicas (plural) and replicas (plural)
+                    ready_replicas = status.get("ready_replicas", 0) or status.get("ready_replica", 0)
+                    replicas = status.get("replicas", 0) or status.get("replica", 0)
+
+                    logger.info(f"Deployment {node.k8s_resource_name}: ready_replicas={ready_replicas}, replicas={replicas}")
+
+                    if ready_replicas >= replicas and replicas > 0:
                         # App node is ready - mark as SUCCEEDED (not running)
                         if node.status != NodeStatus.SUCCEEDED:
                             node.status = NodeStatus.SUCCEEDED
@@ -228,7 +236,7 @@ class WorkflowEngine:
                     else:
                         # Still pending (deployment exists but not ready)
                         if node.status == NodeStatus.PENDING:
-                            node.message = "Waiting for deployment to be ready..."
+                            node.message = f"Waiting for deployment to be ready ({ready_replicas}/{replicas})..."
             else:
                 status = self.k8s_client.get_job_status(
                     self.instance.project_id, node.k8s_resource_name
@@ -263,10 +271,62 @@ class WorkflowEngine:
             logger.error(f"Error syncing node {node.node_id} status: {e}")
 
     async def sync_all_nodes_status(self):
-        """Sync all node status from K8S"""
+        """Sync all node status from K8S and update workflow status"""
         for node in self.nodes:
             if node.status in [NodeStatus.RUNNING, NodeStatus.PENDING]:
                 await self.sync_node_status_from_k8s(node)
+
+        # Update workflow status based on node statuses
+        self._update_workflow_status()
+
+    def _update_workflow_status(self):
+        """Update workflow instance status based on node statuses"""
+        if not self.nodes:
+            return
+
+        # Count nodes by status
+        pending_count = sum(1 for n in self.nodes if n.status == NodeStatus.PENDING)
+        running_count = sum(1 for n in self.nodes if n.status == NodeStatus.RUNNING)
+        succeeded_count = sum(1 for n in self.nodes if n.status == NodeStatus.SUCCEEDED)
+        failed_count = sum(1 for n in self.nodes if n.status == NodeStatus.FAILED)
+        stopped_count = sum(1 for n in self.nodes if n.status == NodeStatus.STOPPED)
+
+        total = len(self.nodes)
+        logger.info(f"Workflow {self.instance_id} node status: pending={pending_count}, running={running_count}, "
+                    f"succeeded={succeeded_count}, failed={failed_count}, stopped={stopped_count}")
+
+        # Determine workflow status
+        if failed_count > 0:
+            # Any node failed -> workflow failed
+            self.instance.status = WorkflowStatus.FAILED
+            if self.instance.finished_at is None:
+                self.instance.finished_at = datetime.utcnow()
+            failed_nodes = [n.name for n in self.nodes if n.status == NodeStatus.FAILED]
+            self.instance.message = f"Workflow failed: nodes {failed_nodes} failed"
+            logger.warning(f"Workflow {self.instance_id} marked as FAILED")
+        elif pending_count == 0 and running_count == 0:
+            # All nodes completed (succeeded or stopped)
+            if succeeded_count == total:
+                self.instance.status = WorkflowStatus.SUCCEEDED
+                if self.instance.finished_at is None:
+                    self.instance.finished_at = datetime.utcnow()
+                self.instance.message = "All nodes completed successfully"
+                logger.info(f"Workflow {self.instance_id} marked as SUCCEEDED")
+            elif stopped_count > 0 and pending_count == 0 and running_count == 0:
+                self.instance.status = WorkflowStatus.STOPPED
+                if self.instance.finished_at is None:
+                    self.instance.finished_at = datetime.utcnow()
+                self.instance.message = "Workflow stopped"
+        elif running_count > 0:
+            # Any node running -> workflow running
+            if self.instance.status != WorkflowStatus.RUNNING:
+                self.instance.status = WorkflowStatus.RUNNING
+                if self.instance.started_at is None:
+                    self.instance.started_at = datetime.utcnow()
+                self.instance.message = "Workflow is running"
+                logger.info(f"Workflow {self.instance_id} marked as RUNNING")
+
+        self.db.commit()
 
     def _get_template(self, node: WorkflowNodeInstance) -> Optional[Any]:
         """Get template for a node"""

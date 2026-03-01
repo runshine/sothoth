@@ -33,6 +33,7 @@ class DatabaseConfig(BaseModel):
 
 class AuthServiceConfig(BaseModel):
     """Auth服务配置"""
+    enabled: bool = True  # 认证开关，设为False时跳过认证
     host: str
     port: int
     validate_token_path: str = "/api/auth/validate-human-token"

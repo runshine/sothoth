@@ -65,6 +65,12 @@ async def get_current_user(
     db: Session = Depends(get_db)
 ) -> dict:
     """获取当前用户"""
+    config = get_config()
+
+    # 如果认证开关关闭，返回默认用户信息
+    if not config.auth_service.enabled:
+        return {"user_id": "anonymous", "username": "anonymous", "role": "admin"}
+
     if not authorization or not authorization.startswith("Bearer "):
         raise ForbiddenError("未提供认证Token")
 
