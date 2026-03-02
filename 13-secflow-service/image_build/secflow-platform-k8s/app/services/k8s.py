@@ -169,7 +169,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "Pod", "删除")
 
@@ -291,12 +291,12 @@ class KubernetesService:
     def delete_service(self, namespace: str, name: str) -> Dict:
         """删除Service"""
         try:
-            result = self.core_v1.delete_namespaced_service(
+            self.core_v1.delete_namespaced_service(
                 name=name,
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "Service", "删除")
 
@@ -305,11 +305,11 @@ class KubernetesService:
         return {
             "name": svc.metadata.name,
             "namespace": svc.metadata.namespace,
-            "label": svc.metadata.label or {},
-            "annotation": svc.metadata.annotation or {},
+            "label": svc.metadata.labels or {},
+            "annotation": svc.metadata.annotations or {},
             "type": svc.spec.type if svc.spec else "ClusterIP",
             "cluster_ip": svc.spec.cluster_ip if svc.spec else None,
-            "external_ips": svc.spec.external_ips if svc.spec else None,
+            "external_ips": svc.spec.external_i_ps if svc.spec else None,
             "ports": [
                 {
                     "name": p.name,
@@ -395,7 +395,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "Ingress", "删除")
 
@@ -539,7 +539,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "Secret", "删除")
 
@@ -614,7 +614,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "ConfigMap", "删除")
 
@@ -690,7 +690,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "Deployment", "删除")
 
@@ -824,7 +824,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "StatefulSet", "删除")
 
@@ -925,7 +925,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "DaemonSet", "删除")
 
@@ -1023,7 +1023,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "Job", "删除")
 
@@ -1124,7 +1124,7 @@ class KubernetesService:
                 namespace=namespace,
                 body=kubernetes.client.V1DeleteOptions()
             )
-            return {"status": result.status, "name": name}
+            return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "PVC", "删除")
 

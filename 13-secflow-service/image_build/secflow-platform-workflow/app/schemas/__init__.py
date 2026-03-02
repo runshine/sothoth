@@ -3,6 +3,9 @@ Schemas package
 """
 
 from app.schemas.schemas import (
+    # Sync Record
+    WorkflowSyncRecordResponse,
+    WorkflowSyncRecordListResponse,
     # Enums
     TemplateScope,
     ImagePullPolicy,
@@ -87,4 +90,6 @@ __all__ = [
     "SuccessResponse",
     "ErrorResponse",
     "HealthResponse",
+    "WorkflowSyncRecordResponse",
+    "WorkflowSyncRecordListResponse",
 ]

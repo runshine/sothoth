@@ -3,6 +3,7 @@ Models package
 """
 
 from app.models.database import (
+    WorkflowSyncRecord,
     Base,
     AppTemplate,
     JobTemplate,
@@ -27,6 +28,7 @@ __all__ = [
     "JobTemplate",
     "WorkflowInstance",
     "WorkflowNodeInstance",
+    "WorkflowSyncRecord",
     "TemplateScope",
     "ImagePullPolicy",
     "WorkflowStatus",

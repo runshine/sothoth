@@ -34,6 +34,54 @@
 | ttl_seconds_after_finished | integer | No | 完成后TTL秒数默认: 3600 |
 | backoff_limit | integer | No | 重试次数默认: 3 |
 
+**ContainerConfig:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | Yes | 容器名称 (1-128字符) |
+| image | string | Yes | 容器镜像地址 |
+| command | array[string] | No | 启动命令 |
+| args | array[string] | No | 命令参数 |
+| env_vars | array[EnvVar] | No | 固定环境变量 |
+| volume_mounts | array[VolumeMount] | No | 固定PVC挂载 |
+| input_env_vars | array[EnvVarInput] | No | 输入环境变量依赖 |
+| input_volume_mounts | array[VolumeMountInput] | No | 输入挂载依赖 |
+| privileged | boolean | No | 特权模式默认: false |
+| image_pull_policy | string | No | `Always`, `IfNotPresent`(默认), `Never` |
+| resources | object | No | 资源要求 |
+
+**EnvVar:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | Yes | 环境变量名 |
+| value | string | Yes | 环境变量值 |
+
+**EnvVarInput:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | Yes | 环境变量名 (在当前容器设置) |
+| default_value | string | No | 默认值 (当上游不可用时) |
+
+**VolumeMount:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| pvc_name | string | Yes | PVC名称 |
+| mount_path | string | Yes | 容器内挂载路径 |
+| sub_path | string | No | PVC子目录挂载 |
+| read_only | boolean | No | 只读挂载默认: false |
+
+**VolumeMountInput:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| mount_path | string | Yes | 容器内需要挂载的路径（声明需要挂载的位置） |
+| read_only | boolean | No | 只读挂载默认: true |
+
+**说明:** 模板级别只声明需要挂载的路径和是否只读，`sub_path` 在节点实例化时通过 `input_volume_mounts` 指定。
+
 > 注意: 任务模板容器不支持健康检查 (liveness_probe, readiness_probe)。
 
 **Request Example:**

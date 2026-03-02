@@ -195,6 +195,20 @@ async def update_app_template(
     if template.created_by != user_id and "admin" not in user_roles:
         raise ForbiddenError("Only template creator or admin can update")
 
+    # Validate service config when create_service is being set to True
+    if template_data.create_service is True:
+        errors = []
+        # Check service_name: use new value if provided, otherwise check existing value
+        service_name = template_data.service_name if template_data.service_name is not None else template.service_name
+        if not service_name or not service_name.strip():
+            errors.append("service_name is required when create_service is True")
+        # Check service_ports: use new value if provided, otherwise check existing value
+        service_ports = template_data.service_ports if template_data.service_ports is not None else template.service_ports
+        if not service_ports or len(service_ports) == 0:
+            errors.append("service_ports cannot be empty when create_service is True")
+        if errors:
+            raise ValidationError("; ".join(errors))
+
     # Update fields
     logger.info(f"Update request: template_id={template_id}, service_ports={template_data.service_ports}, "
                 f"replicas={template_data.replicas}")

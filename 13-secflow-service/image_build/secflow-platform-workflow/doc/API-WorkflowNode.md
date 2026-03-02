@@ -177,6 +177,29 @@
 | input_env_vars | array[DependencyEnvVar] | No | 输入环境变量依赖 |
 | input_volume_mounts | array[DependencyVolumeMount] | No | 输入挂载依赖 |
 
+**DependencyEnvVar:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| name | string | Yes | 环境变量名 (在当前节点设置) |
+| source_node_id | string | Yes | 上游节点ID (从中获取值) |
+| default_value | string | No | 默认值 (当上游不可用时) |
+
+**DependencyVolumeMount:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| mount_path | string | Yes | 容器内挂载路径 |
+| sub_path | string | No | PVC子目录挂载 (在节点实例化时指定) |
+| source_node_id | string | Yes | 上游节点ID (从中获取PVC) |
+| source_pvc_name | string | No | 指定PVC名称 (可选，不指定则自动检测) |
+| read_only | boolean | No | 只读挂载默认: true |
+
+**说明:**
+- 模板的 `input_volume_mounts` 只声明 `mount_path` 和 `read_only`
+- 节点实例化时通过 `input_volume_mounts` 指定 `source_node_id`、`sub_path` 等具体信息
+- `sub_path` 允许从上游 PVC 的特定子目录挂载数据
+
 **Response:** `200 OK`
 
 ---

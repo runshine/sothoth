@@ -271,16 +271,29 @@ initialized/running/stopped/failed/succeeded -> pending (uninitialize)
 
 **Description:**
 
-对于应用模板(AppTemplate)形成的节点:
-- 创建节点的配置
+对于不同类型的节点，初始化逻辑不同：
+
+**JOB类型节点:**
+- 直接上报初始化成功
+- 不创建任何K8S资源（Job在start时创建并执行）
+
+**APP类型节点:**
+- 必须在模板中定义Service（`create_service=true` 且 `service_ports` 不为空）
+- 必须在模板中定义 `service_name`（用于创建Service）
 - 创建对应的K8S Deployment
-- 如果配置了创建Service，则创建对应的K8S Service
-- 不创建JOB（JOB在start时创建并执行）
+- 使用模板中定义的 `service_name` 创建K8S Service（不能使用自动生成的名称如 `wf-8817564c-632245d0`）
+- 如果模板未定义Service或Service创建失败，则上报初始化失败
 
 **初始化流程:**
 1. 接收初始化请求，将状态设置为 `initializing`
-2. 对于应用模板节点，创建 Deployment 和 Service
-3. 初始化完成后，状态变为 `initialized`
+2. 对于JOB节点：直接标记初始化成功
+3. 对于APP节点：
+   - 检查模板是否定义了Service（`create_service=true` 且 `service_ports` 不为空）
+   - 检查模板是否定义了 `service_name`
+   - 创建 Deployment
+   - 使用模板中的 `service_name` 创建 Service
+   - 如果任一步骤失败，则上报初始化失败
+4. 初始化完成后，状态变为 `initialized` 或 `failed`
 
 **强制初始化 (force=true):**
 - 前置条件: 工作流状态为 `initialized` 或 `stopped`
@@ -293,7 +306,10 @@ initialized/running/stopped/failed/succeeded -> pending (uninitialize)
 - 状态为 `initialized` 或 `stopped` 且 `force=true`: 强制重新初始化
 
 **注意:**
-- 只初始化应用模板节点，不启动工作流执行
+- JOB节点初始化时不创建任何K8S资源，直接上报成功
+- APP节点必须在模板中定义Service配置（`create_service=true`、`service_ports`不为空、`service_name`不为空）
+- APP节点创建Service时使用模板中定义的`service_name`，不能使用自动生成的名称
+- 如果APP节点模板未定义Service，初始化会失败
 - 初始化成功后状态变为 `initialized`
 - 创建完成后可通过start API启动工作流
 - 如果状态为 `initializing`，表示正在初始化中，不能重复调用
@@ -351,9 +367,14 @@ initialized/running/stopped/failed/succeeded -> pending (uninitialize)
 
 - 从K8S获取实时状态并同步
 - 更新所有节点状态
-- 触发执行就绪节点
+- 更新工作流整体状态
 - 可手动或定期调用
 - 允许在任何状态下调用，用于手动状态同步和异常状态恢复
+
+**注意:**
+- 当工作流处于 `pending` 状态时，只同步状态，不会启动就绪节点
+- 只有已初始化的工作流（状态不为 `pending`）才会检查并启动就绪节点
+- 这确保了未初始化的工作流不会意外创建 K8S 资源
 
 **Response:** `200 OK`
 

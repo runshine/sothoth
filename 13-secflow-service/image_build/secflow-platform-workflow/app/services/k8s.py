@@ -808,6 +808,68 @@ class K8SClient:
             logger.error(f"Failed to get pod logs: {e}")
             return None
 
+    # ============ List Resources Operations ============
+
+    def list_deployments(self, project_id: str, label_selector: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List deployments in namespace"""
+        namespace = self.get_project_namespace(project_id)
+        try:
+            deployments = self.apps_api.list_namespaced_deployment(
+                namespace=namespace,
+                label_selector=label_selector
+            )
+            return [
+                {
+                    "name": dep.metadata.name,
+                    "replicas": dep.spec.replicas,
+                    "available_replicas": dep.status.available_replicas or 0,
+                    "ready_replicas": dep.status.ready_replicas or 0,
+                }
+                for dep in deployments.items
+            ]
+        except ApiException as e:
+            logger.error(f"Failed to list deployments: {e}")
+            return []
+
+    def list_services(self, project_id: str, label_selector: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List services in namespace"""
+        namespace = self.get_project_namespace(project_id)
+        try:
+            services = self.core_api.list_namespaced_service(
+                namespace=namespace,
+                label_selector=label_selector
+            )
+            return [
+                {
+                    "name": svc.metadata.name,
+                    "type": svc.spec.type,
+                    "ports": [{"port": p.port, "target_port": p.target_port} for p in (svc.spec.ports or [])],
+                }
+                for svc in services.items
+            ]
+        except ApiException as e:
+            logger.error(f"Failed to list services: {e}")
+            return []
+
+    def list_jobs(self, project_id: str, label_selector: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List jobs in namespace"""
+        namespace = self.get_project_namespace(project_id)
+        try:
+            jobs = self.batch_api.list_namespaced_job(
+                namespace=namespace,
+                label_selector=label_selector
+            )
+            return [
+                {
+                    "name": job.metadata.name,
+                    "status": job.status.conditions[0].type if job.status.conditions else "Unknown",
+                }
+                for job in jobs.items
+            ]
+        except ApiException as e:
+            logger.error(f"Failed to list jobs: {e}")
+            return []
+
 
 # Singleton instance
 _k8s_client: Optional[K8SClient] = None

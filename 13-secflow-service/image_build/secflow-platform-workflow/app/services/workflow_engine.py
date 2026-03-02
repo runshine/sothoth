@@ -295,6 +295,12 @@ class WorkflowEngine:
         logger.info(f"Workflow {self.instance_id} node status: pending={pending_count}, running={running_count}, "
                     f"succeeded={succeeded_count}, failed={failed_count}, stopped={stopped_count}")
 
+        # 如果工作流当前是 pending 状态，且所有节点都是 pending 状态，保持不变
+        # 这表示工作流尚未初始化，不应该自动改变状态
+        if self.instance.status == WorkflowStatus.PENDING and pending_count == total:
+            logger.info(f"Workflow {self.instance_id} remains PENDING (not initialized yet)")
+            return
+
         # Determine workflow status
         if failed_count > 0:
             # Any node failed -> workflow failed

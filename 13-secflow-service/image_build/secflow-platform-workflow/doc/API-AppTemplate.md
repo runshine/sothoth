@@ -86,9 +86,10 @@
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| mount_path | string | Yes | 容器内需要挂载的路径 |
-| sub_path | string | No | PVC子目录挂载 |
+| mount_path | string | Yes | 容器内需要挂载的路径（声明需要挂载的位置） |
 | read_only | boolean | No | 只读挂载默认: true |
+
+**说明:** 模板级别只声明需要挂载的路径和是否只读，`sub_path` 在节点实例化时通过 `input_volume_mounts` 指定。
 
 **ServicePort:**
 

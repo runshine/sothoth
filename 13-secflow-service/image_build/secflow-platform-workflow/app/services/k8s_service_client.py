@@ -575,6 +575,50 @@ class K8SServiceClient:
             logger.error(f"获取Pod日志失败: {e}")
             return None
 
+    # ============ List Resources Operations ============
+
+    def list_deployments(self, project_id: str, label_selector: Optional[str] = None) -> List[Dict[str, Any]]:
+        """列出namespace中的Deployments"""
+        url = f"{self._get_base_url()}/deployments?project_id={project_id}"
+        if label_selector:
+            url += f"&label_selector={label_selector}"
+        try:
+            response = self.sync_client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("items", [])
+        except httpx.HTTPError as e:
+            logger.error(f"列出Deployments失败: {e}")
+            return []
+
+    def list_services(self, project_id: str, label_selector: Optional[str] = None) -> List[Dict[str, Any]]:
+        """列出namespace中的Services"""
+        url = f"{self._get_base_url()}/services?project_id={project_id}"
+        if label_selector:
+            url += f"&label_selector={label_selector}"
+        try:
+            response = self.sync_client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("items", [])
+        except httpx.HTTPError as e:
+            logger.error(f"列出Services失败: {e}")
+            return []
+
+    def list_jobs(self, project_id: str, label_selector: Optional[str] = None) -> List[Dict[str, Any]]:
+        """列出namespace中的Jobs"""
+        url = f"{self._get_base_url()}/jobs?project_id={project_id}"
+        if label_selector:
+            url += f"&label_selector={label_selector}"
+        try:
+            response = self.sync_client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("items", [])
+        except httpx.HTTPError as e:
+            logger.error(f"列出Jobs失败: {e}")
+            return []
+
 
 # 单例实例
 _k8s_service_client: Optional[K8SServiceClient] = None

@@ -135,10 +135,11 @@ class VolumeMount(BaseModel):
 class VolumeMountInput(BaseModel):
     """
     Volume mount input dependency - declare need from upstream PVC, source determined at workflow instance.
-    The actual PVC source (source_node_id) is specified when instantiating the workflow.
+    The actual PVC source (source_node_id) and sub_path are specified when instantiating the workflow node.
+
+    模板级别只声明需要挂载的路径和是否只读，具体的 sub_path 在节点实例化时指定。
     """
     mount_path: str = Field(..., description="Mount path in container where upstream PVC will be mounted")
-    sub_path: Optional[str] = Field(None, description="Sub-path within the PVC to mount")
     read_only: bool = Field(default=True, description="Read only mount (input is typically read-only)")
 
 
@@ -219,6 +220,19 @@ class AppTemplateCreate(BaseModel):
     service_name: Optional[str] = Field(None, description="K8s Service name (default: auto-generated)")
     create_service: bool = Field(default=True, description="Whether to create K8s Service")
     service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="K8s Service type")
+
+    @model_validator(mode='after')
+    def validate_service_config(self):
+        """Validate service configuration when create_service is True"""
+        if self.create_service:
+            errors = []
+            if not self.service_name or not self.service_name.strip():
+                errors.append("service_name is required when create_service is True")
+            if not self.service_ports or len(self.service_ports) == 0:
+                errors.append("service_ports cannot be empty when create_service is True")
+            if errors:
+                raise ValueError("; ".join(errors))
+        return self
 
 
 class AppTemplateUpdate(BaseModel):
@@ -603,3 +617,22 @@ class HealthResponse(BaseModel):
     """Health check response"""
     status: str
     service: str
+
+
+# ============ Sync Record Schemas ============
+
+class WorkflowSyncRecordResponse(BaseModel):
+    """同步记录响应"""
+    id: str
+    instance_id: str
+    sync_at: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class WorkflowSyncRecordListResponse(BaseModel):
+    """同步记录列表响应"""
+    total: int
+    items: List[WorkflowSyncRecordResponse]
