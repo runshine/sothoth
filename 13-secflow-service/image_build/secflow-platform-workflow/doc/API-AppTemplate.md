@@ -35,10 +35,6 @@
 | scope | string | No | 模板范围: `global`(全局) 或 `project`(项目)，默认: `project` |
 | project_id | string | Conditional | 项目ID (scope为project时必填) |
 | containers | array[ContainerConfig] | Yes | 容器配置列表 (至少一个容器) |
-| service_ports | array[ServicePort] | No | K8s Service端口配置 |
-| service_name | string | No | K8s Service名称 (不指定则自动生成) |
-| create_service | boolean | No | 是否创建K8s Service默认: true |
-| service_type | string | No | Service类型: `ClusterIP`(默认), `LoadBalancer`, `NodePort` |
 | replicas | integer | No | 副本数默认: 1最小: 1 |
 
 **ContainerConfig:**
@@ -162,12 +158,7 @@
       }
     }
   ],
-  "service_ports": [
-    {"name": "http", "port": 80, "target_port": 8080}
-  ],
-  "replicas": 2,
-  "create_service": true,
-  "service_type": "ClusterIP"
+  "replicas": 2
 }
 ```
 
@@ -183,11 +174,7 @@
   "scope": "project",
   "project_id": "proj-001",
   "containers": [...],
-  "service_ports": [...],
   "replicas": 2,
-  "service_name": "svc-my-app",
-  "create_service": true,
-  "service_type": "ClusterIP",
   "created_by": "user-001",
   "created_at": "2026-02-25T10:00:00",
   "updated_at": "2026-02-25T10:00:00"

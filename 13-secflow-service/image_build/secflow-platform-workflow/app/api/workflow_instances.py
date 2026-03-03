@@ -203,23 +203,44 @@ async def initialize_workflow_instance(
                 init_logs.append(f"  错误: {error_msg}")
                 continue
 
-            # 检查模板是否定义了Service（APP节点必须定义Service）
-            if not template.create_service or not template.service_ports:
-                error_msg = f"App template {template.id} does not define Service (create_service={template.create_service}, service_ports={template.service_ports})"
+            # 从节点配置中获取服务相关参数
+            # 查找当前节点在instance.nodes中的配置
+            node_config = None
+            for n in instance.nodes:
+                if n.get("id") == node.node_id or n.get("node_id") == node.node_id:
+                    node_config = n
+                    break
+
+            if not node_config:
+                error_msg = f"Node configuration not found for node {node.id}"
                 errors.append(error_msg)
-                init_logs.append(f"  错误: APP节点必须定义Service - {error_msg}")
+                init_logs.append(f"  错误: {error_msg}")
                 node.status = NodeStatus.FAILED
                 node.message = error_msg
                 continue
 
-            # 检查模板是否定义了service_name
-            if not template.service_name:
-                error_msg = f"App template {template.id} does not define service_name, Service name is required"
-                errors.append(error_msg)
-                init_logs.append(f"  错误: APP节点必须在模板中定义service_name")
-                node.status = NodeStatus.FAILED
-                node.message = error_msg
-                continue
+            # 检查是否创建Service
+            create_service = node_config.get("create_service", True)
+            if create_service:
+                # 检查service_name
+                service_name = node_config.get("service_name")
+                if not service_name or not service_name.strip():
+                    error_msg = f"Service name is required when create_service is True for node {node.id}"
+                    errors.append(error_msg)
+                    init_logs.append(f"  错误: {error_msg}")
+                    node.status = NodeStatus.FAILED
+                    node.message = error_msg
+                    continue
+
+                # 检查service_ports
+                service_ports = node_config.get("service_ports", [])
+                if not service_ports or len(service_ports) == 0:
+                    error_msg = f"Service ports cannot be empty when create_service is True for node {node.id}"
+                    errors.append(error_msg)
+                    init_logs.append(f"  错误: {error_msg}")
+                    node.status = NodeStatus.FAILED
+                    node.message = error_msg
+                    continue
 
             # 构建容器配置
             containers = _build_containers_from_template(template, node)
@@ -231,11 +252,13 @@ async def initialize_workflow_instance(
             node.k8s_resource_type = "Deployment"
 
             # 创建Deployment
+            # 使用节点配置中的service_ports（如果需要创建Service的话）
+            deployment_ports = service_ports if create_service else []
             success, error_msg = k8s_client.create_deployment(
                 project_id=instance.project_id,
                 name=deployment_name,
                 containers=containers,
-                ports=template.service_ports,
+                ports=deployment_ports,
                 replicas=template.replicas
             )
 
@@ -248,37 +271,76 @@ async def initialize_workflow_instance(
 
             init_logs.append(f"  成功: 创建Deployment {deployment_name}")
 
-            # 创建Service：必须使用模板中定义的service_name
-            service_name = template.service_name
             # 转换端口格式: ServicePort schema使用target_port (snake_case)
             # 但create_service期望targetPort (camelCase)
-            service_ports = []
-            for p in template.service_ports:
+            k8s_service_ports = []
+            for p in service_ports:
                 port_config = {
                     "name": p.get("name", f"port-{p.get('port')}"),
                     "port": p.get("port"),
                     "targetPort": p.get("target_port", p.get("port")),  # 转换为camelCase
                     "protocol": p.get("protocol", "TCP")
                 }
-                service_ports.append(port_config)
+                k8s_service_ports.append(port_config)
 
             # 获取service_type，默认ClusterIP
-            service_type = template.service_type if template.service_type else "ClusterIP"
+            service_type = node_config.get("service_type", "ClusterIP")
+            # Convert ServiceType enum to string if needed
+            if hasattr(service_type, "value"):
+                service_type = service_type.value
 
             success, error_msg = k8s_client.create_service(
                 project_id=instance.project_id,
                 name=service_name,
                 selector={"app": deployment_name},
-                ports=service_ports,
+                ports=k8s_service_ports,
                 service_type=service_type
             )
 
             if success:
                 node.service_name = service_name
-                node.status = NodeStatus.PENDING
-                node.message = "APP node initialized successfully"
-                initialized_nodes.append(node.id)
                 init_logs.append(f"  成功: 创建Service {service_name}")
+
+                # 检查Deployment状态来确定节点状态
+                # PENDING: Pod未运行
+                # NOT_READY: Pod已运行但未就绪
+                # READY: Pod全部就绪
+                try:
+                    deployment_status = k8s_client.get_deployment_status(instance.project_id, deployment_name)
+                    if deployment_status:
+                        ready_replicas = deployment_status.get("ready_replicas", 0) or deployment_status.get("ready_replica", 0)
+                        replicas = deployment_status.get("replicas", 0) or deployment_status.get("replica", 0)
+                        available_replicas = deployment_status.get("available_replicas", 0) or deployment_status.get("available_replica", 0)
+
+                        init_logs.append(f"  Deployment状态: replicas={replicas}, ready={ready_replicas}, available={available_replicas}")
+
+                        if ready_replicas >= replicas and replicas > 0:
+                            # Pod全部就绪
+                            node.status = NodeStatus.READY
+                            node.message = "Deployment is ready"
+                            init_logs.append(f"  节点状态: READY (Pod已就绪)")
+                        elif available_replicas > 0 or ready_replicas > 0:
+                            # Pod已运行但未全部就绪
+                            node.status = NodeStatus.NOT_READY
+                            node.message = "Deployment is running but not ready"
+                            init_logs.append(f"  节点状态: NOT_READY (Pod运行中但未就绪)")
+                        else:
+                            # Pod未运行
+                            node.status = NodeStatus.PENDING
+                            node.message = "Deployment created, waiting for Pod"
+                            init_logs.append(f"  节点状态: PENDING (等待Pod启动)")
+                    else:
+                        # 无法获取状态，默认PENDING
+                        node.status = NodeStatus.PENDING
+                        node.message = "APP node initialized successfully"
+                        init_logs.append(f"  节点状态: PENDING (无法获取Deployment状态)")
+                except Exception as status_error:
+                    logger.warning(f"Failed to get deployment status: {status_error}")
+                    node.status = NodeStatus.PENDING
+                    node.message = "APP node initialized successfully"
+                    init_logs.append(f"  节点状态: PENDING (获取状态异常: {status_error})")
+
+                initialized_nodes.append(node.id)
                 logger.info(f"Initialized node {node.id} with Deployment {deployment_name} and Service {service_name}")
             else:
                 # Service创建失败，删除已创建的Deployment，上报初始化失败
@@ -1273,7 +1335,12 @@ async def delete_workflow_instance(
                 except Exception as e:
                     logger.error(f"Failed to delete K8S resource for node {node.id}: {e}")
 
-    # Delete all node instances first (foreign key constraint requires this)
+    # Delete all sync records first (foreign key constraint requires this)
+    db.query(WorkflowSyncRecord).filter(
+        WorkflowSyncRecord.instance_id == instance_id
+    ).delete()
+    
+    # Delete all node instances (foreign key constraint requires this)
     db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.instance_id == instance_id
     ).delete()
@@ -1601,6 +1668,11 @@ async def create_workflow_node(
     else:
         node_config = node_data.dict()
 
+    # For app type nodes, ensure service configuration is included
+    if node_type_val == "app":
+        # These fields are already in the node_config from the Pydantic model
+        pass
+
     # Note: Different nodes have no dependency relationship, depends_on is always empty
     depends_on = []
 
@@ -1824,6 +1896,15 @@ async def update_workflow_node(
                 existing_node["input_env_vars"] = [iev.model_dump() if hasattr(iev, 'model_dump') else iev.dict() for iev in node_data.input_env_vars]
             if node_data.input_volume_mounts is not None:
                 existing_node["input_volume_mounts"] = [ivm.model_dump() if hasattr(ivm, 'model_dump') else ivm.dict() for ivm in node_data.input_volume_mounts]
+            # Update service configuration
+            if node_data.create_service is not None:
+                existing_node["create_service"] = node_data.create_service
+            if node_data.service_name is not None:
+                existing_node["service_name"] = node_data.service_name
+            if node_data.service_ports is not None:
+                existing_node["service_ports"] = [sp.model_dump() if hasattr(sp, 'model_dump') else sp.dict() for sp in node_data.service_ports]
+            if node_data.service_type is not None:
+                existing_node["service_type"] = node_data.service_type.value if hasattr(node_data.service_type, 'value') else node_data.service_type
             break
     instance.nodes = existing_nodes
 

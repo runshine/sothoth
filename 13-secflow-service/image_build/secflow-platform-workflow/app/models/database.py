@@ -72,10 +72,26 @@ class WorkflowStatus:
 
 
 class NodeStatus:
-    """Workflow node instance status"""
-    PENDING = "pending"        # 等待执行
-    RUNNING = "running"        # 执行中
-    SUCCEEDED = "succeeded"    # 执行成功
+    """Workflow node instance status
+
+    APP节点状态流转:
+    - pending: Pod未运行
+    - not_ready: Pod已运行但未就绪
+    - ready: Pod全部就绪
+    - stopped: 已停止
+    - failed: 执行失败
+
+    JOB节点状态流转:
+    - pending: 等待执行
+    - running: 执行中
+    - succeeded: 执行成功
+    - failed: 执行失败
+    """
+    PENDING = "pending"        # APP: Pod未运行; JOB: 等待执行
+    NOT_READY = "not_ready"    # APP: Pod已运行但未就绪
+    READY = "ready"            # APP: Pod全部就绪
+    RUNNING = "running"        # JOB: 执行中
+    SUCCEEDED = "succeeded"    # JOB: 执行成功
     FAILED = "failed"          # 执行失败
     STOPPED = "stopped"        # 已停止
 
@@ -104,13 +120,7 @@ class AppTemplate(Base):
     containers = Column(JSON, nullable=False)  # List of container configs
 
     # Deployment-level configuration
-    service_ports = Column(JSON, default=[])  # Service ports exposed
     replicas = Column(Integer, default=1)  # Number of replicas
-
-    # Service configuration
-    service_name = Column(String(128), nullable=True)  # K8s Service name
-    create_service = Column(Boolean, default=True)  # Whether to create K8s Service
-    service_type = Column(String(20), default="ClusterIP")  # K8s Service type
 
     # Audit fields
     created_by = Column(String(64), nullable=False)
@@ -128,11 +138,7 @@ class AppTemplate(Base):
             "scope": self.scope,
             "project_id": self.project_id,
             "containers": self.containers,
-            "service_ports": self.service_ports,
             "replicas": self.replicas,
-            "service_name": self.service_name,
-            "create_service": self.create_service,
-            "service_type": self.service_type,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,

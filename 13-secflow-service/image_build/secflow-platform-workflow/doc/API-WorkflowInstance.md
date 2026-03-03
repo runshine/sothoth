@@ -18,14 +18,44 @@
 | failed | 执行失败 |
 | stopped | 已停止 |
 
+## 节点状态
+
+**APP节点状态：**
+
+| 状态 | 说明 |
+|------|------|
+| pending | Pod未运行 |
+| not_ready | Pod已运行但未就绪 |
+| ready | Pod全部就绪 |
+| stopped | 已停止 |
+| failed | 执行失败 |
+
+**JOB节点状态：**
+
+| 状态 | 说明 |
+|------|------|
+| pending | 等待执行 |
+| running | 执行中 |
+| succeeded | 执行成功 |
+| failed | 执行失败 |
+
 **状态流转:**
 ```
+工作流:
 pending -> initializing -> initialized (initialize)
 initialized -> running (start)
 running -> succeeded (all nodes complete) / failed (any node fails) / stopped (stop)
 stopped -> running (start again)
 stopped/initialized -> initializing -> initialized (force initialize)
 initialized/running/stopped/failed/succeeded -> pending (uninitialize)
+
+APP节点:
+pending -> not_ready -> ready (Pod启动并就绪)
+ready/any -> stopped (stop)
+any -> failed (失败)
+
+JOB节点:
+pending -> running -> succeeded/failed (Job执行)
 ```
 
 **持久化模式触发器:**
@@ -84,6 +114,10 @@ initialized/running/stopped/failed/succeeded -> pending (uninitialize)
 | volume_mounts | array[VolumeMount] | No | 覆盖/添加固定PVC挂载 (用于满足模板依赖) |
 | resources | object | No | 覆盖资源要求 |
 | timeout_seconds | integer | No | 节点超时时间(秒): 应用模板默认300(5分钟), 任务模板默认3600(1小时), 不含镜像拉取时间 |
+| create_service | boolean | No | 是否创建K8s Service (仅app类型节点有效), 默认: true |
+| service_name | string | Conditional | K8s Service名称 (当create_service=true时必填) |
+| service_ports | array[ServicePort] | Conditional | Service端口配置 (当create_service=true时必填) |
+| service_type | string | No | Service类型: `ClusterIP`(默认), `LoadBalancer`, `NodePort` (仅app类型节点有效) |
 
 **注意：**
 - 节点ID由系统自动生成，用户不需要指定
@@ -111,7 +145,11 @@ initialized/running/stopped/failed/succeeded -> pending (uninitialize)
       "template_id": "wf-tmpl-app-001",
       "name": "Frontend Service",
       "position": {"x": 100, "y": 100},
-      "env_vars": [{"name": "API_URL", "value": "http://backend:8080"}]
+      "env_vars": [{"name": "API_URL", "value": "http://backend:8080"}],
+      "create_service": true,
+      "service_name": "frontend-svc",
+      "service_ports": [{"name": "http", "port": 80, "target_port": 8080}],
+      "service_type": "ClusterIP"
     },
     {
       "node_type": "job",
@@ -274,24 +312,29 @@ initialized/running/stopped/failed/succeeded -> pending (uninitialize)
 对于不同类型的节点，初始化逻辑不同：
 
 **JOB类型节点:**
-- 直接上报初始化成功
-- 不创建任何K8S资源（Job在start时创建并执行）
+- 不创建任何K8S资源
+- 状态保持 `pending`（等待start时创建Job并执行）
 
 **APP类型节点:**
-- 必须在模板中定义Service（`create_service=true` 且 `service_ports` 不为空）
-- 必须在模板中定义 `service_name`（用于创建Service）
+- 服务配置在工作流节点实例化时指定（`create_service=true` 且 `service_ports` 不为空）
+- 必须在节点配置中定义 `service_name`（用于创建Service）
 - 创建对应的K8S Deployment
-- 使用模板中定义的 `service_name` 创建K8S Service（不能使用自动生成的名称如 `wf-8817564c-632245d0`）
-- 如果模板未定义Service或Service创建失败，则上报初始化失败
+- 使用节点配置中定义的 `service_name` 创建K8S Service（不能使用自动生成的名称如 `wf-8817564c-632245d0`）
+- 如果节点未定义Service或Service创建失败，则上报初始化失败
+- 根据Pod状态设置节点状态：
+  - `pending`: Pod未运行
+  - `not_ready`: Pod已运行但未就绪
+  - `ready`: Pod全部就绪
 
 **初始化流程:**
 1. 接收初始化请求，将状态设置为 `initializing`
-2. 对于JOB节点：直接标记初始化成功
+2. 对于JOB节点：不创建资源，保持 `pending` 状态
 3. 对于APP节点：
-   - 检查模板是否定义了Service（`create_service=true` 且 `service_ports` 不为空）
-   - 检查模板是否定义了 `service_name`
+   - 检查节点配置是否定义了Service（`create_service=true` 且 `service_ports` 不为空）
+   - 检查节点配置是否定义了 `service_name`
    - 创建 Deployment
-   - 使用模板中的 `service_name` 创建 Service
+   - 使用节点配置中的 `service_name` 创建 Service
+   - 检查 Pod 状态设置节点状态（pending/not_ready/ready）
    - 如果任一步骤失败，则上报初始化失败
 4. 初始化完成后，状态变为 `initialized` 或 `failed`
 
@@ -306,12 +349,12 @@ initialized/running/stopped/failed/succeeded -> pending (uninitialize)
 - 状态为 `initialized` 或 `stopped` 且 `force=true`: 强制重新初始化
 
 **注意:**
-- JOB节点初始化时不创建任何K8S资源，直接上报成功
-- APP节点必须在模板中定义Service配置（`create_service=true`、`service_ports`不为空、`service_name`不为空）
-- APP节点创建Service时使用模板中定义的`service_name`，不能使用自动生成的名称
-- 如果APP节点模板未定义Service，初始化会失败
-- 初始化成功后状态变为 `initialized`
-- 创建完成后可通过start API启动工作流
+- JOB节点初始化时不创建任何K8S资源，状态保持 `pending`
+- APP节点必须在节点配置中定义Service配置（`create_service=true`、`service_ports`不为空、`service_name`不为空）
+- APP节点创建Service时使用节点配置中定义的`service_name`，不能使用自动生成的名称
+- APP节点初始化后根据Pod状态设置节点状态：`pending`（未运行）、`not_ready`（运行中未就绪）、`ready`（就绪）
+- 如果APP节点未定义Service配置，初始化会失败
+- 初始化成功后工作流状态变为 `initialized`
 - 如果状态为 `initializing`，表示正在初始化中，不能重复调用
 
 **Response:** `200 OK`

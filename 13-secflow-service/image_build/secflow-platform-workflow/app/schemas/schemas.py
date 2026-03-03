@@ -71,12 +71,18 @@ class NodeType(str, Enum):
 
 
 class NodeStatus(str, Enum):
-    """Workflow node status"""
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    STOPPED = "stopped"
+    """Workflow node status
+
+    APP节点: PENDING, NOT_READY, READY, STOPPED, FAILED
+    JOB节点: PENDING, RUNNING, SUCCEEDED, FAILED
+    """
+    PENDING = "pending"        # APP: Pod未运行; JOB: 等待执行
+    NOT_READY = "not_ready"    # APP: Pod已运行但未就绪
+    READY = "ready"            # APP: Pod全部就绪
+    RUNNING = "running"        # JOB: 执行中
+    SUCCEEDED = "succeeded"    # JOB: 执行成功
+    FAILED = "failed"          # 执行失败
+    STOPPED = "stopped"        # 已停止
 
 
 # ============ Health Check Schemas ============
@@ -214,25 +220,7 @@ class AppTemplateCreate(BaseModel):
     # Multi-container configuration
     containers: List[ContainerConfig] = Field(..., min_length=1, description="Container configurations (at least one)")
     # Deployment-level configuration
-    service_ports: List[ServicePort] = Field(default=[], description="Service ports exposed by the Deployment")
     replicas: int = Field(default=1, ge=1, description="Number of replicas")
-    # Service configuration
-    service_name: Optional[str] = Field(None, description="K8s Service name (default: auto-generated)")
-    create_service: bool = Field(default=True, description="Whether to create K8s Service")
-    service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="K8s Service type")
-
-    @model_validator(mode='after')
-    def validate_service_config(self):
-        """Validate service configuration when create_service is True"""
-        if self.create_service:
-            errors = []
-            if not self.service_name or not self.service_name.strip():
-                errors.append("service_name is required when create_service is True")
-            if not self.service_ports or len(self.service_ports) == 0:
-                errors.append("service_ports cannot be empty when create_service is True")
-            if errors:
-                raise ValueError("; ".join(errors))
-        return self
 
 
 class AppTemplateUpdate(BaseModel):
@@ -240,11 +228,7 @@ class AppTemplateUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=128)
     description: Optional[str] = None
     containers: Optional[List[ContainerConfig]] = None
-    service_ports: Optional[List[ServicePort]] = Field(None, description="K8s Service port configuration")
     replicas: Optional[int] = Field(None, ge=1, description="Number of replicas")
-    service_name: Optional[str] = Field(None, description="K8s Service name")
-    create_service: Optional[bool] = Field(None, description="Whether to create K8s Service")
-    service_type: Optional[ServiceType] = Field(None, description="K8s Service type")
 
 
 class AppTemplateResponse(BaseModel):
@@ -255,34 +239,13 @@ class AppTemplateResponse(BaseModel):
     scope: str
     project_id: Optional[str]
     containers: List[ContainerConfig]
-    service_ports: List[ServicePort]
     replicas: int
-    service_name: Optional[str]
-    # Allow None from DB (old data), will be converted to default values by validator
-    create_service: bool = True
-    service_type: str = "ClusterIP"
     created_by: str
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
-
-    @field_validator('create_service', mode='before')
-    @classmethod
-    def validate_create_service(cls, v):
-        """Handle NULL values from old data"""
-        if v is None:
-            return True
-        return v
-
-    @field_validator('service_type', mode='before')
-    @classmethod
-    def validate_service_type(cls, v):
-        """Handle NULL values from old data"""
-        if v is None:
-            return "ClusterIP"
-        return v
 
 
 class AppTemplateListResponse(BaseModel):
@@ -366,6 +329,26 @@ class WorkflowNodeConfig(BaseModel):
     # For app type: time from start to ready
     # For job type: time for entire job execution
     timeout_seconds: Optional[int] = Field(None, ge=1, description="Node execution timeout in seconds")
+
+    # Service configuration (for app type nodes only)
+    # These fields are only used when node_type is "app"
+    create_service: bool = Field(default=True, description="Whether to create K8s Service")
+    service_name: Optional[str] = Field(None, description="K8s Service name (default: auto-generated)")
+    service_ports: List[ServicePort] = Field(default=[], description="Service ports exposed by the Deployment")
+    service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="K8s Service type")
+
+    @model_validator(mode='after')
+    def validate_service_config(self):
+        """Validate service configuration when create_service is True and node_type is app"""
+        if self.node_type == NodeType.APP and self.create_service:
+            errors = []
+            if not self.service_name or not self.service_name.strip():
+                errors.append("service_name is required when create_service is True")
+            if not self.service_ports or len(self.service_ports) == 0:
+                errors.append("service_ports cannot be empty when create_service is True")
+            if errors:
+                raise ValueError("; ".join(errors))
+        return self
 
 
 class WorkflowEdgeConfig(BaseModel):
@@ -456,6 +439,26 @@ class WorkflowNodeCreate(BaseModel):
     # For job type: time for entire job execution
     timeout_seconds: Optional[int] = Field(None, ge=1, description="Node execution timeout in seconds")
 
+    # Service configuration (for app type nodes only)
+    # These fields are only used when node_type is "app"
+    create_service: bool = Field(default=True, description="Whether to create K8s Service")
+    service_name: Optional[str] = Field(None, description="K8s Service name (default: auto-generated)")
+    service_ports: List[ServicePort] = Field(default=[], description="Service ports exposed by the Deployment")
+    service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="K8s Service type")
+
+    @model_validator(mode='after')
+    def validate_service_config(self):
+        """Validate service configuration when create_service is True and node_type is app"""
+        if self.node_type == NodeType.APP and self.create_service:
+            errors = []
+            if not self.service_name or not self.service_name.strip():
+                errors.append("service_name is required when create_service is True")
+            if not self.service_ports or len(self.service_ports) == 0:
+                errors.append("service_ports cannot be empty when create_service is True")
+            if errors:
+                raise ValueError("; ".join(errors))
+        return self
+
 
 class WorkflowNodeUpdate(BaseModel):
     """Update workflow node request
@@ -472,6 +475,25 @@ class WorkflowNodeUpdate(BaseModel):
     # Input Dependencies (specify source_node_id at instance level)
     input_env_vars: Optional[List[DependencyEnvVar]] = Field(None, description="Input environment variable dependencies")
     input_volume_mounts: Optional[List[DependencyVolumeMount]] = Field(None, description="Input volume mount dependencies")
+    # Service configuration (for app type nodes only)
+    # These fields are only used when node_type is "app"
+    create_service: Optional[bool] = Field(None, description="Whether to create K8s Service")
+    service_name: Optional[str] = Field(None, description="K8s Service name")
+    service_ports: Optional[List[ServicePort]] = Field(None, description="Service ports exposed by the Deployment")
+    service_type: Optional[ServiceType] = Field(None, description="K8s Service type")
+
+    @model_validator(mode='after')
+    def validate_service_config(self):
+        """Validate service configuration when create_service is True"""
+        if self.create_service is True:
+            errors = []
+            if not self.service_name or not self.service_name.strip():
+                errors.append("service_name is required when create_service is True")
+            if not self.service_ports or len(self.service_ports) == 0:
+                errors.append("service_ports cannot be empty when create_service is True")
+            if errors:
+                raise ValueError("; ".join(errors))
+        return self
 
 
 class WorkflowEdgesUpdate(BaseModel):

@@ -29,7 +29,8 @@ class WorkflowEngine:
     """
 
     # Node status that indicate completion
-    COMPLETED_STATUSES = {NodeStatus.SUCCEEDED, NodeStatus.STOPPED}
+    # READY (APP) and SUCCEEDED (JOB) are considered completed
+    COMPLETED_STATUSES = {NodeStatus.READY, NodeStatus.SUCCEEDED, NodeStatus.STOPPED}
     FAILED_STATUSES = {NodeStatus.FAILED}
 
     def __init__(self, instance_id: str, db: Session, k8s_client=None):
@@ -169,8 +170,8 @@ class WorkflowEngine:
     def check_node_dependencies_complete(self, node: WorkflowNodeInstance) -> bool:
         """
         Check if a node's dependencies are all completed
-        For Job: status must be SUCCEEDED
-        For Deployment: we consider it ready when SUCCEEDED (ready check done by K8S)
+        For APP: status must be READY
+        For JOB: status must be SUCCEEDED
         """
         deps = self.dependency_graph.get(node.node_id, [])
 
@@ -184,8 +185,8 @@ class WorkflowEngine:
                 if dep_node.status != NodeStatus.SUCCEEDED:
                     return False
             else:
-                # Deployment must be succeeded (ready check done by K8S)
-                if dep_node.status != NodeStatus.SUCCEEDED:
+                # APP must be ready (Pod全部就绪)
+                if dep_node.status != NodeStatus.READY:
                     return False
 
         return True
@@ -193,9 +194,17 @@ class WorkflowEngine:
     async def sync_node_status_from_k8s(self, node: WorkflowNodeInstance):
         """
         Sync node status from K8S to database
-        For APP nodes: marks as SUCCEEDED when ready (not RUNNING)
-        For JOB nodes: status follows K8S Job status
-        Checks timeout for both node types
+
+        For APP nodes:
+        - PENDING: Pod未运行
+        - NOT_READY: Pod已运行但未就绪
+        - READY: Pod全部就绪
+
+        For JOB nodes:
+        - PENDING: 等待执行
+        - RUNNING: 执行中
+        - SUCCEEDED: 执行成功
+        - FAILED: 执行失败
         """
         if not node.k8s_resource_name:
             return
@@ -208,36 +217,34 @@ class WorkflowEngine:
                 if status:
                     logger.debug(f"Deployment {node.k8s_resource_name} status: {status}")
 
-                    # Check timeout
-                    if node.started_at:
-                        elapsed = (datetime.utcnow() - node.started_at).total_seconds()
-                        timeout = node.timeout_seconds or 300  # Default 5 minutes if not specified
-                        if elapsed > timeout:
-                            # Timeout - mark as failed
-                            node.status = NodeStatus.FAILED
-                            node.finished_at = datetime.utcnow()
-                            node.message = f"Deployment timeout after {elapsed:.0f}s (expected {timeout}s)"
-                            self.db.commit()
-                            return
-
                     # Deployment is ready when ready_replicas >= replicas
-                    # Note: K8S client returns ready_replicas (plural) and replicas (plural)
                     ready_replicas = status.get("ready_replicas", 0) or status.get("ready_replica", 0)
                     replicas = status.get("replicas", 0) or status.get("replica", 0)
+                    available_replicas = status.get("available_replicas", 0) or status.get("available_replica", 0)
 
-                    logger.info(f"Deployment {node.k8s_resource_name}: ready_replicas={ready_replicas}, replicas={replicas}")
+                    logger.info(f"Deployment {node.k8s_resource_name}: replicas={replicas}, ready={ready_replicas}, available={available_replicas}")
 
-                    if ready_replicas >= replicas and replicas > 0:
-                        # App node is ready - mark as SUCCEEDED (not running)
-                        if node.status != NodeStatus.SUCCEEDED:
-                            node.status = NodeStatus.SUCCEEDED
-                            node.finished_at = datetime.utcnow()
+                    # 根据Pod状态确定节点状态
+                    if node.status in [NodeStatus.STOPPED, NodeStatus.FAILED]:
+                        # 已停止或失败的节点不自动更新
+                        pass
+                    elif ready_replicas >= replicas and replicas > 0:
+                        # Pod全部就绪 -> READY
+                        if node.status != NodeStatus.READY:
+                            node.status = NodeStatus.READY
                             node.message = "Deployment is ready"
+                    elif available_replicas > 0 or ready_replicas > 0:
+                        # Pod已运行但未全部就绪 -> NOT_READY
+                        if node.status != NodeStatus.NOT_READY:
+                            node.status = NodeStatus.NOT_READY
+                            node.message = f"Deployment is running but not ready ({ready_replicas}/{replicas} ready)"
                     else:
-                        # Still pending (deployment exists but not ready)
-                        if node.status == NodeStatus.PENDING:
-                            node.message = f"Waiting for deployment to be ready ({ready_replicas}/{replicas})..."
+                        # Pod未运行 -> PENDING
+                        if node.status != NodeStatus.PENDING:
+                            node.status = NodeStatus.PENDING
+                            node.message = f"Waiting for Pod to start ({ready_replicas}/{replicas})"
             else:
+                # JOB节点
                 status = self.k8s_client.get_job_status(
                     self.instance.project_id, node.k8s_resource_name
                 )
@@ -264,6 +271,12 @@ class WorkflowEngine:
                             node.status = NodeStatus.FAILED
                             node.finished_at = datetime.utcnow()
                             node.message = f"Job failed: {status.get('failed', 0)} failures"
+                    elif k8s_status == "Running":
+                        if node.status != NodeStatus.RUNNING:
+                            node.status = NodeStatus.RUNNING
+                            if not node.started_at:
+                                node.started_at = datetime.utcnow()
+                            node.message = "Job is running"
 
             self.db.commit()
 
@@ -273,29 +286,37 @@ class WorkflowEngine:
     async def sync_all_nodes_status(self):
         """Sync all node status from K8S and update workflow status"""
         for node in self.nodes:
-            if node.status in [NodeStatus.RUNNING, NodeStatus.PENDING]:
+            # 同步 PENDING, NOT_READY, RUNNING 状态的节点
+            if node.status in [NodeStatus.PENDING, NodeStatus.NOT_READY, NodeStatus.RUNNING]:
                 await self.sync_node_status_from_k8s(node)
 
         # Update workflow status based on node statuses
         self._update_workflow_status()
 
     def _update_workflow_status(self):
-        """Update workflow instance status based on node statuses"""
+        """Update workflow instance status based on node statuses
+
+        APP节点状态: PENDING, NOT_READY, READY, STOPPED, FAILED
+        JOB节点状态: PENDING, RUNNING, SUCCEEDED, FAILED
+        """
         if not self.nodes:
             return
 
         # Count nodes by status
         pending_count = sum(1 for n in self.nodes if n.status == NodeStatus.PENDING)
+        not_ready_count = sum(1 for n in self.nodes if n.status == NodeStatus.NOT_READY)
+        ready_count = sum(1 for n in self.nodes if n.status == NodeStatus.READY)
         running_count = sum(1 for n in self.nodes if n.status == NodeStatus.RUNNING)
         succeeded_count = sum(1 for n in self.nodes if n.status == NodeStatus.SUCCEEDED)
         failed_count = sum(1 for n in self.nodes if n.status == NodeStatus.FAILED)
         stopped_count = sum(1 for n in self.nodes if n.status == NodeStatus.STOPPED)
 
         total = len(self.nodes)
-        logger.info(f"Workflow {self.instance_id} node status: pending={pending_count}, running={running_count}, "
-                    f"succeeded={succeeded_count}, failed={failed_count}, stopped={stopped_count}")
+        logger.info(f"Workflow {self.instance_id} node status: pending={pending_count}, not_ready={not_ready_count}, "
+                    f"ready={ready_count}, running={running_count}, succeeded={succeeded_count}, "
+                    f"failed={failed_count}, stopped={stopped_count}")
 
-        # 如果工作流当前是 pending 状态，且所有节点都是 pending 状态，保持不变
+        # 如果工作流当前是 PENDING 状态，且所有节点都是 PENDING 状态，保持不变
         # 这表示工作流尚未初始化，不应该自动改变状态
         if self.instance.status == WorkflowStatus.PENDING and pending_count == total:
             logger.info(f"Workflow {self.instance_id} remains PENDING (not initialized yet)")
@@ -310,27 +331,39 @@ class WorkflowEngine:
             failed_nodes = [n.name for n in self.nodes if n.status == NodeStatus.FAILED]
             self.instance.message = f"Workflow failed: nodes {failed_nodes} failed"
             logger.warning(f"Workflow {self.instance_id} marked as FAILED")
-        elif pending_count == 0 and running_count == 0:
-            # All nodes completed (succeeded or stopped)
-            if succeeded_count == total:
-                self.instance.status = WorkflowStatus.SUCCEEDED
-                if self.instance.finished_at is None:
-                    self.instance.finished_at = datetime.utcnow()
-                self.instance.message = "All nodes completed successfully"
-                logger.info(f"Workflow {self.instance_id} marked as SUCCEEDED")
-            elif stopped_count > 0 and pending_count == 0 and running_count == 0:
-                self.instance.status = WorkflowStatus.STOPPED
-                if self.instance.finished_at is None:
-                    self.instance.finished_at = datetime.utcnow()
-                self.instance.message = "Workflow stopped"
         elif running_count > 0:
-            # Any node running -> workflow running
+            # JOB节点正在运行
             if self.instance.status != WorkflowStatus.RUNNING:
                 self.instance.status = WorkflowStatus.RUNNING
                 if self.instance.started_at is None:
                     self.instance.started_at = datetime.utcnow()
                 self.instance.message = "Workflow is running"
                 logger.info(f"Workflow {self.instance_id} marked as RUNNING")
+        elif not_ready_count > 0:
+            # APP节点Pod运行中但未就绪
+            if self.instance.status not in [WorkflowStatus.RUNNING, WorkflowStatus.INITIALIZED]:
+                self.instance.status = WorkflowStatus.INITIALIZED
+                self.instance.message = "Workflow initialized, pods starting"
+                logger.info(f"Workflow {self.instance_id} marked as INITIALIZED (pods starting)")
+        elif pending_count == 0 and running_count == 0 and not_ready_count == 0:
+            # 所有节点都已完成 (READY, SUCCEEDED 或 STOPPED)
+            if ready_count + succeeded_count == total:
+                self.instance.status = WorkflowStatus.SUCCEEDED
+                if self.instance.finished_at is None:
+                    self.instance.finished_at = datetime.utcnow()
+                self.instance.message = "All nodes completed successfully"
+                logger.info(f"Workflow {self.instance_id} marked as SUCCEEDED")
+            elif stopped_count > 0:
+                self.instance.status = WorkflowStatus.STOPPED
+                if self.instance.finished_at is None:
+                    self.instance.finished_at = datetime.utcnow()
+                self.instance.message = "Workflow stopped"
+        elif pending_count > 0 and ready_count + succeeded_count > 0:
+            # 部分节点就绪，部分节点等待（如APP节点就绪，JOB节点等待启动）
+            if self.instance.status == WorkflowStatus.PENDING:
+                self.instance.status = WorkflowStatus.INITIALIZED
+                self.instance.message = "Workflow initialized"
+                logger.info(f"Workflow {self.instance_id} marked as INITIALIZED")
 
         self.db.commit()
 
@@ -568,12 +601,18 @@ class WorkflowEngine:
     async def start_node(self, node: WorkflowNodeInstance) -> bool:
         """
         Start a single node by creating K8S resources
-        Supports multi-container deployments and jobs
+
+        APP节点：
+        - 已初始化（有k8s_resource_name）：检查Deployment状态，设置PENDING/NOT_READY/READY
+        - 未初始化：不应该是这种情况，应该先调用initialize
+
+        JOB节点：
+        - 创建Job并设置为RUNNING
         """
         from datetime import datetime
 
-        if node.status != NodeStatus.PENDING:
-            logger.info(f"Node {node.node_id} is not pending, skipping")
+        if node.status in [NodeStatus.READY, NodeStatus.SUCCEEDED, NodeStatus.STOPPED, NodeStatus.FAILED]:
+            logger.info(f"Node {node.node_id} is in terminal state {node.status}, skipping")
             return True
 
         # Get template
@@ -592,63 +631,56 @@ class WorkflowEngine:
             return False
 
         try:
-            # Build container configurations
-            containers = self._build_containers_config(node, template)
-
-            # Generate K8S resource name
-            k8s_name = f"wf-{self.instance.id[:8]}-{node.node_id[:8]}"
-            node.k8s_resource_name = k8s_name
-
             if node.node_type == NodeType.APP:
+                # APP节点：检查已存在的Deployment状态
                 node.k8s_resource_type = "Deployment"
 
-                # Create service if template has service_ports defined and create_service is True
-                service_ports = []
-                if template.service_ports and getattr(template, 'create_service', True):
-                    # Use custom service_name if provided, otherwise use k8s_name
-                    service_name = template.service_name if template.service_name else k8s_name
-                    node.service_name = service_name
-                    service_ports = [{
-                        "name": p.get("name", f"port-{p['port']}"),
-                        "port": p["port"],
-                        "targetPort": p.get("target_port", p["port"]),
-                        "protocol": p.get("protocol", "TCP")
-                    } for p in template.service_ports]
+                if not node.k8s_resource_name:
+                    # APP节点未初始化，应该先调用initialize
+                    node.status = NodeStatus.FAILED
+                    node.message = "APP node not initialized, call initialize first"
+                    self.db.commit()
+                    return False
 
-                    # Get service_type, default to ClusterIP
-                    service_type = getattr(template, 'service_type', 'ClusterIP') or 'ClusterIP'
+                # 检查Deployment状态
+                k8s_name = node.k8s_resource_name
+                status = self.k8s_client.get_deployment_status(self.instance.project_id, k8s_name)
 
-                    success, error = self.k8s_client.create_service(
-                        project_id=self.instance.project_id,
-                        name=service_name,
-                        selector={"app": k8s_name},
-                        ports=service_ports,
-                        service_type=service_type
-                    )
-                    if not success:
-                        raise RuntimeError(f"Failed to create service: {error}")
+                if status:
+                    ready_replicas = status.get("ready_replicas", 0) or status.get("ready_replica", 0)
+                    replicas = status.get("replicas", 0) or status.get("replica", 0)
+                    available_replicas = status.get("available_replicas", 0) or status.get("available_replica", 0)
 
-                # Build ports for deployment from template-level service_ports
-                ports = [{
-                    "name": p.get("name", f"port-{p['port']}"),
-                    "containerPort": p.get("target_port", p["port"]),
-                    "protocol": p.get("protocol", "TCP")
-                } for p in (template.service_ports or [])]
+                    if ready_replicas >= replicas and replicas > 0:
+                        node.status = NodeStatus.READY
+                        node.message = "Deployment is ready"
+                    elif available_replicas > 0 or ready_replicas > 0:
+                        node.status = NodeStatus.NOT_READY
+                        node.message = f"Deployment is running but not ready ({ready_replicas}/{replicas} ready)"
+                    else:
+                        node.status = NodeStatus.PENDING
+                        node.message = f"Waiting for Pod to start ({ready_replicas}/{replicas})"
+                else:
+                    # Deployment不存在
+                    node.status = NodeStatus.FAILED
+                    node.message = f"Deployment {k8s_name} not found"
+                    self.db.commit()
+                    return False
 
-                # Create deployment with multiple container
-                success, error = self.k8s_client.create_deployment(
-                    project_id=self.instance.project_id,
-                    name=k8s_name,
-                    containers=containers,
-                    ports=ports if ports else None,
-                    replicas=template.replicas if hasattr(template, 'replicas') else 1
-                )
-
-                if not success:
-                    raise RuntimeError(f"Failed to create deployment: {error}")
+                self.db.commit()
+                logger.info(f"Checked APP node {node.node_id} ({k8s_name}), status: {node.status}")
+                return True
 
             else:  # JOB
+                # JOB节点：创建Job
                 node.k8s_resource_type = "Job"
+
+                # Build container configurations
+                containers = self._build_containers_config(node, template)
+
+                # Generate K8S resource name
+                k8s_name = f"wf-{self.instance.id[:8]}-{node.node_id[:8]}"
+                node.k8s_resource_name = k8s_name
 
                 # Create job with multiple container
                 success, error = self.k8s_client.create_job(
@@ -662,13 +694,13 @@ class WorkflowEngine:
                 if not success:
                     raise RuntimeError(f"Failed to create job: {error}")
 
-            node.status = NodeStatus.RUNNING
-            node.started_at = datetime.utcnow()
-            node.message = "Node started successfully"
-            self.db.commit()
+                node.status = NodeStatus.RUNNING
+                node.started_at = datetime.utcnow()
+                node.message = "Job started successfully"
+                self.db.commit()
 
-            logger.info(f"Started node {node.node_id} ({k8s_name}) with {len(containers)} containers")
-            return True
+                logger.info(f"Started JOB node {node.node_id} ({k8s_name}) with {len(containers)} containers")
+                return True
 
         except Exception as e:
             logger.error(f"Failed to start node {node.node_id}: {e}")

@@ -92,11 +92,7 @@ async def create_app_template(
         scope=template_data.scope.value if template_data.scope else "project",
         project_id=template_data.project_id,
         containers=containers_json,
-        service_ports=[sp.model_dump() for sp in template_data.service_ports],
         replicas=template_data.replicas,
-        service_name=template_data.service_name,
-        create_service=template_data.create_service,
-        service_type=template_data.service_type.value if template_data.service_type else "ClusterIP",
         created_by=user_id,
     )
 
@@ -195,19 +191,7 @@ async def update_app_template(
     if template.created_by != user_id and "admin" not in user_roles:
         raise ForbiddenError("Only template creator or admin can update")
 
-    # Validate service config when create_service is being set to True
-    if template_data.create_service is True:
-        errors = []
-        # Check service_name: use new value if provided, otherwise check existing value
-        service_name = template_data.service_name if template_data.service_name is not None else template.service_name
-        if not service_name or not service_name.strip():
-            errors.append("service_name is required when create_service is True")
-        # Check service_ports: use new value if provided, otherwise check existing value
-        service_ports = template_data.service_ports if template_data.service_ports is not None else template.service_ports
-        if not service_ports or len(service_ports) == 0:
-            errors.append("service_ports cannot be empty when create_service is True")
-        if errors:
-            raise ValidationError("; ".join(errors))
+    # No service config validation needed as service settings are now handled at workflow node level
 
     # Update fields
     logger.info(f"Update request: template_id={template_id}, service_ports={template_data.service_ports}, "
@@ -237,18 +221,8 @@ async def update_app_template(
             }
             containers_json.append(container_dict)
         template.containers = containers_json
-    if template_data.service_ports is not None:
-        new_service_port = [sp.model_dump() for sp in template_data.service_ports]
-        logger.info(f"Updating service_port: old={template.service_ports}, new={new_service_port}")
-        template.service_ports = new_service_port
     if template_data.replicas is not None:
         template.replicas = template_data.replicas
-    if template_data.service_name is not None:
-        template.service_name = template_data.service_name
-    if template_data.create_service is not None:
-        template.create_service = template_data.create_service
-    if template_data.service_type is not None:
-        template.service_type = template_data.service_type.value
 
     logger.info(f"Before commit: template.service_ports = {template.service_ports}")
     db.commit()
