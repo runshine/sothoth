@@ -8,10 +8,6 @@ spec:
   ipAddressPools:
     - production-pool
     - static-ips-pool
-  # 可选：指定在哪些节点上通告
-  nodeSelectors:
-    - matchLabels:
-        node-role.kubernetes.io/control-plane: ""
 
   #interfaces:
   #  - eth0

@@ -4,8 +4,8 @@
 cd "$(dirname "$0")"
 
 # 激活虚拟环境
-source /home/runshine/miniconda3/etc/profile.d/conda.sh
-conda activate sothoth
+#source /home/runshine/miniconda3/etc/profile.d/conda.sh
+#conda activate sothoth
 
 python -c "
 from app.database import SessionLocal, init_db
