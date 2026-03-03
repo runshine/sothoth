@@ -1908,7 +1908,7 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 ```yaml
 # Database Configuration
 database:
-  host: "192.168.12.90"
+  host: "172.31.30.100"
   port: 3306
   username: "secflow"
   password: "Huawei12#$"

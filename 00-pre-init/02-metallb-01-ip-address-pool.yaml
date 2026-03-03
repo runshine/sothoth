@@ -6,7 +6,7 @@ metadata:
   namespace: metallb-system
 spec:
   addresses:
-    - 192.168.12.90-192.168.12.99  # IP地址范围
+    - 172.31.30.100-172.31.30.110  # IP地址范围
   autoAssign: false               # 禁用自动分配，完全手动控制
   avoidBuggyIPs: true             # 避免有问题的IP（如网络/广播地址）
 
@@ -19,5 +19,5 @@ metadata:
   namespace: metallb-system
 spec:
   addresses:
-    - 192.168.12.190-192.168.12.199    # 专门用于固定IP的范围
+    - 172.31.30.111-172.31.30.120    # 专门用于固定IP的范围
   autoAssign: true               # 必须设置为false才能手动分配

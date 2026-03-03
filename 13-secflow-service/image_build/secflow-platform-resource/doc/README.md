@@ -96,7 +96,7 @@ Secflow Resource Management Service (资源管理服务) 是一个用于管理�
 ```yaml
 # 数据库配置
 database:
-  host: "192.168.12.90"
+  host: "172.31.30.100"
   port: 3306
   username: "secflow"
   password: "Huawei12#$"

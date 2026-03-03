@@ -1,7 +1,7 @@
 # SecFlow K8S资源管理服务配置
 
 database:
-  host: "192.168.12.90"
+  host: "172.31.30.100"
   port: 3306
   username: "secflow"
   password: "Huawei12#$"
@@ -20,7 +20,7 @@ auth_service:
   token_cache_ttl_minutes: 15
 
 project_service:
-  host: "192.168.12.90"
+  host: "172.31.30.100"
   port: 10010
   get_project_path: "/api/project"
   timeout: 10

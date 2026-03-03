@@ -11,7 +11,7 @@ database:
   # 数据库类型: mysql 或 sqlite
   type: "mysql"
   # MySQL配置（当type为mysql时使用）
-  host: "192.168.12.90"
+  host: "172.31.30.100"
   port: 3306
   username: "secflow"
   password: "Huawei12#$"

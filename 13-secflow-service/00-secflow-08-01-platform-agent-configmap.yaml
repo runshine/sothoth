@@ -35,5 +35,5 @@ data:
       "lock_timeout": 30,
       "max_task_logs": 10000,
       "task_log_retention_days": 30,
-      "external_agent_ips": ["192.168.12.90"]
+      "external_agent_ips": ["172.31.30.100"]
     }

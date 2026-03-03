@@ -14,4 +14,4 @@ spec:
       targetPort: 53
       protocol: TCP
       name: kube-dns
-  loadBalancerIP: "192.168.12.90"  # 必须在static-ips-pool范围内
+  loadBalancerIP: "172.31.30.100"  # 必须在static-ips-pool范围内
