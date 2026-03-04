@@ -79,6 +79,22 @@ spec:
             port:
               number: 80
 
+      - path: /api/k8s
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-k8s
+            port:
+              number: 80
+
+      - path: /api/workflow
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-workflow
+            port:
+              number: 80
+
       - path: /api/app/code-server
         pathType: Prefix
         backend:

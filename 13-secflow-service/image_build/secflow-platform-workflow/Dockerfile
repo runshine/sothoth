@@ -1,6 +1,3 @@
-"""
-Dockerfile for SecFlow Workflow Service
-"""
 FROM python:3.11-slim
 
 WORKDIR /app
