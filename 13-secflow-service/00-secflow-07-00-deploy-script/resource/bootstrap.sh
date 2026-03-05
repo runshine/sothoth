@@ -202,7 +202,7 @@ do
     mkdir -p "$dir"
   fi
 done
-
+export DNS_SERVER="10.96.0.10"
 UPSTREAM_SERVER="$(echo $UPSTREAM | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $UPSTREAM | awk -F':' '{print $2}')"
 UUID="$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3"-"$4"-"$6"-"$8$9}')"
