@@ -4,56 +4,21 @@ metadata:
   name: gaiasec-ingress
   namespace: sothoth
   annotations:
-    nginx.ingress.kubernetes.io/websocket-services: "backend-server"
+    nginx.ingress.kubernetes.io/websocket-services: "nginx-server"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/upstream-vhost: "gaiasec.819819.xyz"
 spec:
   ingressClassName: nginx
-  tls:
-  - hosts:
-      - gaiasec.sothothv2.com
-    secretName: wildcard-sothothv2.com-tls
   rules:
   - host: gaiasec.sothothv2.com
     http:
       paths:
-      - path: /api
-        pathType: Prefix
-        backend:
-          service:
-            name: backend-server
-            port:
-              number: 80
-      - path: /ws
-        pathType: Prefix
-        backend:
-          service:
-            name: backend-server
-            port:
-              number: 80
-      - path: /plugins
+      - path: /
         pathType: Prefix
         backend:
           service:
             name: nginx-server
             port:
               number: 80
-      - path: /assets
-        pathType: Prefix
-        backend:
-          service:
-            name: frontend-server
-            port:
-              number: 80
-      - path: /
-        pathType: Exact
-        backend:
-          service:
-            name: frontend-server
-            port:
-              number: 80
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: backend-server
-            port:
-              number: 80
+
