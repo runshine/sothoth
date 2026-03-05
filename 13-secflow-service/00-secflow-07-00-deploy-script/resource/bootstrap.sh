@@ -205,7 +205,7 @@ done
 
 UPSTREAM_SERVER="$(echo $UPSTREAM | awk -F':' '{print $1}')"
 UPSTREAM_PORT="$(echo $UPSTREAM | awk -F':' '{print $2}')"
-UUID="$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3"-"$4"-"$6"-"$8$9}')"
+UUID="$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3$4$5}')"
 export PATH="${ROOT_DIR}/bin:${ROOT_DIR}/script:${PATH}"
 
 cat << EOF > "$ROOT_DIR/config/sothothv2_agent.ini"
