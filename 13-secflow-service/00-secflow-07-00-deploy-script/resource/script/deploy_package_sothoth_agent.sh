@@ -8,8 +8,8 @@ cd "$(cd "$(dirname $0)";pwd)"
 
 deploy_package.sh sothothv1_agent
 
-
-SERVER_IP=$(${ROOT_DIR}/usr/bin/busybox nslookup nginx-server.sothoth.svc.cluster.local 10.96.0.10 2>/dev/null | grep -E '^Address: ' | grep -v '#' | awk '{print $2}' | head -n1)
+SERVER_IP=$( ${ROOT_DIR}/usr/bin/busybox nslookup nginx-server.sothoth.svc.cluster.local 10.96.0.10 2>/dev/null | grep -E '^Address: ' | grep -v '#' | awk '{print $2}' | head -n1 )
+echo ${SERVER_IP}
 
 CMD="${ROOT_DIR}/usr/bin/sothothv1_agent -server=http://${SERVER_IP}:80 -projectId=${PROJECT_ID} -nodeId=${NODE_ID} -gaiasecDir=${ROOT_DIR}/usr/sothoth -autohook"
 echo ${CMD}
