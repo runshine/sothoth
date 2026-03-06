@@ -342,6 +342,10 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
 spec:
   ingressClassName: nginx
+  tls:
+  - hosts:
+      - secflow.sothothv2.com
+    secretName: wildcard-sothothv2.com-tls
   rules:
   - host: secflow.sothothv2.com
     http:
