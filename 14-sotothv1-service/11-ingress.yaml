@@ -21,4 +21,15 @@ spec:
             name: nginx-server
             port:
               number: 80
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx-server
+            port:
+              number: 443
+  tls:
+  - hosts:
+    - gaiasec.sothothv2.com
+    secretName: wildcard-sothothv2.com-tls
 
