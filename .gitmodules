@@ -10,3 +10,4 @@
 [submodule "13-secflow-service/image_build/secflow-frontend"]
 	path = 13-secflow-service/image_build/secflow-frontend
 	url = https://github.com/runshine/SecFlowFrontend.git
+	branch = local
