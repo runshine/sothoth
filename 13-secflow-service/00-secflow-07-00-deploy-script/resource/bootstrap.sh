@@ -226,7 +226,7 @@ download_package_file "bash"                              "$ROOT_DIR/bin/bash"  
 download_script_file  "script/common.sh"                  "$ROOT_DIR/script/common.sh"                     && chmod +x "$ROOT_DIR/script/common.sh"
 download_script_file  "script/deploy_package.sh"          "$ROOT_DIR/script/deploy_package.sh"             && chmod +x "$ROOT_DIR/script/deploy_package.sh"
 
-package_list="base_file sothothv2_agent nginx openvpn ttyd openssh rpcapd docker frida_server nacos_client"
+package_list="base_file sothothv2_agent nginx openvpn ttyd openssh rpcapd docker frida_server nacos_client sothoth_agent"
 for package in ${package_list};
 do
   if [ "$ARCH" = "armel" ] && [ "${package}" = "frida_server" ];then
