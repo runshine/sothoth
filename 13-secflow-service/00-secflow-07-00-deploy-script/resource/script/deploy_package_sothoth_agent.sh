@@ -49,7 +49,7 @@ cat  <<EOF > ${ROOT_DIR}/service_config/99_sothothv1_service.json
   "name": "sothoth",
   "description": "sothoth v1 service",
   "start_cmd": "${ROOT_DIR}/usr/sothoth/start.sh",
-  "pid_file": "${ROOT_DIR}/usr/sothoth/nodeagent.pid",
+  "pid_file": "${ROOT_DIR}/usr/sothoth/sothoth.pid",
   "stdout_log": "${ROOT_DIR}/var/log/monitor_sothothv1_stdout.log",
   "stderr_log": "${ROOT_DIR}/var/log/monitor_sothothv1_stderr.log",
   "work_dir": "${ROOT_DIR}/usr/sothoth",
