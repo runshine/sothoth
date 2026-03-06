@@ -22,6 +22,9 @@ jobs:
       - name: clean to default
         run: sed -i 's/https:\/\/secflow.819819.xyz//g'   ./13-secflow-service/image_build/secflow-frontend/api/base.ts
 
+      - name: clean to default_local
+        run: sed -i 's/http:\/\/localhost:8080//g'   ./13-secflow-service/image_build/secflow-frontend/api/base.ts
+
       - name: cat base.ts
         run: cat ./13-secflow-service/image_build/secflow-frontend/api/base.ts
 
