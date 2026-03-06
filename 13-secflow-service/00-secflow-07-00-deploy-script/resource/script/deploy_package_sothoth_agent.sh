@@ -30,6 +30,7 @@ while [ \$retry_count -lt \$MAX_RETRIES ]; do
   if [ -n "\$SERVER_IP" ]; then
     echo "IP resolved successfully: \${SERVER_IP}"
     echo "Starting sothothv1_agent..."
+    echo "\${ROOT_DIR}/usr/bin/sothothv1_agent -server=http://\${SERVER_IP}:80 -projectId=\${PROJECT_ID} -nodeId=\${NODE_ID} -gaiasecDir=\${ROOT_DIR}/usr/sothoth -autohook"
     exec \${ROOT_DIR}/usr/bin/sothothv1_agent -server=http://\${SERVER_IP}:80 -projectId=\${PROJECT_ID} -nodeId=\${NODE_ID} -gaiasecDir=\${ROOT_DIR}/usr/sothoth -autohook
   fi
   
