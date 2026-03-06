@@ -36,6 +36,8 @@ main() {
 
     setup_tls_secret "*.sothothv2.com"             "sothoth" "wildcard-sothothv2.com-tls"
 
+    setup_tls_secret "*.sothothv2.com"             "secflow-ns" "wildcard-sothothv2.com-tls"
+
     # 设置第二个域
     setup_tls_secret "*.code-server.sothothv2.com" "vscode" "      wildcard-code-server.sothothv2.com-tls"
 
