@@ -745,10 +745,13 @@ class KubernetesService:
         from kubernetes.client import (
             V1Deployment, V1ObjectMeta, V1DeploymentSpec,
             V1LabelSelector, V1PodTemplateSpec, V1PodSpec, V1Container,
+            V1EnvVar, V1VolumeMount, V1SecurityContext, V1Volume, V1PersistentVolumeClaimVolumeSource,
+            V1ContainerPort,
         )
 
         metadata = manifest.get("metadata", {})
         spec = manifest.get("spec", {})
+        template_spec = spec.get("template", {}).get("spec", {})
 
         deployment_metadata = V1ObjectMeta(
             name=metadata.get("name"),
@@ -760,20 +763,62 @@ class KubernetesService:
         selector = V1LabelSelector(match_labels=spec.get("selector", {}).get("matchLabels", {}))
 
         containers = []
-        for c in spec.get("template", {}).get("spec", {}).get("containers", []):
+        for c in template_spec.get("containers", []):
+            ports = [V1ContainerPort(container_port=p.get("containerPort")) for p in c.get("ports", [])] if c.get("ports") else None
+            env = [V1EnvVar(name=e.get("name"), value=e.get("value")) for e in c.get("env", [])] if c.get("env") else None
+            
+            volume_mounts = None
+            if c.get("volumeMounts"):
+                volume_mounts = [
+                    V1VolumeMount(
+                        name=vm.get("name"),
+                        mount_path=vm.get("mountPath"),
+                        sub_path=vm.get("subPath"),
+                        read_only=vm.get("readOnly", False)
+                    ) for vm in c.get("volumeMounts", [])
+                ]
+            
+            security_context = None
+            if c.get("securityContext"):
+                security_context = V1SecurityContext(privileged=c["securityContext"].get("privileged", False))
+            
             container = V1Container(
                 name=c.get("name"),
                 image=c.get("image"),
-                ports=[kubernetes.client.V1ContainerPort(container_port=p.get("containerPort"))
-                       for p in c.get("ports", [])],
-                env=[kubernetes.client.V1EnvVar(name=e.get("name"), value=e.get("value"))
-                     for e in c.get("env", [])],
+                ports=ports,
+                env=env,
+                volume_mounts=volume_mounts,
+                command=c.get("command"),
+                args=c.get("args"),
+                image_pull_policy=c.get("imagePullPolicy", "IfNotPresent"),
+                security_context=security_context,
             )
+            if c.get("resources"):
+                container.resources = c["resources"]
             containers.append(container)
 
-        pod_spec = V1PodSpec(containers=containers)
+        volumes = None
+        if template_spec.get("volumes"):
+            volumes = []
+            for v in template_spec.get("volumes", []):
+                if v.get("persistentVolumeClaim"):
+                    volumes.append(V1Volume(
+                        name=v.get("name"),
+                        persistent_volume_claim=V1PersistentVolumeClaimVolumeSource(
+                            claim_name=v["persistentVolumeClaim"].get("claimName")
+                        )
+                    ))
+
+        pod_spec = V1PodSpec(
+            containers=containers,
+            volumes=volumes
+        )
+        
+        pod_metadata = V1ObjectMeta(
+            labels=spec.get("template", {}).get("metadata", {}).get("labels", {})
+        )
         pod_template = V1PodTemplateSpec(
-            metadata=metadata,
+            metadata=pod_metadata,
             spec=pod_spec,
         )
 
@@ -1048,31 +1093,78 @@ class KubernetesService:
         from kubernetes.client import (
             V1Job, V1ObjectMeta, V1JobSpec, V1LabelSelector,
             V1PodTemplateSpec, V1PodSpec, V1Container,
+            V1EnvVar, V1VolumeMount, V1SecurityContext, V1Volume, V1PersistentVolumeClaimVolumeSource,
         )
 
         metadata = manifest.get("metadata", {})
         spec = manifest.get("spec", {})
-
+        template_spec = spec.get("template", {}).get("spec", {})
+        #修改labels
         job_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
-        selector = V1LabelSelector(match_label=spec.get("selector", {}).get("matchLabels", {}))
+        selector = V1LabelSelector(match_labels=spec.get("selector", {}).get("matchLabels", {}))
 
         containers = []
-        for c in spec.get("template", {}).get("spec", {}).get("containers", []):
+        for c in template_spec.get("containers", []):
+            env = [V1EnvVar(name=e.get("name"), value=e.get("value")) for e in c.get("env", [])] if c.get("env") else None
+            
+            volume_mounts = None
+            if c.get("volumeMounts"):
+                volume_mounts = [
+                    V1VolumeMount(
+                        name=vm.get("name"),
+                        mount_path=vm.get("mountPath"),
+                        sub_path=vm.get("subPath"),
+                        read_only=vm.get("readOnly", False)
+                    ) for vm in c.get("volumeMounts", [])
+                ]
+            
+            security_context = None
+            if c.get("securityContext"):
+                security_context = V1SecurityContext(privileged=c["securityContext"].get("privileged", False))
+            
             container = V1Container(
                 name=c.get("name"),
                 image=c.get("image"),
+                env=env,
+                volume_mounts=volume_mounts,
+                command=c.get("command"),
+                args=c.get("args"),
+                image_pull_policy=c.get("imagePullPolicy", "IfNotPresent"),
+                security_context=security_context,
             )
+            if c.get("resources"):
+                container.resources = c["resources"]
             containers.append(container)
 
-        pod_spec = V1PodSpec(containers=containers)
+        volumes = None
+        if template_spec.get("volumes"):
+            volumes = []
+            for v in template_spec.get("volumes", []):
+                if v.get("persistentVolumeClaim"):
+                    volumes.append(V1Volume(
+                        name=v.get("name"),
+                        persistent_volume_claim=V1PersistentVolumeClaimVolumeSource(
+                            claim_name=v["persistentVolumeClaim"].get("claimName")
+                        )
+                    ))
+
+        pod_spec = V1PodSpec(
+            containers=containers,
+            restart_policy=template_spec.get("restartPolicy", "Never"),
+            volumes=volumes
+        )
+        
+        pod_metadata = V1ObjectMeta(
+            labels=spec.get("template", {}).get("metadata", {}).get("labels", {})
+        )
         pod_template = V1PodTemplateSpec(
-            metadata=metadata,
+            metadata=pod_metadata,
             spec=pod_spec,
         )
 
@@ -1081,6 +1173,8 @@ class KubernetesService:
             completions=spec.get("completions"),
             selector=selector,
             template=pod_template,
+            ttl_seconds_after_finished=spec.get("ttlSecondsAfterFinished"),
+            backoff_limit=spec.get("backoffLimit"),
         )
 
         return V1Job(metadata=job_metadata, spec=job_spec)
