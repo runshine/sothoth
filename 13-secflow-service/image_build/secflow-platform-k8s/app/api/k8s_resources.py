@@ -866,6 +866,10 @@ async def create_job(
     """创建Job"""
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
 
+    # 处理嵌套的 manifest 结构
+    if "manifest" in manifest and "metadata" not in manifest:
+        manifest = manifest["manifest"]
+
     if "metadata" not in manifest:
         manifest["metadata"] = {}
     manifest["metadata"]["namespace"] = namespace
