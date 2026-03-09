@@ -1054,11 +1054,17 @@ class KubernetesService:
         """创建Job"""
         try:
             from kubernetes.client import V1Job
+            logger.info(f"创建Job manifest: {manifest}")
             job = self._dict_to_v1_job(manifest)
+            logger.info(f"转换后的Job对象: metadata={job.metadata.name}, namespace={job.metadata.namespace}")
             result = self.batch_v1.create_namespaced_job(namespace=namespace, body=job)
             return self._job_to_dict(result)
         except ApiException as e:
+            logger.error(f"K8S API错误: {e.status} - {e.reason} - {e.body}")
             self._handle_api_exception(e, "Job", "创建")
+        except Exception as e:
+            logger.error(f"创建Job异常: {type(e).__name__} - {str(e)}")
+            raise
 
     def delete_job(self, namespace: str, name: str) -> Dict:
         """删除Job"""
