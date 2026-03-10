@@ -8,7 +8,7 @@ import logging
 import threading
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, Query, status, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, Query, status, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -454,7 +454,6 @@ async def proxy_service(
     request: Request = None
 ):
     """代理HTTP请求到K8S Service"""
-    from fastapi import Request
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
     k8s = get_k8s_service()
     
