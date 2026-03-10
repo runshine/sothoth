@@ -1399,6 +1399,372 @@ class KubernetesService:
         except ApiException as e:
             self._handle_api_exception(e, "Pod", "获取容器列表")
 
+    # ==================== 节点交互操作扩展 ====================
+
+    def get_pod_events(self, namespace: str, pod_name: str) -> List[Dict]:
+        """
+        获取Pod相关事件
+        
+        Args:
+            namespace: Namespace
+            pod_name: Pod名称
+            
+        Returns:
+            事件列表
+        """
+        try:
+            events = self.core_v1.list_namespaced_event(
+                namespace=namespace,
+                field_selector=f"involvedObject.name={pod_name}"
+            )
+            return [
+                {
+                    "type": event.type,
+                    "reason": event.reason,
+                    "message": event.message,
+                    "count": event.count,
+                    "first_timestamp": event.first_timestamp.isoformat() if event.first_timestamp else None,
+                    "last_timestamp": event.last_timestamp.isoformat() if event.last_timestamp else None,
+                    "source": event.source.component if event.source else None,
+                }
+                for event in (events.items or [])
+            ]
+        except ApiException as e:
+            self._handle_api_exception(e, "Pod事件", "获取")
+
+    def get_pod_status_detail(self, namespace: str, pod_name: str) -> Dict:
+        """
+        获取Pod详细状态
+        
+        Args:
+            namespace: Namespace
+            pod_name: Pod名称
+            
+        Returns:
+            Pod详细状态信息
+        """
+        try:
+            pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+            return {
+                "name": pod.metadata.name,
+                "namespace": pod.metadata.namespace,
+                "phase": pod.status.phase,
+                "message": pod.status.message,
+                "reason": pod.status.reason,
+                "start_time": pod.status.start_time.isoformat() if pod.status.start_time else None,
+                "pod_ip": pod.status.pod_ip,
+                "host_ip": pod.status.host_ip,
+                "node_name": pod.spec.node_name,
+                "conditions": [
+                    {
+                        "type": c.type,
+                        "status": c.status,
+                        "reason": c.reason,
+                        "message": c.message,
+                        "last_transition_time": c.last_transition_time.isoformat() if c.last_transition_time else None,
+                    }
+                    for c in (pod.status.conditions or [])
+                ],
+                "container_statuses": [
+                    {
+                        "name": cs.name,
+                        "state": self._get_container_state(cs.state),
+                        "ready": cs.ready,
+                        "restart_count": cs.restart_count,
+                        "image": cs.image,
+                        "container_id": cs.container_id,
+                    }
+                    for cs in (pod.status.container_statuses or [])
+                ],
+                "labels": pod.metadata.labels or {},
+            }
+        except ApiException as e:
+            self._handle_api_exception(e, "Pod状态", "获取")
+
+    def _get_container_state(self, state) -> str:
+        """获取容器状态字符串"""
+        if state is None:
+            return "unknown"
+        if state.running:
+            return f"running (since {state.running.started_at.isoformat() if state.running.started_at else 'unknown'})"
+        if state.waiting:
+            return f"waiting ({state.waiting.reason}: {state.waiting.message})"
+        if state.terminated:
+            return f"terminated ({state.terminated.reason}, exit_code={state.terminated.exit_code})"
+        return "unknown"
+
+    def get_pod_metrics(self, namespace: str, pod_name: str) -> Dict:
+        """
+        获取Pod资源指标（需要Metrics Server）
+        
+        Args:
+            namespace: Namespace
+            pod_name: Pod名称
+            
+        Returns:
+            Pod资源指标
+        """
+        try:
+            metrics = self.custom_object.get_namespaced_custom_object(
+                group="metrics.k8s.io",
+                version="v1beta1",
+                namespace=namespace,
+                plural="pods",
+                name=pod_name
+            )
+            return {
+                "name": metrics["metadata"]["name"],
+                "namespace": metrics["metadata"]["namespace"],
+                "containers": [
+                    {
+                        "name": c["name"],
+                        "cpu": c["usage"]["cpu"],
+                        "memory": c["usage"]["memory"],
+                    }
+                    for c in metrics.get("containers", [])
+                ],
+                "timestamp": metrics.get("timestamp"),
+            }
+        except ApiException as e:
+            if e.status == 404:
+                raise NotFoundError("Pod指标", "Metrics Server未安装或Pod不存在")
+            self._handle_api_exception(e, "Pod指标", "获取")
+
+    def restart_deployment(self, namespace: str, name: str) -> Dict:
+        """
+        重启Deployment（通过更新annotation触发滚动更新）
+        
+        Args:
+            namespace: Namespace
+            name: Deployment名称
+            
+        Returns:
+            重启结果
+        """
+        try:
+            import datetime
+            
+            deployment = self.apps_v1.read_namespaced_deployment(name=name, namespace=namespace)
+            
+            if not deployment.spec.template.metadata:
+                from kubernetes.client import V1ObjectMeta
+                deployment.spec.template.metadata = V1ObjectMeta()
+            if not deployment.spec.template.metadata.annotations:
+                deployment.spec.template.metadata.annotations = {}
+            
+            deployment.spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"] = datetime.datetime.now().isoformat()
+            
+            result = self.apps_v1.patch_namespaced_deployment(
+                name=name,
+                namespace=namespace,
+                body=deployment
+            )
+            return {
+                "name": name,
+                "message": "Deployment重启已触发",
+                "restarted_at": deployment.spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"]
+            }
+        except ApiException as e:
+            self._handle_api_exception(e, "Deployment", "重启")
+
+    def recreate_job(self, namespace: str, name: str) -> Dict:
+        """
+        删除并重建Job
+        
+        Args:
+            namespace: Namespace
+            name: Job名称
+            
+        Returns:
+            新Job信息
+        """
+        try:
+            import time
+            
+            job = self.batch_v1.read_namespaced_job(name=name, namespace=namespace)
+            
+            job_manifest = {
+                "metadata": {
+                    "name": job.metadata.name,
+                    "namespace": job.metadata.namespace,
+                    "labels": dict(job.metadata.labels) if job.metadata.labels else {},
+                    "annotations": dict(job.metadata.annotations) if job.metadata.annotations else {},
+                },
+                "spec": {
+                    "parallelism": job.spec.parallelism,
+                    "completions": job.spec.completions,
+                    "backoffLimit": job.spec.backoff_limit,
+                    "ttlSecondsAfterFinished": job.spec.ttl_seconds_after_finished,
+                    "template": {
+                        "metadata": {
+                            "labels": dict(job.spec.template.metadata.labels) if job.spec.template.metadata and job.spec.template.metadata.labels else {},
+                        },
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": c.name,
+                                    "image": c.image,
+                                    "command": list(c.command) if c.command else None,
+                                    "args": list(c.args) if c.args else None,
+                                    "env": [{"name": e.name, "value": e.value} for e in (c.env or [])],
+                                    "resources": {
+                                        "requests": dict(c.resources.requests) if c.resources and c.resources.requests else {},
+                                        "limits": dict(c.resources.limits) if c.resources and c.resources.limits else {},
+                                    } if c.resources else {},
+                                    "volumeMounts": [
+                                        {"name": vm.name, "mountPath": vm.mount_path, "subPath": vm.sub_path, "readOnly": vm.read_only}
+                                        for vm in (c.volume_mounts or [])
+                                    ],
+                                }
+                                for c in (job.spec.template.spec.containers or [])
+                            ],
+                            "volumes": [
+                                {
+                                    "name": v.name,
+                                    "persistentVolumeClaim": {"claimName": v.persistent_volume_claim.claim_name}
+                                }
+                                for v in (job.spec.template.spec.volumes or [])
+                                if v.persistent_volume_claim
+                            ],
+                            "restartPolicy": job.spec.template.spec.restart_policy,
+                        }
+                    }
+                }
+            }
+            
+            self.batch_v1.delete_namespaced_job(
+                name=name,
+                namespace=namespace,
+                body=kubernetes.client.V1DeleteOptions()
+            )
+            
+            for _ in range(30):
+                try:
+                    self.batch_v1.read_namespaced_job(name=name, namespace=namespace)
+                    time.sleep(1)
+                except ApiException as e:
+                    if e.status == 404:
+                        break
+            
+            new_job = self._dict_to_v1_job(job_manifest)
+            result = self.batch_v1.create_namespaced_job(namespace=namespace, body=new_job)
+            return self._job_to_dict(result)
+        except ApiException as e:
+            self._handle_api_exception(e, "Job", "重建")
+
+    def get_service_access_info(self, namespace: str, service_name: str) -> Dict:
+        """
+        获取Service访问信息
+        
+        Args:
+            namespace: Namespace
+            service_name: Service名称
+            
+        Returns:
+            Service访问信息
+        """
+        try:
+            service = self.core_v1.read_namespaced_service(name=service_name, namespace=namespace)
+            
+            access_info = {
+                "name": service.metadata.name,
+                "namespace": service.metadata.namespace,
+                "type": service.spec.type,
+                "cluster_ip": service.spec.cluster_ip,
+                "ports": [],
+                "access_urls": []
+            }
+            
+            # 解析端口信息
+            for port in (service.spec.ports or []):
+                port_info = {
+                    "name": port.name,
+                    "port": port.port,
+                    "target_port": port.target_port,
+                    "protocol": port.protocol,
+                    "node_port": port.node_port
+                }
+                access_info["ports"].append(port_info)
+                
+                # 生成访问URL
+                if service.spec.type == "NodePort" and port.node_port:
+                    # NodePort类型 - 通过节点IP:NodePort访问
+                    access_info["access_urls"].append({
+                        "type": "NodePort",
+                        "port_name": port.name,
+                        "url": f"http://<node-ip>:{port.node_port}",
+                        "node_port": port.node_port
+                    })
+                elif service.spec.type == "LoadBalancer" and service.status.load_balancer and service.status.load_balancer.ingress:
+                    # LoadBalancer类型 - 通过外部IP访问
+                    for ingress in service.status.load_balancer.ingress:
+                        if ingress.ip:
+                            access_info["access_urls"].append({
+                                "type": "LoadBalancer",
+                                "port_name": port.name,
+                                "url": f"http://{ingress.ip}:{port.port}"
+                            })
+                        if ingress.hostname:
+                            access_info["access_urls"].append({
+                                "type": "LoadBalancer",
+                                "port_name": port.name,
+                                "url": f"http://{ingress.hostname}:{port.port}"
+                            })
+                elif service.spec.cluster_ip and service.spec.cluster_ip != "None":
+                    # ClusterIP类型 - 集群内部访问
+                    access_info["access_urls"].append({
+                        "type": "ClusterIP",
+                        "port_name": port.name,
+                        "url": f"http://{service.spec.cluster_ip}:{port.port}",
+                        "cluster_ip": service.spec.cluster_ip,
+                        "port": port.port
+                    })
+            
+            return access_info
+        except ApiException as e:
+            self._handle_api_exception(e, "Service访问信息", "获取")
+
+    def proxy_service_request(self, namespace: str, service_name: str, port: int, path: str = "/", method: str = "GET", body: str = None, headers: dict = None) -> Dict:
+        """
+        代理请求到Service
+        
+        Args:
+            namespace: Namespace
+            service_name: Service名称
+            port: Service端口
+            path: 请求路径
+            method: HTTP方法
+            body: 请求体
+            headers: 请求头
+            
+        Returns:
+            代理响应
+        """
+        try:
+            # 使用K8S API代理
+            # 构建代理URL
+            proxy_path = f"/api/v1/namespaces/{namespace}/services/{service_name}:{port}/proxy{path}"
+            
+            # 发送请求
+            response = self.core_v1.api_client.call_api(
+                proxy_path,
+                method,
+                header_params=headers or {},
+                body=body,
+                response_type="str",
+                _preload_content=False
+            )
+            
+            return {
+                "status": response.status,
+                "data": response.data.decode('utf-8') if response.data else ""
+            }
+        except ApiException as e:
+            return {
+                "status": e.status,
+                "error": str(e)
+            }
+
 
 # 单例实例
 _k8s_service: Optional[KubernetesService] = None
