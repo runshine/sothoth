@@ -823,7 +823,7 @@ class KubernetesService:
         )
 
         deployment_spec = V1DeploymentSpec(
-            replicas=spec.get("replicas"),
+            replicas=spec.get("replicas", 1),
             selector=selector,
             template=pod_template,
         )
