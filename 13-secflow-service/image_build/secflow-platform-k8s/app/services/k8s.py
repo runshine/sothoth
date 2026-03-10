@@ -676,8 +676,11 @@ class KubernetesService:
         """创建Deployment"""
         try:
             from kubernetes.client import V1Deployment
+            replicas = manifest.get("spec", {}).get("replicas", 1)
+            logger.info(f"创建Deployment: {manifest.get('metadata', {}).get('name')}, replicas={replicas}")
             dep = self._dict_to_v1_deployment(manifest)
             result = self.apps_v1.create_namespaced_deployment(namespace=namespace, body=dep)
+            logger.info(f"Deployment创建成功: {result.metadata.name}, spec.replicas={result.spec.replicas}")
             return self._deployment_to_dict(result)
         except ApiException as e:
             self._handle_api_exception(e, "Deployment", "创建")
