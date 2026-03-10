@@ -1087,9 +1087,9 @@ class KubernetesService:
             "annotations": job.metadata.annotations or {},
             "parallelism": job.spec.parallelism if job.spec else None,
             "completions": job.spec.completions if job.spec else None,
-            "active": job.status.active if job.status else 0,
-            "succeeded": job.status.succeeded if job.status else 0,
-            "failed": job.status.failed if job.status else 0,
+            "active": job.status.active if job.status and job.status.active is not None else 0,
+            "succeeded": job.status.succeeded if job.status and job.status.succeeded is not None else 0,
+            "failed": job.status.failed if job.status and job.status.failed is not None else 0,
             "selector": job.spec.selector.match_labels if job.spec and job.spec.selector else {},
             "created_at": job.metadata.creation_timestamp.isoformat() if job.metadata.creation_timestamp else None,
         }
