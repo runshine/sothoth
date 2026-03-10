@@ -1117,7 +1117,8 @@ async def websocket_exec_pod(
     pod_name: str,
     project_id: str = Query(..., description="项目ID"),
     container: Optional[str] = Query(None, description="容器名"),
-    command: Optional[str] = Query("/bin/sh", description="执行的命令")
+    command: Optional[str] = Query("/bin/sh", description="执行的命令"),
+    token: Optional[str] = Query(None, description="认证Token")
 ):
     """
     WebSocket Exec - 类似 kubectl exec -it 的能力
@@ -1128,11 +1129,32 @@ async def websocket_exec_pod(
     - 从 stdout/stderr 接收输出
     - 发送 "exit" 或关闭连接退出
     """
+    # 验证Token
+    if not token:
+        await websocket.accept()
+        await websocket.send_text("Error: 未提供认证Token")
+        await websocket.close()
+        return
+    
+    try:
+        auth_service = get_auth_service()
+        current_user = auth_service.verify_token(token)
+        if not current_user:
+            await websocket.accept()
+            await websocket.send_text("Error: Token无效或已过期")
+            await websocket.close()
+            return
+    except Exception as e:
+        logger.error(f"Token验证失败: {e}")
+        await websocket.accept()
+        await websocket.send_text(f"Error: Token验证失败 - {str(e)}")
+        await websocket.close()
+        return
+    
     # 生成客户端ID
     client_id = f"exec_{pod_name}_{id(websocket)}"
 
     # 验证项目权限
-    # 注意: 这里简化处理，实际应验证token
     try:
         # 获取namespace
         from app.models.database import get_db_session
@@ -1141,11 +1163,13 @@ async def websocket_exec_pod(
         db.close()
 
         if not namespace:
+            await websocket.accept()
             await websocket.send_text("Error: 项目不存在")
             await websocket.close()
             return
     except Exception as e:
         logger.error(f"获取namespace失败: {e}")
+        await websocket.accept()
         await websocket.send_text(f"Error: {str(e)}")
         await websocket.close()
         return
