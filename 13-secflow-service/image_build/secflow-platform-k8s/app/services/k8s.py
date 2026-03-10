@@ -1083,8 +1083,8 @@ class KubernetesService:
         return {
             "name": job.metadata.name,
             "namespace": job.metadata.namespace,
-            "label": job.metadata.label or {},
-            "annotation": job.metadata.annotation or {},
+            "labels": job.metadata.labels or {},
+            "annotations": job.metadata.annotations or {},
             "parallelism": job.spec.parallelism if job.spec else None,
             "completions": job.spec.completions if job.spec else None,
             "active": job.status.active if job.status else 0,
