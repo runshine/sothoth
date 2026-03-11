@@ -713,36 +713,15 @@ class KubernetesService:
 
     def _deployment_to_dict(self, dep) -> Dict:
         """Deployment对象转字典"""
-        # 打印原始deployment对象用于调试
-        logger.info(f"[DEBUG] _deployment_to_dict 原始数据: name={dep.metadata.name}, "
-                   f"spec.replicas={dep.spec.replicas if dep.spec else None}, "
-                   f"status.replicas={getattr(dep.status, 'replicas', None)}, "
-                   f"status.ready_replicas={getattr(dep.status, 'ready_replicas', None)}, "
-                   f"status.available_replicas={getattr(dep.status, 'available_replicas', None)}, "
-                   f"status.updated_replicas={getattr(dep.status, 'updated_replicas', None)}, "
-                   f"status={dep.status}")
-
-        # 处理conditions字段
-        conditions = []
-        if dep.status and dep.status.conditions:
-            for cond in dep.status.conditions:
-                conditions.append({
-                    "type": cond.type,
-                    "status": cond.status,
-                    "reason": cond.reason,
-                    "message": cond.message,
-                })
-
         return {
             "name": dep.metadata.name,
             "namespace": dep.metadata.namespace,
             "labels": dep.metadata.labels or {},
             "annotations": dep.metadata.annotations or {},
             "replicas": dep.spec.replicas if dep.spec else 0,
-            "ready_replicas": dep.status.ready_replicas if dep.status and dep.status.ready_replicas is not None else 0,
-            "available_replicas": dep.status.available_replicas if dep.status and dep.status.available_replicas is not None else 0,
-            "updated_replicas": dep.status.updated_replicas if dep.status and dep.status.updated_replicas is not None else 0,
-            "conditions": conditions,
+            "ready_replicas": dep.status.ready_replicas if dep.status else 0,
+            "available_replicas": dep.status.available_replicas if dep.status else 0,
+            "updated_replicas": dep.status.updated_replicas if dep.status else 0,
             "selector": dep.spec.selector.match_labels if dep.spec and dep.spec.selector else {},
             "containers": [
                 {

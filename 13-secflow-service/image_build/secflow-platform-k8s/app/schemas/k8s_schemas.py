@@ -294,11 +294,10 @@ class DeploymentInfo(BaseModel):
     namespace: str
     label: Dict[str, str] = Field(default_factory=dict)
     annotation: Dict[str, str] = Field(default_factory=dict)
-    replicas: int = 0
-    ready_replicas: int = 0
-    available_replicas: int = 0
-    updated_replicas: int = 0
-    conditions: List[Dict[str, Any]] = Field(default_factory=list)
+    replica: int = 0
+    ready_replica: int = 0
+    available_replica: int = 0
+    updated_replica: int = 0
     selector: Dict[str, str] = Field(default_factory=dict)
     container: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: Optional[str] = None
