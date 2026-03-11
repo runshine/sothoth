@@ -18,8 +18,7 @@ router = APIRouter(tags=["机机Token管理"], prefix="/machine-tokens")
 
 @router.get("", response_model=List[MachineTokenResponse])
 def list_machine_tokens(
-    db: Session = Depends(get_db),
-    _: bool = Depends(get_machine_client)
+    db: Session = Depends(get_db)
 ):
     """
     获取机机Token列表
@@ -27,19 +26,31 @@ def list_machine_tokens(
     返回所有机机Token的基本信息
     """
     tokens = db.query(MachineToken).all()
+    
+    # 检查每个Token的过期状态
+    now = datetime.utcnow()
+    for token in tokens:
+        if token.expires_at and token.expires_at < now and token.is_active:
+            # 如果Token已过期且状态仍为激活，更新状态为禁用
+            token.is_active = False
+            token.updated_at = now
+    
+    # 如果有更新，提交到数据库
+    db.commit()
+    
     return tokens
 
 
 @router.get("/{token_id}", response_model=MachineTokenDetailResponse)
 def get_machine_token(
     token_id: int,
-    db: Session = Depends(get_db),
-    _: bool = Depends(get_machine_client)
+    db: Session = Depends(get_db)
 ):
     """
     获取机机Token详情
 
     返回指定机机Token的详细信息
+    - 如果Token已过期，token字段将被隐藏
     """
     token = db.query(MachineToken).filter(MachineToken.id == token_id).first()
     if not token:
@@ -47,14 +58,37 @@ def get_machine_token(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Token不存在"
         )
+    
+    # 检查Token是否过期
+    now = datetime.utcnow()
+    token_expired = token.expires_at and token.expires_at < now
+    
+    if token_expired and token.is_active:
+        # 如果Token已过期且状态仍为激活，更新状态为禁用
+        token.is_active = False
+        token.updated_at = now
+        db.commit()
+    
+    # 如果Token已过期，创建一个不包含token字段的响应对象
+    if token_expired:
+        response_data = {
+            "id": token.id,
+            "machine_code": token.machine_code,
+            "description": token.description,
+            "is_active": token.is_active,
+            "created_at": token.created_at,
+            "expires_at": token.expires_at,
+            "token": ""  # 设置为空字符串
+        }
+        return MachineTokenDetailResponse(**response_data)
+    
     return token
 
 
 @router.post("", response_model=MachineTokenDetailResponse, status_code=status.HTTP_201_CREATED)
 def create_machine_token(
     token_data: MachineTokenCreate,
-    db: Session = Depends(get_db),
-    _: bool = Depends(get_machine_client)
+    db: Session = Depends(get_db)
 ):
     """
     创建机机Token
@@ -96,8 +130,7 @@ def create_machine_token(
 def update_machine_token(
     token_id: int,
     token_data: MachineTokenUpdate,
-    db: Session = Depends(get_db),
-    _: bool = Depends(get_machine_client)
+    db: Session = Depends(get_db)
 ):
     """
     更新机机Token
@@ -134,8 +167,7 @@ def update_machine_token(
 @router.delete("/{token_id}", response_model=Message)
 def delete_machine_token(
     token_id: int,
-    db: Session = Depends(get_db),
-    _: bool = Depends(get_machine_client)
+    db: Session = Depends(get_db)
 ):
     """
     删除机机Token
@@ -158,8 +190,7 @@ def delete_machine_token(
 @router.post("/{token_id}/enable", response_model=Message)
 def enable_machine_token(
     token_id: int,
-    db: Session = Depends(get_db),
-    _: bool = Depends(get_machine_client)
+    db: Session = Depends(get_db)
 ):
     """
     启用机机Token
@@ -183,8 +214,7 @@ def enable_machine_token(
 @router.post("/{token_id}/disable", response_model=Message)
 def disable_machine_token(
     token_id: int,
-    db: Session = Depends(get_db),
-    _: bool = Depends(get_machine_client)
+    db: Session = Depends(get_db)
 ):
     """
     禁用机机Token
@@ -208,8 +238,7 @@ def disable_machine_token(
 @router.post("/{token_id}/regenerate", response_model=MachineTokenDetailResponse)
 def regenerate_machine_token(
     token_id: int,
-    db: Session = Depends(get_db),
-    _: bool = Depends(get_machine_client)
+    db: Session = Depends(get_db)
 ):
     """
     重新生成机机Token

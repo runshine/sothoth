@@ -198,3 +198,115 @@ class Message(BaseModel):
 class ErrorResponse(BaseModel):
     """错误响应模式"""
     detail: str
+
+
+# ============ 组织管理模式 ============
+
+class DepartmentBase(BaseModel):
+    """部门基础模式"""
+    name: str
+    description: Optional[str] = None
+    parent_id: Optional[int] = None
+
+
+class DepartmentCreate(DepartmentBase):
+    """创建部门模式"""
+    pass
+
+
+class DepartmentUpdate(BaseModel):
+    """更新部门模式"""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parent_id: Optional[int] = None
+
+
+class DepartmentResponse(DepartmentBase):
+    """部门响应模式"""
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DepartmentMemberBase(BaseModel):
+    """部门成员基础模式"""
+    user_id: int
+    department_id: int
+    role: str  # leader, member
+
+
+class DepartmentMemberCreate(DepartmentMemberBase):
+    """创建部门成员模式"""
+    pass
+
+
+class DepartmentMemberUpdate(BaseModel):
+    """更新部门成员模式"""
+    role: Optional[str] = None
+
+
+class DepartmentMemberResponse(BaseModel):
+    """部门成员响应模式"""
+    id: int
+    user_id: int
+    username: str
+    department_id: int
+    department_name: str
+    role: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ProjectBase(BaseModel):
+    """项目基础模式"""
+    name: str
+    description: Optional[str] = None
+    is_public: bool = False
+
+
+class ProjectCreate(ProjectBase):
+    """创建项目模式"""
+    department_ids: Optional[List[int]] = None
+
+
+class ProjectUpdate(BaseModel):
+    """更新项目模式"""
+    name: Optional[str] = None
+    description: Optional[str] = None
+    is_public: Optional[bool] = None
+
+
+class ProjectResponse(ProjectBase):
+    """项目响应模式"""
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ProjectDetailResponse(ProjectResponse):
+    """项目详细响应模式"""
+    departments: List[DepartmentResponse] = []
+
+
+class ProjectDepartmentBindRequest(BaseModel):
+    """项目-部门绑定请求模式"""
+    department_ids: List[int]
+
+
+class UserPermissionInfo(BaseModel):
+    """用户权限信息响应模式"""
+    user_id: int
+    is_admin: bool
+    department_ids: List[int]
+    manageable_department_ids: List[int]
+    department_structure_manageable_ids: List[int]
+    role_names: List[str]
