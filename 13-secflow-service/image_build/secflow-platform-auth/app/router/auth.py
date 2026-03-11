@@ -7,12 +7,12 @@ from sqlalchemy.orm import Session
 import secrets
 
 from app.database import get_db
-from app.auth import create_access_token, decode_access_token, verify_machine_token, create_human_token, create_human_token_with_session
+from app.auth import create_access_token, decode_access_token, verify_machine_token, create_human_token, create_human_token_with_session, get_password_hash
 from app.schema import (
     LoginRequest, TokenResponse, MachineTokenRequest, MachineTokenCreate,
-    MachineTokenResponse, Message, UserResponse
+    MachineTokenResponse, MachineTokenDetailResponse, Message, UserResponse, UserCreate
 )
-from app.model import User, MachineToken
+from app.model import User, MachineToken, Role
 
 router = APIRouter(tags=["认证"])
 
@@ -57,12 +57,16 @@ def login(request: LoginRequest, request_obj: Request, db: Session = Depends(get
     }
 
 
-@router.post("/machine-token", response_model=MachineTokenResponse)
+@router.post("/machine-token", response_model=MachineTokenDetailResponse, status_code=status.HTTP_201_CREATED)
 def create_machine_token(request: MachineTokenRequest, db: Session = Depends(get_db)):
     """
     申请机机Token
 
     通过机器码换取机机Token，机机Token用于服务间调用
+    - 无需认证
+    - 如果机器码已存在且有效，返回现有Token
+    - 如果机器码已存在但已过期，重新生成Token
+    - 如果机器码不存在，创建新Token
     """
     # 检查是否已存在该机器码的token
     existing = db.query(MachineToken).filter(
@@ -75,7 +79,7 @@ def create_machine_token(request: MachineTokenRequest, db: Session = Depends(get
             db.delete(existing)
             db.commit()
         elif existing.is_active:
-            # 返回现有token
+            # 返回现有token，包含完整token值
             return existing
 
     # 生成随机token
@@ -113,6 +117,18 @@ def list_machine_tokens(db: Session = Depends(get_db)):
     仅管理员使用
     """
     tokens = db.query(MachineToken).all()
+    
+    # 检查每个Token的过期状态
+    now = datetime.utcnow()
+    for token in tokens:
+        if token.expires_at and token.expires_at < now and token.is_active:
+            # 如果Token已过期且状态仍为激活，更新状态为禁用
+            token.is_active = False
+            token.updated_at = now
+    
+    # 如果有更新，提交到数据库
+    db.commit()
+    
     return tokens
 
 

@@ -75,6 +75,10 @@ def verify_machine_token(db: Session, token: str) -> Optional[MachineToken]:
     if not db_token.is_active:
         return None
     if db_token.expires_at and db_token.expires_at < datetime.utcnow():
+        # 如果token已过期，将状态设置为禁用并更新时间戳
+        db_token.is_active = False
+        db_token.updated_at = datetime.utcnow()
+        db.commit()
         return None
     return db_token
 
@@ -175,6 +179,24 @@ def cleanup_expired_sessions(db: Session) -> int:
     count = 0
     for session in expired_sessions:
         session.status = "expired"
+        count += 1
+
+    db.commit()
+    return count
+
+
+def cleanup_expired_machine_tokens(db: Session) -> int:
+    """清理过期的机机Token，返回清理数量"""
+    expired_tokens = db.query(MachineToken).filter(
+        MachineToken.expires_at < datetime.utcnow(),
+        MachineToken.is_active == True
+    ).all()
+
+    count = 0
+    for token in expired_tokens:
+        # 将过期token设置为禁用
+        token.is_active = False
+        token.updated_at = datetime.utcnow()
         count += 1
 
     db.commit()

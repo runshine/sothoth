@@ -134,9 +134,35 @@ def lifespan_factory():
                     print(f"[Service Registry] Error: {e}")
                 await asyncio.sleep(30)
 
+        async def periodic_cleanup():
+            """定期清理过期资源"""
+            while True:
+                try:
+                    from app.auth import cleanup_expired_sessions, cleanup_expired_machine_tokens
+                    from app.database import get_db
+                    
+                    db = next(get_db())
+                    
+                    # 清理过期会话
+                    session_count = cleanup_expired_sessions(db)
+                    if session_count > 0:
+                        print(f"[Cleanup] Cleaned up {session_count} expired sessions")
+                    
+                    # 清理过期机机Token
+                    token_count = cleanup_expired_machine_tokens(db)
+                    if token_count > 0:
+                        print(f"[Cleanup] Cleaned up {token_count} expired machine tokens")
+                        
+                except Exception as e:
+                    print(f"[Cleanup] Error: {e}")
+                
+                # 每5分钟执行一次清理
+                await asyncio.sleep(300)
+
         # 启动时执行
         register_to_menu_service()
         asyncio.create_task(periodic_register())
+        asyncio.create_task(periodic_cleanup())
         yield
         # 关闭时执行
         print("[Service] Shutting down...")
@@ -187,13 +213,14 @@ def create_app():
     )
 
     # 路由导入
-    from app.router import auth, users, role_router, machine_tokens_router
+    from app.router import auth, users, role_router, machine_tokens_router, org_router
 
     # 注册路由
     app.include_router(auth.router, prefix="/api/auth")
     app.include_router(users.router, prefix="/api/auth")
     app.include_router(role_router, prefix="/api/auth")
     app.include_router(machine_tokens_router, prefix="/api/auth")
+    app.include_router(org_router)
 
     @app.get("/")
     def root():

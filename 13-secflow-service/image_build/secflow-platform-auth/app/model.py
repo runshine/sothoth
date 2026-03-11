@@ -79,3 +79,60 @@ class UserSession(Base):
 
     # 关联用户
     user = relationship("User", backref="sessions")
+
+
+class Department(Base):
+    """部门模型"""
+    __tablename__ = "secflow_org_department"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500))
+    parent_id = Column(Integer, ForeignKey("secflow_org_department.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # 关联关系
+    parent = relationship("Department", remote_side=[id], backref="children")
+
+
+class DepartmentMember(Base):
+    """部门成员模型"""
+    __tablename__ = "secflow_org_department_member"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("secflow_user_users.id"), nullable=False)
+    department_id = Column(Integer, ForeignKey("secflow_org_department.id"), nullable=False)
+    role = Column(String(20), nullable=False)  # leader, member
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # 关联关系
+    user = relationship("User", backref="department_memberships")
+    department = relationship("Department", backref="members")
+
+
+class Project(Base):
+    """项目模型"""
+    __tablename__ = "secflow_org_project"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500))
+    is_public = Column(Boolean, default=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ProjectDepartment(Base):
+    """项目-部门关联模型"""
+    __tablename__ = "secflow_org_project_department"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(Integer, ForeignKey("secflow_org_project.id"), nullable=False)
+    department_id = Column(Integer, ForeignKey("secflow_org_department.id"), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # 关联关系
+    project = relationship("Project", backref="departments")
+    department = relationship("Department", backref="projects")
