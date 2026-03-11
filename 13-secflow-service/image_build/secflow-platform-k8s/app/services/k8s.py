@@ -305,8 +305,8 @@ class KubernetesService:
         return {
             "name": svc.metadata.name,
             "namespace": svc.metadata.namespace,
-            "label": svc.metadata.labels or {},
-            "annotation": svc.metadata.annotations or {},
+            "labels": svc.metadata.labels or {},
+            "annotations": svc.metadata.annotations or {},
             "type": svc.spec.type if svc.spec else "ClusterIP",
             "cluster_ip": svc.spec.cluster_ip if svc.spec else None,
             "external_ips": svc.spec.external_i_ps if svc.spec else None,
@@ -404,8 +404,8 @@ class KubernetesService:
         return {
             "name": ing.metadata.name,
             "namespace": ing.metadata.namespace,
-            "label": ing.metadata.label or {},
-            "annotation": ing.metadata.annotation or {},
+            "labels": ing.metadata.labels or {},
+            "annotations": ing.metadata.annotations or {},
             "ingress_class_name": ing.spec.ingress_class_name,
             "tls": [
                 {
@@ -452,8 +452,8 @@ class KubernetesService:
         ingress_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
         tls_list = []
@@ -548,8 +548,8 @@ class KubernetesService:
         return {
             "name": sec.metadata.name,
             "namespace": sec.metadata.namespace,
-            "label": sec.metadata.label or {},
-            "annotation": sec.metadata.annotation or {},
+            "labels": sec.metadata.labels or {},
+            "annotations": sec.metadata.annotations or {},
             "type": sec.type,
             "data": sec.data or {},
             "created_at": sec.metadata.creation_timestamp.isoformat() if sec.metadata.creation_timestamp else None,
@@ -565,8 +565,8 @@ class KubernetesService:
         secret_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
         return V1Secret(
@@ -623,8 +623,8 @@ class KubernetesService:
         return {
             "name": cm.metadata.name,
             "namespace": cm.metadata.namespace,
-            "label": cm.metadata.label or {},
-            "annotation": cm.metadata.annotation or {},
+            "labels": cm.metadata.labels or {},
+            "annotations": cm.metadata.annotations or {},
             "data": cm.data or {},
             "binary_data": cm.binary_data or {},
             "created_at": cm.metadata.creation_timestamp.isoformat() if cm.metadata.creation_timestamp else None,
@@ -641,8 +641,8 @@ class KubernetesService:
         configmap_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
         return V1ConfigMap(
@@ -881,14 +881,14 @@ class KubernetesService:
         return {
             "name": ss.metadata.name,
             "namespace": ss.metadata.namespace,
-            "label": ss.metadata.label or {},
-            "annotation": ss.metadata.annotation or {},
-            "replica": ss.spec.replicas if ss.spec else 0,
+            "labels": ss.metadata.labels or {},
+            "annotations": ss.metadata.annotations or {},
+            "replicas": ss.spec.replicas if ss.spec else 0,
             "ready_replicas": ss.status.ready_replicas if ss.status else 0,
-            "current_replica": ss.status.current_replicas if ss.status else 0,
-            "updated_replica": ss.status.updated_replica if ss.status else 0,
+            "current_replicas": ss.status.current_replicas if ss.status else 0,
+            "updated_replicas": ss.status.updated_replicas if ss.status else 0,
             "service_name": ss.spec.service_name if ss.spec else None,
-            "selector": ss.spec.selector.match_label if ss.spec and ss.spec.selector else {},
+            "selector": ss.spec.selector.match_labels if ss.spec and ss.spec.selector else {},
             "created_at": ss.metadata.creation_timestamp.isoformat() if ss.metadata.creation_timestamp else None,
         }
 
@@ -905,8 +905,8 @@ class KubernetesService:
         sts_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
         selector = V1LabelSelector(match_label=spec.get("selector", {}).get("matchLabels", {}))
@@ -982,13 +982,13 @@ class KubernetesService:
         return {
             "name": ds.metadata.name,
             "namespace": ds.metadata.namespace,
-            "label": ds.metadata.label or {},
-            "annotation": ds.metadata.annotation or {},
-            "desired_scheduled": ds.status.desired_scheduled if ds.status else 0,
-            "current_scheduled": ds.status.current_scheduled if ds.status else 0,
-            "ready": ds.status.ready_replicas if ds.status else 0,
-            "updated_ready": ds.status.updated_ready_replicas if ds.status else 0,
-            "selector": ds.spec.selector.match_label if ds.spec and ds.spec.selector else {},
+            "labels": ds.metadata.labels or {},
+            "annotations": ds.metadata.annotations or {},
+            "desired_scheduled": ds.status.desired_number_scheduled if ds.status else 0,
+            "current_scheduled": ds.status.current_number_scheduled if ds.status else 0,
+            "ready": ds.status.number_ready if ds.status else 0,
+            "updated_ready": ds.status.updated_number_scheduled if ds.status else 0,
+            "selector": ds.spec.selector.match_labels if ds.spec and ds.spec.selector else {},
             "created_at": ds.metadata.creation_timestamp.isoformat() if ds.metadata.creation_timestamp else None,
         }
 
@@ -1005,8 +1005,8 @@ class KubernetesService:
         ds_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
         selector = V1LabelSelector(match_label=spec.get("selector", {}).get("matchLabels", {}))
@@ -1236,8 +1236,8 @@ class KubernetesService:
         return {
             "name": pvc.metadata.name,
             "namespace": pvc.metadata.namespace,
-            "label": pvc.metadata.label or {},
-            "annotation": pvc.metadata.annotation or {},
+            "labels": pvc.metadata.labels or {},
+            "annotations": pvc.metadata.annotations or {},
             "status": pvc.status.phase if pvc.status else "Unknown",
             "access_modes": pvc.spec.access_modes if pvc.spec else [],
             "volume_mode": pvc.spec.volume_mode if pvc.spec else None,
@@ -1262,8 +1262,8 @@ class KubernetesService:
         pvc_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
         )
 
         resources = V1PersistentVolumeClaimResources(
