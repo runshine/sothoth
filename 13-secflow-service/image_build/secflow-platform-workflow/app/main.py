@@ -16,7 +16,7 @@ from app.api.workflow_instances import router as workflow_instance_router
 from app.config import load_config, get_config
 from app.exception import setup_exception_handlers
 from app.models import create_tables, get_engine
-from app.services import get_k8s_client, get_registry_service
+from app.services import get_registry_service
 
 # Configure logging
 logging.basicConfig(
@@ -49,16 +49,9 @@ async def lifespan(app: FastAPI):
         logger.error(f"Database initialization failed: {e}")
         sys.exit(1)
 
-    # Verify K8S connection
-    try:
-        k8s_client = get_k8s_client()
-        if not k8s_client.connect():
-            logger.error("K8S connection verification failed")
-            sys.exit(1)
-        logger.info("K8S connection verified successfully")
-    except Exception as e:
-        logger.error(f"K8S connection verification failed: {e}")
-        sys.exit(1)
+    # Verify K8S service configuration
+    config = get_config()
+    logger.info(f"K8S service mode enabled, endpoint: {config.k8s_service.host}:{config.k8s_service.port}")
 
     # Register with Menu service
     try:

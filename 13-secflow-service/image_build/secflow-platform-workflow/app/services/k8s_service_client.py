@@ -57,15 +57,30 @@ class K8SServiceClient:
 
     # ============ Namespace 操作 ============
 
-    def ensure_namespace(self, project_id: str) -> bool:
-        """确保namespace存在"""
+    def ensure_namespace(self, project_id: str) -> tuple[bool, str]:
+        """
+        确保namespace存在
+        
+        Returns:
+            tuple[bool, str]: (是否存在, 错误信息或状态)
+        """
         namespace = self.get_project_namespace(project_id)
         try:
             result = self.check_namespace_exists(namespace)
-            return result.get("exists", False)
+            if result.get("exists", False):
+                return True, "Namespace exists"
+            else:
+                status = result.get("status", "Unknown")
+                error = result.get("error", "")
+                if status == "ServerError":
+                    return False, f"K8S服务内部错误: {error}"
+                elif status == "ConnectionError":
+                    return False, f"无法连接K8S服务"
+                else:
+                    return False, f"Namespace不存在或状态异常: {status}"
         except Exception as e:
             logger.error(f"检查namespace失败: {e}")
-            return False
+            return False, f"检查namespace异常: {str(e)}"
 
     def check_namespace_exists(self, namespace: str) -> Dict:
         """检查namespace是否存在"""
@@ -74,9 +89,15 @@ class K8SServiceClient:
             response = self.sync_client.get(url)
             response.raise_for_status()
             return response.json()
-        except httpx.HTTPError as e:
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 500:
+                logger.error(f"K8S服务内部错误: {e.response.text}")
+                return {"exists": False, "name": namespace, "status": "ServerError", "error": e.response.text}
             logger.error(f"检查namespace失败: {e}")
             return {"exists": False, "name": namespace, "status": "Error"}
+        except httpx.HTTPError as e:
+            logger.error(f"检查namespace失败: {e}")
+            return {"exists": False, "name": namespace, "status": "ConnectionError"}
 
     # ============ Deployment 操作 ============
 
@@ -114,6 +135,13 @@ class K8SServiceClient:
             volume_mounts=volume_mounts,
             replicas=replicas
         )
+        
+        # 确保replicas在manifest中
+        if "spec" not in manifest:
+            manifest["spec"] = {}
+        if manifest["spec"].get("replicas", 1) < 1:
+            manifest["spec"]["replicas"] = 1
+        logger.info(f"创建Deployment {name}, replicas={manifest['spec'].get('replicas', 1)}")
 
         url = f"{self._get_base_url()}/deployments?project_id={project_id}"
         try:
@@ -291,13 +319,17 @@ class K8SServiceClient:
             response = self.sync_client.get(url)
             response.raise_for_status()
             data = response.json()
+            replicas = data.get("replicas") or data.get("replica", 0)
+            ready_replicas = data.get("ready_replicas") or data.get("ready_replica", 0)
+            available_replicas = data.get("available_replicas") or data.get("available_replica", 0)
+            updated_replicas = data.get("updated_replicas") or data.get("updated_replica", 0)
             return {
                 "name": data.get("name"),
-                "replicas": data.get("replica", 0),
-                "available_replicas": data.get("available_replica", 0),
-                "ready_replicas": data.get("ready_replica", 0),
-                "updated_replicas": data.get("updated_replica", 0),
-                "status": "Running" if data.get("ready_replica", 0) >= data.get("replica", 0) else "Pending"
+                "replicas": replicas,
+                "available_replicas": available_replicas,
+                "ready_replicas": ready_replicas,
+                "updated_replicas": updated_replicas,
+                "status": "Running" if ready_replicas >= replicas and replicas > 0 else "Pending"
             }
         except httpx.HTTPError as e:
             if hasattr(e, 'response') and e.response and e.response.status_code == 404:

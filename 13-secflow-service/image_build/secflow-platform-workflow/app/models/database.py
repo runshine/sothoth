@@ -375,6 +375,8 @@ def init_engine():
             pool_size=db_config.pool_size or 10,
             max_overflow=db_config.max_overflow or 20,
             pool_pre_ping=True,
+            pool_recycle=3600,
+            pool_timeout=30,
             echo=False,
         )
     return _engine
@@ -392,7 +394,7 @@ def get_session_factory():
     """Get session factory"""
     global _session_factory
     if _session_factory is None:
-        _session_factory = sessionmaker(bind=get_engine())
+        _session_factory = sessionmaker(bind=get_engine(), expire_on_commit=False)
     return _session_factory
 
 

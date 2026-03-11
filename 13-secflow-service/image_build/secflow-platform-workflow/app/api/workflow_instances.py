@@ -24,7 +24,8 @@ from app.schemas import (
     LogQueryRequest, PodLogResponse, SuccessResponse
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
-from app.services import get_k8s_client, WorkflowEngine
+from app.services import WorkflowEngine
+from app.services.k8s_service_client import get_k8s_service_client
 from app.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -32,14 +33,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/workflow-instances", tags=["Workflow Instances"])
 
 
-def get_k8s_client_auto():
-    """自动选择K8S客户端模式"""
-    config = get_config()
-    if config.k8s_service and config.k8s_service.enabled:
-        from app.services.k8s_service_client import get_k8s_service_client
-        return get_k8s_service_client()
-    else:
-        return get_k8s_client()
+def get_k8s_client():
+    """获取K8S微服务客户端"""
+    return get_k8s_service_client()
 
 
 # ============ 初始化工作流 API ============
@@ -108,11 +104,12 @@ async def initialize_workflow_instance(
             f"Workflow instance already initialized. Use force=True to re-initialize (this will delete existing resources)"
         )
 
-    k8s_client = get_k8s_client_auto()
+    k8s_client = get_k8s_client()
 
     # 验证namespace
-    if not k8s_client.ensure_namespace(instance.project_id):
-        raise InternalError(f"Namespace for project {instance.project_id} does not exist")
+    namespace_exists, namespace_error = k8s_client.ensure_namespace(instance.project_id)
+    if not namespace_exists:
+        raise InternalError(f"Namespace验证失败: {namespace_error}")
 
     # 设置状态为正在初始化
     instance.status = WorkflowStatus.INITIALIZING
@@ -244,7 +241,7 @@ async def initialize_workflow_instance(
 
             # 构建容器配置
             containers = _build_containers_from_template(template, node)
-            init_logs.append(f"  模板: {template.name}, 容器数: {len(containers)}")
+            init_logs.append(f"  模板: {template.name}, 容器数: {len(containers)}, replicas: {template.replicas}")
 
             # 生成Deployment名称
             deployment_name = f"wf-{instance_id[:8]}-{node.node_id[:8]}"
@@ -254,12 +251,15 @@ async def initialize_workflow_instance(
             # 创建Deployment
             # 使用节点配置中的service_ports（如果需要创建Service的话）
             deployment_ports = service_ports if create_service else []
+            # 确保replicas至少为1
+            replicas = template.replicas if template.replicas and template.replicas > 0 else 1
+            init_logs.append(f"  创建Deployment: {deployment_name}, replicas: {replicas}")
             success, error_msg = k8s_client.create_deployment(
                 project_id=instance.project_id,
                 name=deployment_name,
                 containers=containers,
                 ports=deployment_ports,
-                replicas=template.replicas
+                replicas=replicas
             )
 
             if not success:
@@ -874,17 +874,36 @@ async def start_workflow_instance(
     if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
         raise ValidationError(f"Cannot start instance in status: {instance.status}. Valid states: pending, initialized, stopped")
 
+    # Update run count and last run time
+    instance.run_count += 1
+    from datetime import datetime
+    instance.last_run_at = datetime.utcnow()
+    db.commit()
+
     # 使用WorkflowEngine来执行工作流（自动选择K8S客户端模式）
     try:
-        engine = WorkflowEngine(instance_id, db)
+        from app.models import get_session_factory
+        
+        # 为后台任务创建独立的 Session
+        bg_session = get_session_factory()()
+        
+        engine = WorkflowEngine(instance_id, bg_session)
         await engine.initialize()
 
         # 验证namespace
-        if not engine.k8s_client.ensure_namespace(instance.project_id):
-            raise InternalError(f"Namespace for project {instance.project_id} does not exist")
+        namespace_exists, namespace_error = engine.k8s_client.ensure_namespace(instance.project_id)
+        if not namespace_exists:
+            bg_session.close()
+            raise InternalError(f"Namespace验证失败: {namespace_error}")
 
-        # Execute workflow (this runs asynchronously)
-        asyncio.create_task(engine.execute_workflow())
+        # Execute workflow (this runs asynchronously with its own session)
+        async def run_workflow_with_session():
+            try:
+                await engine.execute_workflow()
+            finally:
+                bg_session.close()
+        
+        asyncio.create_task(run_workflow_with_session())
 
         logger.info(f"Started workflow instance {instance_id}")
 
@@ -946,7 +965,7 @@ async def sync_workflow_status(
         # 检查资源残留和状态一致性
         # 1. 检查数据库中记录的资源是否在K8S集群中存在
         # 2. 主动查询K8S集群中与该工作流相关的资源（可能存在资源泄露）
-        k8s_client = get_k8s_client_auto()
+        k8s_client = get_k8s_client()
 
         # 获取所有可能与该工作流相关的资源名称前缀
         instance_prefix = f"wf-{instance_id[:8]}-"
@@ -1212,7 +1231,7 @@ async def uninitialize_workflow_instance(
             f"Valid states: initialized, running, stopped, failed, succeeded"
         )
 
-    k8s_client = get_k8s_client_auto()
+    k8s_client = get_k8s_client()
 
     # 获取所有节点
     nodes = db.query(WorkflowNodeInstance).filter(
@@ -1318,7 +1337,7 @@ async def delete_workflow_instance(
 
     # Delete K8S resources if initialized or running
     if instance.status in [WorkflowStatus.INITIALIZED, WorkflowStatus.RUNNING]:
-        k8s_client = get_k8s_client_auto()
+        k8s_client = get_k8s_client()
         nodes = db.query(WorkflowNodeInstance).filter(
             WorkflowNodeInstance.instance_id == instance_id
         ).all()
@@ -1390,7 +1409,7 @@ async def get_node_logs(
     if not node.k8s_resource_name:
         raise ValidationError("Node has not been started yet")
 
-    k8s_client = get_k8s_client_auto()
+    k8s_client = get_k8s_client()
 
     # Get pod for the node
     if node.k8s_resource_type == "Deployment":
@@ -1504,20 +1523,33 @@ async def trigger_workflow_by_http(
 
     # Start workflow
     try:
-        engine = WorkflowEngine(instance_id, db)
+        from app.models import get_session_factory
+        
+        # 为后台任务创建独立的 Session
+        bg_session = get_session_factory()()
+        
+        engine = WorkflowEngine(instance_id, bg_session)
         await engine.initialize()
 
         # Verify namespace exists
-        if not engine.k8s_client.ensure_namespace(instance.project_id):
-            raise InternalError(f"Namespace for project {instance.project_id} does not exist")
+        namespace_exists, namespace_error = engine.k8s_client.ensure_namespace(instance.project_id)
+        if not namespace_exists:
+            bg_session.close()
+            raise InternalError(f"Namespace验证失败: {namespace_error}")
 
         # Update run count and last run time
         instance.run_count += 1
         from datetime import datetime
         instance.last_run_at = datetime.utcnow()
 
-        # Execute workflow asynchronously
-        asyncio.create_task(engine.execute_workflow())
+        # Execute workflow asynchronously with its own session
+        async def run_workflow_with_session():
+            try:
+                await engine.execute_workflow()
+            finally:
+                bg_session.close()
+        
+        asyncio.create_task(run_workflow_with_session())
 
         logger.info(f"Triggered workflow instance {instance_id} via HTTP trigger")
 

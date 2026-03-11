@@ -62,18 +62,25 @@ class K8SClient:
         """Get project namespace name"""
         return f"secflow-{project_id}"
 
-    def ensure_namespace(self, project_id: str) -> bool:
-        """Ensure namespace exists"""
+    def ensure_namespace(self, project_id: str) -> tuple[bool, str]:
+        """
+        Ensure namespace exists
+        
+        Returns:
+            tuple[bool, str]: (是否存在, 错误信息或状态)
+        """
         namespace = self.get_project_namespace(project_id)
         try:
             self.core_api.read_namespace(name=namespace)
-            return True
+            return True, "Namespace exists"
         except ApiException as e:
             if e.status == 404:
-                # Namespace doesn't exist
                 logger.warning(f"Namespace {namespace} does not exist")
-                return False
-            raise
+                return False, f"Namespace {namespace} 不存在"
+            return False, f"K8S API错误: {e.reason}"
+        except Exception as e:
+            logger.error(f"检查namespace失败: {e}")
+            return False, f"检查namespace异常: {str(e)}"
 
     # ============ Deployment Operations ============
 
