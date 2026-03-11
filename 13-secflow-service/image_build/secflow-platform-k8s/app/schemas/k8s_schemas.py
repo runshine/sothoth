@@ -43,8 +43,8 @@ class K8SResourceMetadata(BaseModel):
     """K8S资源元数据"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
 
 
 class K8SResourceListResponse(BaseModel):
@@ -60,12 +60,12 @@ class PodInfo(BaseModel):
     """Pod信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     status: str
     node_name: Optional[str] = None
     service_account: Optional[str] = None
-    containers: List[Dict[str, Any]] = Field(default_factory=list)
+    container: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: Optional[str] = None
 
 
@@ -119,8 +119,8 @@ class ServiceInfo(BaseModel):
     """Service信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     type: str = "ClusterIP"
     cluster_ip: Optional[str] = None
     external_ips: Optional[List[str]] = None
@@ -175,11 +175,11 @@ class IngressInfo(BaseModel):
     """Ingress信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     ingress_class_name: Optional[str] = None
     tls: List[Dict[str, Any]] = Field(default_factory=list)
-    rules: List[Dict[str, Any]] = Field(default_factory=list)
+    rule: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: Optional[str] = None
 
 
@@ -193,16 +193,16 @@ class IngressCreateRequest(BaseModel):
     """Ingress创建请求"""
     name: str
     ingress_class_name: Optional[str] = None
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     tls: List[Dict[str, Any]] = Field(default_factory=list)
-    rules: Dict[str, Any]
+    rule: Dict[str, Any]
 
 
 class IngressUpdateRequest(BaseModel):
     """Ingress更新请求"""
-    annotations: Optional[Dict[str, str]] = None
+    annotation: Optional[Dict[str, str]] = None
     tls: Optional[List[Dict[str, Any]]] = None
-    rules: Optional[Dict[str, Any]] = None
+    rule: Optional[Dict[str, Any]] = None
 
 
 # ==================== Secret 模型 ====================
@@ -212,8 +212,8 @@ class SecretInfo(BaseModel):
     """Secret信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     type: str
     data: Dict[str, str] = Field(default_factory=dict)
     created_at: Optional[str] = None
@@ -230,8 +230,8 @@ class SecretCreateRequest(BaseModel):
     name: str
     type: str = "Opaque"
     data: Dict[str, str]
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
 
 
 class SecretUpdateRequest(BaseModel):
@@ -247,8 +247,8 @@ class ConfigMapInfo(BaseModel):
     """ConfigMap信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     data: Dict[str, str] = Field(default_factory=dict)
     binary_data: Dict[str, str] = Field(default_factory=dict)
     created_at: Optional[str] = None
@@ -265,8 +265,8 @@ class ConfigMapCreateRequest(BaseModel):
     name: str
     data: Dict[str, str] = Field(default_factory=dict)
     binary_data: Dict[str, str] = Field(default_factory=dict)
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
 
 
 class ConfigMapUpdateRequest(BaseModel):
@@ -292,14 +292,14 @@ class DeploymentInfo(BaseModel):
     """Deployment信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
-    replicas: int = 0
-    ready_replicas: int = 0
-    available_replicas: int = 0
-    updated_replicas: int = 0
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
+    replica: int = 0
+    ready_replica: int = 0
+    available_replica: int = 0
+    updated_replica: int = 0
     selector: Dict[str, str] = Field(default_factory=dict)
-    containers: List[Dict[str, Any]] = Field(default_factory=list)
+    container: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: Optional[str] = None
 
 
@@ -321,7 +321,7 @@ class DeploymentUpdateRequest(BaseModel):
 
 class DeploymentScaleRequest(BaseModel):
     """Deployment扩缩容请求"""
-    replicas: int
+    replica: int
 
 
 # ==================== StatefulSet 模型 ====================
@@ -331,12 +331,12 @@ class StatefulSetInfo(BaseModel):
     """StatefulSet信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
-    replicas: int = 0
-    ready_replicas: int = 0
-    current_replicas: int = 0
-    updated_replicas: int = 0
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
+    replica: int = 0
+    ready_replica: int = 0
+    current_replica: int = 0
+    updated_replica: int = 0
     service_name: Optional[str] = None
     selector: Dict[str, str] = Field(default_factory=dict)
     created_at: Optional[str] = None
@@ -355,8 +355,8 @@ class DaemonSetInfo(BaseModel):
     """DaemonSet信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     desired_scheduled: int = 0
     current_scheduled: int = 0
     ready: int = 0
@@ -378,8 +378,8 @@ class JobInfo(BaseModel):
     """Job信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     parallelism: Optional[int] = None
     completions: Optional[int] = None
     active: int = 0
@@ -402,8 +402,8 @@ class CronJobInfo(BaseModel):
     """CronJob信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     schedule: Optional[str] = None
     suspend: bool = False
     active: int = 0
@@ -424,8 +424,8 @@ class PVCInfo(BaseModel):
     """PVC信息"""
     name: str
     namespace: str
-    labels: Dict[str, str] = Field(default_factory=dict)
-    annotations: Dict[str, str] = Field(default_factory=dict)
+    label: Dict[str, str] = Field(default_factory=dict)
+    annotation: Dict[str, str] = Field(default_factory=dict)
     status: str
     access_modes: List[str] = Field(default_factory=list)
     volume_mode: Optional[str] = None
