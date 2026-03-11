@@ -8,7 +8,7 @@ import logging
 import threading
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, Query, status, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, Header, Query, status, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -313,6 +313,48 @@ async def get_pod_logs(
     return PodLogResponse(logs=logs)
 
 
+@router.get("/pods/{pod_name}/events", summary="获取Pod事件")
+async def get_pod_events(
+    pod_name: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """获取Pod相关事件"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    k8s = get_k8s_service()
+    events = k8s.get_pod_events(namespace, pod_name)
+    return {"pod_name": pod_name, "events": events}
+
+
+@router.get("/pods/{pod_name}/status", summary="获取Pod详细状态")
+async def get_pod_status_detail(
+    pod_name: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """获取Pod详细状态信息"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    k8s = get_k8s_service()
+    status = k8s.get_pod_status_detail(namespace, pod_name)
+    return status
+
+
+@router.get("/pods/{pod_name}/metrics", summary="获取Pod资源指标")
+async def get_pod_metrics(
+    pod_name: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """获取Pod资源使用指标（CPU/内存）"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    k8s = get_k8s_service()
+    metrics = k8s.get_pod_metrics(namespace, pod_name)
+    return metrics
+
+
 # ==================== Service 管理 ====================
 
 
@@ -385,6 +427,54 @@ async def delete_service(
     k8s = get_k8s_service()
     result = k8s.delete_service(namespace, service_name)
     return SuccessResponse(message="Service删除成功", data=result)
+
+
+@router.get("/services/{service_name}/access", summary="获取Service访问信息")
+async def get_service_access(
+    service_name: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """获取Service访问信息，包括访问URL"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    k8s = get_k8s_service()
+    access_info = k8s.get_service_access_info(namespace, service_name)
+    return access_info
+
+
+@router.api_route("/services/{service_name}/proxy/{port}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"], summary="代理请求到Service")
+async def proxy_service(
+    service_name: str,
+    port: int,
+    path: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    request: Request = None
+):
+    """代理HTTP请求到K8S Service"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    k8s = get_k8s_service()
+    
+    # 获取请求体
+    body = None
+    if request and request.method in ["POST", "PUT", "PATCH"]:
+        body = await request.body()
+        body = body.decode('utf-8') if body else None
+    
+    # 代理请求
+    result = k8s.proxy_service_request(
+        namespace=namespace,
+        service_name=service_name,
+        port=port,
+        path=f"/{path}",
+        method=request.method if request else "GET",
+        body=body,
+        headers=dict(request.headers) if request else {}
+    )
+    
+    return result
 
 
 # ==================== Ingress 管理 ====================
@@ -691,6 +781,20 @@ async def scale_deployment(
     return k8s.get_deployment(namespace, deployment_name)
 
 
+@router.post("/deployments/{deployment_name}/restart", response_model=SuccessResponse, summary="重启Deployment")
+async def restart_deployment(
+    deployment_name: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """重启Deployment（触发滚动更新）"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    k8s = get_k8s_service()
+    result = k8s.restart_deployment(namespace, deployment_name)
+    return SuccessResponse(message="Deployment重启已触发", data=result)
+
+
 # ==================== StatefulSet 管理 ====================
 
 
@@ -866,6 +970,10 @@ async def create_job(
     """创建Job"""
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
 
+    # 处理嵌套的 manifest 结构
+    if "manifest" in manifest and "metadata" not in manifest:
+        manifest = manifest["manifest"]
+
     if "metadata" not in manifest:
         manifest["metadata"] = {}
     manifest["metadata"]["namespace"] = namespace
@@ -887,6 +995,20 @@ async def delete_job(
     k8s = get_k8s_service()
     result = k8s.delete_job(namespace, job_name)
     return SuccessResponse(message="Job删除成功", data=result)
+
+
+@router.post("/jobs/{job_name}/recreate", response_model=JobInfo, summary="删除并重建Job")
+async def recreate_job(
+    job_name: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """删除并重建Job（用于重新执行Job）"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    k8s = get_k8s_service()
+    result = k8s.recreate_job(namespace, job_name)
+    return result
 
 
 # ==================== PVC 管理 ====================
@@ -995,7 +1117,8 @@ async def websocket_exec_pod(
     pod_name: str,
     project_id: str = Query(..., description="项目ID"),
     container: Optional[str] = Query(None, description="容器名"),
-    command: Optional[str] = Query("/bin/sh", description="执行的命令")
+    command: Optional[str] = Query("/bin/sh", description="执行的命令"),
+    token: Optional[str] = Query(None, description="认证Token")
 ):
     """
     WebSocket Exec - 类似 kubectl exec -it 的能力
@@ -1006,11 +1129,32 @@ async def websocket_exec_pod(
     - 从 stdout/stderr 接收输出
     - 发送 "exit" 或关闭连接退出
     """
+    # 验证Token
+    if not token:
+        await websocket.accept()
+        await websocket.send_text("Error: 未提供认证Token")
+        await websocket.close()
+        return
+    
+    try:
+        auth_service = get_auth_service()
+        current_user = auth_service.verify_token(token)
+        if not current_user:
+            await websocket.accept()
+            await websocket.send_text("Error: Token无效或已过期")
+            await websocket.close()
+            return
+    except Exception as e:
+        logger.error(f"Token验证失败: {e}")
+        await websocket.accept()
+        await websocket.send_text(f"Error: Token验证失败 - {str(e)}")
+        await websocket.close()
+        return
+    
     # 生成客户端ID
     client_id = f"exec_{pod_name}_{id(websocket)}"
 
     # 验证项目权限
-    # 注意: 这里简化处理，实际应验证token
     try:
         # 获取namespace
         from app.models.database import get_db_session
@@ -1019,11 +1163,13 @@ async def websocket_exec_pod(
         db.close()
 
         if not namespace:
+            await websocket.accept()
             await websocket.send_text("Error: 项目不存在")
             await websocket.close()
             return
     except Exception as e:
         logger.error(f"获取namespace失败: {e}")
+        await websocket.accept()
         await websocket.send_text(f"Error: {str(e)}")
         await websocket.close()
         return

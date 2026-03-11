@@ -18,6 +18,8 @@ from tqdm import tqdm
 import json
 import hashlib
 import re
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class PackageUploader:
     def __init__(self, base_url: str, max_workers: int = 3):
@@ -124,7 +126,7 @@ class PackageUploader:
             print(f"尝试连接到: {health_url}")
 
             # 设置更长的超时时间
-            response = self.session.get(health_url, timeout=15)
+            response = self.session.get(health_url, verify=False, timeout=15)
 
             if response.status_code == 200:
                 data = response.json()
@@ -172,7 +174,7 @@ class PackageUploader:
         """
         try:
             url = f"{self.base_url}/api/packages/{package_id}"
-            response = self.session.get(url, timeout=10)
+            response = self.session.get(url, timeout=10, verify=False)
 
             if response.status_code == 200:
                 data = response.json()
@@ -233,7 +235,7 @@ class PackageUploader:
         try:
             self.stats['check_requests'] += 1
             url = f"{self.base_url}/api/packages/{package_id}/check"
-            response = self.session.get(url, timeout=30)
+            response = self.session.get(url, timeout=30, verify=False)
 
             if response.status_code == 200:
                 data = response.json()
@@ -337,7 +339,7 @@ class PackageUploader:
         try:
             url = f"{self.base_url}/api/packages/{package_id}"
             print(f"  正在删除软件包: {package_id}")
-            response = self.session.delete(url, timeout=30)
+            response = self.session.delete(url, timeout=30, verify=False)
 
             if response.status_code == 200:
                 data = response.json()
@@ -748,6 +750,7 @@ class PackageUploader:
                         upload_url,
                         data=monitor,
                         headers=headers,
+                        verify=False,
                         timeout=300  # 5分钟超时
                     )
 
@@ -765,6 +768,7 @@ class PackageUploader:
                         response = self.session.post(
                             upload_url,
                             files=files,
+                            verify=False,
                             timeout=300
                         )
 

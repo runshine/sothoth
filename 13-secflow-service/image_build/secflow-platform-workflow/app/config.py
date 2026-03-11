@@ -77,24 +77,18 @@ class RegistryConfig(BaseModel):
     menu: Optional[RegistryMenuConfig] = None
 
 
-class KubernetesConfig(BaseModel):
-    """K8S configuration"""
-    connection_mode: str = "incluster"  # "incluster" or "kubeconfig"
-    kubeconfig_path: Optional[str] = None
-    connection_timeout: int = 30
-
-
 class K8SServiceConfig(BaseModel):
     """K8S微服务配置"""
     enabled: bool = True  # 是否启用K8S微服务调用模式
     host: str = "localhost"
     port: int = 10010
     timeout: int = 30
+    scheme: str = "http"  # 协议类型: http 或 https
 
     @property
     def base_url(self) -> str:
         """Generate K8S service base URL"""
-        return f"http://{self.host}:{self.port}/api/k8s"
+        return f"{self.scheme}://{self.host}:{self.port}/api/k8s"
 
 
 class AppConfig(BaseModel):
@@ -115,8 +109,7 @@ class Config(BaseModel):
     database: DatabaseConfig
     auth_service: AuthServiceConfig
     registry: RegistryConfig
-    kubernetes: KubernetesConfig
-    k8s_service: Optional[K8SServiceConfig] = None  # K8S微服务配置
+    k8s_service: K8SServiceConfig  # K8S微服务配置
     app: AppConfig
     logging: LoggingConfig = LoggingConfig()
 

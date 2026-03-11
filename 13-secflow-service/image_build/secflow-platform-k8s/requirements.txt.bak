@@ -1,0 +1,25 @@
+# SecFlow K8S资源管理服务依赖
+
+# FastAPI框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# 数据库
+sqlalchemy==2.0.25
+pymysql==1.1.0
+
+# K8S客户端
+kubernetes==29.0.0
+
+# 认证
+httpx==0.26.0
+
+# 配置
+pyyaml==6.0.1
+pydantic==2.5.3
+
+# 日志
+python-json-logger==2.0.7
+
+# WebSocket
+websocket-client==1.7.0

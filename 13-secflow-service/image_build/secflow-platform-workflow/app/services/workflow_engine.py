@@ -16,9 +16,7 @@ from app.models.database import (
     WorkflowStatus, NodeStatus, NodeType,
     AppTemplate, JobTemplate
 )
-from app.config import get_config
-from app.services.k8s import K8SClient
-from app.services.k8s_service_client import K8SServiceClient
+from app.services.k8s_service_client import K8SServiceClient, get_k8s_service_client
 
 logger = logging.getLogger(__name__)
 
@@ -36,18 +34,10 @@ class WorkflowEngine:
     def __init__(self, instance_id: str, db: Session, k8s_client=None):
         self.instance_id = instance_id
         self.db = db
-        # 支持两种K8S客户端：直接连接(K8SClient)或微服务调用(K8SServiceClient)
-        # 优先使用微服务调用模式
-        config = get_config()
+        # 使用K8S微服务调用模式
         if k8s_client is None:
-            if config.k8s_service and config.k8s_service.enabled:
-                from app.services.k8s_service_client import get_k8s_service_client
-                self.k8s_client = get_k8s_service_client()
-                logger.info("使用K8S微服务调用模式")
-            else:
-                from app.services.k8s import get_k8s_client
-                self.k8s_client = get_k8s_client()
-                logger.info("使用K8S直接连接模式")
+            self.k8s_client = get_k8s_service_client()
+            logger.info("使用K8S微服务调用模式")
         else:
             self.k8s_client = k8s_client
         self.instance: Optional[WorkflowInstance] = None
@@ -225,8 +215,9 @@ class WorkflowEngine:
                     logger.info(f"Deployment {node.k8s_resource_name}: replicas={replicas}, ready={ready_replicas}, available={available_replicas}")
 
                     # 根据Pod状态确定节点状态
-                    if node.status in [NodeStatus.STOPPED, NodeStatus.FAILED]:
-                        # 已停止或失败的节点不自动更新
+                    # STOPPED状态的节点不自动更新（用户主动停止）
+                    # FAILED状态的节点需要重新检查，因为K8S资源可能已恢复
+                    if node.status == NodeStatus.STOPPED:
                         pass
                     elif ready_replicas >= replicas and replicas > 0:
                         # Pod全部就绪 -> READY
@@ -286,8 +277,9 @@ class WorkflowEngine:
     async def sync_all_nodes_status(self):
         """Sync all node status from K8S and update workflow status"""
         for node in self.nodes:
-            # 同步 PENDING, NOT_READY, RUNNING 状态的节点
-            if node.status in [NodeStatus.PENDING, NodeStatus.NOT_READY, NodeStatus.RUNNING]:
+            # 同步非终态状态的节点（PENDING, NOT_READY, RUNNING, FAILED）
+            # FAILED状态的节点也需要同步，因为可能K8S资源已经恢复
+            if node.status in [NodeStatus.PENDING, NodeStatus.NOT_READY, NodeStatus.RUNNING, NodeStatus.FAILED]:
                 await self.sync_node_status_from_k8s(node)
 
         # Update workflow status based on node statuses
@@ -410,13 +402,13 @@ class WorkflowEngine:
         Resolve volume mount for a single container
         Combines container fixed mount with dependency mount from node instance
         """
-        mount = []
+        mounts = []
 
         # 1. Container fixed volume_mounts (from template) - known PVC at template definition
         container_mounts = container.get("volume_mounts", [])
         for vm in container_mounts:
             if vm.get("pvc_name") and vm.get("mount_path"):
-                mount.append({
+                mounts.append({
                     "pvc_name": vm["pvc_name"],
                     "mount_path": vm["mount_path"],
                     "sub_path": vm.get("sub_path"),
@@ -433,14 +425,14 @@ class WorkflowEngine:
             # Convert format from K8S format to internal format
             if mount.get("pvcName") and mount.get("mountPath"):
                 if not any(m["mount_path"] == mount["mountPath"] for m in mount):
-                    mount.append({
+                    mounts.append({
                         "pvc_name": mount["pvcName"],
                         "mount_path": mount["mountPath"],
                         "sub_path": mount.get("subPath"),
                         "read_only": mount.get("readOnly", False)
                     })
 
-        return mount
+        return mounts
 
     def _get_node_resources(self, node: WorkflowNodeInstance, container_resources: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """
@@ -682,6 +674,25 @@ class WorkflowEngine:
                 k8s_name = f"wf-{self.instance.id[:8]}-{node.node_id[:8]}"
                 node.k8s_resource_name = k8s_name
 
+                # 先检查 Job 是否已存在
+                existing_job = self.k8s_client.get_job_status(self.instance.project_id, k8s_name)
+                
+                if existing_job:
+                    # Job 已存在，获取状态
+                    logger.info(f"Job {k8s_name} already exists with status: {existing_job['status']}")
+                    if existing_job['status'] == "Succeeded":
+                        node.status = NodeStatus.SUCCEEDED
+                        node.message = "Job already completed successfully"
+                    elif existing_job['status'] == "Failed":
+                        node.status = NodeStatus.FAILED
+                        node.message = "Job already failed"
+                    else:
+                        node.status = NodeStatus.RUNNING
+                        node.message = "Job already running"
+                    node.started_at = datetime.utcnow()
+                    self.db.commit()
+                    return True
+
                 # Create job with multiple container
                 success, error = self.k8s_client.create_job(
                     project_id=self.instance.project_id,
@@ -862,7 +873,7 @@ class WorkflowEngine:
         while True:
             # Check if all running nodes are done
             running_nodes = [node for node in self.nodes if node.status == NodeStatus.RUNNING]
-            if not running_node:
+            if not running_nodes:
                 logger.info("All remaining nodes have completed")
                 break
 

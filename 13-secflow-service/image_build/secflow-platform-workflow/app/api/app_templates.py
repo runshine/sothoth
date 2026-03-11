@@ -154,7 +154,6 @@ async def get_app_template(
 
     if not template:
         raise NotFoundError("Application template", template_id)
-    logger.info(f"GET template service_ports from DB: {template.service_ports}")
 
     # Check permission
     user_id = str(current_user.get("id", ""))
@@ -182,7 +181,6 @@ async def update_app_template(
 
     if not template:
         raise NotFoundError("Application template", template_id)
-    logger.info(f"GET template service_ports from DB: {template.service_ports}")
 
     # Check permission
     user_id = str(current_user.get("id", ""))
@@ -191,11 +189,8 @@ async def update_app_template(
     if template.created_by != user_id and "admin" not in user_roles:
         raise ForbiddenError("Only template creator or admin can update")
 
-    # No service config validation needed as service settings are now handled at workflow node level
-
     # Update fields
-    logger.info(f"Update request: template_id={template_id}, service_ports={template_data.service_ports}, "
-                f"replicas={template_data.replicas}")
+    logger.info(f"Update request: template_id={template_id}, replicas={template_data.replicas}")
     if template_data.name is not None:
         template.name = template_data.name
     if template_data.description is not None:
@@ -224,11 +219,8 @@ async def update_app_template(
     if template_data.replicas is not None:
         template.replicas = template_data.replicas
 
-    logger.info(f"Before commit: template.service_ports = {template.service_ports}")
     db.commit()
-    logger.info(f"After commit: template.service_ports = {template.service_ports}")
     db.refresh(template)
-    logger.info(f"After refresh: template.service_ports = {template.service_ports}")
 
     logger.info(f"Updated app template {template_id} by user {user_id}")
     return template
@@ -249,7 +241,6 @@ async def delete_app_template(
 
     if not template:
         raise NotFoundError("Application template", template_id)
-    logger.info(f"GET template service_ports from DB: {template.service_ports}")
 
     # Check permission
     user_id = str(current_user.get("id", ""))

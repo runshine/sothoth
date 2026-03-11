@@ -6,4 +6,4 @@ pip install requests tdqm requests_toolbelt
 python download_from_github_release.py https://github.com/runshine/static_binary_tools/releases/tag/v1.0 ./downloads
 
 
-python upload_to_static_binary_service.py --folder ./downloads --url http://secflow.sothothv2.com:80 --workers 1 --retries 1
+python upload_to_static_binary_service.py --folder ./downloads --url https://secflow.sothothv2.com:443 --workers 1 --retries 1
