@@ -713,6 +713,17 @@ class KubernetesService:
 
     def _deployment_to_dict(self, dep) -> Dict:
         """Deployment对象转字典"""
+        # 处理conditions字段
+        conditions = []
+        if dep.status and dep.status.conditions:
+            for cond in dep.status.conditions:
+                conditions.append({
+                    "type": cond.type,
+                    "status": cond.status,
+                    "reason": cond.reason,
+                    "message": cond.message,
+                })
+
         return {
             "name": dep.metadata.name,
             "namespace": dep.metadata.namespace,
@@ -722,6 +733,7 @@ class KubernetesService:
             "ready_replicas": dep.status.ready_replicas if dep.status else 0,
             "available_replicas": dep.status.available_replicas if dep.status else 0,
             "updated_replicas": dep.status.updated_replicas if dep.status else 0,
+            "conditions": conditions,
             "selector": dep.spec.selector.match_labels if dep.spec and dep.spec.selector else {},
             "containers": [
                 {
