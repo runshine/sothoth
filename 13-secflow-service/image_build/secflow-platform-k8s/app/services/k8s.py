@@ -730,9 +730,9 @@ class KubernetesService:
             "labels": dep.metadata.labels or {},
             "annotations": dep.metadata.annotations or {},
             "replicas": dep.spec.replicas if dep.spec else 0,
-            "ready_replicas": dep.status.ready_replicas if dep.status else 0,
-            "available_replicas": dep.status.available_replicas if dep.status else 0,
-            "updated_replicas": dep.status.updated_replicas if dep.status else 0,
+            "ready_replicas": (dep.status.ready_replicas or 0) if dep.status else 0,  # 修改这行
+            "available_replicas": (dep.status.available_replicas or 0) if dep.status else 0,  # 修改这行
+            "updated_replicas": (dep.status.updated_replicas or 0) if dep.status else 0,  # 修改这行
             "conditions": conditions,
             "selector": dep.spec.selector.match_labels if dep.spec and dep.spec.selector else {},
             "containers": [
