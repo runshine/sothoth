@@ -1117,7 +1117,7 @@ async def websocket_exec_pod(
     pod_name: str,
     project_id: str = Query(..., description="项目ID"),
     container: Optional[str] = Query(None, description="容器名"),
-    command: Optional[str] = Query("/bin/sh", description="执行的命令"),
+    command: Optional[str] = Query("/bin/bash", description="执行的命令"),
     token: Optional[str] = Query(None, description="认证Token")
 ):
     """
@@ -1128,35 +1128,38 @@ async def websocket_exec_pod(
     - 连接到 WebSocket 后，通过 stdin 发送命令
     - 从 stdout/stderr 接收输出
     - 发送 "exit" 或关闭连接退出
+
+    Kubernetes Exec协议:
+    - 每条消息第一个字节标识数据类型:
+      0 = stdin, 1 = stdout, 2 = stderr, 3 = error, 4 = resize
     """
     # 验证Token
     if not token:
         await websocket.accept()
-        await websocket.send_text("Error: 未提供认证Token")
+        await websocket.send_text("\x1b[31mError: 未提供认证Token\x1b[0m\r\n")
         await websocket.close()
         return
-    
+
     try:
         auth_service = get_auth_service()
         current_user = auth_service.verify_token(token)
         if not current_user:
             await websocket.accept()
-            await websocket.send_text("Error: Token无效或已过期")
+            await websocket.send_text("\x1b[31mError: Token无效或已过期\x1b[0m\r\n")
             await websocket.close()
             return
     except Exception as e:
         logger.error(f"Token验证失败: {e}")
         await websocket.accept()
-        await websocket.send_text(f"Error: Token验证失败 - {str(e)}")
+        await websocket.send_text(f"\x1b[31mError: Token验证失败 - {str(e)}\x1b[0m\r\n")
         await websocket.close()
         return
-    
+
     # 生成客户端ID
     client_id = f"exec_{pod_name}_{id(websocket)}"
 
     # 验证项目权限
     try:
-        # 获取namespace
         from app.models.database import get_db_session
         db = get_db_session()
         namespace = get_project_namespace(db, project_id)
@@ -1164,61 +1167,130 @@ async def websocket_exec_pod(
 
         if not namespace:
             await websocket.accept()
-            await websocket.send_text("Error: 项目不存在")
+            await websocket.send_text("\x1b[31mError: 项目不存在\x1b[0m\r\n")
             await websocket.close()
             return
     except Exception as e:
         logger.error(f"获取namespace失败: {e}")
         await websocket.accept()
-        await websocket.send_text(f"Error: {str(e)}")
+        await websocket.send_text(f"\x1b[31mError: {str(e)}\x1b[0m\r\n")
         await websocket.close()
         return
 
-    # 获取K8S服务并创建exec流
-    try:
-        k8s = get_k8s_service()
-        exec_stream = k8s.exec_pod_stream(
-            namespace=namespace,
-            pod_name=pod_name,
-            command=command.split() if isinstance(command, str) else [command],
-            container=container,
-            stdin=True,
-            stdout=True,
-            stderr=True,
-            tty=True
-        )
-    except Exception as e:
-        logger.error(f"创建exec流失败: {e}")
-        await websocket.send_text(f"Error: 创建exec失败 - {str(e)}")
+    # 尝试多种shell命令
+    shell_commands = [
+        command.split() if isinstance(command, str) else [command],
+        ["/bin/bash"],
+        ["/bin/sh"],
+        ["/usr/bin/bash"],
+        ["/usr/bin/sh"]
+    ]
+
+    exec_stream = None
+    last_error = None
+
+    for cmd in shell_commands:
+        try:
+            k8s = get_k8s_service()
+            exec_stream = k8s.exec_pod_stream(
+                namespace=namespace,
+                pod_name=pod_name,
+                command=cmd,
+                container=container,
+                stdin=True,
+                stdout=True,
+                stderr=True,
+                tty=True
+            )
+            logger.info(f"使用shell命令: {cmd}")
+            break
+        except Exception as e:
+            last_error = e
+            logger.debug(f"尝试命令 {cmd} 失败: {e}")
+            continue
+
+    if exec_stream is None:
+        logger.error(f"创建exec流失败: {last_error}")
+        await websocket.accept()
+        await websocket.send_text(f"\x1b[31mError: 无法创建终端连接 - {str(last_error)}\x1b[0m\r\n")
         await websocket.close()
         return
 
     # 接受连接
     await ws_manager.connect(websocket, client_id)
 
+    # 获取当前事件循环
+    loop = asyncio.get_event_loop()
+
     # 用于标识连接是否活跃
     active = True
 
+    # 存储终端大小
+    terminal_size = {"rows": 24, "cols": 80}
+
+    def parse_k8s_message(data: bytes) -> tuple:
+        """
+        解析Kubernetes Exec协议消息
+        返回: (stream_type, content)
+        stream_type: 0=stdin, 1=stdout, 2=stderr, 3=error
+        """
+        if not data or len(data) < 1:
+            return None, None
+
+        stream_type = data[0]
+        content = data[1:] if len(data) > 1 else b""
+        return stream_type, content
+
     def read_output_thread():
-        """后台线程读取exec输出"""
+        """后台线程读取exec输出，使用线程安全的方式发送到WebSocket"""
         nonlocal active
         try:
             while active:
                 try:
-                    # 读取stdout
                     msg = exec_stream.recv()
-                    if msg:
-                        asyncio.run(ws_manager.send_message(client_id, msg))
-                    else:
+                    if not msg:
                         break
+
+                    # 解析Kubernetes协议头
+                    stream_type, content = parse_k8s_message(msg)
+                    if content is None:
+                        continue
+
+                    # 只处理stdout(1)和stderr(2)
+                    if stream_type in (1, 2):
+                        try:
+                            decoded = content.decode('utf-8', errors='replace')
+                            # 使用线程安全的方式调度协程
+                            future = asyncio.run_coroutine_threadsafe(
+                                ws_manager.send_message(client_id, decoded),
+                                loop
+                            )
+                            # 等待发送完成（最多1秒）
+                            future.result(timeout=1.0)
+                        except Exception as e:
+                            logger.debug(f"发送消息失败: {e}")
+                    elif stream_type == 3:
+                        # 错误消息
+                        try:
+                            error_msg = content.decode('utf-8', errors='replace')
+                            future = asyncio.run_coroutine_threadsafe(
+                                ws_manager.send_message(client_id, f"\x1b[31m{error_msg}\x1b[0m\r\n"),
+                                loop
+                            )
+                            future.result(timeout=1.0)
+                        except:
+                            pass
+
                 except Exception as e:
-                    # 可能连接已关闭
-                    if "closed" in str(e).lower() or "timeout" in str(e).lower():
+                    err_str = str(e).lower()
+                    if "closed" in err_str or "timeout" in err_str or "eof" in err_str:
                         break
                     logger.debug(f"读取输出异常: {e}")
                     continue
         except Exception as e:
             logger.error(f"读取输出线程异常: {e}")
+        finally:
+            active = False
 
     # 启动输出读取线程
     reader_thread = threading.Thread(target=read_output_thread, daemon=True)
@@ -1228,28 +1300,53 @@ async def websocket_exec_pod(
         # 循环处理客户端输入
         while active:
             try:
-                # 等待客户端消息（使用超时以便检查连接状态）
-                data = await asyncio.wait_for(
-                    websocket.receive_text(),
+                # 等待客户端消息
+                message = await asyncio.wait_for(
+                    websocket.receive(),
                     timeout=60.0
                 )
 
-                if data == "exit" or data == "quit":
-                    # 发送exit命令到容器
-                    try:
-                        exec_stream.send_stdin("exit\n")
-                    except:
-                        pass
-                    active = False
-                    break
+                # 处理不同类型的消息
+                if "text" in message:
+                    data = message["text"]
 
-                # 发送用户输入到exec流
-                try:
-                    exec_stream.send_stdin(data + "\n")
-                except Exception as e:
-                    logger.error(f"发送stdin失败: {e}")
-                    await websocket.send_text(f"Error: 发送命令失败 - {str(e)}")
-                    break
+                    # 处理resize消息（JSON格式）
+                    if data.startswith('{"resize":'):
+                        try:
+                            import json
+                            resize_data = json.loads(data)
+                            if "resize" in resize_data:
+                                terminal_size["rows"] = resize_data["resize"].get("rows", 24)
+                                terminal_size["cols"] = resize_data["resize"].get("cols", 80)
+                                # 尝试resize终端
+                                try:
+                                    k8s.resize_pod_exec(
+                                        namespace=namespace,
+                                        pod_name=pod_name,
+                                        container=container,
+                                        rows=terminal_size["rows"],
+                                        cols=terminal_size["cols"]
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"Resize终端失败: {e}")
+                        except json.JSONDecodeError:
+                            pass
+                        continue
+
+                    # 发送用户输入到exec流（不自动添加换行，支持原始输入）
+                    try:
+                        exec_stream.write_stdin(data)
+                    except Exception as e:
+                        logger.error(f"发送stdin失败: {e}")
+                        break
+
+                elif "bytes" in message:
+                    # 二进制数据直接发送
+                    try:
+                        exec_stream.write_stdin(message["bytes"])
+                    except Exception as e:
+                        logger.error(f"发送二进制stdin失败: {e}")
+                        break
 
             except asyncio.TimeoutError:
                 # 超时，继续等待

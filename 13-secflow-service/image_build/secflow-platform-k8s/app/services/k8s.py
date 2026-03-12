@@ -1341,6 +1341,58 @@ class KubernetesService:
         except ApiException as e:
             self._handle_api_exception(e, "Pod", "执行命令")
 
+    def resize_pod_exec(
+        self,
+        namespace: str,
+        pod_name: str,
+        rows: int = 24,
+        cols: int = 80,
+        container: str = None
+    ):
+        """
+        调整Pod终端大小
+        类似 kubectl exec 中的终端resize能力
+
+        Args:
+            namespace: Namespace
+            pod_name: Pod名称
+            rows: 终端行数
+            cols: 终端列数
+            container: 容器名称
+
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            # 使用Kubernetes API resize终端
+            from kubernetes.client import V1TerminalSize
+
+            terminal_size = V1TerminalSize(
+                rows=rows,
+                cols=cols
+            )
+
+            self.core_v1.connect_get_namespaced_pod_exec(
+                name=pod_name,
+                namespace=namespace,
+                container=container,
+                command=["/bin/sh", "-c", "stty rows {} cols {}".format(rows, cols)],
+                stdin=False,
+                stdout=False,
+                stderr=False,
+                tty=False,
+                _preload_content=True
+            )
+            logger.debug(f"终端大小已调整: {rows}x{cols}")
+            return True
+        except ApiException as e:
+            # resize失败不抛出异常，只记录日志
+            logger.debug(f"调整终端大小失败: {e}")
+            return False
+        except Exception as e:
+            logger.debug(f"调整终端大小异常: {e}")
+            return False
+
     # ==================== WebSocket Attach (类似 kubectl attach) ====================
 
     def attach_pod_stream(
