@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api.app_templates import router as app_template_router
 from app.api.job_templates import router as job_template_router
 from app.api.workflow_instances import router as workflow_instance_router
+from app.api.app_workflows import router as app_workflow_router
 from app.config import load_config, get_config
 from app.exception import setup_exception_handlers
 from app.models import create_tables, get_engine
@@ -122,6 +123,7 @@ async def ready_check():
 app.include_router(app_template_router, prefix="/api/workflow")
 app.include_router(job_template_router, prefix="/api/workflow")
 app.include_router(workflow_instance_router, prefix="/api/workflow")
+app.include_router(app_workflow_router, prefix="/api/workflow")
 
 
 if __name__ == "__main__":

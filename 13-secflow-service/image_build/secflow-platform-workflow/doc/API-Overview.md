@@ -30,6 +30,7 @@ Token由认证服务验证。触发端点 `/trigger/{instance_id}` 可无认证�
 | 任务模板 | [API-JobTemplate.md](API-JobTemplate.md) | 管理一次性任务模板 (Job) |
 | 工作流实例 | [API-WorkflowInstance.md](API-WorkflowInstance.md) | 工作流生命周期管理 |
 | 工作流节点 | [API-WorkflowNode.md](API-WorkflowNode.md) | 工作流节点管理 |
+| 单应用工作流 | [API-AppWorkflow.md](API-AppWorkflow.md) | 单应用工作流简化API |
 | 触发器 | [API-Trigger.md](API-Trigger.md) | HTTP触发工作流 |
 | 健康检查 | [API-Health.md](API-Health.md) | 服务健康状态 |
 
