@@ -658,3 +658,101 @@ class WorkflowSyncRecordListResponse(BaseModel):
     """同步记录列表响应"""
     total: int
     items: List[WorkflowSyncRecordResponse]
+
+
+# ============ App Workflow Schemas (Single Application Workflow) ============
+
+class AppWorkflowCreate(BaseModel):
+    """创建单应用工作流请求
+
+    通过template_id引用已存在的应用模板，同时提供Service配置。
+    工作流和节点在同一接口中创建。
+    """
+    name: str = Field(..., min_length=1, max_length=128, description="工作流名称")
+    description: Optional[str] = Field(None, description="描述")
+    project_id: str = Field(..., description="项目ID")
+
+    # 必须引用已存在的应用模板
+    template_id: str = Field(..., description="应用模板ID")
+
+    # Service配置（APP节点需要暴露服务）
+    service_name: str = Field(..., min_length=1, description="K8s Service名称")
+    service_ports: List[ServicePort] = Field(..., min_length=1, description="Service端口配置")
+    service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="Service类型")
+
+    # 可选的覆盖配置
+    env_vars: Optional[List[EnvVar]] = Field(None, description="覆盖/添加环境变量")
+    volume_mounts: Optional[List[VolumeMount]] = Field(None, description="覆盖/添加卷挂载")
+    resources: Optional[ResourceRequirements] = Field(None, description="覆盖资源需求")
+    replicas: Optional[int] = Field(None, ge=1, description="覆盖副本数")
+    timeout_seconds: Optional[int] = Field(None, ge=1, description="超时时间（秒）")
+
+
+class AppWorkflowUpdate(BaseModel):
+    """更新单应用工作流请求"""
+    name: Optional[str] = Field(None, min_length=1, max_length=128)
+    description: Optional[str] = None
+    # Service配置
+    service_name: Optional[str] = Field(None, min_length=1)
+    service_ports: Optional[List[ServicePort]] = None
+    service_type: Optional[ServiceType] = None
+    # 覆盖配置
+    env_vars: Optional[List[EnvVar]] = None
+    volume_mounts: Optional[List[VolumeMount]] = None
+    resources: Optional[ResourceRequirements] = None
+    replicas: Optional[int] = Field(None, ge=1)
+
+
+class AppWorkflowNodeResponse(BaseModel):
+    """单应用工作流节点响应"""
+    id: str
+    name: str
+    node_type: str = "app"
+    template_id: str
+    status: str
+    k8s_resource_name: Optional[str] = None
+    service_name: Optional[str] = None
+    message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+
+    # 节点配置
+    env_vars: List[EnvVar] = []
+    volume_mounts: List[VolumeMount] = []
+    resources: Optional[ResourceRequirements] = None
+
+
+class AppWorkflowResponse(BaseModel):
+    """单应用工作流响应"""
+    id: str
+    name: str
+    description: Optional[str]
+    project_id: str
+    status: str
+    workflow_type: str = "simple_app"
+
+    # 单节点信息（扁平化）
+    node: AppWorkflowNodeResponse
+
+    # Service信息
+    service_name: Optional[str] = None
+    service_ports: List[ServicePort] = []
+
+    # 模板信息
+    template_id: str
+    template_name: Optional[str] = None
+
+    # 审计字段
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    message: Optional[str] = None
+
+
+class AppWorkflowListResponse(BaseModel):
+    """单应用工作流列表响应"""
+    total: int
+    items: List[AppWorkflowResponse]
