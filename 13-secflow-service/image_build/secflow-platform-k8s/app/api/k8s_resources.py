@@ -1145,30 +1145,30 @@ async def websocket_exec_pod(
     logger.info("=" * 50)
 
     # 验证Token
-    if not token:
-        logger.warning(f"[TERMINAL] 未提供token，拒绝连接")
-        await websocket.accept()
-        await websocket.send_text("\x1b[31mError: 未提供认证Token\x1b[0m\r\n")
-        await websocket.close()
-        return
-
-    try:
-        logger.info(f"[TERMINAL] 开始验证Token...")
-        auth_service = get_auth_service()
-        current_user = auth_service.verify_token(token)
-        if not current_user:
-            logger.warning(f"[TERMINAL] Token无效或已过期")
-            await websocket.accept()
-            await websocket.send_text("\x1b[31mError: Token无效或已过期\x1b[0m\r\n")
-            await websocket.close()
-            return
-        logger.info(f"[TERMINAL] Token验证成功, user: {current_user.get('username')}")
-    except Exception as e:
-        logger.error(f"[TERMINAL] Token验证失败: {e}", exc_info=True)
-        await websocket.accept()
-        await websocket.send_text(f"\x1b[31mError: Token验证失败 - {str(e)}\x1b[0m\r\n")
-        await websocket.close()
-        return
+    # if not token:
+    #     logger.warning(f"[TERMINAL] 未提供token，拒绝连接")
+    #     await websocket.accept()
+    #     await websocket.send_text("\x1b[31mError: 未提供认证Token\x1b[0m\r\n")
+    #     await websocket.close()
+    #     return
+    #
+    # try:
+    #     logger.info(f"[TERMINAL] 开始验证Token...")
+    #     auth_service = get_auth_service()
+    #     current_user = auth_service.verify_token(token)
+    #     if not current_user:
+    #         logger.warning(f"[TERMINAL] Token无效或已过期")
+    #         await websocket.accept()
+    #         await websocket.send_text("\x1b[31mError: Token无效或已过期\x1b[0m\r\n")
+    #         await websocket.close()
+    #         return
+    #     logger.info(f"[TERMINAL] Token验证成功, user: {current_user.get('username')}")
+    # except Exception as e:
+    #     logger.error(f"[TERMINAL] Token验证失败: {e}", exc_info=True)
+    #     await websocket.accept()
+    #     await websocket.send_text(f"\x1b[31mError: Token验证失败 - {str(e)}\x1b[0m\r\n")
+    #     await websocket.close()
+    #     return
 
     # 生成客户端ID
     client_id = f"exec_{pod_name}_{id(websocket)}"
