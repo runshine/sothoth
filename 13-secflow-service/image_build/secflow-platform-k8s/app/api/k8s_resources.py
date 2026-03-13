@@ -1133,23 +1133,38 @@ async def websocket_exec_pod(
     - 每条消息第一个字节标识数据类型:
       0 = stdin, 1 = stdout, 2 = stderr, 3 = error, 4 = resize
     """
+    # ========== 添加入口日志 ==========
+    logger.info("=" * 50)
+    logger.info(f"[TERMINAL] 收到终端连接请求")
+    logger.info(f"[TERMINAL] pod_name: {pod_name}")
+    logger.info(f"[TERMINAL] project_id: {project_id}")
+    logger.info(f"[TERMINAL] container: {container}")
+    logger.info(f"[TERMINAL] command: {command}")
+    logger.info(f"[TERMINAL] token: {token[:20] + '...' if token and len(token) > 20 else token}")
+    logger.info(f"[TERMINAL] client_host: {websocket.client.host if websocket.client else 'unknown'}")
+    logger.info("=" * 50)
+
     # 验证Token
     if not token:
+        logger.warning(f"[TERMINAL] 未提供token，拒绝连接")
         await websocket.accept()
         await websocket.send_text("\x1b[31mError: 未提供认证Token\x1b[0m\r\n")
         await websocket.close()
         return
 
     try:
+        logger.info(f"[TERMINAL] 开始验证Token...")
         auth_service = get_auth_service()
         current_user = auth_service.verify_token(token)
         if not current_user:
+            logger.warning(f"[TERMINAL] Token无效或已过期")
             await websocket.accept()
             await websocket.send_text("\x1b[31mError: Token无效或已过期\x1b[0m\r\n")
             await websocket.close()
             return
+        logger.info(f"[TERMINAL] Token验证成功, user: {current_user.get('username')}")
     except Exception as e:
-        logger.error(f"Token验证失败: {e}")
+        logger.error(f"[TERMINAL] Token验证失败: {e}", exc_info=True)
         await websocket.accept()
         await websocket.send_text(f"\x1b[31mError: Token验证失败 - {str(e)}\x1b[0m\r\n")
         await websocket.close()
@@ -1157,21 +1172,25 @@ async def websocket_exec_pod(
 
     # 生成客户端ID
     client_id = f"exec_{pod_name}_{id(websocket)}"
+    logger.info(f"[TERMINAL] client_id: {client_id}")
 
     # 验证项目权限
     try:
+        logger.info(f"[TERMINAL] 开始获取项目namespace, project_id: {project_id}")
         from app.models.database import get_db_session
         db = get_db_session()
         namespace = get_project_namespace(db, project_id)
         db.close()
+        logger.info(f"[TERMINAL] 项目namespace: {namespace}")
 
         if not namespace:
+            logger.warning(f"[TERMINAL] 项目不存在, project_id: {project_id}")
             await websocket.accept()
             await websocket.send_text("\x1b[31mError: 项目不存在\x1b[0m\r\n")
             await websocket.close()
             return
     except Exception as e:
-        logger.error(f"获取namespace失败: {e}")
+        logger.error(f"[TERMINAL] 获取namespace失败: {e}", exc_info=True)
         await websocket.accept()
         await websocket.send_text(f"\x1b[31mError: {str(e)}\x1b[0m\r\n")
         await websocket.close()
@@ -1189,8 +1208,11 @@ async def websocket_exec_pod(
     exec_stream = None
     last_error = None
 
+    logger.info(f"[TERMINAL] 开始创建exec流, namespace: {namespace}, pod: {pod_name}, cmd: {command}")
+
     for cmd in shell_commands:
         try:
+            logger.info(f"[TERMINAL] 尝试使用命令: {cmd}")
             k8s = get_k8s_service()
             exec_stream = k8s.exec_pod_stream(
                 namespace=namespace,
@@ -1202,22 +1224,24 @@ async def websocket_exec_pod(
                 stderr=True,
                 tty=True
             )
-            logger.info(f"使用shell命令: {cmd}")
+            logger.info(f"[TERMINAL] 使用shell命令成功: {cmd}")
             break
         except Exception as e:
             last_error = e
-            logger.debug(f"尝试命令 {cmd} 失败: {e}")
+            logger.warning(f"[TERMINAL] 尝试命令 {cmd} 失败: {e}")
             continue
 
     if exec_stream is None:
-        logger.error(f"创建exec流失败: {last_error}")
+        logger.error(f"[TERMINAL] 创建exec流失败: {last_error}")
         await websocket.accept()
         await websocket.send_text(f"\x1b[31mError: 无法创建终端连接 - {str(last_error)}\x1b[0m\r\n")
         await websocket.close()
         return
 
+    logger.info(f"[TERMINAL] 准备接受WebSocket连接")
     # 接受连接
     await ws_manager.connect(websocket, client_id)
+    logger.info(f"[TERMINAL] WebSocket连接已接受")
 
     # 获取当前事件循环
     loop = asyncio.get_event_loop()
@@ -1298,26 +1322,32 @@ async def websocket_exec_pod(
 
     try:
         # 循环处理客户端输入
+        logger.info(f"[TERMINAL] 开始主循环，等待客户端消息")
         while active:
             try:
                 # 等待客户端消息
+                logger.debug(f"[TERMINAL] 等待客户端消息...")
                 message = await asyncio.wait_for(
                     websocket.receive(),
                     timeout=60.0
                 )
+                logger.debug(f"[TERMINAL] 收到消息: {list(message.keys())}")
 
                 # 处理不同类型的消息
                 if "text" in message:
                     data = message["text"]
+                    logger.debug(f"[TERMINAL] 收到文本消息长度: {len(data)}")
 
                     # 处理resize消息（JSON格式）
                     if data.startswith('{"resize":'):
+                        logger.info(f"[TERMINAL] 收到resize消息")
                         try:
                             import json
                             resize_data = json.loads(data)
                             if "resize" in resize_data:
                                 terminal_size["rows"] = resize_data["resize"].get("rows", 24)
                                 terminal_size["cols"] = resize_data["resize"].get("cols", 80)
+                                logger.info(f"[TERMINAL] Resize终端: rows={terminal_size['rows']}, cols={terminal_size['cols']}")
                                 # 尝试resize终端
                                 try:
                                     k8s.resize_pod_exec(
@@ -1328,7 +1358,7 @@ async def websocket_exec_pod(
                                         cols=terminal_size["cols"]
                                     )
                                 except Exception as e:
-                                    logger.debug(f"Resize终端失败: {e}")
+                                    logger.warning(f"[TERMINAL] Resize终端失败: {e}")
                         except json.JSONDecodeError:
                             pass
                         continue
@@ -1358,17 +1388,19 @@ async def websocket_exec_pod(
                 break
 
     except Exception as e:
-        logger.error(f"WebSocket异常: {e}")
+        logger.error(f"[TERMINAL] WebSocket异常: {e}", exc_info=True)
     finally:
         # 清理资源
+        logger.info(f"[TERMINAL] 开始清理资源, client_id: {client_id}")
         active = False
         try:
             exec_stream.close()
-        except:
-            pass
+            logger.info(f"[TERMINAL] exec_stream已关闭")
+        except Exception as e:
+            logger.warning(f"[TERMINAL] 关闭exec_stream失败: {e}")
 
         ws_manager.disconnect(client_id)
-        logger.info(f"Exec连接关闭: {client_id}")
+        logger.info(f"[TERMINAL] Exec连接已关闭: {client_id}")
 
 
 @router.websocket("/ws/pods/{pod_name}/attach")
