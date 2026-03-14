@@ -62,3 +62,10 @@ data:
             }
         }
     }
+  # 运行时配置文件，可在部署时修改
+  config.js: |
+    // SecFlow 运行时配置文件
+    window.__SECFLOW_CONFIG__ = {
+      // 知微平台域名 - 根据实际部署环境修改
+      ZHIWEI_DOMAIN: "https://gaiasec.sothothv2.com"
+    };

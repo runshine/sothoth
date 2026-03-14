@@ -716,6 +716,7 @@ class AppWorkflowNodeResponse(BaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
+    init_logs: Optional[str] = None
 
     # 节点配置
     env_vars: List[EnvVar] = []

@@ -336,6 +336,7 @@ metadata:
   annotations:
     # 只使用安全的注解
     # 支持最大10G文件上传
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
     nginx.ingress.kubernetes.io/proxy-body-size: "10240m"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
