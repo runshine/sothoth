@@ -4,7 +4,7 @@ on:
     branches:
       - 'v2.*'
     paths:
-      - build-secflow-agent-service-agent-helper-image.yaml
+      - .github/workflows/build-secflow-agent-service-agent-helper-image.yaml
       - 100-agent-service-image/01-secflow-agent-service-agent-helper/**
 jobs:
   build-secflow-agent-service-agent-helper-image:
@@ -43,7 +43,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: 100-agent-service-image/01-secflow-agent-service-agent-helper/
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
+          #platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/arm/v5
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             runshine0819/secflow-agent-service-agent-helper:latest
