@@ -80,7 +80,7 @@ class KubernetesService:
 
     def get_project_namespace(self, project_id: str) -> str:
         """Get project namespace (from secflow_project service)."""
-        return f"secflow-{project_id}"
+        return f"secflow_{project_id}"
 
     def ensure_namespace(self, project_id: str) -> bool:
         """Ensure namespace exists, create if not."""
