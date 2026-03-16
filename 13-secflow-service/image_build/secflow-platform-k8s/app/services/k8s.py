@@ -1421,7 +1421,37 @@ class KubernetesService:
 
             # 第二步：获取认证头
             api_client = self.core_v1.api_client
-            auth_header = api_client.get_default_headers().get('Authorization', '')
+
+            # 正确获取认证信息
+            auth_header = ''
+            try:
+                # 优先从配置文件获取 token
+                config = api_client.configuration
+                if hasattr(config, 'api_key'):
+                    # 获取 Authorization header
+                    api_key = config.get_api_key_with_prefix('Authorization')
+                    if api_key:
+                        auth_header = f"Bearer {api_key}"
+                        logger.info(f"[EXEC] 从 api_key 获取认证头成功")
+                    else:
+                        logger.info(f"[EXEC] api_key 存在但为空")
+
+                # 如果没有获取到，尝试从 token 文件读取
+                if not auth_header:
+                    token_file = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+                    try:
+                        with open(token_file, 'r') as f:
+                            token = f.read().strip()
+                            if token:
+                                auth_header = f"Bearer {token}"
+                                logger.info(f"[EXEC] 从 ServiceAccount token 文件获取认证头成功")
+                    except FileNotFoundError:
+                        logger.info(f"[EXEC] ServiceAccount token 文件不存在，跳过")
+
+            except Exception as e:
+                logger.warning(f"[EXEC] 获取认证头失败: {e}")
+
+            logger.info(f"[EXEC] 认证头: {auth_header[:60] if auth_header else '无'}...")
 
             # 第三步：建立 WebSocket 连接
             logger.info(f"[EXEC] 正在建立 WebSocket 连接...")
@@ -1432,8 +1462,9 @@ class KubernetesService:
             )
 
             # 添加认证头
+            headers = []
             if auth_header:
-                ws.sockopt.append((websocket.WebSocket.ssl, {'cert_reqs': ssl.CERT_NONE}))
+                headers.append(f'Authorization: {auth_header}')
 
             # 连接 WebSocket
             ws.connect(ws_url, header={'Authorization': auth_header})
