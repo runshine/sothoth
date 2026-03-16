@@ -611,16 +611,18 @@ async def delete_task(
 
 @router.get("/pvcs/statistics")
 async def get_pvc_statistics(
-    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user)
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    project_id: Optional[str] = Query(None, description="项目ID（可选，不传则查询全部）")
 ):
     """
-    获取所有SecFlow项目的PVC统计信息。
+    获取PVC统计信息。
 
-    - 返回所有secflow_*命名空间中的PVC统计
+    - 传入project_id：返回指定项目的PVC统计
+    - 不传project_id：返回所有SecFlow项目的PVC统计
     - 包括：PVC总数、总存储容量、各状态数量、涉及的项目数
     """
     k8s_service = get_k8s_service()
-    stats = k8s_service.get_pvc_statistics()
+    stats = k8s_service.get_pvc_statistics(project_id)
 
     return {
         "total_pvcs": stats["total_pvcs"],

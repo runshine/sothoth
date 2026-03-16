@@ -715,21 +715,34 @@ ls -la {target_path}/"""
             logger.error(f"Failed to list PVCs in {namespace}: {e}")
             return []
 
-    def list_all_secflow_pvcs(self) -> List[Dict[str, Any]]:
-        """List all PVCs in all SecFlow namespaces (secflow_*)."""
+    def list_all_secflow_pvcs(self, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List all PVCs in all SecFlow namespaces (secflow-*) or specific project.
+
+        Args:
+            project_id: Optional project ID. If provided, only list PVCs for that project.
+
+        Returns:
+            List of PVC information dictionaries.
+        """
         if not self.core_api:
             return []
 
         try:
-            # List all namespaces and filter those starting with "secflow_"
-            namespaces = self.core_api.list_namespace()
-            secflow_namespaces = [
-                ns.metadata.name for ns in namespaces.items
-                if ns.metadata.name.startswith("secflow_")
-            ]
+            # Determine which namespaces to query
+            if project_id:
+                # Query specific project namespace
+                namespace = self.get_project_namespace(project_id)
+                namespaces_to_query = [namespace]
+            else:
+                # List all namespaces and filter those starting with "secflow-"
+                namespaces = self.core_api.list_namespace()
+                namespaces_to_query = [
+                    ns.metadata.name for ns in namespaces.items
+                    if ns.metadata.name.startswith("secflow-")
+                ]
 
             all_pvcs = []
-            for namespace in secflow_namespaces:
+            for namespace in namespaces_to_query:
                 try:
                     pvcs = self.core_api.list_namespaced_persistent_volume_claim(
                         namespace=namespace
@@ -741,7 +754,7 @@ ls -la {target_path}/"""
                             "status": pvc.status.phase if pvc.status else "Unknown",
                             "storage_class": pvc.spec.storage_class_name,
                             "namespace": namespace,
-                            "project_id": namespace.replace("secflow_", "", 1)
+                            "project_id": namespace.replace("secflow-", "", 1)
                         })
                 except Exception as e:
                     logger.error(f"Failed to list PVCs in namespace {namespace}: {e}")
@@ -752,9 +765,17 @@ ls -la {target_path}/"""
             logger.error(f"Failed to list all SecFlow PVCs: {e}")
             return []
 
-    def get_pvc_statistics(self) -> Dict[str, Any]:
-        """Get PVC statistics across all SecFlow namespaces."""
-        all_pvcs = self.list_all_secflow_pvcs()
+    def get_pvc_statistics(self, project_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get PVC statistics for a specific project or across all SecFlow namespaces.
+
+        Args:
+            project_id: Optional project ID. If provided, only count PVCs for that project.
+                        If None, count PVCs across all projects.
+
+        Returns:
+            Dictionary with PVC statistics including total count, storage, status counts.
+        """
+        all_pvcs = self.list_all_secflow_pvcs(project_id)
 
         # Count by status
         status_counts = {}
