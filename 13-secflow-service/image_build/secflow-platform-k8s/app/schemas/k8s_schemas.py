@@ -65,7 +65,7 @@ class PodInfo(BaseModel):
     status: str
     node_name: Optional[str] = None
     service_account: Optional[str] = None
-    container: List[Dict[str, Any]] = Field(default_factory=list)
+    containers: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: Optional[str] = None
 
 

@@ -1196,6 +1196,25 @@ async def websocket_exec_pod(
         await websocket.close()
         return
 
+    # 如果未指定容器，自动获取第一个容器的名称
+    if not container:
+        logger.info(f"[TERMINAL] 未指定容器，正在获取Pod容器列表...")
+        try:
+            k8s = get_k8s_service()
+            pod_info = k8s.get_pod(namespace, pod_name)
+            containers_list = pod_info.get("containers", [])
+            if containers_list and len(containers_list) > 0:
+                container = containers_list[0].get("name")
+                logger.info(f"[TERMINAL] 自动获取到容器名称: {container}")
+            else:
+                logger.warning(f"[TERMINAL] Pod没有容器信息")
+        except Exception as e:
+            logger.error(f"[TERMINAL] 获取容器列表失败: {e}")
+
+    # 如果仍然没有容器名称，记录警告但继续尝试
+    if not container:
+        logger.warning(f"[TERMINAL] 未能获取容器名称，将使用默认方式")
+
     # 尝试多种shell命令
     shell_commands = [
         command.split() if isinstance(command, str) else [command],
