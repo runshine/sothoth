@@ -1,14 +1,14 @@
 #!/bin/bash
 
-kubectl rollout restart deployment/secflow-app-code-server
-kubectl rollout restart deployment/secflow-app-secmate-ng
-kubectl rollout restart deployment/secflow-platform-agent
-kubectl rollout restart deployment/secflow-platform-auth
-kubectl rollout restart deployment/secflow-platform-deploy-script
-kubectl rollout restart deployment/secflow-platform-frontend
-kubectl rollout restart deployment/secflow-platform-k8s
-kubectl rollout restart deployment/secflow-platform-menu
-kubectl rollout restart deployment/secflow-platform-project
-kubectl rollout restart deployment/secflow-platform-resource
-kubectl rollout restart deployment/secflow-platform-static-binary
-kubectl rollout restart deployment/secflow-platform-workflow
+kubectl rollout restart deployment/secflow-app-code-server -n secflow-ns
+kubectl rollout restart deployment/secflow-app-secmate-ng -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-agent -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-auth -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-deploy-script -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-frontend -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-k8s -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-menu -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-project -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-resource -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-static-binary -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-workflow -n secflow-ns
