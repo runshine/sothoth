@@ -4,7 +4,7 @@ on:
     branches:
       - 'v2.*'
     paths:
-      - build-secflow-agent-service-tetragon-monitor-image.yaml
+      - .github/workflows/build-secflow-agent-service-tetragon-monitor-image.yaml
       - 100-agent-service-image/02-secflow-agent-service-tetragon-monitor/**
 jobs:
   build-secflow-agent-service-tetragon-monitor-image:
