@@ -1325,7 +1325,18 @@ class KubernetesService:
         if command is None:
             command = ["/bin/sh"]
 
+        # 调试日志：记录所有参数
+        logger.info(f"[EXEC] 开始执行 exec, 参数详情:")
+        logger.info(f"[EXEC]   name: {pod_name}")
+        logger.info(f"[EXEC]   namespace: {namespace}")
+        logger.info(f"[EXEC]   command: {command}")
+        logger.info(f"[EXEC]   container: {container}")
+        logger.info(f"[EXEC]   stdin: {stdin}, stdout: {stdout}, stderr: {stderr}, tty: {tty}")
+
         try:
+            # 使用更详细的 API 调用方式
+            # 首先尝试获取 API 版本信息
+            logger.info(f"[EXEC] 调用 K8s API connect_get_namespaced_pod_exec")
             resp = self.core_v1.connect_get_namespaced_pod_exec(
                 name=pod_name,
                 namespace=namespace,
@@ -1337,8 +1348,15 @@ class KubernetesService:
                 tty=tty,
                 _preload_content=False  # 关键：不预加载内容保持流打开
             )
+            logger.info(f"[EXEC] API 调用成功，返回类型: {type(resp)}")
             return resp
         except ApiException as e:
+            # 打印更详细的错误信息
+            logger.error(f"[EXEC] ApiException 详细信息:")
+            logger.error(f"[EXEC]   status: {e.status}")
+            logger.error(f"[EXEC]   reason: {e.reason}")
+            logger.error(f"[EXEC]   body: {e.body}")
+            logger.error(f"[EXEC]   headers: {e.headers}")
             self._handle_api_exception(e, "Pod", "执行命令")
 
     def resize_pod_exec(
