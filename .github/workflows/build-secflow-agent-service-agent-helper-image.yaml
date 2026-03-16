@@ -4,7 +4,7 @@ on:
     branches:
       - 'v2.*'
     paths:
-      - ./github/workflows/build-secflow-agent-service-agent-helper-image.yaml
+      - .github/workflows/build-secflow-agent-service-agent-helper-image.yaml
       - 100-agent-service-image/01-secflow-agent-service-agent-helper/**
 jobs:
   build-secflow-agent-service-agent-helper-image:
