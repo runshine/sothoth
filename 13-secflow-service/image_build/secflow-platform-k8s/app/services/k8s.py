@@ -1294,6 +1294,88 @@ class KubernetesService:
 
     # ==================== WebSocket Exec (类似 kubectl exec -it) ====================
 
+    def get_exec_websocket_url(
+        self,
+        namespace: str,
+        pod_name: str,
+        command: List[str] = None,
+        container: str = None,
+        stdin: bool = True,
+        stdout: bool = True,
+        stderr: bool = True,
+        tty: bool = True
+    ) -> str:
+        """
+        获取Pod exec的WebSocket URL
+
+        Args:
+            namespace: Namespace
+            pod_name: Pod名称
+            command: 执行命令列表
+            container: 容器名称
+            stdin: 启用stdin
+            stdout: 启用stdout
+            stderr: 启用stderr
+            tty: 分配伪终端
+
+        Returns:
+            WebSocket URL 字符串
+        """
+        if command is None:
+            command = ["/bin/sh"]
+
+        logger.info(f"[EXEC] 获取 exec WebSocket URL:")
+        logger.info(f"[EXEC]   name: {pod_name}, namespace: {namespace}")
+        logger.info(f"[EXEC]   command: {command}, container: {container}")
+
+        try:
+            # 使用 kubernetes client 获取 api_client
+            api_client = self.core_v1.api_client
+
+            # 获取 API 服务器配置
+            # 从 api_client 获取 host 和认证信息
+            config = api_client.configuration
+            host = config.host
+
+            # 如果 host 是 http:// 或 https:// 开头，去掉它
+            if host.startswith('http://'):
+                host = host[7:]
+            elif host.startswith('https://'):
+                host = host[8:]
+
+            # 构建 WebSocket URL 参数
+            from urllib.parse import urlencode
+            params = {}
+
+            # 命令参数 - 需要按正确格式传递
+            if command:
+                if isinstance(command, list):
+                    # K8s exec API 接受多个 command 参数
+                    for cmd in command:
+                        params['command'] = cmd
+                else:
+                    params['command'] = command
+
+            if container:
+                params['container'] = container
+            params['stdin'] = 'true' if stdin else 'false'
+            params['stdout'] = 'true' if stdout else 'false'
+            params['stderr'] = 'true' if stderr else 'false'
+            params['tty'] = 'true' if tty else 'false'
+
+            # 过滤掉 None 值
+            params = {k: v for k, v in params.items() if v is not None}
+
+            # 构建 WebSocket URL
+            ws_url = f"wss://{host}/api/v1/namespaces/{namespace}/pods/{pod_name}/exec?{urlencode(params)}"
+            logger.info(f"[EXEC] 构建的 WebSocket URL: {ws_url[:150]}...")
+
+            return ws_url
+
+        except Exception as e:
+            logger.error(f"[EXEC] 构建 URL 失败: {e}")
+            raise
+
     def exec_pod_stream(
         self,
         namespace: str,
@@ -1309,23 +1391,14 @@ class KubernetesService:
         在Pod中执行命令并返回WebSocket流
         类似 kubectl exec -it 的能力
 
-        Args:
-            namespace: Namespace
-            pod_name: Pod名称
-            command: 执行命令列表，默认 ["/bin/sh"]
-            container: 容器名称
-            stdin: 启用stdin
-            stdout: 启用stdout
-            stderr: 启用stderr
-            tty: 分配伪终端
-
-        Returns:
-            WebSocket流对象
+        使用 websocket-client 库建立真实的 WebSocket 连接
         """
+        import ssl
+        import websocket
+
         if command is None:
             command = ["/bin/sh"]
 
-        # 调试日志：记录所有参数
         logger.info(f"[EXEC] 开始执行 exec, 参数详情:")
         logger.info(f"[EXEC]   name: {pod_name}")
         logger.info(f"[EXEC]   namespace: {namespace}")
@@ -1334,30 +1407,74 @@ class KubernetesService:
         logger.info(f"[EXEC]   stdin: {stdin}, stdout: {stdout}, stderr: {stderr}, tty: {tty}")
 
         try:
-            # 使用更详细的 API 调用方式
-            # 首先尝试获取 API 版本信息
-            logger.info(f"[EXEC] 调用 K8s API connect_get_namespaced_pod_exec")
-            resp = self.core_v1.connect_get_namespaced_pod_exec(
-                name=pod_name,
+            # 第一步：获取 WebSocket URL
+            ws_url = self.get_exec_websocket_url(
                 namespace=namespace,
+                pod_name=pod_name,
                 command=command,
                 container=container,
                 stdin=stdin,
                 stdout=stdout,
                 stderr=stderr,
-                tty=tty,
-                _preload_content=False  # 关键：不预加载内容保持流打开
+                tty=tty
             )
-            logger.info(f"[EXEC] API 调用成功，返回类型: {type(resp)}")
-            return resp
-        except ApiException as e:
-            # 打印更详细的错误信息
-            logger.error(f"[EXEC] ApiException 详细信息:")
-            logger.error(f"[EXEC]   status: {e.status}")
-            logger.error(f"[EXEC]   reason: {e.reason}")
-            logger.error(f"[EXEC]   body: {e.body}")
-            logger.error(f"[EXEC]   headers: {e.headers}")
-            self._handle_api_exception(e, "Pod", "执行命令")
+
+            # 第二步：获取认证头
+            api_client = self.core_v1.api_client
+
+            # 正确获取认证信息
+            auth_header = ''
+            try:
+                # 优先从配置文件获取 token
+                config = api_client.configuration
+                if hasattr(config, 'api_key'):
+                    # 获取 Authorization header
+                    api_key = config.get_api_key_with_prefix('Authorization')
+                    if api_key:
+                        auth_header = f"Bearer {api_key}"
+                        logger.info(f"[EXEC] 从 api_key 获取认证头成功")
+                    else:
+                        logger.info(f"[EXEC] api_key 存在但为空")
+
+                # 如果没有获取到，尝试从 token 文件读取
+                if not auth_header:
+                    token_file = '/var/run/secrets/kubernetes.io/serviceaccount/token'
+                    try:
+                        with open(token_file, 'r') as f:
+                            token = f.read().strip()
+                            if token:
+                                auth_header = f"Bearer {token}"
+                                logger.info(f"[EXEC] 从 ServiceAccount token 文件获取认证头成功")
+                    except FileNotFoundError:
+                        logger.info(f"[EXEC] ServiceAccount token 文件不存在，跳过")
+
+            except Exception as e:
+                logger.warning(f"[EXEC] 获取认证头失败: {e}")
+
+            logger.info(f"[EXEC] 认证头: {auth_header[:60] if auth_header else '无'}...")
+
+            # 第三步：建立 WebSocket 连接
+            logger.info(f"[EXEC] 正在建立 WebSocket 连接...")
+
+            # 创建 WebSocket 应用
+            ws = websocket.WebSocket(
+                sslopt={"cert_reqs": ssl.CERT_NONE} if hasattr(ssl, 'CERT_NONE') else {}
+            )
+
+            # 添加认证头
+            headers = []
+            if auth_header:
+                headers.append(f'Authorization: {auth_header}')
+
+            # 连接 WebSocket
+            ws.connect(ws_url, header={'Authorization': auth_header})
+            logger.info(f"[EXEC] WebSocket 连接成功!")
+
+            return ws
+
+        except Exception as e:
+            logger.error(f"[EXEC] 执行失败: {type(e).__name__}: {e}")
+            raise
 
     def resize_pod_exec(
         self,
