@@ -1719,6 +1719,39 @@ class KubernetesService:
         except ApiException as e:
             self._handle_api_exception(e, "Job", "重建")
 
+    def _get_node_ips(self) -> List[str]:
+        """
+        获取集群节点IP地址列表
+
+        优先返回ExternalIP，如果没有则返回InternalIP
+
+        Returns:
+            节点IP地址列表
+        """
+        try:
+            nodes = self.core_v1.list_node()
+            ips = []
+            for node in nodes.items:
+                if not node.status or not node.status.addresses:
+                    continue
+                # 优先使用 ExternalIP，其次使用 InternalIP
+                external_ip = None
+                internal_ip = None
+                for addr in node.status.addresses:
+                    if addr.type == "ExternalIP":
+                        external_ip = addr.address
+                    elif addr.type == "InternalIP":
+                        internal_ip = addr.address
+                # 优先添加 ExternalIP
+                if external_ip:
+                    ips.append(external_ip)
+                elif internal_ip:
+                    ips.append(internal_ip)
+            return ips
+        except Exception as e:
+            logger.warning(f"获取节点IP失败: {e}")
+            return []
+
     def get_service_access_info(self, namespace: str, service_name: str) -> Dict:
         """
         获取Service访问信息
@@ -1756,12 +1789,27 @@ class KubernetesService:
                 # 生成访问URL
                 if service.spec.type == "NodePort" and port.node_port:
                     # NodePort类型 - 通过节点IP:NodePort访问
-                    access_info["access_urls"].append({
-                        "type": "NodePort",
-                        "port_name": port.name,
-                        "url": f"http://<node-ip>:{port.node_port}",
-                        "node_port": port.node_port
-                    })
+                    # 获取集群节点IP地址
+                    node_ips = self._get_node_ips()
+                    if node_ips:
+                        # 为每个节点IP生成访问URL
+                        for node_ip in node_ips[:3]:  # 最多返回3个节点
+                            access_info["access_urls"].append({
+                                "type": "NodePort",
+                                "port_name": port.name,
+                                "url": f"http://{node_ip}:{port.node_port}",
+                                "node_ip": node_ip,
+                                "node_port": port.node_port
+                            })
+                    else:
+                        # 没有获取到节点IP时，返回提示信息
+                        access_info["access_urls"].append({
+                            "type": "NodePort",
+                            "port_name": port.name,
+                            "url": f"http://<node-ip>:{port.node_port}",
+                            "node_port": port.node_port,
+                            "message": "无法获取节点IP，请手动查询"
+                        })
                 elif service.spec.type == "LoadBalancer" and service.status.load_balancer and service.status.load_balancer.ingress:
                     # LoadBalancer类型 - 通过外部IP访问
                     for ingress in service.status.load_balancer.ingress:
