@@ -80,7 +80,7 @@ class KubernetesService:
 
     def get_project_namespace(self, project_id: str) -> str:
         """Get project namespace (from secflow_project service)."""
-        return f"secflow_{project_id}"
+        return f"secflow-{project_id}"
 
     def ensure_namespace(self, project_id: str) -> bool:
         """Ensure namespace exists, create if not."""
@@ -714,6 +714,80 @@ ls -la {target_path}/"""
         except Exception as e:
             logger.error(f"Failed to list PVCs in {namespace}: {e}")
             return []
+
+    def list_all_secflow_pvcs(self) -> List[Dict[str, Any]]:
+        """List all PVCs in all SecFlow namespaces (secflow_*)."""
+        if not self.core_api:
+            return []
+
+        try:
+            # List all namespaces and filter those starting with "secflow_"
+            namespaces = self.core_api.list_namespace()
+            secflow_namespaces = [
+                ns.metadata.name for ns in namespaces.items
+                if ns.metadata.name.startswith("secflow_")
+            ]
+
+            all_pvcs = []
+            for namespace in secflow_namespaces:
+                try:
+                    pvcs = self.core_api.list_namespaced_persistent_volume_claim(
+                        namespace=namespace
+                    )
+                    for pvc in pvcs.items:
+                        all_pvcs.append({
+                            "name": pvc.metadata.name,
+                            "capacity": pvc.status.capacity.get("storage", "0Gi") if pvc.status else "0Gi",
+                            "status": pvc.status.phase if pvc.status else "Unknown",
+                            "storage_class": pvc.spec.storage_class_name,
+                            "namespace": namespace,
+                            "project_id": namespace.replace("secflow_", "", 1)
+                        })
+                except Exception as e:
+                    logger.error(f"Failed to list PVCs in namespace {namespace}: {e}")
+
+            return all_pvcs
+
+        except Exception as e:
+            logger.error(f"Failed to list all SecFlow PVCs: {e}")
+            return []
+
+    def get_pvc_statistics(self) -> Dict[str, Any]:
+        """Get PVC statistics across all SecFlow namespaces."""
+        all_pvcs = self.list_all_secflow_pvcs()
+
+        # Count by status
+        status_counts = {}
+        for pvc in all_pvcs:
+            status = pvc.get("status", "Unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        # Calculate total storage
+        total_storage_gi = 0
+        for pvc in all_pvcs:
+            capacity = pvc.get("capacity", "0Gi")
+            if capacity.endswith("Gi"):
+                try:
+                    total_storage_gi += int(capacity.replace("Gi", ""))
+                except ValueError:
+                    pass
+            elif capacity.endswith("Mi"):
+                try:
+                    total_storage_gi += int(capacity.replace("Mi", "")) / 1024
+                except ValueError:
+                    pass
+            elif capacity.endswith("Ti"):
+                try:
+                    total_storage_gi += int(capacity.replace("Ti", "")) * 1024
+                except ValueError:
+                    pass
+
+        return {
+            "total_pvcs": len(all_pvcs),
+            "total_storage_gi": round(total_storage_gi, 2),
+            "status_counts": status_counts,
+            "namespaces_count": len(set(pvc.get("namespace") for pvc in all_pvcs))
+        }
 
     def get_pvc_status(self, project_id: str, pvc_name: str) -> Optional[Dict[str, Any]]:
         """Get PVC status."""

@@ -609,6 +609,27 @@ async def delete_task(
 
 # ============ PVC接口 ============
 
+@router.get("/pvcs/statistics")
+async def get_pvc_statistics(
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user)
+):
+    """
+    获取所有SecFlow项目的PVC统计信息。
+
+    - 返回所有secflow_*命名空间中的PVC统计
+    - 包括：PVC总数、总存储容量、各状态数量、涉及的项目数
+    """
+    k8s_service = get_k8s_service()
+    stats = k8s_service.get_pvc_statistics()
+
+    return {
+        "total_pvcs": stats["total_pvcs"],
+        "total_storage_gi": stats["total_storage_gi"],
+        "status_counts": stats["status_counts"],
+        "namespaces_count": stats["namespaces_count"]
+    }
+
+
 @router.get("/pvcs", response_model=PVCListResponse)
 async def list_pvcs(
     user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
