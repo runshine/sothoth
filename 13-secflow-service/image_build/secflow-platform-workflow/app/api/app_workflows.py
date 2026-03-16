@@ -613,7 +613,7 @@ async def initialize_app_workflow(
         instance.message = f"Initialization failed: {str(e)}"
 
     # 保存初始化日志
-    instance.init_logs = "\n".join(init_logs)
+    node.init_logs = "\n".join(init_logs)
     db.commit()
     db.refresh(instance)
 

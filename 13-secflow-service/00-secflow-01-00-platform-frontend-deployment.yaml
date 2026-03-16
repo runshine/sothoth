@@ -4,7 +4,7 @@ metadata:
   name: secflow-platform-frontend
   namespace: secflow-ns
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       name: secflow-platform-frontend
@@ -24,6 +24,9 @@ spec:
           - name: secflow-platform-frontend-config
             mountPath: /etc/nginx/nginx.conf
             subPath: nginx.conf
+          - name: secflow-platform-frontend-config
+            mountPath: /usr/share/nginx/html/config.js
+            subPath: config.js
         livenessProbe:
           httpGet:
             path: /api/frontend/health
@@ -52,3 +55,5 @@ spec:
           items:
             - key: nginx.conf
               path: nginx.conf
+            - key: config.js
+              path: config.js

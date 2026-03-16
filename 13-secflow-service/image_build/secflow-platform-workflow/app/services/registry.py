@@ -46,9 +46,19 @@ class RegistryService:
             return {}
 
         menu = self.config.menu
+
+        # 确定菜单名称：优先使用 level 配置，否则使用 service_name
+        menu_name = self.config.service_name
+        if menu.level3:
+            menu_name = menu.level3.name
+        elif menu.level2:
+            menu_name = menu.level2.name
+        elif menu.level1:
+            menu_name = menu.level1.name
+
         menu_item = {
             "id": menu.id,
-            "name": menu.level3.name if menu.level3 else (menu.level2.name if menu.level2 else menu.level1.name),
+            "name": menu_name,
             "path": menu.path,
             "icon": menu.icon,
             "order": menu.order,

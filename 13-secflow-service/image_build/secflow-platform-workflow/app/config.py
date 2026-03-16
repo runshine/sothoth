@@ -109,7 +109,7 @@ class Config(BaseModel):
     database: DatabaseConfig
     auth_service: AuthServiceConfig
     registry: RegistryConfig
-    k8s_service: K8SServiceConfig  # K8S微服务配置
+    k8s_service: K8SServiceConfig = K8SServiceConfig()  # K8S微服务配置
     app: AppConfig
     logging: LoggingConfig = LoggingConfig()
 

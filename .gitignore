@@ -4,3 +4,18 @@ openvpn_service/docker/vpn-status/openvpn
 .venv
 99-external-service/certs
 13-secflow-service/00-secflow-06-00-platform-static-binary/downloads
+
+# Python
+*.pyc
+__pycache__/
+
+# IDE
+.claude/
+.idea/
+
+# Node.js
+node_modules/
+13-secflow-service/image_build/secflow-platform-workflow/app/config.py
+.mcp.json
+package-lock.json
+package.json
