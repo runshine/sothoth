@@ -1294,6 +1294,64 @@ class KubernetesService:
 
     # ==================== WebSocket Exec (类似 kubectl exec -it) ====================
 
+    class K8sExecStream:
+        """
+        Kubernetes Exec WebSocket 流包装类
+        实现 Kubernetes Exec 协议的数据帧格式
+
+        协议格式: [stream_type (1 byte)][data]
+        stream_type: 0=stdin, 1=stdout, 2=stderr, 3=error, 4=resize
+        """
+
+        def __init__(self, ws):
+            self._ws = ws
+            self._closed = False
+
+        def write_stdin(self, data):
+            """
+            发送 stdin 数据到 K8s
+            添加 stream_type 前缀 (0x00)
+            """
+            if self._closed:
+                raise RuntimeError("Stream is closed")
+
+            # Kubernetes 协议: stdin 数据需要以 0x00 开头
+            if isinstance(data, str):
+                data = data.encode('utf-8')
+            frame = b'\x00' + data
+            self._ws.send(frame, opcode=0x02)  # 0x02 = binary frame
+
+        def send_resize(self, rows: int, cols: int):
+            """
+            发送终端 resize 消息
+            stream_type = 4
+            """
+            if self._closed:
+                return
+            import json
+            resize_data = json.dumps({"Width": cols, "Height": rows})
+            frame = b'\x04' + resize_data.encode('utf-8')
+            self._ws.send(frame, opcode=0x02)
+
+        def recv(self):
+            """接收数据"""
+            if self._closed:
+                return None
+            return self._ws.recv()
+
+        def close(self):
+            """关闭连接"""
+            if not self._closed:
+                self._closed = True
+                try:
+                    self._ws.close()
+                except:
+                    pass
+
+        @property
+        def closed(self):
+            return self._closed
+
     def get_exec_websocket_url(
         self,
         namespace: str,
@@ -1470,7 +1528,8 @@ class KubernetesService:
             ws.connect(ws_url, header={'Authorization': auth_header})
             logger.info(f"[EXEC] WebSocket 连接成功!")
 
-            return ws
+            # 返回包装后的流对象，实现 Kubernetes Exec 协议
+            return self.K8sExecStream(ws)
 
         except Exception as e:
             logger.error(f"[EXEC] 执行失败: {type(e).__name__}: {e}")
