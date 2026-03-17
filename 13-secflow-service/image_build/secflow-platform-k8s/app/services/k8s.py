@@ -421,8 +421,8 @@ class KubernetesService:
             "metadata": {
                 "name": name,
                 "namespace": namespace,
-                "annotation": {},
-                "label": {
+                "annotations": {},
+                "labels": {
                     "app": name,
                     "managed-by": "secflow-workflow"
                 }
