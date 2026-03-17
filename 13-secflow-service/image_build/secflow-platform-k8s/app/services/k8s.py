@@ -387,6 +387,142 @@ class KubernetesService:
         except ApiException as e:
             self._handle_api_exception(e, "Ingress", "创建")
 
+    def create_simple_ingress(
+        self,
+        namespace: str,
+        name: str,
+        service_name: str,
+        service_port: int,
+        host: str,
+        ingress_type: str = "nginx",
+        ingress_ip: str = None,
+        path: str = "/",
+        path_type: str = "Prefix"
+    ) -> Dict:
+        """
+        创建简化版Ingress（供工作流服务使用）
+
+        Args:
+            namespace: 命名空间
+            name: Ingress名称
+            service_name: 后端Service名称
+            service_port: 后端Service端口
+            host: 域名
+            ingress_type: Ingress类型 (nginx)
+            ingress_ip: Ingress Controller的外部IP地址（用于记录，方便用户访问）
+            path: 路径，默认为根路径
+            path_type: 路径类型
+
+        Returns:
+            创建的Ingress信息
+        """
+        # 构建 manifest
+        manifest = {
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "annotation": {},
+                "label": {
+                    "app": name,
+                    "managed-by": "secflow-workflow"
+                }
+            },
+            "spec": {
+                "ingressClassName": ingress_type,
+                "rules": [
+                    {
+                        "host": host,
+                        "http": {
+                            "paths": [
+                                {
+                                    "path": path,
+                                    "path_type": path_type,
+                                    "backend": {
+                                        "service": {
+                                            "name": service_name,
+                                            "port": {
+                                                "number": service_port
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+
+        return self.create_ingress(namespace, manifest)
+
+    def get_ingress_controllers(self) -> List[Dict]:
+        """
+        获取集群中可用的Ingress Controller列表
+
+        从特定namespace（如ingress-nginx）中查找Ingress Controller Service，
+        返回其名称、类型、外部IP等信息，供前端选择使用。
+
+        Returns:
+            Ingress Controller列表，每个包含:
+            - name: Service名称
+            - namespace: 所在namespace
+            - type: Service类型 (LoadBalancer, NodePort等)
+            - external_ip: 外部IP地址
+            - ports: 端口列表
+        """
+        controllers = []
+
+        # 常见的Ingress Controller namespace列表
+        ingress_namespaces = ["ingress-nginx", "nginx-ingress", "kube-system"]
+
+        for ns in ingress_namespaces:
+            try:
+                services = self.core_v1.list_namespaced_service(namespace=ns)
+                for svc in services.items:
+                    # 查找Ingress Controller相关的Service
+                    # 通常名称包含 "ingress" 或 "controller"
+                    svc_name = svc.metadata.name
+                    if "ingress" in svc_name.lower() or "controller" in svc_name.lower():
+                        # 跳过admission webhook服务
+                        if "admission" in svc_name.lower():
+                            continue
+
+                        # 获取外部IP
+                        external_ip = None
+                        if svc.status.load_balancer and svc.status.load_balancer.ingress:
+                            # LoadBalancer类型，从status获取
+                            external_ip = svc.status.load_balancer.ingress[0].ip or svc.status.load_balancer.ingress[0].hostname
+                        elif svc.spec.external_ips:
+                            # 有externalIPs配置
+                            external_ip = svc.spec.external_ips[0]
+
+                        # 获取端口信息
+                        ports = []
+                        for p in svc.spec.ports:
+                            port_info = {
+                                "name": p.name,
+                                "port": p.port,
+                                "protocol": p.protocol,
+                                "node_port": p.node_port
+                            }
+                            ports.append(port_info)
+
+                        controllers.append({
+                            "name": svc_name,
+                            "namespace": ns,
+                            "type": svc.spec.type,
+                            "external_ip": external_ip,
+                            "cluster_ip": svc.spec.cluster_ip,
+                            "ports": ports,
+                            "ingress_class": "nginx" if "nginx" in svc_name.lower() else svc_name.lower()
+                        })
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(f"Failed to list services in namespace {ns}: {e}")
+                continue
+
+        return controllers
+
     def delete_ingress(self, namespace: str, name: str) -> Dict:
         """删除Ingress"""
         try:

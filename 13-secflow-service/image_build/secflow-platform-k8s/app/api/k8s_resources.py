@@ -31,6 +31,7 @@ from app.schemas import (
     IngressInfo,
     IngressCreateRequest,
     IngressUpdateRequest,
+    IngressSimpleCreateRequest,
     SecretListResponse,
     SecretInfo,
     SecretCreateRequest,
@@ -480,6 +481,24 @@ async def proxy_service(
 # ==================== Ingress 管理 ====================
 
 
+@router.get("/ingress-controllers", summary="获取可用的Ingress Controller列表")
+async def get_ingress_controllers(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    获取集群中可用的Ingress Controller列表
+
+    返回Ingress Controller的名称、外部IP、端口等信息，
+    供前端选择使用。用户创建Ingress时可以选择一个Controller，
+    并使用其外部IP访问服务。
+
+    无需project_id，因为Ingress Controller是集群级别的资源。
+    """
+    k8s = get_k8s_service()
+    controllers = k8s.get_ingress_controllers()
+    return {"total": len(controllers), "items": controllers}
+
+
 @router.get("/ingresses", response_model=IngressListResponse, summary="获取Ingress列表")
 async def list_ingresses(
     label_selector: Optional[str] = Query(None, description="标签选择器"),
@@ -535,6 +554,34 @@ async def create_ingress(
 
     k8s = get_k8s_service()
     return k8s.create_ingress(namespace, manifest)
+
+
+@router.post("/ingresses/simple", response_model=IngressInfo, status_code=status.HTTP_201_CREATED, summary="创建简化版Ingress(工作流服务专用)")
+async def create_simple_ingress(
+    request: IngressSimpleCreateRequest,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    创建简化版Ingress
+
+    供工作流服务使用，只需提供Service名称、端口和域名即可创建Ingress。
+    """
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+
+    k8s = get_k8s_service()
+    return k8s.create_simple_ingress(
+        namespace=namespace,
+        name=request.name,
+        service_name=request.service_name,
+        service_port=request.service_port,
+        host=request.host,
+        ingress_type=request.ingress_type,
+        ingress_ip=request.ingress_ip,
+        path=request.path,
+        path_type=request.path_type
+    )
 
 
 @router.delete("/ingresses/{ingress_name}", response_model=SuccessResponse, summary="删除Ingress")

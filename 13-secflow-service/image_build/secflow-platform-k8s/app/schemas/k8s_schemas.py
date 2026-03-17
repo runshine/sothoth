@@ -205,6 +205,18 @@ class IngressUpdateRequest(BaseModel):
     rule: Optional[Dict[str, Any]] = None
 
 
+class IngressSimpleCreateRequest(BaseModel):
+    """Ingress简化创建请求（供工作流服务使用）"""
+    name: str = Field(..., description="Ingress名称")
+    service_name: str = Field(..., description="后端Service名称")
+    service_port: int = Field(..., description="后端Service端口")
+    host: str = Field(..., description="域名")
+    ingress_type: str = Field(default="nginx", description="Ingress类型: nginx")
+    ingress_ip: Optional[str] = Field(default=None, description="Ingress Controller的外部IP地址（用于记录访问地址）")
+    path: str = Field(default="/", description="路径，默认为根路径")
+    path_type: str = Field(default="Prefix", description="路径类型: Prefix, Exact, ImplementationSpecific")
+
+
 # ==================== Secret 模型 ====================
 
 

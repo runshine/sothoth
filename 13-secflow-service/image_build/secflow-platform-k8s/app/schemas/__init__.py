@@ -31,6 +31,7 @@ from app.schemas.k8s_schemas import (
     IngressListResponse,
     IngressCreateRequest,
     IngressUpdateRequest,
+    IngressSimpleCreateRequest,
     # Secret
     SecretInfo,
     SecretListResponse,
@@ -94,6 +95,7 @@ __all__ = [
     "IngressListResponse",
     "IngressCreateRequest",
     "IngressUpdateRequest",
+    "IngressSimpleCreateRequest",
     "SecretInfo",
     "SecretListResponse",
     "SecretCreateRequest",
