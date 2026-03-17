@@ -337,6 +337,12 @@ class WorkflowNodeConfig(BaseModel):
     service_ports: List[ServicePort] = Field(default=[], description="Service ports exposed by the Deployment")
     service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="K8s Service type")
 
+    # Ingress configuration (optional, for app type nodes with service)
+    # These fields are only used when node_type is "app" and create_service is True
+    ingress_type: Optional[str] = Field(None, description="Ingress type: nginx or None")
+    ingress_host: Optional[str] = Field(None, description="Ingress hostname (e.g., myapp.example.com)")
+    ingress_ip: Optional[str] = Field(None, description="Ingress Controller external IP (for user to access the service)")
+
     @model_validator(mode='after')
     def validate_service_config(self):
         """Validate service configuration when create_service is True and node_type is app"""
@@ -446,6 +452,12 @@ class WorkflowNodeCreate(BaseModel):
     service_ports: List[ServicePort] = Field(default=[], description="Service ports exposed by the Deployment")
     service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="K8s Service type")
 
+    # Ingress configuration (optional, for app type nodes with service)
+    # These fields are only used when node_type is "app" and create_service is True
+    ingress_type: Optional[str] = Field(None, description="Ingress type: nginx or None")
+    ingress_host: Optional[str] = Field(None, description="Ingress hostname (e.g., myapp.example.com)")
+    ingress_ip: Optional[str] = Field(None, description="Ingress Controller external IP (for user to access the service)")
+
     @model_validator(mode='after')
     def validate_service_config(self):
         """Validate service configuration when create_service is True and node_type is app"""
@@ -481,6 +493,11 @@ class WorkflowNodeUpdate(BaseModel):
     service_name: Optional[str] = Field(None, description="K8s Service name")
     service_ports: Optional[List[ServicePort]] = Field(None, description="Service ports exposed by the Deployment")
     service_type: Optional[ServiceType] = Field(None, description="K8s Service type")
+
+    # Ingress configuration (optional, for app type nodes with service)
+    ingress_type: Optional[str] = Field(None, description="Ingress type: nginx or None")
+    ingress_host: Optional[str] = Field(None, description="Ingress hostname (e.g., myapp.example.com)")
+    ingress_ip: Optional[str] = Field(None, description="Ingress Controller external IP (for user to access the service)")
 
     @model_validator(mode='after')
     def validate_service_config(self):
@@ -550,6 +567,14 @@ class WorkflowNodeInstanceResponse(BaseModel):
     # Input dependencies (specify sources)
     input_env_vars: List[DependencyEnvVar] = []
     input_volume_mounts: List[DependencyVolumeMount] = []
+    # Service configuration (for app type nodes)
+    create_service: bool = True
+    service_ports: List[ServicePort] = []
+    service_type: Optional[str] = None
+    # Ingress configuration (optional)
+    ingress_type: Optional[str] = None
+    ingress_host: Optional[str] = None
+    ingress_ip: Optional[str] = None
     created_at: Optional[datetime] = None
 
     class Config:

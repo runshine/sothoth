@@ -294,6 +294,11 @@ class WorkflowNodeInstance(Base):
     k8s_resource_type = Column(String(20))  # Deployment or Job
     service_name = Column(String(128))
 
+    # Ingress configuration (optional, for app type nodes with service)
+    ingress_type = Column(String(20))  # nginx or None
+    ingress_host = Column(String(256))  # Ingress hostname
+    ingress_ip = Column(String(64))  # Ingress IP address
+
     # Configuration (saved from creation for query and update)
     position = Column(JSON, default={"x": 0.0, "y": 0.0})  # Node position in canvas
     env_vars = Column(JSON, default=[])  # Fixed environment variables (override template)
@@ -332,6 +337,9 @@ class WorkflowNodeInstance(Base):
             "k8s_resource_name": self.k8s_resource_name,
             "k8s_resource_type": self.k8s_resource_type,
             "service_name": self.service_name,
+            "ingress_type": self.ingress_type,
+            "ingress_host": self.ingress_host,
+            "ingress_ip": self.ingress_ip,
             "position": self.position,
             "env_vars": self.env_vars,
             "volume_mounts": self.volume_mounts,

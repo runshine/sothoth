@@ -290,6 +290,13 @@ class WorkflowEngine:
 
         APP节点状态: PENDING, NOT_READY, READY, STOPPED, FAILED
         JOB节点状态: PENDING, RUNNING, SUCCEEDED, FAILED
+
+        工作流状态判断逻辑（优先级从高到低）:
+        1. FAILED: 有任何节点失败
+        2. RUNNING: 有节点正在执行中（JOB的RUNNING 或 APP的NOT_READY）
+        3. SUCCEEDED: 全部节点完成（READY 或 SUCCEEDED）
+        4. STOPPED: 有节点被停止
+        5. PENDING: 其他情况（有PENDING节点，但没有正在执行的节点）
         """
         if not self.nodes:
             return
@@ -314,48 +321,57 @@ class WorkflowEngine:
             logger.info(f"Workflow {self.instance_id} remains PENDING (not initialized yet)")
             return
 
+        # 计算正在执行的节点数量
+        # APP节点的NOT_READY状态（Pod正在启动但未就绪）也算作正在执行
+        # JOB节点的RUNNING状态算作正在执行
+        executing_count = running_count + not_ready_count
+
         # Determine workflow status
         if failed_count > 0:
-            # Any node failed -> workflow failed
+            # 优先级1: 有任何节点失败 -> 工作流失败
             self.instance.status = WorkflowStatus.FAILED
             if self.instance.finished_at is None:
                 self.instance.finished_at = datetime.utcnow()
             failed_nodes = [n.name for n in self.nodes if n.status == NodeStatus.FAILED]
             self.instance.message = f"Workflow failed: nodes {failed_nodes} failed"
             logger.warning(f"Workflow {self.instance_id} marked as FAILED")
-        elif running_count > 0:
-            # JOB节点正在运行
+        elif executing_count > 0:
+            # 优先级2: 有节点正在执行中（JOB的RUNNING 或 APP的NOT_READY）-> 工作流运行中
             if self.instance.status != WorkflowStatus.RUNNING:
                 self.instance.status = WorkflowStatus.RUNNING
                 if self.instance.started_at is None:
                     self.instance.started_at = datetime.utcnow()
-                self.instance.message = "Workflow is running"
+                # 根据节点类型显示不同的消息
+                if not_ready_count > 0 and running_count > 0:
+                    self.instance.message = f"Workflow is running ({not_ready_count} app(s) starting, {running_count} job(s) running)"
+                elif not_ready_count > 0:
+                    self.instance.message = f"Workflow is running ({not_ready_count} app(s) starting)"
+                else:
+                    self.instance.message = f"Workflow is running ({running_count} job(s) running)"
                 logger.info(f"Workflow {self.instance_id} marked as RUNNING")
-        elif not_ready_count > 0:
-            # APP节点Pod运行中但未就绪
-            if self.instance.status not in [WorkflowStatus.RUNNING, WorkflowStatus.INITIALIZED]:
-                self.instance.status = WorkflowStatus.INITIALIZED
-                self.instance.message = "Workflow initialized, pods starting"
-                logger.info(f"Workflow {self.instance_id} marked as INITIALIZED (pods starting)")
-        elif pending_count == 0 and running_count == 0 and not_ready_count == 0:
-            # 所有节点都已完成 (READY, SUCCEEDED 或 STOPPED)
+        elif pending_count == 0 and executing_count == 0:
+            # 优先级3/4: 没有正在执行的节点，也没有等待的节点
             if ready_count + succeeded_count == total:
+                # 全部节点完成（APP的READY 或 JOB的SUCCEEDED）-> 工作流成功
                 self.instance.status = WorkflowStatus.SUCCEEDED
                 if self.instance.finished_at is None:
                     self.instance.finished_at = datetime.utcnow()
                 self.instance.message = "All nodes completed successfully"
                 logger.info(f"Workflow {self.instance_id} marked as SUCCEEDED")
             elif stopped_count > 0:
+                # 有节点被停止 -> 工作流停止
                 self.instance.status = WorkflowStatus.STOPPED
                 if self.instance.finished_at is None:
                     self.instance.finished_at = datetime.utcnow()
                 self.instance.message = "Workflow stopped"
-        elif pending_count > 0 and ready_count + succeeded_count > 0:
-            # 部分节点就绪，部分节点等待（如APP节点就绪，JOB节点等待启动）
-            if self.instance.status == WorkflowStatus.PENDING:
-                self.instance.status = WorkflowStatus.INITIALIZED
-                self.instance.message = "Workflow initialized"
-                logger.info(f"Workflow {self.instance_id} marked as INITIALIZED")
+                logger.info(f"Workflow {self.instance_id} marked as STOPPED")
+        elif pending_count > 0 or (pending_count > 0 and ready_count + succeeded_count > 0):
+            # 优先级5: 有PENDING节点，但没有正在执行的节点 -> 工作流等待中
+            # 这种情况表示：部分节点完成，部分节点等待执行（如等待依赖满足）
+            if self.instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.RUNNING]:
+                self.instance.status = WorkflowStatus.PENDING
+                self.instance.message = "Workflow waiting for nodes to start"
+                logger.info(f"Workflow {self.instance_id} marked as PENDING (waiting)")
 
         self.db.commit()
 

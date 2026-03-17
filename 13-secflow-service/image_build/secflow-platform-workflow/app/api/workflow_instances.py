@@ -38,6 +38,24 @@ def get_k8s_client():
     return get_k8s_service_client()
 
 
+# ============ Ingress Controller 代理接口 ============
+
+
+@router.get("/ingress-controllers", summary="获取可用的Ingress Controller列表")
+async def get_ingress_controllers(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    获取集群中可用的Ingress Controller列表
+
+    代理调用k8s微服务接口，返回Ingress Controller的名称、外部IP、端口等信息。
+    供前端在创建节点时选择Ingress配置使用。
+    """
+    k8s_client = get_k8s_client()
+    controllers = k8s_client.get_ingress_controllers()
+    return {"total": len(controllers), "items": controllers}
+
+
 # ============ 初始化工作流 API ============
 
 
@@ -153,6 +171,11 @@ async def initialize_workflow_instance(
                             k8s_client.delete_service(instance.project_id, node.service_name)
                             logger.info(f"Deleted Service {node.service_name} for node {node.id}")
                             init_logs.append(f"  - 删除 Service {node.service_name}")
+                            # 删除关联的 Ingress
+                            if node.ingress_type:
+                                k8s_client.delete_ingress(instance.project_id, node.service_name)
+                                logger.info(f"Deleted Ingress {node.service_name} for node {node.id}")
+                                init_logs.append(f"  - 删除 Ingress {node.service_name}")
                     elif node.k8s_resource_type == "Job":
                         k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
                         logger.info(f"Deleted Job {node.k8s_resource_name} for node {node.id}")
@@ -164,6 +187,9 @@ async def initialize_workflow_instance(
                 node.k8s_resource_name = None
                 node.k8s_resource_type = None
                 node.service_name = None
+                node.ingress_type = None
+                node.ingress_host = None
+                node.ingress_ip = None
                 node.status = NodeStatus.PENDING
         db.commit()
 
@@ -300,6 +326,36 @@ async def initialize_workflow_instance(
             if success:
                 node.service_name = service_name
                 init_logs.append(f"  成功: 创建Service {service_name}")
+
+                # 创建Ingress (如果配置了)
+                ingress_type = node_config.get("ingress_type")
+                ingress_host = node_config.get("ingress_host")
+                ingress_ip = node_config.get("ingress_ip")
+
+                if ingress_type and ingress_host:
+                    # Ingress名称与Service名称相同
+                    ingress_name = service_name
+                    # 获取第一个端口作为Ingress后端端口
+                    first_port = service_ports[0].get("port", 80) if service_ports else 80
+
+                    ingress_success, ingress_error = k8s_client.create_ingress(
+                        project_id=instance.project_id,
+                        name=ingress_name,
+                        service_name=service_name,
+                        service_port=first_port,
+                        host=ingress_host,
+                        ingress_type=ingress_type,
+                        ingress_ip=ingress_ip
+                    )
+
+                    if ingress_success:
+                        node.ingress_type = ingress_type
+                        node.ingress_host = ingress_host
+                        node.ingress_ip = ingress_ip
+                        init_logs.append(f"  成功: 创建Ingress {ingress_name} (host: {ingress_host})")
+                    else:
+                        init_logs.append(f"  警告: 创建Ingress失败 - {ingress_error}")
+                        logger.warning(f"Failed to create Ingress for node {node.id}: {ingress_error}")
 
                 # 检查Deployment状态来确定节点状态
                 # PENDING: Pod未运行
@@ -1169,6 +1225,9 @@ async def stop_workflow_instance(
                     k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
                     if node.service_name:
                         k8s_client.delete_service(instance.project_id, node.service_name)
+                        # 删除关联的 Ingress
+                        if node.ingress_type:
+                            k8s_client.delete_ingress(instance.project_id, node.service_name)
                 elif node.k8s_resource_type == "Job":
                     k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
 
@@ -1275,6 +1334,15 @@ async def uninitialize_workflow_instance(
                         # Service 不存在或删除失败，只记录 debug 日志
                         logger.debug(f"Service {svc_name} delete skipped: {e}")
 
+                # 删除关联的 Ingress
+                if node.ingress_type and node.service_name:
+                    try:
+                        k8s_client.delete_ingress(instance.project_id, node.service_name)
+                        logger.info(f"Deleted Ingress {node.service_name} for node {node.id}")
+                        deleted_count += 1
+                    except Exception as e:
+                        logger.debug(f"Ingress {node.service_name} delete skipped: {e}")
+
             # 删除 Job
             elif node.k8s_resource_type == "Job":
                 try:
@@ -1290,6 +1358,9 @@ async def uninitialize_workflow_instance(
         node.k8s_resource_name = None
         node.k8s_resource_type = None
         node.service_name = None
+        node.ingress_type = None
+        node.ingress_host = None
+        node.ingress_ip = None
         node.status = NodeStatus.PENDING
         node.started_at = None
         node.finished_at = None
@@ -1349,6 +1420,9 @@ async def delete_workflow_instance(
                         k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
                         if node.service_name:
                             k8s_client.delete_service(instance.project_id, node.service_name)
+                            # 删除关联的 Ingress
+                            if node.ingress_type:
+                                k8s_client.delete_ingress(instance.project_id, node.service_name)
                     elif node.k8s_resource_type == "Job":
                         k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
                 except Exception as e:
@@ -1726,6 +1800,10 @@ async def create_workflow_node(
         timeout_seconds=node_data.timeout_seconds,
         input_env_vars=[],
         input_volume_mounts=[],
+        # Ingress configuration (for app type nodes)
+        ingress_type=getattr(node_data, 'ingress_type', None) if node_type_val == "app" else None,
+        ingress_host=getattr(node_data, 'ingress_host', None) if node_type_val == "app" else None,
+        ingress_ip=getattr(node_data, 'ingress_ip', None) if node_type_val == "app" else None,
     )
     db.add(node_instance)
 
@@ -1937,6 +2015,13 @@ async def update_workflow_node(
                 existing_node["service_ports"] = [sp.model_dump() if hasattr(sp, 'model_dump') else sp.dict() for sp in node_data.service_ports]
             if node_data.service_type is not None:
                 existing_node["service_type"] = node_data.service_type.value if hasattr(node_data.service_type, 'value') else node_data.service_type
+            # Update ingress configuration
+            if node_data.ingress_type is not None:
+                existing_node["ingress_type"] = node_data.ingress_type
+            if node_data.ingress_host is not None:
+                existing_node["ingress_host"] = node_data.ingress_host
+            if node_data.ingress_ip is not None:
+                existing_node["ingress_ip"] = node_data.ingress_ip
             break
     instance.nodes = existing_nodes
 

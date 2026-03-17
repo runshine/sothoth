@@ -390,6 +390,87 @@ class K8SServiceClient:
             logger.error(f"删除Service {name} 失败: {e}")
             return False
 
+    # ============ Ingress 操作 ============
+
+    def create_ingress(
+        self,
+        project_id: str,
+        name: str,
+        service_name: str,
+        service_port: int,
+        host: str,
+        ingress_type: str = "nginx",
+        ingress_ip: Optional[str] = None,
+        path: str = "/",
+        path_type: str = "Prefix"
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        创建Ingress
+
+        Args:
+            project_id: 项目ID
+            name: Ingress名称
+            service_name: 后端Service名称
+            service_port: 后端Service端口
+            host: 域名
+            ingress_type: Ingress类型 (nginx)
+            ingress_ip: Ingress IP地址 (可选)
+            path: 路径，默认为根路径
+            path_type: 路径类型
+
+        Returns:
+            (success, error_message)
+        """
+        url = f"{self._get_base_url()}/ingresses/simple?project_id={project_id}"
+
+        payload = {
+            "name": name,
+            "service_name": service_name,
+            "service_port": service_port,
+            "host": host,
+            "ingress_type": ingress_type,
+            "ingress_ip": ingress_ip,
+            "path": path,
+            "path_type": path_type
+        }
+
+        try:
+            response = self.sync_client.post(url, json=payload)
+            response.raise_for_status()
+            logger.info(f"Ingress {name} 创建成功")
+            return True, None
+        except httpx.HTTPError as e:
+            error_msg = f"创建Ingress {name} 失败: {e}"
+            if hasattr(e, 'response') and e.response:
+                error_msg = f"创建Ingress {name} 失败: {e.response.text}"
+            logger.error(error_msg)
+            return False, error_msg
+
+    def delete_ingress(self, project_id: str, name: str) -> bool:
+        """删除Ingress"""
+        url = f"{self._get_base_url()}/ingresses/{name}?project_id={project_id}"
+        try:
+            response = self.sync_client.delete(url)
+            response.raise_for_status()
+            logger.info(f"Ingress {name} 删除成功")
+            return True
+        except httpx.HTTPError as e:
+            logger.error(f"删除Ingress {name} 失败: {e}")
+            return False
+
+    def get_ingress(self, project_id: str, name: str) -> Optional[Dict[str, Any]]:
+        """获取Ingress信息"""
+        url = f"{self._get_base_url()}/ingresses/{name}?project_id={project_id}"
+        try:
+            response = self.sync_client.get(url)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as e:
+            if hasattr(e, 'response') and e.response and e.response.status_code == 404:
+                return None
+            logger.error(f"获取Ingress {name} 失败: {e}")
+            return None
+
     # ============ Job 操作 ============
 
     def create_job(
@@ -649,6 +730,31 @@ class K8SServiceClient:
             return data.get("items", [])
         except httpx.HTTPError as e:
             logger.error(f"列出Jobs失败: {e}")
+            return []
+
+    # ============ Ingress Controller 操作 ============
+
+    def get_ingress_controllers(self) -> List[Dict[str, Any]]:
+        """
+        获取集群中可用的Ingress Controller列表
+
+        Returns:
+            Ingress Controller列表，每个包含:
+            - name: Service名称
+            - namespace: 所在namespace
+            - type: Service类型
+            - external_ip: 外部IP地址
+            - ports: 端口列表
+            - ingress_class: Ingress类型
+        """
+        url = f"{self._get_base_url()}/ingress-controllers"
+        try:
+            response = self.sync_client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("items", [])
+        except httpx.HTTPError as e:
+            logger.error(f"获取Ingress Controller列表失败: {e}")
             return []
 
 
