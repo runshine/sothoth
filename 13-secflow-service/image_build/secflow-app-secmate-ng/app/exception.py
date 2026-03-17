@@ -1,5 +1,5 @@
 """
-SecMate-NG Manager - 自定义异常
+Secmate-NG Manager - 自定义异常
 """
 
 from fastapi import HTTPException, status
@@ -33,10 +33,28 @@ class ConflictError(AppException):
         super().__init__(status_code=status.HTTP_409_CONFLICT, detail=message)
 
 
+class ForbiddenError(AppException):
+    """权限拒绝异常"""
+    def __init__(self, message: str = "权限不足或Token无效"):
+        super().__init__(status_code=status.HTTP_403_FORBIDDEN, detail=message)
+
+
+class UnauthorizedError(AppException):
+    """未认证异常"""
+    def __init__(self, message: str = "未提供认证信息"):
+        super().__init__(status_code=status.HTTP_401_UNAUTHORIZED, detail=message)
+
+
 class InternalError(AppException):
     """内部错误异常"""
     def __init__(self, message: str = "内部服务器错误"):
         super().__init__(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=message)
+
+
+class K8sApiError(AppException):
+    """K8s API调用错误"""
+    def __init__(self, message: str = "K8s API调用失败"):
+        super().__init__(status_code=status.HTTP_502_BAD_GATEWAY, detail=message)
 
 
 def setup_exception_handlers(app):
@@ -63,9 +81,30 @@ def setup_exception_handlers(app):
             content={"error": "Conflict", "detail": exc.detail}
         )
 
+    @app.exception_handler(ForbiddenError)
+    async def forbidden_error_handler(request, exc):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "Forbidden", "detail": exc.detail}
+        )
+
+    @app.exception_handler(UnauthorizedError)
+    async def unauthorized_error_handler(request, exc):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "Unauthorized", "detail": exc.detail}
+        )
+
     @app.exception_handler(InternalError)
     async def internal_error_handler(request, exc):
         return JSONResponse(
             status_code=exc.status_code,
             content={"error": "Internal Server Error", "detail": exc.detail}
+        )
+
+    @app.exception_handler(K8sApiError)
+    async def k8s_api_error_handler(request, exc):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": "K8s API Error", "detail": exc.detail}
         )

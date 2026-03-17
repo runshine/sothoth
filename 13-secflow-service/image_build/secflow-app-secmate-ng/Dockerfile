@@ -1,4 +1,4 @@
-# SecMate-NG Manager Dockerfile
+# Secmate-NG Manager Dockerfile
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -15,11 +15,14 @@ COPY requirements.txt .
 # 安装Python依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
+# 复制配置文件
+COPY config.yaml /app/
+
 # 复制应用代码
-COPY . .
+COPY app/ /app/app/
 
-# 暴露端口 (默认8080，可在config.yaml中配置)
-EXPOSE 8080
+# 暴露端口 (默认10011，可在config.yaml中配置)
+EXPOSE 10011
 
-# 启动命令 (所有参数从 config.yaml 读取)
-CMD ["python", "app/main.py"]
+# 启动命令（生产模式使用uvicorn）
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10011"]

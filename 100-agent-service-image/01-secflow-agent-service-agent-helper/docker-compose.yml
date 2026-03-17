@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   remote-debugger:
-    image: ghcr.io/runshine/remote-command-api:latest  # 包含kubectl命令
+    # 镜像由 GitHub Actions 自动构建并推送到 GitHub Container Registry
+    # 标签策略: latest (最新版) 或 YYYYMMDD (日期标签，如 20260317)
+    image: ghcr.io/runshine/secflow-agent-service-agent-helper:latest
     container_name: remote-command-api
     privileged: true  # 特权容器
     restart: always
@@ -16,11 +18,14 @@ services:
       - ANTHROPIC_BASE_URL="http://172.31.29.10:3456"
       - ANTHROPIC_AUTH_TOKEN="sk-12345678"
       - API_TIMEOUT_MS=600000
+      - CODE_SERVER_PORT=20003
+      - CODE_SERVER_PASSWORD=your-password-here  # 建议设置固定密码，留空则自动生成
 
     # 端口映射
     ports:
       - "20001:20001"
       - "20002:20002"
+      - "20003:20003"
     # 卷挂载 - 主机目录只读挂载
     volumes:
       # 主机根目录只读挂载

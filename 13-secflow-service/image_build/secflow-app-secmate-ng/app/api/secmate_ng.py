@@ -1,110 +1,165 @@
 """
-SecMate-NG Manager - API路由
+Secmate-NG Manager - API路由
 """
 
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
-from sqlalchemy.orm import Session, joinedload
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, status, WebSocket, WebSocketDisconnect, Header
+from sqlalchemy.orm import Session
 
 from app.config import get_config
-from app.exception import NotFoundError, ValidationError, ConflictError
+from app.exception import NotFoundError, ValidationError, ConflictError, ForbiddenError, UnauthorizedError
 from app.model import (
-    get_db, get_db_session, generate_id, SecMateNG, Task,
-    SecMateNGStatus, TaskStatus, TaskType
+    get_db, get_db_session, generate_id, SecmateNg, Task,
+    SecmateNgStatus, TaskStatus, TaskType
 )
 from app.schemas import (
-    SecMateNGCreateRequest, SecMateNGDeleteRequest, SecMateNGRestartRequest,
-    SecMateNGResponse, SecMateNGListResponse, SecMateNGStatusResponse,
-    SecMateNGLogsResponse, TaskResponse, TaskListResponse,
+    SecmateNgCreateRequest, SecmateNgDeleteRequest, SecmateNgRestartRequest,
+    SecmateNgResponse, SecmateNgListResponse, SecmateNgStatusResponse,
+    SecmateNgLogsResponse, TaskResponse, TaskListResponse,
     TaskCreatedResponse, SuccessResponse, PVCMount, OutputPVCMount
 )
-from app.services.k8s import get_k8s_service
+from app.services.k8s_api_client import get_k8s_api_client
 from app.services.task_manager import get_task_manager
+from app.services.auth import get_auth_service, TokenInvalidError, AuthServiceError
+from app.utils.health import check_k8s_api_health, check_database_health, check_auth_service_health
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/app/secmate-ng", tags=["SecMate-NG Manager"])
+router = APIRouter(prefix="/api/app/secmate-ng", tags=["Secmate-NG Manager"])
+
+
+# ============ 辅助函数 ============
+
+import re
+
+
+def validate_k8s_name(name: str) -> bool:
+    """
+    验证名称是否符合 K8s DNS 子域名命名规则 (RFC 1123)
+
+    K8s资源名称必须符合以下规则：
+    - 最多 253 个字符
+    - 只能包含小写字母、数字和 '-'
+    - 必须以字母或数字开头和结尾
+    - 不能包含连续的 '-'
+
+    Args:
+        name: 待验证的名称
+
+    Returns:
+        bool: 是否符合命名规范
+    """
+    if not name or len(name) > 253:
+        return False
+    # 正则表达式：以字母或数字开头，中间可以有字母数字和连字符，以字母或数字结尾
+    pattern = r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+    return re.match(pattern, name) is not None
+
+
+# ============ 认证依赖 ============
+
+async def get_current_user(
+    authorization: Optional[str] = Header(None)
+) -> dict:
+    """
+    获取当前用户（通过Token验证）
+    
+    Returns:
+        用户信息字典，包含token用于后续API调用
+    """
+    config = get_config()
+    
+    if not config.auth_service.enabled:
+        return {"user_id": "anonymous", "username": "anonymous", "token": None}
+    
+    if not authorization or not authorization.startswith("Bearer "):
+        raise UnauthorizedError("未提供认证Token")
+    
+    token = authorization.replace("Bearer ", "")
+    
+    auth_service = get_auth_service()
+    try:
+        user_info = await auth_service.validate_token_async(token)
+        user_info["token"] = token  # 存储token用于API pass-through
+        return user_info
+    except TokenInvalidError:
+        raise ForbiddenError("Token无效或已过期")
+    except AuthServiceError as e:
+        raise ForbiddenError(f"认证服务异常: {e}")
+
 
 # ============ Helper Functions ============
 
-def get_secmate_ng_by_name(db: Session, project_id: str, name: str) -> Optional[SecMateNG]:
-    """通过名称获取SecMate-NG"""
-    return db.query(SecMateNG).filter(
-        SecMateNG.project_id == project_id,
-        SecMateNG.name == name,
-        SecMateNG.status != SecMateNGStatus.DELETED.value
+def get_secmate_by_name(db: Session, project_id: str, name: str) -> Optional[SecmateNg]:
+    """通过名称获取SecmateNg"""
+    return db.query(SecmateNg).filter(
+        SecmateNg.project_id == project_id,
+        SecmateNg.name == name,
+        SecmateNg.status != SecmateNgStatus.DELETED.value
     ).first()
 
 
-def get_secmate_ng_realtime_status(server: SecMateNG, k8s_service) -> tuple[str, dict]:
+def get_secmate_realtime_status(secmate: SecmateNg, k8s_client, user_token: str) -> tuple:
     """
-    获取SecMate-NG实时状态
-
+    获取SecmateNg实时状态
+    
     Returns:
         tuple: (status, extra_info)
     """
+    project_id = secmate.project_id
+    
     # 获取Deployment状态
     deployment_exists = False
     ready_replicas = 0
     total_replicas = 0
-    if server.deployment_name:
-        status = k8s_service.get_deployment_status(server.namespace, server.deployment_name)
-        if status:
+    if secmate.deployment_name:
+        status_info = k8s_client.get_deployment_status(project_id, secmate.deployment_name, user_token)
+        if status_info:
             deployment_exists = True
-            ready_replicas = status.get("ready_replicas", 0)
-            total_replicas = status.get("replicas", 0)
+            ready_replicas = status_info.get("ready_replicas", 0)
+            total_replicas = status_info.get("replicas", 0)
 
     # 获取Pod状态
     pod_status = None
     pod_ip = None
     node_name = None
     pod_exists = False
-    if server.deployment_name:
-        pod_info = k8s_service.get_pod_by_deployment(server.namespace, server.deployment_name)
-        if pod_info:
+    if secmate.deployment_name:
+        pods = k8s_client.get_pods_by_deployment(
+            project_id,
+            f"app=secmate-ng,secmate-id={secmate.id}",
+            user_token
+        )
+        if pods:
             pod_exists = True
-            pod_status = pod_info.get("status")
-            pod_ip = pod_info.get("ip")
-            node_name = pod_info.get("node_name")
+            pod = pods[0]
+            pod_status = pod.get("status")
+            pod_ip = pod.get("pod_ip")
+            node_name = pod.get("node_name")
 
-    # 基于Pod和Deployment状态计算实际状态
-    actual_status = server.status
+    # 计算实际状态
+    actual_status = secmate.status
 
     if not deployment_exists and not pod_exists:
-        # Deployment和Pod都不存在
-        if server.status in [SecMateNGStatus.PENDING.value, SecMateNGStatus.CREATING.value]:
-            actual_status = SecMateNGStatus.PENDING.value
+        if secmate.status in [SecmateNgStatus.PENDING.value, SecmateNgStatus.CREATING.value]:
+            actual_status = SecmateNgStatus.PENDING.value
         else:
-            actual_status = SecMateNGStatus.STOPPED.value
+            actual_status = SecmateNgStatus.STOPPED.value
     elif pod_status:
         if ready_replicas > 0 and pod_status == "Running":
-            # Pod运行中且Ready
-            actual_status = SecMateNGStatus.RUNNING.value
+            actual_status = SecmateNgStatus.RUNNING.value
         elif pod_status in ["Pending", "ContainerCreating"]:
-            # Pod正在创建中
-            actual_status = SecMateNGStatus.CREATING.value
+            actual_status = SecmateNgStatus.CREATING.value
         elif pod_status in ["Error", "Failed", "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull"]:
-            # Pod出错
-            actual_status = SecMateNGStatus.ERROR.value
-        elif pod_status in ["Succeeded"]:
-            # Pod已完成（可能是在Job中）
-            actual_status = SecMateNGStatus.STOPPED.value
+            actual_status = SecmateNgStatus.ERROR.value
+        elif pod_status == "Succeeded":
+            actual_status = SecmateNgStatus.STOPPED.value
         elif pod_status == "Running":
-            # Pod Running 但 Deployment 未 Ready（正在启动中）
-            # 检查是否所有容器都 ready
-            if server.deployment_name:
-                pod_info_detail = k8s_service.get_pod_by_deployment(server.namespace, server.deployment_name)
-                if pod_info_detail:
-                    actual_status = SecMateNGStatus.CREATING.value
-                else:
-                    actual_status = SecMateNGStatus.ERROR.value
-            else:
-                actual_status = SecMateNGStatus.CREATING.value
+            actual_status = SecmateNgStatus.CREATING.value
         else:
-            # 未知状态
-            actual_status = SecMateNGStatus.ERROR.value
+            actual_status = SecmateNgStatus.ERROR.value
 
     extra_info = {
         "pod_status": pod_status,
@@ -117,25 +172,25 @@ def get_secmate_ng_realtime_status(server: SecMateNG, k8s_service) -> tuple[str,
     return actual_status, extra_info
 
 
-def make_secmate_ng_response(server: SecMateNG, realtime_status: str = None) -> SecMateNGResponse:
-    """构建SecMate-NG响应"""
-    return SecMateNGResponse(
-        id=server.id,
-        project_id=server.project_id,
-        name=server.name,
-        namespace=server.namespace,
-        status=realtime_status if realtime_status is not None else server.status,
-        source_pvcs=server.source_pvcs or [],
-        output_pvcs=server.output_pvcs or [],
-        deployment_name=server.deployment_name,
-        service_name=server.service_name,
-        ingress_name=server.ingress_name,
-        pod_name=server.pod_name,
-        access_url=server.access_url,
-        secmate_ng_env=server.secmate_ng_env or {},
-        description=server.description,
-        created_at=server.created_at.isoformat() if server.created_at else None,
-        updated_at=server.updated_at.isoformat() if server.updated_at else None
+def make_secmate_response(secmate: SecmateNg, realtime_status: str = None) -> SecmateNgResponse:
+    """构建SecmateNg响应"""
+    return SecmateNgResponse(
+        id=secmate.id,
+        project_id=secmate.project_id,
+        name=secmate.name,
+        namespace=secmate.namespace,
+        status=realtime_status if realtime_status is not None else secmate.status,
+        source_pvcs=secmate.source_pvcs or [],
+        output_pvcs=secmate.output_pvcs or [],
+        deployment_name=secmate.deployment_name,
+        service_name=secmate.service_name,
+        ingress_name=secmate.ingress_name,
+        pod_name=secmate.pod_name,
+        access_url=secmate.access_url,
+        secmate_env=secmate.secmate_env or {},
+        description=secmate.description,
+        created_at=secmate.created_at.isoformat() if secmate.created_at else None,
+        updated_at=secmate.updated_at.isoformat() if secmate.updated_at else None
     )
 
 
@@ -146,8 +201,8 @@ def make_task_response(task: Task) -> TaskResponse:
         project_id=task.project_id,
         type=task.type,
         status=task.status,
-        secmate_ng_id=task.secmate_ng_id,
-        secmate_ng_name=task.secmate_ng_name,
+        secmate_id=task.secmate_id,
+        secmate_name=task.secmate_name,
         params=task.params or {},
         result=task.result,
         error_message=task.error_message,
@@ -161,57 +216,88 @@ def make_task_response(task: Task) -> TaskResponse:
 
 @router.get("/health")
 async def health_check():
-    """
-    健康检查接口
-
-    - 检查服务是否正常运行
-    - 返回服务状态信息
-    """
+    """健康检查接口"""
     return {
         "status": "ok",
         "service": "secmate-ng-manager"
     }
 
 
-# ============ SecMate-NG CRUD ============
+@router.get("/ready")
+async def readiness_check():
+    """
+    就绪探针 - 检查关键依赖服务是否可用
 
-@router.post("/projects/{project_id}/secmate-ngs", response_model=TaskCreatedResponse, status_code=status.HTTP_201_CREATED)
-async def create_secmate_ng(
+    用于Kubernetes就绪探针，检查：
+    - 数据库连接
+    - K8s API服务
+    - 认证服务（如果启用）
+
+    Returns:
+        dict: 包含总体就绪状态和各项检查结果
+    """
+    checks = {
+        "database": check_database_health(),
+        "k8s_api": check_k8s_api_health(),
+        "auth_service": check_auth_service_health()
+    }
+
+    all_ready = all(checks.values())
+
+    return {
+        "ready": all_ready,
+        "checks": checks,
+        "service": "secmate-ng-manager"
+    }
+
+
+# ============ SecmateNg CRUD ============
+
+@router.post("/projects/{project_id}/secmate-instances", response_model=TaskCreatedResponse, status_code=status.HTTP_201_CREATED)
+async def create_secmate_instance(
     project_id: str = Path(..., description="项目ID"),
-    request: SecMateNGCreateRequest = ...,
+    request: SecmateNgCreateRequest = ...,
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    创建SecMate-NG实例
+    创建SecmateNg实例
 
     - 异步创建任务
     - 自动创建不存在的输出PVC
     - 自动创建Deployment、Service、Ingress
     """
-    k8s_service = get_k8s_service()
+    # 验证名称是否符合 K8s 命名规范
+    if not validate_k8s_name(request.name):
+        raise ValidationError(
+            "名称必须符合Kubernetes命名规范：只能包含小写字母、数字和'-'，"
+            "且以字母或数字开头和结尾，最多253个字符"
+        )
 
-    # 检查namespace是否存在
-    if not k8s_service.check_namespace_exists(request.namespace):
-        raise ValidationError(f"Namespace不存在: {request.namespace}")
+    user_token = current_user.get("token")
+    k8s_client = get_k8s_api_client()
 
     # 检查源码PVC是否存在
     for pvc_info in request.source_pvcs:
-        if not k8s_service.check_pvc_exists(request.namespace, pvc_info.pvc_name):
+        if not k8s_client.check_pvc_exists(project_id, pvc_info.pvc_name, user_token):
             raise ValidationError(f"源码PVC不存在: {pvc_info.pvc_name}")
 
     # 检查名称是否已存在
-    existing = get_secmate_ng_by_name(db, project_id, request.name)
+    existing = get_secmat_by_name(db, project_id, request.name)
     if existing:
-        raise ConflictError(f"SecMate-NG名称已存在: {request.name}")
+        raise ConflictError(f"SecmateNg名称已存在: {request.name}")
 
-    # 创建SecMate-NG记录
-    secmate_ng_id = generate_id()
-    secmate_ng = SecMateNG(
-        id=secmate_ng_id,
+    # 创建SecmateNg记录
+    secmate_id = generate_id()
+    config = get_config()
+    namespace = f"project-{project_id}"  # 使用project_id作为namespace标识
+    
+    secmate = SecmateNg(
+        id=secmate_id,
         project_id=project_id,
         name=request.name,
-        namespace=request.namespace,
-        status=SecMateNGStatus.PENDING.value,
+        namespace=namespace,
+        status=SecmateNgStatus.PENDING.value,
         description=request.description,
         source_pvcs=[{"pvc_name": p.pvc_name, "mount_path": p.mount_path} for p in request.source_pvcs],
         output_pvcs=[{
@@ -220,260 +306,387 @@ async def create_secmate_ng(
             "storage_size": p.storage_size
         } for p in request.output_pvcs],
         custom_env=request.custom_env or {},
-        secmate_ng_env=request.secmate_ng_env or {}
+        secmate_env=request.secmate_env or {}
     )
-    db.add(secmate_ng)
+    db.add(secmate)
     db.commit()
 
-    # 创建异步任务
+    # 创建异步任务，传递user_token
     task_manager = get_task_manager()
     params = {
-        "secmate_ng_id": secmate_ng_id,
-        "namespace": request.namespace,
+        "secmate_id": secmate_id,
         "name": request.name,
         "custom_env": request.custom_env,
-        "secmate_ng_env": request.secmate_ng_env,
-        "image": request.image  # 传递自定义镜像参数
+        "secmate_env": request.secmate_env,
+        "image": request.image,
+        "user_token": user_token  # 关键：传递token用于K8s API调用
     }
     task = task_manager.create_task(
         project_id=project_id,
         task_type=TaskType.CREATE.value,
         params=params,
-        secmate_ng_id=secmate_ng_id,
-        secmate_ng_name=request.name
+        secmate_id=secmate_id,
+        secmate_name=request.name
     )
 
     return TaskCreatedResponse(
-        message="SecMate-NG创建任务已提交",
+        message="SecmateNg创建任务已提交",
         task_id=task.id,
         task_type=TaskType.CREATE.value
     )
 
 
-@router.delete("/projects/{project_id}/secmate-ngs", response_model=TaskCreatedResponse)
-async def delete_secmate_ng(
+@router.delete("/projects/{project_id}/secmate-instances", response_model=TaskCreatedResponse)
+async def delete_secmate_instance(
     project_id: str = Path(..., description="项目ID"),
-    request: SecMateNGDeleteRequest = ...,
+    request: SecmateNgDeleteRequest = ...,
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    删除SecMate-NG实例
+    """删除SecmateNg实例"""
+    user_token = current_user.get("token")
+    
+    secmate = get_secmat_by_name(db, project_id, request.name)
+    if not secmate:
+        raise NotFoundError("SecmateNg", request.name)
 
-    - 需要验证SecMate-NG存在
-    - 可选删除输出PVC（默认不删除）
-    - 不会删除源码PVC
-    """
-    # 检查SecMate-NG是否存在
-    secmate_ng = get_secmate_ng_by_name(db, project_id, request.name)
-    if not secmate_ng:
-        raise NotFoundError("SecMate-NG", request.name)
-
-    # 创建异步任务
     task_manager = get_task_manager()
     params = {
-        "secmate_ng_id": secmate_ng.id,
-        "secmate_ng_name": secmate_ng.name,
-        "delete_output_pvcs": request.delete_output_pvcs
+        "secmate_id": secmate.id,
+        "secmate_name": secmate.name,
+        "delete_output_pvcs": request.delete_output_pvcs,
+        "user_token": user_token
     }
     task = task_manager.create_task(
         project_id=project_id,
         task_type=TaskType.DELETE.value,
         params=params,
-        secmate_ng_id=secmate_ng.id,
-        secmate_ng_name=request.name
+        secmate_id=secmate.id,
+        secmate_name=request.name
     )
 
-    # 更新状态为删除中
-    secmate_ng.status = SecMateNGStatus.DELETING.value
+    secmate.status = SecmateNgStatus.DELETING.value
     db.commit()
 
     return TaskCreatedResponse(
-        message="SecMate-NG删除任务已提交",
+        message="SecmateNg删除任务已提交",
         task_id=task.id,
         task_type=TaskType.DELETE.value
     )
 
 
-@router.post("/projects/{project_id}/secmate-ngs/restart", response_model=TaskCreatedResponse)
-async def restart_secmate_ng(
+@router.post("/projects/{project_id}/secmate-instances/restart", response_model=TaskCreatedResponse)
+async def restart_secmate_instance(
     project_id: str = Path(..., description="项目ID"),
-    request: SecMateNGRestartRequest = ...,
+    request: SecmateNgRestartRequest = ...,
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """
-    重建SecMate-NG实例
+    """重建SecmateNg实例"""
+    user_token = current_user.get("token")
+    
+    secmate = get_secmat_by_name(db, project_id, request.name)
+    if not secmate:
+        raise NotFoundError("SecmateNg", request.name)
 
-    - 将Deployment副本数调整为0再调整为1
-    - 用于重启Pod
-    """
-    # 检查SecMate-NG是否存在
-    secmate_ng = get_secmate_ng_by_name(db, project_id, request.name)
-    if not secmate_ng:
-        raise NotFoundError("SecMate-NG", request.name)
+    if not secmate.deployment_name:
+        raise ValidationError("SecmateNg没有关联的Deployment")
 
-    if not secmate_ng.deployment_name:
-        raise ValidationError("SecMate-NG没有关联的Deployment")
-
-    # 创建异步任务
     task_manager = get_task_manager()
     params = {
-        "secmate_ng_id": secmate_ng.id,
-        "secmate_ng_name": secmate_ng.name
+        "secmate_id": secmate.id,
+        "secmate_name": secmate.name,
+        "user_token": user_token
     }
     task = task_manager.create_task(
         project_id=project_id,
         task_type=TaskType.RESTART.value,
         params=params,
-        secmate_ng_id=secmate_ng.id,
-        secmate_ng_name=request.name
+        secmate_id=secmate.id,
+        secmate_name=request.name
     )
 
     return TaskCreatedResponse(
-        message="SecMate-NG重建任务已提交",
+        message="SecmateNg重建任务已提交",
         task_id=task.id,
         task_type=TaskType.RESTART.value
     )
 
 
-# ============ SecMate-NG Query ============
+# ============ SecmateNg Query ============
 
-@router.get("/projects/{project_id}/secmate-ngs", response_model=SecMateNGListResponse)
-async def list_secmate_ngs(
+@router.get("/projects/{project_id}/secmate-instances", response_model=SecmateNgListResponse)
+async def list_secmate_instances(
     project_id: str = Path(..., description="项目ID"),
-    status: Optional[str] = Query(None, description="按状态过滤"),
+    status_filter: Optional[str] = Query(None, alias="status", description="按状态过滤"),
     realtime: bool = Query(True, description="是否实时获取Kubernetes状态"),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """查询SecMate-NG列表
-
-    - 默认实时从Kubernetes获取Pod状态
-    - 设置 realtime=false 可只查询数据库状态（更快）
-    """
-    query = db.query(SecMateNG).filter(
-        SecMateNG.project_id == project_id,
-        SecMateNG.status != SecMateNGStatus.DELETED.value
+    """查询SecmateNg列表"""
+    user_token = current_user.get("token")
+    
+    query = db.query(SecmateNg).filter(
+        SecmateNg.project_id == project_id,
+        SecmateNg.status != SecmateNgStatus.DELETED.value
     )
 
-    if status:
-        query = query.filter(SecMateNG.status == status)
+    if status_filter:
+        query = query.filter(SecmateNg.status == status_filter)
 
-    servers = query.all()
+    instances = query.all()
 
-    k8s_service = get_k8s_service() if realtime else None
+    k8s_client = get_k8s_api_client() if realtime else None
 
     items = []
-    for server in servers:
+    for secmate in instances:
         realtime_status = None
-        if realtime and k8s_service and server.deployment_name:
+        if realtime and k8s_client and secmate.deployment_name and user_token:
             try:
-                realtime_status, _ = get_secmate_ng_realtime_status(server, k8s_service)
+                realtime_status, _ = get_secmate_realtime_status(secmate, k8s_client, user_token)
             except Exception as e:
-                logger.warning(f"获取SecMate-NG {server.name} 实时状态失败: {e}")
-                realtime_status = server.status
+                logger.warning(f"获取SecmateNg {secmate.name} 实时状态失败: {e}")
+                realtime_status = secmate.status
 
-        items.append(make_secmate_ng_response(server, realtime_status))
+        items.append(make_secmate_response(secmate, realtime_status))
 
-    # 如果按状态过滤，需要在获取实时状态后再过滤
-    if status and realtime:
-        items = [item for item in items if item.status == status]
+    if status_filter and realtime:
+        items = [item for item in items if item.status == status_filter]
 
-    return SecMateNGListResponse(
+    return SecmateNgListResponse(
         total=len(items),
         items=items
     )
 
 
-@router.get("/projects/{project_id}/secmate-ngs/{name}", response_model=SecMateNGResponse)
-async def get_secmate_ng(
+@router.get("/projects/{project_id}/secmate-instances/{name}", response_model=SecmateNgResponse)
+async def get_secmate_instance(
     project_id: str = Path(..., description="项目ID"),
-    name: str = Path(..., description="SecMate-NG名称"),
+    name: str = Path(..., description="SecmateNg名称"),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """查询单个SecMate-NG"""
-    server = get_secmate_ng_by_name(db, project_id, name)
-    if not server:
-        raise NotFoundError("SecMate-NG", name)
+    """查询单个SecmateNg"""
+    secmate = get_secmat_by_name(db, project_id, name)
+    if not secmate:
+        raise NotFoundError("SecmateNg", name)
 
-    return make_secmate_ng_response(server)
+    return make_secmate_response(secmate)
 
 
-@router.get("/projects/{project_id}/secmate-ngs/{name}/status", response_model=SecMateNGStatusResponse)
-async def get_secmate_ng_status(
+@router.get("/projects/{project_id}/secmate-instances/{name}/status", response_model=SecmateNgStatusResponse)
+async def get_secmate_instance_status(
     project_id: str = Path(..., description="项目ID"),
-    name: str = Path(..., description="SecMate-NG名称"),
+    name: str = Path(..., description="SecmateNg名称"),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """获取SecMate-NG实时状态"""
-    server = get_secmate_ng_by_name(db, project_id, name)
-    if not server:
-        raise NotFoundError("SecMate-NG", name)
+    """获取SecmateNg实时状态"""
+    user_token = current_user.get("token")
+    
+    secmate = get_secmat_by_name(db, project_id, name)
+    if not secmate:
+        raise NotFoundError("SecmateNg", name)
 
-    k8s_service = get_k8s_service()
+    k8s_client = get_k8s_api_client()
+    actual_status, extra_info = get_secmate_realtime_status(secmate, k8s_client, user_token)
 
-    # 使用辅助函数获取实时状态
-    actual_status, extra_info = get_secmate_ng_realtime_status(server, k8s_service)
-
-    return SecMateNGStatusResponse(
-        id=server.id,
-        name=server.name,
-        namespace=server.namespace,
+    return SecmateNgStatusResponse(
+        id=secmate.id,
+        name=secmate.name,
+        namespace=secmate.namespace,
         status=actual_status,
         pod_status=extra_info.get("pod_status"),
         pod_ip=extra_info.get("pod_ip"),
         node_name=extra_info.get("node_name"),
-        access_url=server.access_url,
+        access_url=secmate.access_url,
         ready_replicas=extra_info.get("ready_replicas", 0),
         total_replicas=extra_info.get("total_replicas", 0)
     )
 
 
-@router.get("/projects/{project_id}/secmate-ngs/{name}/logs", response_model=SecMateNGLogsResponse)
-async def get_secmate_ng_logs(
+@router.get("/projects/{project_id}/secmate-instances/{name}/logs", response_model=SecmateNgLogsResponse)
+async def get_secmate_instance_logs(
     project_id: str = Path(..., description="项目ID"),
-    name: str = Path(..., description="SecMate-NG名称"),
+    name: str = Path(..., description="SecmateNg名称"),
     tail_lines: int = Query(100, description="返回行数", ge=1, le=10000),
     container: Optional[str] = Query(None, description="容器名称"),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """获取SecMate-NG运行日志"""
-    server = get_secmate_ng_by_name(db, project_id, name)
-    if not server:
-        raise NotFoundError("SecMate-NG", name)
+    """获取SecmateNg运行日志"""
+    user_token = current_user.get("token")
+    
+    secmate = get_secmat_by_name(db, project_id, name)
+    if not secmate:
+        raise NotFoundError("SecmateNg", name)
 
-    if not server.deployment_name:
-        raise ValidationError("SecMate-NG没有关联的Deployment")
+    if not secmate.deployment_name:
+        raise ValidationError("SecmateNg没有关联的Deployment")
 
-    k8s_service = get_k8s_service()
+    k8s_client = get_k8s_api_client()
 
-    # 实时获取当前运行的Pod（处理Pod重建后的情况）
-    pod_info = k8s_service.get_pod_by_deployment(server.namespace, server.deployment_name)
-    if not pod_info:
-        raise ValidationError("SecMate-NG没有运行中的Pod")
+    pods = k8s_client.get_pods_by_deployment(
+        project_id,
+        f"app=secmate-ng,secmate-id={secmate.id}",
+        user_token
+    )
+    if not pods:
+        raise ValidationError("SecmateNg没有运行中的Pod")
 
-    current_pod_name = pod_info.get("name")
+    current_pod_name = pods[0].get("name")
     if not current_pod_name:
         raise ValidationError("无法获取Pod名称")
 
-    logs = k8s_service.get_pod_logs(
-        server.namespace, current_pod_name, container=container, tail_lines=tail_lines
+    logs = k8s_client.get_pod_logs(
+        project_id, current_pod_name, container=container, tail_lines=tail_lines, user_token=user_token
     )
 
-    if logs is None:
-        raise NotFoundError("Pod日志", current_pod_name)
-
-    # 如果Pod名称有变化，更新数据库
-    if server.pod_name != current_pod_name:
-        server.pod_name = current_pod_name
+    if secmate.pod_name != current_pod_name:
+        secmate.pod_name = current_pod_name
         db.commit()
 
-    return SecMateNGLogsResponse(
-        secmate_ng_id=server.id,
-        secmate_ng_name=server.name,
-        namespace=server.namespace,
+    return SecmateNgLogsResponse(
+        secmate_id=secmate.id,
+        secmate_name=secmate.name,
+        namespace=secmate.namespace,
         pod_name=current_pod_name,
         container=container,
         logs=logs
     )
+
+
+# ============ WebSocket Terminal ============
+
+@router.websocket("/ws/projects/{project_id}/secmate-instances/{name}/exec")
+async def websocket_terminal(
+    websocket: WebSocket,
+    project_id: str,
+    name: str,
+    token: Optional[str] = Query(None)
+):
+    """
+    WebSocket终端 - 连接到SecmateNg实例
+
+    通过secflow-platform-k8s的WebSocket exec接口
+    支持心跳保活和自动重连
+    """
+    import asyncio
+    import websockets
+
+    # 验证token
+    config = get_config()
+    if config.auth_service.enabled:
+        if not token:
+            await websocket.accept()
+            await websocket.send_text("\x1b[31mError: 未提供认证Token\x1b[0m\r\n")
+            await websocket.close()
+            return
+
+        auth_service = get_auth_service()
+        try:
+            await auth_service.validate_token_async(token)
+        except (TokenInvalidError, AuthServiceError) as e:
+            await websocket.accept()
+            await websocket.send_text(f"\x1b[31mError: {str(e)}\x1b[0m\r\n")
+            await websocket.close()
+            return
+
+    # 获取SecmateNg实例
+    db = get_db_session()
+    try:
+        secmate = db.query(SecmateNg).filter(
+            SecmateNg.project_id == project_id,
+            SecmateNg.name == name,
+            SecmateNg.status != SecmateNgStatus.DELETED.value
+        ).first()
+
+        if not secmate:
+            await websocket.accept()
+            await websocket.send_text("\x1b[31mError: SecmateNg实例不存在\x1b[0m\r\n")
+            await websocket.close()
+            return
+
+        if not secmate.pod_name:
+            await websocket.accept()
+            await websocket.send_text("\x1b[31mError: 没有关联的Pod\x1b[0m\r\n")
+            await websocket.close()
+            return
+
+        # 获取K8s API的WebSocket URL
+        k8s_client = get_k8s_api_client()
+        ws_url = k8s_client.get_websocket_exec_url(project_id, secmate.pod_name, token)
+
+        logger.info(f"[WS Terminal] 连接到K8s API: {ws_url}")
+
+        await websocket.accept()
+
+        # 心跳配置
+        HEARTBEAT_INTERVAL = 30  # 秒
+
+        async def send_heartbeat():
+            """定期发送心跳保持连接活跃"""
+            while True:
+                try:
+                    await asyncio.sleep(HEARTBEAT_INTERVAL)
+                    # 发送空消息作为心跳（或者可以发送特定的ping消息）
+                    # 客户端可以选择性地处理或忽略
+                    logger.debug("[WS Terminal] 发送心跳")
+                except Exception as e:
+                    logger.debug(f"[WS Terminal] 心跳任务结束: {e}")
+                    break
+
+        # 连接到K8s API的WebSocket（带重试）
+        max_retries = 3
+        retry_delay = 1
+
+        for attempt in range(max_retries):
+            try:
+                async with websockets.connect(
+                    ws_url,
+                    ping_interval=20,  # 每20秒发送ping
+                    ping_timeout=10    # 10秒内等待pong响应
+                ) as k8s_ws:
+                    # 双向转发消息
+                    async def forward_to_k8s():
+                        try:
+                            while True:
+                                data = await websocket.receive_text()
+                                await k8s_ws.send(data)
+                        except WebSocketDisconnect:
+                            logger.info("[WS Terminal] 客户端断开连接")
+                        except Exception as e:
+                            logger.error(f"[WS Terminal] 转发到K8s失败: {e}")
+
+                    async def forward_to_client():
+                        try:
+                            while True:
+                                data = await k8s_ws.recv()
+                                await websocket.send_text(data)
+                        except Exception as e:
+                            logger.error(f"[WS Terminal] 转发到客户端失败: {e}")
+
+                    # 并行执行双向转发和心跳
+                    await asyncio.gather(
+                        forward_to_k8s(),
+                        forward_to_client(),
+                        send_heartbeat()
+                    )
+                    break  # 成功连接并正常结束，退出重试循环
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"[WS Terminal] 连接失败，{retry_delay}秒后重试 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    await websocket.send_text(f"\x1b[33m警告: 连接中断，{retry_delay}秒后重试...\x1b[0m\r\n")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # 指数退避
+                else:
+                    logger.error(f"[WS Terminal] K8s WebSocket连接失败，已达最大重试次数: {e}")
+                    await websocket.send_text(f"\x1b[31mError: 无法连接到终端 - {str(e)}\x1b[0m\r\n")
+                    await websocket.close()
+
+    finally:
+        db.close()
 
 
 # ============ Task Management ============
@@ -481,15 +694,16 @@ async def get_secmate_ng_logs(
 @router.get("/projects/{project_id}/tasks", response_model=TaskListResponse)
 async def list_tasks(
     project_id: str = Path(..., description="项目ID"),
-    status: Optional[str] = Query(None, description="按状态过滤"),
+    status_filter: Optional[str] = Query(None, alias="status", description="按状态过滤"),
     task_type: Optional[str] = Query(None, alias="type", description="按类型过滤"),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """查询任务列表"""
     query = db.query(Task).filter(Task.project_id == project_id)
 
-    if status:
-        query = query.filter(Task.status == status)
+    if status_filter:
+        query = query.filter(Task.status == status_filter)
     if task_type:
         query = query.filter(Task.type == task_type)
 
@@ -505,6 +719,7 @@ async def list_tasks(
 async def get_task(
     project_id: str = Path(..., description="项目ID"),
     task_id: str = Path(..., description="任务ID"),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """查询任务详情"""
@@ -523,6 +738,7 @@ async def get_task(
 async def delete_task(
     project_id: str = Path(..., description="项目ID"),
     task_id: str = Path(..., description="任务ID"),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """删除任务"""
@@ -534,7 +750,6 @@ async def delete_task(
     if not task:
         raise NotFoundError("任务", task_id)
 
-    # 使用任务管理器删除
     task_manager = get_task_manager()
     if not task_manager.delete_task(task_id):
         raise NotFoundError("任务", task_id)

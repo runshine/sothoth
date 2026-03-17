@@ -1,5 +1,5 @@
 """
-SecMate-NG Manager - 主入口
+Secmate-NG Manager - 主入口
 """
 
 import logging
@@ -16,9 +16,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import load_config, get_config
 from app.exception import setup_exception_handlers
 from app.model import init_database
-from app.services.k8s import get_k8s_service
+from app.services.k8s_api_client import get_k8s_api_client
 from app.services.task_manager import get_task_manager
 from app.api.secmate_ng import router as secmate_ng_router
+from app.utils.health import check_k8s_api_health
 
 # 配置日志
 logging.basicConfig(
@@ -127,7 +128,7 @@ async def periodic_register():
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 启动时执行
-    logger.info("正在启动SecMate-NG Manager服务...")
+    logger.info("正在启动Secmate-NG Manager服务...")
 
     # 加载配置
     try:
@@ -148,16 +149,14 @@ async def lifespan(app: FastAPI):
         logger.error(f"数据库初始化失败: {e}")
         sys.exit(1)
 
-    # 验证K8S连接
+    # 验证K8s API连接
     try:
-        k8s_service = get_k8s_service()
-        if not k8s_service.connect():
-            logger.error("K8S连接验证失败")
-            sys.exit(1)
-        logger.info("K8S连接验证成功")
+        if not check_k8s_api_health():
+            logger.warning("K8s API服务健康检查失败，但服务仍将启动")
+        else:
+            logger.info("K8s API服务健康检查成功")
     except Exception as e:
-        logger.error(f"K8S连接验证失败: {e}")
-        sys.exit(1)
+        logger.warning(f"K8s API服务健康检查异常: {e}")
 
     # 启动任务管理器
     try:
@@ -176,12 +175,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"菜单服务注册失败: {e}")
 
-    logger.info("SecMate-NG Manager服务启动成功")
+    logger.info("Secmate-NG Manager服务启动成功")
 
     yield
 
     # 关闭时执行
-    logger.info("正在关闭SecMate-NG Manager服务...")
+    logger.info("正在关闭Secmate-NG Manager服务...")
 
     # 停止任务管理器
     try:
@@ -191,22 +190,34 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"停止任务管理器失败: {e}")
 
+    # 关闭K8s API客户端
+    try:
+        k8s_client = get_k8s_api_client()
+        k8s_client.close()
+        logger.info("K8s API客户端已关闭")
+    except Exception as e:
+        logger.warning(f"关闭K8s API客户端失败: {e}")
+
 
 # 创建FastAPI应用
 app = FastAPI(
-    title="SecMate-NG Manager",
-    description="提供SecMate-NG实例的创建、销毁、重建、状态查询、日志查看等功能",
+    title="Secmate-NG Manager",
+    description="提供Secmate-NG实例的创建、销毁、重建、状态查询、日志查看、终端访问等功能",
     version="1.0.0",
     lifespan=lifespan,
 )
 
 # 添加CORS中间件
+# 根据调试模式决定CORS策略
+config = get_config()
+allowed_origins = ["*"] if config.app.debug else config.app.allowed_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept"],
 )
 
 # 注册异常处理器

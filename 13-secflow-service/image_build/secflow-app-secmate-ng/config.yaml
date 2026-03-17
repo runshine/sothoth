@@ -1,17 +1,19 @@
-# SecMate-NG Manager 配置文件
+# Secmate-NG Manager 配置文件
 
 # 应用配置
 app:
   host: "0.0.0.0"
   port: 10011
   debug: false
+  # CORS允许的源列表（生产环境使用，开发模式下自动允许所有源）
+  allowed_origins:
+    - "https://secmate-ng.sothothv2.com"
+    - "http://localhost:3000"
 
 # 数据库配置 (支持 mysql 和 sqlite)
 database:
-  # 数据库类型: mysql 或 sqlite
   type: "mysql"
-  # MySQL配置（当type为mysql时使用）
-  host: 172.31.30.100"
+  host: "172.31.30.100"
   port: 3306
   username: "secflow"
   password: "Huawei12#$"
@@ -19,64 +21,38 @@ database:
   table_prefix: "secflow_app_secmate_ng_"
   pool_size: 10
   max_overflow: 20
-  # SQLite配置（当type为sqlite时使用）
-  path: "./SecMateNG_manager.db"
+  path: "./secmate_ng_manager.db"
 
-# Kubernetes配置
-kubernetes:
-  # 是否在K8S集群内运行
-  in_cluster: false
-  # kubeconfig路径（集群外运行时使用，null表示使用默认~/.kube/config）
-  kubeconfig: null
-  connection_timeout: 30
+# K8s API Service配置（通过secflow-platform-k8s管理K8s资源）
+k8s_api_service:
+  host: "secflow-platform-k8s"
+  port: 80
+  timeout: 30
+  use_user_token: true
 
-# SecMate-NG配置
+# 认证服务配置
+auth_service:
+  enabled: true
+  host: "secflow-platform-auth"
+  port: 80
+  validate_token_path: "/api/auth/validate-human-token"
+  timeout: 10
+  token_cache_enabled: true
+  token_cache_ttl_minutes: 15
+
+# Secmate-NG配置
 secmate_ng:
-  # 默认镜像
-  image: "ghcr.io/skiyer/deepsight:latest"
-  # 镜像拉取策略: Always, IfNotPresent, Never
+  image: "your-registry/secmate-ng:latest"
   image_pull_policy: "Always"
-  # 服务类型: ClusterIP, NodePort, LoadBalancer
   service_type: "ClusterIP"
-  # 服务端口
   service_port: 80
-  # 容器端口（secmate-ng默认端口）
-  container_port: 8080
-  # 默认环境变量
-  env:
-    ANTHROPIC_BASE_URL: "http://192.168.12.90:3000"
-    ANTHROPIC_AUTH_TOKEN: "sk-SRhGNgYtCjlEsGh8wuiVVLvFyBMHIdcJgFNWV3EwHXhah6Zn"
-    ANTHROPIC_MODEL: "minimax/minimax-m2.1"
-    ANTHROPIC_SMALL_FAST_MODEL: "minimax/minimax-m2.1"
-    ANTHROPIC_DEFAULT_SONNET_MODEL: "minimax/minimax-m2.1"
-    ANTHROPIC_DEFAULT_OPUS_MODEL: "minimax/minimax-m2.1"
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: "minimax/minimax-m2.1"
-    API_TIMEOUT_MS: "3000000"
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
-  # secmate-ng 镜像环境变量配置
-  # 参考: https://docs.linuxserver.io/images/docker-secmate-ng/
-  secmate_ng_env:
-    # 用户ID
-    PUID: 1000
-    # 组ID
-    PGID: 1000
-    # 时区
+  container_port: 80
+  # 通用环境变量（所有实例共享）
+  common_env:
+    LOG_LEVEL: "INFO"
     TZ: "Asia/Shanghai"
-    # Web GUI密码（如果未设置，将随机生成）
-    # PASSWORD: ""
-    # 哈希密码（优先级高于PASSWORD）
-    # HASHED_PASSWORD: ""
-    # Sudo密码（如果未设置，将随机生成）
-    # SUDO_PASSWORD: ""
-    # Sudo哈希密码（优先级高于SUDO_PASSWORD）
-    # SUDO_PASSWORD_HASH: ""
-    # 代理域名（用于子域名代理）
-    # PROXY_DOMAIN: ""
-    # 默认工作空间
-    DEFAULT_WORKSPACE: "/config/workspace"
-    # PWA应用名称
-    PWA_APPNAME: "secmate-ng"
-  # 资源限制
+  # Secmate-NG 特定环境变量（镜像默认值）
+  default_secmate_env: {}
   resources:
     requests:
       cpu: "100m"
@@ -87,31 +63,21 @@ secmate_ng:
 
 # PVC配置
 pvc:
-  # 输出PVC的StorageClass（必填）
   storage_class: "standard"
-  # 输出PVC大小（默认5Gi）
   storage_size: "5Gi"
-  # 访问模式
   access_mode: "ReadWriteOnce"
 
 # Ingress配置
 ingress:
-  # 基础域名
   base_domain: "secmate-ng.sothothv2.com"
-  # TLS证书Secret名称
   tls_secret_name: "wildcard-secmate-ng.sothothv2.com-tls"
-  # Ingress Class名称
   ingress_class: "nginx"
-  # 是否启用TLS
   tls_enabled: true
 
 # 任务管理配置
 tasks:
-  # 任务保留天数（完成的任务保留时间）
   retention_days: 7
-  # 任务清理间隔（小时）
   cleanup_interval_hours: 24
-  # 最大并发任务数
   max_concurrent_tasks: 10
 
 # 日志配置
@@ -123,27 +89,24 @@ logging:
 registry:
   enabled: true
   menu_service_url: "http://secflow-platform-menu:80"
-  service_id: "secflow-app-secmate-ng"
-  service_name: "secmate-ng Web管理器"
+  service_id: "secmate-ng-manager"
+  service_name: "Secmate-NG管理器"
   host: "0.0.0.0"
-  port: 10004
-  maturity: "开发中"  # 可选: 已上线、开发中、规划中
-  description: "secmate-ng Web实例管理微服务"
-  api_prefix: "/api/secmate-ng"
+  port: 10011
+  maturity: "开发中"
+  description: "Secmate-NG实例管理微服务"
+  api_prefix: "/api/app/secmate-ng"
   menu:
-    id: "secmate-ng-web-manager"
-    path: "/secmate-ng-web-manager"
-    icon: "code"
-    order: 10
-    # 一级菜单
+    id: "secmate-ng-manager"
+    path: "/secmate-ng-manager"
+    icon: "security"
+    order: 20
     level1:
-      name: "开发工具"
-      name_en: "DevTools"
-    # 二级菜单
+      name: "安全工具"
+      name_en: "SecurityTools"
     level2:
-      name: "secmate-ng Web"
-      name_en: "secmate-ng Web"
-    # 三级菜单（可选）
+      name: "Secmate-NG"
+      name_en: "Secmate-NG"
     level3:
       name: null
       name_en: null
