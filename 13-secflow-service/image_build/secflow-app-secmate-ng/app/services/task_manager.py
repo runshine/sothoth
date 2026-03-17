@@ -1,5 +1,5 @@
 """
-SecMate-NG Manager - 任务管理服务
+Secmate-NG Manager - 任务管理服务
 """
 
 import logging
@@ -13,10 +13,10 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.model import (
-    get_db_session, generate_id, SecMateNG, Task,
-    SecMateNGStatus, TaskStatus, TaskType
+    get_db_session, generate_id, SecmateNg, Task,
+    SecmateNgStatus, TaskStatus, TaskType
 )
-from app.services.k8s import get_k8s_service
+from app.services.k8s_api_client import get_k8s_api_client
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ class TaskManager:
     def __init__(self):
         self.config = get_config()
         self.executor = ThreadPoolExecutor(max_workers=self.config.tasks.max_concurrent_tasks)
-        self.running_tasks: Dict[str, Any] = {}  # task_id -> Future
+        self.running_tasks: Dict[str, Any] = {}
         self.lock = threading.Lock()
         self.cleanup_thread: Optional[threading.Thread] = None
         self.running = False
@@ -35,26 +35,18 @@ class TaskManager:
     def start(self):
         """启动任务管理器"""
         self.running = True
-
-        # 恢复运行中的任务状态
         self._recover_tasks()
-
-        # 启动清理线程
         self.cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
         self.cleanup_thread.start()
-
         logger.info("任务管理器启动成功")
 
     def stop(self):
         """停止任务管理器"""
         self.running = False
-
-        # 等待所有任务完成
         with self.lock:
             for task_id, future in list(self.running_tasks.items()):
                 if not future.done():
                     logger.warning(f"等待任务 {task_id} 完成...")
-
         self.executor.shutdown(wait=True)
         logger.info("任务管理器已停止")
 
@@ -67,7 +59,6 @@ class TaskManager:
             ).all()
 
             for task in running_tasks:
-                # 标记为失败
                 task.status = TaskStatus.FAILED.value
                 task.error_message = "服务重启，任务中断"
                 task.completed_at = datetime.utcnow()
@@ -85,7 +76,7 @@ class TaskManager:
                 time.sleep(self.config.tasks.cleanup_interval_hours * 3600)
             except Exception as e:
                 logger.error(f"清理任务失败: {e}")
-                time.sleep(3600)  # 出错后1小时再尝试
+                time.sleep(3600)
 
     def _cleanup_old_tasks(self):
         """清理旧的任务记录"""
@@ -107,7 +98,7 @@ class TaskManager:
             db.close()
 
     def create_task(self, project_id: str, task_type: str, params: Dict[str, Any],
-                   secmate_ng_id: str = None, secmate_ng_name: str = None) -> Task:
+                   secmate_id: str = None, secmate_name: str = None) -> Task:
         """创建任务"""
         db = get_db_session()
         try:
@@ -116,14 +107,13 @@ class TaskManager:
                 project_id=project_id,
                 type=task_type,
                 status=TaskStatus.PENDING.value,
-                secmate_ng_id=secmate_ng_id,
-                secmate_ng_name=secmate_ng_name,
+                secmate_id=secmate_id,
+                secmate_name=secmate_name,
                 params=params
             )
             db.add(task)
             db.commit()
 
-            # 提交到线程池执行
             future = self.executor.submit(self._execute_task, task.id)
 
             with self.lock:
@@ -142,7 +132,6 @@ class TaskManager:
                 logger.error(f"任务 {task_id} 不存在")
                 return
 
-            # 更新状态为运行中
             task.status = TaskStatus.RUNNING.value
             task.started_at = datetime.utcnow()
             db.commit()
@@ -150,7 +139,6 @@ class TaskManager:
             logger.info(f"开始执行任务 {task_id}: {task.type}")
 
             try:
-                # 根据任务类型执行
                 if task.type == TaskType.CREATE.value:
                     result = self._handle_create_task(task, db)
                 elif task.type == TaskType.DELETE.value:
@@ -160,7 +148,6 @@ class TaskManager:
                 else:
                     raise ValueError(f"未知任务类型: {task.type}")
 
-                # 标记为完成
                 task.status = TaskStatus.COMPLETED.value
                 task.result = str(result) if result else None
                 task.completed_at = datetime.utcnow()
@@ -183,41 +170,40 @@ class TaskManager:
     def _handle_create_task(self, task: Task, db: Session) -> str:
         """处理创建任务"""
         params = task.params or {}
-        secmate_ng_id = params.get("secmate_ng_id")
-        namespace = params.get("namespace")
-        name = params.get("name")
+        secmate_id = params.get("secmate_id")
         custom_env = params.get("custom_env") or {}
-        # 注入PROJECT_ID环境变量
         custom_env["PROJECT_ID"] = task.project_id
-        secmate_ng_env = params.get("secmate_ng_env") or {}
-        image = params.get("image")  # 获取自定义镜像参数
+        secmate_env = params.get("secmate_env") or {}
+        image = params.get("image")
+        user_token = params.get("user_token")
+        project_id = task.project_id
 
-        k8s_service = get_k8s_service()
+        k8s_client = get_k8s_api_client()
 
-        # 获取SecMate-NG记录
-        secmate_ng = db.query(SecMateNG).filter(SecMateNG.id == secmate_ng_id).first()
-        if not secmate_ng:
-            raise ValueError(f"SecMate-NG {secmate_ng_id} 不存在")
+        secmate = db.query(SecmateNg).filter(SecmateNg.id == secmate_id).first()
+        if not secmate:
+            raise ValueError(f"SecmateNg {secmate_id} 不存在")
 
         try:
-            # 更新状态
-            secmate_ng.status = SecMateNGStatus.CREATING.value
+            secmate.status = SecmateNgStatus.CREATING.value
             db.commit()
 
-            # 1. 创建输出PVC（如果不存在）
+            # 1. 创建输出PVC
             output_pvcs_config = []
-            for pvc_info in secmate_ng.output_pvcs or []:
+            for pvc_info in secmate.output_pvcs or []:
                 pvc_name = pvc_info.get("pvc_name")
                 storage_size = pvc_info.get("storage_size") or self.config.pvc.storage_size
 
                 if not pvc_name:
-                    # 生成PVC名称
-                    pvc_name = f"{name}-output-{len(output_pvcs_config)}"
+                    pvc_name = f"{secmate.name}-output-{len(output_pvcs_config)}"
 
-                # 检查并创建PVC
-                if not k8s_service.check_pvc_exists(namespace, pvc_name):
-                    if not k8s_service.create_pvc(namespace, pvc_name, storage_size):
-                        raise RuntimeError(f"创建PVC {pvc_name} 失败")
+                pvc_manifest = self._build_pvc_manifest(pvc_name, storage_size)
+                
+                try:
+                    k8s_client.create_pvc(project_id, pvc_manifest, user_token)
+                except Exception as e:
+                    if "already exists" not in str(e).lower():
+                        raise
 
                 output_pvcs_config.append({
                     "pvc_name": pvc_name,
@@ -225,165 +211,360 @@ class TaskManager:
                     "created": True
                 })
 
-            # 更新PVC信息
-            secmate_ng.output_pvcs = output_pvcs_config
+            secmate.output_pvcs = output_pvcs_config
             db.commit()
 
             # 2. 创建Deployment
-            deployment_name = f"secmate-ng-{name}"
-            success, final_env = k8s_service.create_deployment(
-                namespace=namespace,
-                name=deployment_name,
-                secmate_ng_id=secmate_ng_id,
-                source_pvcs=secmate_ng.source_pvcs or [],
-                output_pvcs=output_pvcs_config,
-                custom_env=custom_env,
-                secmate_ng_env=secmate_ng_env,
-                image=image  # 传递自定义镜像参数
+            deployment_name = f"secmate-ng-{secmate.name}"
+            deployment_manifest = self._build_deployment_manifest(
+                secmate, deployment_name, secmate_id, output_pvcs_config, custom_env, secmate_env, image
             )
-            if not success:
-                raise RuntimeError(f"创建Deployment {deployment_name} 失败")
-
-            secmate_ng.deployment_name = deployment_name
-            # 保存实际使用的环境变量（包含密码）
-            secmate_ng.secmate_ng_env = final_env
+            k8s_client.create_deployment(project_id, deployment_manifest, user_token)
+            secmate.deployment_name = deployment_name
             db.commit()
 
             # 3. 创建Service
-            service_name = f"secmate-ng-{name}"
-            cluster_ip = k8s_service.create_service(namespace, service_name, secmate_ng_id)
-            if not cluster_ip:
-                raise RuntimeError(f"创建Service {service_name} 失败")
-
-            secmate_ng.service_name = service_name
+            service_name = f"secmate-ng-{secmate.name}"
+            service_manifest = self._build_service_manifest(service_name, secmate_id)
+            k8s_client.create_service(project_id, service_manifest, user_token)
+            secmate.service_name = service_name
             db.commit()
 
             # 4. 创建Ingress
-            ingress_name = f"secmate-ng-{name}"
-            host = k8s_service.create_ingress(namespace, ingress_name, secmate_ng_id, service_name)
-            if not host:
-                raise RuntimeError(f"创建Ingress {ingress_name} 失败")
+            ingress_name = f"secmate-ng-{secmate.name}"
+            ingress_manifest = self._build_ingress_manifest(ingress_name, secmate_id, service_name)
+            k8s_client.create_ingress(project_id, ingress_manifest, user_token)
+            
+            host = f"{secmate_id}.{self.config.ingress.base_domain}"
+            secmate.ingress_name = ingress_name
+            secmate.access_url = f"https://{host}" if self.config.ingress.tls_enabled else f"http://{host}"
 
-            secmate_ng.ingress_name = ingress_name
-            secmate_ng.access_url = f"https://{host}" if self.config.ingress.tls_enabled else f"http://{host}"
+            # 5. 获取Pod信息
+            time.sleep(2)
+            pods = k8s_client.get_pods_by_deployment(
+                project_id,
+                f"app=secmate-ng,secmate-id={secmate_id}",
+                user_token
+            )
+            if pods:
+                secmate.pod_name = pods[0].get("name")
 
-            # 5. 获取Pod名称
-            pod_info = k8s_service.get_pod_by_deployment(namespace, deployment_name)
-            if pod_info:
-                secmate_ng.pod_name = pod_info.get("name")
-
-            # 6. 更新状态为运行中
-            secmate_ng.status = SecMateNGStatus.RUNNING.value
+            secmate.status = SecmateNgStatus.RUNNING.value
             db.commit()
 
-            return f"SecMate-NG {name} 创建成功，访问地址: {secmate_ng.access_url}"
+            return f"SecmateNg {secmate.name} 创建成功，访问地址: {secmate.access_url}"
 
         except Exception as e:
-            secmate_ng.status = SecMateNGStatus.ERROR.value
+            secmate.status = SecmateNgStatus.ERROR.value
             db.commit()
             raise
 
     def _handle_delete_task(self, task: Task, db: Session) -> str:
         """处理删除任务"""
         params = task.params or {}
-        secmate_ng_id = params.get("secmate_ng_id")
+        secmate_id = params.get("secmate_id")
         delete_output_pvcs = params.get("delete_output_pvcs", False)
+        user_token = params.get("user_token")
+        project_id = task.project_id
 
-        k8s_service = get_k8s_service()
+        k8s_client = get_k8s_api_client()
 
-        # 获取SecMate-NG记录
-        secmate_ng = db.query(SecMateNG).filter(SecMateNG.id == secmate_ng_id).first()
-        if not secmate_ng:
-            raise ValueError(f"SecMate-NG {secmate_ng_id} 不存在")
-
-        namespace = secmate_ng.namespace
+        secmate = db.query(SecmateNg).filter(SecmateNg.id == secmate_id).first()
+        if not secmate:
+            raise ValueError(f"SecmateNg {secmate_id} 不存在")
 
         try:
             # 1. 删除Ingress
-            if secmate_ng.ingress_name:
-                k8s_service.delete_ingress(namespace, secmate_ng.ingress_name)
+            if secmate.ingress_name:
+                k8s_client.delete_ingress(project_id, secmate.ingress_name, user_token)
 
             # 2. 删除Service
-            if secmate_ng.service_name:
-                k8s_service.delete_service(namespace, secmate_ng.service_name)
+            if secmate.service_name:
+                k8s_client.delete_service(project_id, secmate.service_name, user_token)
 
             # 3. 删除Deployment
-            if secmate_ng.deployment_name:
-                k8s_service.delete_deployment(namespace, secmate_ng.deployment_name)
+            if secmate.deployment_name:
+                k8s_client.delete_deployment(project_id, secmate.deployment_name, user_token)
 
             # 4. 删除PVC（如果需要）
             if delete_output_pvcs:
-                for pvc_info in secmate_ng.output_pvcs or []:
+                for pvc_info in secmate.output_pvcs or []:
                     pvc_name = pvc_info.get("pvc_name")
                     if pvc_name:
-                        k8s_service.delete_pvc(namespace, pvc_name)
+                        k8s_client.delete_pvc(project_id, pvc_name, user_token)
 
-            # 5. 更新状态为已删除
-            secmate_ng.status = SecMateNGStatus.DELETED.value
-            secmate_ng.access_url = None
-            secmate_ng.pod_name = None
-            secmate_ng.deleted_at = datetime.utcnow()
+            # 5. 更新状态
+            secmate.status = SecmateNgStatus.DELETED.value
+            secmate.access_url = None
+            secmate.pod_name = None
+            secmate.deleted_at = datetime.utcnow()
             db.commit()
 
-            return f"SecMate-NG {secmate_ng.name} 删除成功"
+            return f"SecmateNg {secmate.name} 删除成功"
 
         except Exception as e:
-            secmate_ng.status = SecMateNGStatus.ERROR.value
+            secmate.status = SecmateNgStatus.ERROR.value
             db.commit()
             raise
 
     def _handle_restart_task(self, task: Task, db: Session) -> str:
         """处理重建任务"""
         params = task.params or {}
-        secmate_ng_id = params.get("secmate_ng_id")
+        secmate_id = params.get("secmate_id")
+        user_token = params.get("user_token")
+        project_id = task.project_id
 
-        k8s_service = get_k8s_service()
+        k8s_client = get_k8s_api_client()
 
-        # 获取SecMate-NG记录
-        secmate_ng = db.query(SecMateNG).filter(SecMateNG.id == secmate_ng_id).first()
-        if not secmate_ng:
-            raise ValueError(f"SecMate-NG {secmate_ng_id} 不存在")
+        secmate = db.query(SecmateNg).filter(SecmateNg.id == secmate_id).first()
+        if not secmate:
+            raise ValueError(f"SecmateNg {secmate_id} 不存在")
 
-        if not secmate_ng.deployment_name:
-            raise ValueError("SecMate-NG没有关联的Deployment")
+        if not secmate.deployment_name:
+            raise ValueError("SecmateNg没有关联的Deployment")
 
         try:
-            # 保存当前状态
-            old_status = secmate_ng.status
-            secmate_ng.status = SecMateNGStatus.PENDING.value
+            old_status = secmate.status
+            secmate.status = SecmateNgStatus.PENDING.value
             db.commit()
 
-            # 1. 缩容到0
-            if not k8s_service.scale_deployment(
-                secmate_ng.namespace, secmate_ng.deployment_name, 0
-            ):
-                raise RuntimeError("缩容Deployment失败")
+            # 使用restart API
+            k8s_client.restart_deployment(project_id, secmate.deployment_name, user_token)
 
-            # 等待Pod终止
+            # 等待并获取新Pod
             time.sleep(5)
-
-            # 2. 扩容到1
-            if not k8s_service.scale_deployment(
-                secmate_ng.namespace, secmate_ng.deployment_name, 1
-            ):
-                raise RuntimeError("扩容Deployment失败")
-
-            # 3. 更新Pod名称
-            pod_info = k8s_service.get_pod_by_deployment(
-                secmate_ng.namespace, secmate_ng.deployment_name
+            pods = k8s_client.get_pods_by_deployment(
+                project_id,
+                f"app=secmate-ng,secmate-id={secmate_id}",
+                user_token
             )
-            if pod_info:
-                secmate_ng.pod_name = pod_info.get("name")
+            if pods:
+                secmate.pod_name = pods[0].get("name")
 
-            secmate_ng.status = SecMateNGStatus.RUNNING.value
+            secmate.status = SecmateNgStatus.RUNNING.value
             db.commit()
 
-            return f"SecMate-NG {secmate_ng.name} 重建成功"
+            return f"SecmateNg {secmate.name} 重建成功"
 
         except Exception as e:
-            secmate_ng.status = old_status if 'old_status' in locals() else SecMateNGStatus.ERROR.value
+            secmate.status = old_status if 'old_status' in locals() else SecmateNgStatus.ERROR.value
             db.commit()
             raise
+
+    def _build_pvc_manifest(self, pvc_name: str, storage_size: str) -> dict:
+        """构建PVC manifest"""
+        return {
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": pvc_name,
+                "labels": {
+                    "app": "secmate-ng",
+                    "managed-by": "secmate-ng-manager"
+                }
+            },
+            "spec": {
+                "accessModes": [self.config.pvc.access_mode],
+                "resources": {
+                    "requests": {
+                        "storage": storage_size
+                    }
+                },
+                "storageClassName": self.config.pvc.storage_class
+            }
+        }
+
+    def _build_deployment_manifest(self, secmate: SecmateNg, name: str, secmate_id: str,
+                                   output_pvcs: list, custom_env: dict, secmate_env: dict,
+                                   image: str = None) -> dict:
+        """构建Deployment manifest"""
+        config = self.config.secmate_ng
+
+        volumes = []
+        volume_mounts = []
+        volume_index = 0
+
+        # 源码PVC
+        for pvc_info in secmate.source_pvcs or []:
+            volume_name = f"source-volume-{volume_index}"
+            volumes.append({
+                "name": volume_name,
+                "persistentVolumeClaim": {
+                    "claimName": pvc_info["pvc_name"]
+                }
+            })
+            volume_mounts.append({
+                "name": volume_name,
+                "mountPath": pvc_info["mount_path"]
+            })
+            volume_index += 1
+
+        # 输出PVC
+        for pvc_info in output_pvcs:
+            volume_name = f"output-volume-{volume_index}"
+            volumes.append({
+                "name": volume_name,
+                "persistentVolumeClaim": {
+                    "claimName": pvc_info["pvc_name"]
+                }
+            })
+            volume_mounts.append({
+                "name": volume_name,
+                "mountPath": pvc_info["mount_path"]
+            })
+            volume_index += 1
+
+        # 构建环境变量（优先级：custom_env > secmate_env > default_secmate_env > common_env）
+        env = []
+
+        # 1. 添加通用环境变量（最低优先级）
+        for key, value in config.common_env.items():
+            env.append({"name": key, "value": str(value)})
+
+        # 2. 添加默认 Secmate-NG 环境变量
+        for key, value in config.default_secmate_env.items():
+            if key not in [e["name"] for e in env]:  # 不覆盖 common_env
+                env.append({"name": key, "value": str(value)})
+
+        # 3. 添加用户自定义的 Secmate-NG 环境变量（更高优先级）
+        for key, value in secmate_env.items():
+            # 移除已存在的同名环境变量
+            env = [e for e in env if e["name"] != key]
+            env.append({"name": key, "value": str(value)})
+
+        # 4. 添加 custom_env（最高优先级，包含 PROJECT_ID 等）
+        for key, value in custom_env.items():
+            # 移除已存在的同名环境变量
+            env = [e for e in env if e["name"] != key]
+            env.append({"name": key, "value": str(value)})
+
+        container_image = image if image else config.image
+
+        return {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": name,
+                "labels": {
+                    "app": "secmate-ng",
+                    "secmate-id": secmate_id,
+                    "managed-by": "secmate-ng-manager"
+                }
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": {
+                    "matchLabels": {
+                        "app": "secmate-ng",
+                        "secmate-id": secmate_id
+                    }
+                },
+                "template": {
+                    "metadata": {
+                        "labels": {
+                            "app": "secmate-ng",
+                            "secmate-id": secmate_id
+                        }
+                    },
+                    "spec": {
+                        "containers": [{
+                            "name": "secmate-ng",
+                            "image": container_image,
+                            "imagePullPolicy": config.image_pull_policy,
+                            "ports": [{
+                                "containerPort": config.container_port,
+                                "name": "http"
+                            }],
+                            "env": env,
+                            "volumeMounts": volume_mounts,
+                            "resources": config.resources
+                        }],
+                        "volumes": volumes
+                    }
+                }
+            }
+        }
+
+    def _build_service_manifest(self, name: str, secmate_id: str) -> dict:
+        """构建Service manifest"""
+        config = self.config.secmate_ng
+        return {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": name,
+                "labels": {
+                    "app": "secmate-ng",
+                    "secmate-id": secmate_id,
+                    "managed-by": "secmate-ng-manager"
+                }
+            },
+            "spec": {
+                "type": config.service_type,
+                "selector": {
+                    "app": "secmate-ng",
+                    "secmate-id": secmate_id
+                },
+                "ports": [{
+                    "port": config.service_port,
+                    "targetPort": config.container_port,
+                    "protocol": "TCP",
+                    "name": "http"
+                }]
+            }
+        }
+
+    def _build_ingress_manifest(self, name: str, secmate_id: str, service_name: str) -> dict:
+        """构建Ingress manifest"""
+        config = self.config.ingress
+        host = f"{secmate_id}.{config.base_domain}"
+
+        ingress = {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {
+                "name": name,
+                "labels": {
+                    "app": "secmate-ng",
+                    "secmate-id": secmate_id,
+                    "managed-by": "secmate-ng-manager"
+                },
+                "annotations": {
+                    "nginx.ingress.kubernetes.io/proxy-body-size": "100m",
+                    "nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+                    "nginx.ingress.kubernetes.io/proxy-send-timeout": "3600",
+                    "nginx.ingress.kubernetes.io/backend-protocol": "HTTP"
+                }
+            },
+            "spec": {
+                "ingressClassName": config.ingress_class,
+                "rules": [{
+                    "host": host,
+                    "http": {
+                        "paths": [{
+                            "path": "/",
+                            "pathType": "Prefix",
+                            "backend": {
+                                "service": {
+                                    "name": service_name,
+                                    "port": {
+                                        "number": self.config.secmate_ng.service_port
+                                    }
+                                }
+                            }
+                        }]
+                    }
+                }]
+            }
+        }
+
+        if config.tls_enabled and config.tls_secret_name:
+            ingress["spec"]["tls"] = [{
+                "hosts": [host],
+                "secretName": config.tls_secret_name
+            }]
+
+        return ingress
 
     def delete_task(self, task_id: str) -> bool:
         """删除任务"""
@@ -393,7 +574,6 @@ class TaskManager:
             if not task:
                 return False
 
-            # 如果在运行中，取消它
             with self.lock:
                 if task_id in self.running_tasks:
                     future = self.running_tasks[task_id]
@@ -408,7 +588,6 @@ class TaskManager:
             db.close()
 
 
-# 单例实例
 _task_manager: Optional[TaskManager] = None
 
 

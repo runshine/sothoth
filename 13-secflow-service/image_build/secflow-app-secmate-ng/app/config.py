@@ -1,5 +1,5 @@
 """
-SecMate-NG Manager - 配置模块
+Secmate-NG Manager - 配置模块
 """
 
 import os
@@ -18,51 +18,80 @@ class DatabaseConfig(BaseModel):
     port: int = 3306
     username: str = "root"
     password: str = ""
-    name: str = "SecMateNG_manager"
-    table_prefix: str = "secmate_ng_"
+    name: str = "secmate_ng_manager"
+    table_prefix: str = "secflow_app_secmate_ng_"
     pool_size: int = 10
     max_overflow: int = 20
     # SQLite配置
-    path: str = "./SecMateNG_manager.db"
+    path: str = "./secmate_ng_manager.db"
 
     @property
     def url(self) -> str:
-        """生成数据库连接URL"""
+        """
+        生成数据库连接URL
+
+        支持环境变量覆盖配置文件中的值：
+        - DB_HOST: 数据库主机
+        - DB_PORT: 数据库端口
+        - DB_USERNAME: 数据库用户名
+        - DB_PASSWORD: 数据库密码（强烈建议使用环境变量）
+        - DB_NAME: 数据库名称
+
+        优先级：环境变量 > 配置文件值
+        """
+        # 支持环境变量覆盖（向后兼容）
+        host = os.getenv("DB_HOST", self.host)
+        port = int(os.getenv("DB_PORT", str(self.port)))
+        username = os.getenv("DB_USERNAME", self.username)
+        password = os.getenv("DB_PASSWORD", self.password)
+        name = os.getenv("DB_NAME", self.name)
+
         if self.type == "mysql":
-            return f"mysql+pymysql://{self.username}:{self.password}@{self.host}:{self.port}/{self.name}"
+            return f"mysql+pymysql://{username}:{password}@{host}:{port}/{name}"
         else:
             return f"sqlite:///{self.path}"
 
 
-class KubernetesConfig(BaseModel):
-    """K8S配置"""
-    in_cluster: bool = False
-    kubeconfig: Optional[str] = None
-    connection_timeout: int = 30
+class K8sApiServiceConfig(BaseModel):
+    """K8s API Service配置（通过secflow-platform-k8s管理K8s资源）"""
+    host: str = "secflow-platform-k8s"
+    port: int = 80
+    timeout: int = 30
+    use_user_token: bool = True
+
+    @property
+    def base_url(self) -> str:
+        """生成API基础URL"""
+        return f"http://{self.host}:{self.port}"
 
 
-class SecMateNGResources(BaseModel):
-    """SecMate-NG资源限制"""
-    cpu: str = "100m"
-    memory: str = "256Mi"
+class AuthServiceConfig(BaseModel):
+    """认证服务配置"""
+    enabled: bool = True
+    host: str = "secflow-platform-auth"
+    port: int = 80
+    validate_token_path: str = "/api/auth/validate-human-token"
+    timeout: int = 10
+    token_cache_enabled: bool = True
+    token_cache_ttl_minutes: int = 15
+
+    @property
+    def validate_url(self) -> str:
+        """生成Token验证URL"""
+        return f"http://{self.host}:{self.port}{self.validate_token_path}"
 
 
-class SecMateNGConfig(BaseModel):
-    """SecMate-NG配置"""
-    image: str = "codercom/secmate-ng:latest"
+class SecmateNgConfig(BaseModel):
+    """Secmate-NG配置"""
+    image: str = "your-registry/secmate-ng:latest"
     image_pull_policy: str = "Always"
     service_type: str = "ClusterIP"  # ClusterIP, NodePort, LoadBalancer
     service_port: int = 80
-    container_port: int = 8080
-    env: Dict[str, str] = Field(default_factory=dict)
-    # SecMate-NG镜像专属环境变量配置
-    secmate_ng_env: Dict[str, Any] = Field(default_factory=lambda: {
-        "PUID": 1000,
-        "PGID": 1000,
-        "TZ": "Asia/Shanghai",
-        "DEFAULT_WORKSPACE": "/config/workspace",
-        "PWA_APPNAME": "secmate-ng"
-    })
+    container_port: int = 80
+    # 通用环境变量（所有实例共享）
+    common_env: Dict[str, str] = Field(default_factory=dict)
+    # Secmate-NG 特定环境变量（镜像默认值）
+    default_secmate_env: Dict[str, Any] = Field(default_factory=dict)
     resources: Dict[str, Dict[str, str]] = Field(default_factory=lambda: {
         "requests": {"cpu": "100m", "memory": "256Mi"},
         "limits": {"cpu": "1000m", "memory": "2Gi"}
@@ -94,8 +123,9 @@ class TasksConfig(BaseModel):
 class AppConfig(BaseModel):
     """应用配置"""
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 10011
     debug: bool = False
+    allowed_origins: list = Field(default_factory=list)  # CORS允许的源列表
 
 
 class LoggingConfig(BaseModel):
@@ -112,30 +142,27 @@ class MenuLevelConfig(BaseModel):
 
 class MenuConfig(BaseModel):
     """菜单配置"""
-    id: str = "vscode-web-manager"
-    path: str = "/vscode-web-manager"
-    icon: str = "code"
-    order: int = 0
+    id: str = "secmate-ng-manager"
+    path: str = "/secmate-ng-manager"
+    icon: str = "security"
+    order: int = 20
     parent_id: Optional[str] = None
-    # 一级菜单
-    level1: MenuLevelConfig = Field(default_factory=lambda: MenuLevelConfig(name="开发工具", name_en="DevTools"))
-    # 二级菜单
-    level2: MenuLevelConfig = Field(default_factory=lambda: MenuLevelConfig(name="VSCode Web", name_en="VSCode Web"))
-    # 三级菜单
+    level1: MenuLevelConfig = Field(default_factory=lambda: MenuLevelConfig(name="安全工具", name_en="SecurityTools"))
+    level2: MenuLevelConfig = Field(default_factory=lambda: MenuLevelConfig(name="Secmate-NG", name_en="Secmate-NG"))
     level3: MenuLevelConfig = Field(default_factory=MenuLevelConfig)
 
 
 class RegistryConfig(BaseModel):
     """服务注册配置"""
     enabled: bool = False
-    menu_service_url: str = "http://secflow-menu:5000"
-    service_id: str = "vscode-web-manager"
-    service_name: str = "VSCode Web管理器"
+    menu_service_url: str = "http://secflow-platform-menu:80"
+    service_id: str = "secmate-ng-manager"
+    service_name: str = "Secmate-NG管理器"
     host: str = "0.0.0.0"
-    port: int = 10004
-    maturity: str = "开发中"  # 可选: 已上线、开发中、规划中
-    description: str = "VSCode Web实例管理微服务"
-    api_prefix: str = "/api/secmate-ng"
+    port: int = 10011
+    maturity: str = "开发中"
+    description: str = "Secmate-NG实例管理微服务"
+    api_prefix: str = "/api/app/secmate-ng"
     menu: MenuConfig = Field(default_factory=MenuConfig)
 
 
@@ -143,8 +170,9 @@ class Config(BaseModel):
     """主配置类"""
     app: AppConfig = Field(default_factory=AppConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
-    kubernetes: KubernetesConfig = Field(default_factory=KubernetesConfig)
-    secmate_ng: SecMateNGConfig = Field(default_factory=SecMateNGConfig)
+    k8s_api_service: K8sApiServiceConfig = Field(default_factory=K8sApiServiceConfig)
+    auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
+    secmate_ng: SecmateNgConfig = Field(default_factory=SecmateNgConfig)
     pvc: PVCConfig = Field(default_factory=PVCConfig)
     ingress: IngressConfig = Field(default_factory=IngressConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
@@ -171,7 +199,6 @@ def load_config(config_path: Optional[str] = None) -> Config:
         return _config
 
     if config_path is None:
-        # 默认查找当前目录或父目录的config.yaml
         possible_paths = [
             "config.yaml",
             os.path.join(os.path.dirname(__file__), "..", "config.yaml"),
@@ -183,7 +210,6 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 break
 
     if config_path is None or not os.path.exists(config_path):
-        # 使用默认配置
         _config = Config()
         return _config
 

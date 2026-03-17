@@ -26,6 +26,37 @@ echo "----------------------"
 
 nohup ttyd -p 20002 -w / -W  /bin/bash 2>&1 >> /tmp/ttyd.log &
 
+# 启动 code-server
+echo "Starting code-server on port ${CODE_SERVER_PORT}..."
+# 加载 nvm 环境
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
+# 设置 code-server 密码
+if [ -z "$CODE_SERVER_PASSWORD" ]; then
+    # 生成随机密码
+    CODE_SERVER_PASSWORD=$(openssl rand -base64 12)
+    echo "Generated code-server password: ${CODE_SERVER_PASSWORD}"
+fi
+
+# 确定 code-server 工作目录
+CODE_SERVER_WORKDIR="${WORKDIR}"
+if [ -d "/host" ]; then
+    CODE_SERVER_WORKDIR="/host"
+fi
+
+# 启动 code-server
+nohup code-server \
+    --bind-addr 0.0.0.0:${CODE_SERVER_PORT} \
+    --auth password \
+    --disable-telemetry \
+    --disable-update-check \
+    ${CODE_SERVER_WORKDIR} \
+    2>&1 >> /tmp/code-server.log &
+
+echo "code-server started with workdir: ${CODE_SERVER_WORKDIR}"
+echo "code-server password: ${CODE_SERVER_PASSWORD}"
+
 # 设置权限
 if [ -d "/host" ]; then
     echo "Host directory mounted at /host"

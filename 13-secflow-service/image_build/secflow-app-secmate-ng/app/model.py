@@ -1,5 +1,5 @@
 """
-SecMate-NG Manager - 数据库模型
+Secmate-NG Manager - 数据库模型
 """
 
 import enum
@@ -25,8 +25,27 @@ from app.config import get_config
 Base = declarative_base()
 
 
-class SecMateNGStatus(str, enum.Enum):
-    """SecMate-NG状态"""
+def _get_table_name(base_name: str) -> str:
+    """
+    获取带前缀的表名
+
+    Args:
+        base_name: 基础表名
+
+    Returns:
+        带配置前缀的完整表名
+    """
+    try:
+        config = get_config()
+        prefix = config.database.table_prefix
+        return f"{prefix}{base_name}"
+    except Exception:
+        # 如果配置未加载，使用默认前缀
+        return f"secflow_app_secmate_ng_{base_name}"
+
+
+class SecmateNgStatus(str, enum.Enum):
+    """Secmate-NG状态"""
     PENDING = "pending"          # 等待创建
     CREATING = "creating"        # 创建中
     RUNNING = "running"          # 运行中
@@ -47,20 +66,20 @@ class TaskStatus(str, enum.Enum):
 
 class TaskType(str, enum.Enum):
     """任务类型"""
-    CREATE = "create"            # 创建SecMate-NG
-    DELETE = "delete"            # 删除SecMate-NG
-    RESTART = "restart"          # 重建SecMate-NG
+    CREATE = "create"            # 创建Secmate-NG
+    DELETE = "delete"            # 删除Secmate-NG
+    RESTART = "restart"          # 重建Secmate-NG
 
 
-class SecMateNG(Base):
-    """SecMate-NG实例模型"""
-    __tablename__ = "secmate_ngs"
+class SecmateNg(Base):
+    """Secmate-NG实例模型"""
+    __tablename__ = _get_table_name("secmate_ng_instances")
 
     id = Column(String(32), primary_key=True)
     project_id = Column(String(32), nullable=False, index=True)
     name = Column(String(64), nullable=False)
     namespace = Column(String(128), nullable=False)
-    status = Column(String(32), default=SecMateNGStatus.PENDING.value)
+    status = Column(String(32), default=SecmateNgStatus.PENDING.value)
 
     # PVC配置 (JSON格式)
     source_pvcs = Column(JSON, default=list)      # 源码PVC列表 [{"pvc_name": "...", "mount_path": "..."}]
@@ -77,7 +96,7 @@ class SecMateNG(Base):
 
     # 环境变量配置
     custom_env = Column(JSON, default=dict)          # 自定义环境变量
-    secmate_ng_env = Column(JSON, default=dict)     # SecMate-NG镜像环境变量配置
+    secmate_env = Column(JSON, default=dict)         # Secmate-NG镜像环境变量配置
 
     # 元数据
     description = Column(Text)
@@ -101,28 +120,28 @@ class SecMateNG(Base):
             "pod_name": self.pod_name,
             "access_url": self.access_url,
             "custom_env": self.custom_env or {},
-            "secmate_ng_env": self.secmate_ng_env or {},
+            "secmate_env": self.secmate_env or {},
             "description": self.description,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
 
     def __repr__(self):
-        return f"<SecMateNG(id={self.id}, name={self.name}, status={self.status})>"
+        return f"<SecmateNg(id={self.id}, name={self.name}, status={self.status})>"
 
 
 class Task(Base):
     """异步任务模型"""
-    __tablename__ = "tasks"
+    __tablename__ = _get_table_name("tasks")
 
     id = Column(String(32), primary_key=True)
     project_id = Column(String(32), nullable=False, index=True)
     type = Column(String(32), nullable=False)  # create, delete, restart
     status = Column(String(32), default=TaskStatus.PENDING.value)
 
-    # 关联的SecMate-NG
-    secmate_ng_id = Column(String(32), nullable=True)
-    secmate_ng_name = Column(String(64), nullable=True)
+    # 关联的Secmate-NG
+    secmate_id = Column(String(32), nullable=True)
+    secmate_name = Column(String(64), nullable=True)
 
     # 任务参数 (JSON格式)
     params = Column(JSON, default=dict)
@@ -143,8 +162,8 @@ class Task(Base):
             "project_id": self.project_id,
             "type": self.type,
             "status": self.status,
-            "secmate_ng_id": self.secmate_ng_id,
-            "secmate_ng_name": self.secmate_ng_name,
+            "secmate_id": self.secmate_id,
+            "secmate_name": self.secmate_name,
             "params": self.params or {},
             "result": self.result,
             "error_message": self.error_message,
@@ -170,7 +189,6 @@ def get_engine():
             "pool_pre_ping": True,
             "connect_args": {"check_same_thread": False} if config.database.type == "sqlite" else {}
         }
-        # 只有MySQL需要连接池参数
         if config.database.type == "mysql":
             engine_kwargs["pool_size"] = config.database.pool_size
             engine_kwargs["max_overflow"] = config.database.max_overflow

@@ -8,6 +8,8 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV TIMEOUT=180
 ENV PORT=20001
 ENV WORKDIR=/app
+ENV CODE_SERVER_PORT=20003
+ENV CODE_SERVER_PASSWORD=
 
 # 创建工作目录
 WORKDIR ${WORKDIR}
@@ -25,7 +27,7 @@ RUN apt-get update && apt-get install -y \
     # Python环境
     python3 python3-pip python3-dev \
     # 其他实用工具
-    jq tree tmux less file unzip\
+    jq tree tmux less file unzip openssl \
     # 清理缓存
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -61,14 +63,20 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
         apt-get update && apt-get install -y nodejs npm && apt-get clean && rm -rf /var/lib/apt/lists/* ;\
         bash -c ". $HOME/.nvm/nvm.sh ; curl -fsSL https://bun.com/install | bash" \
         npm install -g @anthropic-ai/claude-code ; \
+        npm install -g code-server ; \
     else \
         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash ; \
         bash -c ". $HOME/.nvm/nvm.sh && nvm install 24" ; \
         bash -c ". $HOME/.nvm/nvm.sh && node -v" ; \
         bash -c ". $HOME/.nvm/nvm.sh && npm -v" ; \
         bash -c ". $HOME/.nvm/nvm.sh && npm install -g @anthropic-ai/claude-code" ; \
+        bash -c ". $HOME/.nvm/nvm.sh && npm install -g code-server" ; \
         echo ". $HOME/.nvm/nvm.sh" >> /root/.bashrc ;\
     fi
+
+# 创建 code-server 配置目录
+RUN mkdir -p /root/.config/code-server && \
+    chmod -R 755 /root/.config/code-server
 
 
 # 复制应用代码
@@ -87,6 +95,7 @@ USER root
 
 # 暴露端口
 EXPOSE ${PORT}
+EXPOSE ${CODE_SERVER_PORT}
 
 # 启动脚本
 ENTRYPOINT ["./entrypoint.sh"]
