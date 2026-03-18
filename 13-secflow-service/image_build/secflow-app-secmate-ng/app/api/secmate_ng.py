@@ -17,6 +17,7 @@ from app.model import (
 from app.schemas import (
     SecmateNgCreateRequest, SecmateNgDeleteRequest, SecmateNgRestartRequest,
     SecmateNgResponse, SecmateNgListResponse, SecmateNgStatusResponse,
+    SecmateNgEnvConfigResponse,
     SecmateNgLogsResponse, TaskResponse, TaskListResponse,
     TaskCreatedResponse, SuccessResponse, PVCMount, OutputPVCMount
 )
@@ -56,6 +57,38 @@ def validate_k8s_name(name: str) -> bool:
     # 正则表达式：以字母或数字开头，中间可以有字母数字和连字符，以字母或数字结尾
     pattern = r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
     return re.match(pattern, name) is not None
+
+
+SENSITIVE_ENV_KEYWORDS = (
+    "key", "token", "secret", "password", "passwd", "pwd",
+    "private", "credential", "auth", "access_key", "api_key"
+)
+
+
+def is_sensitive_env_key(key: str) -> bool:
+    """判断环境变量名是否敏感"""
+    key_lower = key.lower()
+    return any(keyword in key_lower for keyword in SENSITIVE_ENV_KEYWORDS)
+
+
+def mask_sensitive_value(value: Any) -> str:
+    """对敏感值做中间脱敏"""
+    text = "" if value is None else str(value)
+    if len(text) <= 2:
+        return "*" * len(text)
+    if len(text) <= 6:
+        return f"{text[0]}{'*' * (len(text) - 2)}{text[-1]}"
+    if len(text) <= 12:
+        return f"{text[:2]}{'*' * (len(text) - 4)}{text[-2:]}"
+    return f"{text[:4]}{'*' * (len(text) - 8)}{text[-4:]}"
+
+
+def mask_env_map(env_map: Optional[dict]) -> dict:
+    """按 key 对环境变量字典做脱敏"""
+    masked = {}
+    for key, value in (env_map or {}).items():
+        masked[key] = mask_sensitive_value(value) if is_sensitive_env_key(key) else value
+    return masked
 
 
 # ============ 认证依赖 ============
@@ -242,6 +275,26 @@ async def readiness_check():
         "auth_service": check_auth_service_health()
     }
 
+
+@router.get("/config/default-env", response_model=SecmateNgEnvConfigResponse)
+async def get_default_env_config(
+    current_user: dict = Depends(get_current_user)
+):
+    """获取后端配置文件中的默认环境变量（敏感字段已脱敏）"""
+    config = get_config().secmate_ng
+
+    common_env = config.common_env or {}
+    default_secmate_env = config.default_secmate_env or {}
+
+    merged_default_env = dict(common_env)
+    merged_default_env.update(default_secmate_env)
+
+    return SecmateNgEnvConfigResponse(
+        common_env=mask_env_map(common_env),
+        default_secmate_env=mask_env_map(default_secmate_env),
+        merged_default_env=mask_env_map(merged_default_env)
+    )
+
     all_ready = all(checks.values())
 
     return {
@@ -283,7 +336,7 @@ async def create_secmate_instance(
             raise ValidationError(f"源码PVC不存在: {pvc_info.pvc_name}")
 
     # 检查名称是否已存在
-    existing = get_secmat_by_name(db, project_id, request.name)
+    existing = get_secmate_by_name(db, project_id, request.name)
     if existing:
         raise ConflictError(f"SecmateNg名称已存在: {request.name}")
 
@@ -346,7 +399,7 @@ async def delete_secmate_instance(
     """删除SecmateNg实例"""
     user_token = current_user.get("token")
     
-    secmate = get_secmat_by_name(db, project_id, request.name)
+    secmate = get_secmate_by_name(db, project_id, request.name)
     if not secmate:
         raise NotFoundError("SecmateNg", request.name)
 
@@ -385,7 +438,7 @@ async def restart_secmate_instance(
     """重建SecmateNg实例"""
     user_token = current_user.get("token")
     
-    secmate = get_secmat_by_name(db, project_id, request.name)
+    secmate = get_secmate_by_name(db, project_id, request.name)
     if not secmate:
         raise NotFoundError("SecmateNg", request.name)
 
@@ -467,7 +520,7 @@ async def get_secmate_instance(
     db: Session = Depends(get_db)
 ):
     """查询单个SecmateNg"""
-    secmate = get_secmat_by_name(db, project_id, name)
+    secmate = get_secmate_by_name(db, project_id, name)
     if not secmate:
         raise NotFoundError("SecmateNg", name)
 
@@ -484,7 +537,7 @@ async def get_secmate_instance_status(
     """获取SecmateNg实时状态"""
     user_token = current_user.get("token")
     
-    secmate = get_secmat_by_name(db, project_id, name)
+    secmate = get_secmate_by_name(db, project_id, name)
     if not secmate:
         raise NotFoundError("SecmateNg", name)
 
@@ -517,7 +570,7 @@ async def get_secmate_instance_logs(
     """获取SecmateNg运行日志"""
     user_token = current_user.get("token")
     
-    secmate = get_secmat_by_name(db, project_id, name)
+    secmate = get_secmate_by_name(db, project_id, name)
     if not secmate:
         raise NotFoundError("SecmateNg", name)
 

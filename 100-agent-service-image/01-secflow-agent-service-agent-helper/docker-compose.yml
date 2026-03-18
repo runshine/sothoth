@@ -1,5 +1,5 @@
 version: '3.8'
-
+name: secflow-agent-service-agent-helper
 services:
   remote-debugger:
     # 镜像由 GitHub Actions 自动构建并推送到 GitHub Container Registry

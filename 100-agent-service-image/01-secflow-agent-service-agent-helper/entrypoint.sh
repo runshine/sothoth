@@ -54,6 +54,8 @@ nohup code-server \
     ${CODE_SERVER_WORKDIR} \
     2>&1 >> /tmp/code-server.log &
 
+nohup claude-a2a 2>&1 >> /tmp/claude-a2a.log &
+
 echo "code-server started with workdir: ${CODE_SERVER_WORKDIR}"
 echo "code-server password: ${CODE_SERVER_PASSWORD}"
 

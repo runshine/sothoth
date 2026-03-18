@@ -12,7 +12,7 @@ cat  <<EOF > ${ROOT_DIR}/service_config/04_rpcapd_service.json
 {
   "name": "rpcapd",
   "description": "rpcapd service",
-  "start_cmd": "${ROOT_DIR}/usr/bin/rpcapd -b 0.0.0.0 -p 11188 -4 -n -D",
+  "start_cmd": "${ROOT_DIR}/usr/bin/rpcapd -b 0.0.0.0 -p 11187 -4 -n -D",
   "pid_file": "${ROOT_DIR}/var/run/rpcapd.pid",
   "stdout_log": "${ROOT_DIR}/var/log/monitor_rpcapd_stdout.log",
   "stderr_log": "${ROOT_DIR}/var/log/monitor_rpcapd_stderr.log",

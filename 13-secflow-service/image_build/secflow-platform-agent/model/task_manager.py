@@ -83,14 +83,15 @@ class TaskManager:
     def _cleanup_old_logs(self):
         try:
             cutoff_date = (datetime.now() - timedelta(days=7)).isoformat()
+            table_name = self.db.get_table_name('task_logs')
             if self.db.db_type == 'mysql':
-                self.db.execute_query('''
-                                      DELETE FROM secflow_agent_task_logs
+                self.db.execute_query(f'''
+                                      DELETE FROM {table_name}
                                       WHERE timestamp < %s
                                       ''', (cutoff_date,))
             else:
-                self.db.execute_query('''
-                                      DELETE FROM secflow_agent_task_logs
+                self.db.execute_query(f'''
+                                      DELETE FROM {table_name}
                                       WHERE timestamp < ?
                                       ''', (cutoff_date,))
 
@@ -103,6 +104,7 @@ class TaskManager:
                     template_name: str = None, extra_params: Dict = None,
                     project_id: str = None) -> str:
         task_id = str(uuid.uuid4())
+        table_tasks = self.db.get_table_name('tasks')
 
         # Use provided project_id or get from agent
         if not project_id:
@@ -111,18 +113,18 @@ class TaskManager:
 
         if self.db.db_type == 'mysql':
             self.db.execute_query('''
-                                  INSERT INTO tasks
+                                  INSERT INTO {}
                                   (task_id, task_type, service_name, agent_key, project_id,
                                    status, progress, message, created_at, pod_id)
                                   VALUES (%s, %s, %s, %s, %s, 'pending', 0, '', NOW(), %s)
-                                  ''', (task_id, task_type, service_name, agent_key, project_id, self.pod_id))
+                                  '''.format(table_tasks), (task_id, task_type, service_name, agent_key, project_id, self.pod_id))
         else:
             self.db.execute_query('''
-                                  INSERT INTO tasks
+                                  INSERT INTO {}
                                   (task_id, task_type, service_name, agent_key, project_id,
                                    status, progress, message, created_at, pod_id)
                                   VALUES (?, ?, ?, ?, ?, 'pending', 0, '', datetime('now'), ?)
-                                  ''', (task_id, task_type, service_name, agent_key, project_id, self.pod_id))
+                                  '''.format(table_tasks), (task_id, task_type, service_name, agent_key, project_id, self.pod_id))
 
         # 添加任务日志
         self._add_task_log(task_id, 'INFO', f"任务创建: {task_type} {service_name} on agent {agent_key}")
@@ -149,37 +151,38 @@ class TaskManager:
     def _add_task_log(self, task_id: str, level: str, message: str):
         try:
             log_id = str(uuid.uuid4())
+            table_name = self.db.get_table_name('task_logs')
 
             if self.db.db_type == 'mysql':
-                self.db.execute_query('''
-                                      INSERT INTO secflow_agent_task_logs
+                self.db.execute_query(f'''
+                                      INSERT INTO {table_name}
                                           (log_id, task_id, level, message, timestamp, pod_id)
                                       VALUES (%s, %s, %s, %s, NOW(), %s)
                                       ''', (log_id, task_id, level, message, self.pod_id))
 
                 # 限制日志数量
-                self.db.execute_query('''
-                    DELETE tl FROM secflow_agent_task_logs tl
+                self.db.execute_query(f'''
+                    DELETE tl FROM {table_name} tl
                     JOIN (
-                        SELECT id FROM secflow_agent_task_logs 
-                        WHERE task_id = %s 
-                        ORDER BY timestamp DESC 
+                        SELECT id FROM {table_name}
+                        WHERE task_id = %s
+                        ORDER BY timestamp DESC
                         LIMIT 1 OFFSET %s
                     ) t ON tl.id = t.id
                 ''', (task_id, self.max_secflow_agent_task_logs))
 
             else:
-                self.db.execute_query('''
-                                      INSERT INTO secflow_agent_task_logs
+                self.db.execute_query(f'''
+                                      INSERT INTO {table_name}
                                           (log_id, task_id, level, message, timestamp, pod_id)
                                       VALUES (?, ?, ?, ?, datetime('now'), ?)
                                       ''', (log_id, task_id, level, message, self.pod_id))
 
                 # 限制日志数量
-                self.db.execute_query('''
-                                      DELETE FROM secflow_agent_task_logs
+                self.db.execute_query(f'''
+                                      DELETE FROM {table_name}
                                       WHERE id IN (
-                                          SELECT id FROM secflow_agent_task_logs
+                                          SELECT id FROM {table_name}
                                           WHERE task_id = ?
                                           ORDER BY timestamp DESC
                                           LIMIT -1 OFFSET ?
@@ -191,6 +194,7 @@ class TaskManager:
 
     def _update_task_status(self, task_id: str, status: str, progress: int = 0,
                             message: str = ''):
+        table_tasks = self.db.get_table_name('tasks')
         update_fields = []
         params = []
 
@@ -212,7 +216,7 @@ class TaskManager:
             update_fields.append("completed_at = NOW()" if self.db.db_type == 'mysql' else "completed_at = datetime('now')")
 
         if update_fields:
-            query = f"UPDATE tasks SET {', '.join(update_fields)} WHERE task_id = "
+            query = f"UPDATE {table_tasks} SET {', '.join(update_fields)} WHERE task_id = "
             query += "%s" if self.db.db_type == 'mysql' else "?"
             params.append(task_id)
             self.db.execute_query(query, tuple(params))
@@ -530,18 +534,20 @@ class TaskManager:
 
 
     def get_task(self, task_id: str) -> Optional[Dict]:
+        table_tasks = self.db.get_table_name('tasks')
+        table_logs = self.db.get_table_name('task_logs')
         task = self.db.fetch_one(
-            "SELECT * FROM secflow_agent_tasks WHERE task_id = %s"
+            f"SELECT * FROM {table_tasks} WHERE task_id = %s"
             if self.db.db_type == 'mysql' else
-            "SELECT * FROM secflow_agent_tasks WHERE task_id = ?",
+            f"SELECT * FROM {table_tasks} WHERE task_id = ?",
             (task_id,)
         )
 
         if task:
             log_count = self.db.fetch_one(
-                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = %s"
+                f"SELECT COUNT(*) as count FROM {table_logs} WHERE task_id = %s"
                 if self.db.db_type == 'mysql' else
-                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = ?",
+                f"SELECT COUNT(*) as count FROM {table_logs} WHERE task_id = ?",
                 (task_id,)
             )
             task['log_count'] = log_count['count'] if log_count else 0
@@ -550,29 +556,30 @@ class TaskManager:
 
     def get_secflow_agent_task_logs(self, task_id: str, page: int = 1, per_page: int = 100) -> Tuple[List[Dict], int]:
         offset = (page - 1) * per_page
+        table_name = self.db.get_table_name('task_logs')
 
         if self.db.db_type == 'mysql':
-            logs = self.db.fetch_all('''
-                                     SELECT * FROM secflow_agent_task_logs
+            logs = self.db.fetch_all(f'''
+                                     SELECT * FROM {table_name}
                                      WHERE task_id = %s
                                      ORDER BY timestamp ASC
                                          LIMIT %s OFFSET %s
                                      ''', (task_id, per_page, offset))
 
             count_result = self.db.fetch_one(
-                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = %s",
+                f"SELECT COUNT(*) as count FROM {table_name} WHERE task_id = %s",
                 (task_id,)
             )
         else:
-            logs = self.db.fetch_all('''
-                                     SELECT * FROM secflow_agent_task_logs
+            logs = self.db.fetch_all(f'''
+                                     SELECT * FROM {table_name}
                                      WHERE task_id = ?
                                      ORDER BY timestamp ASC
                                          LIMIT ? OFFSET ?
                                      ''', (task_id, per_page, offset))
 
             count_result = self.db.fetch_one(
-                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = ?",
+                f"SELECT COUNT(*) as count FROM {table_name} WHERE task_id = ?",
                 (task_id,)
             )
 
@@ -582,7 +589,9 @@ class TaskManager:
     def list_tasks(self, page: int = 1, per_page: int = 20,
                    task_type: str = None, status: str = None,
                    project_id: str = None, agent_key: str = None) -> Tuple[List[Dict], int]:
-        query = "SELECT * FROM secflow_agent_tasks WHERE 1=1"
+        table_tasks = self.db.get_table_name('tasks')
+        table_logs = self.db.get_table_name('task_logs')
+        query = f"SELECT * FROM {table_tasks} WHERE 1=1"
         params = []
 
         if task_type:
@@ -620,7 +629,7 @@ class TaskManager:
 
         for task in tasks:
             log_count = self.db.fetch_one(
-                "SELECT COUNT(*) as count FROM secflow_agent_task_logs WHERE task_id = " +
+                f"SELECT COUNT(*) as count FROM {table_logs} WHERE task_id = " +
                 ("%s" if self.db.db_type == 'mysql' else "?"),
                 (task['task_id'],)
             )
@@ -630,15 +639,17 @@ class TaskManager:
 
     def delete_task(self, task_id: str) -> bool:
         try:
+            table_tasks = self.db.get_table_name('tasks')
+            table_logs = self.db.get_table_name('task_logs')
             if self.db.db_type == 'mysql':
                 self.db.execute_transaction([
-                    ("DELETE FROM secflow_agent_task_logs WHERE task_id = %s", (task_id,)),
-                    ("DELETE FROM secflow_agent_tasks WHERE task_id = %s", (task_id,))
+                    (f"DELETE FROM {table_logs} WHERE task_id = %s", (task_id,)),
+                    (f"DELETE FROM {table_tasks} WHERE task_id = %s", (task_id,))
                 ])
             else:
                 self.db.execute_transaction([
-                    ("DELETE FROM secflow_agent_task_logs WHERE task_id = ?", (task_id,)),
-                    ("DELETE FROM secflow_agent_tasks WHERE task_id = ?", (task_id,))
+                    (f"DELETE FROM {table_logs} WHERE task_id = ?", (task_id,)),
+                    (f"DELETE FROM {table_tasks} WHERE task_id = ?", (task_id,))
                 ])
 
             future = self.active_tasks.pop(task_id, None)

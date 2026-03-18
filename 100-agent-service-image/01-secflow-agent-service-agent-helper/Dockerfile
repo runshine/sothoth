@@ -64,6 +64,7 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
         bash -c ". $HOME/.nvm/nvm.sh ; curl -fsSL https://bun.com/install | bash" \
         npm install -g @anthropic-ai/claude-code ; \
         npm install -g code-server ; \
+        npm install -g claude-a2a ; \
     else \
         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash ; \
         bash -c ". $HOME/.nvm/nvm.sh && nvm install 24" ; \
@@ -71,6 +72,7 @@ RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
         bash -c ". $HOME/.nvm/nvm.sh && npm -v" ; \
         bash -c ". $HOME/.nvm/nvm.sh && npm install -g @anthropic-ai/claude-code" ; \
         bash -c ". $HOME/.nvm/nvm.sh && npm install -g code-server" ; \
+        bash -c ". $HOME/.nvm/nvm.sh && npm install -g claude-a2a" ; \
         echo ". $HOME/.nvm/nvm.sh" >> /root/.bashrc ;\
     fi
 

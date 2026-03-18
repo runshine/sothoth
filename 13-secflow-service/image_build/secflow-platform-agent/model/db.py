@@ -257,6 +257,7 @@ class DatabaseManager:
     def __init__(self, db_config: Dict):
         self.db_config = db_config
         self.db_type = db_config.get('type', 'sqlite')
+        self.table_prefix = db_config.get('table_prefix', 'secflow_agent_')
         self.logger = logging.getLogger(__name__)
 
         # 初始化连接池（但不存储连接）
@@ -266,6 +267,10 @@ class DatabaseManager:
         # 初始化数据库表结构
         self.init_database()
         self.logger.info(f"数据库连接池已初始化 ({self.db_type})")
+
+    def get_table_name(self, suffix: str) -> str:
+        """获取带前缀的完整表名"""
+        return f"{self.table_prefix}{suffix}"
 
     def _init_connection_pool(self):
         """预初始化连接池"""
@@ -291,12 +296,15 @@ class DatabaseManager:
         conn = self.get_connection()
         try:
             db = conn
+            prefix = self.table_prefix
+
             # 创建服务模板表
+            table_templates = f"{prefix}service_templates"
             if self.db_type == 'mysql':
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
-                                                                            id INT AUTO_INCREMENT PRIMARY KEY,
-                                                                            name VARCHAR(100) UNIQUE NOT NULL,
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_templates} (
+                               id INT AUTO_INCREMENT PRIMARY KEY,
+                               name VARCHAR(100) UNIQUE NOT NULL,
                                description TEXT,
                                type VARCHAR(20) NOT NULL,
                                file_path TEXT NOT NULL,
@@ -306,29 +314,30 @@ class DatabaseManager:
                                metadata JSON,
                                INDEX idx_templates_name (name),
                                INDEX idx_templates_updated (updated_at)
-                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
             else:
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS secflow_agent_service_templates (
-                                                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                                            name TEXT UNIQUE NOT NULL,
-                                                                            description TEXT,
-                                                                            type TEXT NOT NULL,
-                                                                            file_path TEXT NOT NULL,
-                                                                            created_by TEXT,
-                                                                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                                            metadata TEXT
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_templates} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               name TEXT UNIQUE NOT NULL,
+                               description TEXT,
+                               type TEXT NOT NULL,
+                               file_path TEXT NOT NULL,
+                               created_by TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               metadata TEXT
                            )
                            ''')
 
             # 创建任务表
+            table_tasks = f"{prefix}tasks"
             if self.db_type == 'mysql':
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
-                                                                id INT AUTO_INCREMENT PRIMARY KEY,
-                                                                task_id VARCHAR(36) UNIQUE NOT NULL,
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_tasks} (
+                               id INT AUTO_INCREMENT PRIMARY KEY,
+                               task_id VARCHAR(36) UNIQUE NOT NULL,
                                task_type VARCHAR(20) NOT NULL,
                                service_name VARCHAR(100) NOT NULL,
                                agent_key VARCHAR(32) NOT NULL,
@@ -345,37 +354,38 @@ class DatabaseManager:
                                INDEX idx_tasks_agent_key (agent_key),
                                INDEX idx_tasks_project (project_id),
                                INDEX idx_tasks_created (created_at)
-                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
             else:
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS secflow_agent_tasks (
-                                                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                                task_id TEXT UNIQUE NOT NULL,
-                                                                task_type TEXT NOT NULL,
-                                                                service_name TEXT NOT NULL,
-                                                                agent_key TEXT NOT NULL,
-                                                                project_id TEXT,
-                                                                status TEXT NOT NULL DEFAULT 'pending',
-                                                                progress INTEGER DEFAULT 0,
-                                                                message TEXT,
-                                                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                                started_at TIMESTAMP,
-                                                                completed_at TIMESTAMP,
-                                                                pod_id TEXT
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_tasks} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               task_id TEXT UNIQUE NOT NULL,
+                               task_type TEXT NOT NULL,
+                               service_name TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               project_id TEXT,
+                               status TEXT NOT NULL DEFAULT 'pending',
+                               progress INTEGER DEFAULT 0,
+                               message TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               started_at TIMESTAMP,
+                               completed_at TIMESTAMP,
+                               pod_id TEXT
                            )
                            ''')
                 # 为SQLite创建索引
-                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON secflow_agent_tasks(task_id)')
-                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON secflow_agent_tasks(status)')
-                db.execute('CREATE INDEX IF NOT EXISTS idx_tasks_agent_key ON secflow_agent_tasks(agent_key)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON {table_tasks}(task_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_status ON {table_tasks}(status)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_agent_key ON {table_tasks}(agent_key)')
 
             # 创建任务日志表
+            table_task_logs = f"{prefix}task_logs"
             if self.db_type == 'mysql':
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
-                                                                    id INT AUTO_INCREMENT PRIMARY KEY,
-                                                                    log_id VARCHAR(36) UNIQUE NOT NULL,
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_task_logs} (
+                               id INT AUTO_INCREMENT PRIMARY KEY,
+                               log_id VARCHAR(36) UNIQUE NOT NULL,
                                task_id VARCHAR(36) NOT NULL,
                                level VARCHAR(10) NOT NULL DEFAULT 'INFO',
                                message TEXT NOT NULL,
@@ -383,31 +393,32 @@ class DatabaseManager:
                                pod_id VARCHAR(100),
                                INDEX idx_logs_task_id (task_id),
                                INDEX idx_logs_timestamp (timestamp),
-                               FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
-                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                               FOREIGN KEY (task_id) REFERENCES {table_tasks}(task_id) ON DELETE CASCADE
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
             else:
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS secflow_agent_task_logs (
-                                                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                                    log_id TEXT UNIQUE NOT NULL,
-                                                                    task_id TEXT NOT NULL,
-                                                                    level TEXT NOT NULL DEFAULT 'INFO',
-                                                                    message TEXT NOT NULL,
-                                                                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                                                    pod_id TEXT,
-                                                                    FOREIGN KEY (task_id) REFERENCES secflow_agent_tasks(task_id) ON DELETE CASCADE
-                               )
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_task_logs} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               log_id TEXT UNIQUE NOT NULL,
+                               task_id TEXT NOT NULL,
+                               level TEXT NOT NULL DEFAULT 'INFO',
+                               message TEXT NOT NULL,
+                               timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               pod_id TEXT,
+                               FOREIGN KEY (task_id) REFERENCES {table_tasks}(task_id) ON DELETE CASCADE
+                           )
                            ''')
                 # 为SQLite创建索引
-                db.execute('CREATE INDEX IF NOT EXISTS idx_logs_task_id ON secflow_agent_task_logs(task_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_logs_task_id ON {table_task_logs}(task_id)')
 
             # 创建Agent状态表（用于多POD状态同步）
+            table_agent_status = f"{prefix}agent_status"
             if self.db_type == 'mysql':
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
-                                                                       id INT AUTO_INCREMENT PRIMARY KEY,
-                                                                       agent_key VARCHAR(32) UNIQUE NOT NULL,
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_agent_status} (
+                               id INT AUTO_INCREMENT PRIMARY KEY,
+                               agent_key VARCHAR(32) UNIQUE NOT NULL,
                                ip_address VARCHAR(45) NOT NULL,
                                hostname VARCHAR(100) NOT NULL,
                                project_id VARCHAR(100) NOT NULL,
@@ -415,37 +426,173 @@ class DatabaseManager:
                                status VARCHAR(20) NOT NULL DEFAULT 'unknown',
                                last_seen TIMESTAMP NULL,
                                system_info JSON,
+                               daemon_info JSON,
                                services JSON,
                                pod_id VARCHAR(100),
                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                               INDEX idx_secflow_agent_agent_status_key (agent_key),
-                               INDEX idx_secflow_agent_agent_status_project (project_id),
-                               INDEX idx_secflow_agent_agent_status_updated (updated_at)
-                               ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                               INDEX idx_agent_status_key (agent_key),
+                               INDEX idx_agent_status_project (project_id),
+                               INDEX idx_agent_status_updated (updated_at)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
             else:
-                db.execute('''
-                           CREATE TABLE IF NOT EXISTS secflow_agent_agent_status (
-                                                                       id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                                                       agent_key TEXT UNIQUE NOT NULL,
-                                                                       ip_address TEXT NOT NULL,
-                                                                       hostname TEXT NOT NULL,
-                                                                       project_id TEXT NOT NULL,
-                                                                       full_name TEXT NOT NULL,
-                                                                       status TEXT NOT NULL DEFAULT 'unknown',
-                                                                       last_seen TIMESTAMP,
-                                                                       system_info TEXT,
-                                                                       services TEXT,
-                                                                       pod_id TEXT,
-                                                                       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                               )
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_agent_status} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               agent_key TEXT UNIQUE NOT NULL,
+                               ip_address TEXT NOT NULL,
+                               hostname TEXT NOT NULL,
+                               project_id TEXT NOT NULL,
+                               full_name TEXT NOT NULL,
+                               status TEXT NOT NULL DEFAULT 'unknown',
+                               last_seen TIMESTAMP,
+                               system_info TEXT,
+                               daemon_info TEXT,
+                               services TEXT,
+                               pod_id TEXT,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
                            ''')
                 # 为SQLite创建索引
-                db.execute('CREATE INDEX IF NOT EXISTS idx_secflow_agent_agent_status_project ON secflow_agent_agent_status(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_status_project ON {table_agent_status}(project_id)')
 
-            self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}）")
+            # 创建Agent服务聚合表（用于全量服务发现）
+            table_agent_services = f"{prefix}agent_services"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_agent_services} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               service_uid VARCHAR(256) UNIQUE NOT NULL,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               agent_hostname VARCHAR(100),
+                               agent_ip VARCHAR(64),
+                               service_name VARCHAR(200) NOT NULL,
+                               image TEXT,
+                               status VARCHAR(32) DEFAULT 'unknown',
+                               ports_json JSON,
+                               raw_json JSON,
+                               source VARCHAR(32) DEFAULT 'pull',
+                               is_stale TINYINT(1) DEFAULT 0,
+                               first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               pod_id VARCHAR(100),
+                               INDEX idx_agent_services_project (project_id),
+                               INDEX idx_agent_services_agent (agent_key),
+                               INDEX idx_agent_services_status (status),
+                               INDEX idx_agent_services_name (service_name),
+                               INDEX idx_agent_services_seen (last_seen_at)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_agent_services} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               service_uid TEXT UNIQUE NOT NULL,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               agent_hostname TEXT,
+                               agent_ip TEXT,
+                               service_name TEXT NOT NULL,
+                               image TEXT,
+                               status TEXT DEFAULT 'unknown',
+                               ports_json TEXT,
+                               raw_json TEXT,
+                               source TEXT DEFAULT 'pull',
+                               is_stale INTEGER DEFAULT 0,
+                               first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               pod_id TEXT
+                           )
+                           ''')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_project ON {table_agent_services}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_agent ON {table_agent_services}(agent_key)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_status ON {table_agent_services}(status)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_name ON {table_agent_services}(service_name)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_seen ON {table_agent_services}(last_seen_at)')
+
+            # 创建服务同步历史表
+            table_sync_logs = f"{prefix}service_sync_logs"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_sync_logs} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               sync_id VARCHAR(64) UNIQUE NOT NULL,
+                               scope VARCHAR(32) NOT NULL,
+                               project_id VARCHAR(100),
+                               agent_key VARCHAR(64),
+                               stale_only TINYINT(1) DEFAULT 0,
+                               status VARCHAR(20) NOT NULL DEFAULT 'ok',
+                               total INT DEFAULT 0,
+                               ok_count INT DEFAULT 0,
+                               fail_count INT DEFAULT 0,
+                               message TEXT,
+                               details_json JSON,
+                               pod_id VARCHAR(100),
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               INDEX idx_sync_logs_created (created_at),
+                               INDEX idx_sync_logs_scope (scope),
+                               INDEX idx_sync_logs_project (project_id),
+                               INDEX idx_sync_logs_agent (agent_key)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_sync_logs} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               sync_id TEXT UNIQUE NOT NULL,
+                               scope TEXT NOT NULL,
+                               project_id TEXT,
+                               agent_key TEXT,
+                               stale_only INTEGER DEFAULT 0,
+                               status TEXT NOT NULL DEFAULT 'ok',
+                               total INTEGER DEFAULT 0,
+                               ok_count INTEGER DEFAULT 0,
+                               fail_count INTEGER DEFAULT 0,
+                               message TEXT,
+                               details_json TEXT,
+                               pod_id TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_created ON {table_sync_logs}(created_at)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_scope ON {table_sync_logs}(scope)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_project ON {table_sync_logs}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_agent ON {table_sync_logs}(agent_key)')
+
+            # 兼容历史数据库：补齐新增列
+            self._ensure_agent_status_columns(db, table_agent_status)
+
+            self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}, 表前缀: {prefix}）")
         finally:
             conn.close()
+
+    def _ensure_agent_status_columns(self, db: DatabaseConnection, table_name: str):
+        """确保 agent_status 表包含新增字段（历史库自动迁移）"""
+        try:
+            if self.db_type == 'mysql':
+                columns = db.fetch_all(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE() AND table_name = %s
+                    """,
+                    (table_name,)
+                )
+                existing = {item['COLUMN_NAME'] for item in columns}
+                if 'daemon_info' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN daemon_info JSON NULL")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 daemon_info 列")
+            else:
+                columns = db.fetch_all(f"PRAGMA table_info({table_name})")
+                existing = {item['name'] for item in columns}
+                if 'daemon_info' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN daemon_info TEXT")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 daemon_info 列")
+        except Exception as e:
+            self.logger.error(f"检查/迁移 {table_name} 表字段失败: {str(e)}")
 
     def execute_query(self, query: str, params: tuple = ()):
         """执行查询 - 使用持久化连接"""

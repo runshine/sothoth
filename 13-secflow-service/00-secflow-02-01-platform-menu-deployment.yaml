@@ -18,6 +18,7 @@ spec:
       - name: secflow-platform-menu
         image: ghcr.io/runshine/secflow-platform-menu:latest  # 包含kubectl命令
         imagePullPolicy: Always
+        command: ["python", "app.py", "--config", "/app/config.yaml"]
         ports:
         - containerPort: 8080
         volumeMounts:

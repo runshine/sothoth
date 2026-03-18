@@ -35,9 +35,13 @@ class EnhancedProxyManager:
     def proxy_request(self, agent_key: str, method: str, endpoint: str,
                       request_data: Any = None, query_params: Dict = None,
                       headers: Dict = None, files: Dict = None,
-                      stream: bool = False, timeout: int = None) -> Tuple[int, Any, Dict]:
+                      stream: bool = False, timeout: int = None,
+                      port: int = None) -> Tuple[int, Any, Dict]:
         """
         代理请求到指定的Agent（增强版）
+
+        Args:
+            port: 指定请求端口，默认使用 agent_api_port
         """
         try:
             # 获取Agent信息
@@ -49,13 +53,22 @@ class EnhancedProxyManager:
             if agent.status != 'online':
                 return 503, {'error': f'Agent {agent_key} is {agent.status}'}, {}
 
+            # 确定使用的端口
+            target_port = port if port is not None else self.agent_manager.agent_api_port
+
             # 构建完整的URL
-            url = f"http://{agent.ip_address}:{self.agent_manager.agent_api_port}{endpoint}"
+            url = f"http://{agent.ip_address}:{target_port}{endpoint}"
 
             # 准备请求头
-            request_headers = {
-                'X-Auth-Token': self.agent_manager.agent_auth_token,
-            }
+            if target_port == self.agent_manager.daemon_api_port:
+                # 11188 鉴权头统一走可配置项
+                request_headers = {
+                    self.agent_manager.daemon_auth_header: self.agent_manager.daemon_auth_token
+                }
+            else:
+                request_headers = {
+                    'X-Auth-Token': self.agent_manager.agent_auth_token,
+                }
 
             # 只有当有JSON数据时才添加Content-Type
             if request_data and isinstance(request_data, dict):
@@ -87,7 +100,9 @@ class EnhancedProxyManager:
                     timeout_tuple = self.timeouts.get('proxy', (10, 300))
             else:
                 # 使用指定的超时时间（秒）
-                timeout_tuple = (10, timeout)
+                # 自定义超时时，连接超时同步收敛，避免长时间卡在建立连接阶段
+                connect_timeout = min(5, max(1, int(timeout)))
+                timeout_tuple = (connect_timeout, timeout)
 
             # 准备请求参数
             request_kwargs = {

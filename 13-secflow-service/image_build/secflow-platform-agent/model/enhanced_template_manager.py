@@ -1,6 +1,7 @@
 import logging
 import tarfile
 import tempfile
+import hashlib
 
 
 from .db import DatabaseManager
@@ -13,6 +14,194 @@ from typing import Dict, List, Any, Optional, Tuple, Union
 from datetime import datetime
 import json
 import yaml
+
+
+# ===================== Docker Compose 解析器 =====================
+
+class DockerComposeParser:
+    """Docker Compose YAML 解析器"""
+
+    def parse_compose_file(self, yaml_content: str) -> Tuple[bool, Dict, str]:
+        """
+        解析 docker-compose YAML 内容
+
+        Args:
+            yaml_content: YAML 文件内容
+
+        Returns:
+            (success, parsed_data, error_message)
+        """
+        try:
+            compose_data = yaml.safe_load(yaml_content)
+
+            if not isinstance(compose_data, dict):
+                return False, {}, "YAML must be a dictionary"
+
+            parsed = {
+                'version': compose_data.get('version', '3.0'),
+                'services': self._parse_services(compose_data.get('services', {})),
+                'networks': self._parse_networks(compose_data.get('networks', {})),
+                'volumes': self._parse_volumes(compose_data.get('volumes', {})),
+                'configs': self._parse_configs(compose_data.get('configs', {})),
+                'secrets': self._parse_secrets(compose_data.get('secrets', {}))
+            }
+
+            return True, parsed, ""
+
+        except Exception as e:
+            return False, {}, str(e)
+
+    def _parse_services(self, services: Dict) -> Dict:
+        """解析 services 部分，提取关键字段"""
+        parsed_services = {}
+
+        for service_name, config in services.items():
+            if not isinstance(config, dict):
+                continue
+
+            parsed_service = {
+                'image': config.get('image', ''),
+                'ports': self._normalize_ports(config.get('ports', [])),
+                'environment': self._normalize_environment(config.get('environment', {})),
+                'volumes': self._normalize_volumes(config.get('volumes', [])),
+                'networks': config.get('networks', []),
+                'depends_on': self._normalize_depends_on(config.get('depends_on', [])),
+                'restart': config.get('restart', ''),
+                'container_name': config.get('container_name', ''),
+                'build': config.get('build', {}),
+                'labels': config.get('labels', {}),
+                'healthcheck': config.get('healthcheck', {}),
+                'deploy': config.get('deploy', {})
+            }
+
+            # 移除空值
+            parsed_service = {k: v for k, v in parsed_service.items() if v}
+            parsed_services[service_name] = parsed_service
+
+        return parsed_services
+
+    def _normalize_ports(self, ports) -> List[Dict]:
+        """规范化端口配置"""
+        normalized = []
+        if isinstance(ports, list):
+            for port in ports:
+                if isinstance(port, str):
+                    # "80:8080" 或 "80:8080/tcp"
+                    parts = port.split(':')
+                    if len(parts) >= 2:
+                        normalized.append({
+                            'published': parts[0],
+                            'target': parts[-1].split('/')[0],
+                            'protocol': 'tcp' if '/' not in parts[-1] else parts[-1].split('/')[1]
+                        })
+                elif isinstance(port, dict):
+                    normalized.append({
+                        'published': str(port.get('published', '')),
+                        'target': str(port.get('target', '')),
+                        'protocol': port.get('protocol', 'tcp')
+                    })
+        return normalized
+
+    def _normalize_environment(self, env) -> Dict:
+        """规范化环境变量"""
+        if isinstance(env, dict):
+            return env
+        elif isinstance(env, list):
+            result = {}
+            for item in env:
+                if isinstance(item, str) and '=' in item:
+                    key, value = item.split('=', 1)
+                    result[key] = value
+            return result
+        return {}
+
+    def _normalize_volumes(self, volumes) -> List[Dict]:
+        """规范化卷挂载"""
+        normalized = []
+        if isinstance(volumes, list):
+            for vol in volumes:
+                if isinstance(vol, str):
+                    # "/host/path:/container/path" or "volume_name:/container/path"
+                    parts = vol.split(':')
+                    if len(parts) >= 2:
+                        vol_info = {
+                            'source': parts[0],
+                            'target': parts[1],
+                            'type': 'bind' if parts[0].startswith('/') or parts[0].startswith('./') else 'volume'
+                        }
+                        if len(parts) >= 3:
+                            vol_info['mode'] = parts[2]
+                        normalized.append(vol_info)
+                elif isinstance(vol, dict):
+                    normalized.append({
+                        'source': vol.get('source', ''),
+                        'target': vol.get('target', ''),
+                        'type': vol.get('type', 'volume'),
+                        'read_only': vol.get('read_only', False)
+                    })
+        return normalized
+
+    def _normalize_depends_on(self, depends) -> List[str]:
+        """规范化依赖关系"""
+        if isinstance(depends, list):
+            return depends
+        elif isinstance(depends, dict):
+            return list(depends.keys())
+        return []
+
+    def _parse_networks(self, networks) -> Dict:
+        """解析 networks 定义"""
+        if not networks:
+            return {}
+
+        parsed = {}
+        for name, config in networks.items():
+            if config is None:
+                parsed[name] = {'external': False}
+            elif isinstance(config, dict):
+                parsed[name] = config
+            elif isinstance(config, bool):
+                parsed[name] = {'external': config}
+            else:
+                parsed[name] = {'external': False}
+        return parsed
+
+    def _parse_volumes(self, volumes) -> Dict:
+        """解析 volumes 定义"""
+        if not volumes:
+            return {}
+
+        parsed = {}
+        for name, config in volumes.items():
+            if config is None:
+                parsed[name] = {}
+            elif isinstance(config, dict):
+                parsed[name] = config
+            else:
+                parsed[name] = {}
+        return parsed
+
+    def _parse_configs(self, configs) -> Dict:
+        """解析 configs 定义 (v3.3+)"""
+        if not configs:
+            return {}
+
+        parsed = {}
+        for name, config in configs.items():
+            if isinstance(config, dict):
+                parsed[name] = config
+        return parsed
+
+    def _parse_secrets(self, secrets) -> Dict:
+        """解析 secrets 定义 (v3.1+)"""
+        if not secrets:
+            return {}
+
+        parsed = {}
+        for name, secret in secrets.items():
+            if isinstance(secret, dict):
+                parsed[name] = secret
+        return parsed
 # ===================== 模板管理器（完整增强版，支持多种压缩格式） =====================
 
 class EnhancedTemplateManager:
@@ -134,12 +323,11 @@ class EnhancedTemplateManager:
             # 确保父目录存在
             safe_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # 备份原文件（如果存在）
-            backup_info = {}
+            # 保留原文件内容用于失败回滚（不落地备份文件）
+            original_content = None
             if safe_path.exists():
-                backup_path = safe_path.with_suffix(f'{safe_path.suffix}.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(safe_path, backup_path)
-                backup_info['backup_file'] = str(backup_path.relative_to(template_dir))
+                with open(safe_path, 'rb') as f:
+                    original_content = f.read()
 
             # 写入新内容
             try:
@@ -165,7 +353,7 @@ class EnhancedTemplateManager:
                 'modified_time': datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
                 'updated_by': updated_by,
                 'updated_at': datetime.now().isoformat(),
-                'backup_info': backup_info
+                'backup_info': {}
             }
 
             # 如果是YAML文件，验证其格式
@@ -176,12 +364,12 @@ class EnhancedTemplateManager:
 
                     is_valid, error_msg = self.validate_yaml_content(yaml_content, template_type, safe_path.name)
                     if not is_valid:
-                        # 恢复备份
-                        if backup_info.get('backup_file'):
-                            backup_full_path = template_dir / backup_info['backup_file']
-                            if backup_full_path.exists():
-                                shutil.copy2(backup_full_path, safe_path)
-                                safe_path.unlink()
+                        # 恢复更新前内容（不依赖备份文件）
+                        if original_content is not None:
+                            with open(safe_path, 'wb') as f:
+                                f.write(original_content)
+                        elif safe_path.exists():
+                            safe_path.unlink()
 
                         return False, f"YAML格式验证失败: {error_msg}", {}
 
@@ -215,14 +403,15 @@ class EnhancedTemplateManager:
 
             # 更新数据库
             metadata_json = json.dumps(metadata)
+            table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    f"UPDATE {table_name} SET updated_at = NOW(), metadata = %s WHERE name = %s",
                     (metadata_json, template_name)
                 )
             else:
                 self.db.execute_query(
-                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    f"UPDATE {table_name} SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (metadata_json, template_name)
                 )
 
@@ -248,9 +437,8 @@ class EnhancedTemplateManager:
             template_dir = self.templates_root / template_name
             relative_path = updated_file.relative_to(template_dir)
 
-            # 备份原压缩文件
-            backup_path = archive_path.with_suffix(f'{archive_path.suffix}.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-            shutil.copy2(archive_path, backup_path)
+            # 保留压缩文件原始字节用于失败回滚（不落地备份文件）
+            original_archive_content = archive_path.read_bytes()
 
             # 获取文件扩展名以确定压缩格式
             filename = archive_path.name.lower()
@@ -273,8 +461,7 @@ class EnhancedTemplateManager:
                 metadata['archive_updates'].append({
                     'file': str(relative_path),
                     'updated_at': datetime.now().isoformat(),
-                    'updated_by': updated_by,
-                    'backup_file': backup_path.name
+                    'updated_by': updated_by
                 })
 
                 # 限制记录数量
@@ -282,11 +469,10 @@ class EnhancedTemplateManager:
                     metadata['archive_updates'] = metadata['archive_updates'][-20:]
 
                 self.logger.info(f"压缩文件更新成功: {template_name}, 文件: {relative_path}")
-                return True, f"压缩文件更新成功，备份: {backup_path.name}"
+                return True, "压缩文件更新成功"
             else:
-                # 恢复备份
-                if backup_path.exists():
-                    shutil.copy2(backup_path, archive_path)
+                # 失败回滚为原始压缩文件
+                archive_path.write_bytes(original_archive_content)
                 return False, "更新压缩文件失败"
 
         except Exception as e:
@@ -472,14 +658,15 @@ class EnhancedTemplateManager:
 
             # 更新数据库
             metadata_json = json.dumps(metadata)
+            table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    f"UPDATE {table_name} SET updated_at = NOW(), metadata = %s WHERE name = %s",
                     (metadata_json, template_name)
                 )
             else:
                 self.db.execute_query(
-                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    f"UPDATE {table_name} SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (metadata_json, template_name)
                 )
 
@@ -724,14 +911,15 @@ class EnhancedTemplateManager:
 
             # 更新数据库
             metadata_json = json.dumps(metadata)
+            table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    f"UPDATE {table_name} SET updated_at = NOW(), metadata = %s WHERE name = %s",
                     (metadata_json, template_name)
                 )
             else:
                 self.db.execute_query(
-                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    f"UPDATE {table_name} SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (metadata_json, template_name)
                 )
 
@@ -1062,8 +1250,7 @@ class EnhancedTemplateManager:
         filename = file_path.name.lower()
 
         if filename.endswith('.zip'):
-            with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_to)
+            self._extract_zip_with_filename_repair(file_path, extract_to)
 
         elif any(filename.endswith(ext) for ext in ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz', '.tbz2', '.tar.xz', '.txz']):
             # 确定压缩模式
@@ -1082,6 +1269,72 @@ class EnhancedTemplateManager:
 
         else:
             raise ValueError(f"不支持的压缩格式: {file_path.name}")
+
+    def _decode_zip_member_name(self, zip_info: zipfile.ZipInfo) -> str:
+        """
+        修复 ZIP 中文文件名乱码：
+        - UTF-8 标记位开启时直接使用原始名称
+        - 未开启时，按 cp437 反编码回原始字节，再尝试 gb18030/gbk 解码
+        """
+        original_name = zip_info.filename
+
+        # UTF-8 filename flag
+        if zip_info.flag_bits & 0x800:
+            return original_name
+
+        try:
+            raw_bytes = original_name.encode('cp437')
+        except Exception:
+            return original_name
+
+        # 优先 UTF-8（兼容部分工具），其次 GB 系编码（常见于 Windows 中文压缩包）
+        for encoding in ('utf-8', 'gb18030', 'gbk', 'big5'):
+            try:
+                decoded = raw_bytes.decode(encoding)
+                if decoded:
+                    return decoded
+            except Exception:
+                continue
+
+        return original_name
+
+    def _safe_extract_target(self, base_dir: Path, member_name: str) -> Path:
+        """构造安全的解压目标路径，防止路径穿越"""
+        normalized = member_name.replace('\\', '/')
+        parts = []
+        for part in Path(normalized).parts:
+            if part in ('', '.'):
+                continue
+            if part == '..':
+                continue
+            parts.append(part)
+
+        relative_path = Path(*parts) if parts else Path()
+        target = (base_dir / relative_path).resolve()
+        base_resolved = base_dir.resolve()
+        try:
+            target.relative_to(base_resolved)
+        except Exception:
+            raise ValueError(f"非法解压路径: {member_name}")
+        return target
+
+    def _extract_zip_with_filename_repair(self, zip_path: Path, extract_to: Path):
+        """解压 ZIP，并修复中文文件名编码问题"""
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            for zip_info in zip_ref.infolist():
+                repaired_name = self._decode_zip_member_name(zip_info)
+                if not repaired_name:
+                    continue
+
+                target_path = self._safe_extract_target(extract_to, repaired_name)
+
+                if zip_info.is_dir() or repaired_name.endswith('/'):
+                    target_path.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with zip_ref.open(zip_info, 'r') as src, open(target_path, 'wb') as dst:
+                    shutil.copyfileobj(src, dst)
 
     def validate_yaml_content(self, yaml_content: str, template_type: str, filename: str = None) -> Tuple[bool, str]:
         """
@@ -1149,10 +1402,11 @@ class EnhancedTemplateManager:
 
         try:
             # 检查模板名称是否已存在
+            table_name = self.db.get_table_name('service_templates')
             existing = self.db.fetch_one(
-                "SELECT id FROM secflow_agent_service_templates WHERE name = %s"
+                f"SELECT id FROM {table_name} WHERE name = %s"
                 if self.db.db_type == 'mysql' else
-                "SELECT id FROM secflow_agent_service_templates WHERE name = ?",
+                f"SELECT id FROM {table_name} WHERE name = ?",
                 (name,)
             )
             if existing:
@@ -1287,21 +1541,32 @@ class EnhancedTemplateManager:
             metadata_json = json.dumps(metadata)
 
             # 插入数据库记录
+            table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    "INSERT INTO secflow_agent_service_templates (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
+                    f"INSERT INTO {table_name} (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
                     "VALUES (%s, %s, %s, %s, %s, NOW(), NOW(), %s)",
                     (name, description, template_type, str(file_path), created_by, metadata_json)
                 )
             else:
                 self.db.execute_query(
-                    "INSERT INTO secflow_agent_service_templates (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
+                    f"INSERT INTO {table_name} (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
                     "VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)",
                     (name, description, template_type, str(file_path), created_by, metadata_json)
                 )
 
             db_cleanup_needed = True
             self.logger.info(f"模板 '{name}' 创建成功，类型: {template_type}")
+
+            # 在模板创建成功后自动解析 docker-compose 内容
+            if template_type == 'yaml':
+                try:
+                    parse_success, parse_msg = self.parse_template_compose(name)
+                    if not parse_success:
+                        self.logger.warning(f"模板创建成功但解析失败: {parse_msg}")
+                except Exception as e:
+                    self.logger.error(f"模板解析异常: {str(e)}")
+
             return True, f"模板 '{name}' 创建成功"
 
         except Exception as e:
@@ -1318,10 +1583,11 @@ class EnhancedTemplateManager:
                 # 2. 删除数据库记录（如果已插入）
                 if db_cleanup_needed:
                     self.logger.info(f"清理数据库记录: {name}")
+                    table_name = self.db.get_table_name('service_templates')
                     self.db.execute_query(
-                        "DELETE FROM secflow_agent_service_templates WHERE name = %s"
+                        f"DELETE FROM {table_name} WHERE name = %s"
                         if self.db.db_type == 'mysql' else
-                        "DELETE FROM secflow_agent_service_templates WHERE name = ?",
+                        f"DELETE FROM {table_name} WHERE name = ?",
                         (name,)
                     )
 
@@ -1337,12 +1603,119 @@ class EnhancedTemplateManager:
 
             return False, f"创建模板失败: {error_msg}"
 
+    def parse_template_compose(self, name: str) -> Tuple[bool, str]:
+        """
+        解析模板的 docker-compose 配置
+
+        Args:
+            name: 模板名称
+
+        Returns:
+            (success, message)
+        """
+        try:
+            template = self.get_template(name)
+            if not template:
+                return False, f"模板 '{name}' 不存在"
+
+            # 获取 YAML 内容
+            success, content, msg = self.get_yaml_content(name)
+            if not success:
+                return False, f"无法获取YAML内容: {content}"
+
+            # 计算内容哈希
+            content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+            # 解析 compose 内容
+            parser = DockerComposeParser()
+            success, parsed_data, error_msg = parser.parse_compose_file(content)
+
+            # 更新 metadata
+            metadata = template.get('metadata', {})
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+
+            metadata['content_hash'] = content_hash
+            metadata['parsed_at'] = datetime.now().isoformat()
+
+            if success:
+                metadata['parsed_compose'] = parsed_data
+                metadata['parse_error'] = None
+                metadata['parse_status'] = 'success'
+            else:
+                metadata['parsed_compose'] = None
+                metadata['parse_error'] = error_msg
+                metadata['parse_status'] = 'error'
+
+            # 更新数据库
+            metadata_json = json.dumps(metadata)
+            table_name = self.db.get_table_name('service_templates')
+            if self.db.db_type == 'mysql':
+                self.db.execute_query(
+                    f"UPDATE {table_name} SET updated_at = NOW(), metadata = %s WHERE name = %s",
+                    (metadata_json, name)
+                )
+            else:
+                self.db.execute_query(
+                    f"UPDATE {table_name} SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    (metadata_json, name)
+                )
+
+            if success:
+                self.logger.info(f"模板 '{name}' 解析成功")
+                return True, "解析成功"
+            else:
+                self.logger.warning(f"模板 '{name}' 解析失败: {error_msg}")
+                return False, f"解析失败: {error_msg}"
+
+        except Exception as e:
+            self.logger.error(f"解析模板 '{name}' 异常: {str(e)}")
+            return False, f"解析异常: {str(e)}"
+
+    def check_parse_staleness(self, name: str) -> Tuple[bool, bool, str]:
+        """
+        检查解析结果是否过期
+
+        Args:
+            name: 模板名称
+
+        Returns:
+            (success, is_stale, message)
+        """
+        try:
+            template = self.get_template(name)
+            if not template:
+                return False, False, "模板不存在"
+
+            metadata = template.get('metadata', {})
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+
+            stored_hash = metadata.get('content_hash')
+            if not stored_hash:
+                return True, True, "未找到内容哈希"
+
+            # 重新计算哈希
+            success, content, _ = self.get_yaml_content(name)
+            if not success:
+                return False, False, "无法读取YAML内容"
+
+            current_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+            is_stale = (stored_hash != current_hash)
+            return True, is_stale, "内容已变更" if is_stale else "内容未变更"
+
+        except Exception as e:
+            self.logger.error(f"检查模板 '{name}' 过期状态失败: {str(e)}")
+            return False, False, str(e)
+
     def get_template(self, name: str) -> Optional[Dict]:
         """获取模板信息（包含元数据）"""
+        table_name = self.db.get_table_name('service_templates')
         template = self.db.fetch_one(
-            "SELECT * FROM secflow_agent_service_templates WHERE name = %s"
+            f"SELECT * FROM {table_name} WHERE name = %s"
             if self.db.db_type == 'mysql' else
-            "SELECT * FROM secflow_agent_service_templates WHERE name = ?",
+            f"SELECT * FROM {table_name} WHERE name = ?",
             (name,)
         )
 
@@ -1483,10 +1856,7 @@ class EnhancedTemplateManager:
             if template_type == 'yaml':
                 # 直接更新YAML文件
                 file_path = Path(template['file_path'])
-
-                # 备份原文件
-                backup_path = file_path.with_suffix(f'.yaml.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(file_path, backup_path)
+                original_yaml_content = file_path.read_bytes() if file_path.exists() else None
 
                 # 写入新内容
                 with open(file_path, 'w', encoding='utf-8') as f:
@@ -1499,23 +1869,32 @@ class EnhancedTemplateManager:
                 metadata['last_updated_by'] = updated_by
                 metadata['last_updated_at'] = datetime.now().isoformat()
 
+                table_name = self.db.get_table_name('service_templates')
                 self.db.execute_query(
-                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s"
+                    f"UPDATE {table_name} SET updated_at = NOW(), metadata = %s WHERE name = %s"
                     if self.db.db_type == 'mysql' else
-                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    f"UPDATE {table_name} SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (json.dumps(metadata), name)
                 )
 
                 self.logger.info(f"YAML模板 '{name}' 更新成功，新大小: {new_size} 字节")
-                return True, f"模板 '{name}' 更新成功，备份文件: {backup_path.name}"
+
+                # 重新解析 docker-compose
+                try:
+                    self.parse_template_compose(name)
+                except Exception as e:
+                    self.logger.error(f"重新解析失败: {str(e)}")
+                    # 解析失败时恢复原内容
+                    if original_yaml_content is not None:
+                        with open(file_path, 'wb') as f:
+                            f.write(original_yaml_content)
+
+                return True, f"模板 '{name}' 更新成功"
 
             elif template_type == 'archive':
                 # 更新压缩包中的YAML
                 archive_path = Path(template['file_path'])
-
-                # 备份原压缩文件
-                backup_path = archive_path.with_suffix(f'.archive.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(archive_path, backup_path)
+                original_archive_content = archive_path.read_bytes() if archive_path.exists() else None
 
                 # 查找解压目录中的YAML文件
                 yaml_files = []
@@ -1532,10 +1911,7 @@ class EnhancedTemplateManager:
 
                 # 更新第一个找到的YAML文件（通常是主文件）
                 yaml_file = yaml_files[0]
-
-                # 备份原YAML文件
-                yaml_backup = yaml_file.with_suffix(f'.yaml.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(yaml_file, yaml_backup)
+                original_yaml_content = yaml_file.read_bytes() if yaml_file.exists() else None
 
                 # 写入新内容
                 with open(yaml_file, 'w', encoding='utf-8') as f:
@@ -1589,15 +1965,30 @@ class EnhancedTemplateManager:
                 dir_size = self._get_directory_size(template_dir)
                 metadata['directory_size'] = dir_size
 
+                table_name = self.db.get_table_name('service_templates')
                 self.db.execute_query(
-                    "UPDATE secflow_agent_service_templates SET updated_at = NOW(), metadata = %s WHERE name = %s"
+                    f"UPDATE {table_name} SET updated_at = NOW(), metadata = %s WHERE name = %s"
                     if self.db.db_type == 'mysql' else
-                    "UPDATE secflow_agent_service_templates SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
+                    f"UPDATE {table_name} SET updated_at = datetime('now'), metadata = ? WHERE name = ?",
                     (json.dumps(metadata), name)
                 )
 
                 self.logger.info(f"压缩模板 '{name}' 更新成功，新大小: {new_size} 字节")
-                return True, f"模板 '{name}' 更新成功，备份文件: {backup_path.name}"
+
+                # 重新解析 docker-compose
+                try:
+                    self.parse_template_compose(name)
+                except Exception as e:
+                    self.logger.error(f"重新解析失败: {str(e)}")
+                    # 解析失败回滚
+                    if original_yaml_content is not None:
+                        with open(yaml_file, 'wb') as f:
+                            f.write(original_yaml_content)
+                    if original_archive_content is not None:
+                        with open(archive_path, 'wb') as f:
+                            f.write(original_archive_content)
+
+                return True, f"模板 '{name}' 更新成功"
 
             else:
                 return False, f"不支持的模板类型: {template_type}"
@@ -1836,19 +2227,20 @@ class EnhancedTemplateManager:
     def list_templates(self, page: int = 1, per_page: int = 20) -> Tuple[List[Dict], int]:
         """列出所有模板（包含文件大小信息）"""
         offset = (page - 1) * per_page
+        table_name = self.db.get_table_name('service_templates')
 
         if self.db.db_type == 'mysql':
             templates = self.db.fetch_all(
-                "SELECT * FROM secflow_agent_service_templates ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                f"SELECT * FROM {table_name} ORDER BY updated_at DESC LIMIT %s OFFSET %s",
                 (per_page, offset)
             )
-            count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM secflow_agent_service_templates")
+            count_result = self.db.fetch_one(f"SELECT COUNT(*) as count FROM {table_name}")
         else:
             templates = self.db.fetch_all(
-                "SELECT * FROM secflow_agent_service_templates ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM {table_name} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                 (per_page, offset)
             )
-            count_result = self.db.fetch_one("SELECT COUNT(*) as count FROM secflow_agent_service_templates")
+            count_result = self.db.fetch_one(f"SELECT COUNT(*) as count FROM {table_name}")
 
         total = count_result.get('count', 0) if count_result else 0
 
@@ -1891,10 +2283,11 @@ class EnhancedTemplateManager:
             if template_dir.exists():
                 shutil.rmtree(template_dir, ignore_errors=True)
 
+            table_name = self.db.get_table_name('service_templates')
             self.db.execute_query(
-                "DELETE FROM secflow_agent_service_templates WHERE name = %s"
+                f"DELETE FROM {table_name} WHERE name = %s"
                 if self.db.db_type == 'mysql' else
-                "DELETE FROM secflow_agent_service_templates WHERE name = ?",
+                f"DELETE FROM {table_name} WHERE name = ?",
                 (name,)
             )
 

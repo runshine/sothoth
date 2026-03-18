@@ -15,6 +15,7 @@ class ProjectCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=128, description="项目名称")
     description: Optional[str] = Field(None, description="项目描述")
     k8s_namespace: Optional[str] = Field(None, description="关联的K8S Namespace名称")
+    is_public: bool = Field(default=False, description="是否公开，False为私有，True为公开")
 
 
 class ProjectUpdate(BaseModel):
@@ -22,6 +23,7 @@ class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=128, description="项目名称")
     description: Optional[str] = Field(None, description="项目描述")
     k8s_namespace: Optional[str] = Field(None, description="关联的K8S Namespace名称")
+    is_public: Optional[bool] = Field(None, description="是否公开，False为私有，True为公开")
 
 
 class ProjectRoleBindCreate(BaseModel):
@@ -46,6 +48,7 @@ class ProjectResponse(BaseModel):
     owner_name: Optional[str]
     k8s_namespace: Optional[str]
     status: str
+    is_public: bool = Field(default=False, description="是否公开，False为私有，True为公开")
     created_at: datetime
     updated_at: datetime
     roles: List[ProjectRoleBindResponse] = []
@@ -58,6 +61,16 @@ class ProjectListResponse(BaseModel):
     """项目列表响应"""
     total: int
     projects: List[ProjectResponse]
+
+
+class ProjectAllListResponse(BaseModel):
+    """项目完整列表响应（获取所有记录）"""
+    code: str = Field(default="200", description="状态码")
+    message: str = Field(default="success", description="消息提示")
+    data: List[ProjectResponse] = Field(default_factory=list, description="项目列表数据")
+
+    class Config:
+        from_attributes = True
 
 
 class DeleteRoleRequest(BaseModel):

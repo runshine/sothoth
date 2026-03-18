@@ -26,6 +26,10 @@ cat  <<EOF > ${ROOT_DIR}/usr/nacos/config.json
   "max_upload_size": 104857600,
   "database_file": "${ROOT_DIR}/usr/nacos/nacos_client.db",
   "nacos_server_url": "http://nacos.sothothv2-ns.svc.cluster.local:8848",
+  "platform_agent_url": "http://secflow-platform-agent.sothothv2-ns.svc.cluster.local",
+  "agent_service_report_enabled": true,
+  "agent_service_report_interval_sec": 30,
+  "platform_agent_report_timeout_sec": 15,
   "root_dir": "${ROOT_DIR}",
   "workspace_id": "$WORKSPACE"
 }

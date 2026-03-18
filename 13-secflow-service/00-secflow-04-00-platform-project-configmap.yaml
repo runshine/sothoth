@@ -62,6 +62,11 @@ data:
       kubeconfig: "/home/runshine/.kube/config"
       # 连接超时时间（秒）
       connection_timeout: 30
+    # K8S API Service配置（统一通过secflow-platform-k8s）
+    k8s_service:
+      host: "secflow-platform-k8s"
+      port: 80
+      timeout: 30
     # TLS Secret Configuration
     # 用于在项目的K8S Namespace中创建TLS Secret
     tls_secret:

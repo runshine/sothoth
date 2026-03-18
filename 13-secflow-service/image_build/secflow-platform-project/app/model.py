@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -32,6 +33,7 @@ class Project(Base):
     owner_name = Column(String(128))  # 所有者名称
     k8s_namespace = Column(String(128))  # 关联的K8S Namespace名称
     status = Column(String(32), default="active")  # active, deleted
+    is_public = Column(Boolean, default=False)  # 是否公开，False为私有，True为公开
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -48,6 +50,7 @@ class Project(Base):
             "owner_name": self.owner_name,
             "k8s_namespace": self.k8s_namespace,
             "status": self.status,
+            "is_public": self.is_public,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

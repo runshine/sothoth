@@ -210,11 +210,93 @@ class IngressSimpleCreateRequest(BaseModel):
     name: str = Field(..., description="Ingress名称")
     service_name: str = Field(..., description="后端Service名称")
     service_port: int = Field(..., description="后端Service端口")
-    host: str = Field(..., description="域名")
+    host: Optional[str] = Field(default=None, description="完整域名，传入则优先使用")
+    host_prefix: Optional[str] = Field(default=None, description="域名前缀，平台将按统一规则生成host")
     ingress_type: str = Field(default="nginx", description="Ingress类型: nginx")
     ingress_ip: Optional[str] = Field(default=None, description="Ingress Controller的外部IP地址（用于记录访问地址）")
     path: str = Field(default="/", description="路径，默认为根路径")
     path_type: str = Field(default="Prefix", description="路径类型: Prefix, Exact, ImplementationSpecific")
+
+
+class IngressExternalCreateRequest(BaseModel):
+    """Ingress外部端点创建请求（路由到外部IP:端口）"""
+    name: str = Field(..., description="Ingress名称")
+    external_ips: List[str] = Field(..., description="外部IP地址列表（支持多个IP负载均衡）")
+    external_port: int = Field(..., description="外部端口")
+    host: Optional[str] = Field(default=None, description="完整域名，传入则优先使用")
+    host_prefix: Optional[str] = Field(default=None, description="域名前缀，平台将按统一规则生成host")
+    path: str = Field(default="/", description="路径，默认为根路径")
+    path_type: str = Field(default="Prefix", description="路径类型: Prefix, Exact, ImplementationSpecific")
+    ingress_type: str = Field(default="nginx", description="Ingress类型: nginx")
+    service_port: int = Field(default=80, description="Service端口（Ingress指向此端口）")
+    tls_enabled: bool = Field(default=False, description="是否启用TLS")
+    tls_secret_name: Optional[str] = Field(default=None, description="TLS Secret名称（启用TLS时必需）")
+    # NGINX Ingress 注解参数
+    websocket_enabled: bool = Field(default=False, description="是否启用WebSocket支持")
+    proxy_body_size: str = Field(default="10m", description="最大上传文件大小，如: 10m, 10240m, 1g")
+    proxy_connect_timeout: int = Field(default=60, description="连接超时时间（秒）")
+    proxy_send_timeout: int = Field(default=60, description="发送超时时间（秒）")
+    proxy_read_timeout: int = Field(default=60, description="读取超时时间（秒）")
+    ssl_redirect: bool = Field(default=True, description="是否强制HTTPS重定向")
+
+
+class AgentIngressRouteCreateRequest(BaseModel):
+    """Agent动态Ingress路由创建请求"""
+    agent_key: str = Field(..., description="Agent唯一标识")
+    external_ips: List[str] = Field(..., min_length=1, description="Agent可达IP列表")
+    target_port: int = Field(..., description="Agent目标端口")
+    host: Optional[str] = Field(default=None, description="完整域名，传入则优先使用")
+    host_prefix: Optional[str] = Field(default=None, description="域名前缀，不传则按agent_key和端口生成")
+    path: str = Field(default="/", description="路由路径")
+    path_type: str = Field(default="Prefix", description="路径类型")
+    ingress_type: Optional[str] = Field(default=None, description="IngressClass，不传则使用平台默认")
+    service_port: Optional[int] = Field(default=None, description="Ingress后端service端口")
+    tls_enabled: Optional[bool] = Field(default=None, description="是否启用TLS")
+    tls_secret_name: Optional[str] = Field(default=None, description="TLS Secret名")
+    websocket_enabled: Optional[bool] = Field(default=None, description="是否开启WebSocket转发")
+    proxy_body_size: Optional[str] = Field(default=None, description="Nginx代理body大小")
+    proxy_connect_timeout: Optional[int] = Field(default=None, description="Nginx连接超时")
+    proxy_send_timeout: Optional[int] = Field(default=None, description="Nginx发送超时")
+    proxy_read_timeout: Optional[int] = Field(default=None, description="Nginx读取超时")
+    ssl_redirect: Optional[bool] = Field(default=None, description="是否强制HTTPS重定向")
+    owner_service: str = Field(default="platform-agent", description="创建来源服务")
+    created_by: Optional[str] = Field(default=None, description="创建人")
+    force_recreate: bool = Field(default=False, description="命中同一业务路由时是否强制重建")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="扩展元数据")
+
+
+class AgentIngressRouteInfo(BaseModel):
+    """Agent动态Ingress路由信息"""
+    route_id: str
+    project_id: str
+    namespace: str
+    agent_key: str
+    target_port: int
+    external_ips: List[str] = Field(default_factory=list)
+    host: str
+    path: str
+    ingress_type: str
+    path_type: str
+    service_port: int
+    ingress_name: str
+    service_name: str
+    tls_enabled: bool
+    tls_secret_name: Optional[str] = None
+    websocket_enabled: bool
+    status: str
+    access_url: Optional[str] = None
+    owner_service: Optional[str] = None
+    created_by: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    deleted_at: Optional[str] = None
+
+
+class AgentIngressRouteListResponse(BaseModel):
+    """Agent动态Ingress路由列表"""
+    total: int
+    items: List[AgentIngressRouteInfo]
 
 
 # ==================== Secret 模型 ====================

@@ -42,11 +42,17 @@ class AgentManager:
                  agent_api_port: int, agent_auth_token: str,
                  db_manager: DatabaseManager, redis_manager: RedisManager,
                  pod_id: str, agent_api_timeouts: Dict = None,
-                 nacos_username: str = None, nacos_password: str = None):  # 新增参数
+                 nacos_username: str = None, nacos_password: str = None,
+                 daemon_api_port: int = 11188,
+                 daemon_auth_header: str = 'X-API-Token',
+                 daemon_auth_token: str = None):
         self.nacos_url = nacos_url.rstrip('/')
         self.nacos_namespace = nacos_namespace
         self.agent_api_port = agent_api_port
+        self.daemon_api_port = daemon_api_port  # 新增：守护进程端口
         self.agent_auth_token = agent_auth_token
+        self.daemon_auth_header = daemon_auth_header or 'X-API-Token'
+        self.daemon_auth_token = daemon_auth_token or agent_auth_token
         self.db = db_manager
         self.redis_manager = redis_manager
         self.pod_id = pod_id
@@ -106,13 +112,14 @@ class AgentManager:
     def _load_agents_from_db(self):
         try:
             with self.lock:
+                table_name = self.db.get_table_name('agent_status')
                 if self.db.db_type == 'mysql':
                     agents_data = self.db.fetch_all(
-                        "SELECT * FROM secflow_agent_agent_status WHERE updated_at > NOW() - INTERVAL 5 MINUTE"
+                        f"SELECT * FROM {table_name} WHERE updated_at > NOW() - INTERVAL 5 MINUTE"
                     )
                 else:
                     agents_data = self.db.fetch_all(
-                        "SELECT * FROM secflow_agent_agent_status WHERE updated_at > datetime('now', '-5 minutes')"
+                        f"SELECT * FROM {table_name} WHERE updated_at > datetime('now', '-5 minutes')"
                     )
 
                 for agent_data in agents_data:
@@ -134,6 +141,16 @@ class AgentManager:
                             agent.system_info = json.loads(agent_data['system_info'])
                         else:
                             agent.system_info = agent_data['system_info']
+
+                    daemon_info_data = agent_data.get('daemon_info')
+                    if daemon_info_data:
+                        if isinstance(daemon_info_data, str):
+                            try:
+                                agent.daemon_info = json.loads(daemon_info_data)
+                            except Exception:
+                                agent.daemon_info = {}
+                        else:
+                            agent.daemon_info = daemon_info_data
 
                     if agent_data['services']:
                         if isinstance(agent_data['services'], str):
@@ -473,6 +490,23 @@ class AgentManager:
                 except:
                     pass
 
+                # 守护进程Agent信息（11188）
+                daemon_headers = {
+                    self.daemon_auth_header: self.daemon_auth_token
+                }
+                try:
+                    daemon_info_url = f"http://{agent.ip_address}:{self.daemon_api_port}/api/v1/agent/info"
+                    daemon_info_response = requests.get(daemon_info_url, headers=daemon_headers, timeout=5)
+                    if daemon_info_response.status_code == 200:
+                        daemon_payload = daemon_info_response.json()
+                        if isinstance(daemon_payload, dict):
+                            if 'data' in daemon_payload and isinstance(daemon_payload['data'], dict):
+                                agent.daemon_info = daemon_payload['data']
+                            else:
+                                agent.daemon_info = daemon_payload
+                except:
+                    pass
+
                 return True
             else:
                 agent.status = 'error'
@@ -574,11 +608,12 @@ class AgentManager:
                     where_clause_sqlite = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
 
                 # 查询所有掉线的agent
+                table_name = self.db.get_table_name('agent_status')
                 if self.db.db_type == 'mysql':
                     offline_agents = self.db.fetch_all(f'''
                                                        SELECT agent_key, hostname, ip_address, project_id, status,
                                                               last_seen, updated_at
-                                                       FROM secflow_agent_agent_status
+                                                       FROM {table_name}
                                                        {where_clause}
                                                        ORDER BY updated_at ASC
                                                        ''', (project_id,) if project_id else None)
@@ -586,7 +621,7 @@ class AgentManager:
                     offline_agents = self.db.fetch_all(f'''
                                                        SELECT agent_key, hostname, ip_address, project_id, status,
                                                               last_seen, updated_at
-                                                       FROM secflow_agent_agent_status
+                                                       FROM {table_name}
                                                        {where_clause_sqlite}
                                                        ORDER BY updated_at ASC
                                                        ''', (project_id,) if project_id else None)
@@ -611,14 +646,15 @@ class AgentManager:
 
                         try:
                             # 从数据库中删除
+                            table_name = self.db.get_table_name('agent_status')
                             if self.db.db_type == 'mysql':
                                 self.db.execute_query(
-                                    "DELETE FROM secflow_agent_agent_status WHERE agent_key = %s",
+                                    f"DELETE FROM {table_name} WHERE agent_key = %s",
                                     (agent_key,)
                                 )
                             else:
                                 self.db.execute_query(
-                                    "DELETE FROM secflow_agent_agent_status WHERE agent_key = ?",
+                                    f"DELETE FROM {table_name} WHERE agent_key = ?",
                                     (agent_key,)
                                 )
 
@@ -692,6 +728,7 @@ class AgentManager:
         """
         try:
             # 构建过滤条件
+            table_name = self.db.get_table_name('agent_status')
             project_filter = ""
             params = []
             if project_id:
@@ -701,24 +738,24 @@ class AgentManager:
             # 获取总agent数
             if self.db.db_type == 'mysql':
                 total_result = self.db.fetch_one(
-                    f"SELECT COUNT(*) as count FROM secflow_agent_agent_status{project_filter}",
+                    f"SELECT COUNT(*) as count FROM {table_name}{project_filter}",
                     tuple(params) if params else None
                 )
                 offline_filter = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
                 offline_result = self.db.fetch_one(
-                    f"SELECT COUNT(*) as count FROM secflow_agent_agent_status{offline_filter}",
+                    f"SELECT COUNT(*) as count FROM {table_name}{offline_filter}",
                     tuple(params) if params else None
                 )
             else:
                 placeholders = "?" * len(params) if params else ""
                 project_filter_sql = f" WHERE project_id = {placeholders}" if project_id else ""
                 total_result = self.db.fetch_one(
-                    f"SELECT COUNT(*) as count FROM secflow_agent_agent_status{project_filter_sql}",
+                    f"SELECT COUNT(*) as count FROM {table_name}{project_filter_sql}",
                     tuple(params) if params else None
                 )
                 offline_filter_sql = f" WHERE project_id = {placeholders} AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
                 offline_result = self.db.fetch_one(
-                    f"SELECT COUNT(*) as count FROM secflow_agent_agent_status{offline_filter_sql}",
+                    f"SELECT COUNT(*) as count FROM {table_name}{offline_filter_sql}",
                     tuple(params) if params else None
                 )
 
@@ -747,15 +784,17 @@ class AgentManager:
     def _save_agent_to_db(self, agent: AgentInfo):
         try:
             system_info_json = json.dumps(agent.system_info) if agent.system_info else '{}'
+            daemon_info_json = json.dumps(agent.daemon_info) if agent.daemon_info else '{}'
             services_json = json.dumps(agent.services) if agent.services else '[]'
             last_seen_str = agent.last_seen.isoformat() if agent.last_seen else None
+            table_name = self.db.get_table_name('agent_status')
 
             if self.db.db_type == 'mysql':
-                self.db.execute_query('''
-                                      INSERT INTO secflow_agent_agent_status
+                self.db.execute_query(f'''
+                                      INSERT INTO {table_name}
                                       (agent_key, ip_address, hostname, project_id, full_name, status,
-                                       last_seen, system_info, services, pod_id, updated_at)
-                                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                                       last_seen, system_info, daemon_info, services, pod_id, updated_at)
+                                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                                           ON DUPLICATE KEY UPDATE
                                                                ip_address = VALUES(ip_address),
                                                                hostname = VALUES(hostname),
@@ -764,6 +803,7 @@ class AgentManager:
                                                                status = VALUES(status),
                                                                last_seen = VALUES(last_seen),
                                                                system_info = VALUES(system_info),
+                                                               daemon_info = VALUES(daemon_info),
                                                                services = VALUES(services),
                                                                pod_id = VALUES(pod_id),
                                                                updated_at = NOW()
@@ -776,15 +816,16 @@ class AgentManager:
                                           agent.status,
                                           last_seen_str,
                                           system_info_json,
+                                          daemon_info_json,
                                           services_json,
                                           self.pod_id
                                       ))
             else:
-                self.db.execute_query('''
-                    INSERT OR REPLACE INTO secflow_agent_agent_status 
-                    (agent_key, ip_address, hostname, project_id, full_name, status, 
-                     last_seen, system_info, services, pod_id, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                self.db.execute_query(f'''
+                    INSERT OR REPLACE INTO {table_name}
+                    (agent_key, ip_address, hostname, project_id, full_name, status,
+                     last_seen, system_info, daemon_info, services, pod_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
                 ''', (
                     agent.key,
                     agent.ip_address,
@@ -794,6 +835,7 @@ class AgentManager:
                     agent.status,
                     last_seen_str,
                     system_info_json,
+                    daemon_info_json,
                     services_json,
                     self.pod_id
                 ))

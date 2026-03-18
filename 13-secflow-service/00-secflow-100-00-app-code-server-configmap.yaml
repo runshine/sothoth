@@ -33,6 +33,11 @@ data:
       # kubeconfig路径（集群外运行时使用，null表示使用默认~/.kube/config）
       kubeconfig: null
       connection_timeout: 30
+    # K8S API Service配置（统一通过secflow-platform-k8s）
+    k8s_service:
+      host: "secflow-platform-k8s"
+      port: 80
+      timeout: 30
     # Code Server配置
     code_server:
       # 默认镜像

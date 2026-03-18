@@ -20,7 +20,7 @@ spec:
         image: ghcr.io/runshine/secflow-app-secmate-ng:latest  # 包含kubectl命令
         imagePullPolicy: Always
         ports:
-        - containerPort: 8080
+        - containerPort: 10011
         volumeMounts:
         - name: secflow-app-secmate-ng-config
           mountPath: /app/config.yaml
@@ -35,13 +35,13 @@ spec:
         livenessProbe:
           httpGet:
             path: /api/app/secmate-ng/health
-            port: 8080
+            port: 10011
           initialDelaySeconds: 30
           periodSeconds: 30
         readinessProbe:
           httpGet:
             path: /api/app/secmate-ng/health
-            port: 8080
+            port: 10011
           initialDelaySeconds: 30
           periodSeconds: 30
 

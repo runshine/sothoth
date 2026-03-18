@@ -9,6 +9,6 @@ spec:
     name: "secflow-app-secmate-ng"
   ports:
     - port: 80
-      targetPort: 8080
+      targetPort: 10011
       protocol: TCP
       name: secflow-app-secmate-ng

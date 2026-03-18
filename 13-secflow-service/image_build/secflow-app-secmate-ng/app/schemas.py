@@ -89,6 +89,13 @@ class SecmateNgStatusResponse(BaseModel):
     total_replicas: int
 
 
+class SecmateNgEnvConfigResponse(BaseModel):
+    """Secmate-NG 默认环境变量配置响应"""
+    common_env: Dict[str, Any]
+    default_secmate_env: Dict[str, Any]
+    merged_default_env: Dict[str, Any]
+
+
 # ============ 日志相关Schema ============
 
 class SecmateNgLogsResponse(BaseModel):
