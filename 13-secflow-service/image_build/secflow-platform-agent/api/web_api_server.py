@@ -1994,7 +1994,8 @@ class WebAPIServer:
                     'path': data.get('path', '/'),
                     'path_type': data.get('path_type', 'Prefix'),
                     'ingress_type': data.get('ingress_type'),
-                    'service_port': data.get('service_port'),
+                    # Agent动态转发默认应回源到目标端口，避免未传时落到80端口
+                    'service_port': int(data.get('service_port') or target_port),
                     'tls_enabled': data.get('tls_enabled'),
                     'tls_secret_name': data.get('tls_secret_name'),
                     'websocket_enabled': data.get('websocket_enabled', True),
