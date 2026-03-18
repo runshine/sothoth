@@ -873,22 +873,91 @@ class AgentManager:
                     project_id: str = None) -> Tuple[List[Dict], int]:
         with self.lock:
             if project_id:
-                project = self.projects.get(project_id)
-                if not project:
-                    return [], 0
+                table_name = self.db.get_table_name('agent_status')
+                if self.db.db_type == 'mysql':
+                    rows = self.db.fetch_all(
+                        f"SELECT * FROM {table_name} WHERE project_id = %s ORDER BY updated_at DESC",
+                        (project_id,)
+                    )
+                else:
+                    rows = self.db.fetch_all(
+                        f"SELECT * FROM {table_name} WHERE project_id = ? ORDER BY updated_at DESC",
+                        (project_id,)
+                    )
 
-                agents_list = []
-                for agent_key in project.agents:
-                    agent = self.agents.get(agent_key)
-                    if agent:
-                        agents_list.append(agent)
+                agents_map: Dict[str, Dict] = {}
+
+                for row in rows or []:
+                    key = row.get('agent_key')
+                    if not key:
+                        continue
+
+                    data = {
+                        'key': key,
+                        'ip_address': row.get('ip_address'),
+                        'hostname': row.get('hostname'),
+                        'project_id': row.get('project_id'),
+                        'full_name': row.get('full_name'),
+                        'status': row.get('status') or 'unknown',
+                        'pod_id': row.get('pod_id'),
+                    }
+
+                    last_seen = row.get('last_seen')
+                    if last_seen:
+                        data['last_seen'] = str(last_seen)
+
+                    system_info = row.get('system_info')
+                    if system_info:
+                        if isinstance(system_info, str):
+                            try:
+                                data['system_info'] = json.loads(system_info)
+                            except Exception:
+                                data['system_info'] = {}
+                        else:
+                            data['system_info'] = system_info
+
+                    daemon_info = row.get('daemon_info')
+                    if daemon_info:
+                        if isinstance(daemon_info, str):
+                            try:
+                                data['daemon_info'] = json.loads(daemon_info)
+                            except Exception:
+                                data['daemon_info'] = {}
+                        else:
+                            data['daemon_info'] = daemon_info
+
+                    services = row.get('services')
+                    if services:
+                        if isinstance(services, str):
+                            try:
+                                data['services'] = json.loads(services)
+                            except Exception:
+                                data['services'] = []
+                        else:
+                            data['services'] = services
+
+                    agents_map[key] = data
+
+                # 用内存中的最新状态覆盖同key数据（如果存在）
+                for key, agent in self.agents.items():
+                    if agent.project_id != project_id:
+                        continue
+                    agents_map[key] = {
+                        **agents_map.get(key, {}),
+                        **agent.to_dict()
+                    }
+
+                agents_list = list(agents_map.values())
+                for item in agents_list:
+                    status = (item.get('status') or 'unknown').lower()
+                    item['is_allowed'] = status == 'online'
+                    item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
+                    item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
 
                 total = len(agents_list)
                 start_idx = (page - 1) * per_page
                 end_idx = start_idx + per_page
-                paginated_agents = agents_list[start_idx:end_idx]
-
-                return [agent.to_dict() for agent in paginated_agents], total
+                return agents_list[start_idx:end_idx], total
             else:
                 agents_list = list(self.agents.values())
                 total = len(agents_list)
