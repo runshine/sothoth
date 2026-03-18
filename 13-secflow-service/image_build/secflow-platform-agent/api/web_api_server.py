@@ -1578,6 +1578,53 @@ class WebAPIServer:
                     query_sql += " LIMIT ? OFFSET ?"
                 rows = self.db_manager.fetch_all(query_sql, tuple(params + [per_page, offset]))
 
+                # 预加载模板映射：通过服务名推断模板（service_name 规则通常为 <normalized_template_name>-<agent_suffix>）
+                template_table = self.db_manager.get_table_name('service_templates')
+                template_rows = self.db_manager.fetch_all(
+                    f"SELECT id, name FROM {template_table} ORDER BY id ASC",
+                    tuple()
+                ) or []
+
+                def _normalize_template_name(name: str) -> str:
+                    text = (name or '').strip().lower()
+                    text = re.sub(r'[^a-z0-9-_]', '-', text)
+                    text = re.sub(r'-+', '-', text).strip('-')
+                    return text[:48]
+
+                normalized_templates: List[Dict[str, Any]] = []
+                for tpl in template_rows:
+                    tpl_name = str(tpl.get('name') or '').strip()
+                    if not tpl_name:
+                        continue
+                    normalized_templates.append({
+                        'id': tpl.get('id'),
+                        'name': tpl_name,
+                        'normalized': _normalize_template_name(tpl_name)
+                    })
+
+                def _resolve_template(service_name: str) -> Dict[str, Any]:
+                    svc = (service_name or '').strip().lower()
+                    if not svc:
+                        return {'template_id': None, 'template_name': ''}
+
+                    # 优先最长前缀匹配，避免短模板名误匹配
+                    best = None
+                    best_len = -1
+                    for tpl in normalized_templates:
+                        prefix = tpl.get('normalized') or ''
+                        if not prefix:
+                            continue
+                        if svc == prefix or svc.startswith(prefix + '-'):
+                            if len(prefix) > best_len:
+                                best = tpl
+                                best_len = len(prefix)
+                    if not best:
+                        return {'template_id': None, 'template_name': ''}
+                    return {
+                        'template_id': best.get('id'),
+                        'template_name': best.get('name') or ''
+                    }
+
                 items = []
                 for row in rows:
                     ports = {}
@@ -1591,6 +1638,8 @@ class WebAPIServer:
                         elif isinstance(raw_ports, dict):
                             ports = raw_ports
 
+                    resolved_template = _resolve_template(str(row.get('service_name') or ''))
+
                     items.append({
                         'id': row.get('service_uid'),
                         'service_uid': row.get('service_uid'),
@@ -1601,6 +1650,8 @@ class WebAPIServer:
                         'name': row.get('service_name'),
                         'service_name': row.get('service_name'),
                         'image': row.get('image') or '',
+                        'template_id': resolved_template.get('template_id'),
+                        'template_name': resolved_template.get('template_name'),
                         'status': row.get('status') or 'unknown',
                         'ports': ports,
                         'is_stale': bool(row.get('is_stale')),
