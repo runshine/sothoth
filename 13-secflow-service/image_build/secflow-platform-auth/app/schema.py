@@ -297,11 +297,6 @@ class ProjectDetailResponse(ProjectResponse):
     departments: List[DepartmentResponse] = []
 
 
-class ProjectDepartmentBindRequest(BaseModel):
-    """项目-部门绑定请求模式"""
-    department_ids: List[int]
-
-
 class UserPermissionInfo(BaseModel):
     """用户权限信息响应模式"""
     user_id: int
@@ -310,3 +305,69 @@ class UserPermissionInfo(BaseModel):
     manageable_department_ids: List[int]
     department_structure_manageable_ids: List[int]
     role_names: List[str]
+
+
+# ============ Project服务相关模式 ============
+
+class ProjectRoleBindResponse(BaseModel):
+    """项目角色绑定响应模式（来自project服务）"""
+    user_id: str
+    role: str
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ProjectServiceResponse(BaseModel):
+    """项目服务响应模式（来自project服务）"""
+    id: str
+    name: str
+    description: Optional[str]
+    owner_id: str
+    owner_name: Optional[str]
+    k8s_namespace: Optional[str]
+    status: str
+    is_public: bool = False
+    created_at: datetime
+    updated_at: datetime
+    roles: List[ProjectRoleBindResponse] = []
+
+    class Config:
+        from_attributes = True
+
+
+class ProjectServiceListResponse(BaseModel):
+    """项目服务列表响应模式"""
+    code: str = "200"
+    message: str = "success"
+    data: List[ProjectServiceResponse] = []
+
+    class Config:
+        from_attributes = True
+
+
+class UserDepartmentProjectResponse(BaseModel):
+    """用户部门相关项目响应模式"""
+    id: str
+    name: str
+    description: Optional[str]
+    owner_id: str
+    owner_name: Optional[str]
+    k8s_namespace: Optional[str]
+    status: str
+    is_public: bool
+    created_at: datetime
+    updated_at: datetime
+    roles: List[ProjectRoleBindResponse] = []
+    owner_department_id: Optional[int] = None
+    owner_department_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class UserDepartmentProjectListResponse(BaseModel):
+    """用户部门相关项目列表响应模式"""
+    total: int
+    projects: List[UserDepartmentProjectResponse] = []

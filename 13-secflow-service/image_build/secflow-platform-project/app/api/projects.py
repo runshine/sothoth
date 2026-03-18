@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, joinedload
 from app.config import get_config
 from app.exception import (
     ForbiddenError,
+    InternalError,
     NotFoundError,
     UnauthorizedError,
     ValidationError,
@@ -24,6 +25,7 @@ from app.schemas import (
     ProjectUpdate,
     ProjectResponse,
     ProjectListResponse,
+    ProjectAllListResponse,
     ProjectRoleBindCreate,
     ProjectRoleBindResponse,
     SuccessResponse,
@@ -164,6 +166,7 @@ def make_project_response(project: Project, roles: List[ProjectRoleBindResponse]
         owner_name=project.owner_name,
         k8s_namespace=project.k8s_namespace,
         status=project.status,
+        is_public=project.is_public if project.is_public is not None else False,
         created_at=project.created_at,
         updated_at=project.updated_at,
         roles=roles
@@ -210,6 +213,7 @@ async def create_project(
         owner_name=current_user.get("username"),
         k8s_namespace=k8s_namespace,
         status="active",
+        is_public=project_data.is_public,
     )
     db.add(project)
 
@@ -283,6 +287,33 @@ async def list_projects(
         result.append(make_project_response(project, roles))
 
     return ProjectListResponse(total=len(result), projects=result)
+
+
+@router.get("/list", response_model=ProjectAllListResponse)
+async def list_all_projects(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    查询所有项目列表
+
+    - 返回所有项目（不考虑用户角色），只需登录即可访问
+    """
+    # 查询所有项目
+    projects = db.query(Project).options(joinedload(Project.role_binds)).filter(
+        Project.status == "active"
+    ).all()
+
+    result = []
+    for project in projects:
+        roles = [ProjectRoleBindResponse(
+            user_id=bind.user_id,
+            role=bind.role,
+            created_at=bind.created_at
+        ) for bind in project.role_binds]
+        result.append(make_project_response(project, roles))
+
+    return ProjectAllListResponse(data=result)
 
 
 @router.get("/{project_id}", response_model=ProjectResponse)
@@ -363,6 +394,9 @@ async def update_project(
 
     if project_data.k8s_namespace is not None:
         project.k8s_namespace = project_data.k8s_namespace
+
+    if project_data.is_public is not None:
+        project.is_public = project_data.is_public
 
     db.commit()
 
