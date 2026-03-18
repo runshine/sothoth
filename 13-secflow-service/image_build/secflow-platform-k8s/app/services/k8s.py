@@ -426,7 +426,7 @@ class KubernetesService:
     def _dict_to_v1_endpoints(self, manifest: Dict):
         """字典转V1Endpoints对象"""
         from kubernetes.client import (
-            V1Endpoints, V1ObjectMeta, V1EndpointsSubset,
+            V1Endpoints, V1ObjectMeta, V1EndpointSubset,
             V1EndpointAddress, V1EndpointPort
         )
 
@@ -453,7 +453,7 @@ class KubernetesService:
                 )
                 for p in subset.get("ports", [])
             ]
-            subsets.append(V1EndpointsSubset(addresses=addresses, ports=ports))
+            subsets.append(V1EndpointSubset(addresses=addresses, ports=ports))
 
         return V1Endpoints(metadata=endpoints_metadata, subsets=subsets)
 

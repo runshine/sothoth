@@ -169,6 +169,30 @@ async def get_project_and_namespace(
     return project_id, namespace
 
 
+def _ensure_namespace_exists(namespace: str) -> None:
+    """
+    确保目标 namespace 存在。
+    对动态 Ingress 等场景做兜底，避免因项目 namespace 尚未落地导致创建失败。
+    """
+    k8s = get_k8s_service()
+    try:
+        k8s.get_namespace(namespace)
+        return
+    except Exception as e:
+        msg = str(e).lower()
+        if "不存在" in str(e) or "not found" in msg:
+            logger.warning(f"namespace 不存在，自动创建: {namespace}")
+            k8s.create_namespace(
+                namespace,
+                labels={
+                    "managed-by": "secflow-platform-k8s",
+                    "secflow-auto-created": "true",
+                },
+            )
+            return
+        raise
+
+
 # ==================== 健康检查 ====================
 
 
@@ -713,6 +737,7 @@ async def create_external_ingress(
     from typing import Dict
 
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    _ensure_namespace_exists(namespace)
 
     resolved_host = _resolve_ingress_host(
         project_id=project_id,
@@ -789,6 +814,7 @@ async def create_dynamic_agent_ingress_route(
     db: Session = Depends(get_db)
 ):
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    _ensure_namespace_exists(namespace)
     conf = get_config().dynamic_ingress
     if not conf.enabled:
         raise ValidationError("动态Ingress功能已关闭")
