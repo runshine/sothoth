@@ -323,12 +323,11 @@ class EnhancedTemplateManager:
             # 确保父目录存在
             safe_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # 备份原文件（如果存在）
-            backup_info = {}
+            # 保留原文件内容用于失败回滚（不落地备份文件）
+            original_content = None
             if safe_path.exists():
-                backup_path = safe_path.with_suffix(f'{safe_path.suffix}.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(safe_path, backup_path)
-                backup_info['backup_file'] = str(backup_path.relative_to(template_dir))
+                with open(safe_path, 'rb') as f:
+                    original_content = f.read()
 
             # 写入新内容
             try:
@@ -354,7 +353,7 @@ class EnhancedTemplateManager:
                 'modified_time': datetime.fromtimestamp(stat_info.st_mtime).isoformat(),
                 'updated_by': updated_by,
                 'updated_at': datetime.now().isoformat(),
-                'backup_info': backup_info
+                'backup_info': {}
             }
 
             # 如果是YAML文件，验证其格式
@@ -365,12 +364,12 @@ class EnhancedTemplateManager:
 
                     is_valid, error_msg = self.validate_yaml_content(yaml_content, template_type, safe_path.name)
                     if not is_valid:
-                        # 恢复备份
-                        if backup_info.get('backup_file'):
-                            backup_full_path = template_dir / backup_info['backup_file']
-                            if backup_full_path.exists():
-                                shutil.copy2(backup_full_path, safe_path)
-                                safe_path.unlink()
+                        # 恢复更新前内容（不依赖备份文件）
+                        if original_content is not None:
+                            with open(safe_path, 'wb') as f:
+                                f.write(original_content)
+                        elif safe_path.exists():
+                            safe_path.unlink()
 
                         return False, f"YAML格式验证失败: {error_msg}", {}
 
@@ -438,9 +437,8 @@ class EnhancedTemplateManager:
             template_dir = self.templates_root / template_name
             relative_path = updated_file.relative_to(template_dir)
 
-            # 备份原压缩文件
-            backup_path = archive_path.with_suffix(f'{archive_path.suffix}.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-            shutil.copy2(archive_path, backup_path)
+            # 保留压缩文件原始字节用于失败回滚（不落地备份文件）
+            original_archive_content = archive_path.read_bytes()
 
             # 获取文件扩展名以确定压缩格式
             filename = archive_path.name.lower()
@@ -463,8 +461,7 @@ class EnhancedTemplateManager:
                 metadata['archive_updates'].append({
                     'file': str(relative_path),
                     'updated_at': datetime.now().isoformat(),
-                    'updated_by': updated_by,
-                    'backup_file': backup_path.name
+                    'updated_by': updated_by
                 })
 
                 # 限制记录数量
@@ -472,11 +469,10 @@ class EnhancedTemplateManager:
                     metadata['archive_updates'] = metadata['archive_updates'][-20:]
 
                 self.logger.info(f"压缩文件更新成功: {template_name}, 文件: {relative_path}")
-                return True, f"压缩文件更新成功，备份: {backup_path.name}"
+                return True, "压缩文件更新成功"
             else:
-                # 恢复备份
-                if backup_path.exists():
-                    shutil.copy2(backup_path, archive_path)
+                # 失败回滚为原始压缩文件
+                archive_path.write_bytes(original_archive_content)
                 return False, "更新压缩文件失败"
 
         except Exception as e:
@@ -1860,10 +1856,7 @@ class EnhancedTemplateManager:
             if template_type == 'yaml':
                 # 直接更新YAML文件
                 file_path = Path(template['file_path'])
-
-                # 备份原文件
-                backup_path = file_path.with_suffix(f'.yaml.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(file_path, backup_path)
+                original_yaml_content = file_path.read_bytes() if file_path.exists() else None
 
                 # 写入新内容
                 with open(file_path, 'w', encoding='utf-8') as f:
@@ -1891,16 +1884,17 @@ class EnhancedTemplateManager:
                     self.parse_template_compose(name)
                 except Exception as e:
                     self.logger.error(f"重新解析失败: {str(e)}")
+                    # 解析失败时恢复原内容
+                    if original_yaml_content is not None:
+                        with open(file_path, 'wb') as f:
+                            f.write(original_yaml_content)
 
-                return True, f"模板 '{name}' 更新成功，备份文件: {backup_path.name}"
+                return True, f"模板 '{name}' 更新成功"
 
             elif template_type == 'archive':
                 # 更新压缩包中的YAML
                 archive_path = Path(template['file_path'])
-
-                # 备份原压缩文件
-                backup_path = archive_path.with_suffix(f'.archive.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(archive_path, backup_path)
+                original_archive_content = archive_path.read_bytes() if archive_path.exists() else None
 
                 # 查找解压目录中的YAML文件
                 yaml_files = []
@@ -1917,10 +1911,7 @@ class EnhancedTemplateManager:
 
                 # 更新第一个找到的YAML文件（通常是主文件）
                 yaml_file = yaml_files[0]
-
-                # 备份原YAML文件
-                yaml_backup = yaml_file.with_suffix(f'.yaml.backup.{datetime.now().strftime("%Y%m%d%H%M%S")}')
-                shutil.copy2(yaml_file, yaml_backup)
+                original_yaml_content = yaml_file.read_bytes() if yaml_file.exists() else None
 
                 # 写入新内容
                 with open(yaml_file, 'w', encoding='utf-8') as f:
@@ -1989,8 +1980,15 @@ class EnhancedTemplateManager:
                     self.parse_template_compose(name)
                 except Exception as e:
                     self.logger.error(f"重新解析失败: {str(e)}")
+                    # 解析失败回滚
+                    if original_yaml_content is not None:
+                        with open(yaml_file, 'wb') as f:
+                            f.write(original_yaml_content)
+                    if original_archive_content is not None:
+                        with open(archive_path, 'wb') as f:
+                            f.write(original_archive_content)
 
-                return True, f"模板 '{name}' 更新成功，备份文件: {backup_path.name}"
+                return True, f"模板 '{name}' 更新成功"
 
             else:
                 return False, f"不支持的模板类型: {template_type}"

@@ -456,6 +456,112 @@ class DatabaseManager:
                 # 为SQLite创建索引
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_status_project ON {table_agent_status}(project_id)')
 
+            # 创建Agent服务聚合表（用于全量服务发现）
+            table_agent_services = f"{prefix}agent_services"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_agent_services} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               service_uid VARCHAR(256) UNIQUE NOT NULL,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               agent_hostname VARCHAR(100),
+                               agent_ip VARCHAR(64),
+                               service_name VARCHAR(200) NOT NULL,
+                               image TEXT,
+                               status VARCHAR(32) DEFAULT 'unknown',
+                               ports_json JSON,
+                               raw_json JSON,
+                               source VARCHAR(32) DEFAULT 'pull',
+                               is_stale TINYINT(1) DEFAULT 0,
+                               first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               pod_id VARCHAR(100),
+                               INDEX idx_agent_services_project (project_id),
+                               INDEX idx_agent_services_agent (agent_key),
+                               INDEX idx_agent_services_status (status),
+                               INDEX idx_agent_services_name (service_name),
+                               INDEX idx_agent_services_seen (last_seen_at)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_agent_services} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               service_uid TEXT UNIQUE NOT NULL,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               agent_hostname TEXT,
+                               agent_ip TEXT,
+                               service_name TEXT NOT NULL,
+                               image TEXT,
+                               status TEXT DEFAULT 'unknown',
+                               ports_json TEXT,
+                               raw_json TEXT,
+                               source TEXT DEFAULT 'pull',
+                               is_stale INTEGER DEFAULT 0,
+                               first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               pod_id TEXT
+                           )
+                           ''')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_project ON {table_agent_services}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_agent ON {table_agent_services}(agent_key)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_status ON {table_agent_services}(status)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_name ON {table_agent_services}(service_name)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_seen ON {table_agent_services}(last_seen_at)')
+
+            # 创建服务同步历史表
+            table_sync_logs = f"{prefix}service_sync_logs"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_sync_logs} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               sync_id VARCHAR(64) UNIQUE NOT NULL,
+                               scope VARCHAR(32) NOT NULL,
+                               project_id VARCHAR(100),
+                               agent_key VARCHAR(64),
+                               stale_only TINYINT(1) DEFAULT 0,
+                               status VARCHAR(20) NOT NULL DEFAULT 'ok',
+                               total INT DEFAULT 0,
+                               ok_count INT DEFAULT 0,
+                               fail_count INT DEFAULT 0,
+                               message TEXT,
+                               details_json JSON,
+                               pod_id VARCHAR(100),
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               INDEX idx_sync_logs_created (created_at),
+                               INDEX idx_sync_logs_scope (scope),
+                               INDEX idx_sync_logs_project (project_id),
+                               INDEX idx_sync_logs_agent (agent_key)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_sync_logs} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               sync_id TEXT UNIQUE NOT NULL,
+                               scope TEXT NOT NULL,
+                               project_id TEXT,
+                               agent_key TEXT,
+                               stale_only INTEGER DEFAULT 0,
+                               status TEXT NOT NULL DEFAULT 'ok',
+                               total INTEGER DEFAULT 0,
+                               ok_count INTEGER DEFAULT 0,
+                               fail_count INTEGER DEFAULT 0,
+                               message TEXT,
+                               details_json TEXT,
+                               pod_id TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_created ON {table_sync_logs}(created_at)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_scope ON {table_sync_logs}(scope)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_project ON {table_sync_logs}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_agent ON {table_sync_logs}(agent_key)')
+
             # 兼容历史数据库：补齐新增列
             self._ensure_agent_status_columns(db, table_agent_status)
 

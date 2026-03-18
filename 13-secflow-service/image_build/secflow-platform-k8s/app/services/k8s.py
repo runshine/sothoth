@@ -681,10 +681,8 @@ class KubernetesService:
             if websocket_enabled:
                 annotations["nginx.ingress.kubernetes.io/proxy-http-version"] = "1.1"
                 annotations["nginx.ingress.kubernetes.io/proxy-buffering"] = "off"
-                annotations["nginx.ingress.kubernetes.io/configuration-snippet"] = (
-                    "proxy_set_header Upgrade $http_upgrade;\n"
-                    "proxy_set_header Connection $connection_upgrade;"
-                )
+                # 兼容默认关闭 snippet annotations 的集群策略，避免 Admission 拒绝
+                annotations["nginx.ingress.kubernetes.io/enable-websocket"] = "true"
 
             ingress_manifest = {
                 "metadata": {
@@ -879,8 +877,8 @@ class KubernetesService:
         return {
             "name": ing.metadata.name,
             "namespace": ing.metadata.namespace,
-            "label": ing.metadata.label or {},
-            "annotation": ing.metadata.annotation or {},
+            "labels": ing.metadata.labels or {},
+            "annotations": ing.metadata.annotations or {},
             "ingress_class_name": ing.spec.ingress_class_name,
             "tls": [
                 {
@@ -927,8 +925,8 @@ class KubernetesService:
         ingress_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", metadata.get("label", {})),
+            annotations=metadata.get("annotations", metadata.get("annotation", {}))
         )
 
         tls_list = []

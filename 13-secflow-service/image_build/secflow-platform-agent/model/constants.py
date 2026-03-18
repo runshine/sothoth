@@ -53,6 +53,7 @@ DEFAULT_CONFIG = {
     'daemon_auth_token': 'default_token_change_me',
     'daemon_read_timeout_sec': 8,
     'refresh_interval': 30,
+    'service_sync_interval': 30,
     'max_workers': 10,
     'upload_max_size': 100 * 1024 * 1024,
     'token_expiration': 24 * 3600,

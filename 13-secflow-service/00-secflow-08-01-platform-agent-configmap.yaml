@@ -35,6 +35,7 @@ data:
       "daemon_read_timeout_sec": 8,
       "ttyd_probe_timeout_sec": 3,
       "refresh_interval": 60,
+      "service_sync_interval": 30,
       "max_workers": 10,
       "upload_max_size": 104857600,
       "token_expiration": 86400,
