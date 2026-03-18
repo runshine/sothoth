@@ -220,7 +220,7 @@ def create_app():
     app.include_router(users.router, prefix="/api/auth")
     app.include_router(role_router, prefix="/api/auth")
     app.include_router(machine_tokens_router, prefix="/api/auth")
-    app.include_router(org_router)
+    app.include_router(org_router, prefix="/api/auth")
 
     @app.get("/")
     def root():

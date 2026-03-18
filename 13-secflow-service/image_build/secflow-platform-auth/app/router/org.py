@@ -15,7 +15,7 @@ from app.schema import (
     ProjectDepartmentBindRequest, Message, UserPermissionInfo
 )
 
-router = APIRouter(prefix="/api/org", tags=["organization"])
+router = APIRouter(prefix="/org", tags=["organization"])
 
 logger = logging.getLogger(__name__)
 
