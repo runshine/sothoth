@@ -838,6 +838,9 @@ async def create_dynamic_agent_ingress_route(
     service_port = int(request.service_port if request.service_port is not None else target_port)
     tls_enabled = bool(conf.default_tls_enabled if request.tls_enabled is None else request.tls_enabled)
     tls_secret_name = request.tls_secret_name if request.tls_secret_name is not None else conf.default_tls_secret_name
+    if tls_secret_name == "wildcard-code-server.sothothv2.com-tls":
+        # 兼容历史配置，统一切换到当前公共TLS Secret
+        tls_secret_name = "wildcard-sothothv2.com-tls"
     if tls_enabled and (not tls_secret_name or not str(tls_secret_name).strip()):
         raise ValidationError("已启用TLS但未配置tls_secret_name，请配置公共TLS Secret名称")
     if tls_enabled:
