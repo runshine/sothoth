@@ -17,7 +17,7 @@ from app.schema import (
 )
 from app.service.project import get_project_service, ProjectServiceError
 
-router = APIRouter(prefix="/api/org", tags=["organization"])
+router = APIRouter(prefix="/org", tags=["organization"])
 
 logger = logging.getLogger(__name__)
 
