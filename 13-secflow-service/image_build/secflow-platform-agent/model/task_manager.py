@@ -223,6 +223,37 @@ class TaskManager:
 
         return task_id
 
+    def find_active_task_for_service(self, task_type: str, service_name: str, agent_key: str,
+                                     project_id: Optional[str] = None) -> Optional[Dict]:
+        """
+        查询同项目/同Agent/同服务名是否存在进行中的任务（pending/running）。
+        用于部署防重。
+        """
+        table_tasks = self.db.get_table_name('tasks')
+        if self.db.db_type == 'mysql':
+            query = f'''
+                SELECT * FROM {table_tasks}
+                WHERE task_type = %s
+                  AND service_name = %s
+                  AND agent_key = %s
+                  AND project_id = %s
+                  AND status IN ('pending', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+            '''
+        else:
+            query = f'''
+                SELECT * FROM {table_tasks}
+                WHERE task_type = ?
+                  AND service_name = ?
+                  AND agent_key = ?
+                  AND project_id = ?
+                  AND status IN ('pending', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+            '''
+        return self.db.fetch_one(query, (task_type, service_name, agent_key, project_id or ''))
+
     def _execute_task(self, task_id: str, task_type: str, service_name: str,
                       agent_key: str, template_name: str, extra_params: Dict):
         if task_type == 'deploy':

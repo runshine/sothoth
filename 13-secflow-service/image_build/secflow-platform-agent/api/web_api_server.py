@@ -530,6 +530,53 @@ class WebAPIServer:
             user_ctx.get('username', '')
         )
 
+    def _service_exists_on_agent(self, agent_key: str, service_name: str) -> bool:
+        """检查Agent上是否已存在同名服务。"""
+        try:
+            status_code, response = self.agent_manager.call_agent_api(
+                agent_key, 'GET', f'/api/services/{service_name}', None, timeout_type='health_check'
+            )
+            if status_code == 200:
+                return True
+
+            # 兼容部分Agent不支持单服务查询，回退到列表查询
+            list_code, list_resp = self.agent_manager.call_agent_api(
+                agent_key, 'GET', '/api/services', None, timeout_type='health_check'
+            )
+            if list_code == 200:
+                if isinstance(list_resp, list):
+                    return any(isinstance(item, dict) and item.get('name') == service_name for item in list_resp)
+                if isinstance(list_resp, dict):
+                    services = list_resp.get('services') or list_resp.get('items') or []
+                    if isinstance(services, list):
+                        return any(isinstance(item, dict) and item.get('name') == service_name for item in services)
+            return False
+        except Exception as e:
+            self.logger.warning(f"检查Agent服务是否重复失败: agent={agent_key}, service={service_name}, error={e}")
+            # 无法确定时不阻断请求，交由后续流程处理
+            return False
+
+    def _check_deploy_duplicate(self, service_name: str, agent_key: str, project_id: str) -> Optional[Dict[str, Any]]:
+        """统一部署防重检查：进行中的部署任务 + Agent已存在服务。"""
+        active_task = self.task_manager.find_active_task_for_service(
+            'deploy', service_name, agent_key, project_id
+        )
+        if active_task:
+            return {
+                'reason': 'active_task',
+                'message': f'服务 {service_name} 在节点 {agent_key} 上已有进行中的部署任务',
+                'task_id': active_task.get('task_id'),
+                'task_status': active_task.get('status'),
+            }
+
+        if self._service_exists_on_agent(agent_key, service_name):
+            return {
+                'reason': 'existing_service',
+                'message': f'服务 {service_name} 在节点 {agent_key} 上已存在，禁止重复部署'
+            }
+
+        return None
+
     def _record_service_sync_log(self, scope: str, status: str = 'ok',
                                  project_id: Optional[str] = None, agent_key: Optional[str] = None,
                                  stale_only: bool = False, total: int = 0, ok_count: int = 0,
@@ -1055,6 +1102,16 @@ class WebAPIServer:
             if agent.project_id != project_id:
                 return jsonify({'error': f"Agent {data['agent_key']} 不属于项目 {project_id}"}), 403
 
+            duplicate = self._check_deploy_duplicate(
+                data['service_name'], data['agent_key'], project_id
+            )
+            if duplicate:
+                return jsonify({
+                    'error': duplicate.get('message') or '重复部署被拒绝',
+                    'code': 'DUPLICATE_DEPLOYMENT',
+                    'details': duplicate
+                }), 409
+
             task_id = self.task_manager.create_task(
                 'deploy', data['service_name'], data['agent_key'],
                 data['template_name'], data.get('extra_params'), project_id
@@ -1082,6 +1139,7 @@ class WebAPIServer:
 
             results = []
             errors = []
+            request_level_seen = set()
 
             for idx, item in enumerate(deployments):
                 if not isinstance(item, dict):
@@ -1124,6 +1182,32 @@ class WebAPIServer:
                         'agent_key': agent_key,
                         'template_name': template_name,
                         'error': f"Agent {agent_key} 不属于项目 {project_id}"
+                    })
+                    continue
+
+                dedup_key = f"{project_id}::{agent_key}::{service_name}"
+                if dedup_key in request_level_seen:
+                    errors.append({
+                        'index': idx,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name,
+                        'code': 'DUPLICATE_DEPLOYMENT',
+                        'error': f"请求中存在重复部署项: {service_name} on {agent_key}"
+                    })
+                    continue
+                request_level_seen.add(dedup_key)
+
+                duplicate = self._check_deploy_duplicate(service_name, agent_key, project_id)
+                if duplicate:
+                    errors.append({
+                        'index': idx,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name,
+                        'code': 'DUPLICATE_DEPLOYMENT',
+                        'error': duplicate.get('message') or '重复部署被拒绝',
+                        'details': duplicate
                     })
                     continue
 
