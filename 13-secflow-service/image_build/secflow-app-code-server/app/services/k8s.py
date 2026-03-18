@@ -1,13 +1,11 @@
 """
-Code Server Manager - K8S客户端服务
+Code Server Manager - K8S API 客户端服务（统一通过 secflow-platform-k8s）
 """
 
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
-from kubernetes import client, config
-from kubernetes.client import ApiClient
-from kubernetes.client.rest import ApiException
+import httpx
 
 from app.config import get_config
 
@@ -15,67 +13,76 @@ logger = logging.getLogger(__name__)
 
 
 class K8SService:
-    """K8S服务类"""
+    """K8S服务类（通过 platform-k8s 微服务）"""
 
     def __init__(self):
         self.config = get_config()
-        self.client: Optional[ApiClient] = None
-        self.core_v1 = None
-        self.apps_v1 = None
-        self.networking_v1 = None
+        timeout = getattr(self.config.kubernetes, "connection_timeout", 30)
+        self.client = httpx.Client(timeout=timeout)
+        self.base_url = self._build_base_url()
+
+    def _build_base_url(self) -> str:
+        # 优先读取统一的 k8s_service 配置，兼容旧配置
+        k8s_service = getattr(self.config, "k8s_service", None)
+        if k8s_service:
+            return f"http://{k8s_service.host}:{k8s_service.port}/api/k8s"
+        return "http://secflow-platform-k8s:80/api/k8s"
+
+    @staticmethod
+    def _project_id_from_namespace(namespace: str) -> str:
+        if not namespace or not namespace.startswith("secflow-"):
+            raise ValueError(f"无效namespace，无法解析project_id: {namespace}")
+        return namespace.replace("secflow-", "", 1)
+
+    def _request(self, method: str, path: str, project_id: Optional[str] = None, **kwargs) -> httpx.Response:
+        url = f"{self.base_url}{path}"
+        params = dict(kwargs.pop("params", {}) or {})
+        if project_id:
+            params["project_id"] = project_id
+        resp = self.client.request(method=method.upper(), url=url, params=params, **kwargs)
+        return resp
 
     def connect(self) -> bool:
-        """连接K8S集群"""
+        """连接检查（检查 platform-k8s 健康）"""
         try:
-            if self.config.kubernetes.in_cluster:
-                config.load_incluster_config()
-                logger.info("使用ServiceAccount加载K8S配置")
+            resp = self._request("GET", "/health")
+            ok = resp.status_code == 200
+            if ok:
+                logger.info("通过 platform-k8s 连接验证成功")
             else:
-                kubeconfig_path = self.config.kubernetes.kubeconfig or "~/.kube/config"
-                config.load_kube_config(config_file=kubeconfig_path)
-                logger.info(f"使用kubeconfig加载K8S配置: {kubeconfig_path}")
-
-            self.client = client.ApiClient()
-            self.core_v1 = client.CoreV1Api(self.client)
-            self.apps_v1 = client.AppsV1Api(self.client)
-            self.networking_v1 = client.NetworkingV1Api(self.client)
-
-            # 验证连接
-            self.core_v1.read_namespace_status("default")
-            logger.info("K8S连接验证成功")
-            return True
-
+                logger.error(f"通过 platform-k8s 连接验证失败: {resp.status_code} {resp.text}")
+            return ok
         except Exception as e:
-            logger.error(f"K8S连接失败: {e}")
+            logger.error(f"通过 platform-k8s 连接失败: {e}")
             return False
 
     def check_namespace_exists(self, namespace: str) -> bool:
         """检查Namespace是否存在"""
         try:
-            self.core_v1.read_namespace(name=namespace)
-            return True
-        except ApiException as e:
-            if e.status == 404:
+            resp = self._request("GET", f"/namespaces/{namespace}")
+            if resp.status_code != 200:
                 return False
-            raise
+            data = resp.json()
+            return bool(data.get("exists", False))
+        except Exception as e:
+            logger.error(f"检查namespace失败: {e}")
+            return False
 
     def check_pvc_exists(self, namespace: str, pvc_name: str) -> bool:
         """检查PVC是否存在"""
         try:
-            self.core_v1.read_namespaced_persistent_volume_claim(
-                name=pvc_name, namespace=namespace
-            )
-            return True
-        except ApiException as e:
-            if e.status == 404:
-                return False
-            raise
+            project_id = self._project_id_from_namespace(namespace)
+            resp = self._request("GET", f"/pvcs/{pvc_name}", project_id=project_id)
+            return resp.status_code == 200
+        except Exception:
+            return False
 
     def create_pvc(self, namespace: str, pvc_name: str, storage_size: str,
                    storage_class: str = None, access_mode: str = "ReadWriteOnce") -> bool:
         """创建PVC"""
         try:
-            pvc_manifest = {
+            project_id = self._project_id_from_namespace(namespace)
+            manifest = {
                 "apiVersion": "v1",
                 "kind": "PersistentVolumeClaim",
                 "metadata": {
@@ -95,36 +102,27 @@ class K8SService:
                     }
                 }
             }
-
-            # 添加storageClassName
             sc = storage_class or self.config.pvc.storage_class
             if sc:
-                pvc_manifest["spec"]["storageClassName"] = sc
-
-            self.core_v1.create_namespaced_persistent_volume_claim(
-                namespace=namespace, body=pvc_manifest
-            )
-            logger.info(f"PVC {pvc_name} 在Namespace {namespace} 创建成功")
-            return True
-
-        except ApiException as e:
-            if e.status == 409:
-                logger.info(f"PVC {pvc_name} 已存在")
+                manifest["spec"]["storageClassName"] = sc
+            resp = self._request("POST", "/pvcs", project_id=project_id, json={"manifest": manifest})
+            if resp.status_code in (200, 201):
                 return True
+            if resp.status_code == 409:
+                return True
+            logger.error(f"创建PVC失败: {resp.status_code} {resp.text}")
+            return False
+        except Exception as e:
             logger.error(f"创建PVC失败: {e}")
             return False
 
     def delete_pvc(self, namespace: str, pvc_name: str) -> bool:
         """删除PVC"""
         try:
-            self.core_v1.delete_namespaced_persistent_volume_claim(
-                name=pvc_name, namespace=namespace
-            )
-            logger.info(f"PVC {pvc_name} 在Namespace {namespace} 删除成功")
-            return True
-        except ApiException as e:
-            if e.status == 404:
-                return True
+            project_id = self._project_id_from_namespace(namespace)
+            resp = self._request("DELETE", f"/pvcs/{pvc_name}", project_id=project_id)
+            return resp.status_code in (200, 404)
+        except Exception as e:
             logger.error(f"删除PVC失败: {e}")
             return False
 
@@ -133,73 +131,34 @@ class K8SService:
                          custom_env: Dict[str, str] = None,
                          code_server_env: Dict[str, Any] = None,
                          image: str = None) -> tuple[bool, Optional[Dict[str, Any]]]:
-        """创建Deployment
-
-        Args:
-            namespace: 命名空间
-            name: Deployment名称
-            code_server_id: Code Server ID
-            source_pvcs: 源码PVC列表
-            output_pvcs: 输出PVC列表
-            custom_env: 自定义环境变量
-            code_server_env: Code Server镜像环境变量配置
-            image: 自定义镜像地址，如果为None则使用配置文件中的默认镜像
-
-        Returns:
-            tuple: (success: bool, env_vars: dict or None)
-        """
+        """创建Deployment"""
         try:
+            project_id = self._project_id_from_namespace(namespace)
             config = self.config.code_server
 
-            # 构建卷和卷挂载
             volumes = []
             volume_mounts = []
             volume_index = 0
-
-            # 源码PVC
             for pvc_info in source_pvcs:
                 volume_name = f"source-volume-{volume_index}"
-                volumes.append({
-                    "name": volume_name,
-                    "persistentVolumeClaim": {
-                        "claimName": pvc_info["pvc_name"]
-                    }
-                })
-                volume_mounts.append({
-                    "name": volume_name,
-                    "mountPath": pvc_info["mount_path"]
-                })
+                volumes.append({"name": volume_name, "persistentVolumeClaim": {"claimName": pvc_info["pvc_name"]}})
+                volume_mounts.append({"name": volume_name, "mountPath": pvc_info["mount_path"]})
                 volume_index += 1
-
-            # 输出PVC
             for pvc_info in output_pvcs:
                 volume_name = f"output-volume-{volume_index}"
-                volumes.append({
-                    "name": volume_name,
-                    "persistentVolumeClaim": {
-                        "claimName": pvc_info["pvc_name"]
-                    }
-                })
-                volume_mounts.append({
-                    "name": volume_name,
-                    "mountPath": pvc_info["mount_path"]
-                })
+                volumes.append({"name": volume_name, "persistentVolumeClaim": {"claimName": pvc_info["pvc_name"]}})
+                volume_mounts.append({"name": volume_name, "mountPath": pvc_info["mount_path"]})
                 volume_index += 1
 
-            # 构建Code Server环境变量
             import secrets
             final_code_server_env = {}
             cs_env_config = config.code_server_env
-
-            # 如果请求中提供了环境变量，使用请求中的值，否则使用配置中的值
             if code_server_env:
                 final_code_server_env["PUID"] = str(code_server_env.get("PUID", cs_env_config.get("PUID", 1000)))
                 final_code_server_env["PGID"] = str(code_server_env.get("PGID", cs_env_config.get("PGID", 1000)))
                 final_code_server_env["TZ"] = code_server_env.get("TZ", cs_env_config.get("TZ", "Asia/Shanghai"))
                 final_code_server_env["DEFAULT_WORKSPACE"] = code_server_env.get("DEFAULT_WORKSPACE", cs_env_config.get("DEFAULT_WORKSPACE", "/config/workspace"))
                 final_code_server_env["PWA_APPNAME"] = code_server_env.get("PWA_APPNAME", cs_env_config.get("PWA_APPNAME", "code-server"))
-
-                # 密码：优先使用请求中的，其次是配置中的，最后随机生成
                 if code_server_env.get("HASHED_PASSWORD"):
                     final_code_server_env["HASHED_PASSWORD"] = code_server_env["HASHED_PASSWORD"]
                 elif code_server_env.get("PASSWORD"):
@@ -210,8 +169,6 @@ class K8SService:
                     final_code_server_env["PASSWORD"] = cs_env_config["PASSWORD"]
                 else:
                     final_code_server_env["PASSWORD"] = secrets.token_urlsafe(16)
-
-                # Sudo密码
                 if code_server_env.get("SUDO_PASSWORD_HASH"):
                     final_code_server_env["SUDO_PASSWORD_HASH"] = code_server_env["SUDO_PASSWORD_HASH"]
                 elif code_server_env.get("SUDO_PASSWORD"):
@@ -222,59 +179,42 @@ class K8SService:
                     final_code_server_env["SUDO_PASSWORD"] = cs_env_config["SUDO_PASSWORD"]
                 else:
                     final_code_server_env["SUDO_PASSWORD"] = secrets.token_urlsafe(16)
-
-                # 代理域名
                 proxy_domain = code_server_env.get("PROXY_DOMAIN", cs_env_config.get("PROXY_DOMAIN"))
                 if proxy_domain:
                     final_code_server_env["PROXY_DOMAIN"] = proxy_domain
             else:
-                # 使用配置中的值
                 final_code_server_env["PUID"] = str(cs_env_config.get("PUID", 1000))
                 final_code_server_env["PGID"] = str(cs_env_config.get("PGID", 1000))
                 final_code_server_env["TZ"] = cs_env_config.get("TZ", "Asia/Shanghai")
                 final_code_server_env["DEFAULT_WORKSPACE"] = cs_env_config.get("DEFAULT_WORKSPACE", "/config/workspace")
                 final_code_server_env["PWA_APPNAME"] = cs_env_config.get("PWA_APPNAME", "code-server")
-
                 if cs_env_config.get("HASHED_PASSWORD"):
                     final_code_server_env["HASHED_PASSWORD"] = cs_env_config["HASHED_PASSWORD"]
                 elif cs_env_config.get("PASSWORD"):
                     final_code_server_env["PASSWORD"] = cs_env_config["PASSWORD"]
                 else:
                     final_code_server_env["PASSWORD"] = secrets.token_urlsafe(16)
-
                 if cs_env_config.get("SUDO_PASSWORD_HASH"):
                     final_code_server_env["SUDO_PASSWORD_HASH"] = cs_env_config["SUDO_PASSWORD_HASH"]
                 elif cs_env_config.get("SUDO_PASSWORD"):
                     final_code_server_env["SUDO_PASSWORD"] = cs_env_config["SUDO_PASSWORD"]
                 else:
                     final_code_server_env["SUDO_PASSWORD"] = secrets.token_urlsafe(16)
-
                 if cs_env_config.get("PROXY_DOMAIN"):
                     final_code_server_env["PROXY_DOMAIN"] = cs_env_config["PROXY_DOMAIN"]
 
-            # 构建完整的环境变量列表
             env = []
-
-            # 1. Code Server镜像环境变量（最重要，放最前面）
             for key, value in final_code_server_env.items():
                 env.append({"name": key, "value": value})
-
-            # 2. 配置中的其他环境变量
             for key, value in config.env.items():
-                # 避免覆盖Code Server的特殊环境变量
                 if key not in final_code_server_env:
                     env.append({"name": key, "value": value})
-
-            # 3. 请求中的自定义环境变量
             if custom_env:
                 for key, value in custom_env.items():
-                    # 避免覆盖Code Server的特殊环境变量
                     if key not in final_code_server_env:
                         env.append({"name": key, "value": value})
 
-            # 确定使用的镜像：优先使用传入的自定义镜像，否则使用配置文件中的默认镜像
             container_image = image if image else config.image
-
             deployment_manifest = {
                 "apiVersion": "apps/v1",
                 "kind": "Deployment",
@@ -289,28 +229,15 @@ class K8SService:
                 },
                 "spec": {
                     "replicas": 1,
-                    "selector": {
-                        "matchLabels": {
-                            "app": "code-server",
-                            "code-server-id": code_server_id
-                        }
-                    },
+                    "selector": {"matchLabels": {"app": "code-server", "code-server-id": code_server_id}},
                     "template": {
-                        "metadata": {
-                            "labels": {
-                                "app": "code-server",
-                                "code-server-id": code_server_id
-                            }
-                        },
+                        "metadata": {"labels": {"app": "code-server", "code-server-id": code_server_id}},
                         "spec": {
                             "containers": [{
                                 "name": "code-server",
                                 "image": container_image,
                                 "imagePullPolicy": config.image_pull_policy,
-                                "ports": [{
-                                    "containerPort": 8443,
-                                    "name": "http"
-                                }],
+                                "ports": [{"containerPort": 8443, "name": "http"}],
                                 "env": env,
                                 "volumeMounts": volume_mounts,
                                 "resources": config.resources
@@ -320,65 +247,56 @@ class K8SService:
                     }
                 }
             }
-
-            self.apps_v1.create_namespaced_deployment(
-                namespace=namespace, body=deployment_manifest
-            )
-            logger.info(f"Deployment {name} 在Namespace {namespace} 创建成功")
-            return True, final_code_server_env
-
-        except ApiException as e:
+            resp = self._request("POST", "/deployments", project_id=project_id, json={"manifest": deployment_manifest})
+            if resp.status_code in (200, 201):
+                return True, final_code_server_env
+            logger.error(f"创建Deployment失败: {resp.status_code} {resp.text}")
+            return False, None
+        except Exception as e:
             logger.error(f"创建Deployment失败: {e}")
             return False, None
 
     def delete_deployment(self, namespace: str, name: str) -> bool:
-        """删除Deployment"""
         try:
-            self.apps_v1.delete_namespaced_deployment(
-                name=name, namespace=namespace
-            )
-            logger.info(f"Deployment {name} 在Namespace {namespace} 删除成功")
-            return True
-        except ApiException as e:
-            if e.status == 404:
-                return True
+            project_id = self._project_id_from_namespace(namespace)
+            resp = self._request("DELETE", f"/deployments/{name}", project_id=project_id)
+            return resp.status_code in (200, 404)
+        except Exception as e:
             logger.error(f"删除Deployment失败: {e}")
             return False
 
     def scale_deployment(self, namespace: str, name: str, replicas: int) -> bool:
-        """调整Deployment副本数"""
         try:
-            patch = {"spec": {"replicas": replicas}}
-            self.apps_v1.patch_namespaced_deployment_scale(
-                name=name, namespace=namespace, body=patch
-            )
-            logger.info(f"Deployment {name} 副本数调整到 {replicas}")
-            return True
-        except ApiException as e:
+            project_id = self._project_id_from_namespace(namespace)
+            resp = self._request("POST", f"/deployments/{name}/scale", project_id=project_id, json={"replica": replicas})
+            return resp.status_code == 200
+        except Exception as e:
             logger.error(f"调整Deployment副本数失败: {e}")
             return False
 
     def get_deployment_status(self, namespace: str, name: str) -> Optional[Dict]:
-        """获取Deployment状态"""
         try:
-            dep = self.apps_v1.read_namespaced_deployment(name=name, namespace=namespace)
-            return {
-                "name": dep.metadata.name,
-                "replicas": dep.spec.replicas,
-                "ready_replicas": dep.status.ready_replicas or 0,
-                "available_replicas": dep.status.available_replicas or 0,
-            }
-        except ApiException as e:
-            if e.status == 404:
+            project_id = self._project_id_from_namespace(namespace)
+            resp = self._request("GET", f"/deployments/{name}", project_id=project_id)
+            if resp.status_code == 404:
                 return None
-            raise
+            resp.raise_for_status()
+            dep = resp.json()
+            return {
+                "name": dep.get("name"),
+                "replicas": dep.get("replicas", 0),
+                "ready_replicas": dep.get("ready_replicas", 0),
+                "available_replicas": dep.get("available_replicas", 0),
+            }
+        except Exception as e:
+            logger.error(f"获取Deployment状态失败: {e}")
+            return None
 
     def create_service(self, namespace: str, name: str, code_server_id: str) -> Optional[str]:
-        """创建Service"""
         try:
+            project_id = self._project_id_from_namespace(namespace)
             config = self.config.code_server
-
-            service_manifest = {
+            manifest = {
                 "apiVersion": "v1",
                 "kind": "Service",
                 "metadata": {
@@ -392,10 +310,7 @@ class K8SService:
                 },
                 "spec": {
                     "type": config.service_type,
-                    "selector": {
-                        "app": "code-server",
-                        "code-server-id": code_server_id
-                    },
+                    "selector": {"app": "code-server", "code-server-id": code_server_id},
                     "ports": [{
                         "port": 8443,
                         "targetPort": 8443,
@@ -404,183 +319,107 @@ class K8SService:
                     }]
                 }
             }
-
-            # NodePort和LoadBalancer时添加额外配置
-            if config.service_type == "NodePort":
-                service_manifest["spec"]["ports"][0]["nodePort"] = None  # 自动分配
-
-            svc = self.core_v1.create_namespaced_service(
-                namespace=namespace, body=service_manifest
-            )
-            logger.info(f"Service {name} 在Namespace {namespace} 创建成功")
-            return svc.spec.cluster_ip
-
-        except ApiException as e:
-            if e.status == 409:
-                # 已存在，获取cluster_ip
-                try:
-                    svc = self.core_v1.read_namespaced_service(name=name, namespace=namespace)
-                    return svc.spec.cluster_ip
-                except:
-                    return None
+            resp = self._request("POST", "/services", project_id=project_id, json={"manifest": manifest})
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                return data.get("cluster_ip")
+            if resp.status_code == 409:
+                detail = self._request("GET", f"/services/{name}", project_id=project_id)
+                if detail.status_code == 200:
+                    return detail.json().get("cluster_ip")
+            logger.error(f"创建Service失败: {resp.status_code} {resp.text}")
+            return None
+        except Exception as e:
             logger.error(f"创建Service失败: {e}")
             return None
 
     def delete_service(self, namespace: str, name: str) -> bool:
-        """删除Service"""
         try:
-            self.core_v1.delete_namespaced_service(
-                name=name, namespace=namespace
-            )
-            logger.info(f"Service {name} 在Namespace {namespace} 删除成功")
-            return True
-        except ApiException as e:
-            if e.status == 404:
-                return True
+            project_id = self._project_id_from_namespace(namespace)
+            resp = self._request("DELETE", f"/services/{name}", project_id=project_id)
+            return resp.status_code in (200, 404)
+        except Exception as e:
             logger.error(f"删除Service失败: {e}")
             return False
 
-    def create_ingress(self, namespace: str, name: str, code_server_id: str,
-                       service_name: str) -> Optional[str]:
-        """创建Ingress"""
+    def create_ingress(self, namespace: str, name: str, code_server_id: str, service_name: str) -> Optional[str]:
+        """创建Ingress（统一 host 规则，由 platform-k8s 生成）"""
         try:
+            project_id = self._project_id_from_namespace(namespace)
             config = self.config.ingress
-
-            # 生成访问域名
-            host = f"{code_server_id}.{config.base_domain}"
-
-            ingress_manifest = {
-                "apiVersion": "networking.k8s.io/v1",
-                "kind": "Ingress",
-                "metadata": {
-                    "name": name,
-                    "namespace": namespace,
-                    "labels": {
-                        "app": "code-server",
-                        "code-server-id": code_server_id,
-                        "managed-by": "vscode-web-manager"
-                    },
-                    "annotations": {
-                        "nginx.ingress.kubernetes.io/proxy-body-size": "100m",
-                        "nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
-                        "nginx.ingress.kubernetes.io/proxy-send-timeout": "3600",
-                        "nginx.ingress.kubernetes.io/backend-protocol": "HTTP",
-                        "nginx.ingress.kubernetes.io/proxy-ssl-verify": "off"
-                    }
-                },
-                "spec": {
-                    "ingressClassName": config.ingress_class,
-                    "rules": [{
-                        "host": host,
-                        "http": {
-                            "paths": [{
-                                "path": "/",
-                                "pathType": "Prefix",
-                                "backend": {
-                                    "service": {
-                                        "name": service_name,
-                                        "port": {
-                                            "number": 8443
-                                        }
-                                    }
-                                }
-                            }]
-                        }
-                    }]
-                }
+            payload = {
+                "name": name,
+                "service_name": service_name,
+                "service_port": 8443,
+                "host_prefix": code_server_id,
+                "ingress_type": config.ingress_class,
+                "path": "/",
+                "path_type": "Prefix"
             }
-
-            # 添加TLS配置
-            if config.tls_enabled and config.tls_secret_name:
-                ingress_manifest["spec"]["tls"] = [{
-                    "hosts": [host],
-                    "secretName": config.tls_secret_name
-                }]
-
-            self.networking_v1.create_namespaced_ingress(
-                namespace=namespace, body=ingress_manifest
-            )
-            logger.info(f"Ingress {name} 在Namespace {namespace} 创建成功")
-            return host
-
-        except ApiException as e:
-            if e.status == 409:
-                try:
-                    ing = self.networking_v1.read_namespaced_ingress(name=name, namespace=namespace)
-                    if ing.spec.rules:
-                        return ing.spec.rules[0].host
-                except:
-                    pass
+            resp = self._request("POST", "/ingresses/simple", project_id=project_id, json=payload)
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                rules = data.get("rules") or []
+                if rules and rules[0].get("host"):
+                    return rules[0]["host"]
+            logger.error(f"创建Ingress失败: {resp.status_code} {resp.text}")
+            return None
+        except Exception as e:
             logger.error(f"创建Ingress失败: {e}")
             return None
 
     def delete_ingress(self, namespace: str, name: str) -> bool:
-        """删除Ingress"""
         try:
-            self.networking_v1.delete_namespaced_ingress(
-                name=name, namespace=namespace
-            )
-            logger.info(f"Ingress {name} 在Namespace {namespace} 删除成功")
-            return True
-        except ApiException as e:
-            if e.status == 404:
-                return True
+            project_id = self._project_id_from_namespace(namespace)
+            resp = self._request("DELETE", f"/ingresses/{name}", project_id=project_id)
+            return resp.status_code in (200, 404)
+        except Exception as e:
             logger.error(f"删除Ingress失败: {e}")
             return False
 
     def get_pod_by_deployment(self, namespace: str, deployment_name: str) -> Optional[Dict]:
-        """通过Deployment获取Pod信息"""
         try:
-            # 先获取Deployment的标签选择器
-            dep = self.apps_v1.read_namespaced_deployment(
-                name=deployment_name, namespace=namespace
-            )
-            selector = dep.spec.selector.match_labels
-
-            # 构建标签选择器字符串
-            label_selector = ",".join([f"{k}={v}" for k, v in selector.items()])
-
-            # 获取Pod列表
-            pods = self.core_v1.list_namespaced_pod(
-                namespace=namespace, label_selector=label_selector
-            )
-
-            if pods.items:
-                pod = pods.items[0]
-                return {
-                    "name": pod.metadata.name,
-                    "status": pod.status.phase,
-                    "ip": pod.status.pod_ip,
-                    "node_name": pod.spec.node_name,
-                    "start_time": pod.status.start_time
-                }
-            return None
-
+            project_id = self._project_id_from_namespace(namespace)
+            dep_resp = self._request("GET", f"/deployments/{deployment_name}", project_id=project_id)
+            if dep_resp.status_code != 200:
+                return None
+            dep = dep_resp.json()
+            selector = dep.get("selector") or {}
+            label_selector = ",".join([f"{k}={v}" for k, v in selector.items()]) if selector else None
+            pods_resp = self._request("GET", "/pods", project_id=project_id, params={"label_selector": label_selector} if label_selector else None)
+            if pods_resp.status_code != 200:
+                return None
+            items = (pods_resp.json() or {}).get("items", [])
+            if not items:
+                return None
+            pod = items[0]
+            return {
+                "name": pod.get("name"),
+                "status": pod.get("status"),
+                "ip": pod.get("pod_ip"),
+                "node_name": pod.get("node_name"),
+                "start_time": pod.get("created_at"),
+            }
         except Exception as e:
             logger.error(f"获取Pod信息失败: {e}")
             return None
 
     def get_pod_logs(self, namespace: str, pod_name: str,
                      container: str = None, tail_lines: int = 100) -> Optional[str]:
-        """获取Pod日志"""
         try:
-            kwargs = {
-                "name": pod_name,
-                "namespace": namespace,
-                "tail_lines": tail_lines
-            }
+            project_id = self._project_id_from_namespace(namespace)
+            params = {"tail_lines": tail_lines}
             if container:
-                kwargs["container"] = container
-
-            logs = self.core_v1.read_namespaced_pod_log(**kwargs)
-            return logs
-
-        except ApiException as e:
+                params["container"] = container
+            resp = self._request("GET", f"/pods/{pod_name}/logs", project_id=project_id, params=params)
+            if resp.status_code != 200:
+                return None
+            return (resp.json() or {}).get("logs")
+        except Exception as e:
             logger.error(f"获取Pod日志失败: {e}")
             return None
 
 
-# 单例实例
 _k8s_service: Optional[K8SService] = None
 
 

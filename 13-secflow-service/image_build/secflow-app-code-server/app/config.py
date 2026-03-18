@@ -41,6 +41,13 @@ class KubernetesConfig(BaseModel):
     connection_timeout: int = 30
 
 
+class K8sServiceConfig(BaseModel):
+    """platform-k8s 服务配置"""
+    host: str = "secflow-platform-k8s"
+    port: int = 80
+    timeout: int = 30
+
+
 class CodeServerResources(BaseModel):
     """Code Server资源限制"""
     cpu: str = "100m"
@@ -144,6 +151,7 @@ class Config(BaseModel):
     app: AppConfig = Field(default_factory=AppConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     kubernetes: KubernetesConfig = Field(default_factory=KubernetesConfig)
+    k8s_service: K8sServiceConfig = Field(default_factory=K8sServiceConfig)
     code_server: CodeServerConfig = Field(default_factory=CodeServerConfig)
     pvc: PVCConfig = Field(default_factory=PVCConfig)
     ingress: IngressConfig = Field(default_factory=IngressConfig)

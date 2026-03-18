@@ -398,7 +398,8 @@ class K8SServiceClient:
         name: str,
         service_name: str,
         service_port: int,
-        host: str,
+        host: Optional[str] = None,
+        host_prefix: Optional[str] = None,
         ingress_type: str = "nginx",
         ingress_ip: Optional[str] = None,
         path: str = "/",
@@ -412,7 +413,8 @@ class K8SServiceClient:
             name: Ingress名称
             service_name: 后端Service名称
             service_port: 后端Service端口
-            host: 域名
+            host: 域名（可选，优先级高于host_prefix）
+            host_prefix: 域名前缀（可选，不传时平台按name推导）
             ingress_type: Ingress类型 (nginx)
             ingress_ip: Ingress IP地址 (可选)
             path: 路径，默认为根路径
@@ -428,6 +430,7 @@ class K8SServiceClient:
             "service_name": service_name,
             "service_port": service_port,
             "host": host,
+            "host_prefix": host_prefix,
             "ingress_type": ingress_type,
             "ingress_ip": ingress_ip,
             "path": path,

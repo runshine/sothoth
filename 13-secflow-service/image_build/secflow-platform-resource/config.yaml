@@ -49,6 +49,14 @@ k8s:
   # 资源复制超时 (秒)
   resource_copy_timeout: 1800
 
+# K8S Service Gateway Configuration (统一收口到platform-k8s)
+k8s_service:
+  enabled: true
+  host: "192.168.12.44"
+  port: 10008
+  base_url: "http://192.168.12.44:10008/api/k8s"
+  timeout: 30
+
 # Async Task Configuration
 task:
   # 任务日志目录

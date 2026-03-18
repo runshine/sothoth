@@ -283,7 +283,7 @@ async def create_secmate_instance(
             raise ValidationError(f"源码PVC不存在: {pvc_info.pvc_name}")
 
     # 检查名称是否已存在
-    existing = get_secmat_by_name(db, project_id, request.name)
+    existing = get_secmate_by_name(db, project_id, request.name)
     if existing:
         raise ConflictError(f"SecmateNg名称已存在: {request.name}")
 
@@ -346,7 +346,7 @@ async def delete_secmate_instance(
     """删除SecmateNg实例"""
     user_token = current_user.get("token")
     
-    secmate = get_secmat_by_name(db, project_id, request.name)
+    secmate = get_secmate_by_name(db, project_id, request.name)
     if not secmate:
         raise NotFoundError("SecmateNg", request.name)
 
@@ -385,7 +385,7 @@ async def restart_secmate_instance(
     """重建SecmateNg实例"""
     user_token = current_user.get("token")
     
-    secmate = get_secmat_by_name(db, project_id, request.name)
+    secmate = get_secmate_by_name(db, project_id, request.name)
     if not secmate:
         raise NotFoundError("SecmateNg", request.name)
 
@@ -467,7 +467,7 @@ async def get_secmate_instance(
     db: Session = Depends(get_db)
 ):
     """查询单个SecmateNg"""
-    secmate = get_secmat_by_name(db, project_id, name)
+    secmate = get_secmate_by_name(db, project_id, name)
     if not secmate:
         raise NotFoundError("SecmateNg", name)
 
@@ -484,7 +484,7 @@ async def get_secmate_instance_status(
     """获取SecmateNg实时状态"""
     user_token = current_user.get("token")
     
-    secmate = get_secmat_by_name(db, project_id, name)
+    secmate = get_secmate_by_name(db, project_id, name)
     if not secmate:
         raise NotFoundError("SecmateNg", name)
 
@@ -517,7 +517,7 @@ async def get_secmate_instance_logs(
     """获取SecmateNg运行日志"""
     user_token = current_user.get("token")
     
-    secmate = get_secmat_by_name(db, project_id, name)
+    secmate = get_secmate_by_name(db, project_id, name)
     if not secmate:
         raise NotFoundError("SecmateNg", name)
 

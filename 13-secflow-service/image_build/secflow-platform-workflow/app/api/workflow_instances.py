@@ -394,9 +394,10 @@ async def initialize_workflow_instance(
                 # 创建Ingress (如果配置了)
                 ingress_type = node_config.get("ingress_type")
                 ingress_host = node_config.get("ingress_host")
+                ingress_host_prefix = node_config.get("ingress_host_prefix") or service_name
                 ingress_ip = node_config.get("ingress_ip")
 
-                if ingress_type and ingress_host:
+                if ingress_type:
                     # Ingress名称与Service名称相同
                     ingress_name = service_name
                     # 获取第一个端口作为Ingress后端端口
@@ -408,6 +409,7 @@ async def initialize_workflow_instance(
                         service_name=service_name,
                         service_port=first_port,
                         host=ingress_host,
+                        host_prefix=ingress_host_prefix,
                         ingress_type=ingress_type,
                         ingress_ip=ingress_ip
                     )

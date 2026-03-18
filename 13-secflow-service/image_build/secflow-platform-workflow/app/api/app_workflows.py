@@ -594,9 +594,10 @@ async def initialize_app_workflow(
             # Create Ingress if configured
             ingress_type = node_config.get("ingress_type")
             ingress_host = node_config.get("ingress_host")
+            ingress_host_prefix = node_config.get("ingress_host_prefix") or service_name
             ingress_ip = node_config.get("ingress_ip")
 
-            if ingress_type and ingress_host and service_name:
+            if ingress_type and service_name:
                 ingress_name = service_name  # Same name as service
                 service_port = service_ports[0].get("port") if service_ports else 80
 
@@ -606,6 +607,7 @@ async def initialize_app_workflow(
                     service_name=service_name,
                     service_port=service_port,
                     host=ingress_host,
+                    host_prefix=ingress_host_prefix,
                     ingress_type=ingress_type,
                     ingress_ip=ingress_ip
                 )

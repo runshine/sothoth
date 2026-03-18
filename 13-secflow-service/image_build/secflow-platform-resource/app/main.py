@@ -97,16 +97,14 @@ def validate_config(config: dict) -> tuple[bool, list[str]]:
         errors.append("database.name is required")
 
     # 检查K8S配置
+    # 资源服务已统一通过 platform-k8s，保留 k8s.storage_class_name 供PVC默认值使用
     k8s_config = config.get("k8s", {})
-    if not k8s_config.get("connection_mode"):
-        errors.append("k8s.connection_mode is required (incluster or kubeconfig)")
-    if k8s_config.get("connection_mode") == "kubeconfig":
-        if not k8s_config.get("kubeconfig_path"):
-            errors.append("k8s.kubeconfig_path is required when connection_mode is kubeconfig")
-        elif not os.path.exists(k8s_config["kubeconfig_path"]):
-            errors.append(f"k8s.kubeconfig_path not found: {k8s_config['kubeconfig_path']}")
     if not k8s_config.get("storage_class_name"):
         errors.append("k8s.storage_class_name is required")
+    k8s_service_config = config.get("k8s_service", {})
+    if not k8s_service_config.get("base_url"):
+        if not (k8s_service_config.get("host") and k8s_service_config.get("port")):
+            errors.append("k8s_service.base_url or k8s_service.host+port is required")
 
     # 检查认证服务配置
     auth_config = config.get("auth_service", {})
@@ -125,8 +123,7 @@ def test_k8s_connection(config: dict) -> tuple[bool, str]:
     """测试Kubernetes连接。"""
     try:
         from app.services.k8s import init_k8s_service
-        k8s_config = config.get("k8s", {})
-        k8s_service = init_k8s_service(k8s_config)
+        k8s_service = init_k8s_service(config)
         return True, "Kubernetes connection successful"
     except ConnectionError as e:
         return False, f"Kubernetes connection failed: {str(e)}"
@@ -189,9 +186,8 @@ def init_services(config: dict):
     logger.info("Project service initialized")
 
     # 初始化K8S服务
-    k8s_config = config.get("k8s", {})
     try:
-        init_k8s_service(k8s_config)
+        init_k8s_service(config)
         logger.info("Kubernetes service initialized")
     except ConnectionError as e:
         logger.error(f"Failed to connect to Kubernetes: {e}")
