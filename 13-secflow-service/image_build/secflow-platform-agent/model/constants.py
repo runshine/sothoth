@@ -35,14 +35,20 @@ DEFAULT_CONFIG = {
         'port': 3306,  # MySQL专用
         'user': 'root',  # MySQL专用
         'password': '',  # MySQL专用
-        'database': 'webapi'  # MySQL专用
+        'database': 'webapi',  # MySQL专用
+        'table_prefix': 'secflow_agent_'  # 数据库表前缀
     },
     'redis_url': 'redis://localhost:6379/0',
     'redis_enabled': True,  # 是否启用Redis
     'nacos_url': 'http://localhost:8848',
     'nacos_namespace': 'public',
     'agent_api_port': 11187,
+    'daemon_api_port': 11188,
     'agent_auth_token': 'default_token_change_me',
+    # 11188 守护进程 API 鉴权配置（可与 agent_auth_token 不同）
+    'daemon_auth_header': 'X-API-Token',
+    'daemon_auth_token': 'default_token_change_me',
+    'daemon_read_timeout_sec': 8,
     'refresh_interval': 30,
     'max_workers': 10,
     'upload_max_size': 100 * 1024 * 1024,

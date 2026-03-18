@@ -712,6 +712,11 @@ class AppWorkflowCreate(BaseModel):
     replicas: Optional[int] = Field(None, ge=1, description="覆盖副本数")
     timeout_seconds: Optional[int] = Field(None, ge=1, description="超时时间（秒）")
 
+    # Ingress配置（可选）
+    ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
+    ingress_host: Optional[str] = Field(None, description="Ingress域名 (例如: myapp.example.com)")
+    ingress_ip: Optional[str] = Field(None, description="Ingress Controller外部IP地址")
+
 
 class AppWorkflowUpdate(BaseModel):
     """更新单应用工作流请求"""
@@ -726,6 +731,11 @@ class AppWorkflowUpdate(BaseModel):
     volume_mounts: Optional[List[VolumeMount]] = None
     resources: Optional[ResourceRequirements] = None
     replicas: Optional[int] = Field(None, ge=1)
+
+    # Ingress配置（可选）
+    ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
+    ingress_host: Optional[str] = Field(None, description="Ingress域名")
+    ingress_ip: Optional[str] = Field(None, description="Ingress Controller外部IP地址")
 
 
 class AppWorkflowNodeResponse(BaseModel):

@@ -32,6 +32,7 @@ from app.schemas import (
     IngressCreateRequest,
     IngressUpdateRequest,
     IngressSimpleCreateRequest,
+    IngressExternalCreateRequest,
     SecretListResponse,
     SecretInfo,
     SecretCreateRequest,
@@ -597,6 +598,66 @@ async def delete_ingress(
     k8s = get_k8s_service()
     result = k8s.delete_ingress(namespace, ingress_name)
     return SuccessResponse(message="Ingress删除成功", data=result)
+
+
+@router.post("/ingresses/external", response_model=dict, status_code=status.HTTP_201_CREATED, summary="创建外部端点Ingress(路由到外部IP:端口)")
+async def create_external_ingress(
+    request: IngressExternalCreateRequest,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    创建外部端点Ingress
+
+    用于将流量路由到外部IP:端口而非K8s内部Service。
+    自动创建Service(无selector)、Endpoints(包含外部IP)和Ingress。
+    支持多个外部IP地址实现负载均衡。
+    支持NGINX Ingress注解配置（WebSocket、上传大小、超时等）。
+    """
+    from typing import Dict
+
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+
+    k8s = get_k8s_service()
+    return k8s.create_external_ingress(
+        namespace=namespace,
+        name=request.name,
+        external_ips=request.external_ips,
+        external_port=request.external_port,
+        host=request.host,
+        path=request.path,
+        path_type=request.path_type,
+        ingress_type=request.ingress_type,
+        service_port=request.service_port,
+        tls_enabled=request.tls_enabled,
+        tls_secret_name=request.tls_secret_name,
+        websocket_enabled=request.websocket_enabled,
+        proxy_body_size=request.proxy_body_size,
+        proxy_connect_timeout=request.proxy_connect_timeout,
+        proxy_send_timeout=request.proxy_send_timeout,
+        proxy_read_timeout=request.proxy_read_timeout,
+        ssl_redirect=request.ssl_redirect
+    )
+
+
+@router.delete("/ingresses/external/{ingress_name}", response_model=SuccessResponse, summary="删除外部端点Ingress(级联删除)")
+async def delete_external_ingress(
+    ingress_name: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    删除外部端点Ingress
+
+    级联删除关联的Service和Endpoints资源。
+    """
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+
+    k8s = get_k8s_service()
+    result = k8s.delete_external_ingress(namespace, ingress_name)
+    return SuccessResponse(message="外部端点Ingress删除成功", data=result)
 
 
 # ==================== Secret 管理 ====================

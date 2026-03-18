@@ -8,12 +8,13 @@ from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.api.dependencies import get_current_user, generate_id
 from app.models import (
     get_db, WorkflowInstance, WorkflowNodeInstance,
     WorkflowStatus, NodeStatus, NodeType, AppTemplate, JobTemplate,
-    WorkflowSyncRecord
+    WorkflowSyncRecord, TemplateScope
 )
 from app.schemas import (
     WorkflowSyncRecordResponse, WorkflowSyncRecordListResponse,
@@ -54,6 +55,69 @@ async def get_ingress_controllers(
     k8s_client = get_k8s_client()
     controllers = k8s_client.get_ingress_controllers()
     return {"total": len(controllers), "items": controllers}
+
+
+@router.get("/statistics", summary="获取工作流统计信息")
+async def get_workflow_statistics(
+    project_id: Optional[str] = Query(None, description="项目ID，不传则统计所有项目"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    获取工作流实例统计信息
+
+    返回:
+    - total_instances: 工作流实例总数
+    - status_distribution: 各状态实例数量分布
+    - templates: 模板统计（应用模板数、任务模板数）
+    """
+    # 构建基础查询
+    base_query = db.query(WorkflowInstance)
+    if project_id:
+        base_query = base_query.filter(WorkflowInstance.project_id == project_id)
+
+    # 总实例数
+    total_instances = base_query.count()
+
+    # 状态分布
+    status_distribution = {}
+    status_list = [
+        WorkflowStatus.PENDING,
+        WorkflowStatus.INITIALIZING,
+        WorkflowStatus.INITIALIZED,
+        WorkflowStatus.RUNNING,
+        WorkflowStatus.SUCCEEDED,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.STOPPED
+    ]
+    for status in status_list:
+        count = db.query(func.count(WorkflowInstance.id)).filter(
+            WorkflowInstance.status == status
+        ).scalar() or 0
+        status_distribution[status] = count
+
+    # 模板统计
+    app_template_query = db.query(AppTemplate)
+    job_template_query = db.query(JobTemplate)
+    if project_id:
+        app_template_query = app_template_query.filter(
+            (AppTemplate.project_id == project_id) | (AppTemplate.scope == TemplateScope.GLOBAL)
+        )
+        job_template_query = job_template_query.filter(
+            (JobTemplate.project_id == project_id) | (JobTemplate.scope == TemplateScope.GLOBAL)
+        )
+
+    app_templates = app_template_query.count()
+    job_templates = job_template_query.count()
+
+    return {
+        "total_instances": total_instances,
+        "status_distribution": status_distribution,
+        "templates": {
+            "app_templates": app_templates,
+            "job_templates": job_templates
+        }
+    }
 
 
 # ============ 初始化工作流 API ============

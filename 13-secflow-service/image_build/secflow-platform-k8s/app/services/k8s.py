@@ -356,6 +356,77 @@ class KubernetesService:
 
         return V1Service(metadata=service_metadata, spec=service_spec)
 
+    # ==================== Endpoints 管理 ====================
+
+    def create_endpoints(self, namespace: str, manifest: Dict) -> Dict:
+        """创建Endpoints"""
+        try:
+            ep = self._dict_to_v1_endpoints(manifest)
+            result = self.core_v1.create_namespaced_endpoints(namespace=namespace, body=ep)
+            return self._endpoints_to_dict(result)
+        except ApiException as e:
+            self._handle_api_exception(e, "Endpoints", "创建")
+
+    def delete_endpoints(self, namespace: str, name: str) -> Dict:
+        """删除Endpoints"""
+        try:
+            self.core_v1.delete_namespaced_endpoints(
+                name=name,
+                namespace=namespace,
+                body=kubernetes.client.V1DeleteOptions()
+            )
+            return {"status": "deleted", "name": name}
+        except ApiException as e:
+            self._handle_api_exception(e, "Endpoints", "删除")
+
+    def _endpoints_to_dict(self, ep) -> Dict:
+        """Endpoints对象转字典"""
+        return {
+            "name": ep.metadata.name,
+            "namespace": ep.metadata.namespace,
+            "subsets": [
+                {
+                    "addresses": [{"ip": addr.ip} for addr in (subset.addresses or [])],
+                    "ports": [{"port": p.port, "protocol": p.protocol} for p in (subset.ports or [])]
+                }
+                for subset in (ep.subsets or [])
+            ]
+        }
+
+    def _dict_to_v1_endpoints(self, manifest: Dict):
+        """字典转V1Endpoints对象"""
+        from kubernetes.client import (
+            V1Endpoints, V1ObjectMeta, V1EndpointsSubset,
+            V1EndpointAddress, V1EndpointPort
+        )
+
+        metadata = manifest.get("metadata", {})
+        spec = manifest.get("spec", {})
+
+        endpoints_metadata = V1ObjectMeta(
+            name=metadata.get("name"),
+            namespace=metadata.get("namespace"),
+            labels=metadata.get("labels", {}),
+            annotations=metadata.get("annotations", {})
+        )
+
+        subsets = []
+        for subset in spec.get("subsets", []):
+            addresses = [
+                V1EndpointAddress(ip=addr.get("ip"))
+                for addr in subset.get("addresses", [])
+            ]
+            ports = [
+                V1EndpointPort(
+                    port=p.get("port"),
+                    protocol=p.get("protocol", "TCP")
+                )
+                for p in subset.get("ports", [])
+            ]
+            subsets.append(V1EndpointsSubset(addresses=addresses, ports=ports))
+
+        return V1Endpoints(metadata=endpoints_metadata, subsets=subsets)
+
     # ==================== Ingress 管理 ====================
 
     def list_ingresses(self, namespace: str, label_selector: str = None) -> List[Dict]:
@@ -454,6 +525,244 @@ class KubernetesService:
         }
 
         return self.create_ingress(namespace, manifest)
+
+    def create_external_ingress(
+        self,
+        namespace: str,
+        name: str,
+        external_ips: List[str],
+        external_port: int,
+        host: str,
+        path: str = "/",
+        path_type: str = "Prefix",
+        ingress_type: str = "nginx",
+        service_port: int = 80,
+        tls_enabled: bool = False,
+        tls_secret_name: str = None,
+        websocket_enabled: bool = False,
+        proxy_body_size: str = "10m",
+        proxy_connect_timeout: int = 60,
+        proxy_send_timeout: int = 60,
+        proxy_read_timeout: int = 60,
+        ssl_redirect: bool = True
+    ) -> Dict:
+        """
+        创建外部端点Ingress（路由到外部IP:端口）
+
+        Args:
+            namespace: 命名空间
+            name: Ingress名称
+            external_ips: 外部IP地址列表（支持多个IP负载均衡）
+            external_port: 外部端口
+            host: 域名
+            path: 路径，默认为根路径
+            path_type: 路径类型
+            ingress_type: Ingress类型 (nginx)
+            service_port: Service端口（Ingress指向此端口）
+            tls_enabled: 是否启用TLS
+            tls_secret_name: TLS Secret名称
+            websocket_enabled: 是否启用WebSocket支持
+            proxy_body_size: 最大上传文件大小
+            proxy_connect_timeout: 连接超时时间（秒）
+            proxy_send_timeout: 发送超时时间（秒）
+            proxy_read_timeout: 读取超时时间（秒）
+            ssl_redirect: 是否强制HTTPS重定向
+
+        Returns:
+            创建的资源信息，包含ingress、service、endpoints和access_url
+        """
+        import ipaddress
+
+        # 验证所有IP地址格式
+        for ip in external_ips:
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                raise ValidationError(f"无效的IP地址格式: {ip}")
+
+        # 生成 Service/Endpoints 名称
+        service_name = f"{name}-external-svc"
+
+        # 记录已创建的资源，用于回滚
+        created_resources = []
+
+        try:
+            # 步骤1: 创建 Service (无 selector)
+            service_manifest = {
+                "metadata": {
+                    "name": service_name,
+                    "namespace": namespace,
+                    "labels": {
+                        "app": name,
+                        "managed-by": "secflow-external-ingress"
+                    }
+                },
+                "spec": {
+                    "type": "ClusterIP",
+                    "ports": [{
+                        "name": "http",
+                        "port": service_port,
+                        "targetPort": external_port,
+                        "protocol": "TCP"
+                    }]
+                }
+            }
+
+            service_result = self.create_service(namespace, service_manifest)
+            created_resources.append(("service", service_name))
+            logger.info(f"创建Service成功: {service_name}")
+
+            # 步骤2: 创建 Endpoints
+            endpoints_manifest = {
+                "metadata": {
+                    "name": service_name,  # 必须与 Service 名称相同
+                    "namespace": namespace,
+                    "labels": {
+                        "app": name,
+                        "managed-by": "secflow-external-ingress"
+                    }
+                },
+                "spec": {
+                    "subsets": [{
+                        "addresses": [{"ip": ip} for ip in external_ips],
+                        "ports": [{
+                            "port": external_port,
+                            "protocol": "TCP"
+                        }]
+                    }]
+                }
+            }
+
+            endpoints_result = self.create_endpoints(namespace, endpoints_manifest)
+            created_resources.append(("endpoints", service_name))
+            logger.info(f"创建Endpoints成功: {service_name}")
+
+            # 步骤3: 创建 Ingress
+            # 构建 NGINX Ingress 注解
+            annotations = {
+                "nginx.ingress.kubernetes.io/ssl-redirect": str(ssl_redirect).lower(),
+                "nginx.ingress.kubernetes.io/proxy-body-size": proxy_body_size,
+                "nginx.ingress.kubernetes.io/proxy-connect-timeout": str(proxy_connect_timeout),
+                "nginx.ingress.kubernetes.io/proxy-send-timeout": str(proxy_send_timeout),
+                "nginx.ingress.kubernetes.io/proxy-read-timeout": str(proxy_read_timeout),
+            }
+
+            # WebSocket 支持
+            if websocket_enabled:
+                annotations["nginx.ingress.kubernetes.io/proxy-http-version"] = "1.1"
+                annotations["nginx.ingress.kubernetes.io/proxy-buffering"] = "off"
+                annotations["nginx.ingress.kubernetes.io/configuration-snippet"] = (
+                    "proxy_set_header Upgrade $http_upgrade;\n"
+                    "proxy_set_header Connection $connection_upgrade;"
+                )
+
+            ingress_manifest = {
+                "metadata": {
+                    "name": name,
+                    "namespace": namespace,
+                    "annotations": annotations,
+                    "labels": {
+                        "app": name,
+                        "managed-by": "secflow-external-ingress"
+                    }
+                },
+                "spec": {
+                    "ingressClassName": ingress_type,
+                    "rules": [{
+                        "host": host,
+                        "http": {
+                            "paths": [{
+                                "path": path,
+                                "path_type": path_type,
+                                "backend": {
+                                    "service": {
+                                        "name": service_name,
+                                        "port": {"number": service_port}
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }
+
+            # 添加 TLS 配置
+            if tls_enabled and tls_secret_name:
+                ingress_manifest["spec"]["tls"] = [{
+                    "hosts": [host],
+                    "secret_name": tls_secret_name
+                }]
+
+            ingress_result = self.create_ingress(namespace, ingress_manifest)
+            created_resources.append(("ingress", name))
+            logger.info(f"创建Ingress成功: {name}")
+
+            # 返回完整结果
+            return {
+                "ingress": ingress_result,
+                "service": service_result,
+                "endpoints": endpoints_result,
+                "access_url": f"{'https' if tls_enabled else 'http'}://{host}{path}"
+            }
+
+        except Exception as e:
+            logger.error(f"创建外部Ingress失败: {e}, 开始回滚")
+
+            # 按逆序回滚
+            for resource_type, resource_name in reversed(created_resources):
+                try:
+                    if resource_type == "ingress":
+                        self.delete_ingress(namespace, resource_name)
+                        logger.info(f"回滚删除Ingress: {resource_name}")
+                    elif resource_type == "endpoints":
+                        self.delete_endpoints(namespace, resource_name)
+                        logger.info(f"回滚删除Endpoints: {resource_name}")
+                    elif resource_type == "service":
+                        self.delete_service(namespace, resource_name)
+                        logger.info(f"回滚删除Service: {resource_name}")
+                except Exception as rollback_error:
+                    logger.error(f"回滚删除{resource_type}失败: {rollback_error}")
+
+            # 重新抛出原始异常
+            raise
+
+    def delete_external_ingress(self, namespace: str, name: str) -> Dict:
+        """
+        删除外部端点Ingress（级联删除Service和Endpoints）
+
+        Args:
+            namespace: 命名空间
+            name: Ingress名称
+
+        Returns:
+            删除结果
+        """
+        service_name = f"{name}-external-svc"
+
+        # 按顺序删除: Ingress → Endpoints → Service
+        try:
+            self.delete_ingress(namespace, name)
+            logger.info(f"删除Ingress成功: {name}")
+        except Exception as e:
+            logger.warning(f"删除Ingress失败: {e}")
+
+        try:
+            self.delete_endpoints(namespace, service_name)
+            logger.info(f"删除Endpoints成功: {service_name}")
+        except Exception as e:
+            logger.warning(f"删除Endpoints失败: {e}")
+
+        try:
+            self.delete_service(namespace, service_name)
+            logger.info(f"删除Service成功: {service_name}")
+        except Exception as e:
+            logger.warning(f"删除Service失败: {e}")
+
+        return {
+            "status": "deleted",
+            "name": name,
+            "cascade": ["ingress", "endpoints", "service"]
+        }
 
     def get_ingress_controllers(self) -> List[Dict]:
         """

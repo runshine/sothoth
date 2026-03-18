@@ -75,6 +75,9 @@ def build_app_workflow_response(
         },
         "service_name": node.service_name,
         "service_ports": node_config.get("service_ports", []),
+        "ingress_type": node.ingress_type,
+        "ingress_host": node.ingress_host,
+        "ingress_ip": node.ingress_ip,
         "template_id": node.template_id,
         "template_name": template.name if template else None,
         "created_by": instance.created_by,
@@ -142,6 +145,9 @@ async def create_app_workflow(
         "resources": workflow_data.resources.model_dump() if workflow_data.resources and hasattr(workflow_data.resources, 'model_dump') else (workflow_data.resources.dict() if workflow_data.resources else None),
         "replicas": workflow_data.replicas,
         "timeout_seconds": workflow_data.timeout_seconds,
+        "ingress_type": workflow_data.ingress_type,
+        "ingress_host": workflow_data.ingress_host,
+        "ingress_ip": workflow_data.ingress_ip,
     }
 
     # 5. 创建 WorkflowInstance
@@ -176,6 +182,9 @@ async def create_app_workflow(
         volume_mounts=[v.model_dump() if hasattr(v, 'model_dump') else v.dict() for v in workflow_data.volume_mounts] if workflow_data.volume_mounts else [],
         resources=workflow_data.resources.model_dump() if workflow_data.resources and hasattr(workflow_data.resources, 'model_dump') else (workflow_data.resources.dict() if workflow_data.resources else None),
         timeout_seconds=workflow_data.timeout_seconds,
+        ingress_type=workflow_data.ingress_type,
+        ingress_host=workflow_data.ingress_host,
+        ingress_ip=workflow_data.ingress_ip,
     )
     db.add(node_instance)
     db.commit()
@@ -222,6 +231,23 @@ async def list_app_workflows(
             items.append(build_app_workflow_response(inst, node, template))
 
     return AppWorkflowListResponse(total=len(items), items=items)
+
+
+# ============ Ingress Controllers ============
+
+@router.get("/ingress-controllers", summary="获取可用的Ingress Controller列表")
+async def get_ingress_controllers(
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    获取集群中可用的Ingress Controller列表
+
+    代理调用k8s微服务接口，返回Ingress Controller的名称、外部IP、端口等信息。
+    供前端在创建应用实例时选择Ingress配置使用。
+    """
+    k8s_client = get_k8s_client()
+    controllers = k8s_client.get_ingress_controllers()
+    return {"controllers": controllers}
 
 
 # ============ Get App Workflow ============
@@ -372,6 +398,14 @@ async def delete_app_workflow(
         if node and node.k8s_resource_name:
             try:
                 if node.k8s_resource_type == "Deployment":
+                    # Delete Ingress if exists
+                    if node.ingress_type and node.service_name:
+                        try:
+                            k8s_client.delete_ingress(instance.project_id, node.service_name)
+                            logger.info(f"Deleted Ingress {node.service_name} for node {node.id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to delete Ingress: {e}")
+
                     k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
                     if node.service_name:
                         k8s_client.delete_service(instance.project_id, node.service_name)
@@ -556,6 +590,34 @@ async def initialize_app_workflow(
         if success:
             node.service_name = service_name
             init_logs.append(f"  成功: 创建Service {service_name}")
+
+            # Create Ingress if configured
+            ingress_type = node_config.get("ingress_type")
+            ingress_host = node_config.get("ingress_host")
+            ingress_ip = node_config.get("ingress_ip")
+
+            if ingress_type and ingress_host and service_name:
+                ingress_name = service_name  # Same name as service
+                service_port = service_ports[0].get("port") if service_ports else 80
+
+                ingress_success, ingress_error = k8s_client.create_ingress(
+                    project_id=instance.project_id,
+                    name=ingress_name,
+                    service_name=service_name,
+                    service_port=service_port,
+                    host=ingress_host,
+                    ingress_type=ingress_type,
+                    ingress_ip=ingress_ip
+                )
+
+                if ingress_success:
+                    node.ingress_type = ingress_type
+                    node.ingress_host = ingress_host
+                    node.ingress_ip = ingress_ip
+                    init_logs.append(f"  成功: 创建Ingress {ingress_name} (host: {ingress_host})")
+                else:
+                    init_logs.append(f"  警告: 创建Ingress失败 - {ingress_error}")
+                    logger.warning(f"Failed to create Ingress for node {node.id}: {ingress_error}")
 
             # 检查 Deployment 状态
             try:
@@ -812,11 +874,24 @@ async def stop_app_workflow(
     if node.k8s_resource_name:
         try:
             if node.k8s_resource_type == "Deployment":
+                # Delete Ingress if exists
+                if node.ingress_type and node.service_name:
+                    try:
+                        k8s_client.delete_ingress(instance.project_id, node.service_name)
+                        logger.info(f"Deleted Ingress {node.service_name} for node {node.id}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete Ingress: {e}")
+
                 k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
                 if node.service_name:
                     k8s_client.delete_service(instance.project_id, node.service_name)
                 node.status = NodeStatus.STOPPED
                 node.finished_at = datetime.utcnow()
+
+                # Clear Ingress fields
+                node.ingress_type = None
+                node.ingress_host = None
+                node.ingress_ip = None
         except Exception as e:
             logger.error(f"Failed to stop node {node.id}: {e}")
             node.message = str(e)

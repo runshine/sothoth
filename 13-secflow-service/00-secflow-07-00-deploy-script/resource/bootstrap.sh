@@ -208,6 +208,11 @@ UPSTREAM_PORT="$(echo $UPSTREAM | awk -F':' '{print $2}')"
 UUID="$(cat /dev/urandom | od -x | head -1 | awk '{print $2$3$4$5}')"
 export PATH="${ROOT_DIR}/bin:${ROOT_DIR}/script:${PATH}"
 
+# sothothv2_agent API 配置（可通过环境变量覆盖）
+AGENT_API_ENABLED="${AGENT_API_ENABLED:-true}"
+AGENT_API_LISTEN="${AGENT_API_LISTEN:-:11188}"
+AGENT_API_AUTH_TOKEN="${AGENT_API_AUTH_TOKEN:-your_secure_token_here}"
+
 cat << EOF > "$ROOT_DIR/config/sothothv2_agent.ini"
 workspace=${ROOT_DIR}
 project_id=${WORKSPACE}
@@ -217,6 +222,9 @@ uuid=${UUID}
 log_level=info
 log_path=${ROOT_DIR}/log/sothothv2_agent
 foreground=false
+api_enabled=${AGENT_API_ENABLED}
+api_listen=${AGENT_API_LISTEN}
+api_auth_token=${AGENT_API_AUTH_TOKEN}
 EOF
 
 export WORKSPACE=${WORKSPACE}

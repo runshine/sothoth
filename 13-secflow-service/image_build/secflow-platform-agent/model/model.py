@@ -31,6 +31,7 @@ class AgentInfo:
     status: str = 'unknown'
     last_seen: Optional[datetime] = None
     system_info: Optional[Dict] = None
+    daemon_info: Optional[Dict] = None
     services: List[Dict] = field(default_factory=list)
     pod_id: str = ''
 

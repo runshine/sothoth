@@ -83,7 +83,10 @@ class WebAPIServer:
             config['pod_id'],
             agent_api_timeouts,
             config.get('nacos_username'),  # 新增：Nacos用户名
-            config.get('nacos_password')  # 新增：Nacos密码
+            config.get('nacos_password'),  # 新增：Nacos密码
+            config.get('daemon_api_port', 11188),  # 新增：守护进程API端口
+            config.get('daemon_auth_header', 'X-API-Token'),
+            config.get('daemon_auth_token') or config.get('agent_auth_token', 'default_token_change_me')
         )
 
         # 9. 初始化任务管理器（传递超时配置）
@@ -100,6 +103,8 @@ class WebAPIServer:
 
         # 10. 初始化代理管理器（新增，传递超时配置）
         self.proxy_manager = EnhancedProxyManager(self.agent_manager, agent_api_timeouts)
+        # 11188 守护进程 API 读接口快速失败超时（秒）
+        self.daemon_read_timeout_sec = int(config.get('daemon_read_timeout_sec', 8))
 
         # 11. 注册路由
         self._register_routes()
@@ -113,6 +118,7 @@ class WebAPIServer:
         self.logger.info(f"Redis状态: {'已启用' if self.redis_manager.enabled else '已禁用'}")
         self.logger.info(f"支持的压缩格式: {', '.join(supported_formats)}")
         self.logger.info(f"Agent API超时配置: {agent_api_timeouts}")
+        self.logger.info(f"Daemon API快速失败超时: {self.daemon_read_timeout_sec}s")
         self.logger.info(f"代理功能: 已启用")
 
     def _setup_logger(self) -> logging.Logger:
@@ -364,24 +370,25 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id parameter is required'}), 400
 
                 # 获取各种状态的agent数量 (filtered by project_id)
+                table_name = self.db_manager.get_table_name('agent_status')
                 if self.db_manager.db_type == 'mysql':
-                    status_stats = self.db_manager.fetch_all('''
+                    status_stats = self.db_manager.fetch_all(f'''
                                                              SELECT status,
                                                                     COUNT(*) as count,
                             MAX(last_seen) as last_seen_max,
                             MIN(last_seen) as last_seen_min
-                                                             FROM secflow_agent_agent_status
+                                                             FROM {table_name}
                                                              WHERE project_id = %s
                                                              GROUP BY status
                                                              ORDER BY count DESC
                                                              ''', (project_id,))
                 else:
-                    status_stats = self.db_manager.fetch_all('''
+                    status_stats = self.db_manager.fetch_all(f'''
                                                              SELECT status,
                                                                     COUNT(*) as count,
                             MAX(last_seen) as last_seen_max,
                             MIN(last_seen) as last_seen_min
-                                                             FROM secflow_agent_agent_status
+                                                             FROM {table_name}
                                                              WHERE project_id = ?
                                                              GROUP BY status
                                                              ORDER BY count DESC
@@ -389,9 +396,9 @@ class WebAPIServer:
 
                 # 计算掉线agent（超过5分钟未更新）for this project
                 if self.db_manager.db_type == 'mysql':
-                    offline_result = self.db_manager.fetch_one('''
+                    offline_result = self.db_manager.fetch_one(f'''
                                                                SELECT COUNT(*) as count
-                                                               FROM secflow_agent_agent_status
+                                                               FROM {table_name}
                                                                WHERE project_id = %s
                                                                  AND status IN ('offline'
                                                                    , 'error'
@@ -401,13 +408,13 @@ class WebAPIServer:
                                                                    < NOW() - INTERVAL 5 MINUTE
                                                                ''', (project_id,))
                     total_result = self.db_manager.fetch_one(
-                        "SELECT COUNT(*) as count FROM secflow_agent_agent_status WHERE project_id = %s",
+                        f"SELECT COUNT(*) as count FROM {table_name} WHERE project_id = %s",
                         (project_id,)
                     )
                 else:
-                    offline_result = self.db_manager.fetch_one('''
+                    offline_result = self.db_manager.fetch_one(f'''
                                                                SELECT COUNT(*) as count
-                                                               FROM secflow_agent_agent_status
+                                                               FROM {table_name}
                                                                WHERE project_id = ?
                                                                  AND status IN ('offline'
                                                                    , 'error'
@@ -418,7 +425,7 @@ class WebAPIServer:
                                                                    , '-5 minutes')
                                                                ''', (project_id,))
                     total_result = self.db_manager.fetch_one(
-                        "SELECT COUNT(*) as count FROM secflow_agent_agent_status WHERE project_id = ?",
+                        f"SELECT COUNT(*) as count FROM {table_name} WHERE project_id = ?",
                         (project_id,)
                     )
 
@@ -470,14 +477,15 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id is required'}), 400
 
                 # 检查agent是否存在
+                table_name = self.db_manager.get_table_name('agent_status')
                 if self.db_manager.db_type == 'mysql':
                     agent = self.db_manager.fetch_one(
-                        "SELECT * FROM secflow_agent_agent_status WHERE agent_key = %s",
+                        f"SELECT * FROM {table_name} WHERE agent_key = %s",
                         (agent_key,)
                     )
                 else:
                     agent = self.db_manager.fetch_one(
-                        "SELECT * FROM secflow_agent_agent_status WHERE agent_key = ?",
+                        f"SELECT * FROM {table_name} WHERE agent_key = ?",
                         (agent_key,)
                     )
 
@@ -490,15 +498,15 @@ class WebAPIServer:
 
                 # 更新agent状态
                 if self.db_manager.db_type == 'mysql':
-                    self.db_manager.execute_query('''
-                                                  UPDATE secflow_agent_agent_status
+                    self.db_manager.execute_query(f'''
+                                                  UPDATE {table_name}
                                                   SET status     = %s,
                                                       updated_at = NOW()
                                                   WHERE agent_key = %s
                                                   ''', (status, agent_key))
                 else:
-                    self.db_manager.execute_query('''
-                                                  UPDATE secflow_agent_agent_status
+                    self.db_manager.execute_query(f'''
+                                                  UPDATE {table_name}
                                                   SET status     = ?,
                                                       updated_at = datetime('now')
                                                   WHERE agent_key = ?
@@ -647,6 +655,102 @@ class WebAPIServer:
                 'message': '部署任务已创建',
                 'project_id': project_id
             }), 202
+
+        @self.app.route('/api/agent/task/deploy/batch', methods=['POST'])
+        def deploy_service_batch():
+            data = request.get_json()
+            if not data:
+                return jsonify({'error': '请求体不能为空'}), 400
+
+            project_id = data.get('project_id')
+            if not project_id:
+                return jsonify({'error': 'project_id不能为空'}), 400
+
+            deployments = data.get('deployments')
+            if not isinstance(deployments, list) or len(deployments) == 0:
+                return jsonify({'error': 'deployments不能为空，且必须为数组'}), 400
+
+            results = []
+            errors = []
+
+            for idx, item in enumerate(deployments):
+                if not isinstance(item, dict):
+                    errors.append({
+                        'index': idx,
+                        'error': '部署项必须为对象'
+                    })
+                    continue
+
+                service_name = item.get('service_name')
+                agent_key = item.get('agent_key')
+                template_name = item.get('template_name')
+                extra_params = item.get('extra_params')
+
+                if not service_name or not agent_key or not template_name:
+                    errors.append({
+                        'index': idx,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name,
+                        'error': 'service_name、agent_key、template_name不能为空'
+                    })
+                    continue
+
+                # Validate that agent belongs to the project
+                agent = self.agent_manager.get_agent(agent_key)
+                if not agent:
+                    errors.append({
+                        'index': idx,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name,
+                        'error': f"Agent {agent_key} 不存在"
+                    })
+                    continue
+                if agent.project_id != project_id:
+                    errors.append({
+                        'index': idx,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name,
+                        'error': f"Agent {agent_key} 不属于项目 {project_id}"
+                    })
+                    continue
+
+                try:
+                    task_id = self.task_manager.create_task(
+                        'deploy', service_name, agent_key, template_name, extra_params, project_id
+                    )
+                    results.append({
+                        'index': idx,
+                        'task_id': task_id,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name
+                    })
+                except Exception as e:
+                    errors.append({
+                        'index': idx,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name,
+                        'error': str(e)
+                    })
+
+            success_count = len(results)
+            failed_count = len(errors)
+            total = len(deployments)
+            status_code = 202 if failed_count == 0 else 207
+
+            return jsonify({
+                'message': f'批量部署请求处理完成: 成功 {success_count}，失败 {failed_count}',
+                'project_id': project_id,
+                'total': total,
+                'success_count': success_count,
+                'failed_count': failed_count,
+                'tasks': results,
+                'errors': errors
+            }), status_code
 
         @self.app.route('/api/agent/task/undeploy', methods=['POST'])
         def undeploy_service():
@@ -1009,6 +1113,202 @@ class WebAPIServer:
 
             return response
 
+        @self.app.route('/api/agent/agent/<agent_key>/daemon-agent-info', methods=['GET'])
+        def daemon_agent_info(agent_key):
+            """获取Agent守护进程综合信息（11188）"""
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='GET',
+                endpoint='/api/v1/agent/info',
+                port=self.agent_manager.daemon_api_port,
+                timeout=self.daemon_read_timeout_sec
+            )
+
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'Content-Length'.lower():
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/daemon-agent-health', methods=['GET'])
+        def daemon_agent_health(agent_key):
+            """获取Agent守护进程健康状态（11188）"""
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='GET',
+                endpoint='/api/v1/agent/health',
+                port=self.agent_manager.daemon_api_port,
+                timeout=self.daemon_read_timeout_sec
+            )
+
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'Content-Length'.lower():
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
+        # ===================== 守护进程服务代理路由 =====================
+
+        @self.app.route('/api/agent/agent/<agent_key>/daemon-services', methods=['GET'])
+        def get_daemon_services(agent_key):
+            """获取 Agent 守护进程服务列表"""
+            try:
+                status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                    agent_key=agent_key,
+                    method='GET',
+                    endpoint='/api/v1/services',
+                    port=self.agent_manager.daemon_api_port,
+                    timeout=self.daemon_read_timeout_sec
+                )
+
+                response = jsonify(response_data)
+                for key, value in response_headers.items():
+                    if key.lower() == 'Content-Length'.lower():
+                        continue
+                    response.headers[key] = value
+                response.status_code = status_code
+                return response
+
+            except Exception as e:
+                self.logger.error(f"获取守护进程服务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/daemon-services/<service_name>', methods=['GET'])
+        def get_daemon_service_detail(agent_key, service_name):
+            """获取单个守护进程服务详情"""
+            try:
+                status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                    agent_key=agent_key,
+                    method='GET',
+                    endpoint=f'/api/v1/services/{service_name}',
+                    port=self.agent_manager.daemon_api_port,
+                    timeout=self.daemon_read_timeout_sec
+                )
+
+                response = jsonify(response_data)
+                for key, value in response_headers.items():
+                    if key.lower() == 'Content-Length'.lower():
+                        continue
+                    response.headers[key] = value
+                response.status_code = status_code
+                return response
+
+            except Exception as e:
+                self.logger.error(f"获取守护进程服务详情失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/daemon-services/<service_name>/start', methods=['POST'])
+        def start_daemon_service(agent_key, service_name):
+            """启动守护进程服务"""
+            try:
+                status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                    agent_key=agent_key,
+                    method='POST',
+                    endpoint=f'/api/v1/services/{service_name}/start',
+                    port=self.agent_manager.daemon_api_port,
+                    timeout=60
+                )
+
+                response = jsonify(response_data)
+                for key, value in response_headers.items():
+                    if key.lower() == 'Content-Length'.lower():
+                        continue
+                    response.headers[key] = value
+                response.status_code = status_code
+                return response
+
+            except Exception as e:
+                self.logger.error(f"启动守护进程服务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/daemon-services/<service_name>/stop', methods=['POST'])
+        def stop_daemon_service(agent_key, service_name):
+            """停止守护进程服务"""
+            try:
+                status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                    agent_key=agent_key,
+                    method='POST',
+                    endpoint=f'/api/v1/services/{service_name}/stop',
+                    port=self.agent_manager.daemon_api_port,
+                    timeout=60
+                )
+
+                response = jsonify(response_data)
+                for key, value in response_headers.items():
+                    if key.lower() == 'Content-Length'.lower():
+                        continue
+                    response.headers[key] = value
+                response.status_code = status_code
+                return response
+
+            except Exception as e:
+                self.logger.error(f"停止守护进程服务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/daemon-services/<service_name>/restart', methods=['POST'])
+        def restart_daemon_service(agent_key, service_name):
+            """重启守护进程服务"""
+            try:
+                status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                    agent_key=agent_key,
+                    method='POST',
+                    endpoint=f'/api/v1/services/{service_name}/restart',
+                    port=self.agent_manager.daemon_api_port,
+                    timeout=120
+                )
+
+                response = jsonify(response_data)
+                for key, value in response_headers.items():
+                    if key.lower() == 'Content-Length'.lower():
+                        continue
+                    response.headers[key] = value
+                response.status_code = status_code
+                return response
+
+            except Exception as e:
+                self.logger.error(f"重启守护进程服务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/daemon-services/<service_name>/logs', methods=['GET'])
+        def get_daemon_service_logs(agent_key, service_name):
+            """获取守护进程服务日志"""
+            try:
+                # 获取查询参数
+                log_type = request.args.get('type', 'stdout')
+                lines = request.args.get('lines', '100')
+
+                query_params = {
+                    'type': log_type,
+                    'lines': lines
+                }
+
+                status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                    agent_key=agent_key,
+                    method='GET',
+                    endpoint=f'/api/v1/services/{service_name}/logs',
+                    query_params=query_params,
+                    port=self.agent_manager.daemon_api_port,
+                    timeout=self.daemon_read_timeout_sec
+                )
+
+                response = jsonify(response_data)
+                for key, value in response_headers.items():
+                    if key.lower() == 'Content-Length'.lower():
+                        continue
+                    response.headers[key] = value
+                response.status_code = status_code
+                return response
+
+            except Exception as e:
+                self.logger.error(f"获取守护进程服务日志失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        # ===================== 守护进程服务代理路由结束 =====================
+
         @self.app.route('/api/agent/proxy/info', methods=['GET'])
         def get_proxy_info():
             """获取代理API信息"""
@@ -1073,14 +1373,15 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id parameter is required'}), 400
 
                 # 从数据库查询Agent
+                table_name = self.db_manager.get_table_name('agent_status')
                 if self.db_manager.db_type == 'mysql':
                     agent_data = self.db_manager.fetch_one(
-                        "SELECT * FROM secflow_agent_agent_status WHERE agent_key = %s",
+                        f"SELECT * FROM {table_name} WHERE agent_key = %s",
                         (agent_key,)
                     )
                 else:
                     agent_data = self.db_manager.fetch_one(
-                        "SELECT * FROM secflow_agent_agent_status WHERE agent_key = ?",
+                        f"SELECT * FROM {table_name} WHERE agent_key = ?",
                         (agent_key,)
                     )
 
@@ -1114,12 +1415,12 @@ class WebAPIServer:
                     # Fetch from database for additional fields
                     if self.db_manager.db_type == 'mysql':
                         full_data = self.db_manager.fetch_one(
-                            "SELECT * FROM secflow_agent_agent_status WHERE agent_key = %s",
+                            f"SELECT * FROM {table_name} WHERE agent_key = %s",
                             (agent_key,)
                         )
                     else:
                         full_data = self.db_manager.fetch_one(
-                            "SELECT * FROM secflow_agent_agent_status WHERE agent_key = ?",
+                            f"SELECT * FROM {table_name} WHERE agent_key = ?",
                             (agent_key,)
                         )
                     if full_data:
@@ -1137,6 +1438,16 @@ class WebAPIServer:
                                     agent_data['system_info'] = full_data['system_info']
                             else:
                                 agent_data['system_info'] = full_data['system_info']
+
+                        daemon_info_raw = full_data.get('daemon_info')
+                        if daemon_info_raw:
+                            if isinstance(daemon_info_raw, str):
+                                try:
+                                    agent_data['daemon_info'] = json.loads(daemon_info_raw)
+                                except:
+                                    agent_data['daemon_info'] = daemon_info_raw
+                            else:
+                                agent_data['daemon_info'] = daemon_info_raw
 
                         if full_data['services']:
                             if isinstance(full_data['services'], str):
@@ -1320,7 +1631,7 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/templates/<name>', methods=['GET'])
         def get_template_detail(name):
-            """获取模板详细信息（包含文件大小）"""
+            """获取模板详细信息（包含解析数据和文件大小）"""
             template = self.template_manager.get_template(name)
 
             if template:
@@ -1343,6 +1654,22 @@ class WebAPIServer:
                                 'modified': datetime.fromtimestamp(file_stat.st_mtime).isoformat()
                             })
                     template['directory_files'] = files
+
+                # 处理 metadata 并检查解析数据是否过期
+                metadata = template.get('metadata', {})
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                        template['metadata'] = metadata
+                    except:
+                        template['metadata'] = {}
+
+                # 检查解析数据是否过期
+                if metadata and metadata.get('parsed_compose'):
+                    success, is_stale, msg = self.template_manager.check_parse_staleness(name)
+                    if success and is_stale:
+                        metadata['parse_status'] = 'stale'
+                        template['metadata'] = metadata
 
                 return jsonify(template)
             else:
@@ -1972,6 +2299,102 @@ class WebAPIServer:
             except Exception as e:
                 self.logger.error(f"删除模板目录失败: {str(e)}", exc_info=True)
                 return jsonify({'error': f'删除失败: {str(e)}'}), 500
+
+        @self.app.route('/api/agent/templates/<name>/parsed', methods=['GET'])
+        def get_parsed_compose(name):
+            """
+            获取模板的解析数据（专用接口）
+
+            返回 docker-compose 结构化信息
+            """
+            try:
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': f'模板 {name} 不存在'}), 404
+
+                metadata = template.get('metadata', {})
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+
+                # 检查是否已解析
+                parsed_compose = metadata.get('parsed_compose')
+                if not parsed_compose:
+                    # 尝试解析
+                    success, msg = self.template_manager.parse_template_compose(name)
+                    if success:
+                        # 重新获取
+                        template = self.template_manager.get_template(name)
+                        metadata = template.get('metadata', {})
+                        if isinstance(metadata, str):
+                            metadata = json.loads(metadata)
+                        parsed_compose = metadata.get('parsed_compose')
+                    else:
+                        return jsonify({
+                            'error': '解析失败',
+                            'details': metadata.get('parse_error', msg),
+                            'parse_status': 'error'
+                        }), 400
+
+                # 检查是否过期
+                success, is_stale, _ = self.template_manager.check_parse_staleness(name)
+
+                return jsonify({
+                    'template_name': name,
+                    'parsed_compose': parsed_compose,
+                    'parse_status': 'stale' if is_stale else metadata.get('parse_status', 'success'),
+                    'parsed_at': metadata.get('parsed_at'),
+                    'parse_error': metadata.get('parse_error'),
+                    'is_stale': is_stale if success else None
+                })
+
+            except Exception as e:
+                self.logger.error(f"获取解析数据失败: {str(e)}")
+                return jsonify({'error': f'获取失败: {str(e)}'}), 500
+
+        @self.app.route('/api/agent/templates/<name>/parse', methods=['POST'])
+        def parse_template(name):
+            """
+            手动触发模板解析
+
+            适用于：
+            1. 解析失败后重试
+            2. 文件手动修改后刷新
+            3. 强制重新解析
+            """
+            try:
+                # 检查模板是否存在
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': f'模板 {name} 不存在'}), 404
+
+                # 执行解析
+                success, message = self.template_manager.parse_template_compose(name)
+
+                if success:
+                    # 返回更新后的模板信息
+                    template = self.template_manager.get_template(name)
+                    metadata = template.get('metadata', {})
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+
+                    return jsonify({
+                        'message': message,
+                        'template_name': name,
+                        'parsed_compose': metadata.get('parsed_compose'),
+                        'parse_status': metadata.get('parse_status'),
+                        'parsed_at': metadata.get('parsed_at'),
+                        'status': 'success'
+                    })
+                else:
+                    return jsonify({
+                        'error': message,
+                        'template_name': name,
+                        'status': 'failed'
+                    }), 400
+
+            except Exception as e:
+                self.logger.error(f"解析模板 {name} 失败: {str(e)}")
+                return jsonify({'error': f'解析失败: {str(e)}'}), 500
 
     def _refresh_loop(self):
         """后台刷新循环"""

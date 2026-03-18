@@ -217,6 +217,27 @@ class IngressSimpleCreateRequest(BaseModel):
     path_type: str = Field(default="Prefix", description="路径类型: Prefix, Exact, ImplementationSpecific")
 
 
+class IngressExternalCreateRequest(BaseModel):
+    """Ingress外部端点创建请求（路由到外部IP:端口）"""
+    name: str = Field(..., description="Ingress名称")
+    external_ips: List[str] = Field(..., description="外部IP地址列表（支持多个IP负载均衡）")
+    external_port: int = Field(..., description="外部端口")
+    host: str = Field(..., description="域名")
+    path: str = Field(default="/", description="路径，默认为根路径")
+    path_type: str = Field(default="Prefix", description="路径类型: Prefix, Exact, ImplementationSpecific")
+    ingress_type: str = Field(default="nginx", description="Ingress类型: nginx")
+    service_port: int = Field(default=80, description="Service端口（Ingress指向此端口）")
+    tls_enabled: bool = Field(default=False, description="是否启用TLS")
+    tls_secret_name: Optional[str] = Field(default=None, description="TLS Secret名称（启用TLS时必需）")
+    # NGINX Ingress 注解参数
+    websocket_enabled: bool = Field(default=False, description="是否启用WebSocket支持")
+    proxy_body_size: str = Field(default="10m", description="最大上传文件大小，如: 10m, 10240m, 1g")
+    proxy_connect_timeout: int = Field(default=60, description="连接超时时间（秒）")
+    proxy_send_timeout: int = Field(default=60, description="发送超时时间（秒）")
+    proxy_read_timeout: int = Field(default=60, description="读取超时时间（秒）")
+    ssl_redirect: bool = Field(default=True, description="是否强制HTTPS重定向")
+
+
 # ==================== Secret 模型 ====================
 
 
