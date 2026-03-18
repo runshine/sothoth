@@ -1558,8 +1558,8 @@ class EnhancedTemplateManager:
             db_cleanup_needed = True
             self.logger.info(f"模板 '{name}' 创建成功，类型: {template_type}")
 
-            # 在模板创建成功后自动解析 docker-compose 内容
-            if template_type == 'yaml':
+            # 在模板创建成功后自动解析 docker-compose 内容（yaml/archive 一致）
+            if template_type in ['yaml', 'archive']:
                 try:
                     parse_success, parse_msg = self.parse_template_compose(name)
                     if not parse_success:
