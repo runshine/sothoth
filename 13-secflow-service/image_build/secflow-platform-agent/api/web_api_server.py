@@ -475,6 +475,61 @@ class WebAPIServer:
         expected = self.config.get('agent_auth_token') or ''
         return bool(token) and token == expected
 
+    def _get_request_user_context(self) -> Dict[str, str]:
+        """从请求中提取用户身份信息（优先JWT，其次透传头）"""
+        user_id = ''
+        username = ''
+        token_type = ''
+
+        try:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.lower().startswith('bearer '):
+                token = auth_header.split(' ', 1)[1].strip()
+                token_parts = token.split('.')
+                if len(token_parts) >= 2:
+                    payload_b64 = token_parts[1]
+                    padding = '=' * (-len(payload_b64) % 4)
+                    decoded = base64.urlsafe_b64decode(payload_b64 + padding)
+                    payload = json.loads(decoded.decode('utf-8'))
+                    user_id = str(payload.get('sub') or '').strip()
+                    username = str(payload.get('username') or '').strip()
+                    token_type = str(payload.get('type') or '').strip().lower()
+        except Exception:
+            pass
+
+        header_user_id = str(request.headers.get('X-User-Id') or '').strip()
+        header_username = str(request.headers.get('X-Username') or '').strip()
+        if not user_id and header_user_id:
+            user_id = header_user_id
+        if not username and header_username:
+            username = header_username
+
+        # 兜底兼容，避免空身份影响历史流程
+        if not user_id:
+            user_id = 'system'
+        if not username:
+            username = 'system'
+
+        return {
+            'user_id': user_id,
+            'username': username,
+            'token_type': token_type
+        }
+
+    def _check_template_visible(self, template: Optional[Dict], user_ctx: Dict[str, str]) -> bool:
+        return self.template_manager.can_view_template(
+            template,
+            user_ctx.get('user_id', ''),
+            user_ctx.get('username', '')
+        )
+
+    def _check_template_manageable(self, template: Optional[Dict], user_ctx: Dict[str, str]) -> bool:
+        return self.template_manager.can_manage_template(
+            template,
+            user_ctx.get('user_id', ''),
+            user_ctx.get('username', '')
+        )
+
     def _record_service_sync_log(self, scope: str, status: str = 'ok',
                                  project_id: Optional[str] = None, agent_key: Optional[str] = None,
                                  stale_only: bool = False, total: int = 0, ok_count: int = 0,
@@ -2459,13 +2514,20 @@ class WebAPIServer:
 
         # ===================== 模板管理API（完整版，支持多种压缩格式） =====================
 
+        def _resolve_template_by_id(template_id: int) -> Optional[Dict]:
+            return self.template_manager.get_template_by_id(template_id)
+
         @self.app.route('/api/agent/templates', methods=['GET'])
         def list_templates():
             """列出所有模板（包含文件大小信息）"""
             page = int(request.args.get('page', 1))
             per_page = int(request.args.get('per_page', 20))
-
-            templates, total = self.template_manager.list_templates(page, per_page)
+            user_ctx = self._get_request_user_context()
+            templates, total = self.template_manager.list_templates(
+                page, per_page,
+                user_ctx.get('user_id', ''),
+                user_ctx.get('username', '')
+            )
             return jsonify({
                 'templates': templates,
                 'page': page,
@@ -2484,6 +2546,9 @@ class WebAPIServer:
             name = request.form.get('name')
             description = request.form.get('description', '')
             template_type = request.form.get('type', 'auto')  # 默认为自动检测
+            visibility = (request.form.get('visibility', 'shared') or 'shared').strip().lower()
+            if visibility not in ('shared', 'private'):
+                return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
 
             if not name:
                 return jsonify({'error': '模板名称不能为空'}), 400
@@ -2521,11 +2586,16 @@ class WebAPIServer:
 
             # 读取文件内容
             file_content = file.read()
+            user_ctx = self._get_request_user_context()
+            created_by = user_ctx.get('username', 'system')
 
             # 获取当前用户
             success, message = self.template_manager.create_template(
                 name, description, template_type, file_content, filename,
-                'system'
+                created_by,
+                visibility=visibility,
+                owner_id=user_ctx.get('user_id', ''),
+                owner_name=user_ctx.get('username', '')
             )
 
             if success:
@@ -2533,7 +2603,10 @@ class WebAPIServer:
                     'message': message,
                     'template_name': name,
                     'template_type': template_type,
-                    'filename': filename
+                    'filename': filename,
+                    'visibility': visibility,
+                    'owner_id': user_ctx.get('user_id', ''),
+                    'owner_name': user_ctx.get('username', '')
                 }), 201
             else:
                 return jsonify({'error': message}), 400
@@ -2541,9 +2614,13 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>', methods=['GET'])
         def get_template_detail(name):
             """获取模板详细信息（包含解析数据和文件大小）"""
+            user_ctx = self._get_request_user_context()
             template = self.template_manager.get_template(name)
 
             if template:
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
+
                 # 获取文件详细信息
                 file_info = self.template_manager.get_template_file_info(name)
                 if file_info:
@@ -2579,14 +2656,71 @@ class WebAPIServer:
                     if success and is_stale:
                         metadata['parse_status'] = 'stale'
                         template['metadata'] = metadata
+                template = self.template_manager.decorate_template_permissions(
+                    template,
+                    user_ctx.get('user_id', ''),
+                    user_ctx.get('username', '')
+                )
 
                 return jsonify(template)
             else:
                 return jsonify({'error': '模板不存在'}), 404
 
+        @self.app.route('/api/agent/templates/by-name/<name>', methods=['GET'])
+        def get_template_detail_by_name(name):
+            """根据名称查询模板"""
+            return get_template_detail(name)
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>', methods=['GET'])
+        def get_template_detail_by_id(template_id):
+            """根据ID获取模板详情"""
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_detail(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>', methods=['PUT'])
+        def update_template_basic_by_id(template_id):
+            """根据ID更新模板基础信息（支持改名）"""
+            user_ctx = self._get_request_user_context()
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
+
+            data = request.get_json(silent=True) or {}
+            new_name = data.get('name')
+            description = data.get('description') if 'description' in data else None
+            visibility = data.get('visibility') if 'visibility' in data else None
+            if visibility is not None and str(visibility).strip().lower() not in ('shared', 'private'):
+                return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
+
+            success, message, updated = self.template_manager.update_template_basic(
+                template_id=template_id,
+                new_name=new_name,
+                description=description,
+                visibility=visibility,
+                updated_by=user_ctx.get('username', 'system')
+            )
+            if not success:
+                return jsonify({'error': message}), 400
+            updated = self.template_manager.decorate_template_permissions(
+                updated,
+                user_ctx.get('user_id', ''),
+                user_ctx.get('username', '')
+            )
+            return jsonify({'message': message, 'template': updated, 'status': 'success'})
+
         @self.app.route('/api/agent/templates/<name>/yaml', methods=['GET'])
         def get_template_yaml(name):
             """获取模板的YAML内容"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
             success, content, message = self.template_manager.get_yaml_content(name)
 
             if success:
@@ -2605,6 +2739,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/yaml', methods=['PUT'])
         def update_template_yaml(name):
             """更新模板的YAML内容"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
             data = request.get_json()
             if not data:
                 return jsonify({'error': '请求体必须为JSON'}), 400
@@ -2614,7 +2754,7 @@ class WebAPIServer:
                 return jsonify({'error': 'YAML内容不能为空'}), 400
 
             success, message = self.template_manager.update_yaml_content(
-                name, yaml_content, 'system'
+                name, yaml_content, user_ctx.get('username', 'system')
             )
 
             if success:
@@ -2632,6 +2772,7 @@ class WebAPIServer:
         def download_template(name):
             """下载模板文件"""
             try:
+                user_ctx = self._get_request_user_context()
                 format_param = request.args.get('format', 'original')
                 as_zip = request.args.get('as_zip', '').lower() == 'true'
                 include_all = request.args.get('include_all', 'true').lower() == 'true'
@@ -2643,6 +2784,8 @@ class WebAPIServer:
                 template = self.template_manager.get_template(name)
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
 
                 # 处理下载请求
                 if as_zip:
@@ -2693,6 +2836,12 @@ class WebAPIServer:
         def get_template_file(name):
             """获取模板原始文件"""
             try:
+                user_ctx = self._get_request_user_context()
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
                 file_info = self.template_manager.get_template_file_info(name)
 
                 if not file_info:
@@ -2737,10 +2886,13 @@ class WebAPIServer:
         def get_template_content(name):
             """获取模板内容（JSON格式）"""
             try:
+                user_ctx = self._get_request_user_context()
                 template = self.template_manager.get_template(name)
 
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
 
                 success, content, content_type = self.template_manager.get_template_file_content(
                     name, 'bytes'
@@ -2779,10 +2931,13 @@ class WebAPIServer:
         def get_template_info(name):
             """获取模板详细信息（包含文件列表）"""
             try:
+                user_ctx = self._get_request_user_context()
                 template = self.template_manager.get_template(name)
 
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
 
                 file_info = self.template_manager.get_template_file_info(name)
 
@@ -2824,6 +2979,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>', methods=['DELETE'])
         def delete_template(name):
             """删除模板"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限删除该模板，仅拥有者可删除'}), 403
             success, message = self.template_manager.delete_template(name)
 
             if success:
@@ -2831,10 +2992,49 @@ class WebAPIServer:
             else:
                 return jsonify({'error': message}), 400
 
+        @self.app.route('/api/agent/templates/<name>/copy', methods=['POST'])
+        def copy_template(name):
+            """复制模板"""
+            user_ctx = self._get_request_user_context()
+            source = self.template_manager.get_template(name)
+            if not source:
+                return jsonify({'error': '源模板不存在'}), 404
+            if not self._check_template_visible(source, user_ctx):
+                return jsonify({'error': '无权限复制该模板'}), 403
+
+            data = request.get_json(silent=True) or {}
+            target_name = (data.get('target_name') or '').strip()
+            if not target_name:
+                return jsonify({'error': 'target_name 不能为空'}), 400
+            visibility = (data.get('visibility', 'private') or 'private').strip().lower()
+            if visibility not in ('shared', 'private'):
+                return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
+            description = data.get('description', '')
+
+            success, message = self.template_manager.copy_template(
+                source_name=name,
+                target_name=target_name,
+                created_by=user_ctx.get('username', 'system'),
+                owner_id=user_ctx.get('user_id', ''),
+                owner_name=user_ctx.get('username', ''),
+                visibility=visibility,
+                description=description
+            )
+
+            if success:
+                return jsonify({
+                    'message': message,
+                    'source_name': name,
+                    'target_name': target_name,
+                    'visibility': visibility
+                }), 201
+            return jsonify({'error': message}), 400
+
         @self.app.route('/api/agent/templates/download/batch', methods=['POST'])
         def download_templates_batch():
             """批量下载模板"""
             try:
+                user_ctx = self._get_request_user_context()
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -2849,7 +3049,8 @@ class WebAPIServer:
                 # 检查模板是否存在
                 missing_templates = []
                 for name in template_names:
-                    if not self.template_manager.get_template(name):
+                    template = self.template_manager.get_template(name)
+                    if not template or not self._check_template_visible(template, user_ctx):
                         missing_templates.append(name)
 
                 if missing_templates:
@@ -2907,6 +3108,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/files', methods=['GET'])
         def list_template_files(name):
             """列出模板目录下的所有文件和目录"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
             path = request.args.get('path', '')
 
             success, result = self.template_manager.list_template_files(name, path)
@@ -2924,6 +3131,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/files/content', methods=['GET'])
         def get_template_file_content(name):
             """获取模板目录下指定文件的内容"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
             file_path = request.args.get('path', '')
             encoding = request.args.get('encoding', 'utf-8')
             preview = request.args.get('preview', 'false').lower() == 'true'
@@ -2977,6 +3190,12 @@ class WebAPIServer:
         def update_template_file_content(name):
             """更新模板目录下指定文件的内容"""
             try:
+                user_ctx = self._get_request_user_context()
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': '模板不存在'}), 404
+                if not self._check_template_manageable(template, user_ctx):
+                    return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -3002,7 +3221,7 @@ class WebAPIServer:
                         return jsonify({'error': f'Base64解码失败: {str(e)}'}), 400
 
                 # 获取当前用户
-                updated_by = 'system'
+                updated_by = user_ctx.get('username', 'system')
 
                 success, message, update_info = self.template_manager.update_template_file(
                     name, file_path, actual_content, encoding, updated_by
@@ -3034,6 +3253,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/files/download', methods=['GET'])
         def download_template_file(name):
             """下载模板目录下的单个文件"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
             file_path = request.args.get('path', '')
 
             if not file_path:
@@ -3078,6 +3303,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/files/upload', methods=['POST'])
         def upload_template_file(name):
             """上传文件到模板目录"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
             if 'file' not in request.files:
                 return jsonify({'error': '未找到文件'}), 400
 
@@ -3093,7 +3324,7 @@ class WebAPIServer:
                 target_path = file.filename
 
             # 获取当前用户
-            updated_by = 'system'
+            updated_by = user_ctx.get('username', 'system')
 
             # 读取文件内容
             file_content = file.read()
@@ -3147,6 +3378,12 @@ class WebAPIServer:
         def delete_template_file(name):
             """删除模板目录下的指定文件"""
             try:
+                user_ctx = self._get_request_user_context()
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': '模板不存在'}), 404
+                if not self._check_template_manageable(template, user_ctx):
+                    return jsonify({'error': '无权限删除模板文件，仅拥有者可删除'}), 403
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -3156,7 +3393,7 @@ class WebAPIServer:
                     return jsonify({'error': '文件路径不能为空'}), 400
 
                 # 获取当前用户
-                deleted_by = 'system'
+                deleted_by = user_ctx.get('username', 'system')
 
                 success, message, delete_info = self.template_manager.delete_template_file(
                     name, file_path, deleted_by
@@ -3179,6 +3416,12 @@ class WebAPIServer:
         def delete_template_directory(name):
             """删除模板目录下的指定目录"""
             try:
+                user_ctx = self._get_request_user_context()
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': '模板不存在'}), 404
+                if not self._check_template_manageable(template, user_ctx):
+                    return jsonify({'error': '无权限删除模板目录，仅拥有者可删除'}), 403
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -3190,7 +3433,7 @@ class WebAPIServer:
                     return jsonify({'error': '目录路径不能为空'}), 400
 
                 # 获取当前用户
-                deleted_by = 'system'
+                deleted_by = user_ctx.get('username', 'system')
 
                 success, message, delete_info = self.template_manager.delete_template_directory(
                     name, dir_path, deleted_by, force
@@ -3217,9 +3460,12 @@ class WebAPIServer:
             返回 docker-compose 结构化信息
             """
             try:
+                user_ctx = self._get_request_user_context()
                 template = self.template_manager.get_template(name)
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
 
                 metadata = template.get('metadata', {})
                 if isinstance(metadata, str):
@@ -3271,10 +3517,13 @@ class WebAPIServer:
             3. 强制重新解析
             """
             try:
+                user_ctx = self._get_request_user_context()
                 # 检查模板是否存在
                 template = self.template_manager.get_template(name)
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_manageable(template, user_ctx):
+                    return jsonify({'error': '无权限重新解析该模板，仅拥有者可操作'}), 403
 
                 # 执行解析
                 success, message = self.template_manager.parse_template_compose(name)
@@ -3304,6 +3553,127 @@ class WebAPIServer:
             except Exception as e:
                 self.logger.error(f"解析模板 {name} 失败: {str(e)}")
                 return jsonify({'error': f'解析失败: {str(e)}'}), 500
+
+        # ===================== 模板管理ID路由（唯一引用） =====================
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/yaml', methods=['GET'])
+        def get_template_yaml_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_yaml(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/yaml', methods=['PUT'])
+        def update_template_yaml_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return update_template_yaml(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/download', methods=['GET'])
+        def download_template_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return download_template(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/file', methods=['GET'])
+        def get_template_file_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_file(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/content', methods=['GET'])
+        def get_template_content_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_content(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/info', methods=['GET'])
+        def get_template_info_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_info(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>', methods=['DELETE'])
+        def delete_template_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return delete_template(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/copy', methods=['POST'])
+        def copy_template_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return copy_template(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files', methods=['GET'])
+        def list_template_files_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return list_template_files(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files/content', methods=['GET'])
+        def get_template_file_content_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_file_content(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files/content', methods=['PUT'])
+        def update_template_file_content_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return update_template_file_content(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files/download', methods=['GET'])
+        def download_template_file_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return download_template_file(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files/upload', methods=['POST'])
+        def upload_template_file_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return upload_template_file(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files', methods=['DELETE'])
+        def delete_template_file_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return delete_template_file(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/directories', methods=['DELETE'])
+        def delete_template_directory_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return delete_template_directory(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/parsed', methods=['GET'])
+        def get_parsed_compose_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_parsed_compose(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/parse', methods=['POST'])
+        def parse_template_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return parse_template(template['name'])
 
     def _refresh_loop(self):
         """后台刷新循环"""
