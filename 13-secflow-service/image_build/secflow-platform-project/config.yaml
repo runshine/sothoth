@@ -69,12 +69,12 @@ k8s_service:
 # TLS Secret Configuration
 # 用于在项目的K8S Namespace中创建TLS Secret
 tls_secret:
-  # TLS Secret名称（所有项目的TLS Secret名称都相同）
-  name: "wildcard-code-server.sothothv2.com-tls"
-  # FullChain CRT文件路径（包含完整证书链）
-  crt_file: "./full_chain.crt"
-  # 私钥文件路径
-  key_file: "./full_chain.key"
+  # 目标项目命名空间中的 TLS Secret 名称
+  name: "wildcard-sothothv2.com-tls"
+  # 源公共TLS Secret所在命名空间
+  source_namespace: "secflow-ns"
+  # 源公共TLS Secret名称（由setup-ingress-tls.sh初始化）
+  source_secret_name: "wildcard-sothothv2.com-tls"
 
 # Application Configuration
 app:

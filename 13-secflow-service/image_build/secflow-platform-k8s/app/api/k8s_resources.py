@@ -31,6 +31,7 @@ from app.services.k8s import get_k8s_service
 from app.schemas import (
     ErrorResponse,
     SuccessResponse,
+    ProjectTLSSyncRequest,
     PodListResponse,
     PodInfo,
     PodLogResponse,
@@ -974,6 +975,26 @@ async def delete_dynamic_agent_ingress_route(
 
 
 # ==================== Secret 管理 ====================
+
+
+@router.post("/projects/{project_id}/tls-secret/sync", response_model=SuccessResponse, summary="同步项目TLS Secret")
+async def sync_project_tls_secret(
+    project_id: str,
+    request: ProjectTLSSyncRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    将源命名空间中的 TLS Secret 复制到项目命名空间（已存在则覆盖）。
+    """
+    _, namespace = await get_project_and_namespace(project_id, current_user, db)
+    result = get_k8s_service().sync_tls_secret(
+        source_namespace=request.source_namespace,
+        source_secret_name=request.source_secret_name,
+        target_namespace=namespace,
+        target_secret_name=request.target_secret_name,
+    )
+    return SuccessResponse(message="项目TLS Secret同步成功", data=result)
 
 
 @router.get("/secrets", response_model=SecretListResponse, summary="获取Secret列表")

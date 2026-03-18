@@ -1,25 +1,31 @@
 #!/bin/bash
 
+# 脚本目录
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # 证书存储目录
-CERTS_DIR="./certs"
+CERTS_DIR="${CERTS_DIR:-${SCRIPT_DIR}/certs}"
 CA_KEY="$CERTS_DIR/ca.key"
 CA_CRT="$CERTS_DIR/ca.crt"
 CA_SRL="$CERTS_DIR/ca.srl"
 
 # 检查参数
-if [ $# -ne 1 ]; then
-    echo "用法: $0 <泛域名>"
-    echo "示例: $0 '*.example.com'"
+if [ $# -gt 1 ]; then
+    echo "用法: $0 [泛域名]"
+    echo "示例1(仅初始化CA): $0"
+    echo "示例2(创建域名证书): $0 '*.example.com'"
     exit 1
 fi
 
-DOMAIN="$1"
-# 从泛域名中提取基础域名（去掉*号）
-BASE_DOMAIN=$(echo "$DOMAIN" | sed 's/^\*\.//')
-KEY_FILE="$CERTS_DIR/$DOMAIN.key"
-CRT_FILE="$CERTS_DIR/$DOMAIN.crt"
-CSR_FILE="$CERTS_DIR/$DOMAIN.csr"
-EXT_FILE="$CERTS_DIR/$DOMAIN.ext"
+DOMAIN="${1:-}"
+if [ -n "$DOMAIN" ]; then
+    # 从泛域名中提取基础域名（去掉*号）
+    BASE_DOMAIN=$(echo "$DOMAIN" | sed 's/^\*\.//')
+    KEY_FILE="$CERTS_DIR/$DOMAIN.key"
+    CRT_FILE="$CERTS_DIR/$DOMAIN.crt"
+    CSR_FILE="$CERTS_DIR/$DOMAIN.csr"
+    EXT_FILE="$CERTS_DIR/$DOMAIN.ext"
+fi
 
 # 创建certs目录（如果不存在）
 mkdir -p "$CERTS_DIR"
@@ -84,7 +90,11 @@ EOF
 
 # 主流程
 echo "===== 证书管理脚本 ====="
-echo "目标域名: $DOMAIN"
+if [ -n "$DOMAIN" ]; then
+    echo "目标域名: $DOMAIN"
+else
+    echo "目标域名: <无，仅初始化CA>"
+fi
 echo "证书目录: $CERTS_DIR"
 echo ""
 
@@ -99,28 +109,32 @@ else
     echo ""
 fi
 
-# 检查域名证书是否存在
-if [ ! -f "$KEY_FILE" ] || [ ! -f "$CRT_FILE" ]; then
-    echo "域名证书不存在，开始创建..."
-    create_domain_certificate "$DOMAIN" "$BASE_DOMAIN"
+if [ -n "$DOMAIN" ]; then
+    # 检查域名证书是否存在
+    if [ ! -f "$KEY_FILE" ] || [ ! -f "$CRT_FILE" ]; then
+        echo "域名证书不存在，开始创建..."
+        create_domain_certificate "$DOMAIN" "$BASE_DOMAIN"
 
-    # 显示证书信息
-    echo "证书详情:"
-    openssl x509 -in "$CRT_FILE" -noout -text | grep -A1 "Subject:"
-    openssl x509 -in "$CRT_FILE" -noout -text | grep -A2 "Subject Alternative Name"
-    echo ""
-    echo "证书有效期:"
-    openssl x509 -in "$CRT_FILE" -noout -dates
+        # 显示证书信息
+        echo "证书详情:"
+        openssl x509 -in "$CRT_FILE" -noout -text | grep -A1 "Subject:"
+        openssl x509 -in "$CRT_FILE" -noout -text | grep -A2 "Subject Alternative Name"
+        echo ""
+        echo "证书有效期:"
+        openssl x509 -in "$CRT_FILE" -noout -dates
+    else
+        echo "域名证书已存在，跳过创建"
+        echo "  - 私钥: $KEY_FILE"
+        echo "  - 证书: $CRT_FILE"
+        echo ""
+
+        # 显示现有证书信息
+        echo "现有证书详情:"
+        openssl x509 -in "$CRT_FILE" -noout -text | grep -A1 "Subject\|Not"
+        echo ""
+    fi
 else
-    echo "域名证书已存在，跳过创建"
-    echo "  - 私钥: $KEY_FILE"
-    echo "  - 证书: $CRT_FILE"
-    echo ""
-
-    # 显示现有证书信息
-    echo "现有证书详情:"
-    openssl x509 -in "$CRT_FILE" -noout -text | grep -A1 "Subject\|Not"
-    echo ""
+    echo "未指定域名，已完成CA初始化检查"
 fi
 
 echo "===== 完成 ====="

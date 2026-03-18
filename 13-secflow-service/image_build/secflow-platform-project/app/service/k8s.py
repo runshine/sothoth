@@ -2,11 +2,10 @@
 K8S客户端模块
 """
 
-import hashlib
 import logging
-import base64
 from typing import Optional, Dict, List
 
+import httpx
 from kubernetes import client, config
 from kubernetes.client import ApiClient
 from kubernetes.client.rest import ApiException
@@ -21,6 +20,7 @@ class K8SClient:
 
     def __init__(self):
         self.config = get_config().kubernetes
+        self.k8s_service_config = get_config().k8s_service
         self.tls_config = get_config().tls_secret
         self.client: Optional[ApiClient] = None
         self.core_v1 = None
@@ -113,72 +113,47 @@ class K8SClient:
             logger.error(f"创建Namespace失败: {e}")
             return False
 
-    def create_tls_secret(self, project_id: str) -> tuple[bool, Optional[str]]:
+    def create_tls_secret(self, project_id: str, authorization: Optional[str] = None) -> tuple[bool, Optional[str]]:
         """
-        在项目的Namespace中创建TLS Secret
+        通过 platform-k8s 在项目Namespace中同步TLS Secret
 
         Args:
             project_id: 项目ID
+            authorization: Bearer Token
 
         Returns:
             tuple: (是否创建成功, 错误信息)
         """
-        namespace_name = self.generate_namespace_name(project_id)
-        secret_name = self.tls_config.name
+        base_url = f"http://{self.k8s_service_config.host}:{self.k8s_service_config.port}"
+        url = f"{base_url}/api/k8s/projects/{project_id}/tls-secret/sync"
+        payload = {
+            "source_namespace": self.tls_config.source_namespace,
+            "source_secret_name": self.tls_config.source_secret_name,
+            "target_secret_name": self.tls_config.name,
+        }
+        headers = {}
+        if authorization:
+            headers["Authorization"] = authorization
 
         try:
-            # 检查Secret是否已存在
-            try:
-                self.core_v1.read_namespaced_secret(name=secret_name, namespace=namespace_name)
-                logger.info(f"TLS Secret {secret_name} 在Namespace {namespace_name} 中已存在")
+            with httpx.Client(timeout=self.k8s_service_config.timeout) as client_http:
+                resp = client_http.post(url, json=payload, headers=headers)
+
+            if 200 <= resp.status_code < 300:
+                logger.info(
+                    "TLS Secret同步成功: project_id=%s, source=%s/%s, target=%s",
+                    project_id,
+                    self.tls_config.source_namespace,
+                    self.tls_config.source_secret_name,
+                    self.tls_config.name,
+                )
                 return True, None
-            except ApiException as e:
-                if e.status != 404:
-                    raise
 
-            # 读取证书文件
-            try:
-                with open(self.tls_config.crt_file, 'r', encoding='utf-8') as f:
-                    tls_crt = f.read()
-            except Exception as e:
-                error_msg = f"读取TLS证书文件失败: {self.tls_config.crt_file}, 错误: {e}"
-                logger.error(error_msg)
-                return False, error_msg
-
-            # 读取私钥文件
-            try:
-                with open(self.tls_config.key_file, 'r', encoding='utf-8') as f:
-                    tls_key = f.read()
-            except Exception as e:
-                error_msg = f"读取TLS私钥文件失败: {self.tls_config.key_file}, 错误: {e}"
-                logger.error(error_msg)
-                return False, error_msg
-
-            # 创建Secret
-            secret_manifest = {
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {
-                    "name": secret_name,
-                    "namespace": namespace_name,
-                    "labels": {
-                        "app": "secflow",
-                        "project-id": project_id,
-                    }
-                },
-                "type": "kubernetes.io/tls",
-                "data": {
-                    "tls.crt": base64.b64encode(tls_crt.encode()).decode(),
-                    "tls.key": base64.b64encode(tls_key.encode()).decode(),
-                }
-            }
-
-            self.core_v1.create_namespaced_secret(namespace=namespace_name, body=secret_manifest)
-            logger.info(f"TLS Secret {secret_name} 在Namespace {namespace_name} 中创建成功")
-            return True, None
-
-        except ApiException as e:
-            error_msg = f"创建TLS Secret失败: {e}"
+            error_msg = f"{resp.status_code} {resp.text}"
+            logger.error("调用platform-k8s同步TLS Secret失败: %s", error_msg)
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"调用platform-k8s同步TLS Secret异常: {e}"
             logger.error(error_msg)
             return False, error_msg
 

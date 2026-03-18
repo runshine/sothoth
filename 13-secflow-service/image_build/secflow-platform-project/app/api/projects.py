@@ -178,6 +178,7 @@ def make_project_response(project: Project, roles: List[ProjectRoleBindResponse]
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 async def create_project(
     project_data: ProjectCreate,
+    authorization: Optional[str] = Header(None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -239,7 +240,7 @@ async def create_project(
     db.refresh(role_bind)
 
     # 创建TLS Secret（platform-k8s 会校验 project_id 对应项目存在）
-    tls_success, tls_error = k8s_client.create_tls_secret(project_id)
+    tls_success, tls_error = k8s_client.create_tls_secret(project_id, authorization=authorization)
     if not tls_success:
         logger.error(f"创建TLS Secret失败: {project_id}, 错误: {tls_error}")
         # 删除已创建的Namespace
