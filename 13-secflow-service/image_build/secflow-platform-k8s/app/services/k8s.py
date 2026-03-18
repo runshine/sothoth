@@ -130,6 +130,36 @@ class KubernetesService:
                 return False
             raise
 
+    def create_namespace(self, name: str, labels: Optional[Dict[str, str]] = None,
+                         annotations: Optional[Dict[str, str]] = None) -> Dict:
+        """创建Namespace"""
+        try:
+            manifest = kubernetes.client.V1Namespace(
+                metadata=kubernetes.client.V1ObjectMeta(
+                    name=name,
+                    labels=labels or {},
+                    annotations=annotations or {}
+                )
+            )
+            ns = self.core_v1.create_namespace(body=manifest)
+            return {
+                "name": ns.metadata.name,
+                "status": ns.status.phase if ns.status else "Unknown",
+                "labels": ns.metadata.labels or {},
+                "annotations": ns.metadata.annotations or {},
+                "created_at": ns.metadata.creation_timestamp.isoformat() if ns.metadata.creation_timestamp else None,
+            }
+        except ApiException as e:
+            self._handle_api_exception(e, "Namespace", "创建")
+
+    def delete_namespace(self, name: str) -> Dict:
+        """删除Namespace"""
+        try:
+            self.core_v1.delete_namespace(name=name, body=kubernetes.client.V1DeleteOptions())
+            return {"status": "deleting", "name": name}
+        except ApiException as e:
+            self._handle_api_exception(e, "Namespace", "删除")
+
     # ==================== POD 管理 ====================
 
     def list_pods(self, namespace: str, label_selector: str = None) -> List[Dict]:
@@ -1687,6 +1717,51 @@ class KubernetesService:
             return {"status": "deleted", "name": name}
         except ApiException as e:
             self._handle_api_exception(e, "PVC", "删除")
+
+    def check_pvc_in_use(self, namespace: str, name: str) -> Dict:
+        """检查PVC是否被Pod/Job使用"""
+        try:
+            # PVC存在性检查
+            self.core_v1.read_namespaced_persistent_volume_claim(name=name, namespace=namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return {"in_use": False, "message": f"PVC {name} does not exist"}
+            self._handle_api_exception(e, "PVC", "检查使用状态")
+
+        # 检查Pod挂载
+        try:
+            pods = self.core_v1.list_namespaced_pod(namespace=namespace)
+            for pod in pods.items:
+                if not pod.spec or not pod.spec.volumes:
+                    continue
+                for volume in pod.spec.volumes:
+                    pvc = getattr(volume, "persistent_volume_claim", None)
+                    if pvc and pvc.claim_name == name:
+                        phase = pod.status.phase if pod.status else "Unknown"
+                        if phase in ["Running", "Pending", "Unknown"]:
+                            return {"in_use": True, "message": f"PVC mounted by pod {pod.metadata.name} ({phase})"}
+        except ApiException as e:
+            self._handle_api_exception(e, "Pod", "检查PVC使用状态")
+
+        # 检查Job模板引用
+        try:
+            jobs = self.batch_v1.list_namespaced_job(namespace=namespace)
+            for job in jobs.items:
+                tpl = getattr(job.spec, "template", None)
+                pod_spec = getattr(tpl, "spec", None) if tpl else None
+                volumes = getattr(pod_spec, "volumes", None) if pod_spec else None
+                if not volumes:
+                    continue
+                for volume in volumes:
+                    pvc = getattr(volume, "persistent_volume_claim", None)
+                    if pvc and pvc.claim_name == name:
+                        active = job.status.active if job.status else 0
+                        if active and active > 0:
+                            return {"in_use": True, "message": f"PVC used by active job {job.metadata.name}"}
+        except ApiException as e:
+            self._handle_api_exception(e, "Job", "检查PVC使用状态")
+
+        return {"in_use": False, "message": "PVC is not in use"}
 
     def _pvc_to_dict(self, pvc) -> Dict:
         """PVC对象转字典"""

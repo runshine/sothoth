@@ -98,6 +98,26 @@ class KubernetesConfig(BaseModel):
     connection_timeout: int = 30
 
 
+class DynamicIngressConfig(BaseModel):
+    """动态Ingress路由配置"""
+    enabled: bool = True
+    common_domain_suffix: Optional[str] = None
+    # 兼容旧配置，后续可移除
+    default_domain_suffix: Optional[str] = None
+    default_ingress_type: str = "nginx"
+    default_path: str = "/"
+    default_path_type: str = "Prefix"
+    default_service_port: int = 80
+    default_websocket_enabled: bool = True
+    default_tls_enabled: bool = False
+    default_tls_secret_name: Optional[str] = None
+    default_proxy_body_size: str = "32m"
+    default_proxy_connect_timeout: int = 15
+    default_proxy_send_timeout: int = 120
+    default_proxy_read_timeout: int = 120
+    default_ssl_redirect: bool = False
+
+
 class AppConfig(BaseModel):
     """应用配置"""
     host: str = "0.0.0.0"
@@ -118,6 +138,7 @@ class Config(BaseModel):
     project_service: ProjectServiceConfig
     registry: RegistryConfig
     kubernetes: KubernetesConfig
+    dynamic_ingress: DynamicIngressConfig = DynamicIngressConfig()
     app: AppConfig
     logging: LoggingConfig = LoggingConfig()
 

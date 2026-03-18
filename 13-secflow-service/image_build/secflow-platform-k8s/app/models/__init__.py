@@ -12,6 +12,13 @@ from app.models.database import (
     get_db_session,
     get_project_by_id,
     get_project_namespace,
+    get_agent_ingress_route_table_name,
+    ensure_agent_ingress_route_table,
+    create_agent_ingress_route,
+    update_agent_ingress_route,
+    get_agent_ingress_route,
+    get_agent_ingress_route_by_unique_key,
+    list_agent_ingress_routes,
 )
 
 __all__ = [
@@ -24,4 +31,11 @@ __all__ = [
     "get_db_session",
     "get_project_by_id",
     "get_project_namespace",
+    "get_agent_ingress_route_table_name",
+    "ensure_agent_ingress_route_table",
+    "create_agent_ingress_route",
+    "update_agent_ingress_route",
+    "get_agent_ingress_route",
+    "get_agent_ingress_route_by_unique_key",
+    "list_agent_ingress_routes",
 ]

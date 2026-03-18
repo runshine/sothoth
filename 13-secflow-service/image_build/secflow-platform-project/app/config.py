@@ -85,6 +85,13 @@ class KubernetesConfig(BaseModel):
     connection_timeout: int = 30
 
 
+class K8sServiceConfig(BaseModel):
+    """platform-k8s 服务配置"""
+    host: str = "secflow-platform-k8s"
+    port: int = 80
+    timeout: int = 30
+
+
 class TLSSecretConfig(BaseModel):
     """TLS Secret配置"""
     name: str = "project-tls-secret"
@@ -111,6 +118,7 @@ class Config(BaseModel):
     auth_service: AuthServiceConfig
     registry: RegistryConfig
     kubernetes: KubernetesConfig
+    k8s_service: K8sServiceConfig = K8sServiceConfig()
     tls_secret: TLSSecretConfig
     app: AppConfig
     logging: LoggingConfig = LoggingConfig()

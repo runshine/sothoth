@@ -4,8 +4,11 @@ K8S资源管理API路由
 """
 
 import asyncio
+import hashlib
 import logging
 import threading
+import uuid
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, Query, status, WebSocket, WebSocketDisconnect, Request
@@ -14,7 +17,15 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.exception import NotFoundError, ForbiddenError, ValidationError
-from app.models.database import get_project_namespace, get_project_by_id, get_db
+from app.models.database import (
+    get_project_namespace,
+    get_db,
+    create_agent_ingress_route,
+    update_agent_ingress_route,
+    get_agent_ingress_route,
+    get_agent_ingress_route_by_unique_key,
+    list_agent_ingress_routes,
+)
 from app.services.auth import get_auth_service
 from app.services.k8s import get_k8s_service
 from app.schemas import (
@@ -33,6 +44,9 @@ from app.schemas import (
     IngressUpdateRequest,
     IngressSimpleCreateRequest,
     IngressExternalCreateRequest,
+    AgentIngressRouteCreateRequest,
+    AgentIngressRouteListResponse,
+    AgentIngressRouteInfo,
     SecretListResponse,
     SecretInfo,
     SecretCreateRequest,
@@ -60,6 +74,55 @@ from app.schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/k8s", tags=["K8S资源管理"])
+
+
+def _normalize_path(path: str) -> str:
+    value = (path or "/").strip()
+    if not value.startswith("/"):
+        value = f"/{value}"
+    return value
+
+
+def _sanitize_name_fragment(value: str) -> str:
+    lowered = (value or "").lower()
+    cleaned = "".join(ch if ch.isalnum() else "-" for ch in lowered).strip("-")
+    if not cleaned:
+        return "na"
+    return cleaned[:40]
+
+
+def _get_common_domain_suffix() -> Optional[str]:
+    conf = get_config().dynamic_ingress
+    return conf.common_domain_suffix or conf.default_domain_suffix
+
+
+def _build_host_by_prefix(project_id: str, host_prefix: str, domain_suffix: Optional[str]) -> Optional[str]:
+    if not domain_suffix:
+        return None
+    prefix = _sanitize_name_fragment(host_prefix)
+    project = _sanitize_name_fragment(project_id)
+    return f"{prefix}-{project}.{domain_suffix}"
+
+
+def _resolve_ingress_host(
+    project_id: str,
+    explicit_host: Optional[str] = None,
+    host_prefix: Optional[str] = None,
+    default_prefix: Optional[str] = None,
+) -> Optional[str]:
+    if explicit_host and explicit_host.strip():
+        return explicit_host.strip()
+    prefix = (host_prefix or default_prefix or "").strip()
+    if not prefix:
+        return None
+    return _build_host_by_prefix(project_id, prefix, _get_common_domain_suffix())
+
+
+def _build_resource_names(project_id: str, agent_key: str, target_port: int, host: str, path: str) -> tuple[str, str]:
+    uniq = hashlib.sha1(f"{project_id}|{agent_key}|{target_port}|{host}|{path}".encode("utf-8")).hexdigest()[:10]
+    ingress_name = f"agrt-{_sanitize_name_fragment(agent_key)[:12]}-{target_port}-{uniq}"[:63]
+    service_name = f"{ingress_name}-external-svc"
+    return ingress_name, service_name
 
 
 async def get_current_user(
@@ -144,6 +207,29 @@ async def check_namespace(
             "name": namespace_name,
             "status": "NotFound"
         }
+
+
+@router.post("/namespaces/{namespace_name}", response_model=SuccessResponse, summary="创建Namespace")
+async def create_namespace(
+    namespace_name: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """创建Namespace"""
+    k8s = get_k8s_service()
+    labels = {"managed-by": "secflow-platform-k8s"}
+    result = k8s.create_namespace(namespace_name, labels=labels)
+    return SuccessResponse(message="Namespace创建成功", data=result)
+
+
+@router.delete("/namespaces/{namespace_name}", response_model=SuccessResponse, summary="删除Namespace")
+async def delete_namespace(
+    namespace_name: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """删除Namespace"""
+    k8s = get_k8s_service()
+    result = k8s.delete_namespace(namespace_name)
+    return SuccessResponse(message="Namespace删除请求已提交", data=result)
 
 
 @router.get("/projects/{project_id}/namespace", summary="获取项目Namespace信息")
@@ -571,13 +657,22 @@ async def create_simple_ingress(
     """
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
 
+    resolved_host = _resolve_ingress_host(
+        project_id=project_id,
+        explicit_host=request.host,
+        host_prefix=request.host_prefix,
+        default_prefix=request.name
+    )
+    if not resolved_host:
+        raise ValidationError("host 或 host_prefix 必须至少提供一个，且需配置 dynamic_ingress.common_domain_suffix")
+
     k8s = get_k8s_service()
     return k8s.create_simple_ingress(
         namespace=namespace,
         name=request.name,
         service_name=request.service_name,
         service_port=request.service_port,
-        host=request.host,
+        host=resolved_host,
         ingress_type=request.ingress_type,
         ingress_ip=request.ingress_ip,
         path=request.path,
@@ -619,13 +714,22 @@ async def create_external_ingress(
 
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
 
+    resolved_host = _resolve_ingress_host(
+        project_id=project_id,
+        explicit_host=request.host,
+        host_prefix=request.host_prefix,
+        default_prefix=request.name
+    )
+    if not resolved_host:
+        raise ValidationError("host 或 host_prefix 必须至少提供一个，且需配置 dynamic_ingress.common_domain_suffix")
+
     k8s = get_k8s_service()
-    return k8s.create_external_ingress(
+    result = k8s.create_external_ingress(
         namespace=namespace,
         name=request.name,
         external_ips=request.external_ips,
         external_port=request.external_port,
-        host=request.host,
+        host=resolved_host,
         path=request.path,
         path_type=request.path_type,
         ingress_type=request.ingress_type,
@@ -639,6 +743,8 @@ async def create_external_ingress(
         proxy_read_timeout=request.proxy_read_timeout,
         ssl_redirect=request.ssl_redirect
     )
+    result["resolved_host"] = resolved_host
+    return result
 
 
 @router.delete("/ingresses/external/{ingress_name}", response_model=SuccessResponse, summary="删除外部端点Ingress(级联删除)")
@@ -658,6 +764,176 @@ async def delete_external_ingress(
     k8s = get_k8s_service()
     result = k8s.delete_external_ingress(namespace, ingress_name)
     return SuccessResponse(message="外部端点Ingress删除成功", data=result)
+
+
+# ==================== Agent动态Ingress路由 ====================
+
+
+@router.get("/agent-ingress-routes", response_model=AgentIngressRouteListResponse, summary="获取Agent动态Ingress路由列表")
+async def list_dynamic_agent_ingress_routes(
+    project_id: str = Query(..., description="项目ID"),
+    agent_key: Optional[str] = Query(None, description="Agent唯一标识"),
+    include_deleted: bool = Query(False, description="是否包含已删除记录"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    project_id, _ = await get_project_and_namespace(project_id, current_user, db)
+    return list_agent_ingress_routes(db, project_id, agent_key, include_deleted)
+
+
+@router.post("/agent-ingress-routes", response_model=AgentIngressRouteInfo, status_code=status.HTTP_201_CREATED, summary="创建/更新Agent动态Ingress路由")
+async def create_dynamic_agent_ingress_route(
+    request: AgentIngressRouteCreateRequest,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    conf = get_config().dynamic_ingress
+    if not conf.enabled:
+        raise ValidationError("动态Ingress功能已关闭")
+
+    target_port = int(request.target_port)
+    default_prefix = f"{request.agent_key}-{target_port}"
+    host = _resolve_ingress_host(
+        project_id=project_id,
+        explicit_host=request.host,
+        host_prefix=request.host_prefix,
+        default_prefix=default_prefix
+    )
+    if not host:
+        raise ValidationError("host 不能为空，且未配置 dynamic_ingress.common_domain_suffix")
+    path = _normalize_path(request.path or conf.default_path)
+    ingress_type = request.ingress_type or conf.default_ingress_type
+    path_type = request.path_type or conf.default_path_type
+    service_port = int(request.service_port if request.service_port is not None else conf.default_service_port)
+    tls_enabled = bool(conf.default_tls_enabled if request.tls_enabled is None else request.tls_enabled)
+    tls_secret_name = request.tls_secret_name if request.tls_secret_name is not None else conf.default_tls_secret_name
+    websocket_enabled = bool(conf.default_websocket_enabled if request.websocket_enabled is None else request.websocket_enabled)
+    proxy_body_size = request.proxy_body_size if request.proxy_body_size is not None else conf.default_proxy_body_size
+    proxy_connect_timeout = int(request.proxy_connect_timeout if request.proxy_connect_timeout is not None else conf.default_proxy_connect_timeout)
+    proxy_send_timeout = int(request.proxy_send_timeout if request.proxy_send_timeout is not None else conf.default_proxy_send_timeout)
+    proxy_read_timeout = int(request.proxy_read_timeout if request.proxy_read_timeout is not None else conf.default_proxy_read_timeout)
+    ssl_redirect = bool(conf.default_ssl_redirect if request.ssl_redirect is None else request.ssl_redirect)
+
+    existing = get_agent_ingress_route_by_unique_key(db, project_id, request.agent_key, target_port, host, path)
+    ext_ips_normalized = sorted(list(dict.fromkeys(request.external_ips)))
+    force_recreate = bool(request.force_recreate)
+    if existing and not force_recreate:
+        same_ips = sorted(existing.get("external_ips") or []) == ext_ips_normalized
+        if (
+            same_ips
+            and existing.get("ingress_type") == ingress_type
+            and existing.get("path_type") == path_type
+            and int(existing.get("service_port") or 0) == service_port
+            and bool(existing.get("tls_enabled")) == tls_enabled
+            and (existing.get("tls_secret_name") or "") == (tls_secret_name or "")
+            and bool(existing.get("websocket_enabled")) == websocket_enabled
+            and existing.get("status") == "ready"
+        ):
+            return existing
+
+    ingress_name, service_name = _build_resource_names(project_id, request.agent_key, target_port, host, path)
+    route_id = existing["route_id"] if existing else uuid.uuid4().hex
+    base_route_data = {
+        "route_id": route_id,
+        "project_id": project_id,
+        "namespace": namespace,
+        "agent_key": request.agent_key,
+        "target_port": target_port,
+        "external_ips": ext_ips_normalized,
+        "host": host,
+        "path": path,
+        "ingress_type": ingress_type,
+        "path_type": path_type,
+        "service_port": service_port,
+        "ingress_name": ingress_name,
+        "service_name": service_name,
+        "tls_enabled": tls_enabled,
+        "tls_secret_name": tls_secret_name,
+        "websocket_enabled": websocket_enabled,
+        "owner_service": request.owner_service,
+        "created_by": request.created_by or current_user.get("user_id"),
+        "metadata": request.metadata or {},
+        "status": "creating",
+        "access_url": None,
+        "deleted_at": None,
+    }
+
+    if existing:
+        update_agent_ingress_route(db, route_id, base_route_data)
+        try:
+            get_k8s_service().delete_external_ingress(namespace=namespace, name=existing.get("ingress_name", ingress_name))
+        except Exception as e:
+            logger.warning(f"重建动态路由前删除旧Ingress失败，继续尝试创建: route_id={route_id}, error={e}")
+    else:
+        create_agent_ingress_route(db, base_route_data)
+
+    try:
+        k8s_result = get_k8s_service().create_external_ingress(
+            namespace=namespace,
+            name=ingress_name,
+            external_ips=ext_ips_normalized,
+            external_port=target_port,
+            host=host,
+            path=path,
+            path_type=path_type,
+            ingress_type=ingress_type,
+            service_port=service_port,
+            tls_enabled=tls_enabled,
+            tls_secret_name=tls_secret_name,
+            websocket_enabled=websocket_enabled,
+            proxy_body_size=proxy_body_size,
+            proxy_connect_timeout=proxy_connect_timeout,
+            proxy_send_timeout=proxy_send_timeout,
+            proxy_read_timeout=proxy_read_timeout,
+            ssl_redirect=ssl_redirect,
+        )
+        access_url = k8s_result.get("access_url")
+        update_agent_ingress_route(db, route_id, {
+            "status": "ready",
+            "access_url": access_url,
+            "metadata": {
+                **(request.metadata or {}),
+                "k8s_result": {
+                    "ingress": k8s_result.get("ingress", {}),
+                    "service": k8s_result.get("service", {}),
+                    "endpoints": k8s_result.get("endpoints", {}),
+                }
+            },
+        })
+        return get_agent_ingress_route(db, route_id)
+    except Exception as e:
+        update_agent_ingress_route(db, route_id, {
+            "status": "error",
+            "metadata": {**(request.metadata or {}), "error": str(e)},
+        })
+        raise ValidationError(f"动态路由创建失败: {e}")
+
+
+@router.delete("/agent-ingress-routes/{route_id}", response_model=SuccessResponse, summary="删除Agent动态Ingress路由")
+async def delete_dynamic_agent_ingress_route(
+    route_id: str,
+    project_id: str = Query(..., description="项目ID"),
+    agent_key: Optional[str] = Query(None, description="Agent唯一标识"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    project_id, _ = await get_project_and_namespace(project_id, current_user, db)
+    route = get_agent_ingress_route(db, route_id)
+    if not route:
+        raise NotFoundError("动态Ingress路由", route_id)
+    if route.get("project_id") != project_id:
+        raise ForbiddenError("无权访问该项目下的动态Ingress路由")
+    if agent_key and route.get("agent_key") != agent_key:
+        raise ValidationError(f"路由不属于指定agent: {agent_key}")
+
+    try:
+        get_k8s_service().delete_external_ingress(route["namespace"], route["ingress_name"])
+    except Exception as e:
+        logger.warning(f"删除动态路由对应Ingress失败: route_id={route_id}, error={e}")
+    update_agent_ingress_route(db, route_id, {"status": "deleted", "access_url": None, "deleted_at": datetime.utcnow()})
+    return SuccessResponse(message="动态Ingress路由删除成功", data=get_agent_ingress_route(db, route_id))
 
 
 # ==================== Secret 管理 ====================
@@ -1150,6 +1426,19 @@ async def get_pvc(
 
     k8s = get_k8s_service()
     return k8s.get_pvc(namespace, pvc_name)
+
+
+@router.get("/pvcs/{pvc_name}/usage", summary="检查PVC使用状态")
+async def get_pvc_usage(
+    pvc_name: str,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """检查PVC是否被Pod/Job使用"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    k8s = get_k8s_service()
+    return k8s.check_pvc_in_use(namespace, pvc_name)
 
 
 @router.post("/pvcs", response_model=PVCInfo, status_code=status.HTTP_201_CREATED, summary="创建PVC")

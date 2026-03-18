@@ -105,6 +105,10 @@ class WebAPIServer:
         self.proxy_manager = EnhancedProxyManager(self.agent_manager, agent_api_timeouts)
         # 11188 守护进程 API 读接口快速失败超时（秒）
         self.daemon_read_timeout_sec = int(config.get('daemon_read_timeout_sec', 8))
+        self.agent_ttyd_port = int(config.get('agent_ttyd_port', 11198))
+        self.ttyd_probe_timeout_sec = int(config.get('ttyd_probe_timeout_sec', 3))
+        self.k8s_service_url = (config.get('k8s_service_url') or '').rstrip('/')
+        self.k8s_service_timeout_sec = int(config.get('k8s_service_timeout_sec', 15))
 
         # 11. 注册路由
         self._register_routes()
@@ -119,6 +123,8 @@ class WebAPIServer:
         self.logger.info(f"支持的压缩格式: {', '.join(supported_formats)}")
         self.logger.info(f"Agent API超时配置: {agent_api_timeouts}")
         self.logger.info(f"Daemon API快速失败超时: {self.daemon_read_timeout_sec}s")
+        self.logger.info(f"Agent TTYD端口: {self.agent_ttyd_port}, 探测超时: {self.ttyd_probe_timeout_sec}s")
+        self.logger.info(f"K8S服务地址: {self.k8s_service_url}, 超时: {self.k8s_service_timeout_sec}s")
         self.logger.info(f"代理功能: 已启用")
 
     def _setup_logger(self) -> logging.Logger:
@@ -181,6 +187,33 @@ class WebAPIServer:
             self.logger.warning(f"⚠ {redis_message}，Redis功能将禁用")
 
         self.logger.info("所有启动连接检查完成")
+
+    def _call_k8s_service(self, method: str, path: str, project_id: str,
+                          payload: Optional[Dict] = None,
+                          params: Optional[Dict] = None,
+                          headers: Optional[Dict] = None) -> requests.Response:
+        """调用platform-k8s服务"""
+        if not self.k8s_service_url:
+            raise ValueError("k8s_service_url未配置")
+
+        url = f"{self.k8s_service_url}{path}"
+        merged_params = dict(params or {})
+        merged_params["project_id"] = project_id
+
+        req_headers = {}
+        if headers:
+            req_headers.update(headers)
+        if payload is not None:
+            req_headers.setdefault('Content-Type', 'application/json')
+
+        return requests.request(
+            method=method.upper(),
+            url=url,
+            params=merged_params,
+            json=payload,
+            headers=req_headers,
+            timeout=(5, self.k8s_service_timeout_sec)
+        )
 
     def _register_routes(self):
         """注册路由"""
@@ -1150,6 +1183,181 @@ class WebAPIServer:
                 response.headers[key] = value
             response.status_code = status_code
             return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/ttyd/connection', methods=['GET'])
+        def agent_ttyd_connection(agent_key):
+            """获取 Agent TTYD 连接信息（用于前端终端转发，支持 WebSocket）"""
+            try:
+                agent = self.agent_manager.get_agent(agent_key)
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
+
+                if agent.status != 'online':
+                    return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
+
+                scheme = request.scheme or 'http'
+                ws_scheme = 'wss' if scheme == 'https' else 'ws'
+                ttyd_base = f"{scheme}://{agent.ip_address}:{self.agent_ttyd_port}"
+
+                reachable = False
+                probe_error = None
+                try:
+                    probe = requests.get(
+                        ttyd_base,
+                        timeout=(min(3, self.ttyd_probe_timeout_sec), self.ttyd_probe_timeout_sec),
+                        verify=False
+                    )
+                    reachable = probe.status_code < 500
+                except Exception as e:
+                    probe_error = str(e)
+
+                return jsonify({
+                    'agent_key': agent_key,
+                    'agent_ip': agent.ip_address,
+                    'agent_status': agent.status,
+                    'ttyd_port': self.agent_ttyd_port,
+                    'reachable': reachable,
+                    'probe_error': probe_error,
+                    'http_url': ttyd_base,
+                    'ws_url': f"{ws_scheme}://{agent.ip_address}:{self.agent_ttyd_port}/ws",
+                    'open_path': f"/api/agent/agent/{agent_key}/ttyd/open"
+                })
+            except Exception as e:
+                self.logger.error(f"获取TTYD连接信息失败: {str(e)}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/ttyd/open', methods=['GET'])
+        def open_agent_ttyd(agent_key):
+            """跳转到 Agent TTYD 页面（浏览器将直接与目标节点建立 WS 连接）"""
+            agent = self.agent_manager.get_agent(agent_key)
+            if not agent:
+                return jsonify({'error': f'Agent {agent_key} not found'}), 404
+            if agent.status != 'online':
+                return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
+
+            target = f"http://{agent.ip_address}:{self.agent_ttyd_port}"
+            return redirect(target, code=302)
+
+        @self.app.route('/api/agent/agent/<agent_key>/ingress-routes', methods=['GET'])
+        def list_agent_ingress_routes(agent_key):
+            """列出Agent动态Ingress路由"""
+            try:
+                project_id = request.args.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+
+                agent = self.agent_manager.get_agent(agent_key)
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
+                if agent.project_id != project_id:
+                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
+
+                auth_header = request.headers.get('Authorization')
+                resp = self._call_k8s_service(
+                    method='GET',
+                    path='/api/k8s/agent-ingress-routes',
+                    project_id=project_id,
+                    params={'agent_key': agent_key},
+                    headers={'Authorization': auth_header} if auth_header else None
+                )
+                return jsonify(resp.json()), resp.status_code
+            except requests.RequestException as e:
+                self.logger.error(f"查询动态Ingress路由失败: {e}")
+                return jsonify({'error': f'k8s service unavailable: {e}'}), 502
+            except Exception as e:
+                self.logger.error(f"查询动态Ingress路由失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/ingress-routes', methods=['POST'])
+        def create_agent_ingress_route(agent_key):
+            """创建/更新Agent动态Ingress路由"""
+            try:
+                data = request.get_json() or {}
+                project_id = data.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                agent = self.agent_manager.get_agent(agent_key)
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
+                if agent.project_id != project_id:
+                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
+
+                target_port = int(data.get('target_port', self.agent_manager.daemon_api_port))
+                external_ips = data.get('external_ips') or [agent.ip_address]
+                payload = {
+                    'agent_key': agent_key,
+                    'external_ips': external_ips,
+                    'target_port': target_port,
+                    'host': data.get('host'),
+                    'host_prefix': data.get('host_prefix') or f"{agent_key}-{target_port}",
+                    'path': data.get('path', '/'),
+                    'path_type': data.get('path_type', 'Prefix'),
+                    'ingress_type': data.get('ingress_type'),
+                    'service_port': data.get('service_port'),
+                    'tls_enabled': data.get('tls_enabled'),
+                    'tls_secret_name': data.get('tls_secret_name'),
+                    'websocket_enabled': data.get('websocket_enabled', True),
+                    'proxy_body_size': data.get('proxy_body_size'),
+                    'proxy_connect_timeout': data.get('proxy_connect_timeout'),
+                    'proxy_send_timeout': data.get('proxy_send_timeout'),
+                    'proxy_read_timeout': data.get('proxy_read_timeout'),
+                    'ssl_redirect': data.get('ssl_redirect'),
+                    'owner_service': 'platform-agent',
+                    'created_by': data.get('created_by'),
+                    'force_recreate': bool(data.get('force_recreate', False)),
+                    'metadata': {
+                        **(data.get('metadata') or {}),
+                        'agent_hostname': agent.hostname,
+                        'source_api': '/api/agent/agent/<agent_key>/ingress-routes'
+                    }
+                }
+
+                auth_header = request.headers.get('Authorization')
+                resp = self._call_k8s_service(
+                    method='POST',
+                    path='/api/k8s/agent-ingress-routes',
+                    project_id=project_id,
+                    payload=payload,
+                    headers={'Authorization': auth_header} if auth_header else None
+                )
+                return jsonify(resp.json()), resp.status_code
+            except requests.RequestException as e:
+                self.logger.error(f"创建动态Ingress路由失败: {e}")
+                return jsonify({'error': f'k8s service unavailable: {e}'}), 502
+            except Exception as e:
+                self.logger.error(f"创建动态Ingress路由失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/ingress-routes/<route_id>', methods=['DELETE'])
+        def delete_agent_ingress_route(agent_key, route_id):
+            """删除Agent动态Ingress路由"""
+            try:
+                project_id = request.args.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+
+                agent = self.agent_manager.get_agent(agent_key)
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
+                if agent.project_id != project_id:
+                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
+
+                auth_header = request.headers.get('Authorization')
+                resp = self._call_k8s_service(
+                    method='DELETE',
+                    path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                    project_id=project_id,
+                    params={'agent_key': agent_key},
+                    headers={'Authorization': auth_header} if auth_header else None
+                )
+                return jsonify(resp.json()), resp.status_code
+            except requests.RequestException as e:
+                self.logger.error(f"删除动态Ingress路由失败: {e}")
+                return jsonify({'error': f'k8s service unavailable: {e}'}), 502
+            except Exception as e:
+                self.logger.error(f"删除动态Ingress路由失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
 
         # ===================== 守护进程服务代理路由 =====================
 

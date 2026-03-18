@@ -42,8 +42,11 @@ DEFAULT_CONFIG = {
     'redis_enabled': True,  # 是否启用Redis
     'nacos_url': 'http://localhost:8848',
     'nacos_namespace': 'public',
+    'k8s_service_url': 'http://secflow-platform-k8s:10010',
+    'k8s_service_timeout_sec': 15,
     'agent_api_port': 11187,
     'daemon_api_port': 11188,
+    'agent_ttyd_port': 11198,
     'agent_auth_token': 'default_token_change_me',
     # 11188 守护进程 API 鉴权配置（可与 agent_auth_token 不同）
     'daemon_auth_header': 'X-API-Token',
