@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: secflow-platform-menu-config
+  name: secflow-platform-resource-config
   namespace: secflow-ns
 data:
   config.yaml: |
