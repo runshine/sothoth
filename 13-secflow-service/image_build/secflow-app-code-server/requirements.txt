@@ -7,3 +7,4 @@ pyyaml>=6.0
 kubernetes>=28.0.0
 pymysql>=1.1.0
 cryptography>=41.0.0
+httpx>=0.26.0

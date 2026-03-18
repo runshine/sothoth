@@ -9,7 +9,7 @@ data:
     # 应用配置
     app:
       host: "0.0.0.0"
-      port: 8080
+      port: 10011
       debug: false
     # 数据库配置 (支持 mysql 和 sqlite)
     database:
@@ -124,7 +124,7 @@ data:
       service_id: "secflow-app-secmate-ng"
       service_name: "SecMate-NG管理器"
       host: "0.0.0.0"
-      port: 10004
+      port: 10011
       maturity: "开发中"  # 可选: 已上线、开发中、规划中
       description: "secflow-app-secmate-ng实例管理微服务"
       api_prefix: "/api/secmate-ng"
