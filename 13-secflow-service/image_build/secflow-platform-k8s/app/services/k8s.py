@@ -427,7 +427,7 @@ class KubernetesService:
         """字典转V1Endpoints对象"""
         from kubernetes.client import (
             V1Endpoints, V1ObjectMeta, V1EndpointSubset,
-            V1EndpointAddress, V1EndpointPort
+            V1EndpointAddress, CoreV1EndpointPort
         )
 
         metadata = manifest.get("metadata", {})
@@ -447,7 +447,7 @@ class KubernetesService:
                 for addr in subset.get("addresses", [])
             ]
             ports = [
-                V1EndpointPort(
+                CoreV1EndpointPort(
                     port=p.get("port"),
                     protocol=p.get("protocol", "TCP")
                 )
