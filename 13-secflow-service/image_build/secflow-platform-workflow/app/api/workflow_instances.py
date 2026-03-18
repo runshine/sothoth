@@ -21,11 +21,13 @@ from app.schemas import (
     WorkflowInstanceResponse, WorkflowInstanceListResponse,
     WorkflowNodeCreate, WorkflowNodeUpdate, WorkflowNodeInstanceResponse,
     WorkflowEdgesUpdateRequest, WorkflowInstanceInitializeRequest,
-    LogQueryRequest, PodLogResponse, SuccessResponse
+    LogQueryRequest, PodLogResponse, SuccessResponse,
+    NodeStatusCallbackRequest, NodeStatusCallbackResponse
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
 from app.services import WorkflowEngine
 from app.services.k8s_service_client import get_k8s_service_client
+from app.services.workflow_status_client import get_workflow_status_client
 from app.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -105,19 +107,14 @@ async def initialize_workflow_instance(
         raise ForbiddenError("No permission to initialize this instance")
 
     # 检查状态和强制初始化参数
-    if instance.status == WorkflowStatus.INITIALIZING:
-        raise ValidationError(f"Workflow instance is already initializing, please wait")
-
-    if instance.status == WorkflowStatus.RUNNING:
-        raise ValidationError(f"Cannot initialize running instance, stop it first")
-
+    # 新状态系统：pending/unready/ready
     force = request.force
 
     # 检查是否需要强制初始化
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
+    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         raise ValidationError(f"Cannot initialize instance in status: {instance.status}")
 
-    if instance.status in [WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED] and not force:
+    if instance.status in [WorkflowStatus.UNREADY, WorkflowStatus.READY] and not force:
         raise ValidationError(
             f"Workflow instance already initialized. Use force=True to re-initialize (this will delete existing resources)"
         )
@@ -129,8 +126,8 @@ async def initialize_workflow_instance(
     if not namespace_exists:
         raise InternalError(f"Namespace验证失败: {namespace_error}")
 
-    # 设置状态为正在初始化
-    instance.status = WorkflowStatus.INITIALIZING
+    # 设置状态为unready（初始化中/已初始化但未完全就绪）
+    instance.status = WorkflowStatus.UNREADY
     instance.message = "Initializing workflow instance..."
     db.commit()
 
@@ -157,7 +154,7 @@ async def initialize_workflow_instance(
     init_logs.append(f"节点总数: {len(nodes)}")
 
     # 如果强制初始化，先删除已存在的K8S资源
-    if force and instance.status in [WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
+    if force and instance.status in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         init_logs.append(f"[{datetime.utcnow().isoformat()}] 强制初始化: 删除已存在的K8S资源")
         logger.info(f"Force initialization: deleting existing K8S resources for instance {instance_id}")
         for node in nodes:
@@ -398,6 +395,32 @@ async def initialize_workflow_instance(
 
                 initialized_nodes.append(node.id)
                 logger.info(f"Initialized node {node.id} with Deployment {deployment_name} and Service {service_name}")
+
+                # 记录节点到workflow-status服务
+                config = get_config()
+                if config.workflow_status_service and config.workflow_status_service.enabled:
+                    status_client = get_workflow_status_client()
+                    try:
+                        # 记录节点初始状态
+                        await status_client.record_node(
+                            node_id=node.node_id,
+                            instance_id=str(instance.id),
+                            project_id=instance.project_id,
+                            node_type="app",
+                            k8s_resource_name=deployment_name,
+                            k8s_resource_type="Deployment",
+                            initial_status=node.status.value if hasattr(node.status, 'value') else str(node.status),
+                            init_logs=None
+                        )
+                        # 保存初始化日志到状态服务
+                        node_init_logs = f"节点 {node.node_id} 初始化:\n"
+                        node_init_logs += f"  Deployment: {deployment_name}\n"
+                        node_init_logs += f"  Service: {service_name}\n"
+                        node_init_logs += f"  状态: {node.status.value if hasattr(node.status, 'value') else str(node.status)}\n"
+                        await status_client.save_init_logs(node_id=node.node_id, logs=node_init_logs)
+                        logger.info(f"节点 {node.node_id} 已记录到workflow-status服务")
+                    except Exception as status_error:
+                        logger.warning(f"记录节点到workflow-status服务失败: {status_error}")
             else:
                 # Service创建失败，删除已创建的Deployment，上报初始化失败
                 error_msg = f"Failed to create Service {service_name}: {error_msg}"
@@ -424,31 +447,48 @@ async def initialize_workflow_instance(
 
     db.commit()
 
-    # 更新工作流状态
+    # 更新工作流状态（根据APP节点状态计算）
     init_logs.append(f"[{datetime.utcnow().isoformat()}] 初始化完成")
+
+    # 获取所有APP节点用于计算工作流状态
+    app_nodes = [n for n in nodes if n.node_type == NodeType.APP]
+
     if errors and not initialized_nodes:
-        # 所有节点初始化都失败
-        instance.status = WorkflowStatus.FAILED
+        # 所有节点初始化都失败 - 仍为unready状态
+        instance.status = WorkflowStatus.UNREADY
         instance.message = f"Initialization failed: {'; '.join(errors)}"
         init_logs.append(f"结果: 全部失败 - {'; '.join(errors)}")
         logger.error(f"Workflow {instance_id} initialization failed: {errors}")
-    elif errors:
-        # 部分节点初始化失败，但仍有成功的节点
-        instance.status = WorkflowStatus.INITIALIZED
-        instance.message = f"Initialization completed with errors: {'; '.join(errors)}"
-        init_logs.append(f"结果: 部分成功 - 成功 {len(initialized_nodes)} 个, 失败 {len(errors)} 个")
-        logger.warning(f"Workflow {instance_id} initialized with errors: {errors}")
-    elif initialized_nodes:
-        # 全部成功
-        instance.status = WorkflowStatus.INITIALIZED
-        action = "re-initialized" if force else "initialized"
-        instance.message = f"Successfully {action} {len(initialized_nodes)} app nodes"
-        init_logs.append(f"结果: 全部成功 - {len(initialized_nodes)} 个节点")
-    else:
-        # 没有需要初始化的节点
+    elif not app_nodes:
+        # 没有APP节点
         instance.status = WorkflowStatus.PENDING
         instance.message = "No app nodes to initialize"
-        init_logs.append(f"结果: 无需初始化的节点")
+        init_logs.append(f"结果: 无APP节点")
+    else:
+        # 根据APP节点状态计算工作流状态
+        ready_count = sum(1 for n in app_nodes if n.status == NodeStatus.READY)
+        pending_count = sum(1 for n in app_nodes if n.status == NodeStatus.PENDING)
+
+        if ready_count == len(app_nodes):
+            # 所有APP节点都ready
+            instance.status = WorkflowStatus.READY
+            instance.message = f"All {len(app_nodes)} APP nodes are ready"
+            init_logs.append(f"结果: 全部就绪 - {len(app_nodes)} 个APP节点")
+        elif pending_count == len(app_nodes):
+            # 所有APP节点都pending
+            instance.status = WorkflowStatus.PENDING
+            instance.message = f"All {len(app_nodes)} APP nodes are pending"
+            init_logs.append(f"结果: 全部等待 - {len(app_nodes)} 个APP节点")
+        else:
+            # 部分就绪或部分失败
+            instance.status = WorkflowStatus.UNREADY
+            if errors:
+                instance.message = f"Initialization completed with errors: {'; '.join(errors)}"
+                init_logs.append(f"结果: 部分成功 - 成功 {len(initialized_nodes)} 个, 失败 {len(errors)} 个")
+            else:
+                instance.message = f"APP nodes: {ready_count} ready, {pending_count} pending"
+                init_logs.append(f"结果: 初始化完成 - {ready_count} 就绪, {pending_count} 等待")
+            logger.info(f"Workflow {instance_id} status: UNREADY")
 
     # 保存初始化日志
     instance.init_logs = "\n".join(init_logs)
@@ -865,8 +905,8 @@ async def update_workflow_instance(
     if instance_data.edges is not None and instance.status != WorkflowStatus.PENDING:
         raise ValidationError(f"Cannot update edges in status: {instance.status}. Only pending state allows modification.")
 
-    # 其他字段可以在 pending, initialized, stopped 状态下修改
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
+    # 其他字段可以在 pending, unready, ready 状态下修改
+    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         raise ValidationError(f"Cannot update instance in status: {instance.status}")
 
     # Update fields
@@ -927,8 +967,12 @@ async def start_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to start this instance")
 
-    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
-        raise ValidationError(f"Cannot start instance in status: {instance.status}. Valid states: pending, initialized, stopped")
+    if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.UNREADY, WorkflowStatus.READY]:
+        raise ValidationError(f"Cannot start instance in status: {instance.status}. Valid states: pending, unready, ready")
+
+    # 如果是从ready状态启动（重新执行），重置 JOB 节点状态
+    # 注：新状态系统下不再有STOPPED状态，READY状态可以重新执行
+        await _reset_job_nodes_for_retrigger(instance_id, instance.project_id)
 
     # Update run count and last run time
     instance.run_count += 1
@@ -939,12 +983,15 @@ async def start_workflow_instance(
     # 使用WorkflowEngine来执行工作流（自动选择K8S客户端模式）
     try:
         from app.models import get_session_factory
-        
+
         # 为后台任务创建独立的 Session
         bg_session = get_session_factory()()
-        
+
         engine = WorkflowEngine(instance_id, bg_session)
         await engine.initialize()
+
+        # 将节点记录到状态服务
+        await engine._record_nodes_to_status_service()
 
         # 验证namespace
         namespace_exists, namespace_error = engine.k8s_client.ensure_namespace(instance.project_id)
@@ -958,7 +1005,7 @@ async def start_workflow_instance(
                 await engine.execute_workflow()
             finally:
                 bg_session.close()
-        
+
         asyncio.create_task(run_workflow_with_session())
 
         logger.info(f"Started workflow instance {instance_id}")
@@ -1190,8 +1237,8 @@ async def stop_workflow_instance(
     Stop workflow instance
 
     - Stops all running K8S resources
-    - Can be called from INITIALIZED or RUNNING state
-    - Sets status to STOPPED
+    - Can be called from UNREADY or READY state
+    - Sets status to PENDING (resources deleted)
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -1202,8 +1249,8 @@ async def stop_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to stop this instance")
 
-    if instance.status not in [WorkflowStatus.INITIALIZED, WorkflowStatus.RUNNING]:
-        raise ValidationError(f"Cannot stop instance in status: {instance.status}. Valid states: initialized, running")
+    if instance.status not in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
+        raise ValidationError(f"Cannot stop instance in status: {instance.status}. Valid states: unready, ready")
 
     # 获取K8S客户端（自动选择模式）
     config = get_config()
@@ -1231,14 +1278,15 @@ async def stop_workflow_instance(
                 elif node.k8s_resource_type == "Job":
                     k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
 
-                node.status = NodeStatus.STOPPED
+                node.status = NodeStatus.PENDING
                 from datetime import datetime
                 node.finished_at = datetime.utcnow()
             except Exception as e:
                 logger.error(f"Failed to stop node {node.id}: {e}")
                 node.message = str(e)
 
-    instance.status = WorkflowStatus.STOPPED
+    # 停止后状态设为PENDING（资源已删除）
+    instance.status = WorkflowStatus.PENDING
     db.commit()
     db.refresh(instance)
 
@@ -1261,7 +1309,7 @@ async def uninitialize_workflow_instance(
     - 将工作流状态重置为 PENDING
 
     前置条件:
-    - 状态为 INITIALIZED、RUNNING、STOPPED、FAILED 或 SUCCEEDED
+    - 状态为 UNREADY 或 READY
 
     用途:
     - 完全重置工作流到初始状态
@@ -1276,18 +1324,15 @@ async def uninitialize_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to uninitialize this instance")
 
-    # 检查状态 - 只能在已初始化或之后的状态下反初始化
+    # 检查状态 - 只能在已初始化的状态下反初始化
     valid_states = [
-        WorkflowStatus.INITIALIZED,
-        WorkflowStatus.RUNNING,
-        WorkflowStatus.STOPPED,
-        WorkflowStatus.FAILED,
-        WorkflowStatus.SUCCEEDED
+        WorkflowStatus.UNREADY,
+        WorkflowStatus.READY
     ]
     if instance.status not in valid_states:
         raise ValidationError(
             f"Cannot uninitialize instance in status: {instance.status}. "
-            f"Valid states: initialized, running, stopped, failed, succeeded"
+            f"Valid states: unready, ready"
         )
 
     k8s_client = get_k8s_client()
@@ -1406,8 +1451,8 @@ async def delete_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to delete this instance")
 
-    # Delete K8S resources if initialized or running
-    if instance.status in [WorkflowStatus.INITIALIZED, WorkflowStatus.RUNNING]:
+    # Delete K8S resources if initialized (unready or ready)
+    if instance.status in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         k8s_client = get_k8s_client()
         nodes = db.query(WorkflowNodeInstance).filter(
             WorkflowNodeInstance.instance_id == instance_id
@@ -1560,6 +1605,21 @@ async def get_node_init_logs(
 
 # ============ Trigger Endpoints ============
 
+async def _reset_job_nodes_for_retrigger(instance_id: str, project_id: str):
+    """重新触发工作流时重置 JOB 节点状态"""
+    status_client = get_workflow_status_client()
+
+    try:
+        result = await status_client.reset_job_nodes(
+            instance_id=instance_id,
+            project_id=project_id,
+            reset_logs=False  # 保留日志
+        )
+        logger.info(f"重置 JOB 节点状态: instance_id={instance_id}, reset_count={result.get('reset_count', 0)}")
+    except Exception as e:
+        logger.warning(f"重置 JOB 节点状态失败: {e}")
+
+
 @router.post("/trigger/{instance_id}", response_model=SuccessResponse)
 async def trigger_workflow_by_http(
     instance_id: str,
@@ -1571,7 +1631,7 @@ async def trigger_workflow_by_http(
     - For persistent mode workflows with HTTP trigger enabled
     - Can be called without authentication (internal use)
     - Returns immediately, workflow runs asynchronously
-    - Valid states: initialized (can trigger), running (reject - already running), stopped (need to start first)
+    - Valid states: unready (can trigger), ready (can trigger), pending (reject - not initialized)
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -1589,21 +1649,27 @@ async def trigger_workflow_by_http(
         raise ValidationError(f"Workflow instance {instance_id} is not configured for HTTP trigger")
 
     # Check if workflow can be triggered
-    # Valid states: initialized (can trigger), stopped (can trigger)
-    if instance.status == WorkflowStatus.RUNNING:
-        raise ValidationError(f"Workflow instance {instance_id} is already running")
+    # Valid states: unready (can trigger), ready (can trigger)
     if instance.status == WorkflowStatus.PENDING:
         raise ValidationError(f"Workflow instance {instance_id} is not initialized. Call initialize first.")
+    if instance.status == WorkflowStatus.PENDING:
+        raise ValidationError(f"Workflow instance {instance_id} is not initialized. Call initialize first.")
+
+    # 重置 JOB 节点状态（用于重新触发场景）
+    await _reset_job_nodes_for_retrigger(instance_id, instance.project_id)
 
     # Start workflow
     try:
         from app.models import get_session_factory
-        
+
         # 为后台任务创建独立的 Session
         bg_session = get_session_factory()()
-        
+
         engine = WorkflowEngine(instance_id, bg_session)
         await engine.initialize()
+
+        # 将节点记录到状态服务
+        await engine._record_nodes_to_status_service()
 
         # Verify namespace exists
         namespace_exists, namespace_error = engine.k8s_client.ensure_namespace(instance.project_id)
@@ -1622,7 +1688,7 @@ async def trigger_workflow_by_http(
                 await engine.execute_workflow()
             finally:
                 bg_session.close()
-        
+
         asyncio.create_task(run_workflow_with_session())
 
         logger.info(f"Triggered workflow instance {instance_id} via HTTP trigger")
@@ -1661,8 +1727,8 @@ async def activate_workflow_instance(
     if instance.run_mode != "persistent":
         raise ValidationError("Only persistent mode workflow can be activated")
 
-    # Workflow must be initialized or stopped to be activated
-    if instance.status not in [WorkflowStatus.INITIALIZED, WorkflowStatus.STOPPED]:
+    # Workflow must be unready or ready to be activated
+    if instance.status not in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         raise ValidationError(f"Cannot activate instance in status: {instance.status}. Initialize first.")
 
     instance.is_active = True
@@ -2200,3 +2266,101 @@ async def update_workflow_edge(
 
     logger.info(f"Updated workflow edges in instance {instance_id}, action: {action}")
     return build_instance_response(instance, db)
+
+
+# ============ Callback API (for workflow-status service) ============
+
+# 状态映射：workflow-status 状态 -> workflow NodeStatus
+STATUS_MAPPING = {
+    "pending": NodeStatus.PENDING,
+    "Pending": NodeStatus.PENDING,
+    "not_ready": NodeStatus.NOT_READY,
+    "Not_ready": NodeStatus.NOT_READY,
+    "ready": NodeStatus.READY,
+    "Ready": NodeStatus.READY,
+    "running": NodeStatus.RUNNING,
+    "Running": NodeStatus.RUNNING,
+    "succeeded": NodeStatus.SUCCEEDED,
+    "Succeeded": NodeStatus.SUCCEEDED,
+    "failed": NodeStatus.FAILED,
+    "Failed": NodeStatus.FAILED,
+    "stopped": NodeStatus.STOPPED,
+    "Stopped": NodeStatus.STOPPED,
+}
+
+
+@router.post("/callback/status", response_model=NodeStatusCallbackResponse, summary="接收节点状态回调")
+async def receive_node_status_callback(
+    request: NodeStatusCallbackRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    接收来自 workflow-status 服务的节点状态回调
+
+    workflow-status 服务在从 K8S 同步到节点状态变化后，通过此接口通知 workflow 服务更新本地数据库。
+
+    此接口设计为幂等：相同状态的重复调用不会产生副作用。
+    """
+    # 查询节点实例
+    node = db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.id == request.node_id
+    ).first()
+
+    if not node:
+        logger.warning(f"Callback received for non-existent node: {request.node_id}")
+        raise NotFoundError("Workflow node instance", request.node_id)
+
+    # 验证 instance_id 匹配
+    if node.instance_id != request.instance_id:
+        logger.warning(
+            f"Callback instance_id mismatch: node {request.node_id} "
+            f"belongs to {node.instance_id}, but callback says {request.instance_id}"
+        )
+        raise ValidationError(f"instance_id mismatch: node belongs to {node.instance_id}")
+
+    # 映射状态
+    new_status = STATUS_MAPPING.get(request.status)
+    if not new_status:
+        logger.warning(f"Unknown status in callback: {request.status}")
+        raise ValidationError(f"Unknown status: {request.status}")
+
+    # 幂等性检查：如果状态相同，直接返回成功
+    if node.status == new_status:
+        logger.debug(f"Node {request.node_id} already in status {new_status}, skipping update")
+        return NodeStatusCallbackResponse(
+            success=True,
+            node_id=request.node_id,
+            status=node.status,
+            message="Status unchanged (idempotent)"
+        )
+
+    # 记录旧状态
+    old_status = node.status
+
+    # 更新节点状态
+    node.status = new_status
+
+    # 更新时间字段
+    if request.started_at:
+        node.started_at = request.started_at
+    if request.finished_at:
+        node.finished_at = request.finished_at
+
+    # 更新消息
+    if request.message:
+        node.message = request.message
+
+    db.commit()
+    db.refresh(node)
+
+    logger.info(
+        f"Node status updated via callback: {request.node_id} "
+        f"{old_status} -> {new_status}"
+    )
+
+    return NodeStatusCallbackResponse(
+        success=True,
+        node_id=request.node_id,
+        status=node.status,
+        message=f"Status updated from {old_status} to {new_status}"
+    )

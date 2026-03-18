@@ -782,3 +782,27 @@ class AppWorkflowListResponse(BaseModel):
     """单应用工作流列表响应"""
     total: int
     items: List[AppWorkflowResponse]
+
+
+# ============ Callback Schemas (for workflow-status service) ============
+
+class NodeStatusCallbackRequest(BaseModel):
+    """节点状态回调请求
+
+    用于接收来自 workflow-status 服务的节点状态更新回调。
+    workflow-status 在从 K8S 同步到节点状态变化后，通过此接口通知 workflow 服务。
+    """
+    node_id: str = Field(..., description="节点ID")
+    instance_id: str = Field(..., description="工作流实例ID")
+    status: str = Field(..., description="新状态: Pending/Not_ready/Ready/Running/Succeeded/Failed/Stopped")
+    message: Optional[str] = Field(None, description="状态消息")
+    started_at: Optional[datetime] = Field(None, description="开始时间")
+    finished_at: Optional[datetime] = Field(None, description="结束时间")
+
+
+class NodeStatusCallbackResponse(BaseModel):
+    """节点状态回调响应"""
+    success: bool
+    node_id: str
+    status: str
+    message: Optional[str] = None

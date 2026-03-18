@@ -91,6 +91,19 @@ class K8SServiceConfig(BaseModel):
         return f"{self.scheme}://{self.host}:{self.port}/api/k8s"
 
 
+class WorkflowStatusServiceConfig(BaseModel):
+    """Workflow Status微服务配置"""
+    enabled: bool = True  # 是否启用Workflow Status微服务调用模式
+    host: str = "localhost"
+    port: int = 10007
+    timeout: int = 30
+
+    @property
+    def base_url(self) -> str:
+        """Generate Workflow Status service base URL"""
+        return f"http://{self.host}:{self.port}/api/workflow-status"
+
+
 class AppConfig(BaseModel):
     """Application configuration"""
     host: str = "0.0.0.0"
@@ -110,6 +123,7 @@ class Config(BaseModel):
     auth_service: AuthServiceConfig
     registry: RegistryConfig
     k8s_service: K8SServiceConfig = K8SServiceConfig()  # K8S微服务配置
+    workflow_status_service: WorkflowStatusServiceConfig = WorkflowStatusServiceConfig()  # Workflow Status微服务配置
     app: AppConfig
     logging: LoggingConfig = LoggingConfig()
 
