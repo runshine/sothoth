@@ -45,5 +45,11 @@ data:
       "lock_timeout": 30,
       "max_task_logs": 10000,
       "task_log_retention_days": 30,
+      "agent_api_timeouts": {
+        "deploy_start": [10, 1200],
+        "deploy_stop": [10, 180],
+        "undeploy": [10, 300],
+        "file_upload": [10, 900]
+      },
       "external_agent_ips": ["172.31.30.100"]
     }

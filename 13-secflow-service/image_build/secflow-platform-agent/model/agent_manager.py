@@ -69,7 +69,7 @@ class AgentManager:
             'default': (10, 30),
             'health_check': (5, 10),
             'deploy_create': (10, 60),
-            'deploy_start': (10, 300),
+            'deploy_start': (10, 900),
             'deploy_stop': (10, 120),
             'deploy_delete': (10, 60),
             'undeploy': (10, 180),
