@@ -30,7 +30,7 @@ project_service:
 
 # 服务注册配置
 registry:
-  enabled: false
+  enabled: true
   menu_service_url: "http://secflow-platform-menu:80"
   service_id: "secflow-user"
   service_name: "用户服务"
