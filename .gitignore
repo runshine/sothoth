@@ -8,6 +8,9 @@ openvpn_service/docker/vpn-status/openvpn
 # Python
 *.pyc
 __pycache__/
+*.bak
+*.db
+config.mysql.json
 
 # IDE
 .claude/
@@ -19,4 +22,3 @@ node_modules/
 .mcp.json
 package-lock.json
 package.json
-
