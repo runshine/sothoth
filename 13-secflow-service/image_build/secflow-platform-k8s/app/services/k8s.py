@@ -916,7 +916,7 @@ class KubernetesService:
         from kubernetes.client import (
             V1Ingress, V1ObjectMeta, V1IngressSpec, V1IngressTLS,
             V1IngressRule, V1HTTPIngressRuleValue, V1HTTPIngressPath,
-            V1IngressBackend, V1ServiceBackendPort
+            V1IngressBackend, V1ServiceBackendPort, V1IngressServiceBackend
         )
 
         metadata = manifest.get("metadata", {})
@@ -949,7 +949,7 @@ class KubernetesService:
                     number=port.get("number"),
                     name=port.get("name"),
                 )
-                v1_service = kubernetes.client.V1ServiceBackend(
+                v1_service = V1IngressServiceBackend(
                     name=service.get("name"),
                     port=v1_port,
                 )
