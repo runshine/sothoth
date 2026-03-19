@@ -7,11 +7,14 @@ import base64
 import hashlib
 import uuid
 import requests
+import websocket as ws_client
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import io
 import zipfile
 from urllib.parse import quote, urlencode
+from simple_websocket import Server
+from simple_websocket.errors import ConnectionClosed
 
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
@@ -250,6 +253,22 @@ class WebAPIServer:
             headers=req_headers,
             timeout=(5, self.k8s_service_timeout_sec)
         )
+
+    def _resolve_request_ws_scheme(self) -> str:
+        """根据请求上下文推断前端应使用的WS协议。"""
+        forwarded_proto = (request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
+        if forwarded_proto == 'https':
+            return 'wss'
+        if forwarded_proto == 'http':
+            return 'ws'
+        return 'wss' if (request.scheme or 'http').lower() == 'https' else 'ws'
+
+    def _resolve_request_host(self) -> str:
+        """优先使用反向代理头里的Host。"""
+        forwarded_host = (request.headers.get('X-Forwarded-Host') or '').split(',')[0].strip()
+        if forwarded_host:
+            return forwarded_host
+        return request.host
 
     def _normalize_service_ports(self, ports: Any) -> Dict[str, str]:
         if isinstance(ports, dict):
@@ -1895,6 +1914,7 @@ class WebAPIServer:
                 project_id = request.args.get('project_id')
                 container_name = request.args.get('container', '')
                 shell = request.args.get('shell', '/bin/sh')
+                mode = request.args.get('mode', 'shell')
                 user = request.args.get('user', '')
 
                 agent = self.agent_manager.get_agent(agent_key)
@@ -1907,53 +1927,19 @@ class WebAPIServer:
                 if agent.status != 'online':
                     return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
 
-                # 优先使用已创建的11197动态Ingress（支持HTTPS/WSS）
-                ingress_ws_url = None
-                ingress_http_url = None
-                ingress_route = None
-                if project_id:
-                    try:
-                        auth_header = request.headers.get('Authorization')
-                        resp = self._call_k8s_service(
-                            method='GET',
-                            path='/api/k8s/agent-ingress-routes',
-                            project_id=project_id,
-                            params={'agent_key': agent_key},
-                            headers={'Authorization': auth_header} if auth_header else None
-                        )
-                        if resp.ok:
-                            route_items = (resp.json() or {}).get('items') or []
-                            for item in route_items:
-                                if int(item.get('target_port') or 0) == self.agent_manager.agent_api_port:
-                                    ingress_route = item
-                                    host = (item.get('host') or '').strip()
-                                    path = (item.get('path') or '/').rstrip('/')
-                                    if host:
-                                        qs = {
-                                            'token': self.agent_manager.agent_auth_token,
-                                            'container': container_name,
-                                            'shell': shell
-                                        }
-                                        if user:
-                                            qs['user'] = user
-                                        query = urlencode(qs)
-                                        scheme = 'wss' if bool(item.get('tls_enabled', True)) else 'ws'
-                                        ingress_ws_url = f"{scheme}://{host}{path}/api/services/{quote(service_name, safe='')}/exec/ws?{query}"
-                                        ingress_http_url = f"{'https' if scheme == 'wss' else 'http'}://{host}{path}"
-                                    break
-                    except Exception as ingress_err:
-                        self.logger.warning(f"获取11197动态Ingress失败: {ingress_err}")
-
-                # 回退直连（HTTP场景可用；HTTPS页面可能被浏览器拦截ws://mixed content）
-                qs = {
-                    'token': self.agent_manager.agent_auth_token,
+                tunnel_query = {
+                    'project_id': project_id or '',
                     'container': container_name,
-                    'shell': shell
+                    'shell': shell,
+                    'mode': mode
                 }
                 if user:
-                    qs['user'] = user
-                query = urlencode(qs)
-                direct_ws_url = f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}/api/services/{quote(service_name, safe='')}/exec/ws?{query}"
+                    tunnel_query['user'] = user
+
+                ws_scheme = self._resolve_request_ws_scheme()
+                host = self._resolve_request_host()
+                tunnel_path = f"/api/agent/agent/{quote(agent_key, safe='')}/services/{quote(service_name, safe='')}/exec/ws-tunnel"
+                ws_url = f"{ws_scheme}://{host}{tunnel_path}?{urlencode(tunnel_query)}"
 
                 return jsonify({
                     'agent_key': agent_key,
@@ -1963,18 +1949,112 @@ class WebAPIServer:
                     'project_id': project_id,
                     'container': container_name,
                     'shell': shell,
+                    'mode': mode,
                     'user': user,
-                    'ws_url': ingress_ws_url or direct_ws_url,
-                    'direct_ws_url': direct_ws_url,
-                    'ingress_ws_url': ingress_ws_url,
-                    'ingress_http_url': ingress_http_url,
-                    'ingress_route': ingress_route,
+                    'ws_url': ws_url,
+                    'direct_ws_url': None,
+                    'ingress_ws_url': None,
+                    'ingress_http_url': None,
+                    'ingress_route': None,
                     'rest_exec_url': f"/api/agent/agent/{agent_key}/services/{quote(service_name, safe='')}/exec",
-                    'note': 'HTTPS页面建议使用wss ingress地址；若返回ws://直连，浏览器可能因mixed content拒绝连接。'
+                    'note': '终端连接使用平台内置WS中转通道（browser -> platform-agent -> agent），支持HTTP/HTTPS。'
                 })
             except Exception as e:
                 self.logger.error(f"获取服务Exec WS连接信息失败: {str(e)}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/exec/ws-tunnel', methods=['GET'])
+        def agent_service_exec_ws_tunnel(agent_key, service_name):
+            """服务终端WebSocket中转：browser <-> platform-agent <-> agent"""
+            ws = None
+            upstream = None
+            try:
+                project_id = request.args.get('project_id')
+                container_name = request.args.get('container', '')
+                shell = request.args.get('shell', '/bin/sh')
+                mode = request.args.get('mode', 'shell')
+                user = request.args.get('user', '')
+
+                agent = self.agent_manager.get_agent(agent_key)
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
+                if project_id and agent.project_id != project_id:
+                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
+                if agent.status != 'online':
+                    return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
+
+                ws = Server.accept(request.environ)
+
+                query = {
+                    'token': self.agent_manager.agent_auth_token,
+                    'container': container_name,
+                    'shell': shell,
+                    'mode': mode
+                }
+                if user:
+                    query['user'] = user
+                upstream_ws_url = (
+                    f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}"
+                    f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(query)}"
+                )
+
+                upstream = ws_client.create_connection(
+                    upstream_ws_url,
+                    timeout=15,
+                    enable_multithread=True
+                )
+
+                stop_event = threading.Event()
+
+                def _upstream_to_client():
+                    try:
+                        while not stop_event.is_set():
+                            data = upstream.recv()
+                            if data is None:
+                                break
+                            ws.send(data)
+                    except Exception as e:
+                        if not stop_event.is_set():
+                            self.logger.info(f"终端中转上行关闭: agent={agent_key}, service={service_name}, err={e}")
+                    finally:
+                        stop_event.set()
+
+                t = threading.Thread(target=_upstream_to_client, daemon=True)
+                t.start()
+
+                while not stop_event.is_set():
+                    try:
+                        message = ws.receive()
+                        if message is None:
+                            break
+                        upstream.send(message)
+                    except ConnectionClosed:
+                        break
+                    except Exception as e:
+                        self.logger.info(f"终端中转下行关闭: agent={agent_key}, service={service_name}, err={e}")
+                        break
+                stop_event.set()
+                return ''
+            except Exception as e:
+                self.logger.error(f"终端中转失败: agent={agent_key}, service={service_name}, err={e}", exc_info=True)
+                if ws is None:
+                    return jsonify({'error': f'终端中转失败: {str(e)}'}), 500
+                try:
+                    ws.send(f"\r\n[ERROR] terminal tunnel failed: {str(e)}\r\n")
+                except Exception:
+                    pass
+                return ''
+            finally:
+                try:
+                    if upstream is not None:
+                        upstream.close()
+                except Exception:
+                    pass
+                try:
+                    if ws is not None:
+                        ws.close()
+                except Exception:
+                    pass
 
         @self.app.route('/api/agent/services/global', methods=['GET'])
         def list_global_services():

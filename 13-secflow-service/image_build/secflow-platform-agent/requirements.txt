@@ -12,3 +12,5 @@ werkzeug
 redis
 requests
 DBUtils
+simple-websocket
+websocket-client
