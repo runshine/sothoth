@@ -2209,6 +2209,20 @@ class WebAPIServer:
                 )
 
                 stop_event = threading.Event()
+                close_lock = threading.Lock()
+
+                def _close_both():
+                    with close_lock:
+                        try:
+                            if upstream is not None:
+                                upstream.close()
+                        except Exception:
+                            pass
+                        try:
+                            if ws is not None:
+                                ws.close()
+                        except Exception:
+                            pass
 
                 def _upstream_to_client():
                     try:
@@ -2216,28 +2230,47 @@ class WebAPIServer:
                             data = upstream.recv()
                             if data is None:
                                 break
+                            if data == '':
+                                # 忽略上游空帧，避免浏览器侧被无意义空消息触发异常状态。
+                                continue
                             ws.send(data)
                     except Exception as e:
                         if not stop_event.is_set():
                             self.logger.info(f"终端中转上行关闭: agent={agent_key}, service={service_name}, err={e}")
                     finally:
                         stop_event.set()
+                        _close_both()
 
-                t = threading.Thread(target=_upstream_to_client, daemon=True)
-                t.start()
+                def _client_to_upstream():
+                    try:
+                        while not stop_event.is_set():
+                            try:
+                                message = ws.receive()
+                            except ConnectionClosed:
+                                break
+
+                            if message is None:
+                                break
+                            if message == '':
+                                # 浏览器/代理偶尔会透传空帧或保活帧，不应把它转发给上游 shell。
+                                continue
+                            upstream.send(message)
+                    except Exception as e:
+                        if not stop_event.is_set():
+                            self.logger.info(f"终端中转下行关闭: agent={agent_key}, service={service_name}, err={e}")
+                    finally:
+                        stop_event.set()
+                        _close_both()
+
+                t_up = threading.Thread(target=_upstream_to_client, daemon=True)
+                t_down = threading.Thread(target=_client_to_upstream, daemon=True)
+                t_up.start()
+                t_down.start()
 
                 while not stop_event.is_set():
-                    try:
-                        message = ws.receive()
-                        if message is None:
-                            break
-                        upstream.send(message)
-                    except ConnectionClosed:
-                        break
-                    except Exception as e:
-                        self.logger.info(f"终端中转下行关闭: agent={agent_key}, service={service_name}, err={e}")
-                        break
+                    time.sleep(0.05)
                 stop_event.set()
+                _close_both()
                 return ''
             except Exception as e:
                 self.logger.error(f"终端中转失败: agent={agent_key}, service={service_name}, err={e}", exc_info=True)
