@@ -2106,7 +2106,64 @@ class WebAPIServer:
                 ws_scheme = self._resolve_request_ws_scheme()
                 host = self._resolve_request_host()
                 tunnel_path = f"/api/agent/agent/{quote(agent_key, safe='')}/services/{quote(service_name, safe='')}/exec/ws-tunnel"
-                ws_url = f"{ws_scheme}://{host}{tunnel_path}?{urlencode(tunnel_query)}"
+                tunnel_ws_url = f"{ws_scheme}://{host}{tunnel_path}?{urlencode(tunnel_query)}"
+
+                direct_query = {
+                    'token': self.agent_manager.agent_auth_token,
+                    'container': container_name,
+                    'shell': shell,
+                    'mode': mode
+                }
+                if user:
+                    direct_query['user'] = user
+
+                direct_ws_url = (
+                    f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}"
+                    f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(direct_query)}"
+                )
+
+                ingress_ws_url = None
+                ingress_http_url = None
+                ingress_route = None
+                auth_header = request.headers.get('Authorization')
+                if project_id:
+                    try:
+                        all_routes = self._list_project_ingress_routes(
+                            project_id=project_id,
+                            include_deleted=False,
+                            auth_header=auth_header
+                        )
+                        for route in all_routes:
+                            if str(route.get('agent_key') or '') != agent_key:
+                                continue
+                            if int(route.get('target_port') or 0) != int(self.agent_manager.agent_api_port):
+                                continue
+                            if str(route.get('status') or '').lower() != 'ready':
+                                continue
+                            if not self._is_agent_console_ingress_route(route):
+                                continue
+
+                            route_host = str(route.get('host') or '').strip()
+                            access_url = str(route.get('access_url') or '').strip()
+                            route_path = str(route.get('path') or '/').strip() or '/'
+                            ingress_route = route
+                            ingress_http_url = access_url or (f"https://{route_host}{route_path}" if route_host else None)
+                            if route_host:
+                                route_ws_scheme = 'wss' if bool(route.get('tls_enabled')) or access_url.startswith('https://') else 'ws'
+                                ingress_ws_url = (
+                                    f"{route_ws_scheme}://{route_host}"
+                                    f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(direct_query)}"
+                                )
+                            break
+                    except Exception as e:
+                        self.logger.warning(f"查询Agent ingress路由失败，回退平台WS中转: agent={agent_key}, err={e}")
+
+                ws_url = ingress_ws_url or tunnel_ws_url
+                note = (
+                    '终端连接优先使用Agent Ingress直连通道（browser -> agent ingress -> agent）。'
+                    if ingress_ws_url else
+                    '终端连接使用平台内置WS中转通道（browser -> platform-agent -> agent），支持HTTP/HTTPS。'
+                )
 
                 return jsonify({
                     'agent_key': agent_key,
@@ -2119,12 +2176,12 @@ class WebAPIServer:
                     'mode': mode,
                     'user': user,
                     'ws_url': ws_url,
-                    'direct_ws_url': None,
-                    'ingress_ws_url': None,
-                    'ingress_http_url': None,
-                    'ingress_route': None,
+                    'direct_ws_url': direct_ws_url,
+                    'ingress_ws_url': ingress_ws_url,
+                    'ingress_http_url': ingress_http_url,
+                    'ingress_route': ingress_route,
                     'rest_exec_url': f"/api/agent/agent/{agent_key}/services/{quote(service_name, safe='')}/exec",
-                    'note': '终端连接使用平台内置WS中转通道（browser -> platform-agent -> agent），支持HTTP/HTTPS。'
+                    'note': note
                 })
             except Exception as e:
                 self.logger.error(f"获取服务Exec WS连接信息失败: {str(e)}", exc_info=True)
