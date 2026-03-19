@@ -459,6 +459,35 @@ class AgentManager:
             self.logger.error(f"获取Nacos服务列表异常: {str(e)}")
             return []
 
+    def _has_healthy_nacos_client_instance(self, service_name: str, expected_ip: str = None) -> bool:
+        """检查服务在 nacos-client 集群下是否仍有健康实例，避免残留 service name 重新带回失效 Agent。"""
+        try:
+            url = f"{self.nacos_url}/nacos/v1/ns/instance/list"
+            params = {
+                'serviceName': service_name,
+                'groupName': 'DEFAULT_GROUP',
+                'namespaceId': self.nacos_namespace,
+                'clusters': 'nacos-client'
+            }
+            response = requests.get(url, params=params, timeout=5, auth=self.nacos_auth)
+            if response.status_code != 200:
+                self.logger.debug(f"检查Nacos健康实例失败: service={service_name}, status={response.status_code}")
+                return False
+
+            payload = response.json() if response.content else {}
+            for host in payload.get('hosts') or []:
+                if expected_ip and str(host.get('ip') or '').strip() != expected_ip:
+                    continue
+                if host.get('healthy') is False:
+                    continue
+                if host.get('enabled') is False:
+                    continue
+                return True
+            return False
+        except Exception as e:
+            self.logger.debug(f"检查Nacos健康实例异常: service={service_name}, err={e}")
+            return False
+
     def _check_secflow_agent_agent_status(self, agent: AgentInfo) -> bool:
         try:
             # 首先检查是否有有效的agent_key
@@ -545,6 +574,10 @@ class AgentManager:
                     if result:
                         project_id, hostname, ip_address = result
 
+                        if not self._has_healthy_nacos_client_instance(service, ip_address):
+                            self.logger.debug(f"跳过无健康实例的agent服务: {service}")
+                            continue
+
                         # 使用新方法获取agent_key，传入service_name
                         agent_key = self._get_agent_key(hostname, ip_address, service)
 
@@ -581,7 +614,7 @@ class AgentManager:
         except Exception as e:
             self.logger.error(f"刷新Agent列表异常: {str(e)}")
 
-    def cleanup_offline_agents(self, project_id: str = None) -> Tuple[bool, str, Dict]:
+    def cleanup_offline_agents(self, project_id: str = None, force: bool = False) -> Tuple[bool, str, Dict]:
         """
         清除指定project下掉线的agent
 
@@ -603,11 +636,19 @@ class AgentManager:
 
                 # 构建查询条件
                 if project_id:
-                    where_clause = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
-                    where_clause_sqlite = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+                    if force:
+                        where_clause = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown')"
+                        where_clause_sqlite = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown')"
+                    else:
+                        where_clause = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                        where_clause_sqlite = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
                 else:
-                    where_clause = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
-                    where_clause_sqlite = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+                    if force:
+                        where_clause = " WHERE status IN ('offline', 'error', 'timeout', 'unknown')"
+                        where_clause_sqlite = " WHERE status IN ('offline', 'error', 'timeout', 'unknown')"
+                    else:
+                        where_clause = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                        where_clause_sqlite = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
 
                 # 查询所有掉线的agent
                 table_name = self.db.get_table_name('agent_status')
@@ -635,7 +676,7 @@ class AgentManager:
                         'timestamp': datetime.now().isoformat()
                     }
 
-                self.logger.info(f"找到 {len(offline_agents)} 个掉线agent需要清理")
+                self.logger.info(f"找到 {len(offline_agents)} 个掉线agent需要清理 force={force}")
 
                 # 记录清理信息
                 cleaned_agents = []
@@ -704,6 +745,7 @@ class AgentManager:
                 cleanup_info = {
                     'cleaned_count': cleaned_count,
                     'offline_count': len(offline_agents),
+                    'force': force,
                     'timestamp': datetime.now().isoformat(),
                     'pod_id': self.pod_id,
                     'cleaned_agents': cleaned_agents,
@@ -718,7 +760,7 @@ class AgentManager:
             self.logger.error(f"清除掉线agent失败: {str(e)}", exc_info=True)
             return False, f"清理失败: {str(e)}", {}
 
-    def get_offline_agents_count(self, project_id: str = None) -> Tuple[int, int]:
+    def get_offline_agents_count(self, project_id: str = None, force: bool = False) -> Tuple[int, int]:
         """
         获取掉线agent的统计信息
 
@@ -731,31 +773,37 @@ class AgentManager:
         try:
             # 构建过滤条件
             table_name = self.db.get_table_name('agent_status')
-            project_filter = ""
             params = []
             if project_id:
-                project_filter = " WHERE project_id = %s"
                 params.append(project_id)
 
             # 获取总agent数
             if self.db.db_type == 'mysql':
+                project_filter = " WHERE project_id = %s" if project_id else ""
                 total_result = self.db.fetch_one(
                     f"SELECT COUNT(*) as count FROM {table_name}{project_filter}",
                     tuple(params) if params else None
                 )
-                offline_filter = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                offline_filter = " WHERE status IN ('offline', 'error', 'timeout', 'unknown')"
+                if project_id:
+                    offline_filter = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown')"
+                if not force:
+                    offline_filter += " AND updated_at < NOW() - INTERVAL 5 MINUTE"
                 offline_result = self.db.fetch_one(
                     f"SELECT COUNT(*) as count FROM {table_name}{offline_filter}",
                     tuple(params) if params else None
                 )
             else:
-                placeholders = "?" * len(params) if params else ""
-                project_filter_sql = f" WHERE project_id = {placeholders}" if project_id else ""
+                project_filter_sql = " WHERE project_id = ?" if project_id else ""
                 total_result = self.db.fetch_one(
                     f"SELECT COUNT(*) as count FROM {table_name}{project_filter_sql}",
                     tuple(params) if params else None
                 )
-                offline_filter_sql = f" WHERE project_id = {placeholders} AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+                offline_filter_sql = " WHERE status IN ('offline', 'error', 'timeout', 'unknown')"
+                if project_id:
+                    offline_filter_sql = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown')"
+                if not force:
+                    offline_filter_sql += " AND updated_at < datetime('now', '-5 minutes')"
                 offline_result = self.db.fetch_one(
                     f"SELECT COUNT(*) as count FROM {table_name}{offline_filter_sql}",
                     tuple(params) if params else None

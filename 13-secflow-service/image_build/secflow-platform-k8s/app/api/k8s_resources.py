@@ -6,6 +6,7 @@ K8S资源管理API路由
 import asyncio
 import hashlib
 import logging
+import secrets
 import threading
 import uuid
 from datetime import datetime
@@ -23,6 +24,7 @@ from app.models.database import (
     create_agent_ingress_route,
     update_agent_ingress_route,
     get_agent_ingress_route,
+    get_agent_ingress_route_by_host_path,
     get_agent_ingress_route_by_unique_key,
     list_agent_ingress_routes,
 )
@@ -90,6 +92,15 @@ def _sanitize_name_fragment(value: str) -> str:
     if not cleaned:
         return "na"
     return cleaned[:40]
+
+
+def _random_suffix(length: int = 6) -> str:
+    return secrets.token_hex(max(1, length // 2))[:length]
+
+
+def _build_secure_default_prefix(base: str) -> str:
+    sanitized = _sanitize_name_fragment(base)
+    return f"{sanitized}-{_random_suffix(6)}"[:40]
 
 
 def _get_common_domain_suffix() -> Optional[str]:
@@ -821,7 +832,7 @@ async def create_dynamic_agent_ingress_route(
         raise ValidationError("动态Ingress功能已关闭")
 
     target_port = int(request.target_port)
-    default_prefix = f"{request.agent_key}-{target_port}"
+    default_prefix = _build_secure_default_prefix(f"{request.agent_key}-{target_port}")
     host = _resolve_ingress_host(
         project_id=project_id,
         explicit_host=request.host,
@@ -858,6 +869,13 @@ async def create_dynamic_agent_ingress_route(
     ssl_redirect = bool(conf.default_ssl_redirect if request.ssl_redirect is None else request.ssl_redirect)
 
     existing = get_agent_ingress_route_by_unique_key(db, project_id, request.agent_key, target_port, host, path)
+    conflicting_route = get_agent_ingress_route_by_host_path(db, project_id, host, path)
+    if conflicting_route and (not existing or conflicting_route.get("route_id") != existing.get("route_id")):
+        conflict_port = conflicting_route.get("target_port")
+        raise ValidationError(
+            f"动态路由冲突: {host}{path} 已绑定到端口 {conflict_port}。"
+            f" 同一 host + path 不能同时转发到多个端口，请改用不同的 host_prefix 或 path。"
+        )
     ext_ips_normalized = sorted(list(dict.fromkeys(request.external_ips)))
     force_recreate = bool(request.force_recreate)
     if existing and not force_recreate:

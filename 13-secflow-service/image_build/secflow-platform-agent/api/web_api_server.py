@@ -5,6 +5,7 @@ import threading
 import time
 import base64
 import hashlib
+import secrets
 import uuid
 from collections import OrderedDict
 import requests
@@ -34,6 +35,12 @@ from model.model import AgentInfo
 
 from flask import send_file, redirect, Response
 # ===================== Flask应用 =====================
+
+
+def _build_random_host_prefix(base: str, suffix_len: int = 6) -> str:
+    sanitized = ''.join(ch if str(ch).isalnum() else '-' for ch in str(base or '').lower()).strip('-') or 'route'
+    random_part = secrets.token_hex(max(1, suffix_len // 2))[:suffix_len]
+    return f"{sanitized[:28]}-{random_part}".strip('-')
 
 class WebAPIServer:
     """WEB API服务器（支持多种压缩格式）"""
@@ -714,7 +721,7 @@ class WebAPIServer:
             'agent_key': agent_key,
             'external_ips': [agent.ip_address],
             'target_port': int(target_port),
-            'host_prefix': f"{agent_key}-{int(target_port)}",
+            'host_prefix': _build_random_host_prefix(f"{agent_key}-{int(target_port)}"),
             'path': '/',
             'path_type': 'Prefix',
             'service_port': int(target_port),
@@ -1281,7 +1288,7 @@ class WebAPIServer:
                 cleanup_k8s_resources = bool(data.get('cleanup_k8s_resources', True))
 
                 # 先获取统计信息（按project过滤）
-                offline_count, total_count = self.agent_manager.get_offline_agents_count(project_id)
+                offline_count, total_count = self.agent_manager.get_offline_agents_count(project_id, force=force)
 
                 if offline_count == 0:
                     return jsonify({
@@ -1305,7 +1312,7 @@ class WebAPIServer:
                     })
 
                 # 执行清理操作（按project过滤）
-                success, message, cleanup_info = self.agent_manager.cleanup_offline_agents(project_id)
+                success, message, cleanup_info = self.agent_manager.cleanup_offline_agents(project_id, force=force)
 
                 if success:
                     k8s_cleanup = {
@@ -2604,6 +2611,10 @@ class WebAPIServer:
 
                 stale_routes: List[Dict[str, Any]] = []
                 for item in routes:
+                    route_status = str(item.get('status') or '').strip().lower()
+                    if route_status == 'error':
+                        stale_routes.append(item)
+                        continue
                     metadata = self._extract_route_metadata(item)
                     assoc_service = str(metadata.get('service_name') or '').strip()
                     if not assoc_service:
@@ -3499,7 +3510,7 @@ class WebAPIServer:
                     'external_ips': external_ips,
                     'target_port': target_port,
                     'host': data.get('host'),
-                    'host_prefix': data.get('host_prefix') or f"{agent_key}-{target_port}",
+                    'host_prefix': data.get('host_prefix') or _build_random_host_prefix(f"{agent_key}-{target_port}"),
                     'path': data.get('path', '/'),
                     'path_type': data.get('path_type', 'Prefix'),
                     'ingress_type': data.get('ingress_type'),

@@ -330,6 +330,34 @@ def get_agent_ingress_route_by_unique_key(
     return _row_to_route_dict(row)
 
 
+def get_agent_ingress_route_by_host_path(
+    db: Session,
+    project_id: str,
+    host: str,
+    path: str,
+) -> Optional[Dict]:
+    """按 host + path 查询现存路由，用于拦截不同端口复用同一路由入口的冲突。"""
+    table_name = get_agent_ingress_route_table_name()
+    sql = text(f"""
+        SELECT *
+        FROM {table_name}
+        WHERE project_id = :project_id
+          AND host = :host
+          AND path = :path
+          AND deleted_at IS NULL
+        ORDER BY updated_at DESC
+        LIMIT 1
+    """)
+    row = db.execute(sql, {
+        "project_id": project_id,
+        "host": host,
+        "path": path,
+    }).fetchone()
+    if not row:
+        return None
+    return _row_to_route_dict(row)
+
+
 def list_agent_ingress_routes(
     db: Session,
     project_id: str,
