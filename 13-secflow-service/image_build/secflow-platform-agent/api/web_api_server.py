@@ -915,6 +915,40 @@ class WebAPIServer:
             # 无法确定时不阻断请求，交由后续流程处理
             return False
 
+    def _probe_agent_exec_ws_capability(self, agent: AgentInfo, service_name: str,
+                                        container_name: str, shell: str, mode: str, user: str) -> Tuple[bool, int, str]:
+        """
+        预探测Agent是否支持服务终端WS接口。
+        - 404: 明确视为上游不支持 /api/services/<name>/exec/ws
+        - 非404: 认为端点存在（可能因非Upgrade请求返回400/426等）
+        """
+        try:
+            query = {
+                'token': self.agent_manager.agent_auth_token,
+                'container': container_name or '',
+                'shell': shell or '/bin/sh',
+                'mode': mode or 'shell'
+            }
+            if user:
+                query['user'] = user
+
+            probe_url = (
+                f"http://{agent.ip_address}:{self.agent_manager.agent_api_port}"
+                f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(query)}"
+            )
+            resp = requests.get(
+                probe_url,
+                headers={'X-Auth-Token': self.agent_manager.agent_auth_token},
+                timeout=(3, 5),
+                allow_redirects=False
+            )
+            if resp.status_code == 404:
+                detail = resp.text or '上游返回404'
+                return False, 404, detail
+            return True, resp.status_code, ''
+        except Exception as e:
+            return False, 500, str(e)
+
     def _check_deploy_duplicate(self, service_name: str, agent_key: str, project_id: str) -> Optional[Dict[str, Any]]:
         """统一部署防重检查：进行中的部署任务 + Agent已存在服务。"""
         active_task = self.task_manager.find_active_task_for_service(
@@ -2030,6 +2064,19 @@ class WebAPIServer:
                         'upstream_status': service_status
                     }), 404
 
+                supported, probe_status, probe_detail = self._probe_agent_exec_ws_capability(
+                    agent, service_name, container_name, shell, mode, user
+                )
+                if not supported:
+                    return jsonify({
+                        'error': '当前Agent未提供服务终端WS接口，无法建立实时终端连接',
+                        'agent_key': agent_key,
+                        'service_name': service_name,
+                        'agent_ip': agent.ip_address,
+                        'upstream_status': probe_status,
+                        'upstream_detail': probe_detail
+                    }), 400
+
                 tunnel_query = {
                     'project_id': project_id or '',
                     'container': container_name,
@@ -2109,6 +2156,19 @@ class WebAPIServer:
                         'service_name': service_name,
                         'upstream_status': service_status
                     }), 404
+
+                supported, probe_status, probe_detail = self._probe_agent_exec_ws_capability(
+                    agent, service_name, container_name, shell, mode, user
+                )
+                if not supported:
+                    return jsonify({
+                        'error': '当前Agent未提供服务终端WS接口，无法建立实时终端连接',
+                        'agent_key': agent_key,
+                        'service_name': service_name,
+                        'agent_ip': agent.ip_address,
+                        'upstream_status': probe_status,
+                        'upstream_detail': probe_detail
+                    }), 400
 
                 ws = Server.accept(request.environ)
 

@@ -66,9 +66,10 @@ RUN set -eux; \
         npm install --unsafe-perm -g @anthropic-ai/claude-code; \
         npm install --unsafe-perm -g code-server; \
         npm install --unsafe-perm -g claude-a2a; \
+        npm install -g @openai/codex ； \
     else \
         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash; \
-        bash -lc ". \"$NVM_DIR/nvm.sh\" && nvm install 20 && nvm alias default 20 && nvm use --silent default && npm install --unsafe-perm -g @anthropic-ai/claude-code && npm install --unsafe-perm -g claude-a2a"; \
+        bash -lc ". \"$NVM_DIR/nvm.sh\" && nvm install 20 && nvm alias default 20 && nvm use --silent default && npm install --unsafe-perm -g @anthropic-ai/claude-code && npm install -g @openai/codex && npm install --unsafe-perm -g claude-a2a"; \
         curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone; \
         echo ". \"$NVM_DIR/nvm.sh\"" >> /root/.bashrc; \
     fi; \

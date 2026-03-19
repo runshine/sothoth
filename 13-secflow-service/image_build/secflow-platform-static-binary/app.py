@@ -9,6 +9,7 @@ import re
 import sys
 import json
 import hashlib
+import threading
 import zipfile
 import tarfile
 import shutil
@@ -105,6 +106,14 @@ for folder in [app.config['UPLOAD_FOLDER'], app.config['STORAGE_FOLDER'], app.co
 
 # 初始化数据库
 db = SQLAlchemy(app)
+
+# 包级并发锁：避免校验与删除同时操作同一软件包
+_package_locks_guard = threading.Lock()
+_package_locks: Dict[str, threading.RLock] = {}
+
+# 定时校验线程控制
+_auto_verify_stop_event = threading.Event()
+_auto_verify_thread: Optional[threading.Thread] = None
 
 # ==================== 数据库模型 ====================
 
@@ -293,44 +302,125 @@ def extract_package(source_path: str, package_id: str, package_info: Dict) -> Tu
     return storage_dir, files_info
 
 
-def check_package_integrity(package: Package) -> Dict[str, any]:
+def _get_package_lock(package_id: str) -> threading.RLock:
+    """获取单个软件包的进程内锁，避免同一包并发删除/校验冲突。"""
+    with _package_locks_guard:
+        lock = _package_locks.get(package_id)
+        if lock is None:
+            lock = threading.RLock()
+            _package_locks[package_id] = lock
+        return lock
+
+
+def _release_package_lock_if_unused(package_id: str) -> None:
+    """尽可能清理已不再使用的锁对象，避免字典无限增长。"""
+    # RLock 不提供可靠的“无持有者”公开判断接口，这里保留为空实现。
+    # 该字典仅按 package_id 增长，数量与历史软件包数量同阶，开销可接受。
+    _ = package_id
+
+
+def check_package_integrity(package_id: str) -> Dict[str, any]:
     """
-    校验软件包完整性
+    校验软件包完整性（并发安全）
     检查文件是否存在和大小是否匹配
     """
-    package.check_status = 'checking'
-    package.last_check_time = datetime.utcnow()  # 更新校验时间
-    db.session.commit()
+    package_lock = _get_package_lock(package_id)
+    with package_lock:
+        package = Package.query.get(package_id)
+        if not package:
+            raise ValueError("软件包不存在")
 
-    missing_files = []
-    size_mismatch_files = []
+        package.check_status = 'checking'
+        package.last_check_time = datetime.utcnow()
+        db.session.commit()
 
-    for file_record in package.files:
-        if not os.path.exists(file_record.storage_path):
-            missing_files.append(file_record.file_path)
-            continue
+        files = PackageFile.query.filter_by(package_id=package_id).all()
+        missing_files = []
+        size_mismatch_files = []
 
-        actual_size = os.path.getsize(file_record.storage_path)
-        if actual_size != file_record.file_size:
-            size_mismatch_files.append({
-                'file': file_record.file_path,
-                'expected': file_record.file_size,
-                'actual': actual_size
-            })
+        for file_record in files:
+            if not os.path.exists(file_record.storage_path):
+                missing_files.append(file_record.file_path)
+                continue
 
-    is_valid = len(missing_files) == 0 and len(size_mismatch_files) == 0
-    package.check_status = 'valid' if is_valid else 'invalid'
-    package.last_check_time = datetime.utcnow()  # 再次更新校验时间，确保是最新的
-    db.session.commit()
+            actual_size = os.path.getsize(file_record.storage_path)
+            if actual_size != file_record.file_size:
+                size_mismatch_files.append({
+                    'file': file_record.file_path,
+                    'expected': file_record.file_size,
+                    'actual': actual_size
+                })
 
-    return {
-        'valid': is_valid,
-        'missing_files': missing_files,
-        'size_mismatch_files': size_mismatch_files,
-        'total_files': package.file_count,
-        'checked_files': package.file_count - len(missing_files),
-        'check_time': package.last_check_time.isoformat()
-    }
+        package = Package.query.get(package_id)
+        if not package:
+            raise ValueError("软件包已被删除")
+
+        is_valid = len(missing_files) == 0 and len(size_mismatch_files) == 0
+        package.check_status = 'valid' if is_valid else 'invalid'
+        package.last_check_time = datetime.utcnow()
+        db.session.commit()
+
+        result = {
+            'valid': is_valid,
+            'missing_files': missing_files,
+            'size_mismatch_files': size_mismatch_files,
+            'total_files': package.file_count,
+            'checked_files': package.file_count - len(missing_files),
+            'check_time': package.last_check_time.isoformat() if package.last_check_time else None
+        }
+
+    _release_package_lock_if_unused(package_id)
+    return result
+
+
+def _find_unchecked_package_ids(limit_count: int) -> List[str]:
+    """查询待校验软件包（未校验或状态仍为pending）。"""
+    packages = (
+        db.session.query(Package.id)
+        .filter(
+            (Package.last_check_time.is_(None)) |
+            (Package.check_status == 'pending')
+        )
+        .order_by(Package.upload_time.asc())
+        .limit(limit_count)
+        .all()
+    )
+    return [pkg[0] for pkg in packages]
+
+
+def auto_verify_packages_loop() -> None:
+    """后台线程：定时扫描未校验软件包并执行完整性校验。"""
+    enabled = config.auto_verify.enabled
+    if not enabled:
+        logger.info("自动校验功能已禁用")
+        return
+
+    interval_seconds = max(5, int(config.auto_verify.interval_seconds))
+    batch_size = max(1, int(config.auto_verify.batch_size))
+    logger.info(f"自动校验线程启动: interval={interval_seconds}s, batch_size={batch_size}")
+
+    while not _auto_verify_stop_event.wait(interval_seconds):
+        try:
+            with app.app_context():
+                package_ids = _find_unchecked_package_ids(batch_size)
+                if not package_ids:
+                    continue
+
+                logger.info(f"自动校验扫描到 {len(package_ids)} 个待处理软件包")
+                for package_id in package_ids:
+                    if _auto_verify_stop_event.is_set():
+                        break
+                    try:
+                        check_package_integrity(package_id)
+                    except ValueError as e:
+                        logger.info(f"自动校验跳过 package_id={package_id}: {e}")
+                    except Exception as e:
+                        db.session.rollback()
+                        logger.error(f"自动校验失败 package_id={package_id}: {e}")
+        except Exception as e:
+            logger.error(f"自动校验线程异常: {e}")
+
+    logger.info("自动校验线程已退出")
 
 
 # ==================== 新增统计接口 ====================
@@ -1432,27 +1522,47 @@ def check_package(package_id):
     if not package:
         return jsonify({'success': False, 'error': '软件包不存在'}), 404
 
-    result = check_package_integrity(package)
+    try:
+        result = check_package_integrity(package_id)
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 404
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': f'校验失败: {str(e)}'}), 500
+
+    package = Package.query.get(package_id)
     result['success'] = True
     result['package_id'] = package_id
-    result['package_name'] = f"{package.name}-{package.version}"
-    result['last_check_time'] = package.last_check_time.isoformat() if package.last_check_time else None
-
+    result['package_name'] = f"{package.name}-{package.version}" if package else package_id
+    result['last_check_time'] = package.last_check_time.isoformat() if package and package.last_check_time else None
     return jsonify(result)
 
 
 @app.route('/api/packages/check-all', methods=['POST'])
 def check_all_packages():
     """批量校验所有软件包"""
-    packages = Package.query.all()
+    package_ids = [pkg_id for (pkg_id,) in Package.query.with_entities(Package.id).all()]
     results = []
 
-    for package in packages:
-        result = check_package_integrity(package)
-        result['package_id'] = package.id
-        result['package_name'] = f"{package.name}-{package.version}"
-        result['last_check_time'] = package.last_check_time.isoformat() if package.last_check_time else None
-        results.append(result)
+    for package_id in package_ids:
+        try:
+            result = check_package_integrity(package_id)
+            package = Package.query.get(package_id)
+            result['package_id'] = package_id
+            result['package_name'] = f"{package.name}-{package.version}" if package else package_id
+            result['last_check_time'] = package.last_check_time.isoformat() if package and package.last_check_time else None
+            results.append(result)
+        except ValueError:
+            # 删除并发导致不存在，跳过
+            continue
+        except Exception as e:
+            db.session.rollback()
+            results.append({
+                'package_id': package_id,
+                'valid': False,
+                'error': str(e)
+            })
 
     return jsonify({
         'success': True,
@@ -1464,32 +1574,36 @@ def check_all_packages():
 @app.route('/api/packages/<package_id>', methods=['DELETE'])
 def delete_package(package_id):
     """删除单个软件包"""
-    package = Package.query.get(package_id)
-    if not package:
-        return jsonify({'success': False, 'error': '软件包不存在'}), 404
+    package_lock = _get_package_lock(package_id)
+    with package_lock:
+        package = Package.query.get(package_id)
+        if not package:
+            return jsonify({'success': False, 'error': '软件包不存在'}), 404
 
-    try:
-        # 删除存储的文件
-        if os.path.exists(package.storage_path):
-            shutil.rmtree(package.storage_path)
+        try:
+            # 删除存储的文件
+            if os.path.exists(package.storage_path):
+                shutil.rmtree(package.storage_path)
 
-        # 删除原始包文件
-        if package.original_package_path and os.path.exists(package.original_package_path):
-            os.remove(package.original_package_path)
+            # 删除原始包文件
+            if package.original_package_path and os.path.exists(package.original_package_path):
+                os.remove(package.original_package_path)
 
-        # 删除数据库记录（级联删除文件记录）
-        db.session.delete(package)
-        db.session.commit()
+            # 删除数据库记录（级联删除文件记录）
+            db.session.delete(package)
+            db.session.commit()
 
-        return jsonify({
-            'success': True,
-            'message': '软件包删除成功',
-            'package_id': package_id
-        })
+            return jsonify({
+                'success': True,
+                'message': '软件包删除成功',
+                'package_id': package_id
+            })
 
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({'success': False, 'error': f'删除失败: {str(e)}'}), 500
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({'success': False, 'error': f'删除失败: {str(e)}'}), 500
+        finally:
+            _release_package_lock_if_unused(package_id)
 
 
 # ==================== 解决数据库锁超时问题 ====================
@@ -1520,38 +1634,40 @@ def batch_delete_packages():
 
     try:
         for package_id in package_ids:
-            package = Package.query.get(package_id)
-            if not package:
-                errors.append(f"软件包 {package_id} 不存在")
-                error_count += 1
-                continue
-            logger.info("start delete package: {}-{}-{}-{}".format(package.name,package.version,package.system,package.architecture))
-            try:
-                # 使用独立的事务处理每个删除，避免长事务
-                # 注意：这里我们为每个删除创建新的事务
-                with db.session.begin_nested():
-                    # 删除存储的文件
-                    if os.path.exists(package.storage_path):
-                        shutil.rmtree(package.storage_path)
+            package_lock = _get_package_lock(package_id)
+            with package_lock:
+                package = Package.query.get(package_id)
+                if not package:
+                    errors.append(f"软件包 {package_id} 不存在")
+                    error_count += 1
+                    continue
+                logger.info("start delete package: {}-{}-{}-{}".format(package.name,package.version,package.system,package.architecture))
+                try:
+                    # 使用独立的事务处理每个删除，避免长事务
+                    with db.session.begin_nested():
+                        # 删除存储的文件
+                        if os.path.exists(package.storage_path):
+                            shutil.rmtree(package.storage_path)
 
-                    # 删除原始包文件
-                    if package.original_package_path and os.path.exists(package.original_package_path):
-                        os.remove(package.original_package_path)
+                        # 删除原始包文件
+                        if package.original_package_path and os.path.exists(package.original_package_path):
+                            os.remove(package.original_package_path)
 
-                    # 删除数据库记录
-                    db.session.delete(package)
-                    success_count += 1
+                        # 删除数据库记录
+                        db.session.delete(package)
+                        success_count += 1
 
-                    # 立即提交这个嵌套事务
-                    db.session.flush()
+                        # 立即提交这个嵌套事务
+                        db.session.flush()
 
-            except Exception as e:
-                db.session.rollback()  # 回滚嵌套事务
-                errors.append(f"删除软件包 {package_id} 失败: {str(e)}")
-                error_count += 1
-                # 继续处理下一个包
-                continue
-            db.session.commit()
+                except Exception as e:
+                    db.session.rollback()  # 回滚嵌套事务
+                    errors.append(f"删除软件包 {package_id} 失败: {str(e)}")
+                    error_count += 1
+                    continue
+                finally:
+                    _release_package_lock_if_unused(package_id)
+                db.session.commit()
 
         # 提交所有更改
         db.session.commit()
@@ -1578,15 +1694,18 @@ def delete_all_packages():
         deleted_count = 0
 
         for package in packages:
-            # 删除存储的文件
-            if os.path.exists(package.storage_path):
-                shutil.rmtree(package.storage_path)
+            package_lock = _get_package_lock(package.id)
+            with package_lock:
+                # 删除存储的文件
+                if os.path.exists(package.storage_path):
+                    shutil.rmtree(package.storage_path)
 
-            # 删除原始包文件
-            if package.original_package_path and os.path.exists(package.original_package_path):
-                os.remove(package.original_package_path)
+                # 删除原始包文件
+                if package.original_package_path and os.path.exists(package.original_package_path):
+                    os.remove(package.original_package_path)
 
-            deleted_count += 1
+                deleted_count += 1
+            _release_package_lock_if_unused(package.id)
 
         # 清空数据库（使用原生SQL确保效率）
         db.session.execute(db.text('DELETE FROM secflow_static_binary_package_files'))
@@ -1758,6 +1877,30 @@ def init_database():
         print("数据库表创建完成")
 
 
+def start_auto_verify_worker():
+    """启动后台自动校验线程。"""
+    global _auto_verify_thread
+    if _auto_verify_thread and _auto_verify_thread.is_alive():
+        return
+
+    _auto_verify_stop_event.clear()
+    _auto_verify_thread = threading.Thread(
+        target=auto_verify_packages_loop,
+        name="static-binary-auto-verify",
+        daemon=True
+    )
+    _auto_verify_thread.start()
+
+
+def stop_auto_verify_worker(timeout_seconds: int = 5):
+    """停止后台自动校验线程。"""
+    global _auto_verify_thread
+    _auto_verify_stop_event.set()
+    if _auto_verify_thread and _auto_verify_thread.is_alive():
+        _auto_verify_thread.join(timeout=timeout_seconds)
+    _auto_verify_thread = None
+
+
 def verify_auth_service_or_exit():
     """启动时校验Auth服务连通性与机机Token有效性。"""
     cfg = config.auth_service
@@ -1830,6 +1973,7 @@ def cleanup(signum=None, frame=None):
     """清理操作"""
     logger.info("正在执行清理操作...")
     try:
+        stop_auto_verify_worker()
         # 使用事件循环执行异步清理
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -1844,6 +1988,7 @@ def cleanup(signum=None, frame=None):
 signal.signal(signal.SIGTERM, cleanup)
 signal.signal(signal.SIGINT, cleanup)
 atexit.register(lambda: asyncio.run(shutdown_registry()) if get_registry_service() else None)
+atexit.register(lambda: stop_auto_verify_worker())
 
 
 # ==================== 启动应用 ====================
@@ -1854,6 +1999,7 @@ if __name__ == '__main__':
 
     # 初始化数据库
     init_database()
+    start_auto_verify_worker()
 
     # 启动Menu注册服务
     try:
