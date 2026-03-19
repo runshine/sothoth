@@ -257,6 +257,24 @@ class EnhancedTemplateManager:
             dedup[f"{p['port']}:{p['protocol']}"] = p
         return list(dedup.values())[:32]
 
+    @staticmethod
+    def _normalize_template_owner(template: Dict[str, Any]) -> Dict[str, Any]:
+        """确保模板返回数据始终包含作者信息。"""
+        item = dict(template or {})
+        owner_name = str(item.get('owner_name') or '').strip()
+        owner_id = str(item.get('owner_id') or '').strip()
+        created_by = str(item.get('created_by') or '').strip()
+
+        if not owner_name:
+            owner_name = created_by or 'system'
+        if not owner_id:
+            # 兼容历史数据：若无 owner_id，保留为空或使用 created_by 作为可读标识
+            owner_id = created_by or 'system'
+
+        item['owner_name'] = owner_name
+        item['owner_id'] = owner_id
+        return item
+
     # 新增方法：获取模板目录下指定文件的内容
     def get_template_file_by_path(self, template_name: str, file_path: str,
                                   encoding: str = 'utf-8') -> Tuple[bool, Union[str, bytes], str, Dict]:
@@ -1797,6 +1815,8 @@ class EnhancedTemplateManager:
             else:
                 template['directory_size'] = 0
 
+            template = self._normalize_template_owner(template)
+
         return template
 
     def get_template_by_id(self, template_id: int) -> Optional[Dict]:
@@ -2380,7 +2400,7 @@ class EnhancedTemplateManager:
         total = count_result.get('count', 0) if count_result else 0
 
         # 为每个模板添加文件大小信息
-        for template in templates:
+        for idx, template in enumerate(templates):
             # 解析metadata
             if template.get('metadata'):
                 if isinstance(template['metadata'], str):
@@ -2405,6 +2425,7 @@ class EnhancedTemplateManager:
             else:
                 template['directory_size'] = 0
             template['visibility'] = self._normalize_visibility(template.get('visibility'))
+            templates[idx] = self._normalize_template_owner(template)
 
         templates = [self.decorate_template_permissions(t, user_id, username) for t in templates]
 
