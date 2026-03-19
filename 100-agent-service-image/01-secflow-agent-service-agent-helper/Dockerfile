@@ -63,10 +63,12 @@ RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 RUN set -eux; \
     if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
         apt-get update && apt-get install -y nodejs npm && apt-get clean && rm -rf /var/lib/apt/lists/*; \
-        npm install -g @anthropic-ai/claude-code code-server claude-a2a; \
+        npm install -g @anthropic-ai/claude-code; \
+        npm install -g code-server; \
+        npm install -g claude-a2a; \
     else \
         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash; \
-        bash -lc ". \"$NVM_DIR/nvm.sh\" && nvm install 24 && nvm alias default 24 && nvm use --silent default && npm install -g @anthropic-ai/claude-code code-server claude-a2a"; \
+        bash -lc ". \"$NVM_DIR/nvm.sh\" && nvm install 20 && nvm alias default 20 && nvm use --silent default && npm install -g @anthropic-ai/claude-code && npm install -g code-server && npm install -g claude-a2a"; \
         echo ". \"$NVM_DIR/nvm.sh\"" >> /root/.bashrc; \
     fi; \
     bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude-a2a; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a"
