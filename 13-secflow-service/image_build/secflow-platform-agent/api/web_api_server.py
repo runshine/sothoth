@@ -1,21 +1,21 @@
 import logging
 import os
 import re
-import queue
 import threading
 import time
 import base64
 import hashlib
 import uuid
+from collections import OrderedDict
 import requests
 import websocket as ws_client
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+from geventwebsocket import Resource, WebSocketApplication
+from geventwebsocket.exceptions import WebSocketError
 import io
 import zipfile
-from urllib.parse import quote, urlencode
-from simple_websocket import Server
-from simple_websocket.errors import ConnectionClosed
+from urllib.parse import quote, urlencode, parse_qs
 
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
@@ -762,6 +762,68 @@ class WebAPIServer:
             if ak and sn:
                 keys.add(f"{ak}::{sn}")
         return keys
+
+    def _prepare_agent_exec_ws_tunnel(
+        self,
+        agent_key: str,
+        service_name: str,
+        project_id: str,
+        container_name: str,
+        shell: str,
+        mode: str,
+        user: str
+    ) -> Tuple[Any, str, str]:
+        agent = self.agent_manager.get_agent(agent_key)
+        if not agent:
+            raise RuntimeError(f'Agent {agent_key} not found')
+        if project_id and agent.project_id != project_id:
+            raise RuntimeError(f'Agent {agent_key} does not belong to project {project_id}')
+        if agent.status != 'online':
+            raise RuntimeError(f'Agent {agent_key} is {agent.status}')
+
+        service_status, service_payload = self.agent_manager.call_agent_api(
+            agent_key,
+            'GET',
+            f'/api/services/{quote(service_name, safe="")}',
+            None,
+            timeout_type='health_check'
+        )
+        if service_status != 200:
+            detail = ''
+            if isinstance(service_payload, dict):
+                detail = str(service_payload.get('error') or service_payload.get('message') or '')
+            elif isinstance(service_payload, str):
+                detail = service_payload
+            msg = f'服务不存在或不可访问: {service_name}'
+            if detail:
+                msg = f'{msg} ({detail})'
+            raise RuntimeError(msg)
+
+        supported, probe_status, probe_detail = self._probe_agent_exec_ws_capability(
+            agent, service_name, container_name, shell, mode, user
+        )
+        if not supported:
+            raise RuntimeError(
+                f'当前Agent未提供服务终端WS接口: status={probe_status}, detail={probe_detail}'
+            )
+
+        query = {
+            'token': self.agent_manager.agent_auth_token,
+            'container': container_name,
+            'shell': shell,
+            'mode': mode
+        }
+        if user:
+            query['user'] = user
+        upstream_ws_url = (
+            f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}"
+            f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(query)}"
+        )
+        tunnel_tag = (
+            f"agent={agent_key}, service={service_name}, project={project_id or '-'}, "
+            f"container={container_name or '-'}, mode={mode}, shell={shell}, user={user or '-'}"
+        )
+        return agent, upstream_ws_url, tunnel_tag
 
     def _sync_all_agent_services(self):
         """从所有在线Agent拉取服务清单并写入聚合表。"""
@@ -2263,205 +2325,12 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/exec/ws-tunnel', methods=['GET'])
         def agent_service_exec_ws_tunnel(agent_key, service_name):
-            """服务终端WebSocket中转：browser <-> platform-agent <-> agent"""
-            ws = None
-            upstream = None
-            tunnel_tag = f"agent={agent_key}, service={service_name}"
-            try:
-                project_id = request.args.get('project_id')
-                container_name = request.args.get('container', '')
-                shell = request.args.get('shell', '/bin/sh')
-                mode = request.args.get('mode', 'shell')
-                user = request.args.get('user', '')
-                tunnel_tag = (
-                    f"agent={agent_key}, service={service_name}, project={project_id or '-'}, "
-                    f"container={container_name or '-'}, mode={mode}, shell={shell}, user={user or '-'}"
-                )
-                self.logger.info(f"终端中转开始: {tunnel_tag}")
-
-                agent = self.agent_manager.get_agent(agent_key)
-                if not agent:
-                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
-                if project_id and agent.project_id != project_id:
-                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
-                if agent.status != 'online':
-                    return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
-
-                # 建立WebSocket前先做一次服务存在性校验，避免握手成功后立即断连。
-                service_status, service_payload = self.agent_manager.call_agent_api(
-                    agent_key,
-                    'GET',
-                    f'/api/services/{quote(service_name, safe="")}',
-                    None,
-                    timeout_type='health_check'
-                )
-                if service_status != 200:
-                    detail = ''
-                    if isinstance(service_payload, dict):
-                        detail = str(service_payload.get('error') or service_payload.get('message') or '')
-                    elif isinstance(service_payload, str):
-                        detail = service_payload
-                    msg = f'服务不存在或不可访问: {service_name}'
-                    if detail:
-                        msg = f'{msg} ({detail})'
-                    return jsonify({
-                        'error': msg,
-                        'agent_key': agent_key,
-                        'service_name': service_name,
-                        'upstream_status': service_status
-                    }), 404
-
-                supported, probe_status, probe_detail = self._probe_agent_exec_ws_capability(
-                    agent, service_name, container_name, shell, mode, user
-                )
-                if not supported:
-                    return jsonify({
-                        'error': '当前Agent未提供服务终端WS接口，无法建立实时终端连接',
-                        'agent_key': agent_key,
-                        'service_name': service_name,
-                        'agent_ip': agent.ip_address,
-                        'upstream_status': probe_status,
-                        'upstream_detail': probe_detail
-                    }), 400
-
-                ws = Server.accept(
-                    request.environ,
-                    ping_interval=25
-                )
-                self.logger.info(f"终端中转浏览器握手成功: {tunnel_tag}")
-
-                query = {
-                    'token': self.agent_manager.agent_auth_token,
-                    'container': container_name,
-                    'shell': shell,
-                    'mode': mode
-                }
-                if user:
-                    query['user'] = user
-                upstream_ws_url = (
-                    f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}"
-                    f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(query)}"
-                )
-
-                upstream = ws_client.create_connection(
-                    upstream_ws_url,
-                    timeout=15,
-                    enable_multithread=True
-                )
-                self.logger.info(f"终端中转上游握手成功: {tunnel_tag}, upstream={upstream_ws_url}")
-
-                stop_event = threading.Event()
-                close_lock = threading.Lock()
-                upstream_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
-
-                def _close_both():
-                    with close_lock:
-                        self.logger.info(f"终端中转关闭双端: {tunnel_tag}")
-                        try:
-                            if upstream is not None:
-                                upstream.close()
-                        except Exception:
-                            pass
-                        try:
-                            if ws is not None:
-                                ws.close()
-                        except Exception:
-                            pass
-
-                def _upstream_to_client():
-                    try:
-                        while not stop_event.is_set():
-                            data = upstream.recv()
-                            self.logger.info(
-                                f"终端中转上游消息: {tunnel_tag}, type={type(data).__name__}, "
-                                f"len={len(data) if isinstance(data, (str, bytes)) else 'n/a'}, value={repr(data)[:200]}"
-                            )
-                            if data is None:
-                                break
-                            if data == '':
-                                # 忽略上游空帧，避免浏览器侧被无意义空消息触发异常状态。
-                                continue
-                            upstream_queue.put(('data', data))
-                    except Exception as e:
-                        if not stop_event.is_set():
-                            self.logger.info(f"终端中转上行关闭: {tunnel_tag}, err={e!r}")
-                    finally:
-                        upstream_queue.put(('closed', None))
-                        stop_event.set()
-
-                t_up = threading.Thread(target=_upstream_to_client, daemon=True)
-                t_up.start()
-
-                while not stop_event.is_set():
-                    while True:
-                        try:
-                            item_type, item_value = upstream_queue.get_nowait()
-                        except queue.Empty:
-                            break
-
-                        if item_type == 'data':
-                            ws.send(item_value)
-                            self.logger.info(f"终端中转已转发到浏览器: {tunnel_tag}")
-                        elif item_type == 'closed':
-                            stop_event.set()
-                            break
-
-                    if stop_event.is_set():
-                        break
-
-                    try:
-                        message = ws.receive(timeout=0.2)
-                    except ConnectionClosed:
-                        self.logger.info(f"终端中转浏览器连接关闭: {tunnel_tag}")
-                        stop_event.set()
-                        break
-                    except Exception as e:
-                        self.logger.info(f"终端中转下行关闭: {tunnel_tag}, err={e!r}")
-                        stop_event.set()
-                        break
-
-                    if message is None:
-                        if getattr(ws, 'connected', True):
-                            continue
-                        self.logger.info(f"终端中转浏览器已断开(None): {tunnel_tag}")
-                        stop_event.set()
-                        break
-                    if message == '':
-                        continue
-
-                    self.logger.info(
-                        f"终端中转浏览器消息: {tunnel_tag}, type={type(message).__name__}, "
-                        f"len={len(message) if isinstance(message, (str, bytes)) else 'n/a'}, value={repr(message)[:200]}"
-                    )
-                    if message == '':
-                        # 浏览器/代理偶尔会透传空帧或保活帧，不应把它转发给上游 shell。
-                        continue
-                    upstream.send(message)
-                    self.logger.info(f"终端中转已转发到上游: {tunnel_tag}")
-                stop_event.set()
-                _close_both()
-                self.logger.info(f"终端中转结束: {tunnel_tag}")
-                return ''
-            except Exception as e:
-                self.logger.error(f"终端中转失败: {tunnel_tag}, err={e}", exc_info=True)
-                if ws is None:
-                    return jsonify({'error': f'终端中转失败: {str(e)}'}), 500
-                try:
-                    ws.send(f"\r\n[ERROR] terminal tunnel failed: {str(e)}\r\n")
-                except Exception:
-                    pass
-                return ''
-            finally:
-                try:
-                    if upstream is not None:
-                        upstream.close()
-                except Exception:
-                    pass
-                try:
-                    if ws is not None:
-                        ws.close()
-                except Exception:
-                    pass
+            """服务终端WebSocket中转说明入口（真正的WS升级由专用WebSocket应用处理）"""
+            return jsonify({
+                'error': 'WebSocket upgrade required',
+                'message': '请通过WebSocket连接访问该地址',
+                'path': f"/api/agent/agent/{agent_key}/services/{service_name}/exec/ws-tunnel"
+            }), 426
 
         @self.app.route('/api/agent/services/global', methods=['GET'])
         def list_global_services():
@@ -5384,12 +5253,116 @@ class WebAPIServer:
         # 运行Flask应用
         self.logger.info(f"启动WEB API服务器，监听 {self.config['host']}:{self.config['port']}")
         try:
-            # WebSocket 中转依赖真实 WS 服务器；Werkzeug 开发服务器在该场景下会返回 400。
             from gevent import pywsgi
+
+            server_ref = self
+
+            class AgentExecWsTunnelApplication(WebSocketApplication):
+                _path_re = re.compile(
+                    r'^/api/agent/agent/(?P<agent_key>[^/]+)/services/(?P<service_name>[^/]+)/exec/ws-tunnel$'
+                )
+
+                def __init__(self, ws):
+                    super().__init__(ws)
+                    self.server = server_ref
+                    self.upstream = None
+                    self.upstream_thread = None
+                    self.stop_event = threading.Event()
+                    self.close_lock = threading.Lock()
+                    self.tunnel_tag = 'agent=-, service=-'
+
+                def _close_both(self):
+                    with self.close_lock:
+                        try:
+                            if self.upstream is not None:
+                                self.upstream.close()
+                        except Exception:
+                            pass
+                        try:
+                            if self.ws is not None:
+                                self.ws.close()
+                        except Exception:
+                            pass
+
+                def on_open(self):
+                    environ = self.ws.environ or {}
+                    path = str(environ.get('PATH_INFO') or '')
+                    match = self._path_re.match(path)
+                    if not match:
+                        raise RuntimeError(f'invalid ws tunnel path: {path}')
+
+                    agent_key = match.group('agent_key')
+                    service_name = match.group('service_name')
+                    query = parse_qs(str(environ.get('QUERY_STRING') or ''), keep_blank_values=True)
+                    project_id = (query.get('project_id') or [''])[0]
+                    container_name = (query.get('container') or [''])[0]
+                    shell = (query.get('shell') or ['/bin/sh'])[0]
+                    mode = (query.get('mode') or ['shell'])[0]
+                    user = (query.get('user') or [''])[0]
+
+                    _, upstream_ws_url, tunnel_tag = self.server._prepare_agent_exec_ws_tunnel(
+                        agent_key=agent_key,
+                        service_name=service_name,
+                        project_id=project_id,
+                        container_name=container_name,
+                        shell=shell,
+                        mode=mode,
+                        user=user
+                    )
+                    self.tunnel_tag = tunnel_tag
+                    self.server.logger.info(f"终端中转WS打开: {self.tunnel_tag}, upstream={upstream_ws_url}")
+
+                    self.upstream = ws_client.create_connection(
+                        upstream_ws_url,
+                        timeout=15,
+                        enable_multithread=True
+                    )
+
+                    def _pump_upstream():
+                        try:
+                            while not self.stop_event.is_set():
+                                data = self.upstream.recv()
+                                if data is None:
+                                    break
+                                if data == '':
+                                    continue
+                                self.ws.send(data)
+                        except Exception as e:
+                            if not self.stop_event.is_set():
+                                self.server.logger.info(f"终端中转WS上行关闭: {self.tunnel_tag}, err={e!r}")
+                        finally:
+                            self.stop_event.set()
+                            self._close_both()
+
+                    self.upstream_thread = threading.Thread(target=_pump_upstream, daemon=True)
+                    self.upstream_thread.start()
+
+                def on_message(self, message, *args, **kwargs):
+                    if self.stop_event.is_set():
+                        return
+                    if message is None or message == '':
+                        return
+                    try:
+                        self.upstream.send(message)
+                    except Exception as e:
+                        self.server.logger.info(f"终端中转WS下行关闭: {self.tunnel_tag}, err={e!r}")
+                        self.stop_event.set()
+                        self._close_both()
+                        raise
+
+                def on_close(self, *args, **kwargs):
+                    self.server.logger.info(f"终端中转WS关闭: {self.tunnel_tag}")
+                    self.stop_event.set()
+                    self._close_both()
+
+            application = Resource(OrderedDict([
+                (r'^/api/agent/agent/[^/]+/services/[^/]+/exec/ws-tunnel$', AgentExecWsTunnelApplication),
+                (r'^/.*', self.app),
+            ]))
 
             server = pywsgi.WSGIServer(
                 (self.config['host'], self.config['port']),
-                self.app
+                application
             )
             server.serve_forever()
         except Exception as e:
