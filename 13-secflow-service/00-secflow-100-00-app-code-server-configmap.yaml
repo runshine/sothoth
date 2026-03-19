@@ -40,6 +40,7 @@ data:
       timeout: 30
     # 认证服务配置
     auth_service:
+      enabled: true
       host: "secflow-platform-auth"
       port: 80
       validate_token_path: "/api/auth/validate-token"
