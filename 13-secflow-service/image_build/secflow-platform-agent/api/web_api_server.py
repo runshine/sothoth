@@ -5254,6 +5254,7 @@ class WebAPIServer:
         self.logger.info(f"启动WEB API服务器，监听 {self.config['host']}:{self.config['port']}")
         try:
             from gevent import pywsgi
+            from geventwebsocket.handler import WebSocketHandler
 
             server_ref = self
 
@@ -5362,7 +5363,8 @@ class WebAPIServer:
 
             server = pywsgi.WSGIServer(
                 (self.config['host'], self.config['port']),
-                application
+                application,
+                handler_class=WebSocketHandler
             )
             server.serve_forever()
         except Exception as e:
