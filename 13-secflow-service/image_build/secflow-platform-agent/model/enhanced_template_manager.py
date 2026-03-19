@@ -376,6 +376,14 @@ class EnhancedTemplateManager:
             if not safe_path:
                 return False, f"无效的文件路径: {file_path}", {}
 
+            if template_type == 'yaml' and safe_path.suffix.lower() in ['.yaml', '.yml']:
+                main_file = Path(template.get('file_path') or '')
+                if main_file.exists() and safe_path.resolve() != main_file.resolve():
+                    return False, f"yaml模板仅允许编辑主文件: {main_file.name}", {
+                        'expected_path': str(main_file.name),
+                        'requested_path': str(safe_path.relative_to(template_dir))
+                    }
+
             # 确保父目录存在
             safe_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -472,6 +480,11 @@ class EnhancedTemplateManager:
                 )
 
             self.logger.info(f"模板文件更新成功: {template_name}/{file_path}, 大小: {file_size} 字节")
+            if template_type == 'yaml' and safe_path.suffix.lower() in ['.yaml', '.yml']:
+                removed = self._cleanup_extra_yaml_files_for_yaml_template(template)
+                if removed:
+                    update_info['removed_extra_yaml_files'] = removed
+                    self.logger.info(f"模板 '{template_name}' 已清理多余YAML: {removed}")
             return True, f"文件更新成功", update_info
 
         except Exception as e:
@@ -1898,6 +1911,38 @@ class EnhancedTemplateManager:
                 total_size += file_path.stat().st_size
         return total_size
 
+    def _cleanup_extra_yaml_files_for_yaml_template(self, template: Dict) -> List[str]:
+        """
+        yaml类型模板只保留主YAML（file_path），清理同目录下其他yaml/yml文件。
+        返回被删除的相对路径列表。
+        """
+        removed: List[str] = []
+        try:
+            if not template or template.get('type') != 'yaml':
+                return removed
+            name = str(template.get('name') or '').strip()
+            if not name:
+                return removed
+            template_dir = self.templates_root / name
+            if not template_dir.exists():
+                return removed
+            main_file = Path(template.get('file_path') or '')
+            if not main_file.exists():
+                return removed
+            main_resolved = main_file.resolve()
+            candidates = list(template_dir.rglob('*.yaml')) + list(template_dir.rglob('*.yml'))
+            for p in candidates:
+                try:
+                    if p.resolve() == main_resolved:
+                        continue
+                    p.unlink()
+                    removed.append(str(p.relative_to(template_dir)))
+                except Exception:
+                    continue
+        except Exception as e:
+            self.logger.warning(f"清理多余YAML文件失败: {str(e)}")
+        return removed
+
     def get_template_file(self, name: str) -> Optional[Path]:
         """获取模板文件路径（兼容旧接口）"""
         try:
@@ -1935,6 +1980,9 @@ class EnhancedTemplateManager:
                 return False, f"模板文件不存在: {file_path}", ""
 
             if template_type == 'yaml':
+                removed = self._cleanup_extra_yaml_files_for_yaml_template(template)
+                if removed:
+                    self.logger.info(f"模板 '{name}' 清理多余YAML: {removed}")
                 # 直接读取YAML文件
                 with open(file_path, 'r', encoding='utf-8') as f:
                     yaml_content = f.read()
@@ -2020,6 +2068,10 @@ class EnhancedTemplateManager:
                 )
 
                 self.logger.info(f"YAML模板 '{name}' 更新成功，新大小: {new_size} 字节")
+
+                removed = self._cleanup_extra_yaml_files_for_yaml_template(template)
+                if removed:
+                    self.logger.info(f"模板 '{name}' 已清理多余YAML: {removed}")
 
                 # 重新解析 docker-compose
                 try:

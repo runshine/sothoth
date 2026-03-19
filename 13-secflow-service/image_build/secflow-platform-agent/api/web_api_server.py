@@ -2006,6 +2006,30 @@ class WebAPIServer:
                 if agent.status != 'online':
                     return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
 
+                # 预先校验服务是否存在，避免前端拿到ws_url后立刻1005断开却看不到具体原因。
+                service_status, service_payload = self.agent_manager.call_agent_api(
+                    agent_key,
+                    'GET',
+                    f'/api/services/{quote(service_name, safe="")}',
+                    None,
+                    timeout_type='health_check'
+                )
+                if service_status != 200:
+                    detail = ''
+                    if isinstance(service_payload, dict):
+                        detail = str(service_payload.get('error') or service_payload.get('message') or '')
+                    elif isinstance(service_payload, str):
+                        detail = service_payload
+                    msg = f'服务不存在或不可访问: {service_name}'
+                    if detail:
+                        msg = f'{msg} ({detail})'
+                    return jsonify({
+                        'error': msg,
+                        'agent_key': agent_key,
+                        'service_name': service_name,
+                        'upstream_status': service_status
+                    }), 404
+
                 tunnel_query = {
                     'project_id': project_id or '',
                     'container': container_name,
@@ -2061,6 +2085,30 @@ class WebAPIServer:
                     return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
                 if agent.status != 'online':
                     return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
+
+                # 建立WebSocket前先做一次服务存在性校验，避免握手成功后立即断连。
+                service_status, service_payload = self.agent_manager.call_agent_api(
+                    agent_key,
+                    'GET',
+                    f'/api/services/{quote(service_name, safe="")}',
+                    None,
+                    timeout_type='health_check'
+                )
+                if service_status != 200:
+                    detail = ''
+                    if isinstance(service_payload, dict):
+                        detail = str(service_payload.get('error') or service_payload.get('message') or '')
+                    elif isinstance(service_payload, str):
+                        detail = service_payload
+                    msg = f'服务不存在或不可访问: {service_name}'
+                    if detail:
+                        msg = f'{msg} ({detail})'
+                    return jsonify({
+                        'error': msg,
+                        'agent_key': agent_key,
+                        'service_name': service_name,
+                        'upstream_status': service_status
+                    }), 404
 
                 ws = Server.accept(request.environ)
 
