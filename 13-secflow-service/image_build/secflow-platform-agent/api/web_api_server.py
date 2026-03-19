@@ -619,14 +619,21 @@ class WebAPIServer:
         scope = str(metadata.get('ingress_scope') or '').strip().lower()
         if scope == 'agent_console':
             return True
+        if scope == 'service_binding':
+            return False
+
+        source = str(metadata.get('source') or '').strip().lower()
+        if source in ('agent-detail', 'agent-cluster', 'agent-mgmt', 'agent'):
+            return True
+        if source in ('service-mgmt', 'service-management', 'service'):
+            return False
 
         target_port = int(route.get('target_port') or 0)
         if target_port in (11197, 11198):
             return True
 
         owner_service = str(route.get('owner_service') or '').strip().lower()
-        source_api = str(metadata.get('source_api') or '').strip()
-        if owner_service == 'platform-agent' and 'agent/<agent_key>/ingress-routes' in source_api:
+        if owner_service == 'platform-agent' and not self._is_service_bound_ingress_route(route):
             return True
         return False
 
@@ -637,11 +644,21 @@ class WebAPIServer:
             return True
         if scope == 'agent_console':
             return False
-        service_name = str(metadata.get('service_name') or '').strip()
+
+        source = str(metadata.get('source') or '').strip().lower()
+        if source in ('service-mgmt', 'service-management', 'service'):
+            return True
+        if source in ('agent-detail', 'agent-cluster', 'agent-mgmt', 'agent'):
+            return False
+
+        service_name = str(
+            metadata.get('service_name')
+            or metadata.get('associated_service_name')
+            or metadata.get('bind_service_name')
+            or ''
+        ).strip()
         if service_name:
             return True
-        if self._is_agent_console_ingress_route(route):
-            return False
         return False
 
     def _get_project_active_service_keys(self, project_id: str) -> set:
