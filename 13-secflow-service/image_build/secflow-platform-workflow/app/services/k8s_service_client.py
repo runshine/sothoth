@@ -19,6 +19,7 @@ class K8SServiceClient:
     def __init__(self):
         config = get_config()
         self.k8s_service_config = config.k8s_service
+        self.auth_service_config = config.auth_service
         self._client: Optional[httpx.AsyncClient] = None
         self._sync_client: Optional[httpx.Client] = None
 
@@ -29,13 +30,20 @@ class K8SServiceClient:
         else:
             logger.info("K8S微服务客户端未启用，使用直接连接模式")
 
+    def _default_headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        machine_token = getattr(self.auth_service_config, "service_machine_token", None)
+        if machine_token:
+            headers["Authorization"] = f"Bearer {machine_token}"
+        return headers
+
     @property
     def client(self) -> httpx.AsyncClient:
         """获取异步HTTP客户端"""
         if self._client is None:
             config = get_config()
             timeout = config.k8s_service.timeout if config.k8s_service else 30
-            self._client = httpx.AsyncClient(timeout=timeout)
+            self._client = httpx.AsyncClient(timeout=timeout, headers=self._default_headers())
         return self._client
 
     @property
@@ -44,7 +52,7 @@ class K8SServiceClient:
         if self._sync_client is None:
             config = get_config()
             timeout = config.k8s_service.timeout if config.k8s_service else 30
-            self._sync_client = httpx.Client(timeout=timeout)
+            self._sync_client = httpx.Client(timeout=timeout, headers=self._default_headers())
         return self._sync_client
 
     def _get_base_url(self) -> str:

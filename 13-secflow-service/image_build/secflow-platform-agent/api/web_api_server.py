@@ -113,6 +113,7 @@ class WebAPIServer:
         self.ttyd_probe_timeout_sec = int(config.get('ttyd_probe_timeout_sec', 3))
         self.k8s_service_url = (config.get('k8s_service_url') or '').rstrip('/')
         self.k8s_service_timeout_sec = int(config.get('k8s_service_timeout_sec', 15))
+        self.service_machine_token = config.get('service_machine_token')
 
         # 11. 注册路由
         self._register_routes()
@@ -207,6 +208,8 @@ class WebAPIServer:
         req_headers = {}
         if headers:
             req_headers.update(headers)
+        if 'Authorization' not in req_headers and self.service_machine_token:
+            req_headers['Authorization'] = f"Bearer {self.service_machine_token}"
         if payload is not None:
             req_headers.setdefault('Content-Type', 'application/json')
 

@@ -134,6 +134,8 @@ class K8SClient:
         headers = {}
         if authorization:
             headers["Authorization"] = authorization
+        elif getattr(get_config().auth_service, "service_machine_token", None):
+            headers["Authorization"] = f"Bearer {get_config().auth_service.service_machine_token}"
 
         try:
             with httpx.Client(timeout=self.k8s_service_config.timeout) as client_http:

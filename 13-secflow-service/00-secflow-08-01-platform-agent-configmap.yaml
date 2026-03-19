@@ -26,6 +26,7 @@ data:
       "nacos_namespace": "public",
       "k8s_service_url": "http://secflow-platform-k8s:80",
       "k8s_service_timeout_sec": 15,
+      "service_machine_token": "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8",
       "agent_api_port": 11197,
       "daemon_api_port": 11188,
       "agent_ttyd_port": 11198,

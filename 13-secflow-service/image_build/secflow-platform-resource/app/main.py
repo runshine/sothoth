@@ -170,7 +170,7 @@ def init_services(config: dict):
     auth_config = config.get("auth_service", {})
     init_auth_service(
         base_url=auth_config.get("base_url", "http://localhost:8080"),
-        validate_path=auth_config.get("validate_token_path", "/api/auth/validate-human-token"),
+        validate_path=auth_config.get("validate_token_path", "/api/auth/validate-token"),
         timeout=auth_config.get("timeout", 10),
         token_cache_ttl=auth_config.get("token_cache_ttl", 900)
     )
@@ -181,7 +181,8 @@ def init_services(config: dict):
     init_project_service(
         base_url=project_config.get("base_url", "http://localhost:10001"),
         get_project_path=project_config.get("get_project_path", "/api/project"),
-        timeout=project_config.get("timeout", 10)
+        timeout=project_config.get("timeout", 10),
+        service_machine_token=auth_config.get("service_machine_token"),
     )
     logger.info("Project service initialized")
 

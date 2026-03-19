@@ -26,6 +26,8 @@ class K8sApiClient:
         headers = {"Content-Type": "application/json"}
         if user_token:
             headers["Authorization"] = f"Bearer {user_token}"
+        elif getattr(self.config.auth_service, "service_machine_token", None):
+            headers["Authorization"] = f"Bearer {self.config.auth_service.service_machine_token}"
         return headers
 
     def _build_url(self, path: str, project_id: str) -> str:

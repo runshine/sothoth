@@ -11,10 +11,11 @@ file_root: "./resource"
 
 # Auth Service Configuration (call external auth service)
 auth_service:
-  enabled: false
+  enabled: true
   host: "192.168.12.44"
   port: 10000
-  validate_token_path: "/api/auth/validate-human-token"
+  validate_token_path: "/api/auth/validate-token"
+  service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
   timeout: 10
   token_cache_enabled: true
   token_cache_ttl_minutes: 15

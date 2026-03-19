@@ -40,7 +40,17 @@ class ProjectService:
         """获取项目详情URL"""
         return f"{self.config.base_url}{self.config.get_project_path}/{project_id}"
 
-    def get_project(self, project_id: str, token: str) -> Optional[ProjectInfo]:
+    def _build_auth_headers(self, token: Optional[str] = None) -> dict:
+        headers = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        else:
+            machine_token = getattr(get_config().auth_service, "service_machine_token", None)
+            if machine_token:
+                headers["Authorization"] = f"Bearer {machine_token}"
+        return headers
+
+    def get_project(self, project_id: str, token: Optional[str] = None) -> Optional[ProjectInfo]:
         """
         获取项目信息
 
@@ -53,7 +63,7 @@ class ProjectService:
             None: 项目不存在或无权限
         """
         try:
-            headers = {"Authorization": f"Bearer {token}"}
+            headers = self._build_auth_headers(token)
             response = self.client.get(
                 self.get_project_url(project_id),
                 headers=headers
@@ -75,7 +85,7 @@ class ProjectService:
             logger.error(f"无法连接到项目服务: {e}")
             return None
 
-    async def get_project_async(self, project_id: str, token: str) -> Optional[ProjectInfo]:
+    async def get_project_async(self, project_id: str, token: Optional[str] = None) -> Optional[ProjectInfo]:
         """
         异步获取项目信息
 
@@ -89,7 +99,7 @@ class ProjectService:
         """
         async with httpx.AsyncClient(timeout=self.config.timeout) as client:
             try:
-                headers = {"Authorization": f"Bearer {token}"}
+                headers = self._build_auth_headers(token)
                 response = await client.get(
                     self.get_project_url(project_id),
                     headers=headers

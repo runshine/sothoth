@@ -25,6 +25,10 @@ data:
       secret_key: "secflow-secret-key-change-in-production"
       algorithm: "HS256"
       access_token_expire_minutes: 1440  # 24小时
+
+    # 统一机机Token（用于微服务间认证）
+    service_auth:
+      machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
     
     # 服务注册配置
     registry:

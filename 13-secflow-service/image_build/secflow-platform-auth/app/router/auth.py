@@ -1,6 +1,6 @@
 """认证路由"""
 
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
 from sqlalchemy.orm import Session
@@ -15,6 +15,54 @@ from app.schema import (
 from app.model import User, MachineToken, Role
 
 router = APIRouter(tags=["认证"])
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> str:
+    """从Authorization头中提取Bearer token。"""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="无法验证凭据",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+    if authorization is None:
+        raise credentials_exception
+
+    try:
+        scheme, token = authorization.split()
+        if scheme.lower() != "bearer":
+            raise credentials_exception
+        return token
+    except ValueError:
+        raise credentials_exception
+
+
+def _build_human_user_payload(user: User) -> Dict[str, Any]:
+    """构建统一的人类用户响应结构。"""
+    return {
+        "id": user.id,
+        "username": user.username,
+        "is_active": user.is_active,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+        "role": [r.name for r in user.roles] if getattr(user, "roles", None) else [],
+        "token_type": "human",
+    }
+
+
+def _build_machine_user_payload(machine_code: str, machine_token_id: Optional[int] = None) -> Dict[str, Any]:
+    """构建统一的机机主体响应结构，兼容既有依赖中的用户字段。"""
+    return {
+        "id": -1,
+        "username": f"machine:{machine_code}",
+        "is_active": True,
+        "created_at": None,
+        "updated_at": None,
+        "role": ["machine"],
+        "token_type": "machine",
+        "machine_code": machine_code,
+        "machine_token_id": machine_token_id,
+    }
 
 
 @router.get("/health")
@@ -166,21 +214,7 @@ def validate_human_token(
     请求头示例：
     Authorization: Bearer <human_token>
     """
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="无法验证凭据",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-    if authorization is None:
-        raise credentials_exception
-
-    try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise credentials_exception
-    except ValueError:
-        raise credentials_exception
+    token = _extract_bearer_token(authorization)
 
     # 解码Token
     payload = decode_access_token(token)
@@ -239,21 +273,7 @@ def validate_machine_token(
     请求头示例：
     Authorization: Bearer <machine_token>
     """
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="无法验证凭据",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-    if authorization is None:
-        raise credentials_exception
-
-    try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise credentials_exception
-    except ValueError:
-        raise credentials_exception
+    token = _extract_bearer_token(authorization)
 
     # 验证机机Token
     db_token = verify_machine_token(db, token)
@@ -265,3 +285,62 @@ def validate_machine_token(
         )
 
     return db_token
+
+
+@router.post("/validate-token")
+def validate_token(
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """
+    统一验证Token（人机/机机）。
+
+    认证顺序：
+    1. 人机JWT Token
+    2. 数据库中的机机Token
+    3. 配置中的统一机机Token（service_auth.machine_token）
+    """
+    token = _extract_bearer_token(authorization)
+
+    # 1) 人机Token校验
+    payload = decode_access_token(token)
+    if payload is not None and payload.get("type") == "human":
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="人机Token缺少用户标识",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if user is None or not user.is_active:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="用户不存在或已被禁用",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return _build_human_user_payload(user)
+
+    # 2) 机机Token（数据库）
+    db_token = verify_machine_token(db, token)
+    if db_token is not None:
+        return _build_machine_user_payload(
+            machine_code=db_token.machine_code,
+            machine_token_id=db_token.id,
+        )
+
+    # 3) 统一机机Token（配置）
+    shared_machine_token = (
+        config.get("service_auth", {}).get("machine_token")
+        or config.get("service_auth", {}).get("service_machine_token")
+        or ""
+    )
+    if shared_machine_token and secrets.compare_digest(token, shared_machine_token):
+        return _build_machine_user_payload(machine_code="secflow-service-token")
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Token无效、已过期或未授权",
+        headers={"WWW-Authenticate": "Bearer"},
+    )

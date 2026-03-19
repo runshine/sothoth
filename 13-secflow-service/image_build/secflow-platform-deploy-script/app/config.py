@@ -22,7 +22,8 @@ class AuthServiceConfig(BaseModel):
     enabled: bool = True
     host: str = "localhost"
     port: int = 10000
-    validate_token_path: str = "/api/auth/validate-human-token"
+    validate_token_path: str = "/api/auth/validate-token"
+    service_machine_token: Optional[str] = None
     timeout: int = 10
     token_cache_enabled: bool = True
     token_cache_ttl_minutes: int = 15

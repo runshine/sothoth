@@ -20,7 +20,8 @@ data:
     auth_service:
       host: "secflow-platform-auth"
       port: 80
-      validate_token_path: "/api/auth/validate-human-token"
+      validate_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
       timeout: 10
       # Token缓存配置
       token_cache_enabled: true

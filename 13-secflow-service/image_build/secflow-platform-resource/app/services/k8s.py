@@ -23,6 +23,7 @@ class KubernetesService:
         job_timeout: int = 600,
         k8s_service_base_url: Optional[str] = None,
         k8s_service_timeout: int = 30,
+        service_machine_token: Optional[str] = None,
     ):
         # Keep old parameters for compatibility, but all operations are routed to platform-k8s.
         self.connection_mode = connection_mode
@@ -37,6 +38,7 @@ class KubernetesService:
         ).rstrip("/")
         self.timeout = k8s_service_timeout
         self.client = httpx.Client(timeout=self.timeout)
+        self.service_machine_token = service_machine_token
 
     def _request(
         self,
@@ -47,9 +49,12 @@ class KubernetesService:
     ) -> httpx.Response:
         url = f"{self.k8s_service_base_url}{path}"
         params = dict(kwargs.pop("params", {}) or {})
+        headers = dict(kwargs.pop("headers", {}) or {})
+        if self.service_machine_token and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {self.service_machine_token}"
         if project_id:
             params["project_id"] = project_id
-        return self.client.request(method.upper(), url, params=params, **kwargs)
+        return self.client.request(method.upper(), url, params=params, headers=headers, **kwargs)
 
     def load_config(self):
         """Compatibility method for legacy startup flow."""
@@ -562,6 +567,7 @@ def init_k8s_service(config: Dict[str, Any]) -> KubernetesService:
     # Compatible parsing: supports legacy `k8s` and new `k8s_service` blocks.
     k8s_cfg = config.get("k8s", config) if isinstance(config, dict) else {}
     k8s_svc_cfg = config.get("k8s_service", {}) if isinstance(config, dict) else {}
+    auth_cfg = config.get("auth_service", {}) if isinstance(config, dict) else {}
 
     host = k8s_svc_cfg.get("host")
     port = k8s_svc_cfg.get("port")
@@ -580,6 +586,7 @@ def init_k8s_service(config: Dict[str, Any]) -> KubernetesService:
         job_timeout=k8s_cfg.get("job_timeout", 600),
         k8s_service_base_url=base_url,
         k8s_service_timeout=k8s_svc_cfg.get("timeout", 30),
+        service_machine_token=auth_cfg.get("service_machine_token"),
     )
 
     if not _k8s_service.check_connection():
