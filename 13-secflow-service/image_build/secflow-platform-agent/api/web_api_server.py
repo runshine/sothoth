@@ -663,6 +663,89 @@ class WebAPIServer:
             return True
         return False
 
+    def _find_agent_console_ingress_route(
+        self,
+        project_id: str,
+        agent_key: str,
+        target_port: int,
+        auth_header: Optional[str] = None,
+        include_deleted: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        all_routes = self._list_project_ingress_routes(
+            project_id=project_id,
+            include_deleted=include_deleted,
+            auth_header=auth_header
+        )
+        for route in all_routes:
+            if str(route.get('agent_key') or '').strip() != agent_key:
+                continue
+            if int(route.get('target_port') or 0) != int(target_port):
+                continue
+            if not self._is_agent_console_ingress_route(route):
+                continue
+            if not include_deleted and str(route.get('status') or '').lower() == 'deleted':
+                continue
+            return route
+        return None
+
+    def _ensure_agent_console_ingress_route(
+        self,
+        project_id: str,
+        agent: Any,
+        target_port: int,
+        auth_header: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        agent_key = str(getattr(agent, 'key', '') or '').strip()
+        if not agent_key or not project_id:
+            return None
+
+        existing = self._find_agent_console_ingress_route(
+            project_id=project_id,
+            agent_key=agent_key,
+            target_port=target_port,
+            auth_header=auth_header,
+            include_deleted=False
+        )
+        if existing and str(existing.get('status') or '').lower() == 'ready':
+            return existing
+
+        payload = {
+            'agent_key': agent_key,
+            'external_ips': [agent.ip_address],
+            'target_port': int(target_port),
+            'host_prefix': f"{agent_key}-{int(target_port)}",
+            'path': '/',
+            'path_type': 'Prefix',
+            'service_port': int(target_port),
+            'websocket_enabled': True,
+            'owner_service': 'platform-agent',
+            'metadata': {
+                'agent_hostname': getattr(agent, 'hostname', ''),
+                'source': 'agent-detail',
+                'ingress_scope': 'agent_console',
+                'source_api': '/api/agent/agent/<agent_key>/services/<service_name>/exec/ws-connection',
+            }
+        }
+        resp = self._call_k8s_service(
+            method='POST',
+            path='/api/k8s/agent-ingress-routes',
+            project_id=project_id,
+            payload=payload,
+            headers={'Authorization': auth_header} if auth_header else None
+        )
+        if resp.status_code >= 300:
+            raise RuntimeError(f"create ingress route failed: {resp.status_code}, body={resp.text[:300]}")
+        created = resp.json() if resp.content else {}
+        if isinstance(created, dict) and created.get('route_id'):
+            return created
+        return self._find_agent_console_ingress_route(
+            project_id=project_id,
+            agent_key=agent_key,
+            target_port=target_port,
+            auth_header=auth_header,
+            include_deleted=False
+        )
+
     def _get_project_active_service_keys(self, project_id: str) -> set:
         """获取项目内当前有效服务键集合：{agent_key::service_name}。"""
         table_name = self.db_manager.get_table_name('agent_services')
@@ -2128,35 +2211,25 @@ class WebAPIServer:
                 auth_header = request.headers.get('Authorization')
                 if project_id:
                     try:
-                        all_routes = self._list_project_ingress_routes(
+                        ingress_route = self._ensure_agent_console_ingress_route(
                             project_id=project_id,
-                            include_deleted=False,
+                            agent=agent,
+                            target_port=int(self.agent_manager.agent_api_port),
                             auth_header=auth_header
                         )
-                        for route in all_routes:
-                            if str(route.get('agent_key') or '') != agent_key:
-                                continue
-                            if int(route.get('target_port') or 0) != int(self.agent_manager.agent_api_port):
-                                continue
-                            if str(route.get('status') or '').lower() != 'ready':
-                                continue
-                            if not self._is_agent_console_ingress_route(route):
-                                continue
-
-                            route_host = str(route.get('host') or '').strip()
-                            access_url = str(route.get('access_url') or '').strip()
-                            route_path = str(route.get('path') or '/').strip() or '/'
-                            ingress_route = route
+                        if ingress_route and str(ingress_route.get('status') or '').lower() == 'ready':
+                            route_host = str(ingress_route.get('host') or '').strip()
+                            access_url = str(ingress_route.get('access_url') or '').strip()
+                            route_path = str(ingress_route.get('path') or '/').strip() or '/'
                             ingress_http_url = access_url or (f"https://{route_host}{route_path}" if route_host else None)
                             if route_host:
-                                route_ws_scheme = 'wss' if bool(route.get('tls_enabled')) or access_url.startswith('https://') else 'ws'
+                                route_ws_scheme = 'wss' if bool(ingress_route.get('tls_enabled')) or access_url.startswith('https://') else 'ws'
                                 ingress_ws_url = (
                                     f"{route_ws_scheme}://{route_host}"
                                     f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(direct_query)}"
                                 )
-                            break
                     except Exception as e:
-                        self.logger.warning(f"查询Agent ingress路由失败，回退平台WS中转: agent={agent_key}, err={e}")
+                        self.logger.warning(f"查询/创建Agent ingress路由失败，回退平台WS中转: agent={agent_key}, err={e}")
 
                 ws_url = ingress_ws_url or tunnel_ws_url
                 note = (
