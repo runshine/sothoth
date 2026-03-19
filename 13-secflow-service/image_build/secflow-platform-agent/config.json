@@ -30,6 +30,16 @@
   "agent_auth_token": "your_secure_token_here",
   "daemon_auth_header": "X-API-Token",
   "daemon_auth_token": "your_secure_token_here",
+  "agent_api_timeouts": {
+    "deploy_create": [10, 7200],
+    "deploy_start": [10, 7200],
+    "deploy_stop": [10, 7200],
+    "deploy_delete": [10, 7200],
+    "undeploy": [10, 7200],
+    "file_upload": [10, 7200],
+    "deploy_start_grace_sec": 7200,
+    "deploy_start_poll_interval_sec": 15
+  },
   "daemon_read_timeout_sec": 8,
   "ttyd_probe_timeout_sec": 3,
   "refresh_interval": 30,

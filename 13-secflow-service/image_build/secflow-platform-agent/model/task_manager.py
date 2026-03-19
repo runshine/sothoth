@@ -63,12 +63,14 @@ class TaskManager:
         self.timeouts = agent_api_timeouts or {
             'default': (10, 30),
             'health_check': (5, 10),
-            'deploy_create': (10, 60),
-            'deploy_start': (10, 900),
-            'deploy_stop': (10, 120),
-            'deploy_delete': (10, 60),
-            'undeploy': (10, 180),
-            'file_upload': (10, 600),
+            'deploy_create': (10, 7200),
+            'deploy_start': (10, 7200),
+            'deploy_stop': (10, 7200),
+            'deploy_delete': (10, 7200),
+            'undeploy': (10, 7200),
+            'file_upload': (10, 7200),
+            'deploy_start_grace_sec': 7200,
+            'deploy_start_poll_interval_sec': 15,
             'stream': (10, 3600),
             'proxy': (10, 300),
         }
@@ -131,7 +133,7 @@ class TaskManager:
         start接口超时后的兜底检查。
         轮询服务状态，若服务最终进入running则判定成功；若明确失败则判定失败。
         """
-        max_wait_sec = int(self.timeouts.get('deploy_start_grace_sec', 900))
+        max_wait_sec = int(self.timeouts.get('deploy_start_grace_sec', 7200))
         poll_interval_sec = int(self.timeouts.get('deploy_start_poll_interval_sec', 15))
         deadline = time.time() + max_wait_sec
         next_log_at = 0.0

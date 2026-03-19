@@ -60,7 +60,11 @@ def main():
         config['agent_api_timeouts']['proxy'] = (10, args.timeout)
 
     if args.deploy_timeout:
-        config['agent_api_timeouts']['deploy_start'] = (10, args.deploy_timeout)
+        deploy_read_timeout = int(args.deploy_timeout)
+        deploy_timeout_tuple = (10, deploy_read_timeout)
+        for key in ('deploy_create', 'deploy_start', 'deploy_stop', 'deploy_delete', 'undeploy', 'file_upload'):
+            config['agent_api_timeouts'][key] = deploy_timeout_tuple
+        config['agent_api_timeouts']['deploy_start_grace_sec'] = deploy_read_timeout
 
     # 打印启动信息
     print("=" * 60)
