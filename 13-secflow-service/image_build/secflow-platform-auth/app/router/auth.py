@@ -8,6 +8,7 @@ import secrets
 
 from app.database import get_db
 from app.auth import create_access_token, decode_access_token, verify_machine_token, create_human_token, create_human_token_with_session, get_password_hash
+from app.config import config
 from app.schema import (
     LoginRequest, TokenResponse, MachineTokenRequest, MachineTokenCreate,
     MachineTokenResponse, MachineTokenDetailResponse, Message, UserResponse, UserCreate

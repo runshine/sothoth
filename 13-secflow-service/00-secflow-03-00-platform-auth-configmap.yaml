@@ -29,6 +29,7 @@ data:
     # 统一机机Token（用于微服务间认证）
     service_auth:
       machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+      machine_token_record_file: "/tmp/secflow-machine-token.txt"
     
     # 服务注册配置
     registry:

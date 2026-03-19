@@ -184,6 +184,34 @@ class WebAPIServer:
 
         self.logger.info(f"✓ {nacos_message}")
 
+        # 检查Auth连接与机机Token
+        auth_url = (self.config.get('auth_service_url') or 'http://secflow-platform-auth').rstrip('/')
+        machine_token = self.config.get('service_machine_token')
+        if not machine_token:
+            self.logger.error("未配置service_machine_token，拒绝启动")
+            raise ConnectionError("未配置service_machine_token")
+
+        try:
+            health_resp = requests.get(f"{auth_url}/api/auth/health", timeout=(5, 10))
+            if health_resp.status_code != 200:
+                raise ConnectionError(f"Auth健康检查失败: {health_resp.status_code}")
+
+            validate_resp = requests.post(
+                f"{auth_url}/api/auth/validate-token",
+                headers={"Authorization": f"Bearer {machine_token}"},
+                timeout=(5, 10),
+            )
+            if validate_resp.status_code != 200:
+                raise ConnectionError(f"机机Token校验失败: {validate_resp.status_code} {validate_resp.text}")
+            payload = validate_resp.json() if validate_resp.text else {}
+            if payload.get("token_type") != "machine":
+                raise ConnectionError(f"机机Token类型异常: {payload.get('token_type')}")
+
+            self.logger.info("✓ Auth连通性与机机Token校验通过")
+        except Exception as e:
+            self.logger.error(f"Auth检查失败: {e}")
+            raise ConnectionError(f"Auth检查失败: {e}")
+
         # 检查Redis连接
         redis_success, redis_message = results.get('redis', (False, 'Redis检查失败'))
         if redis_success:

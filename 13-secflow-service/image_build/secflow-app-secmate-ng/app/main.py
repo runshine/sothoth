@@ -30,6 +30,51 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def verify_auth_service_or_exit():
+    """启动时校验Auth服务连通性与机机Token有效性。"""
+    cfg = get_config().auth_service
+    machine_token = getattr(cfg, "service_machine_token", None)
+    if not machine_token:
+        logger.error("未配置auth_service.service_machine_token，拒绝启动")
+        sys.exit(1)
+
+    base_url = f"http://{cfg.host}:{cfg.port}"
+    health_url = f"{base_url}/api/auth/health"
+    validate_url = cfg.validate_url
+
+    try:
+        with urlopen(health_url, timeout=cfg.timeout) as resp:
+            if resp.status != 200:
+                logger.error(f"Auth服务健康检查失败: status={resp.status}")
+                sys.exit(1)
+    except Exception as e:
+        logger.error(f"Auth服务不可达: {e}")
+        sys.exit(1)
+
+    try:
+        req = Request(validate_url, method="POST")
+        req.add_header("Authorization", f"Bearer {machine_token}")
+        with urlopen(req, timeout=cfg.timeout) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            if resp.status != 200:
+                logger.error(f"机机Token校验失败: status={resp.status}, body={body}")
+                sys.exit(1)
+            payload = json.loads(body or "{}")
+            if payload.get("token_type") != "machine":
+                logger.error(f"机机Token类型异常: token_type={payload.get('token_type')}")
+                sys.exit(1)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+        logger.error(f"机机Token校验失败: status={e.code}, body={body}")
+        sys.exit(1)
+    except URLError as e:
+        logger.error(f"机机Token校验失败，Auth服务不可达: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"机机Token校验失败: {e}")
+        sys.exit(1)
+
+
 def register_to_menu_service():
     """向菜单注册中心注册服务"""
     config = get_config()
@@ -140,6 +185,9 @@ async def lifespan(app: FastAPI):
 
     # 设置日志级别
     logging.getLogger().setLevel(getattr(logging, config.logging.level.upper()))
+
+    verify_auth_service_or_exit()
+    logger.info("Auth服务连通性与机机Token校验通过")
 
     # 初始化数据库
     try:
