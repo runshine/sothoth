@@ -192,6 +192,46 @@ def parse_filename(filename: str) -> Dict[str, str]:
     }
 
 
+def parse_bool_arg(value: Optional[str], default: bool = False) -> bool:
+    """解析URL中的布尔参数"""
+    if value is None:
+        return default
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+
+def pick_best_file_match(results: List[Tuple["PackageFile", "Package"]],
+                         system: str,
+                         architecture: str,
+                         filename: str,
+                         package_name: str) -> Tuple["PackageFile", "Package"]:
+    """
+    从多个候选中选择“最新且最匹配”的文件
+    1) 匹配分数更高优先
+    2) upload_time 更新的优先
+    3) file id 更大的优先（兜底）
+    """
+    def _score(item: Tuple["PackageFile", "Package"]) -> Tuple[int, datetime, int]:
+        file_record, package = item
+        score = 0
+
+        if package_name:
+            if package.name == package_name:
+                score += 100
+            elif package_name.lower() in package.name.lower():
+                score += 50
+
+        if package.system == system:
+            score += 20
+        if package.architecture == architecture:
+            score += 20
+        if file_record.file_name == filename:
+            score += 20
+
+        return score, (package.upload_time or datetime.min), (file_record.id or 0)
+
+    return max(results, key=_score)
+
+
 def extract_package(source_path: str, package_id: str, package_info: Dict) -> Tuple[str, List[Dict]]:
     """
     解压软件包到存储目录
@@ -893,8 +933,8 @@ def redirect_to_latest_package():
 def redirect_to_file_by_conditions():
     """
     根据系统、架构、文件名重定向到文件
-    参数：system（必须），architecture（必须），filename（必须，不含路径的精确匹配），name（可选，软件包名）
-    返回：302重定向到文件静态路径或符合条件的文件列表
+    参数：system（必须），architecture（必须），filename（必须，不含路径的精确匹配），name（可选，软件包名），force（可选，布尔）
+    返回：302重定向到文件静态路径或符合条件的文件列表（force=true时多结果也会自动选择并重定向）
     """
     try:
         # 获取查询参数
@@ -902,6 +942,7 @@ def redirect_to_file_by_conditions():
         architecture = request.args.get('architecture', '')
         filename = request.args.get('filename', '')
         package_name = request.args.get('name', '')
+        force = parse_bool_arg(request.args.get('force'), default=False)
 
         # 验证必须参数
         if not system or not architecture or not filename:
@@ -933,9 +974,22 @@ def redirect_to_file_by_conditions():
                          (f', name={package_name}' if package_name else '')
             }), 404
 
-        # 如果只有一个匹配结果，重定向到文件
-        if len(results) == 1:
-            file_record, package = results[0]
+        # 单结果，或者 force=true 且多结果时，直接选择目标并重定向
+        if len(results) == 1 or force:
+            if len(results) == 1:
+                file_record, package = results[0]
+            else:
+                file_record, package = pick_best_file_match(
+                    results=results,
+                    system=system,
+                    architecture=architecture,
+                    filename=filename,
+                    package_name=package_name
+                )
+                logger.info(
+                    "force=true 命中多候选，自动选择: package_id=%s, package_name=%s, version=%s, file=%s",
+                    package.id, package.name, package.version, file_record.file_path
+                )
 
             # 检查文件是否存在
             if not os.path.exists(file_record.storage_path):
@@ -976,7 +1030,7 @@ def redirect_to_file_by_conditions():
             # 返回302重定向
             return redirect(redirect_url, code=302)
 
-        # 如果多个匹配结果，返回JSON列表
+        # 多个匹配结果且未 force，返回JSON列表
         else:
             matched_files = []
             for file_record, package in results:

@@ -455,9 +455,14 @@ Redirects to file by conditions (302 redirect).
 
 **Endpoint:** `GET /api/packages/files/download/by-conditions/redirect`
 
-**Query Parameters:** Same as above
+**Query Parameters:** Same as above, plus:
 
-**Response:** 302 Redirect to nginx static path or JSON list if multiple matches
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| force | boolean | No | When `true`, if multiple files match, auto-select the latest and best-matched file and redirect directly |
+
+**Response:** 302 Redirect to nginx static path.  
+If multiple matches and `force` is not true, returns JSON list.
 
 ---
 
