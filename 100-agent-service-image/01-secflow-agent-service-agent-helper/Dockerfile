@@ -72,7 +72,8 @@ RUN set -eux; \
         curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone; \
         echo ". \"$NVM_DIR/nvm.sh\"" >> /root/.bashrc; \
     fi; \
-    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude-a2a; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a"
+    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude-a2a; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a" \
+    echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
 
 # 创建 code-server 配置目录
 RUN mkdir -p /root/.config/code-server && \
