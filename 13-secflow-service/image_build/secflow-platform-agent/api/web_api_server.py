@@ -71,12 +71,14 @@ class WebAPIServer:
         agent_api_timeouts = config.get('agent_api_timeouts', {
             'default': (10, 30),
             'health_check': (5, 10),
-            'deploy_create': (10, 60),
-            'deploy_start': (10, 900),
-            'deploy_stop': (10, 120),
-            'deploy_delete': (10, 60),
-            'undeploy': (10, 180),
-            'file_upload': (10, 600),
+            'deploy_create': (10, 7200),
+            'deploy_start': (10, 7200),
+            'deploy_stop': (10, 7200),
+            'deploy_delete': (10, 7200),
+            'undeploy': (10, 7200),
+            'file_upload': (10, 7200),
+            'deploy_start_grace_sec': 7200,
+            'deploy_start_poll_interval_sec': 15,
             'stream': (10, 3600),
             'proxy': (10, 300),
         })
@@ -919,8 +921,12 @@ class WebAPIServer:
                                         container_name: str, shell: str, mode: str, user: str) -> Tuple[bool, int, str]:
         """
         预探测Agent是否支持服务终端WS接口。
-        - 404: 明确视为上游不支持 /api/services/<name>/exec/ws
-        - 非404: 认为端点存在（可能因非Upgrade请求返回400/426等）
+        这里不能再用普通 HTTP GET 探测 Flask-Sock 路由。
+        当前 nacos_client 的 `/api/services/<name>/exec/ws` 对非 Upgrade 请求会直接返回 404，
+        但真实 WebSocket 握手是可用的。这里改为做一次短连接握手探测：
+        - 握手成功: 视为支持
+        - 握手失败且上游明确 404: 视为不支持
+        - 其他状态码: 认为端点存在，但本次握手因参数/容器状态等原因失败
         """
         try:
             query = {
@@ -932,20 +938,31 @@ class WebAPIServer:
             if user:
                 query['user'] = user
 
-            probe_url = (
-                f"http://{agent.ip_address}:{self.agent_manager.agent_api_port}"
+            probe_ws_url = (
+                f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}"
                 f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(query)}"
             )
-            resp = requests.get(
-                probe_url,
-                headers={'X-Auth-Token': self.agent_manager.agent_auth_token},
-                timeout=(3, 5),
-                allow_redirects=False
-            )
-            if resp.status_code == 404:
-                detail = resp.text or '上游返回404'
+            ws = None
+            try:
+                ws = ws_client.create_connection(
+                    probe_ws_url,
+                    timeout=5,
+                    enable_multithread=True,
+                    header=[f"X-Auth-Token: {self.agent_manager.agent_auth_token}"]
+                )
+                return True, 101, ''
+            finally:
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+        except ws_client.WebSocketBadStatusException as e:
+            status_code = int(getattr(e, 'status_code', 500) or 500)
+            detail = str(e)
+            if status_code == 404:
                 return False, 404, detail
-            return True, resp.status_code, ''
+            return True, status_code, detail
         except Exception as e:
             return False, 500, str(e)
 
@@ -5189,12 +5206,14 @@ def adjust_timeout_config(config: Dict) -> Dict:
     default_timeouts = {
         'default': (10, 30),
         'health_check': (5, 10),
-        'deploy_create': (10, 60),
-        'deploy_start': (10, 900),
-        'deploy_stop': (10, 120),
-        'deploy_delete': (10, 60),
-        'undeploy': (10, 180),
-        'file_upload': (10, 600),
+        'deploy_create': (10, 7200),
+        'deploy_start': (10, 7200),
+        'deploy_stop': (10, 7200),
+        'deploy_delete': (10, 7200),
+        'undeploy': (10, 7200),
+        'file_upload': (10, 7200),
+        'deploy_start_grace_sec': 7200,
+        'deploy_start_poll_interval_sec': 15,
         'stream': (10, 3600),
         'proxy': (10, 300),
     }
