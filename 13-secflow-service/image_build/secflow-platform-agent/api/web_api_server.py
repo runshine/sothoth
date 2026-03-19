@@ -602,6 +602,48 @@ class WebAPIServer:
             return payload
         return []
 
+    def _extract_route_metadata(self, route: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = route.get('metadata') or {}
+        if isinstance(metadata, dict):
+            return metadata
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _is_agent_console_ingress_route(self, route: Dict[str, Any]) -> bool:
+        metadata = self._extract_route_metadata(route)
+        scope = str(metadata.get('ingress_scope') or '').strip().lower()
+        if scope == 'agent_console':
+            return True
+
+        target_port = int(route.get('target_port') or 0)
+        if target_port in (11197, 11198):
+            return True
+
+        owner_service = str(route.get('owner_service') or '').strip().lower()
+        source_api = str(metadata.get('source_api') or '').strip()
+        if owner_service == 'platform-agent' and 'agent/<agent_key>/ingress-routes' in source_api:
+            return True
+        return False
+
+    def _is_service_bound_ingress_route(self, route: Dict[str, Any]) -> bool:
+        metadata = self._extract_route_metadata(route)
+        scope = str(metadata.get('ingress_scope') or '').strip().lower()
+        if scope == 'service_binding':
+            return True
+        if scope == 'agent_console':
+            return False
+        service_name = str(metadata.get('service_name') or '').strip()
+        if service_name:
+            return True
+        if self._is_agent_console_ingress_route(route):
+            return False
+        return False
+
     def _get_project_active_service_keys(self, project_id: str) -> set:
         """获取项目内当前有效服务键集合：{agent_key::service_name}。"""
         table_name = self.db_manager.get_table_name('agent_services')
@@ -620,6 +662,15 @@ class WebAPIServer:
 
     def _sync_all_agent_services(self):
         """从所有在线Agent拉取服务清单并写入聚合表。"""
+        summary = {
+            'total_agents': 0,
+            'online_agents': 0,
+            'offline_agents': 0,
+            'ok_count': 0,
+            'fail_count': 0,
+            'synced_services': 0,
+            'results': []
+        }
         try:
             page = 1
             per_page = 1000
@@ -633,34 +684,45 @@ class WebAPIServer:
                     break
                 page += 1
 
-            synced_agents = 0
-            synced_services = 0
-            stale_agents = 0
+            summary['total_agents'] = len(agents)
 
             for agent_data in agents:
                 if agent_data.get('status') != 'online':
+                    summary['offline_agents'] += 1
                     if agent_data.get('key'):
                         self._mark_agent_services_stale(agent_data.get('key'))
                     continue
+                summary['online_agents'] += 1
                 agent = self.agent_manager.get_agent(agent_data.get('key'))
                 if not agent:
+                    summary['fail_count'] += 1
+                    summary['results'].append({
+                        'ok': False,
+                        'agent_key': agent_data.get('key', ''),
+                        'reason_code': 'agent_not_loaded',
+                        'reason': 'Agent对象未加载',
+                        'status_code': 404
+                    })
                     continue
 
                 sync_result = self._sync_single_agent_services(agent)
+                summary['results'].append(sync_result)
                 if not sync_result.get('ok'):
-                    stale_agents += 1
+                    summary['fail_count'] += 1
                     continue
-                synced_agents += 1
-                synced_services += int(sync_result.get('upserted', 0))
+                summary['ok_count'] += 1
+                summary['synced_services'] += int(sync_result.get('upserted', 0))
                 self.logger.debug(
                     f"服务聚合同步: agent={agent.key}, seen={sync_result.get('seen', 0)}, upserted={sync_result.get('upserted', 0)}"
                 )
 
             self.logger.info(
-                f"服务聚合同步完成: agents={synced_agents}, services={synced_services}, stale_agents={stale_agents}"
+                f"服务聚合同步完成: total={summary['total_agents']}, online={summary['online_agents']}, "
+                f"ok={summary['ok_count']}, fail={summary['fail_count']}, services={summary['synced_services']}"
             )
         except Exception as e:
             self.logger.error(f"服务聚合同步失败: {e}", exc_info=True)
+        return summary
 
     def _sync_single_agent_services(self, agent: Any) -> Dict[str, Any]:
         """强制同步单个Agent的服务状态。"""
@@ -2215,11 +2277,12 @@ class WebAPIServer:
                 include_deleted = request.args.get('include_deleted', 'false').lower() == 'true'
                 auth_header = request.headers.get('Authorization')
 
-                items = self._list_project_ingress_routes(
+                all_items = self._list_project_ingress_routes(
                     project_id=project_id,
                     include_deleted=include_deleted,
                     auth_header=auth_header
                 )
+                items = [item for item in all_items if self._is_service_bound_ingress_route(item)]
                 active_service_keys = self._get_project_active_service_keys(project_id)
 
                 enhanced_items: List[Dict[str, Any]] = []
@@ -2229,12 +2292,7 @@ class WebAPIServer:
                 error_count = 0
 
                 for item in items:
-                    metadata = item.get('metadata') or {}
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except Exception:
-                            metadata = {}
+                    metadata = self._extract_route_metadata(item)
                     assoc_service = str(metadata.get('service_name') or '').strip()
                     assoc_key = f"{item.get('agent_key', '')}::{assoc_service}" if assoc_service else ''
                     service_exists = bool(assoc_service) and assoc_key in active_service_keys
@@ -2326,17 +2384,13 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id is required'}), 400
 
                 auth_header = request.headers.get('Authorization')
-                routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=False, auth_header=auth_header)
+                all_routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=False, auth_header=auth_header)
+                routes = [item for item in all_routes if self._is_service_bound_ingress_route(item)]
                 active_service_keys = self._get_project_active_service_keys(project_id)
 
                 stale_routes: List[Dict[str, Any]] = []
                 for item in routes:
-                    metadata = item.get('metadata') or {}
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except Exception:
-                            metadata = {}
+                    metadata = self._extract_route_metadata(item)
                     assoc_service = str(metadata.get('service_name') or '').strip()
                     if not assoc_service:
                         stale_routes.append(item)
@@ -2395,7 +2449,8 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id is required'}), 400
 
                 auth_header = request.headers.get('Authorization')
-                routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=include_deleted, auth_header=auth_header)
+                all_routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=include_deleted, auth_header=auth_header)
+                routes = [item for item in all_routes if self._is_service_bound_ingress_route(item)]
                 deleted = 0
                 failed: List[Dict[str, Any]] = []
                 for route in routes:
@@ -2424,6 +2479,224 @@ class WebAPIServer:
                 }), 200 if len(failed) == 0 else 207
             except Exception as e:
                 self.logger.error(f"清空服务Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/global/ingress', methods=['GET'])
+        def list_global_agent_ingress():
+            """查询项目级 Agent 节点入口 Ingress（仅11197/11198）。"""
+            try:
+                project_id = request.args.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+                include_deleted = request.args.get('include_deleted', 'false').lower() == 'true'
+                auth_header = request.headers.get('Authorization')
+
+                all_items = self._list_project_ingress_routes(
+                    project_id=project_id,
+                    include_deleted=include_deleted,
+                    auth_header=auth_header
+                )
+                items = [item for item in all_items if self._is_agent_console_ingress_route(item)]
+
+                agents, _ = self.agent_manager.list_agents(page=1, per_page=5000, project_id=project_id)
+                online_keys = {str(a.get('key') or '').strip() for a in agents if str(a.get('status') or '').lower() == 'online'}
+
+                enhanced_items: List[Dict[str, Any]] = []
+                stale_count = 0
+                deleted_count = 0
+                ready_count = 0
+                error_count = 0
+                port_11197_count = 0
+                port_11198_count = 0
+
+                for item in items:
+                    target_port = int(item.get('target_port') or 0)
+                    agent_key = str(item.get('agent_key') or '').strip()
+                    is_deleted = bool(item.get('deleted_at')) or str(item.get('status') or '').lower() == 'deleted'
+                    is_online = agent_key in online_keys if agent_key else False
+                    is_stale = (not is_deleted) and (not is_online)
+
+                    if target_port == 11197:
+                        port_11197_count += 1
+                    elif target_port == 11198:
+                        port_11198_count += 1
+                    if is_deleted:
+                        deleted_count += 1
+                    if str(item.get('status') or '').lower() == 'ready':
+                        ready_count += 1
+                    if str(item.get('status') or '').lower() == 'error':
+                        error_count += 1
+                    if is_stale:
+                        stale_count += 1
+
+                    enhanced_items.append({
+                        **item,
+                        'agent_online': is_online,
+                        'is_stale_agent_ingress': is_stale,
+                    })
+
+                return jsonify({
+                    'project_id': project_id,
+                    'items': enhanced_items,
+                    'stats': {
+                        'total': len(enhanced_items),
+                        'ready': ready_count,
+                        'error': error_count,
+                        'deleted': deleted_count,
+                        'stale_agent_ingress': stale_count,
+                        'port_11197': port_11197_count,
+                        'port_11198': port_11198_count,
+                    }
+                })
+            except Exception as e:
+                self.logger.error(f"查询Agent节点Ingress视图失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/global/ingress/delete-batch', methods=['POST'])
+        def delete_global_agent_ingress_batch():
+            """批量删除 Agent 节点入口 Ingress。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                route_ids = data.get('route_ids') or []
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                if not isinstance(route_ids, list) or len(route_ids) == 0:
+                    return jsonify({'error': 'route_ids must be a non-empty array'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for rid in route_ids:
+                    route_id = str(rid or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'requested': len(route_ids),
+                    'deleted': deleted,
+                    'failed': failed
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"批量删除Agent节点Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/global/ingress/cleanup-stale', methods=['POST'])
+        def cleanup_stale_agent_ingress():
+            """一键删除所有离线节点关联的Agent入口Ingress。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                dry_run = bool(data.get('dry_run', False))
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                all_routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=False, auth_header=auth_header)
+                routes = [item for item in all_routes if self._is_agent_console_ingress_route(item)]
+                agents, _ = self.agent_manager.list_agents(page=1, per_page=5000, project_id=project_id)
+                online_keys = {str(a.get('key') or '').strip() for a in agents if str(a.get('status') or '').lower() == 'online'}
+
+                stale_routes: List[Dict[str, Any]] = []
+                for item in routes:
+                    agent_key = str(item.get('agent_key') or '').strip()
+                    if not agent_key or agent_key not in online_keys:
+                        stale_routes.append(item)
+
+                if dry_run:
+                    return jsonify({
+                        'project_id': project_id,
+                        'dry_run': True,
+                        'to_delete_count': len(stale_routes),
+                        'items': stale_routes,
+                    })
+
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for route in stale_routes:
+                    route_id = str(route.get('route_id') or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'dry_run': False,
+                    'target_count': len(stale_routes),
+                    'deleted': deleted,
+                    'failed': failed,
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"清理无效Agent入口Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/global/ingress/clear-all', methods=['POST'])
+        def clear_all_agent_ingress():
+            """清空项目所有Agent入口Ingress（仅11197/11198）。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                include_deleted = bool(data.get('include_deleted', False))
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                all_routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=include_deleted, auth_header=auth_header)
+                routes = [item for item in all_routes if self._is_agent_console_ingress_route(item)]
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for route in routes:
+                    route_id = str(route.get('route_id') or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'requested': len(routes),
+                    'deleted': deleted,
+                    'failed': failed
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"清空Agent入口Ingress失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/services/global/sync', methods=['POST'])
@@ -2543,14 +2816,29 @@ class WebAPIServer:
                         'results': results
                     })
                 else:
-                    self._sync_all_agent_services()
+                    summary = self._sync_all_agent_services()
+                    details = summary.get('results') or []
+                    total = int(summary.get('online_agents') or 0)
+                    ok_count = int(summary.get('ok_count') or 0)
+                    fail_count = int(summary.get('fail_count') or 0)
                     self._record_service_sync_log(
                         scope='global',
-                        status='ok',
+                        status='ok' if fail_count == 0 else 'partial',
                         stale_only=False,
-                        message='global service sync triggered'
+                        total=total,
+                        ok_count=ok_count,
+                        fail_count=fail_count,
+                        message='global service sync completed',
+                        details=details
                     )
-                    return jsonify({'message': 'global service sync triggered', 'status': 'ok'})
+                    return jsonify({
+                        'message': 'global service sync completed',
+                        'status': 'ok' if fail_count == 0 else 'partial',
+                        'total': total,
+                        'ok_count': ok_count,
+                        'fail_count': fail_count,
+                        'results': details
+                    })
             except Exception as e:
                 self.logger.error(f"手动触发服务聚合同步失败: {e}", exc_info=True)
                 try:
@@ -2563,14 +2851,36 @@ class WebAPIServer:
                     pass
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/services/global/sync/history', methods=['GET'])
+        @self.app.route('/api/agent/services/global/sync/history', methods=['GET', 'DELETE'])
         def get_global_service_sync_history():
             """查询服务强制同步历史记录。"""
             try:
+                table_name = self.db_manager.get_table_name('service_sync_logs')
+
+                if request.method == 'DELETE':
+                    project_id = request.args.get('project_id')
+                    where = []
+                    params: List[Any] = []
+                    if project_id:
+                        where.append("project_id = " + ("%s" if self.db_manager.db_type == 'mysql' else "?"))
+                        params.append(project_id)
+                    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+                    count_sql = f"SELECT COUNT(*) as count FROM {table_name} {where_sql}"
+                    count_result = self.db_manager.fetch_one(count_sql, tuple(params))
+                    target_count = int(count_result.get('count', 0) if count_result else 0)
+
+                    delete_sql = f"DELETE FROM {table_name} {where_sql}"
+                    self.db_manager.execute_query(delete_sql, tuple(params))
+                    return jsonify({
+                        'message': 'sync history cleared',
+                        'project_id': project_id,
+                        'deleted_count': target_count
+                    })
+
                 page = max(int(request.args.get('page', 1)), 1)
                 per_page = min(max(int(request.args.get('per_page', 20)), 1), 200)
                 project_id = request.args.get('project_id')
-                table_name = self.db_manager.get_table_name('service_sync_logs')
 
                 where = []
                 params: List[Any] = []
@@ -2635,6 +2945,33 @@ class WebAPIServer:
                 })
             except Exception as e:
                 self.logger.error(f"查询服务同步历史失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/services/global/sync/history/<sync_id>', methods=['DELETE'])
+        def delete_global_service_sync_history_item(sync_id):
+            """删除单条服务强制同步历史记录。"""
+            try:
+                sync_id = str(sync_id or '').strip()
+                if not sync_id:
+                    return jsonify({'error': 'sync_id is required'}), 400
+
+                table_name = self.db_manager.get_table_name('service_sync_logs')
+                placeholder = "%s" if self.db_manager.db_type == 'mysql' else "?"
+                count_row = self.db_manager.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name} WHERE sync_id = {placeholder}",
+                    (sync_id,)
+                )
+                exists = int(count_row.get('count', 0) if count_row else 0) > 0
+                if not exists:
+                    return jsonify({'error': 'sync history not found'}), 404
+
+                self.db_manager.execute_query(
+                    f"DELETE FROM {table_name} WHERE sync_id = {placeholder}",
+                    (sync_id,)
+                )
+                return jsonify({'message': 'sync history deleted', 'sync_id': sync_id})
+            except Exception as e:
+                self.logger.error(f"删除服务同步历史失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/report/services/full', methods=['POST'])
@@ -2929,6 +3266,20 @@ class WebAPIServer:
 
                 target_port = int(data.get('target_port', self.agent_ttyd_port))
                 external_ips = data.get('external_ips') or [agent.ip_address]
+                metadata = {
+                    **(data.get('metadata') or {}),
+                    'agent_hostname': agent.hostname,
+                    'source_api': '/api/agent/agent/<agent_key>/ingress-routes'
+                }
+                ingress_scope = str(metadata.get('ingress_scope') or '').strip().lower()
+                if not ingress_scope:
+                    if target_port in (11197, 11198):
+                        ingress_scope = 'agent_console'
+                    elif str(metadata.get('service_name') or '').strip():
+                        ingress_scope = 'service_binding'
+                    else:
+                        ingress_scope = 'agent_console'
+                metadata['ingress_scope'] = ingress_scope
                 payload = {
                     'agent_key': agent_key,
                     'external_ips': external_ips,
@@ -2951,11 +3302,7 @@ class WebAPIServer:
                     'owner_service': 'platform-agent',
                     'created_by': data.get('created_by'),
                     'force_recreate': bool(data.get('force_recreate', False)),
-                    'metadata': {
-                        **(data.get('metadata') or {}),
-                        'agent_hostname': agent.hostname,
-                        'source_api': '/api/agent/agent/<agent_key>/ingress-routes'
-                    }
+                    'metadata': metadata
                 }
 
                 auth_header = request.headers.get('Authorization')
@@ -3614,6 +3961,74 @@ class WebAPIServer:
                 user_ctx.get('username', '')
             )
             return jsonify({'message': message, 'template': updated, 'status': 'success'})
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/web-ports', methods=['GET', 'PUT'])
+        def manage_template_web_ports_by_id(template_id):
+            """按模板ID查询/更新WEB端口预设。"""
+            user_ctx = self._get_request_user_context()
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
+
+            if request.method == 'GET':
+                metadata = template.get('metadata') or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except Exception:
+                        metadata = {}
+                raw_presets = metadata.get('web_port_presets') if isinstance(metadata, dict) else []
+                presets = self.template_manager._normalize_web_port_presets(raw_presets)
+                return jsonify({
+                    'template_id': template_id,
+                    'template_name': template.get('name'),
+                    'web_port_presets': presets,
+                    'permissions': {
+                        'can_manage': self._check_template_manageable(template, user_ctx)
+                    }
+                })
+
+            # PUT
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
+
+            data = request.get_json(silent=True) or {}
+            web_port_presets = data.get('web_port_presets')
+            if web_port_presets is None:
+                return jsonify({'error': 'web_port_presets is required'}), 400
+            if not isinstance(web_port_presets, list):
+                return jsonify({'error': 'web_port_presets 必须是数组'}), 400
+
+            success, message, updated = self.template_manager.update_template_basic(
+                template_id=template_id,
+                web_port_presets=web_port_presets,
+                updated_by=user_ctx.get('username', 'system')
+            )
+            if not success:
+                return jsonify({'error': message}), 400
+
+            updated = self.template_manager.decorate_template_permissions(
+                updated,
+                user_ctx.get('user_id', ''),
+                user_ctx.get('username', '')
+            )
+            metadata = updated.get('metadata') or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+            normalized = self.template_manager._normalize_web_port_presets(
+                metadata.get('web_port_presets') if isinstance(metadata, dict) else []
+            )
+            return jsonify({
+                'message': 'WEB端口已更新',
+                'status': 'success',
+                'template': updated,
+                'web_port_presets': normalized
+            })
 
         @self.app.route('/api/agent/templates/<name>/yaml', methods=['GET'])
         def get_template_yaml(name):
