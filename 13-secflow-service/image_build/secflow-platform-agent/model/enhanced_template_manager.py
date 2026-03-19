@@ -1837,9 +1837,22 @@ class EnhancedTemplateManager:
         v = (value or 'shared').strip().lower()
         return v if v in ('shared', 'private') else 'shared'
 
+    @staticmethod
+    def _is_super_admin(user_id: str = '', username: str = '') -> bool:
+        """
+        超级管理员判定：
+        - UID=1 强制为管理员（核心规则）
+        - 兼容：用户名 admin 也视为管理员
+        """
+        uid = str(user_id or '').strip()
+        uname = str(username or '').strip().lower()
+        return uid == '1' or uname == 'admin'
+
     def can_view_template(self, template: Optional[Dict], user_id: str = '', username: str = '') -> bool:
         if not template:
             return False
+        if self._is_super_admin(user_id, username):
+            return True
         visibility = self._normalize_visibility(template.get('visibility'))
         if visibility == 'shared':
             return True
@@ -1854,6 +1867,8 @@ class EnhancedTemplateManager:
     def can_manage_template(self, template: Optional[Dict], user_id: str = '', username: str = '') -> bool:
         if not template:
             return False
+        if self._is_super_admin(user_id, username):
+            return True
         owner_id = str(template.get('owner_id') or '').strip()
         owner_name = str(template.get('owner_name') or '').strip()
         if owner_id and user_id and owner_id == str(user_id).strip():
@@ -2357,9 +2372,18 @@ class EnhancedTemplateManager:
         table_name = self.db.get_table_name('service_templates')
         user_id = str(user_id or '').strip()
         username = str(username or '').strip()
+        is_super_admin = self._is_super_admin(user_id, username)
 
         if self.db.db_type == 'mysql':
-            if user_id or username:
+            if is_super_admin:
+                templates = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                    (per_page, offset)
+                )
+                count_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name}"
+                )
+            elif user_id or username:
                 where_clause = "visibility = 'shared' OR owner_id = %s OR owner_name = %s"
                 templates = self.db.fetch_all(
                     f"SELECT * FROM {table_name} WHERE ({where_clause}) ORDER BY updated_at DESC LIMIT %s OFFSET %s",
@@ -2378,7 +2402,15 @@ class EnhancedTemplateManager:
                     f"SELECT COUNT(*) as count FROM {table_name} WHERE visibility = 'shared'"
                 )
         else:
-            if user_id or username:
+            if is_super_admin:
+                templates = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (per_page, offset)
+                )
+                count_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name}"
+                )
+            elif user_id or username:
                 where_clause = "visibility = 'shared' OR owner_id = ? OR owner_name = ?"
                 templates = self.db.fetch_all(
                     f"SELECT * FROM {table_name} WHERE ({where_clause}) ORDER BY updated_at DESC LIMIT ? OFFSET ?",
