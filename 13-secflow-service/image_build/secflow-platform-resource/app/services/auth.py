@@ -86,7 +86,7 @@ class AuthService:
     def __init__(
         self,
         base_url: str,
-        validate_path: str = "/api/auth/validate-human-token",
+        validate_path: str = "/api/auth/validate-token",
         timeout: int = 10,
         token_cache_ttl: int = 900
     ):
@@ -185,7 +185,7 @@ def get_auth_service() -> AuthService:
 
 def init_auth_service(
     base_url: str,
-    validate_path: str = "/api/auth/validate-human-token",
+    validate_path: str = "/api/auth/validate-token",
     timeout: int = 10,
     token_cache_ttl: int = 900
 ):

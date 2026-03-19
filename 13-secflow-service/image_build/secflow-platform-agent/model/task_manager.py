@@ -64,7 +64,7 @@ class TaskManager:
             'default': (10, 30),
             'health_check': (5, 10),
             'deploy_create': (10, 60),
-            'deploy_start': (10, 300),
+            'deploy_start': (10, 900),
             'deploy_stop': (10, 120),
             'deploy_delete': (10, 60),
             'undeploy': (10, 180),
@@ -79,6 +79,90 @@ class TaskManager:
         self.logger = logging.getLogger(__name__)
 
         self._cleanup_old_logs()
+
+    @staticmethod
+    def _is_timeout_error(status_code: int, response: Any) -> bool:
+        if status_code != 504:
+            return False
+        if isinstance(response, dict):
+            err = str(response.get('error', '')).lower()
+            return 'timeout' in err
+        return 'timeout' in str(response).lower()
+
+    @staticmethod
+    def _is_running_state(state: str) -> bool:
+        return state in {'running', 'active', 'healthy', 'started', 'up'}
+
+    @staticmethod
+    def _is_failed_state(state: str) -> bool:
+        return state in {'failed', 'error', 'exited', 'stopped', 'dead'}
+
+    @staticmethod
+    def _normalize_service_state(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ''
+        state = payload.get('status') or payload.get('state') or payload.get('service_status')
+        if isinstance(state, str):
+            return state.strip().lower()
+        if payload.get('is_running') is True:
+            return 'running'
+        return ''
+
+    def _get_service_status(self, agent_key: str, service_name: str) -> Tuple[int, Any, str]:
+        """查询Agent上服务状态，优先单服务接口，失败时回退到列表接口。"""
+        code, resp = self.agent_manager.call_agent_api(
+            agent_key, 'GET', f'/api/services/{service_name}', None, timeout_type='health_check'
+        )
+        if code == 200:
+            return code, resp, self._normalize_service_state(resp)
+
+        list_code, list_resp = self.agent_manager.call_agent_api(
+            agent_key, 'GET', '/api/services', None, timeout_type='health_check'
+        )
+        if list_code == 200 and isinstance(list_resp, list):
+            target = next((s for s in list_resp if isinstance(s, dict) and s.get('name') == service_name), None)
+            if target:
+                return 200, target, self._normalize_service_state(target)
+            return 404, {'error': 'service not found in list'}, ''
+        return code, resp, ''
+
+    def _wait_service_ready_after_start_timeout(self, task_id: str, agent_key: str, service_name: str) -> bool:
+        """
+        start接口超时后的兜底检查。
+        轮询服务状态，若服务最终进入running则判定成功；若明确失败则判定失败。
+        """
+        max_wait_sec = int(self.timeouts.get('deploy_start_grace_sec', 900))
+        poll_interval_sec = int(self.timeouts.get('deploy_start_poll_interval_sec', 15))
+        deadline = time.time() + max_wait_sec
+        next_log_at = 0.0
+
+        self._add_task_log(
+            task_id, 'WARN',
+            f"启动接口超时，进入状态轮询兜底: 最长等待{max_wait_sec}秒，间隔{poll_interval_sec}秒"
+        )
+
+        while time.time() < deadline:
+            code, payload, state = self._get_service_status(agent_key, service_name)
+            now = time.time()
+            if now >= next_log_at:
+                self._add_task_log(
+                    task_id, 'INFO',
+                    f"轮询服务状态: http={code}, state={state or 'unknown'}"
+                )
+                next_log_at = now + 60
+
+            if code == 200 and self._is_running_state(state):
+                self._add_task_log(task_id, 'INFO', "服务在超时后已就绪，判定部署成功")
+                return True
+
+            if code == 200 and self._is_failed_state(state):
+                self._add_task_log(task_id, 'ERROR', f"服务状态异常: {state}")
+                return False
+
+            time.sleep(poll_interval_sec)
+
+        self._add_task_log(task_id, 'ERROR', f"轮询超时，服务仍未进入running: {service_name}")
+        return False
 
     def _cleanup_old_logs(self):
         try:
@@ -138,6 +222,37 @@ class TaskManager:
         future.add_done_callback(lambda f: self.active_tasks.pop(task_id, None))
 
         return task_id
+
+    def find_active_task_for_service(self, task_type: str, service_name: str, agent_key: str,
+                                     project_id: Optional[str] = None) -> Optional[Dict]:
+        """
+        查询同项目/同Agent/同服务名是否存在进行中的任务（pending/running）。
+        用于部署防重。
+        """
+        table_tasks = self.db.get_table_name('tasks')
+        if self.db.db_type == 'mysql':
+            query = f'''
+                SELECT * FROM {table_tasks}
+                WHERE task_type = %s
+                  AND service_name = %s
+                  AND agent_key = %s
+                  AND project_id = %s
+                  AND status IN ('pending', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+            '''
+        else:
+            query = f'''
+                SELECT * FROM {table_tasks}
+                WHERE task_type = ?
+                  AND service_name = ?
+                  AND agent_key = ?
+                  AND project_id = ?
+                  AND status IN ('pending', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+            '''
+        return self.db.fetch_one(query, (task_type, service_name, agent_key, project_id or ''))
 
     def _execute_task(self, task_id: str, task_type: str, service_name: str,
                       agent_key: str, template_name: str, extra_params: Dict):
@@ -343,6 +458,15 @@ class TaskManager:
             if start_status_code == 200:
                 self._update_task_status(task_id, 'success', 100, '服务部署成功')
                 self._add_task_log(task_id, 'INFO', '服务部署完成')
+            elif self._is_timeout_error(start_status_code, start_response):
+                # start接口超时不等于服务启动失败：避免误清理，先轮询服务实际状态
+                self._add_task_log(task_id, 'WARN', f"启动请求超时: {start_response}")
+                if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
+                    self._update_task_status(task_id, 'success', 100, '服务部署成功（超时后状态确认）')
+                else:
+                    error_msg = f'启动服务超时，且轮询未就绪: {start_response}'
+                    self._update_task_status(task_id, 'failed', 70, error_msg)
+                    self._add_task_log(task_id, 'ERROR', error_msg)
             else:
                 error_msg = f'启动服务失败: {start_response}'
                 self._update_task_status(task_id, 'failed', 70, error_msg)
@@ -402,6 +526,13 @@ class TaskManager:
 
                 if start_status_code == 200:
                     self._update_task_status(task_id, 'success', 100, '服务重新部署成功')
+                elif self._is_timeout_error(start_status_code, start_response):
+                    self._add_task_log(task_id, 'WARN', f"重建后启动请求超时: {start_response}")
+                    if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
+                        self._update_task_status(task_id, 'success', 100, '服务重新部署成功（超时后状态确认）')
+                    else:
+                        error_msg = f'重新部署后启动服务超时，且轮询未就绪: {start_response}'
+                        self._update_task_status(task_id, 'failed', 70, error_msg)
                 else:
                     error_msg = f'重新部署后启动服务失败: {start_response}'
                     self._update_task_status(task_id, 'failed', 70, error_msg)
@@ -477,6 +608,14 @@ class TaskManager:
             if start_status_code == 200:
                 self._update_task_status(task_id, 'success', 100, '压缩服务部署成功')
                 self._add_task_log(task_id, 'INFO', '压缩服务部署完成')
+            elif self._is_timeout_error(start_status_code, start_response):
+                self._add_task_log(task_id, 'WARN', f"启动压缩服务请求超时: {start_response}")
+                if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
+                    self._update_task_status(task_id, 'success', 100, '压缩服务部署成功（超时后状态确认）')
+                else:
+                    error_msg = f'启动压缩服务超时，且轮询未就绪: {start_response}'
+                    self._update_task_status(task_id, 'failed', 70, error_msg)
+                    self._add_task_log(task_id, 'ERROR', error_msg)
             else:
                 error_msg = f'启动压缩服务失败: {start_response}'
                 self._update_task_status(task_id, 'failed', 70, error_msg)
@@ -661,3 +800,61 @@ class TaskManager:
         except Exception as e:
             self.logger.error(f"删除任务失败: {str(e)}")
             return False
+
+    def delete_tasks_by_project(self, project_id: str) -> int:
+        """按项目清空全部任务记录（含日志）。返回删除的任务数。"""
+        if not project_id:
+            return 0
+
+        try:
+            table_tasks = self.db.get_table_name('tasks')
+            table_logs = self.db.get_table_name('task_logs')
+
+            # 先查出任务ID，用于取消内存中的活跃任务
+            if self.db.db_type == 'mysql':
+                rows = self.db.fetch_all(
+                    f"SELECT task_id FROM {table_tasks} WHERE project_id = %s",
+                    (project_id,)
+                ) or []
+            else:
+                rows = self.db.fetch_all(
+                    f"SELECT task_id FROM {table_tasks} WHERE project_id = ?",
+                    (project_id,)
+                ) or []
+
+            task_ids = [str(r.get('task_id')) for r in rows if r.get('task_id')]
+            if not task_ids:
+                return 0
+
+            # 批量删除日志和任务
+            if self.db.db_type == 'mysql':
+                self.db.execute_transaction([
+                    (
+                        f"DELETE {table_logs} FROM {table_logs} "
+                        f"INNER JOIN {table_tasks} ON {table_logs}.task_id = {table_tasks}.task_id "
+                        f"WHERE {table_tasks}.project_id = %s",
+                        (project_id,)
+                    ),
+                    (f"DELETE FROM {table_tasks} WHERE project_id = %s", (project_id,))
+                ])
+            else:
+                self.db.execute_transaction([
+                    (
+                        f"DELETE FROM {table_logs} WHERE task_id IN "
+                        f"(SELECT task_id FROM {table_tasks} WHERE project_id = ?)",
+                        (project_id,)
+                    ),
+                    (f"DELETE FROM {table_tasks} WHERE project_id = ?", (project_id,))
+                ])
+
+            # 取消活跃任务future
+            for task_id in task_ids:
+                future = self.active_tasks.pop(task_id, None)
+                if future and not future.done():
+                    future.cancel()
+
+            self.logger.info(f"项目任务清空成功: project_id={project_id}, deleted={len(task_ids)}")
+            return len(task_ids)
+        except Exception as e:
+            self.logger.error(f"按项目清空任务失败: project_id={project_id}, err={str(e)}", exc_info=True)
+            return 0

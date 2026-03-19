@@ -1016,13 +1016,89 @@ class KubernetesService:
         except ApiException as e:
             self._handle_api_exception(e, "Secret", "删除")
 
+    def sync_tls_secret(
+        self,
+        source_namespace: str,
+        source_secret_name: str,
+        target_namespace: str,
+        target_secret_name: str,
+    ) -> Dict:
+        """从源命名空间复制 TLS Secret 到目标命名空间（存在则覆盖）"""
+        try:
+            source_secret = self.core_v1.read_namespaced_secret(
+                name=source_secret_name,
+                namespace=source_namespace,
+            )
+        except ApiException as e:
+            self._handle_api_exception(e, "源TLS Secret", "读取")
+
+        if source_secret.type != "kubernetes.io/tls":
+            raise ValidationError(
+                f"源Secret不是TLS类型: {source_namespace}/{source_secret_name}, type={source_secret.type}"
+            )
+
+        source_data = source_secret.data or {}
+        tls_crt = source_data.get("tls.crt")
+        tls_key = source_data.get("tls.key")
+        if not tls_crt or not tls_key:
+            raise ValidationError(
+                f"源TLS Secret缺少必需字段 tls.crt 或 tls.key: {source_namespace}/{source_secret_name}"
+            )
+
+        from kubernetes.client import V1ObjectMeta, V1Secret
+
+        target_body = V1Secret(
+            metadata=V1ObjectMeta(
+                name=target_secret_name,
+                namespace=target_namespace,
+                labels={
+                    "managed-by": "secflow-platform-k8s",
+                    "secflow.tls-source-namespace": source_namespace,
+                    "secflow.tls-source-secret": source_secret_name,
+                },
+            ),
+            type="kubernetes.io/tls",
+            data={
+                "tls.crt": tls_crt,
+                "tls.key": tls_key,
+            },
+        )
+
+        try:
+            self.core_v1.read_namespaced_secret(
+                name=target_secret_name,
+                namespace=target_namespace,
+            )
+            self.core_v1.replace_namespaced_secret(
+                name=target_secret_name,
+                namespace=target_namespace,
+                body=target_body,
+            )
+            action = "replaced"
+        except ApiException as e:
+            if e.status != 404:
+                self._handle_api_exception(e, "目标TLS Secret", "检查")
+            self.core_v1.create_namespaced_secret(
+                namespace=target_namespace,
+                body=target_body,
+            )
+            action = "created"
+
+        return {
+            "source_namespace": source_namespace,
+            "source_secret_name": source_secret_name,
+            "target_namespace": target_namespace,
+            "target_secret_name": target_secret_name,
+            "action": action,
+        }
+
     def _secret_to_dict(self, sec) -> Dict:
         """Secret对象转字典"""
         return {
             "name": sec.metadata.name,
             "namespace": sec.metadata.namespace,
-                "label": sec.metadata.label or {},
-            "annotation": sec.metadata.annotation or {},
+            "label": sec.metadata.labels or {},
+            "annotation": sec.metadata.annotations or {},
     "type": sec.type,
             "data": sec.data or {},
             "created_at": sec.metadata.creation_timestamp.isoformat() if sec.metadata.creation_timestamp else None,
@@ -1096,8 +1172,8 @@ class KubernetesService:
         return {
             "name": cm.metadata.name,
             "namespace": cm.metadata.namespace,
-                    "label": cm.metadata.label or {},
-            "annotation": cm.metadata.annotation or {},
+            "label": cm.metadata.labels or {},
+            "annotation": cm.metadata.annotations or {},
 "data": cm.data or {},
             "binary_data": cm.binary_data or {},
             "created_at": cm.metadata.creation_timestamp.isoformat() if cm.metadata.creation_timestamp else None,
@@ -1366,8 +1442,8 @@ class KubernetesService:
         return {
             "name": ss.metadata.name,
             "namespace": ss.metadata.namespace,
-            "label": ss.metadata.label or {},
-            "annotation": ss.metadata.annotation or {},
+            "label": ss.metadata.labels or {},
+            "annotation": ss.metadata.annotations or {},
             "replica": ss.spec.replicas if ss.spec else 0,
             "ready_replicas": ss.status.ready_replicas if ss.status else 0,
             "current_replica": ss.status.current_replicas if ss.status else 0,
@@ -1467,8 +1543,8 @@ class KubernetesService:
         return {
             "name": ds.metadata.name,
             "namespace": ds.metadata.namespace,
-            "label": ds.metadata.label or {},
-            "annotation": ds.metadata.annotation or {},
+            "label": ds.metadata.labels or {},
+            "annotation": ds.metadata.annotations or {},
             "desired_scheduled": ds.status.desired_scheduled if ds.status else 0,
             "current_scheduled": ds.status.current_scheduled if ds.status else 0,
             "ready": ds.status.ready_replicas if ds.status else 0,
@@ -1766,8 +1842,8 @@ class KubernetesService:
         return {
             "name": pvc.metadata.name,
             "namespace": pvc.metadata.namespace,
-            "label": pvc.metadata.label or {},
-            "annotation": pvc.metadata.annotation or {},
+            "label": pvc.metadata.labels or {},
+            "annotation": pvc.metadata.annotations or {},
             "status": pvc.status.phase if pvc.status else "Unknown",
             "access_modes": pvc.spec.access_modes if pvc.spec else [],
             "volume_mode": pvc.spec.volume_mode if pvc.spec else None,

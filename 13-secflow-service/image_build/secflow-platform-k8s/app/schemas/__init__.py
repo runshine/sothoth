@@ -9,6 +9,7 @@ from app.schemas.k8s_schemas import (
     # 通用
     ErrorResponse,
     SuccessResponse,
+    ProjectTLSSyncRequest,
     K8SResourceMetadata,
     K8SResourceListResponse,
     # Pod
@@ -80,6 +81,7 @@ __all__ = [
     "TokenPayload",
     "ErrorResponse",
     "SuccessResponse",
+    "ProjectTLSSyncRequest",
     "K8SResourceMetadata",
     "K8SResourceListResponse",
     "PodInfo",

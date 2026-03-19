@@ -25,7 +25,8 @@ class ProjectService:
         self,
         base_url: str,
         get_project_path: str = "/api/project",
-        timeout: int = 10
+        timeout: int = 10,
+        service_machine_token: Optional[str] = None,
     ):
         """
         初始化项目服务。
@@ -38,11 +39,19 @@ class ProjectService:
         self.base_url = base_url.rstrip("/")
         self.get_project_path = get_project_path
         self.timeout = timeout
+        self.service_machine_token = service_machine_token
+
+    def _build_headers(self, token: Optional[str]) -> dict:
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+        if self.service_machine_token:
+            return {"Authorization": f"Bearer {self.service_machine_token}"}
+        return {}
 
     async def get_project(
         self,
         project_id: str,
-        token: str
+        token: Optional[str] = None
     ) -> Optional[ProjectInfo]:
         """
         获取项目信息（验证项目是否存在及权限）。
@@ -56,7 +65,7 @@ class ProjectService:
             None: 项目不存在或无权限
         """
         url = f"{self.base_url}{self.get_project_path}/{project_id}"
-        headers = {"Authorization": f"Bearer {token}"}
+        headers = self._build_headers(token)
 
         try:
             async with httpx.AsyncClient() as client:
@@ -81,7 +90,7 @@ class ProjectService:
     async def validate_project_access(
         self,
         project_id: str,
-        token: str
+        token: Optional[str] = None
     ) -> tuple[bool, Optional[ProjectInfo]]:
         """
         验证用户对项目的访问权限。
@@ -106,7 +115,7 @@ class ProjectService:
     async def get_project_info(
         self,
         project_id: str,
-        token: str
+        token: Optional[str] = None
     ) -> dict:
         """
         获取项目信息（返回字典格式）。
@@ -147,12 +156,14 @@ def get_project_service() -> ProjectService:
 def init_project_service(
     base_url: str,
     get_project_path: str = "/api/project",
-    timeout: int = 10
+    timeout: int = 10,
+    service_machine_token: Optional[str] = None,
 ):
     """初始化项目服务实例。"""
     global _project_service
     _project_service = ProjectService(
         base_url=base_url,
         get_project_path=get_project_path,
-        timeout=timeout
+        timeout=timeout,
+        service_machine_token=service_machine_token,
     )

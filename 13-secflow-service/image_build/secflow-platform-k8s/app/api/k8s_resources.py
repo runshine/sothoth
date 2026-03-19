@@ -31,6 +31,7 @@ from app.services.k8s import get_k8s_service
 from app.schemas import (
     ErrorResponse,
     SuccessResponse,
+    ProjectTLSSyncRequest,
     PodListResponse,
     PodInfo,
     PodLogResponse,
@@ -832,9 +833,23 @@ async def create_dynamic_agent_ingress_route(
     path = _normalize_path(request.path or conf.default_path)
     ingress_type = request.ingress_type or conf.default_ingress_type
     path_type = request.path_type or conf.default_path_type
-    service_port = int(request.service_port if request.service_port is not None else conf.default_service_port)
+    # Agent动态转发场景下，若未显式指定service_port，应与target_port保持一致，
+    # 否则Ingress会错误回源到默认80端口导致502。
+    service_port = int(request.service_port if request.service_port is not None else target_port)
     tls_enabled = bool(conf.default_tls_enabled if request.tls_enabled is None else request.tls_enabled)
     tls_secret_name = request.tls_secret_name if request.tls_secret_name is not None else conf.default_tls_secret_name
+    if tls_secret_name == "wildcard-code-server.sothothv2.com-tls":
+        # 兼容历史配置，统一切换到当前公共TLS Secret
+        tls_secret_name = "wildcard-sothothv2.com-tls"
+    if tls_enabled and (not tls_secret_name or not str(tls_secret_name).strip()):
+        raise ValidationError("已启用TLS但未配置tls_secret_name，请配置公共TLS Secret名称")
+    if tls_enabled:
+        try:
+            get_k8s_service().get_secret(namespace, tls_secret_name)
+        except Exception:
+            raise ValidationError(
+                f"目标命名空间缺少TLS Secret: {tls_secret_name}，请先在 {namespace} 中创建该公共Secret"
+            )
     websocket_enabled = bool(conf.default_websocket_enabled if request.websocket_enabled is None else request.websocket_enabled)
     proxy_body_size = request.proxy_body_size if request.proxy_body_size is not None else conf.default_proxy_body_size
     proxy_connect_timeout = int(request.proxy_connect_timeout if request.proxy_connect_timeout is not None else conf.default_proxy_connect_timeout)
@@ -963,6 +978,26 @@ async def delete_dynamic_agent_ingress_route(
 
 
 # ==================== Secret 管理 ====================
+
+
+@router.post("/projects/{project_id}/tls-secret/sync", response_model=SuccessResponse, summary="同步项目TLS Secret")
+async def sync_project_tls_secret(
+    project_id: str,
+    request: ProjectTLSSyncRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    将源命名空间中的 TLS Secret 复制到项目命名空间（已存在则覆盖）。
+    """
+    _, namespace = await get_project_and_namespace(project_id, current_user, db)
+    result = get_k8s_service().sync_tls_secret(
+        source_namespace=request.source_namespace,
+        source_secret_name=request.source_secret_name,
+        target_namespace=namespace,
+        target_secret_name=request.target_secret_name,
+    )
+    return SuccessResponse(message="项目TLS Secret同步成功", data=result)
 
 
 @router.get("/secrets", response_model=SecretListResponse, summary="获取Secret列表")

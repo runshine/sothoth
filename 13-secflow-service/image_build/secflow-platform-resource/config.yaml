@@ -22,7 +22,8 @@ app:
 # Auth Service Configuration (for token validation)
 auth_service:
   base_url: "http://192.168.12.44:10000"
-  validate_token_path: "/api/auth/validate-human-token"
+  validate_token_path: "/api/auth/validate-token"
+  service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
   timeout: 10
   # Token缓存有效期（秒），默认15分钟
   # 在缓存有效期内，同一Token的验证请求将直接从缓存返回，不再请求auth服务

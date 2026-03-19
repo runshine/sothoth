@@ -3,6 +3,7 @@ openvpn_service/docker/nacos_data
 openvpn_service/docker/vpn-status/openvpn
 .venv
 99-external-service/certs
+00-pre-init/certs
 13-secflow-service/00-secflow-06-00-platform-static-binary/downloads
 
 # Python

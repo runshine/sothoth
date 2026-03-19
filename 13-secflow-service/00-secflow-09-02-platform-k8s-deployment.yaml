@@ -13,6 +13,7 @@ spec:
       labels:
         name: secflow-platform-k8s
     spec:
+      serviceAccountName: secflow-platform-k8s-serviceaccount
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-k8s

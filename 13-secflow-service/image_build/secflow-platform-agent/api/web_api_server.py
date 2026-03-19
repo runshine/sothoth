@@ -10,6 +10,7 @@ from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import io
 import zipfile
+from urllib.parse import quote, urlencode
 
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
@@ -24,6 +25,7 @@ from model.enhanced_template_manager import EnhancedTemplateManager
 from model.agent_manager import AgentManager
 from model.task_manager import TaskManager
 from model.enhanced_proxy_manager import EnhancedProxyManager
+from model.model import AgentInfo
 
 from flask import send_file, redirect, Response
 # ===================== Flask应用 =====================
@@ -66,7 +68,7 @@ class WebAPIServer:
             'default': (10, 30),
             'health_check': (5, 10),
             'deploy_create': (10, 60),
-            'deploy_start': (10, 300),
+            'deploy_start': (10, 900),
             'deploy_stop': (10, 120),
             'deploy_delete': (10, 60),
             'undeploy': (10, 180),
@@ -111,6 +113,7 @@ class WebAPIServer:
         self.ttyd_probe_timeout_sec = int(config.get('ttyd_probe_timeout_sec', 3))
         self.k8s_service_url = (config.get('k8s_service_url') or '').rstrip('/')
         self.k8s_service_timeout_sec = int(config.get('k8s_service_timeout_sec', 15))
+        self.service_machine_token = config.get('service_machine_token')
 
         # 11. 注册路由
         self._register_routes()
@@ -205,6 +208,8 @@ class WebAPIServer:
         req_headers = {}
         if headers:
             req_headers.update(headers)
+        if 'Authorization' not in req_headers and self.service_machine_token:
+            req_headers['Authorization'] = f"Bearer {self.service_machine_token}"
         if payload is not None:
             req_headers.setdefault('Content-Type', 'application/json')
 
@@ -378,6 +383,133 @@ class WebAPIServer:
                 (agent_key,)
             )
 
+    def _resolve_or_auto_create_agent_for_report(self, agent_key: str):
+        """服务上报场景下，允许未知agent自动发现并创建。"""
+        agent = self.agent_manager.get_agent(agent_key)
+        if agent:
+            return agent
+
+        try:
+            agent = self.agent_manager.ensure_agent_exists(agent_key)
+        except Exception as e:
+            self.logger.warning(f"服务上报自动创建Agent失败: key={agent_key}, err={e}")
+            agent = None
+
+        return agent
+
+    def _upsert_agent_from_report(self, agent_key: str, report_data: Dict[str, Any]):
+        """根据Agent上报负载补齐/修正Agent主记录。"""
+        if not agent_key:
+            return None
+
+        project_id = str(report_data.get('project_id') or report_data.get('workspace_id') or '').strip()
+        hostname = str(report_data.get('hostname') or '').strip()
+        ip_address = str(report_data.get('ip_address') or report_data.get('agent_ip') or '').strip()
+        full_name = str(report_data.get('full_name') or '').strip()
+
+        agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
+        if agent:
+            if project_id:
+                agent.project_id = project_id
+            if hostname:
+                agent.hostname = hostname
+            if ip_address:
+                agent.ip_address = ip_address
+
+            if full_name:
+                agent.full_name = full_name
+            elif agent.project_id and agent.hostname and agent.ip_address:
+                agent.full_name = f"{agent.project_id}-{agent.hostname}-{agent.ip_address}"
+            elif not agent.full_name:
+                agent.full_name = agent_key
+
+            agent.status = 'online'
+            agent.last_seen = datetime.now()
+            self.agent_manager._save_agent_to_db(agent)
+            if agent.project_id:
+                with self.agent_manager.lock:
+                    self.agent_manager.agents[agent.key] = agent
+                    self.agent_manager._update_project(agent.project_id, agent.key)
+            return agent
+
+        if not project_id:
+            return None
+
+        if not hostname:
+            hostname = f"agent-{agent_key[:8]}"
+        if not full_name:
+            full_name = f"{project_id}-{hostname}-{ip_address}" if ip_address else f"{project_id}-{hostname}"
+        created = AgentInfo(
+            key=agent_key,
+            ip_address=ip_address,
+            hostname=hostname,
+            project_id=project_id,
+            full_name=full_name,
+            status='online',
+            pod_id=self.config.get('pod_id', '')
+        )
+        created.last_seen = datetime.now()
+        self.agent_manager._save_agent_to_db(created)
+        ensured = self.agent_manager.ensure_agent_exists(agent_key)
+        if ensured and ensured.project_id:
+            with self.agent_manager.lock:
+                self.agent_manager.agents[ensured.key] = ensured
+                self.agent_manager._update_project(ensured.project_id, ensured.key)
+        return ensured
+
+    def _cleanup_agent_k8s_resources(self, project_id: str, agent_key: str) -> Dict[str, Any]:
+        """清理agent关联的K8S资源（当前含动态Ingress路由）。"""
+        result = {
+            'agent_key': agent_key,
+            'success': True,
+            'deleted_ingress_routes': 0,
+            'errors': []
+        }
+        if not project_id or not agent_key:
+            return result
+
+        try:
+            list_resp = self._call_k8s_service(
+                method='GET',
+                path='/api/k8s/agent-ingress-routes',
+                project_id=project_id,
+                params={'agent_key': agent_key},
+            )
+            if list_resp.status_code >= 300:
+                result['success'] = False
+                result['errors'].append(f"list ingress routes failed: {list_resp.status_code}")
+                return result
+
+            payload = list_resp.json() if list_resp.content else {}
+            items = []
+            if isinstance(payload, dict):
+                raw_items = payload.get('items') or payload.get('routes') or []
+                if isinstance(raw_items, list):
+                    items = raw_items
+            elif isinstance(payload, list):
+                items = payload
+
+            for item in items:
+                route_id = str((item or {}).get('route_id') or (item or {}).get('id') or '').strip()
+                if not route_id:
+                    continue
+                del_resp = self._call_k8s_service(
+                    method='DELETE',
+                    path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                    project_id=project_id,
+                    params={'agent_key': agent_key},
+                )
+                if del_resp.status_code < 300:
+                    result['deleted_ingress_routes'] += 1
+                else:
+                    result['success'] = False
+                    result['errors'].append(f"delete ingress route {route_id} failed: {del_resp.status_code}")
+        except Exception as e:
+            result['success'] = False
+            result['errors'].append(str(e))
+
+        return result
+
     def _get_stale_agent_keys(self, project_id: Optional[str] = None) -> set:
         table_name = self.db_manager.get_table_name('agent_services')
         if self.db_manager.db_type == 'mysql':
@@ -401,6 +533,42 @@ class WebAPIServer:
                     f"SELECT DISTINCT agent_key FROM {table_name} WHERE is_stale = 1"
                 )
         return {str(row.get('agent_key')) for row in rows if row.get('agent_key')}
+
+    def _list_project_ingress_routes(self, project_id: str, include_deleted: bool = False,
+                                     auth_header: Optional[str] = None) -> List[Dict[str, Any]]:
+        """查询项目下动态Ingress路由列表（来自platform-k8s）。"""
+        resp = self._call_k8s_service(
+            method='GET',
+            path='/api/k8s/agent-ingress-routes',
+            project_id=project_id,
+            params={'include_deleted': str(include_deleted).lower()},
+            headers={'Authorization': auth_header} if auth_header else None
+        )
+        if resp.status_code >= 300:
+            raise RuntimeError(f"list ingress routes failed: {resp.status_code}, body={resp.text[:200]}")
+        payload = resp.json() if resp.content else {}
+        if isinstance(payload, dict):
+            items = payload.get('items') or payload.get('routes') or []
+            return items if isinstance(items, list) else []
+        if isinstance(payload, list):
+            return payload
+        return []
+
+    def _get_project_active_service_keys(self, project_id: str) -> set:
+        """获取项目内当前有效服务键集合：{agent_key::service_name}。"""
+        table_name = self.db_manager.get_table_name('agent_services')
+        where_sql = "project_id = %s AND is_stale = 0" if self.db_manager.db_type == 'mysql' else "project_id = ? AND is_stale = 0"
+        rows = self.db_manager.fetch_all(
+            f"SELECT agent_key, service_name FROM {table_name} WHERE {where_sql}",
+            (project_id,)
+        ) or []
+        keys = set()
+        for row in rows:
+            ak = str(row.get('agent_key') or '').strip()
+            sn = str(row.get('service_name') or '').strip()
+            if ak and sn:
+                keys.add(f"{ak}::{sn}")
+        return keys
 
     def _sync_all_agent_services(self):
         """从所有在线Agent拉取服务清单并写入聚合表。"""
@@ -449,14 +617,36 @@ class WebAPIServer:
     def _sync_single_agent_services(self, agent: Any) -> Dict[str, Any]:
         """强制同步单个Agent的服务状态。"""
         if not agent:
-            return {'ok': False, 'error': 'agent_not_found'}
+            return {
+                'ok': False,
+                'agent_key': '',
+                'reason_code': 'agent_not_found',
+                'reason': 'Agent对象不存在',
+                'status_code': 404
+            }
 
+        begin = time.time()
         status_code, response = self.agent_manager.call_agent_api(
-            agent.key, 'GET', '/api/services', timeout_type='health_check'
+            agent.key, 'GET', '/api/services', timeout_type='proxy'
         )
         if status_code != 200:
             self._mark_agent_services_stale(agent.key)
-            return {'ok': False, 'error': f'agent_api_status_{status_code}', 'status_code': status_code}
+            reason = ''
+            if isinstance(response, dict):
+                reason = str(response.get('error') or response.get('message') or '')
+            elif isinstance(response, str):
+                reason = response
+            if not reason:
+                reason = f'Agent API返回状态码 {status_code}'
+            return {
+                'ok': False,
+                'agent_key': agent.key,
+                'reason_code': f'agent_api_status_{status_code}',
+                'reason': reason,
+                'status_code': status_code,
+                'agent_status': getattr(agent, 'status', 'unknown'),
+                'duration_ms': int((time.time() - begin) * 1000)
+            }
 
         services = []
         if isinstance(response, list):
@@ -466,14 +656,158 @@ class WebAPIServer:
                 services = response.get('services') or []
             elif isinstance(response.get('items'), list):
                 services = response.get('items') or []
+            else:
+                return {
+                    'ok': False,
+                    'agent_key': agent.key,
+                    'reason_code': 'invalid_services_payload',
+                    'reason': 'Agent /api/services 返回格式不符合预期（缺少列表字段）',
+                    'status_code': 200,
+                    'agent_status': getattr(agent, 'status', 'unknown'),
+                    'duration_ms': int((time.time() - begin) * 1000)
+                }
+        else:
+            return {
+                'ok': False,
+                'agent_key': agent.key,
+                'reason_code': 'invalid_services_payload',
+                'reason': 'Agent /api/services 返回非JSON列表格式',
+                'status_code': 200,
+                'agent_status': getattr(agent, 'status', 'unknown'),
+                'duration_ms': int((time.time() - begin) * 1000)
+            }
 
-        seen, upserted = self._upsert_agent_services_snapshot(agent, services, source='pull_force')
-        return {'ok': True, 'agent_key': agent.key, 'seen': seen, 'upserted': upserted}
+        try:
+            seen, upserted = self._upsert_agent_services_snapshot(agent, services, source='pull_force')
+            return {
+                'ok': True,
+                'agent_key': agent.key,
+                'seen': seen,
+                'upserted': upserted,
+                'reason_code': 'success',
+                'reason': '同步成功',
+                'status_code': 200,
+                'agent_status': getattr(agent, 'status', 'unknown'),
+                'duration_ms': int((time.time() - begin) * 1000)
+            }
+        except Exception as e:
+            self.logger.error(f"写入服务聚合表失败: agent={agent.key}, err={e}", exc_info=True)
+            return {
+                'ok': False,
+                'agent_key': agent.key,
+                'reason_code': 'db_upsert_failed',
+                'reason': f'服务状态入库失败: {str(e)}',
+                'status_code': 500,
+                'agent_status': getattr(agent, 'status', 'unknown'),
+                'duration_ms': int((time.time() - begin) * 1000)
+            }
 
     def _is_agent_report_authenticated(self) -> bool:
         token = request.headers.get('X-Auth-Token')
         expected = self.config.get('agent_auth_token') or ''
         return bool(token) and token == expected
+
+    def _get_request_user_context(self) -> Dict[str, str]:
+        """从请求中提取用户身份信息（优先JWT，其次透传头）"""
+        user_id = ''
+        username = ''
+        token_type = ''
+
+        try:
+            auth_header = request.headers.get('Authorization', '')
+            if auth_header.lower().startswith('bearer '):
+                token = auth_header.split(' ', 1)[1].strip()
+                token_parts = token.split('.')
+                if len(token_parts) >= 2:
+                    payload_b64 = token_parts[1]
+                    padding = '=' * (-len(payload_b64) % 4)
+                    decoded = base64.urlsafe_b64decode(payload_b64 + padding)
+                    payload = json.loads(decoded.decode('utf-8'))
+                    user_id = str(payload.get('sub') or '').strip()
+                    username = str(payload.get('username') or '').strip()
+                    token_type = str(payload.get('type') or '').strip().lower()
+        except Exception:
+            pass
+
+        header_user_id = str(request.headers.get('X-User-Id') or '').strip()
+        header_username = str(request.headers.get('X-Username') or '').strip()
+        if not user_id and header_user_id:
+            user_id = header_user_id
+        if not username and header_username:
+            username = header_username
+
+        # 兜底兼容，避免空身份影响历史流程
+        if not user_id:
+            user_id = 'system'
+        if not username:
+            username = 'system'
+
+        return {
+            'user_id': user_id,
+            'username': username,
+            'token_type': token_type
+        }
+
+    def _check_template_visible(self, template: Optional[Dict], user_ctx: Dict[str, str]) -> bool:
+        return self.template_manager.can_view_template(
+            template,
+            user_ctx.get('user_id', ''),
+            user_ctx.get('username', '')
+        )
+
+    def _check_template_manageable(self, template: Optional[Dict], user_ctx: Dict[str, str]) -> bool:
+        return self.template_manager.can_manage_template(
+            template,
+            user_ctx.get('user_id', ''),
+            user_ctx.get('username', '')
+        )
+
+    def _service_exists_on_agent(self, agent_key: str, service_name: str) -> bool:
+        """检查Agent上是否已存在同名服务。"""
+        try:
+            status_code, response = self.agent_manager.call_agent_api(
+                agent_key, 'GET', f'/api/services/{service_name}', None, timeout_type='health_check'
+            )
+            if status_code == 200:
+                return True
+
+            # 兼容部分Agent不支持单服务查询，回退到列表查询
+            list_code, list_resp = self.agent_manager.call_agent_api(
+                agent_key, 'GET', '/api/services', None, timeout_type='health_check'
+            )
+            if list_code == 200:
+                if isinstance(list_resp, list):
+                    return any(isinstance(item, dict) and item.get('name') == service_name for item in list_resp)
+                if isinstance(list_resp, dict):
+                    services = list_resp.get('services') or list_resp.get('items') or []
+                    if isinstance(services, list):
+                        return any(isinstance(item, dict) and item.get('name') == service_name for item in services)
+            return False
+        except Exception as e:
+            self.logger.warning(f"检查Agent服务是否重复失败: agent={agent_key}, service={service_name}, error={e}")
+            # 无法确定时不阻断请求，交由后续流程处理
+            return False
+
+    def _check_deploy_duplicate(self, service_name: str, agent_key: str, project_id: str) -> Optional[Dict[str, Any]]:
+        """统一部署防重检查：进行中的部署任务 + Agent已存在服务。"""
+        active_task = self.task_manager.find_active_task_for_service(
+            'deploy', service_name, agent_key, project_id
+        )
+        if active_task:
+            return {
+                'reason': 'active_task',
+                'message': f'服务 {service_name} 在节点 {agent_key} 上已有进行中的部署任务',
+                'task_id': active_task.get('task_id'),
+                'task_status': active_task.get('status'),
+            }
+
+        if self._service_exists_on_agent(agent_key, service_name):
+            return {
+                'reason': 'existing_service',
+                'message': f'服务 {service_name} 在节点 {agent_key} 上已存在，禁止重复部署'
+            }
+
+        return None
 
     def _record_service_sync_log(self, scope: str, status: str = 'ok',
                                  project_id: Optional[str] = None, agent_key: Optional[str] = None,
@@ -620,6 +954,7 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id is required'}), 400
                 dry_run = data.get('dry_run', False)  # 是否模拟运行
                 force = data.get('force', False)  # 是否强制清理（不检查时间）
+                cleanup_k8s_resources = bool(data.get('cleanup_k8s_resources', True))
 
                 # 先获取统计信息（按project过滤）
                 offline_count, total_count = self.agent_manager.get_offline_agents_count(project_id)
@@ -649,10 +984,31 @@ class WebAPIServer:
                 success, message, cleanup_info = self.agent_manager.cleanup_offline_agents(project_id)
 
                 if success:
+                    k8s_cleanup = {
+                        'enabled': cleanup_k8s_resources,
+                        'processed': 0,
+                        'ok': 0,
+                        'failed': 0,
+                        'details': []
+                    }
+                    if cleanup_k8s_resources:
+                        for item in cleanup_info.get('cleaned_agents', []) or []:
+                            cleaned_key = str(item.get('agent_key') or '').strip()
+                            if not cleaned_key:
+                                continue
+                            detail = self._cleanup_agent_k8s_resources(project_id, cleaned_key)
+                            k8s_cleanup['processed'] += 1
+                            if detail.get('success'):
+                                k8s_cleanup['ok'] += 1
+                            else:
+                                k8s_cleanup['failed'] += 1
+                            k8s_cleanup['details'].append(detail)
+
                     return jsonify({
                         'message': message,
                         'success': True,
                         'cleanup_info': cleanup_info,
+                        'k8s_cleanup': k8s_cleanup,
                         'offline_count_before': offline_count,
                         'total_count_before': total_count,
                         'project_id': project_id,
@@ -911,6 +1267,20 @@ class WebAPIServer:
                 'project_id': project_id
             })
 
+        @self.app.route('/api/agent/task', methods=['DELETE'])
+        def clear_tasks():
+            """按项目清空全部任务记录。"""
+            project_id = request.args.get('project_id')
+            if not project_id:
+                return jsonify({'error': 'project_id parameter is required'}), 400
+
+            deleted_count = self.task_manager.delete_tasks_by_project(project_id)
+            return jsonify({
+                'message': f'项目任务记录已清空: {deleted_count}',
+                'project_id': project_id,
+                'deleted_count': deleted_count
+            })
+
         @self.app.route('/api/agent/task/<task_id>', methods=['GET'])
         def get_task(task_id):
             # Get project_id from query parameter
@@ -1000,6 +1370,16 @@ class WebAPIServer:
             if agent.project_id != project_id:
                 return jsonify({'error': f"Agent {data['agent_key']} 不属于项目 {project_id}"}), 403
 
+            duplicate = self._check_deploy_duplicate(
+                data['service_name'], data['agent_key'], project_id
+            )
+            if duplicate:
+                return jsonify({
+                    'error': duplicate.get('message') or '重复部署被拒绝',
+                    'code': 'DUPLICATE_DEPLOYMENT',
+                    'details': duplicate
+                }), 409
+
             task_id = self.task_manager.create_task(
                 'deploy', data['service_name'], data['agent_key'],
                 data['template_name'], data.get('extra_params'), project_id
@@ -1027,6 +1407,7 @@ class WebAPIServer:
 
             results = []
             errors = []
+            request_level_seen = set()
 
             for idx, item in enumerate(deployments):
                 if not isinstance(item, dict):
@@ -1069,6 +1450,32 @@ class WebAPIServer:
                         'agent_key': agent_key,
                         'template_name': template_name,
                         'error': f"Agent {agent_key} 不属于项目 {project_id}"
+                    })
+                    continue
+
+                dedup_key = f"{project_id}::{agent_key}::{service_name}"
+                if dedup_key in request_level_seen:
+                    errors.append({
+                        'index': idx,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name,
+                        'code': 'DUPLICATE_DEPLOYMENT',
+                        'error': f"请求中存在重复部署项: {service_name} on {agent_key}"
+                    })
+                    continue
+                request_level_seen.add(dedup_key)
+
+                duplicate = self._check_deploy_duplicate(service_name, agent_key, project_id)
+                if duplicate:
+                    errors.append({
+                        'index': idx,
+                        'service_name': service_name,
+                        'agent_key': agent_key,
+                        'template_name': template_name,
+                        'code': 'DUPLICATE_DEPLOYMENT',
+                        'error': duplicate.get('message') or '重复部署被拒绝',
+                        'details': duplicate
                     })
                     continue
 
@@ -1384,6 +1791,162 @@ class WebAPIServer:
 
             return response
 
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>', methods=['GET'])
+        def agent_service_detail(agent_key, service_name):
+            """获取Agent单个服务详情（快捷方式）"""
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='GET',
+                endpoint=f'/api/services/{quote(service_name, safe="")}'
+            )
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'content-length':
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/logs', methods=['GET'])
+        def agent_service_logs(agent_key, service_name):
+            """获取Agent服务日志（快捷方式）"""
+            tail = int(request.args.get('tail', 200))
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='GET',
+                endpoint=f'/api/services/{quote(service_name, safe="")}/logs',
+                query_params={'tail': tail}
+            )
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'content-length':
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/files', methods=['GET'])
+        def agent_service_files(agent_key, service_name):
+            """获取Agent服务文件列表（快捷方式）"""
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='GET',
+                endpoint=f'/api/services/{quote(service_name, safe="")}/files'
+            )
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'content-length':
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/exec', methods=['POST'])
+        def agent_service_exec(agent_key, service_name):
+            """在Agent服务容器内执行命令（快捷方式）"""
+            payload = request.get_json(silent=True) or {}
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='POST',
+                endpoint=f'/api/services/{quote(service_name, safe="")}/exec',
+                request_data=payload
+            )
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'content-length':
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/exec/ws-connection', methods=['GET'])
+        def agent_service_exec_ws_connection(agent_key, service_name):
+            """获取服务容器实时执行WS连接信息。"""
+            try:
+                project_id = request.args.get('project_id')
+                container_name = request.args.get('container', '')
+                shell = request.args.get('shell', '/bin/sh')
+                user = request.args.get('user', '')
+
+                agent = self.agent_manager.get_agent(agent_key)
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
+
+                if project_id and agent.project_id != project_id:
+                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
+
+                if agent.status != 'online':
+                    return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
+
+                # 优先使用已创建的11197动态Ingress（支持HTTPS/WSS）
+                ingress_ws_url = None
+                ingress_http_url = None
+                ingress_route = None
+                if project_id:
+                    try:
+                        auth_header = request.headers.get('Authorization')
+                        resp = self._call_k8s_service(
+                            method='GET',
+                            path='/api/k8s/agent-ingress-routes',
+                            project_id=project_id,
+                            params={'agent_key': agent_key},
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.ok:
+                            route_items = (resp.json() or {}).get('items') or []
+                            for item in route_items:
+                                if int(item.get('target_port') or 0) == self.agent_manager.agent_api_port:
+                                    ingress_route = item
+                                    host = (item.get('host') or '').strip()
+                                    path = (item.get('path') or '/').rstrip('/')
+                                    if host:
+                                        qs = {
+                                            'token': self.agent_manager.agent_auth_token,
+                                            'container': container_name,
+                                            'shell': shell
+                                        }
+                                        if user:
+                                            qs['user'] = user
+                                        query = urlencode(qs)
+                                        scheme = 'wss' if bool(item.get('tls_enabled', True)) else 'ws'
+                                        ingress_ws_url = f"{scheme}://{host}{path}/api/services/{quote(service_name, safe='')}/exec/ws?{query}"
+                                        ingress_http_url = f"{'https' if scheme == 'wss' else 'http'}://{host}{path}"
+                                    break
+                    except Exception as ingress_err:
+                        self.logger.warning(f"获取11197动态Ingress失败: {ingress_err}")
+
+                # 回退直连（HTTP场景可用；HTTPS页面可能被浏览器拦截ws://mixed content）
+                qs = {
+                    'token': self.agent_manager.agent_auth_token,
+                    'container': container_name,
+                    'shell': shell
+                }
+                if user:
+                    qs['user'] = user
+                query = urlencode(qs)
+                direct_ws_url = f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}/api/services/{quote(service_name, safe='')}/exec/ws?{query}"
+
+                return jsonify({
+                    'agent_key': agent_key,
+                    'agent_ip': agent.ip_address,
+                    'agent_status': agent.status,
+                    'service_name': service_name,
+                    'project_id': project_id,
+                    'container': container_name,
+                    'shell': shell,
+                    'user': user,
+                    'ws_url': ingress_ws_url or direct_ws_url,
+                    'direct_ws_url': direct_ws_url,
+                    'ingress_ws_url': ingress_ws_url,
+                    'ingress_http_url': ingress_http_url,
+                    'ingress_route': ingress_route,
+                    'rest_exec_url': f"/api/agent/agent/{agent_key}/services/{quote(service_name, safe='')}/exec",
+                    'note': 'HTTPS页面建议使用wss ingress地址；若返回ws://直连，浏览器可能因mixed content拒绝连接。'
+                })
+            except Exception as e:
+                self.logger.error(f"获取服务Exec WS连接信息失败: {str(e)}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/agent/services/global', methods=['GET'])
         def list_global_services():
             """聚合查询项目下所有Agent服务（不再前端逐个Agent拉取）。"""
@@ -1439,6 +2002,53 @@ class WebAPIServer:
                     query_sql += " LIMIT ? OFFSET ?"
                 rows = self.db_manager.fetch_all(query_sql, tuple(params + [per_page, offset]))
 
+                # 预加载模板映射：通过服务名推断模板（service_name 规则通常为 <normalized_template_name>-<agent_suffix>）
+                template_table = self.db_manager.get_table_name('service_templates')
+                template_rows = self.db_manager.fetch_all(
+                    f"SELECT id, name FROM {template_table} ORDER BY id ASC",
+                    tuple()
+                ) or []
+
+                def _normalize_template_name(name: str) -> str:
+                    text = (name or '').strip().lower()
+                    text = re.sub(r'[^a-z0-9-_]', '-', text)
+                    text = re.sub(r'-+', '-', text).strip('-')
+                    return text[:48]
+
+                normalized_templates: List[Dict[str, Any]] = []
+                for tpl in template_rows:
+                    tpl_name = str(tpl.get('name') or '').strip()
+                    if not tpl_name:
+                        continue
+                    normalized_templates.append({
+                        'id': tpl.get('id'),
+                        'name': tpl_name,
+                        'normalized': _normalize_template_name(tpl_name)
+                    })
+
+                def _resolve_template(service_name: str) -> Dict[str, Any]:
+                    svc = (service_name or '').strip().lower()
+                    if not svc:
+                        return {'template_id': None, 'template_name': ''}
+
+                    # 优先最长前缀匹配，避免短模板名误匹配
+                    best = None
+                    best_len = -1
+                    for tpl in normalized_templates:
+                        prefix = tpl.get('normalized') or ''
+                        if not prefix:
+                            continue
+                        if svc == prefix or svc.startswith(prefix + '-'):
+                            if len(prefix) > best_len:
+                                best = tpl
+                                best_len = len(prefix)
+                    if not best:
+                        return {'template_id': None, 'template_name': ''}
+                    return {
+                        'template_id': best.get('id'),
+                        'template_name': best.get('name') or ''
+                    }
+
                 items = []
                 for row in rows:
                     ports = {}
@@ -1452,6 +2062,8 @@ class WebAPIServer:
                         elif isinstance(raw_ports, dict):
                             ports = raw_ports
 
+                    resolved_template = _resolve_template(str(row.get('service_name') or ''))
+
                     items.append({
                         'id': row.get('service_uid'),
                         'service_uid': row.get('service_uid'),
@@ -1462,6 +2074,8 @@ class WebAPIServer:
                         'name': row.get('service_name'),
                         'service_name': row.get('service_name'),
                         'image': row.get('image') or '',
+                        'template_id': resolved_template.get('template_id'),
+                        'template_name': resolved_template.get('template_name'),
                         'status': row.get('status') or 'unknown',
                         'ports': ports,
                         'is_stale': bool(row.get('is_stale')),
@@ -1482,6 +2096,227 @@ class WebAPIServer:
                 self.logger.error(f"聚合服务查询失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/agent/services/global/ingress', methods=['GET'])
+        def list_global_service_ingress():
+            """查询项目级服务Ingress视图（含统计、可批量管理）。"""
+            try:
+                project_id = request.args.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+                include_deleted = request.args.get('include_deleted', 'false').lower() == 'true'
+                auth_header = request.headers.get('Authorization')
+
+                items = self._list_project_ingress_routes(
+                    project_id=project_id,
+                    include_deleted=include_deleted,
+                    auth_header=auth_header
+                )
+                active_service_keys = self._get_project_active_service_keys(project_id)
+
+                enhanced_items: List[Dict[str, Any]] = []
+                stale_count = 0
+                deleted_count = 0
+                ready_count = 0
+                error_count = 0
+
+                for item in items:
+                    metadata = item.get('metadata') or {}
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except Exception:
+                            metadata = {}
+                    assoc_service = str(metadata.get('service_name') or '').strip()
+                    assoc_key = f"{item.get('agent_key', '')}::{assoc_service}" if assoc_service else ''
+                    service_exists = bool(assoc_service) and assoc_key in active_service_keys
+                    is_deleted = bool(item.get('deleted_at')) or str(item.get('status') or '').lower() == 'deleted'
+                    is_stale = (not is_deleted) and (not service_exists)
+
+                    if is_deleted:
+                        deleted_count += 1
+                    if str(item.get('status') or '').lower() == 'ready':
+                        ready_count += 1
+                    if str(item.get('status') or '').lower() == 'error':
+                        error_count += 1
+                    if is_stale:
+                        stale_count += 1
+
+                    enhanced_items.append({
+                        **item,
+                        'associated_service_name': assoc_service,
+                        'service_exists': service_exists,
+                        'is_stale_service_ingress': is_stale,
+                    })
+
+                return jsonify({
+                    'project_id': project_id,
+                    'items': enhanced_items,
+                    'stats': {
+                        'total': len(enhanced_items),
+                        'ready': ready_count,
+                        'error': error_count,
+                        'deleted': deleted_count,
+                        'stale_service_ingress': stale_count,
+                    }
+                })
+            except Exception as e:
+                self.logger.error(f"查询服务Ingress视图失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/services/global/ingress/delete-batch', methods=['POST'])
+        def delete_global_service_ingress_batch():
+            """批量删除项目Ingress路由。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                route_ids = data.get('route_ids') or []
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                if not isinstance(route_ids, list) or len(route_ids) == 0:
+                    return jsonify({'error': 'route_ids must be a non-empty array'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for rid in route_ids:
+                    route_id = str(rid or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'requested': len(route_ids),
+                    'deleted': deleted,
+                    'failed': failed,
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"批量删除服务Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/services/global/ingress/cleanup-stale', methods=['POST'])
+        def cleanup_stale_service_ingress():
+            """一键删除所有不在位服务关联的Ingress。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                dry_run = bool(data.get('dry_run', False))
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=False, auth_header=auth_header)
+                active_service_keys = self._get_project_active_service_keys(project_id)
+
+                stale_routes: List[Dict[str, Any]] = []
+                for item in routes:
+                    metadata = item.get('metadata') or {}
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except Exception:
+                            metadata = {}
+                    assoc_service = str(metadata.get('service_name') or '').strip()
+                    if not assoc_service:
+                        stale_routes.append(item)
+                        continue
+                    assoc_key = f"{item.get('agent_key', '')}::{assoc_service}"
+                    if assoc_key not in active_service_keys:
+                        stale_routes.append(item)
+
+                if dry_run:
+                    return jsonify({
+                        'project_id': project_id,
+                        'dry_run': True,
+                        'to_delete_count': len(stale_routes),
+                        'items': stale_routes,
+                    })
+
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for route in stale_routes:
+                    route_id = str(route.get('route_id') or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'dry_run': False,
+                    'target_count': len(stale_routes),
+                    'deleted': deleted,
+                    'failed': failed,
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"清理无效服务Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/services/global/ingress/clear-all', methods=['POST'])
+        def clear_all_service_ingress():
+            """清空项目所有Ingress路由（可选包含已删除记录）。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                include_deleted = bool(data.get('include_deleted', False))
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=include_deleted, auth_header=auth_header)
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for route in routes:
+                    route_id = str(route.get('route_id') or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'requested': len(routes),
+                    'deleted': deleted,
+                    'failed': failed
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"清空服务Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/agent/services/global/sync', methods=['POST'])
         def sync_global_services_now():
             """手动触发聚合同步（支持全量/项目/单Agent强制同步）。"""
@@ -1493,7 +2328,7 @@ class WebAPIServer:
 
                 # 1) 单Agent强制同步
                 if agent_key:
-                    agent = self.agent_manager.get_agent(agent_key)
+                    agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
                     if not agent:
                         return jsonify({'error': f'Agent {agent_key} not found'}), 404
                     result = self._sync_single_agent_services(agent)
@@ -1709,7 +2544,7 @@ class WebAPIServer:
                 if not isinstance(services, list):
                     return jsonify({'error': 'services must be an array'}), 400
 
-                agent = self.agent_manager.get_agent(agent_key)
+                agent = self._upsert_agent_from_report(agent_key, data) or self._resolve_or_auto_create_agent_for_report(agent_key)
                 if not agent:
                     return jsonify({'error': f'Agent {agent_key} not found'}), 404
 
@@ -1740,7 +2575,7 @@ class WebAPIServer:
                 if not isinstance(services, list):
                     return jsonify({'error': 'services must be an array'}), 400
 
-                agent = self.agent_manager.get_agent(agent_key)
+                agent = self._upsert_agent_from_report(agent_key, data) or self._resolve_or_auto_create_agent_for_report(agent_key)
                 if not agent:
                     return jsonify({'error': f'Agent {agent_key} not found'}), 404
 
@@ -1994,7 +2829,8 @@ class WebAPIServer:
                     'path': data.get('path', '/'),
                     'path_type': data.get('path_type', 'Prefix'),
                     'ingress_type': data.get('ingress_type'),
-                    'service_port': data.get('service_port'),
+                    # Agent动态转发默认应回源到目标端口，避免未传时落到80端口
+                    'service_port': int(data.get('service_port') or target_port),
                     'tls_enabled': data.get('tls_enabled'),
                     'tls_secret_name': data.get('tls_secret_name'),
                     'websocket_enabled': data.get('websocket_enabled', True),
@@ -2458,13 +3294,20 @@ class WebAPIServer:
 
         # ===================== 模板管理API（完整版，支持多种压缩格式） =====================
 
+        def _resolve_template_by_id(template_id: int) -> Optional[Dict]:
+            return self.template_manager.get_template_by_id(template_id)
+
         @self.app.route('/api/agent/templates', methods=['GET'])
         def list_templates():
             """列出所有模板（包含文件大小信息）"""
             page = int(request.args.get('page', 1))
             per_page = int(request.args.get('per_page', 20))
-
-            templates, total = self.template_manager.list_templates(page, per_page)
+            user_ctx = self._get_request_user_context()
+            templates, total = self.template_manager.list_templates(
+                page, per_page,
+                user_ctx.get('user_id', ''),
+                user_ctx.get('username', '')
+            )
             return jsonify({
                 'templates': templates,
                 'page': page,
@@ -2483,6 +3326,18 @@ class WebAPIServer:
             name = request.form.get('name')
             description = request.form.get('description', '')
             template_type = request.form.get('type', 'auto')  # 默认为自动检测
+            visibility = (request.form.get('visibility', 'shared') or 'shared').strip().lower()
+            web_port_presets_raw = request.form.get('web_port_presets')
+            web_port_presets = None
+            if visibility not in ('shared', 'private'):
+                return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
+            if web_port_presets_raw:
+                try:
+                    web_port_presets = json.loads(web_port_presets_raw)
+                    if not isinstance(web_port_presets, list):
+                        return jsonify({'error': 'web_port_presets 必须是JSON数组'}), 400
+                except Exception:
+                    return jsonify({'error': 'web_port_presets JSON格式错误'}), 400
 
             if not name:
                 return jsonify({'error': '模板名称不能为空'}), 400
@@ -2520,11 +3375,17 @@ class WebAPIServer:
 
             # 读取文件内容
             file_content = file.read()
+            user_ctx = self._get_request_user_context()
+            created_by = user_ctx.get('username', 'system')
 
             # 获取当前用户
             success, message = self.template_manager.create_template(
                 name, description, template_type, file_content, filename,
-                'system'
+                created_by,
+                visibility=visibility,
+                owner_id=user_ctx.get('user_id', ''),
+                owner_name=user_ctx.get('username', ''),
+                web_port_presets=web_port_presets
             )
 
             if success:
@@ -2532,7 +3393,10 @@ class WebAPIServer:
                     'message': message,
                     'template_name': name,
                     'template_type': template_type,
-                    'filename': filename
+                    'filename': filename,
+                    'visibility': visibility,
+                    'owner_id': user_ctx.get('user_id', ''),
+                    'owner_name': user_ctx.get('username', '')
                 }), 201
             else:
                 return jsonify({'error': message}), 400
@@ -2540,9 +3404,13 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>', methods=['GET'])
         def get_template_detail(name):
             """获取模板详细信息（包含解析数据和文件大小）"""
+            user_ctx = self._get_request_user_context()
             template = self.template_manager.get_template(name)
 
             if template:
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
+
                 # 获取文件详细信息
                 file_info = self.template_manager.get_template_file_info(name)
                 if file_info:
@@ -2578,14 +3446,75 @@ class WebAPIServer:
                     if success and is_stale:
                         metadata['parse_status'] = 'stale'
                         template['metadata'] = metadata
+                template = self.template_manager.decorate_template_permissions(
+                    template,
+                    user_ctx.get('user_id', ''),
+                    user_ctx.get('username', '')
+                )
 
                 return jsonify(template)
             else:
                 return jsonify({'error': '模板不存在'}), 404
 
+        @self.app.route('/api/agent/templates/by-name/<name>', methods=['GET'])
+        def get_template_detail_by_name(name):
+            """根据名称查询模板"""
+            return get_template_detail(name)
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>', methods=['GET'])
+        def get_template_detail_by_id(template_id):
+            """根据ID获取模板详情"""
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_detail(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>', methods=['PUT'])
+        def update_template_basic_by_id(template_id):
+            """根据ID更新模板基础信息（支持改名）"""
+            user_ctx = self._get_request_user_context()
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
+
+            data = request.get_json(silent=True) or {}
+            new_name = data.get('name')
+            description = data.get('description') if 'description' in data else None
+            visibility = data.get('visibility') if 'visibility' in data else None
+            web_port_presets = data.get('web_port_presets') if 'web_port_presets' in data else None
+            if visibility is not None and str(visibility).strip().lower() not in ('shared', 'private'):
+                return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
+            if web_port_presets is not None and not isinstance(web_port_presets, list):
+                return jsonify({'error': 'web_port_presets 必须是数组'}), 400
+
+            success, message, updated = self.template_manager.update_template_basic(
+                template_id=template_id,
+                new_name=new_name,
+                description=description,
+                visibility=visibility,
+                web_port_presets=web_port_presets,
+                updated_by=user_ctx.get('username', 'system')
+            )
+            if not success:
+                return jsonify({'error': message}), 400
+            updated = self.template_manager.decorate_template_permissions(
+                updated,
+                user_ctx.get('user_id', ''),
+                user_ctx.get('username', '')
+            )
+            return jsonify({'message': message, 'template': updated, 'status': 'success'})
+
         @self.app.route('/api/agent/templates/<name>/yaml', methods=['GET'])
         def get_template_yaml(name):
             """获取模板的YAML内容"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
             success, content, message = self.template_manager.get_yaml_content(name)
 
             if success:
@@ -2604,6 +3533,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/yaml', methods=['PUT'])
         def update_template_yaml(name):
             """更新模板的YAML内容"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
             data = request.get_json()
             if not data:
                 return jsonify({'error': '请求体必须为JSON'}), 400
@@ -2613,7 +3548,7 @@ class WebAPIServer:
                 return jsonify({'error': 'YAML内容不能为空'}), 400
 
             success, message = self.template_manager.update_yaml_content(
-                name, yaml_content, 'system'
+                name, yaml_content, user_ctx.get('username', 'system')
             )
 
             if success:
@@ -2631,6 +3566,7 @@ class WebAPIServer:
         def download_template(name):
             """下载模板文件"""
             try:
+                user_ctx = self._get_request_user_context()
                 format_param = request.args.get('format', 'original')
                 as_zip = request.args.get('as_zip', '').lower() == 'true'
                 include_all = request.args.get('include_all', 'true').lower() == 'true'
@@ -2642,6 +3578,8 @@ class WebAPIServer:
                 template = self.template_manager.get_template(name)
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
 
                 # 处理下载请求
                 if as_zip:
@@ -2692,6 +3630,12 @@ class WebAPIServer:
         def get_template_file(name):
             """获取模板原始文件"""
             try:
+                user_ctx = self._get_request_user_context()
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
                 file_info = self.template_manager.get_template_file_info(name)
 
                 if not file_info:
@@ -2736,10 +3680,13 @@ class WebAPIServer:
         def get_template_content(name):
             """获取模板内容（JSON格式）"""
             try:
+                user_ctx = self._get_request_user_context()
                 template = self.template_manager.get_template(name)
 
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
 
                 success, content, content_type = self.template_manager.get_template_file_content(
                     name, 'bytes'
@@ -2778,10 +3725,13 @@ class WebAPIServer:
         def get_template_info(name):
             """获取模板详细信息（包含文件列表）"""
             try:
+                user_ctx = self._get_request_user_context()
                 template = self.template_manager.get_template(name)
 
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
 
                 file_info = self.template_manager.get_template_file_info(name)
 
@@ -2823,6 +3773,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>', methods=['DELETE'])
         def delete_template(name):
             """删除模板"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限删除该模板，仅拥有者可删除'}), 403
             success, message = self.template_manager.delete_template(name)
 
             if success:
@@ -2830,10 +3786,49 @@ class WebAPIServer:
             else:
                 return jsonify({'error': message}), 400
 
+        @self.app.route('/api/agent/templates/<name>/copy', methods=['POST'])
+        def copy_template(name):
+            """复制模板"""
+            user_ctx = self._get_request_user_context()
+            source = self.template_manager.get_template(name)
+            if not source:
+                return jsonify({'error': '源模板不存在'}), 404
+            if not self._check_template_visible(source, user_ctx):
+                return jsonify({'error': '无权限复制该模板'}), 403
+
+            data = request.get_json(silent=True) or {}
+            target_name = (data.get('target_name') or '').strip()
+            if not target_name:
+                return jsonify({'error': 'target_name 不能为空'}), 400
+            visibility = (data.get('visibility', 'private') or 'private').strip().lower()
+            if visibility not in ('shared', 'private'):
+                return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
+            description = data.get('description', '')
+
+            success, message = self.template_manager.copy_template(
+                source_name=name,
+                target_name=target_name,
+                created_by=user_ctx.get('username', 'system'),
+                owner_id=user_ctx.get('user_id', ''),
+                owner_name=user_ctx.get('username', ''),
+                visibility=visibility,
+                description=description
+            )
+
+            if success:
+                return jsonify({
+                    'message': message,
+                    'source_name': name,
+                    'target_name': target_name,
+                    'visibility': visibility
+                }), 201
+            return jsonify({'error': message}), 400
+
         @self.app.route('/api/agent/templates/download/batch', methods=['POST'])
         def download_templates_batch():
             """批量下载模板"""
             try:
+                user_ctx = self._get_request_user_context()
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -2848,7 +3843,8 @@ class WebAPIServer:
                 # 检查模板是否存在
                 missing_templates = []
                 for name in template_names:
-                    if not self.template_manager.get_template(name):
+                    template = self.template_manager.get_template(name)
+                    if not template or not self._check_template_visible(template, user_ctx):
                         missing_templates.append(name)
 
                 if missing_templates:
@@ -2906,6 +3902,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/files', methods=['GET'])
         def list_template_files(name):
             """列出模板目录下的所有文件和目录"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
             path = request.args.get('path', '')
 
             success, result = self.template_manager.list_template_files(name, path)
@@ -2923,6 +3925,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/files/content', methods=['GET'])
         def get_template_file_content(name):
             """获取模板目录下指定文件的内容"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
             file_path = request.args.get('path', '')
             encoding = request.args.get('encoding', 'utf-8')
             preview = request.args.get('preview', 'false').lower() == 'true'
@@ -2976,6 +3984,12 @@ class WebAPIServer:
         def update_template_file_content(name):
             """更新模板目录下指定文件的内容"""
             try:
+                user_ctx = self._get_request_user_context()
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': '模板不存在'}), 404
+                if not self._check_template_manageable(template, user_ctx):
+                    return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -3001,7 +4015,7 @@ class WebAPIServer:
                         return jsonify({'error': f'Base64解码失败: {str(e)}'}), 400
 
                 # 获取当前用户
-                updated_by = 'system'
+                updated_by = user_ctx.get('username', 'system')
 
                 success, message, update_info = self.template_manager.update_template_file(
                     name, file_path, actual_content, encoding, updated_by
@@ -3033,6 +4047,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/files/download', methods=['GET'])
         def download_template_file(name):
             """下载模板目录下的单个文件"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
             file_path = request.args.get('path', '')
 
             if not file_path:
@@ -3077,6 +4097,12 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>/files/upload', methods=['POST'])
         def upload_template_file(name):
             """上传文件到模板目录"""
+            user_ctx = self._get_request_user_context()
+            template = self.template_manager.get_template(name)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
             if 'file' not in request.files:
                 return jsonify({'error': '未找到文件'}), 400
 
@@ -3092,7 +4118,7 @@ class WebAPIServer:
                 target_path = file.filename
 
             # 获取当前用户
-            updated_by = 'system'
+            updated_by = user_ctx.get('username', 'system')
 
             # 读取文件内容
             file_content = file.read()
@@ -3146,6 +4172,12 @@ class WebAPIServer:
         def delete_template_file(name):
             """删除模板目录下的指定文件"""
             try:
+                user_ctx = self._get_request_user_context()
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': '模板不存在'}), 404
+                if not self._check_template_manageable(template, user_ctx):
+                    return jsonify({'error': '无权限删除模板文件，仅拥有者可删除'}), 403
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -3155,7 +4187,7 @@ class WebAPIServer:
                     return jsonify({'error': '文件路径不能为空'}), 400
 
                 # 获取当前用户
-                deleted_by = 'system'
+                deleted_by = user_ctx.get('username', 'system')
 
                 success, message, delete_info = self.template_manager.delete_template_file(
                     name, file_path, deleted_by
@@ -3178,6 +4210,12 @@ class WebAPIServer:
         def delete_template_directory(name):
             """删除模板目录下的指定目录"""
             try:
+                user_ctx = self._get_request_user_context()
+                template = self.template_manager.get_template(name)
+                if not template:
+                    return jsonify({'error': '模板不存在'}), 404
+                if not self._check_template_manageable(template, user_ctx):
+                    return jsonify({'error': '无权限删除模板目录，仅拥有者可删除'}), 403
                 data = request.get_json()
                 if not data:
                     return jsonify({'error': '请求体必须为JSON'}), 400
@@ -3189,7 +4227,7 @@ class WebAPIServer:
                     return jsonify({'error': '目录路径不能为空'}), 400
 
                 # 获取当前用户
-                deleted_by = 'system'
+                deleted_by = user_ctx.get('username', 'system')
 
                 success, message, delete_info = self.template_manager.delete_template_directory(
                     name, dir_path, deleted_by, force
@@ -3216,9 +4254,12 @@ class WebAPIServer:
             返回 docker-compose 结构化信息
             """
             try:
+                user_ctx = self._get_request_user_context()
                 template = self.template_manager.get_template(name)
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_visible(template, user_ctx):
+                    return jsonify({'error': '无权限访问该模板'}), 403
 
                 metadata = template.get('metadata', {})
                 if isinstance(metadata, str):
@@ -3270,10 +4311,13 @@ class WebAPIServer:
             3. 强制重新解析
             """
             try:
+                user_ctx = self._get_request_user_context()
                 # 检查模板是否存在
                 template = self.template_manager.get_template(name)
                 if not template:
                     return jsonify({'error': f'模板 {name} 不存在'}), 404
+                if not self._check_template_manageable(template, user_ctx):
+                    return jsonify({'error': '无权限重新解析该模板，仅拥有者可操作'}), 403
 
                 # 执行解析
                 success, message = self.template_manager.parse_template_compose(name)
@@ -3303,6 +4347,127 @@ class WebAPIServer:
             except Exception as e:
                 self.logger.error(f"解析模板 {name} 失败: {str(e)}")
                 return jsonify({'error': f'解析失败: {str(e)}'}), 500
+
+        # ===================== 模板管理ID路由（唯一引用） =====================
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/yaml', methods=['GET'])
+        def get_template_yaml_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_yaml(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/yaml', methods=['PUT'])
+        def update_template_yaml_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return update_template_yaml(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/download', methods=['GET'])
+        def download_template_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return download_template(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/file', methods=['GET'])
+        def get_template_file_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_file(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/content', methods=['GET'])
+        def get_template_content_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_content(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/info', methods=['GET'])
+        def get_template_info_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_info(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>', methods=['DELETE'])
+        def delete_template_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return delete_template(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/copy', methods=['POST'])
+        def copy_template_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return copy_template(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files', methods=['GET'])
+        def list_template_files_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return list_template_files(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files/content', methods=['GET'])
+        def get_template_file_content_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_template_file_content(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files/content', methods=['PUT'])
+        def update_template_file_content_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return update_template_file_content(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files/download', methods=['GET'])
+        def download_template_file_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return download_template_file(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files/upload', methods=['POST'])
+        def upload_template_file_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return upload_template_file(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/files', methods=['DELETE'])
+        def delete_template_file_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return delete_template_file(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/directories', methods=['DELETE'])
+        def delete_template_directory_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return delete_template_directory(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/parsed', methods=['GET'])
+        def get_parsed_compose_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return get_parsed_compose(template['name'])
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/parse', methods=['POST'])
+        def parse_template_by_id(template_id):
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            return parse_template(template['name'])
 
     def _refresh_loop(self):
         """后台刷新循环"""
@@ -3363,7 +4528,7 @@ def adjust_timeout_config(config: Dict) -> Dict:
         'default': (10, 30),
         'health_check': (5, 10),
         'deploy_create': (10, 60),
-        'deploy_start': (10, 300),
+        'deploy_start': (10, 900),
         'deploy_stop': (10, 120),
         'deploy_delete': (10, 60),
         'undeploy': (10, 180),

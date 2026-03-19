@@ -39,6 +39,13 @@ class SuccessResponse(BaseModel):
     data: Optional[Dict[str, Any]] = None
 
 
+class ProjectTLSSyncRequest(BaseModel):
+    """项目TLS Secret同步请求"""
+    source_namespace: str = Field(..., min_length=1, description="源命名空间")
+    source_secret_name: str = Field(..., min_length=1, description="源TLS Secret名称")
+    target_secret_name: str = Field(..., min_length=1, description="目标TLS Secret名称")
+
+
 class K8SResourceMetadata(BaseModel):
     """K8S资源元数据"""
     name: str

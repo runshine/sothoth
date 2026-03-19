@@ -18,10 +18,11 @@ data:
       max_overflow: 20
     
     auth_service:
-      enabled: false  # 认证开关，设为false时跳过认证
-      host: "secflow-platform-menu"
+      enabled: true
+      host: "secflow-platform-auth"
       port: 80
-      validate_token_path: "/api/auth/validate-human-token"
+      validate_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
       timeout: 10
       token_cache_enabled: true
       token_cache_ttl_minutes: 15
@@ -54,20 +55,20 @@ data:
 
     dynamic_ingress:
       enabled: true
-      common_domain_suffix: "agent.secflow.local"
-      default_domain_suffix: "agent.secflow.local"
+      common_domain_suffix: "sothothv2.com"
+      default_domain_suffix: "sothothv2.com"
       default_ingress_type: "nginx"
       default_path: "/"
       default_path_type: "Prefix"
       default_service_port: 80
       default_websocket_enabled: true
-      default_tls_enabled: false
-      default_tls_secret_name: null
+      default_tls_enabled: true
+      default_tls_secret_name: "wildcard-sothothv2.com-tls"
       default_proxy_body_size: "32m"
       default_proxy_connect_timeout: 15
       default_proxy_send_timeout: 120
       default_proxy_read_timeout: 120
-      default_ssl_redirect: false
+      default_ssl_redirect: true
 
     app:
       host: "0.0.0.0"

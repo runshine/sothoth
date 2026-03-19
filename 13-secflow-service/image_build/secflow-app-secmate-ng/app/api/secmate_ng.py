@@ -3,7 +3,7 @@ Secmate-NG Manager - API路由
 """
 
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status, WebSocket, WebSocketDisconnect, Header
 from sqlalchemy.orm import Session

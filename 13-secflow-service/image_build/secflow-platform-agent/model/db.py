@@ -308,12 +308,17 @@ class DatabaseManager:
                                description TEXT,
                                type VARCHAR(20) NOT NULL,
                                file_path TEXT NOT NULL,
+                               visibility VARCHAR(20) NOT NULL DEFAULT 'shared',
+                               owner_id VARCHAR(64),
+                               owner_name VARCHAR(100),
                                created_by VARCHAR(100),
                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                                metadata JSON,
                                INDEX idx_templates_name (name),
-                               INDEX idx_templates_updated (updated_at)
+                               INDEX idx_templates_updated (updated_at),
+                               INDEX idx_templates_visibility (visibility),
+                               INDEX idx_templates_owner_id (owner_id)
                            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
             else:
@@ -324,6 +329,9 @@ class DatabaseManager:
                                description TEXT,
                                type TEXT NOT NULL,
                                file_path TEXT NOT NULL,
+                               visibility TEXT NOT NULL DEFAULT 'shared',
+                               owner_id TEXT,
+                               owner_name TEXT,
                                created_by TEXT,
                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -564,6 +572,7 @@ class DatabaseManager:
 
             # 兼容历史数据库：补齐新增列
             self._ensure_agent_status_columns(db, table_agent_status)
+            self._ensure_template_columns(db, table_templates)
 
             self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}, 表前缀: {prefix}）")
         finally:
@@ -593,6 +602,65 @@ class DatabaseManager:
                     self.logger.info(f"数据库迁移: 已为 {table_name} 添加 daemon_info 列")
         except Exception as e:
             self.logger.error(f"检查/迁移 {table_name} 表字段失败: {str(e)}")
+
+    def _ensure_template_columns(self, db: DatabaseConnection, table_name: str):
+        """确保 service_templates 表包含模板可见性和归属字段（历史库自动迁移）"""
+        try:
+            if self.db_type == 'mysql':
+                columns = db.fetch_all(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE() AND table_name = %s
+                    """,
+                    (table_name,)
+                )
+                existing = {item['COLUMN_NAME'] for item in columns}
+
+                if 'visibility' not in existing:
+                    db.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN visibility VARCHAR(20) NOT NULL DEFAULT 'shared'"
+                    )
+                    db.execute(f"ALTER TABLE {table_name} ADD INDEX idx_templates_visibility (visibility)")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 visibility 列")
+                if 'owner_id' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN owner_id VARCHAR(64) NULL")
+                    db.execute(f"ALTER TABLE {table_name} ADD INDEX idx_templates_owner_id (owner_id)")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 owner_id 列")
+                if 'owner_name' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN owner_name VARCHAR(100) NULL")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 owner_name 列")
+            else:
+                columns = db.fetch_all(f"PRAGMA table_info({table_name})")
+                existing = {item['name'] for item in columns}
+
+                if 'visibility' not in existing:
+                    db.execute(
+                        f"ALTER TABLE {table_name} ADD COLUMN visibility TEXT NOT NULL DEFAULT 'shared'"
+                    )
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 visibility 列")
+                if 'owner_id' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN owner_id TEXT")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 owner_id 列")
+                if 'owner_name' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN owner_name TEXT")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 owner_name 列")
+                db.execute(f"CREATE INDEX IF NOT EXISTS idx_templates_visibility ON {table_name}(visibility)")
+                db.execute(f"CREATE INDEX IF NOT EXISTS idx_templates_owner_id ON {table_name}(owner_id)")
+
+            # 历史数据默认迁移为共享模板，避免升级后数据不可见
+            if self.db_type == 'mysql':
+                db.execute(
+                    f"UPDATE {table_name} SET visibility = 'shared' "
+                    "WHERE visibility IS NULL OR visibility = ''"
+                )
+            else:
+                db.execute(
+                    f"UPDATE {table_name} SET visibility = 'shared' "
+                    "WHERE visibility IS NULL OR visibility = ''"
+                )
+        except Exception as e:
+            self.logger.error(f"检查/迁移 {table_name} 模板字段失败: {str(e)}")
 
     def execute_query(self, query: str, params: tuple = ()):
         """执行查询 - 使用持久化连接"""

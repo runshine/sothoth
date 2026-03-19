@@ -178,6 +178,7 @@ def make_project_response(project: Project, roles: List[ProjectRoleBindResponse]
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 async def create_project(
     project_data: ProjectCreate,
+    authorization: Optional[str] = Header(None),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -226,24 +227,33 @@ async def create_project(
     )
     db.add(role_bind)
 
-    # 创建K8S Namespace
+    # 创建K8S Namespace（不依赖项目已提交）
     if not k8s_client.create_namespace(project_id):
         logger.warning(f"创建K8S Namespace失败: {project_id}")
         # 回滚数据库事务
         db.rollback()
         raise HTTPException(status_code=500, detail="创建K8S Namespace失败")
 
-    # 创建TLS Secret
-    tls_success, tls_error = k8s_client.create_tls_secret(project_id)
+    # 先提交项目数据，再创建依赖project_id校验的TLS Secret
+    db.commit()
+    db.refresh(project)
+    db.refresh(role_bind)
+
+    # 创建TLS Secret（platform-k8s 会校验 project_id 对应项目存在）
+    tls_success, tls_error = k8s_client.create_tls_secret(project_id, authorization=authorization)
     if not tls_success:
         logger.error(f"创建TLS Secret失败: {project_id}, 错误: {tls_error}")
-        # 回滚数据库事务
-        db.rollback()
         # 删除已创建的Namespace
         k8s_client.delete_namespace(project_id, force=True)
+        # 补偿删除已提交的项目与角色绑定，避免脏数据
+        try:
+            db.query(ProjectRoleBind).filter(ProjectRoleBind.project_id == project_id).delete(synchronize_session=False)
+            db.query(Project).filter(Project.id == project_id).delete(synchronize_session=False)
+            db.commit()
+        except Exception as cleanup_error:
+            db.rollback()
+            logger.error(f"创建TLS Secret失败后的数据库补偿清理失败: {project_id}, 错误: {cleanup_error}")
         raise HTTPException(status_code=500, detail=f"创建TLS Secret失败: {tls_error}")
-
-    db.commit()
 
     return make_project_response(project, [ProjectRoleBindResponse(
         user_id=role_bind.user_id,

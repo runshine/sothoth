@@ -219,6 +219,62 @@ class EnhancedTemplateManager:
 
         self.logger.info(f"模板管理器初始化，支持格式: {', '.join(self.supported_formats)}")
 
+    def _normalize_web_port_presets(self, presets: Any) -> List[Dict[str, Any]]:
+        """规范化模板预制Web端口配置。"""
+        if not presets:
+            return []
+        normalized: List[Dict[str, Any]] = []
+        if not isinstance(presets, list):
+            return normalized
+
+        for item in presets:
+            if not isinstance(item, dict):
+                continue
+            try:
+                port = int(item.get('port'))
+            except Exception:
+                continue
+            if port <= 0 or port > 65535:
+                continue
+
+            protocol = str(item.get('protocol') or 'http').strip().lower()
+            if protocol not in ('http', 'https'):
+                protocol = 'http'
+
+            entry = {
+                'port': port,
+                'protocol': protocol,
+                'name': str(item.get('name') or '').strip()[:64],
+                'description': str(item.get('description') or '').strip()[:256],
+                'path': str(item.get('path') or '/').strip() or '/',
+                'websocket_enabled': bool(item.get('websocket_enabled', True)),
+                'tls_enabled': bool(item.get('tls_enabled', protocol == 'https'))
+            }
+            normalized.append(entry)
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for p in normalized:
+            dedup[f"{p['port']}:{p['protocol']}"] = p
+        return list(dedup.values())[:32]
+
+    @staticmethod
+    def _normalize_template_owner(template: Dict[str, Any]) -> Dict[str, Any]:
+        """确保模板返回数据始终包含作者信息。"""
+        item = dict(template or {})
+        owner_name = str(item.get('owner_name') or '').strip()
+        owner_id = str(item.get('owner_id') or '').strip()
+        created_by = str(item.get('created_by') or '').strip()
+
+        if not owner_name:
+            owner_name = created_by or 'system'
+        if not owner_id:
+            # 兼容历史数据：若无 owner_id，保留为空或使用 created_by 作为可读标识
+            owner_id = created_by or 'system'
+
+        item['owner_name'] = owner_name
+        item['owner_id'] = owner_id
+        return item
+
     # 新增方法：获取模板目录下指定文件的内容
     def get_template_file_by_path(self, template_name: str, file_path: str,
                                   encoding: str = 'utf-8') -> Tuple[bool, Union[str, bytes], str, Dict]:
@@ -1394,7 +1450,9 @@ class EnhancedTemplateManager:
             return False, f"验证失败: {str(e)}"
 
     def create_template(self, name: str, description: str, template_type: str,
-                        file_content: bytes, filename: str, created_by: str) -> Tuple[bool, str]:
+                        file_content: bytes, filename: str, created_by: str,
+                        visibility: str = 'shared', owner_id: str = '', owner_name: str = '',
+                        web_port_presets: Optional[List[Dict[str, Any]]] = None) -> Tuple[bool, str]:
         """创建模板（增强版，支持多种压缩格式）"""
         template_dir = None
         file_path = None
@@ -1525,6 +1583,10 @@ class EnhancedTemplateManager:
             else:
                 raise ValueError(f"不支持的模板类型: {template_type}")
 
+            visibility_value = (visibility or 'shared').strip().lower()
+            if visibility_value not in ('shared', 'private'):
+                visibility_value = 'shared'
+
             # 准备元数据
             metadata = {
                 'file_size': len(file_content),
@@ -1532,8 +1594,13 @@ class EnhancedTemplateManager:
                 'created_by': created_by,
                 'created_at': datetime.now().isoformat(),
                 'template_type': template_type,
-                'compression_type': self.compression_map.get(file_ext, 'unknown') if template_type == 'archive' else None
+                'compression_type': self.compression_map.get(file_ext, 'unknown') if template_type == 'archive' else None,
+                'visibility': visibility_value,
+                'owner_id': owner_id or None,
+                'owner_name': owner_name or None
             }
+            if web_port_presets is not None:
+                metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
 
             if template_type == 'archive' and found_yaml:
                 metadata['main_yaml_file'] = str(found_yaml.relative_to(template_dir))
@@ -1544,22 +1611,24 @@ class EnhancedTemplateManager:
             table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':
                 self.db.execute_query(
-                    f"INSERT INTO {table_name} (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
-                    "VALUES (%s, %s, %s, %s, %s, NOW(), NOW(), %s)",
-                    (name, description, template_type, str(file_path), created_by, metadata_json)
+                    f"INSERT INTO {table_name} "
+                    "(name, description, type, file_path, visibility, owner_id, owner_name, created_by, created_at, updated_at, metadata) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW(), %s)",
+                    (name, description, template_type, str(file_path), visibility_value, owner_id or None, owner_name or None, created_by, metadata_json)
                 )
             else:
                 self.db.execute_query(
-                    f"INSERT INTO {table_name} (name, description, type, file_path, created_by, created_at, updated_at, metadata) "
-                    "VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)",
-                    (name, description, template_type, str(file_path), created_by, metadata_json)
+                    f"INSERT INTO {table_name} "
+                    "(name, description, type, file_path, visibility, owner_id, owner_name, created_by, created_at, updated_at, metadata) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'), ?)",
+                    (name, description, template_type, str(file_path), visibility_value, owner_id or None, owner_name or None, created_by, metadata_json)
                 )
 
             db_cleanup_needed = True
             self.logger.info(f"模板 '{name}' 创建成功，类型: {template_type}")
 
-            # 在模板创建成功后自动解析 docker-compose 内容
-            if template_type == 'yaml':
+            # 在模板创建成功后自动解析 docker-compose 内容（yaml/archive 一致）
+            if template_type in ['yaml', 'archive']:
                 try:
                     parse_success, parse_msg = self.parse_template_compose(name)
                     if not parse_success:
@@ -1746,7 +1815,65 @@ class EnhancedTemplateManager:
             else:
                 template['directory_size'] = 0
 
+            template = self._normalize_template_owner(template)
+
         return template
+
+    def get_template_by_id(self, template_id: int) -> Optional[Dict]:
+        """根据ID获取模板信息（包含元数据）"""
+        table_name = self.db.get_table_name('service_templates')
+        template = self.db.fetch_one(
+            f"SELECT * FROM {table_name} WHERE id = %s"
+            if self.db.db_type == 'mysql' else
+            f"SELECT * FROM {table_name} WHERE id = ?",
+            (template_id,)
+        )
+        if not template:
+            return None
+        return self.get_template(template.get('name'))
+
+    @staticmethod
+    def _normalize_visibility(value: Optional[str]) -> str:
+        v = (value or 'shared').strip().lower()
+        return v if v in ('shared', 'private') else 'shared'
+
+    def can_view_template(self, template: Optional[Dict], user_id: str = '', username: str = '') -> bool:
+        if not template:
+            return False
+        visibility = self._normalize_visibility(template.get('visibility'))
+        if visibility == 'shared':
+            return True
+        owner_id = str(template.get('owner_id') or '').strip()
+        owner_name = str(template.get('owner_name') or '').strip()
+        if owner_id and user_id and owner_id == str(user_id).strip():
+            return True
+        if owner_name and username and owner_name == username:
+            return True
+        return False
+
+    def can_manage_template(self, template: Optional[Dict], user_id: str = '', username: str = '') -> bool:
+        if not template:
+            return False
+        owner_id = str(template.get('owner_id') or '').strip()
+        owner_name = str(template.get('owner_name') or '').strip()
+        if owner_id and user_id and owner_id == str(user_id).strip():
+            return True
+        if owner_name and username and owner_name == username:
+            return True
+        return False
+
+    def decorate_template_permissions(self, template: Dict, user_id: str = '', username: str = '') -> Dict:
+        item = dict(template)
+        item['visibility'] = self._normalize_visibility(item.get('visibility'))
+        can_manage = self.can_manage_template(item, user_id, username)
+        item['permissions'] = {
+            'can_view': self.can_view_template(item, user_id, username),
+            'can_manage': can_manage,
+            'can_copy': self.can_view_template(item, user_id, username),
+            'can_delete': can_manage,
+            'can_update': can_manage
+        }
+        return item
 
     def _get_directory_size(self, path: Path) -> int:
         """计算目录总大小"""
@@ -2224,28 +2351,56 @@ class EnhancedTemplateManager:
         else:
             return 'application/octet-stream'
 
-    def list_templates(self, page: int = 1, per_page: int = 20) -> Tuple[List[Dict], int]:
+    def list_templates(self, page: int = 1, per_page: int = 20, user_id: str = '', username: str = '') -> Tuple[List[Dict], int]:
         """列出所有模板（包含文件大小信息）"""
         offset = (page - 1) * per_page
         table_name = self.db.get_table_name('service_templates')
+        user_id = str(user_id or '').strip()
+        username = str(username or '').strip()
 
         if self.db.db_type == 'mysql':
-            templates = self.db.fetch_all(
-                f"SELECT * FROM {table_name} ORDER BY updated_at DESC LIMIT %s OFFSET %s",
-                (per_page, offset)
-            )
-            count_result = self.db.fetch_one(f"SELECT COUNT(*) as count FROM {table_name}")
+            if user_id or username:
+                where_clause = "visibility = 'shared' OR owner_id = %s OR owner_name = %s"
+                templates = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} WHERE ({where_clause}) ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                    (user_id, username, per_page, offset)
+                )
+                count_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name} WHERE ({where_clause})",
+                    (user_id, username)
+                )
+            else:
+                templates = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} WHERE visibility = 'shared' ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                    (per_page, offset)
+                )
+                count_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name} WHERE visibility = 'shared'"
+                )
         else:
-            templates = self.db.fetch_all(
-                f"SELECT * FROM {table_name} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-                (per_page, offset)
-            )
-            count_result = self.db.fetch_one(f"SELECT COUNT(*) as count FROM {table_name}")
+            if user_id or username:
+                where_clause = "visibility = 'shared' OR owner_id = ? OR owner_name = ?"
+                templates = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} WHERE ({where_clause}) ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (user_id, username, per_page, offset)
+                )
+                count_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name} WHERE ({where_clause})",
+                    (user_id, username)
+                )
+            else:
+                templates = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} WHERE visibility = 'shared' ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (per_page, offset)
+                )
+                count_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name} WHERE visibility = 'shared'"
+                )
 
         total = count_result.get('count', 0) if count_result else 0
 
         # 为每个模板添加文件大小信息
-        for template in templates:
+        for idx, template in enumerate(templates):
             # 解析metadata
             if template.get('metadata'):
                 if isinstance(template['metadata'], str):
@@ -2269,6 +2424,10 @@ class EnhancedTemplateManager:
                 template['directory_size'] = self._get_directory_size(template_dir)
             else:
                 template['directory_size'] = 0
+            template['visibility'] = self._normalize_visibility(template.get('visibility'))
+            templates[idx] = self._normalize_template_owner(template)
+
+        templates = [self.decorate_template_permissions(t, user_id, username) for t in templates]
 
         return templates, total
 
@@ -2296,3 +2455,119 @@ class EnhancedTemplateManager:
         except Exception as e:
             self.logger.error(f"删除模板失败: {str(e)}")
             return False, f"删除模板失败: {str(e)}"
+
+    def update_template_basic(self, template_id: int,
+                              new_name: Optional[str] = None,
+                              description: Optional[str] = None,
+                              visibility: Optional[str] = None,
+                              web_port_presets: Optional[List[Dict[str, Any]]] = None,
+                              updated_by: str = '') -> Tuple[bool, str, Optional[Dict]]:
+        """更新模板基础信息（支持重命名）"""
+        try:
+            template = self.get_template_by_id(template_id)
+            if not template:
+                return False, "模板不存在", None
+
+            current_name = template['name']
+            target_name = (new_name or current_name).strip()
+            if not target_name:
+                return False, "模板名称不能为空", None
+
+            target_visibility = self._normalize_visibility(visibility or template.get('visibility'))
+            target_description = template.get('description', '') if description is None else description
+
+            current_dir = self.templates_root / current_name
+            target_dir = self.templates_root / target_name
+            old_file_path = Path(template['file_path'])
+            moved = False
+
+            if target_name != current_name:
+                existed = self.get_template(target_name)
+                if existed:
+                    return False, f"模板名称 '{target_name}' 已存在", None
+                if current_dir.exists():
+                    if target_dir.exists():
+                        return False, f"目标目录已存在: {target_dir}", None
+                    shutil.move(str(current_dir), str(target_dir))
+                    moved = True
+
+            new_file_path = old_file_path
+            if target_name != current_name and moved:
+                try:
+                    rel = old_file_path.relative_to(current_dir)
+                    new_file_path = target_dir / rel
+                except Exception:
+                    new_file_path = target_dir / old_file_path.name
+
+            metadata = template.get('metadata') or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+            metadata['last_updated_by'] = updated_by or metadata.get('last_updated_by')
+            metadata['last_updated_at'] = datetime.now().isoformat()
+            metadata['visibility'] = target_visibility
+            if web_port_presets is not None:
+                metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
+
+            table_name = self.db.get_table_name('service_templates')
+            if self.db.db_type == 'mysql':
+                self.db.execute_query(
+                    f"UPDATE {table_name} SET name = %s, description = %s, visibility = %s, "
+                    "file_path = %s, updated_at = NOW(), metadata = %s WHERE id = %s",
+                    (target_name, target_description, target_visibility, str(new_file_path), json.dumps(metadata), template_id)
+                )
+            else:
+                self.db.execute_query(
+                    f"UPDATE {table_name} SET name = ?, description = ?, visibility = ?, "
+                    "file_path = ?, updated_at = datetime('now'), metadata = ? WHERE id = ?",
+                    (target_name, target_description, target_visibility, str(new_file_path), json.dumps(metadata), template_id)
+                )
+
+            updated = self.get_template_by_id(template_id)
+            return True, "模板更新成功", updated
+        except Exception as e:
+            self.logger.error(f"更新模板基础信息失败: {str(e)}", exc_info=True)
+            return False, f"更新模板失败: {str(e)}", None
+
+    def copy_template(self, source_name: str, target_name: str, created_by: str,
+                      owner_id: str = '', owner_name: str = '',
+                      visibility: str = 'private', description: str = '') -> Tuple[bool, str]:
+        """复制模板为新模板"""
+        try:
+            source = self.get_template(source_name)
+            if not source:
+                return False, f"源模板 '{source_name}' 不存在"
+
+            source_file = Path(source['file_path'])
+            if not source_file.exists():
+                return False, f"源模板文件不存在: {source_file}"
+
+            with open(source_file, 'rb') as f:
+                file_content = f.read()
+
+            source_desc = source.get('description') or ''
+            final_description = description if description else f"{source_desc} (copy from {source_name})".strip()
+            source_meta = source.get('metadata') or {}
+            if isinstance(source_meta, str):
+                try:
+                    source_meta = json.loads(source_meta)
+                except Exception:
+                    source_meta = {}
+            original_filename = source_meta.get('original_filename') or source_file.name
+
+            return self.create_template(
+                name=target_name,
+                description=final_description,
+                template_type=source.get('type', 'yaml'),
+                file_content=file_content,
+                filename=original_filename,
+                created_by=created_by,
+                visibility=visibility,
+                owner_id=owner_id,
+                owner_name=owner_name
+            )
+        except Exception as e:
+            self.logger.error(f"复制模板失败: {str(e)}", exc_info=True)
+            return False, f"复制模板失败: {str(e)}"

@@ -33,6 +33,22 @@ data:
       # kubeconfig路径（集群外运行时使用，null表示使用默认~/.kube/config）
       kubeconfig: null
       connection_timeout: 30
+    # K8S API Service配置（通过secflow-platform-k8s管理K8s资源）
+    k8s_api_service:
+      host: "secflow-platform-k8s"
+      port: 80
+      timeout: 30
+      use_user_token: true
+    # 认证服务配置
+    auth_service:
+      enabled: true
+      host: "secflow-platform-auth"
+      port: 80
+      validate_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+      timeout: 10
+      token_cache_enabled: true
+      token_cache_ttl_minutes: 15
     # Code Server配置
     code_server:
       # 默认镜像
