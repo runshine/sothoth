@@ -219,6 +219,44 @@ class EnhancedTemplateManager:
 
         self.logger.info(f"模板管理器初始化，支持格式: {', '.join(self.supported_formats)}")
 
+    def _normalize_web_port_presets(self, presets: Any) -> List[Dict[str, Any]]:
+        """规范化模板预制Web端口配置。"""
+        if not presets:
+            return []
+        normalized: List[Dict[str, Any]] = []
+        if not isinstance(presets, list):
+            return normalized
+
+        for item in presets:
+            if not isinstance(item, dict):
+                continue
+            try:
+                port = int(item.get('port'))
+            except Exception:
+                continue
+            if port <= 0 or port > 65535:
+                continue
+
+            protocol = str(item.get('protocol') or 'http').strip().lower()
+            if protocol not in ('http', 'https'):
+                protocol = 'http'
+
+            entry = {
+                'port': port,
+                'protocol': protocol,
+                'name': str(item.get('name') or '').strip()[:64],
+                'description': str(item.get('description') or '').strip()[:256],
+                'path': str(item.get('path') or '/').strip() or '/',
+                'websocket_enabled': bool(item.get('websocket_enabled', True)),
+                'tls_enabled': bool(item.get('tls_enabled', protocol == 'https'))
+            }
+            normalized.append(entry)
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for p in normalized:
+            dedup[f"{p['port']}:{p['protocol']}"] = p
+        return list(dedup.values())[:32]
+
     # 新增方法：获取模板目录下指定文件的内容
     def get_template_file_by_path(self, template_name: str, file_path: str,
                                   encoding: str = 'utf-8') -> Tuple[bool, Union[str, bytes], str, Dict]:
@@ -1395,7 +1433,8 @@ class EnhancedTemplateManager:
 
     def create_template(self, name: str, description: str, template_type: str,
                         file_content: bytes, filename: str, created_by: str,
-                        visibility: str = 'shared', owner_id: str = '', owner_name: str = '') -> Tuple[bool, str]:
+                        visibility: str = 'shared', owner_id: str = '', owner_name: str = '',
+                        web_port_presets: Optional[List[Dict[str, Any]]] = None) -> Tuple[bool, str]:
         """创建模板（增强版，支持多种压缩格式）"""
         template_dir = None
         file_path = None
@@ -1542,6 +1581,8 @@ class EnhancedTemplateManager:
                 'owner_id': owner_id or None,
                 'owner_name': owner_name or None
             }
+            if web_port_presets is not None:
+                metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
 
             if template_type == 'archive' and found_yaml:
                 metadata['main_yaml_file'] = str(found_yaml.relative_to(template_dir))
@@ -2398,6 +2439,7 @@ class EnhancedTemplateManager:
                               new_name: Optional[str] = None,
                               description: Optional[str] = None,
                               visibility: Optional[str] = None,
+                              web_port_presets: Optional[List[Dict[str, Any]]] = None,
                               updated_by: str = '') -> Tuple[bool, str, Optional[Dict]]:
         """更新模板基础信息（支持重命名）"""
         try:
@@ -2445,6 +2487,8 @@ class EnhancedTemplateManager:
             metadata['last_updated_by'] = updated_by or metadata.get('last_updated_by')
             metadata['last_updated_at'] = datetime.now().isoformat()
             metadata['visibility'] = target_visibility
+            if web_port_presets is not None:
+                metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
 
             table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':

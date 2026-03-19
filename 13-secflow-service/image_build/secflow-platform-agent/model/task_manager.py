@@ -800,3 +800,61 @@ class TaskManager:
         except Exception as e:
             self.logger.error(f"删除任务失败: {str(e)}")
             return False
+
+    def delete_tasks_by_project(self, project_id: str) -> int:
+        """按项目清空全部任务记录（含日志）。返回删除的任务数。"""
+        if not project_id:
+            return 0
+
+        try:
+            table_tasks = self.db.get_table_name('tasks')
+            table_logs = self.db.get_table_name('task_logs')
+
+            # 先查出任务ID，用于取消内存中的活跃任务
+            if self.db.db_type == 'mysql':
+                rows = self.db.fetch_all(
+                    f"SELECT task_id FROM {table_tasks} WHERE project_id = %s",
+                    (project_id,)
+                ) or []
+            else:
+                rows = self.db.fetch_all(
+                    f"SELECT task_id FROM {table_tasks} WHERE project_id = ?",
+                    (project_id,)
+                ) or []
+
+            task_ids = [str(r.get('task_id')) for r in rows if r.get('task_id')]
+            if not task_ids:
+                return 0
+
+            # 批量删除日志和任务
+            if self.db.db_type == 'mysql':
+                self.db.execute_transaction([
+                    (
+                        f"DELETE {table_logs} FROM {table_logs} "
+                        f"INNER JOIN {table_tasks} ON {table_logs}.task_id = {table_tasks}.task_id "
+                        f"WHERE {table_tasks}.project_id = %s",
+                        (project_id,)
+                    ),
+                    (f"DELETE FROM {table_tasks} WHERE project_id = %s", (project_id,))
+                ])
+            else:
+                self.db.execute_transaction([
+                    (
+                        f"DELETE FROM {table_logs} WHERE task_id IN "
+                        f"(SELECT task_id FROM {table_tasks} WHERE project_id = ?)",
+                        (project_id,)
+                    ),
+                    (f"DELETE FROM {table_tasks} WHERE project_id = ?", (project_id,))
+                ])
+
+            # 取消活跃任务future
+            for task_id in task_ids:
+                future = self.active_tasks.pop(task_id, None)
+                if future and not future.done():
+                    future.cancel()
+
+            self.logger.info(f"项目任务清空成功: project_id={project_id}, deleted={len(task_ids)}")
+            return len(task_ids)
+        except Exception as e:
+            self.logger.error(f"按项目清空任务失败: project_id={project_id}, err={str(e)}", exc_info=True)
+            return 0
