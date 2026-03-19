@@ -5055,12 +5055,25 @@ class WebAPIServer:
 
         # 运行Flask应用
         self.logger.info(f"启动WEB API服务器，监听 {self.config['host']}:{self.config['port']}")
-        self.app.run(
-            host=self.config['host'],
-            port=self.config['port'],
-            debug=self.config['debug'],
-            use_reloader=False
-        )
+        try:
+            # WebSocket 中转依赖真实 WS 服务器；Werkzeug 开发服务器在该场景下会返回 400。
+            from gevent import pywsgi
+            from geventwebsocket.handler import WebSocketHandler
+
+            server = pywsgi.WSGIServer(
+                (self.config['host'], self.config['port']),
+                self.app,
+                handler_class=WebSocketHandler
+            )
+            server.serve_forever()
+        except Exception as e:
+            self.logger.warning(f"gevent WebSocket server不可用，回退Flask开发服务器: {e}")
+            self.app.run(
+                host=self.config['host'],
+                port=self.config['port'],
+                debug=self.config['debug'],
+                use_reloader=False
+            )
 
 
 def adjust_timeout_config(config: Dict) -> Dict:

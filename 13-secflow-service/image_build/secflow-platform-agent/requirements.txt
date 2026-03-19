@@ -14,3 +14,5 @@ requests
 DBUtils
 simple-websocket
 websocket-client
+gevent
+gevent-websocket
