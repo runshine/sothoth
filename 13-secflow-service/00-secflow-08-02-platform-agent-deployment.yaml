@@ -18,6 +18,11 @@ spec:
       - name: secflow-platform-agent
         image: ghcr.io/runshine/secflow-platform-agent:latest  # 包含kubectl命令
         imagePullPolicy: Always
+        command:
+        - /bin/sh
+        - -c
+        args:
+        - exec python /app/app.py --config /app/config.json
         ports:
         - containerPort: 8080
         volumeMounts:

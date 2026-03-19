@@ -9,12 +9,13 @@ import hashlib
 import uuid
 import requests
 import websocket as ws_client
-from gevent import with_timeout
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import io
 import zipfile
 from urllib.parse import quote, urlencode
+from simple_websocket import Server
+from simple_websocket.errors import ConnectionClosed
 
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
@@ -2323,9 +2324,10 @@ class WebAPIServer:
                         'upstream_detail': probe_detail
                     }), 400
 
-                ws = request.environ.get('wsgi.websocket')
-                if ws is None:
-                    return jsonify({'error': 'WebSocket upgrade required'}), 426
+                ws = Server.accept(
+                    request.environ,
+                    ping_interval=25
+                )
                 self.logger.info(f"终端中转浏览器握手成功: {tunnel_tag}")
 
                 query = {
@@ -2351,7 +2353,6 @@ class WebAPIServer:
                 stop_event = threading.Event()
                 close_lock = threading.Lock()
                 upstream_queue: "queue.Queue[tuple[str, Any]]" = queue.Queue()
-                ws_no_message = object()
 
                 def _close_both():
                     with close_lock:
@@ -2409,18 +2410,24 @@ class WebAPIServer:
                         break
 
                     try:
-                        message = with_timeout(0.2, ws.receive, timeout_value=ws_no_message)
+                        message = ws.receive(timeout=0.2)
+                    except ConnectionClosed:
+                        self.logger.info(f"终端中转浏览器连接关闭: {tunnel_tag}")
+                        stop_event.set()
+                        break
                     except Exception as e:
                         self.logger.info(f"终端中转下行关闭: {tunnel_tag}, err={e!r}")
                         stop_event.set()
                         break
 
-                    if message is ws_no_message:
-                        continue
                     if message is None:
+                        if getattr(ws, 'connected', True):
+                            continue
                         self.logger.info(f"终端中转浏览器已断开(None): {tunnel_tag}")
                         stop_event.set()
                         break
+                    if message == '':
+                        continue
 
                     self.logger.info(
                         f"终端中转浏览器消息: {tunnel_tag}, type={type(message).__name__}, "
@@ -5379,12 +5386,10 @@ class WebAPIServer:
         try:
             # WebSocket 中转依赖真实 WS 服务器；Werkzeug 开发服务器在该场景下会返回 400。
             from gevent import pywsgi
-            from geventwebsocket.handler import WebSocketHandler
 
             server = pywsgi.WSGIServer(
                 (self.config['host'], self.config['port']),
-                self.app,
-                handler_class=WebSocketHandler
+                self.app
             )
             server.serve_forever()
         except Exception as e:
