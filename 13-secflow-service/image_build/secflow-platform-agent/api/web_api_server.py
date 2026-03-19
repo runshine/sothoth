@@ -24,6 +24,7 @@ from model.enhanced_template_manager import EnhancedTemplateManager
 from model.agent_manager import AgentManager
 from model.task_manager import TaskManager
 from model.enhanced_proxy_manager import EnhancedProxyManager
+from model.model import AgentInfo
 
 from flask import send_file, redirect, Response
 # ===================== Flask应用 =====================
@@ -378,6 +379,133 @@ class WebAPIServer:
                 (agent_key,)
             )
 
+    def _resolve_or_auto_create_agent_for_report(self, agent_key: str):
+        """服务上报场景下，允许未知agent自动发现并创建。"""
+        agent = self.agent_manager.get_agent(agent_key)
+        if agent:
+            return agent
+
+        try:
+            agent = self.agent_manager.ensure_agent_exists(agent_key)
+        except Exception as e:
+            self.logger.warning(f"服务上报自动创建Agent失败: key={agent_key}, err={e}")
+            agent = None
+
+        return agent
+
+    def _upsert_agent_from_report(self, agent_key: str, report_data: Dict[str, Any]):
+        """根据Agent上报负载补齐/修正Agent主记录。"""
+        if not agent_key:
+            return None
+
+        project_id = str(report_data.get('project_id') or report_data.get('workspace_id') or '').strip()
+        hostname = str(report_data.get('hostname') or '').strip()
+        ip_address = str(report_data.get('ip_address') or report_data.get('agent_ip') or '').strip()
+        full_name = str(report_data.get('full_name') or '').strip()
+
+        agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
+        if agent:
+            if project_id:
+                agent.project_id = project_id
+            if hostname:
+                agent.hostname = hostname
+            if ip_address:
+                agent.ip_address = ip_address
+
+            if full_name:
+                agent.full_name = full_name
+            elif agent.project_id and agent.hostname and agent.ip_address:
+                agent.full_name = f"{agent.project_id}-{agent.hostname}-{agent.ip_address}"
+            elif not agent.full_name:
+                agent.full_name = agent_key
+
+            agent.status = 'online'
+            agent.last_seen = datetime.now()
+            self.agent_manager._save_agent_to_db(agent)
+            if agent.project_id:
+                with self.agent_manager.lock:
+                    self.agent_manager.agents[agent.key] = agent
+                    self.agent_manager._update_project(agent.project_id, agent.key)
+            return agent
+
+        if not project_id:
+            return None
+
+        if not hostname:
+            hostname = f"agent-{agent_key[:8]}"
+        if not full_name:
+            full_name = f"{project_id}-{hostname}-{ip_address}" if ip_address else f"{project_id}-{hostname}"
+        created = AgentInfo(
+            key=agent_key,
+            ip_address=ip_address,
+            hostname=hostname,
+            project_id=project_id,
+            full_name=full_name,
+            status='online',
+            pod_id=self.config.get('pod_id', '')
+        )
+        created.last_seen = datetime.now()
+        self.agent_manager._save_agent_to_db(created)
+        ensured = self.agent_manager.ensure_agent_exists(agent_key)
+        if ensured and ensured.project_id:
+            with self.agent_manager.lock:
+                self.agent_manager.agents[ensured.key] = ensured
+                self.agent_manager._update_project(ensured.project_id, ensured.key)
+        return ensured
+
+    def _cleanup_agent_k8s_resources(self, project_id: str, agent_key: str) -> Dict[str, Any]:
+        """清理agent关联的K8S资源（当前含动态Ingress路由）。"""
+        result = {
+            'agent_key': agent_key,
+            'success': True,
+            'deleted_ingress_routes': 0,
+            'errors': []
+        }
+        if not project_id or not agent_key:
+            return result
+
+        try:
+            list_resp = self._call_k8s_service(
+                method='GET',
+                path='/api/k8s/agent-ingress-routes',
+                project_id=project_id,
+                params={'agent_key': agent_key},
+            )
+            if list_resp.status_code >= 300:
+                result['success'] = False
+                result['errors'].append(f"list ingress routes failed: {list_resp.status_code}")
+                return result
+
+            payload = list_resp.json() if list_resp.content else {}
+            items = []
+            if isinstance(payload, dict):
+                raw_items = payload.get('items') or payload.get('routes') or []
+                if isinstance(raw_items, list):
+                    items = raw_items
+            elif isinstance(payload, list):
+                items = payload
+
+            for item in items:
+                route_id = str((item or {}).get('route_id') or (item or {}).get('id') or '').strip()
+                if not route_id:
+                    continue
+                del_resp = self._call_k8s_service(
+                    method='DELETE',
+                    path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                    project_id=project_id,
+                    params={'agent_key': agent_key},
+                )
+                if del_resp.status_code < 300:
+                    result['deleted_ingress_routes'] += 1
+                else:
+                    result['success'] = False
+                    result['errors'].append(f"delete ingress route {route_id} failed: {del_resp.status_code}")
+        except Exception as e:
+            result['success'] = False
+            result['errors'].append(str(e))
+
+        return result
+
     def _get_stale_agent_keys(self, project_id: Optional[str] = None) -> set:
         table_name = self.db_manager.get_table_name('agent_services')
         if self.db_manager.db_type == 'mysql':
@@ -449,14 +577,36 @@ class WebAPIServer:
     def _sync_single_agent_services(self, agent: Any) -> Dict[str, Any]:
         """强制同步单个Agent的服务状态。"""
         if not agent:
-            return {'ok': False, 'error': 'agent_not_found'}
+            return {
+                'ok': False,
+                'agent_key': '',
+                'reason_code': 'agent_not_found',
+                'reason': 'Agent对象不存在',
+                'status_code': 404
+            }
 
+        begin = time.time()
         status_code, response = self.agent_manager.call_agent_api(
-            agent.key, 'GET', '/api/services', timeout_type='health_check'
+            agent.key, 'GET', '/api/services', timeout_type='proxy'
         )
         if status_code != 200:
             self._mark_agent_services_stale(agent.key)
-            return {'ok': False, 'error': f'agent_api_status_{status_code}', 'status_code': status_code}
+            reason = ''
+            if isinstance(response, dict):
+                reason = str(response.get('error') or response.get('message') or '')
+            elif isinstance(response, str):
+                reason = response
+            if not reason:
+                reason = f'Agent API返回状态码 {status_code}'
+            return {
+                'ok': False,
+                'agent_key': agent.key,
+                'reason_code': f'agent_api_status_{status_code}',
+                'reason': reason,
+                'status_code': status_code,
+                'agent_status': getattr(agent, 'status', 'unknown'),
+                'duration_ms': int((time.time() - begin) * 1000)
+            }
 
         services = []
         if isinstance(response, list):
@@ -466,9 +616,51 @@ class WebAPIServer:
                 services = response.get('services') or []
             elif isinstance(response.get('items'), list):
                 services = response.get('items') or []
+            else:
+                return {
+                    'ok': False,
+                    'agent_key': agent.key,
+                    'reason_code': 'invalid_services_payload',
+                    'reason': 'Agent /api/services 返回格式不符合预期（缺少列表字段）',
+                    'status_code': 200,
+                    'agent_status': getattr(agent, 'status', 'unknown'),
+                    'duration_ms': int((time.time() - begin) * 1000)
+                }
+        else:
+            return {
+                'ok': False,
+                'agent_key': agent.key,
+                'reason_code': 'invalid_services_payload',
+                'reason': 'Agent /api/services 返回非JSON列表格式',
+                'status_code': 200,
+                'agent_status': getattr(agent, 'status', 'unknown'),
+                'duration_ms': int((time.time() - begin) * 1000)
+            }
 
-        seen, upserted = self._upsert_agent_services_snapshot(agent, services, source='pull_force')
-        return {'ok': True, 'agent_key': agent.key, 'seen': seen, 'upserted': upserted}
+        try:
+            seen, upserted = self._upsert_agent_services_snapshot(agent, services, source='pull_force')
+            return {
+                'ok': True,
+                'agent_key': agent.key,
+                'seen': seen,
+                'upserted': upserted,
+                'reason_code': 'success',
+                'reason': '同步成功',
+                'status_code': 200,
+                'agent_status': getattr(agent, 'status', 'unknown'),
+                'duration_ms': int((time.time() - begin) * 1000)
+            }
+        except Exception as e:
+            self.logger.error(f"写入服务聚合表失败: agent={agent.key}, err={e}", exc_info=True)
+            return {
+                'ok': False,
+                'agent_key': agent.key,
+                'reason_code': 'db_upsert_failed',
+                'reason': f'服务状态入库失败: {str(e)}',
+                'status_code': 500,
+                'agent_status': getattr(agent, 'status', 'unknown'),
+                'duration_ms': int((time.time() - begin) * 1000)
+            }
 
     def _is_agent_report_authenticated(self) -> bool:
         token = request.headers.get('X-Auth-Token')
@@ -722,6 +914,7 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id is required'}), 400
                 dry_run = data.get('dry_run', False)  # 是否模拟运行
                 force = data.get('force', False)  # 是否强制清理（不检查时间）
+                cleanup_k8s_resources = bool(data.get('cleanup_k8s_resources', True))
 
                 # 先获取统计信息（按project过滤）
                 offline_count, total_count = self.agent_manager.get_offline_agents_count(project_id)
@@ -751,10 +944,31 @@ class WebAPIServer:
                 success, message, cleanup_info = self.agent_manager.cleanup_offline_agents(project_id)
 
                 if success:
+                    k8s_cleanup = {
+                        'enabled': cleanup_k8s_resources,
+                        'processed': 0,
+                        'ok': 0,
+                        'failed': 0,
+                        'details': []
+                    }
+                    if cleanup_k8s_resources:
+                        for item in cleanup_info.get('cleaned_agents', []) or []:
+                            cleaned_key = str(item.get('agent_key') or '').strip()
+                            if not cleaned_key:
+                                continue
+                            detail = self._cleanup_agent_k8s_resources(project_id, cleaned_key)
+                            k8s_cleanup['processed'] += 1
+                            if detail.get('success'):
+                                k8s_cleanup['ok'] += 1
+                            else:
+                                k8s_cleanup['failed'] += 1
+                            k8s_cleanup['details'].append(detail)
+
                     return jsonify({
                         'message': message,
                         'success': True,
                         'cleanup_info': cleanup_info,
+                        'k8s_cleanup': k8s_cleanup,
                         'offline_count_before': offline_count,
                         'total_count_before': total_count,
                         'project_id': project_id,
@@ -1683,7 +1897,7 @@ class WebAPIServer:
 
                 # 1) 单Agent强制同步
                 if agent_key:
-                    agent = self.agent_manager.get_agent(agent_key)
+                    agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
                     if not agent:
                         return jsonify({'error': f'Agent {agent_key} not found'}), 404
                     result = self._sync_single_agent_services(agent)
@@ -1899,7 +2113,7 @@ class WebAPIServer:
                 if not isinstance(services, list):
                     return jsonify({'error': 'services must be an array'}), 400
 
-                agent = self.agent_manager.get_agent(agent_key)
+                agent = self._upsert_agent_from_report(agent_key, data) or self._resolve_or_auto_create_agent_for_report(agent_key)
                 if not agent:
                     return jsonify({'error': f'Agent {agent_key} not found'}), 404
 
@@ -1930,7 +2144,7 @@ class WebAPIServer:
                 if not isinstance(services, list):
                     return jsonify({'error': 'services must be an array'}), 400
 
-                agent = self.agent_manager.get_agent(agent_key)
+                agent = self._upsert_agent_from_report(agent_key, data) or self._resolve_or_auto_create_agent_for_report(agent_key)
                 if not agent:
                     return jsonify({'error': f'Agent {agent_key} not found'}), 404
 

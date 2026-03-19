@@ -869,6 +869,134 @@ class AgentManager:
         with self.lock:
             return self.agents.get(key)
 
+    def ensure_agent_exists(self, agent_key: str) -> Optional[AgentInfo]:
+        """
+        确保指定agent存在：
+        1. 先查内存
+        2. 再查数据库
+        3. 最后从Nacos扫描并按agent_key反查创建
+        """
+        if not agent_key:
+            return None
+
+        # 1) 内存命中
+        with self.lock:
+            cached = self.agents.get(agent_key)
+        if cached:
+            return cached
+
+        # 2) DB命中并回填内存
+        try:
+            table_name = self.db.get_table_name('agent_status')
+            if self.db.db_type == 'mysql':
+                row = self.db.fetch_one(
+                    f"SELECT * FROM {table_name} WHERE agent_key = %s LIMIT 1",
+                    (agent_key,)
+                )
+            else:
+                row = self.db.fetch_one(
+                    f"SELECT * FROM {table_name} WHERE agent_key = ? LIMIT 1",
+                    (agent_key,)
+                )
+            if row:
+                restored = AgentInfo(
+                    key=row.get('agent_key') or agent_key,
+                    ip_address=row.get('ip_address') or '',
+                    hostname=row.get('hostname') or '',
+                    project_id=row.get('project_id') or '',
+                    full_name=row.get('full_name') or '',
+                    status=row.get('status') or 'unknown',
+                    pod_id=row.get('pod_id') or self.pod_id
+                )
+                last_seen = row.get('last_seen')
+                if last_seen:
+                    try:
+                        restored.last_seen = datetime.fromisoformat(str(last_seen))
+                    except Exception:
+                        restored.last_seen = datetime.now()
+
+                system_info = row.get('system_info')
+                if system_info:
+                    if isinstance(system_info, str):
+                        try:
+                            restored.system_info = json.loads(system_info)
+                        except Exception:
+                            restored.system_info = {}
+                    elif isinstance(system_info, dict):
+                        restored.system_info = system_info
+
+                daemon_info = row.get('daemon_info')
+                if daemon_info:
+                    if isinstance(daemon_info, str):
+                        try:
+                            restored.daemon_info = json.loads(daemon_info)
+                        except Exception:
+                            restored.daemon_info = {}
+                    elif isinstance(daemon_info, dict):
+                        restored.daemon_info = daemon_info
+
+                services = row.get('services')
+                if services:
+                    if isinstance(services, str):
+                        try:
+                            restored.services = json.loads(services)
+                        except Exception:
+                            restored.services = []
+                    elif isinstance(services, list):
+                        restored.services = services
+
+                with self.lock:
+                    self.agents[restored.key] = restored
+                    if restored.project_id:
+                        self._update_project(restored.project_id, restored.key)
+
+                self.logger.info(f"通过数据库恢复Agent成功: {agent_key}")
+                return restored
+        except Exception as e:
+            self.logger.warning(f"数据库恢复Agent失败: key={agent_key}, err={e}")
+
+        # 3) Nacos反查发现并创建
+        try:
+            services = self._fetch_nacos_services()
+            for service in services:
+                parsed = self._parse_agent_name(service)
+                if not parsed:
+                    continue
+                project_id, hostname, ip_address = parsed
+                discovered_key = self._get_agent_key(hostname, ip_address, service)
+                if discovered_key != agent_key:
+                    continue
+
+                discovered = AgentInfo(
+                    key=agent_key,
+                    ip_address=ip_address,
+                    hostname=hostname,
+                    project_id=project_id,
+                    full_name=service,
+                    status='unknown',
+                    pod_id=self.pod_id
+                )
+
+                # 尽量更新在线状态（失败也不阻塞自动创建）
+                try:
+                    self._check_secflow_agent_agent_status(discovered)
+                except Exception:
+                    pass
+
+                self._save_agent_to_db(discovered)
+                with self.lock:
+                    self.agents[discovered.key] = discovered
+                    self._update_project(discovered.project_id, discovered.key)
+
+                self.logger.info(
+                    f"通过Nacos自动创建Agent成功: key={agent_key}, project={project_id}, ip={ip_address}, host={hostname}"
+                )
+                return discovered
+        except Exception as e:
+            self.logger.warning(f"Nacos反查自动创建Agent失败: key={agent_key}, err={e}")
+
+        return None
+
     def list_agents(self, page: int = 1, per_page: int = 20,
                     project_id: str = None) -> Tuple[List[Dict], int]:
         with self.lock:
