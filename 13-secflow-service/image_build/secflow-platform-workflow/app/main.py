@@ -4,7 +4,10 @@ SecFlow Workflow Service Main Entry
 
 import logging
 import sys
+import json
 from contextlib import asynccontextmanager
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,6 +30,51 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+
+def verify_auth_service_or_exit():
+    """Startup check: auth connectivity + machine token validation."""
+    cfg = get_config().auth_service
+    machine_token = getattr(cfg, "service_machine_token", None)
+    if not machine_token:
+        logger.error("auth_service.service_machine_token is required")
+        sys.exit(1)
+
+    base_url = f"http://{cfg.host}:{cfg.port}"
+    health_url = f"{base_url}/api/auth/health"
+    validate_url = cfg.validate_url
+
+    try:
+        with urlopen(health_url, timeout=cfg.timeout) as resp:
+            if resp.status != 200:
+                logger.error(f"Auth health check failed: status={resp.status}")
+                sys.exit(1)
+    except Exception as e:
+        logger.error(f"Auth service unreachable: {e}")
+        sys.exit(1)
+
+    try:
+        req = Request(validate_url, method="POST")
+        req.add_header("Authorization", f"Bearer {machine_token}")
+        with urlopen(req, timeout=cfg.timeout) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            if resp.status != 200:
+                logger.error(f"Machine token validation failed: status={resp.status}, body={body}")
+                sys.exit(1)
+            payload = json.loads(body or "{}")
+            if payload.get("token_type") != "machine":
+                logger.error(f"Invalid machine token type: {payload.get('token_type')}")
+                sys.exit(1)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+        logger.error(f"Machine token validation failed: status={e.code}, body={body}")
+        sys.exit(1)
+    except URLError as e:
+        logger.error(f"Machine token validation failed, auth unreachable: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Machine token validation failed: {e}")
+        sys.exit(1)
 
 
 @asynccontextmanager
@@ -54,6 +102,9 @@ async def lifespan(app: FastAPI):
     # Verify K8S service configuration
     config = get_config()
     logger.info(f"K8S service mode enabled, endpoint: {config.k8s_service.host}:{config.k8s_service.port}")
+
+    verify_auth_service_or_exit()
+    logger.info("Auth connectivity and machine token validation passed")
 
     # Register with Menu service
     try:

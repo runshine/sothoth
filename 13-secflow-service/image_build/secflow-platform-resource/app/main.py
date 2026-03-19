@@ -6,9 +6,12 @@ import uuid
 import yaml
 import asyncio
 import logging
+import json
 import aiofiles
 from pathlib import Path
 from typing import Optional
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
 
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
@@ -23,6 +26,57 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def verify_auth_service_or_exit(config: dict):
+    """启动时校验Auth服务连通性与机机Token有效性。"""
+    auth_cfg = config.get("auth_service", {})
+    base_url = (auth_cfg.get("base_url") or "").rstrip("/")
+    validate_path = auth_cfg.get("validate_token_path", "/api/auth/validate-token")
+    timeout = auth_cfg.get("timeout", 10)
+    machine_token = auth_cfg.get("service_machine_token")
+
+    if not base_url:
+        logger.error("auth_service.base_url 未配置，拒绝启动")
+        sys.exit(1)
+    if not machine_token:
+        logger.error("auth_service.service_machine_token 未配置，拒绝启动")
+        sys.exit(1)
+
+    health_url = f"{base_url}/api/auth/health"
+    validate_url = f"{base_url}{validate_path}"
+
+    try:
+        with urlopen(health_url, timeout=timeout) as resp:
+            if resp.status != 200:
+                logger.error(f"Auth服务健康检查失败: status={resp.status}")
+                sys.exit(1)
+    except Exception as e:
+        logger.error(f"Auth服务不可达: {e}")
+        sys.exit(1)
+
+    try:
+        req = Request(validate_url, method="POST")
+        req.add_header("Authorization", f"Bearer {machine_token}")
+        with urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            if resp.status != 200:
+                logger.error(f"机机Token校验失败: status={resp.status}, body={body}")
+                sys.exit(1)
+            payload = json.loads(body or "{}")
+            if payload.get("token_type") != "machine":
+                logger.error(f"机机Token类型异常: token_type={payload.get('token_type')}")
+                sys.exit(1)
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore") if hasattr(e, "read") else ""
+        logger.error(f"机机Token校验失败: status={e.code}, body={body}")
+        sys.exit(1)
+    except URLError as e:
+        logger.error(f"机机Token校验失败，Auth服务不可达: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"机机Token校验失败: {e}")
+        sys.exit(1)
 
 
 def load_config(config_path: str = None) -> dict:
@@ -110,6 +164,8 @@ def validate_config(config: dict) -> tuple[bool, list[str]]:
     auth_config = config.get("auth_service", {})
     if not auth_config.get("base_url"):
         errors.append("auth_service.base_url is required")
+    if not auth_config.get("service_machine_token"):
+        errors.append("auth_service.service_machine_token is required")
 
     # 检查项目服务配置
     project_config = config.get("project_service", {})
@@ -248,6 +304,9 @@ def create_app(config: dict = None) -> FastAPI:
             logger.error(f"Configuration validation failed: {config_errors}")
             sys.exit(1)
         logger.info("Configuration validated successfully")
+
+        verify_auth_service_or_exit(config)
+        logger.info("Auth服务连通性与机机Token校验通过")
 
         # 2. 测试数据库连接
         logger.info("Testing database connection...")

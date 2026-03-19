@@ -3,6 +3,8 @@
 
 import os
 import logging
+import secrets
+from datetime import datetime
 
 # 配置日志
 logging.basicConfig(
@@ -176,7 +178,8 @@ def create_app():
     logger = logging.getLogger(__name__)
 
     from app.db_base import Base, engine  # noqa: F401
-    from app.database import init_db, verify_tables_exist  # noqa: F401
+    from app.database import init_db, verify_tables_exist, SessionLocal  # noqa: F401
+    from app.model import MachineToken  # noqa: F401
     from app.config import config
 
     logger.info(f"[Database] Initializing database...")
@@ -192,6 +195,71 @@ def create_app():
         raise
 
     logger.info(f"[Database] Database initialization completed")
+
+    def ensure_machine_token_seeded():
+        """
+        启动时检查机机Token是否存在。
+        - 若不存在：自动生成一个机机Token并写入数据库
+        - 将Token明文写入文件，便于配置其他微服务
+        """
+        db = SessionLocal()
+        try:
+            existing = db.query(MachineToken).order_by(MachineToken.id.asc()).all()
+            if existing:
+                logger.info(f"[MachineToken] 机机Token已存在，无需自动生成，count={len(existing)}")
+                return
+
+            token_value = secrets.token_urlsafe(48)
+            machine_code = "secflow-service-token-auto"
+            auto_token = MachineToken(
+                token=token_value,
+                machine_code=machine_code,
+                description=f"Auto generated at startup ({datetime.utcnow().isoformat()}Z)",
+                is_active=True,
+            )
+            db.add(auto_token)
+            db.commit()
+            db.refresh(auto_token)
+
+            # 日志明文输出（按需求）
+            logger.warning("[MachineToken] 未检测到机机Token，已自动生成")
+            logger.warning(f"[MachineToken] machine_code={auto_token.machine_code}")
+            logger.warning(f"[MachineToken] token={auto_token.token}")
+
+            # 明文落盘（按需求）
+            service_auth_cfg = config.get("service_auth", {}) if isinstance(config, dict) else {}
+            output_file = (
+                service_auth_cfg.get("machine_token_record_file")
+                or os.environ.get("SECFLOW_MACHINE_TOKEN_RECORD_FILE")
+                or "/tmp/secflow-machine-token.txt"
+            )
+            output_dir = os.path.dirname(output_file)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write("# Auto generated machine token for microservice auth\n")
+                f.write(f"generated_at={datetime.utcnow().isoformat()}Z\n")
+                f.write(f"machine_code={auto_token.machine_code}\n")
+                f.write(f"token={auto_token.token}\n\n")
+                f.write("# Suggested config snippet\n")
+                f.write("auth_service:\n")
+                f.write("  validate_token_path: \"/api/auth/validate-token\"\n")
+                f.write(f"  service_machine_token: \"{auto_token.token}\"\n")
+
+            try:
+                os.chmod(output_file, 0o600)
+            except Exception:
+                pass
+            logger.warning(f"[MachineToken] 机机Token已写入明文文件: {output_file}")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"[MachineToken] 自动生成机机Token失败: {e}")
+            raise
+        finally:
+            db.close()
+
+    ensure_machine_token_seeded()
 
     # 创建FastAPI应用，使用 lifespan
     app = FastAPI(

@@ -20,6 +20,8 @@
   "nacos_namespace": "public",
   "nacos_username": "nacos",
   "nacos_password": "nacos",
+  "auth_service_url": "http://secflow-platform-auth",
+  "service_machine_token": "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8",
   "k8s_service_url": "http://172.31.30.100:10010",
   "k8s_service_timeout_sec": 15,
   "agent_api_port": 11197,
