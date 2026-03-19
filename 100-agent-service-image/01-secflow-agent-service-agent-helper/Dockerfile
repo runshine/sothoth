@@ -66,14 +66,14 @@ RUN set -eux; \
         npm install --unsafe-perm -g @anthropic-ai/claude-code; \
         npm install --unsafe-perm -g code-server; \
         npm install --unsafe-perm -g claude-a2a; \
-        npm install -g @openai/codex ； \
+        npm install -g @openai/codex; \
     else \
         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash; \
         bash -lc ". \"$NVM_DIR/nvm.sh\" && nvm install 20 && nvm alias default 20 && nvm use --silent default && npm install --unsafe-perm -g @anthropic-ai/claude-code && npm install -g @openai/codex && npm install --unsafe-perm -g claude-a2a"; \
         curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone; \
         echo ". \"$NVM_DIR/nvm.sh\"" >> /root/.bashrc; \
     fi; \
-    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude-a2a; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a" \
+    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude-a2a; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a"; \
     echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
 
 # 创建 code-server 配置目录
