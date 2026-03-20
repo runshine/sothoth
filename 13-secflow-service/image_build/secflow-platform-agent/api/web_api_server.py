@@ -48,6 +48,14 @@ class WebAPIServer:
     def __init__(self, config: Dict):
         self.config = config
         self.logger = self._setup_logger()
+        self.started_at = datetime.now()
+        self.cached_component_health = {
+            'database': 'unknown',
+            'redis': 'unknown',
+            'nacos': 'unknown',
+        }
+        self.cached_health_status = 'starting'
+        self.health_state_lock = threading.Lock()
 
         # 1. 检查所有连接
         self._check_startup_connections()
@@ -241,6 +249,14 @@ class WebAPIServer:
             self.logger.info(f"✓ {redis_message}")
         else:
             self.logger.warning(f"⚠ {redis_message}，Redis功能将禁用")
+
+        with self.health_state_lock:
+            self.cached_component_health = {
+                'database': 'connected' if db_success else 'disconnected',
+                'redis': 'connected' if redis_success else 'disconnected',
+                'nacos': 'connected' if nacos_success else 'disconnected',
+            }
+            self.cached_health_status = 'healthy' if db_success and nacos_success else 'unhealthy'
 
         self.logger.info("所有启动连接检查完成")
 
@@ -1178,42 +1194,23 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/health', methods=['GET'])
         def health_check():
-            """健康检查端点"""
-            db_ok = False
-            try:
-                db = self.db_manager.get_connection()
-                db.fetch_one("SELECT 1")
-                db_ok = True
-            except:
-                pass
-
-            redis_ok = False
-            if self.redis_manager.enabled:
-                redis_ok = self.redis_manager.test_connection()
-
-            nacos_ok = False
-            try:
-                result, _ = ConnectionChecker.check_nacos(
-                    self.config['nacos_url'],
-                    self.config.get('nacos_namespace', 'public')
-                )
-                nacos_ok = result
-            except:
-                pass
-
-            # 计算总体状态
-            status = 'healthy' if db_ok and nacos_ok else 'unhealthy'
-
+            """
+            轻量健康检查端点。
+            供 K8S liveness/readiness/startup probe 使用，不在探针路径中同步探测
+            MySQL / Redis / Nacos，避免外部依赖抖动拖垮进程存活判断。
+            深度连通性检查仍通过 /api/agent/system/connections 暴露。
+            """
+            with self.health_state_lock:
+                status = self.cached_health_status
+                components = dict(self.cached_component_health)
             return jsonify({
                 'status': status,
                 'timestamp': datetime.now().isoformat(),
+                'started_at': self.started_at.isoformat(),
                 'pod_id': self.config['pod_id'],
                 'database_type': self.config['database'].get('type', 'sqlite'),
-                'components': {
-                    'database': 'connected' if db_ok else 'disconnected',
-                    'redis': 'connected' if redis_ok else 'disconnected',
-                    'nacos': 'connected' if nacos_ok else 'disconnected'
-                },
+                'probe_mode': 'shallow',
+                'components': components,
                 'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
