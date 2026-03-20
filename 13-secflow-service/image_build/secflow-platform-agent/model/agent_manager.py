@@ -572,6 +572,10 @@ class AgentManager:
 
     def _refresh_agents_without_lock(self):
         services = self._fetch_nacos_services()
+        if not services:
+            self.logger.warning("本轮未从Nacos获取到任何Agent服务，跳过缺失Agent下线收敛")
+            return
+
         new_agents = {}
 
         for service in services:
@@ -605,6 +609,8 @@ class AgentManager:
                 self._save_agent_to_db(agent)
                 new_agents[agent_key] = agent
 
+        self._mark_missing_agents_offline(set(new_agents.keys()))
+
         with self.lock:
             for key, new_agent in new_agents.items():
                 self.agents[key] = new_agent
@@ -615,6 +621,57 @@ class AgentManager:
                 del self.agents[key]
 
         self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个有效Agent")
+
+    def _mark_missing_agents_offline(self, active_keys: set):
+        """将本轮Nacos未发现但数据库中仍标记在线的Agent收敛为离线。"""
+        try:
+            table_name = self.db.get_table_name('agent_status')
+            rows = self.db.fetch_all(
+                f"SELECT agent_key, project_id, status FROM {table_name}"
+            ) or []
+
+            missing_online_keys = [
+                row['agent_key']
+                for row in rows
+                if row.get('agent_key')
+                and row.get('agent_key') not in active_keys
+                and (row.get('status') or '').lower() == 'online'
+            ]
+
+            if not missing_online_keys:
+                return
+
+            self.logger.info(f"将 {len(missing_online_keys)} 个未在Nacos中发现的旧在线Agent标记为offline")
+
+            if self.db.db_type == 'mysql':
+                placeholders = ','.join(['%s'] * len(missing_online_keys))
+                self.db.execute_query(
+                    f"UPDATE {table_name} "
+                    f"SET status = 'offline', pod_id = %s, updated_at = NOW() "
+                    f"WHERE agent_key IN ({placeholders})",
+                    (self.pod_id, *missing_online_keys)
+                )
+            else:
+                placeholders = ','.join(['?'] * len(missing_online_keys))
+                self.db.execute_query(
+                    f"UPDATE {table_name} "
+                    f"SET status = 'offline', pod_id = ?, updated_at = datetime('now') "
+                    f"WHERE agent_key IN ({placeholders})",
+                    (self.pod_id, *missing_online_keys)
+                )
+
+            with self.lock:
+                for agent_key in missing_online_keys:
+                    agent = self.agents.get(agent_key)
+                    if agent:
+                        agent.status = 'offline'
+                        agent.pod_id = self.pod_id
+                    for project in self.projects.values():
+                        if agent_key in project.agents:
+                            self._update_project(project.id, agent_key)
+
+        except Exception as e:
+            self.logger.error(f"收敛缺失Agent离线状态失败: {str(e)}")
 
     def cleanup_offline_agents(self, project_id: str = None, force: bool = False) -> Tuple[bool, str, Dict]:
         """
@@ -1078,6 +1135,7 @@ class AgentManager:
                 'full_name': row.get('full_name'),
                 'status': row.get('status') or 'unknown',
                 'pod_id': row.get('pod_id'),
+                'updated_at': str(row.get('updated_at')) if row.get('updated_at') else None,
             }
 
             last_seen = row.get('last_seen')
@@ -1160,6 +1218,18 @@ class AgentManager:
             agents_list = list(agents_map.values())
             for item in agents_list:
                 status = (item.get('status') or 'unknown').lower()
+                updated_at_raw = item.get('updated_at')
+                if status == 'online' and updated_at_raw:
+                    try:
+                        updated_at = datetime.fromisoformat(str(updated_at_raw).replace('Z', '+00:00'))
+                        if updated_at.tzinfo is not None:
+                            updated_at = updated_at.astimezone().replace(tzinfo=None)
+                        if datetime.now() - updated_at > timedelta(minutes=5):
+                            status = 'offline'
+                            item['status'] = 'offline'
+                            item['status_reason'] = '节点超过5分钟未在Nacos刷新，已自动视为离线'
+                    except Exception:
+                        pass
                 item['is_allowed'] = status == 'online'
                 item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
                 item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
