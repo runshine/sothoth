@@ -88,6 +88,7 @@ class TaskManager:
         self.worker_dispatch_thread: Optional[threading.Thread] = None
         self.worker_heartbeat_thread: Optional[threading.Thread] = None
         self.worker_stop_event = threading.Event()
+        self.service_sync_callback = None
 
         self._cleanup_old_logs()
 
@@ -224,6 +225,10 @@ class TaskManager:
             f"任务 worker 已启动: worker_id={self.worker_id}, max_workers={getattr(self.executor, '_max_workers', 5)}, "
             f"lease={self.task_lease_sec}s"
         )
+
+    def set_service_sync_callback(self, callback):
+        """注册任务完成后的服务状态同步回调。"""
+        self.service_sync_callback = callback
 
     def stop_workers(self):
         """停止任务 worker。"""
@@ -370,6 +375,14 @@ class TaskManager:
     def _on_task_future_done(self, task_id: str):
         with self.active_task_lock:
             self.active_tasks.pop(task_id, None)
+
+    def _notify_service_state_changed(self, agent_key: str, reason: str):
+        if not agent_key or not self.service_sync_callback:
+            return
+        try:
+            self.service_sync_callback(agent_key, reason)
+        except Exception as e:
+            self.logger.warning(f"任务完成后同步服务状态失败: agent={agent_key}, reason={reason}, err={e}")
 
     def _run_claimed_task(self, task_id: str, task_type: str, service_name: str,
                           agent_key: str, project_id: Optional[str]):
@@ -625,217 +638,223 @@ class TaskManager:
     def _deploy_yaml_template(self, task_id: str, service_name: str, agent_key: str,
                               template_name: str, extra_params: Dict = None):
         """部署YAML模板"""
-        # 获取YAML内容
-        success, yaml_content, error_msg = self.template_manager.get_yaml_content(template_name)
-        if not success:
-            self._update_task_status(task_id, 'failed', 30, f'获取YAML内容失败: {yaml_content}')
-            return
+        try:
+            # 获取YAML内容
+            success, yaml_content, error_msg = self.template_manager.get_yaml_content(template_name)
+            if not success:
+                self._update_task_status(task_id, 'failed', 30, f'获取YAML内容失败: {yaml_content}')
+                return
 
-        self._add_task_log(task_id, 'INFO', f"YAML内容大小: {len(yaml_content)} 字符")
+            self._add_task_log(task_id, 'INFO', f"YAML内容大小: {len(yaml_content)} 字符")
 
-        # 准备部署数据
-        data = {
-            'name': service_name,
-            'yaml': yaml_content
-        }
+            # 准备部署数据
+            data = {
+                'name': service_name,
+                'yaml': yaml_content
+            }
 
-        # 添加额外参数（如果有）
-        if extra_params:
-            data.update(extra_params)
+            # 添加额外参数（如果有）
+            if extra_params:
+                data.update(extra_params)
 
-        self._add_task_log(task_id, 'INFO', f"调用Agent API创建服务: {service_name}")
+            self._add_task_log(task_id, 'INFO', f"调用Agent API创建服务: {service_name}")
 
-        # 调用Agent API创建服务（使用较长的超时）
-        self._add_task_log(task_id, 'INFO', f"创建服务，超时设置: {self.timeouts['deploy_create']}")
-        status_code, response = self.agent_manager.call_agent_api(
-            agent_key, 'POST', '/api/services/yaml', data,
-            timeout_type='deploy_create'
-        )
-
-        self._add_task_log(task_id, 'INFO', f"Agent响应状态码: {status_code}")
-        self._add_task_log(task_id, 'DEBUG', f"Agent响应内容: {json.dumps(response)[:200]}...")
-
-        # 处理响应
-        if status_code == 201:
-            self._update_task_status(task_id, 'running', 70, '服务创建成功，正在启动')
-            time.sleep(2)
-
-            # 启动服务（使用更长的超时，因为可能需要下载镜像）
-            self._add_task_log(task_id, 'INFO', f"启动服务，超时设置: {self.timeouts['deploy_start']}")
-            start_status_code, start_response = self.agent_manager.call_agent_api(
-                agent_key, 'POST', f'/api/services/{service_name}/start', {},
-                timeout_type='deploy_start'
-            )
-
-            if start_status_code == 200:
-                self._update_task_status(task_id, 'success', 100, '服务部署成功')
-                self._add_task_log(task_id, 'INFO', '服务部署完成')
-            elif self._is_timeout_error(start_status_code, start_response):
-                # start接口超时不等于服务启动失败：避免误清理，先轮询服务实际状态
-                self._add_task_log(task_id, 'WARN', f"启动请求超时: {start_response}")
-                if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
-                    self._update_task_status(task_id, 'success', 100, '服务部署成功（超时后状态确认）')
-                else:
-                    error_msg = f'启动服务超时，且轮询未就绪: {start_response}'
-                    self._update_task_status(task_id, 'failed', 70, error_msg)
-                    self._add_task_log(task_id, 'ERROR', error_msg)
-            else:
-                error_msg = f'启动服务失败: {start_response}'
-                self._update_task_status(task_id, 'failed', 70, error_msg)
-                self._add_task_log(task_id, 'ERROR', error_msg)
-
-                # 尝试清理创建的服务
-                self._add_task_log(task_id, 'WARN', '尝试清理已创建的服务')
-                self._add_task_log(task_id, 'INFO', f"停止服务，超时设置: {self.timeouts['deploy_stop']}")
-                self.agent_manager.call_agent_api(
-                    agent_key, 'POST', f'/api/services/{service_name}/stop', {},
-                    timeout_type='deploy_stop'
-                )
-
-                time.sleep(2)
-
-                self._add_task_log(task_id, 'INFO', f"删除服务，超时设置: {self.timeouts['deploy_delete']}")
-                self.agent_manager.call_agent_api(
-                    agent_key, 'DELETE', f'/api/services/{service_name}', {},
-                    timeout_type='deploy_delete'
-                )
-
-        elif status_code == 409:
-            # 服务已存在，重新创建
-            self._update_task_status(task_id, 'running', 70, '服务已存在，尝试重新创建')
-            self._add_task_log(task_id, 'INFO', '停止现有服务')
-
-            # 先停止并删除现有服务
-            self.agent_manager.call_agent_api(
-                agent_key, 'POST', f'/api/services/{service_name}/stop', {},
-                timeout_type='deploy_stop'
-            )
-
-            time.sleep(3)
-
-            self._add_task_log(task_id, 'INFO', '删除现有服务')
-            self.agent_manager.call_agent_api(
-                agent_key, 'DELETE', f'/api/services/{service_name}', {},
-                timeout_type='deploy_delete'
-            )
-
-            time.sleep(2)
-
-            # 重新创建服务
-            self._add_task_log(task_id, 'INFO', '重新创建服务')
+            # 调用Agent API创建服务（使用较长的超时）
+            self._add_task_log(task_id, 'INFO', f"创建服务，超时设置: {self.timeouts['deploy_create']}")
             status_code, response = self.agent_manager.call_agent_api(
                 agent_key, 'POST', '/api/services/yaml', data,
                 timeout_type='deploy_create'
             )
 
+            self._add_task_log(task_id, 'INFO', f"Agent响应状态码: {status_code}")
+            self._add_task_log(task_id, 'DEBUG', f"Agent响应内容: {json.dumps(response)[:200]}...")
+
+            # 处理响应
             if status_code == 201:
-                # 启动服务
+                self._update_task_status(task_id, 'running', 70, '服务创建成功，正在启动')
                 time.sleep(2)
+
+                # 启动服务（使用更长的超时，因为可能需要下载镜像）
+                self._add_task_log(task_id, 'INFO', f"启动服务，超时设置: {self.timeouts['deploy_start']}")
                 start_status_code, start_response = self.agent_manager.call_agent_api(
                     agent_key, 'POST', f'/api/services/{service_name}/start', {},
                     timeout_type='deploy_start'
                 )
 
                 if start_status_code == 200:
-                    self._update_task_status(task_id, 'success', 100, '服务重新部署成功')
+                    self._update_task_status(task_id, 'success', 100, '服务部署成功')
+                    self._add_task_log(task_id, 'INFO', '服务部署完成')
                 elif self._is_timeout_error(start_status_code, start_response):
-                    self._add_task_log(task_id, 'WARN', f"重建后启动请求超时: {start_response}")
+                    # start接口超时不等于服务启动失败：避免误清理，先轮询服务实际状态
+                    self._add_task_log(task_id, 'WARN', f"启动请求超时: {start_response}")
                     if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
-                        self._update_task_status(task_id, 'success', 100, '服务重新部署成功（超时后状态确认）')
+                        self._update_task_status(task_id, 'success', 100, '服务部署成功（超时后状态确认）')
                     else:
-                        error_msg = f'重新部署后启动服务超时，且轮询未就绪: {start_response}'
+                        error_msg = f'启动服务超时，且轮询未就绪: {start_response}'
+                        self._update_task_status(task_id, 'failed', 70, error_msg)
+                        self._add_task_log(task_id, 'ERROR', error_msg)
+                else:
+                    error_msg = f'启动服务失败: {start_response}'
+                    self._update_task_status(task_id, 'failed', 70, error_msg)
+                    self._add_task_log(task_id, 'ERROR', error_msg)
+
+                    # 尝试清理创建的服务
+                    self._add_task_log(task_id, 'WARN', '尝试清理已创建的服务')
+                    self._add_task_log(task_id, 'INFO', f"停止服务，超时设置: {self.timeouts['deploy_stop']}")
+                    self.agent_manager.call_agent_api(
+                        agent_key, 'POST', f'/api/services/{service_name}/stop', {},
+                        timeout_type='deploy_stop'
+                    )
+
+                    time.sleep(2)
+
+                    self._add_task_log(task_id, 'INFO', f"删除服务，超时设置: {self.timeouts['deploy_delete']}")
+                    self.agent_manager.call_agent_api(
+                        agent_key, 'DELETE', f'/api/services/{service_name}', {},
+                        timeout_type='deploy_delete'
+                    )
+
+            elif status_code == 409:
+                # 服务已存在，重新创建
+                self._update_task_status(task_id, 'running', 70, '服务已存在，尝试重新创建')
+                self._add_task_log(task_id, 'INFO', '停止现有服务')
+
+                # 先停止并删除现有服务
+                self.agent_manager.call_agent_api(
+                    agent_key, 'POST', f'/api/services/{service_name}/stop', {},
+                    timeout_type='deploy_stop'
+                )
+
+                time.sleep(3)
+
+                self._add_task_log(task_id, 'INFO', '删除现有服务')
+                self.agent_manager.call_agent_api(
+                    agent_key, 'DELETE', f'/api/services/{service_name}', {},
+                    timeout_type='deploy_delete'
+                )
+
+                time.sleep(2)
+
+                # 重新创建服务
+                self._add_task_log(task_id, 'INFO', '重新创建服务')
+                status_code, response = self.agent_manager.call_agent_api(
+                    agent_key, 'POST', '/api/services/yaml', data,
+                    timeout_type='deploy_create'
+                )
+
+                if status_code == 201:
+                    # 启动服务
+                    time.sleep(2)
+                    start_status_code, start_response = self.agent_manager.call_agent_api(
+                        agent_key, 'POST', f'/api/services/{service_name}/start', {},
+                        timeout_type='deploy_start'
+                    )
+
+                    if start_status_code == 200:
+                        self._update_task_status(task_id, 'success', 100, '服务重新部署成功')
+                    elif self._is_timeout_error(start_status_code, start_response):
+                        self._add_task_log(task_id, 'WARN', f"重建后启动请求超时: {start_response}")
+                        if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
+                            self._update_task_status(task_id, 'success', 100, '服务重新部署成功（超时后状态确认）')
+                        else:
+                            error_msg = f'重新部署后启动服务超时，且轮询未就绪: {start_response}'
+                            self._update_task_status(task_id, 'failed', 70, error_msg)
+                    else:
+                        error_msg = f'重新部署后启动服务失败: {start_response}'
                         self._update_task_status(task_id, 'failed', 70, error_msg)
                 else:
-                    error_msg = f'重新部署后启动服务失败: {start_response}'
+                    error_msg = f'重新创建服务失败: {response}'
                     self._update_task_status(task_id, 'failed', 70, error_msg)
-            else:
-                error_msg = f'重新创建服务失败: {response}'
-                self._update_task_status(task_id, 'failed', 70, error_msg)
 
-        else:
-            error_msg = f'创建服务失败 (HTTP {status_code}): {response}'
-            self._update_task_status(task_id, 'failed', 30, error_msg)
-            self._add_task_log(task_id, 'ERROR', error_msg)
+            else:
+                error_msg = f'创建服务失败 (HTTP {status_code}): {response}'
+                self._update_task_status(task_id, 'failed', 30, error_msg)
+                self._add_task_log(task_id, 'ERROR', error_msg)
+        finally:
+            self._notify_service_state_changed(agent_key, f"deploy_yaml:{service_name}")
 
     def _deploy_archive_template(self, task_id: str, service_name: str, agent_key: str,
                                  template_name: str, extra_params: Dict = None):
         """部署压缩模板（支持多种格式）"""
-        self._update_task_status(task_id, 'running', 30, '处理压缩模板')
+        try:
+            self._update_task_status(task_id, 'running', 30, '处理压缩模板')
 
-        # 获取模板文件路径
-        template_file = self.template_manager.get_template_file(template_name)
-        if not template_file:
-            self._update_task_status(task_id, 'failed', 30, '压缩模板文件不存在')
-            return
+            # 获取模板文件路径
+            template_file = self.template_manager.get_template_file(template_name)
+            if not template_file:
+                self._update_task_status(task_id, 'failed', 30, '压缩模板文件不存在')
+                return
 
-        self._add_task_log(task_id, 'INFO', f"压缩文件: {template_file}")
+            self._add_task_log(task_id, 'INFO', f"压缩文件: {template_file}")
 
-        # 读取压缩文件内容
-        with open(template_file, 'rb') as f:
-            file_content = f.read()
+            # 读取压缩文件内容
+            with open(template_file, 'rb') as f:
+                file_content = f.read()
 
-        # 获取文件扩展名
-        filename = Path(template_file).name
+            # 获取文件扩展名
+            filename = Path(template_file).name
 
-        # 创建文件字典（符合call_agent_api的文件格式）
-        files = {
-            'file': (filename, file_content, self._get_content_type(filename))
-        }
+            # 创建文件字典（符合call_agent_api的文件格式）
+            files = {
+                'file': (filename, file_content, self._get_content_type(filename))
+            }
 
-        data = {
-            'name': service_name
-        }
+            data = {
+                'name': service_name
+            }
 
-        # 添加额外参数
-        if extra_params:
-            data.update(extra_params)
+            # 添加额外参数
+            if extra_params:
+                data.update(extra_params)
 
-        self._add_task_log(task_id, 'INFO', f"上传压缩文件到Agent: {filename}")
+            self._add_task_log(task_id, 'INFO', f"上传压缩文件到Agent: {filename}")
 
-        # 调用Agent的压缩文件部署接口（使用文件上传的超时）
-        self._add_task_log(task_id, 'INFO', f"上传文件，超时设置: {self.timeouts['file_upload']}")
-        status_code, response = self.agent_manager.call_agent_api(
-            agent_key, 'POST', '/api/services/zip', data=data, files=files,
-            timeout_type='file_upload'
-        )
-
-        self._add_task_log(task_id, 'INFO', f"Agent响应状态码: {status_code}")
-        self._add_task_log(task_id, 'DEBUG', f"Agent响应内容: {json.dumps(response)[:200]}...")
-
-        if status_code == 201:
-            self._update_task_status(task_id, 'running', 70, '压缩服务创建成功，正在启动')
-
-            # 等待几秒让服务创建完成
-            time.sleep(3)
-
-            self._add_task_log(task_id, 'INFO', f"启动服务: {service_name}")
-
-            # 启动服务（使用较长的超时）
-            self._add_task_log(task_id, 'INFO', f"启动服务，超时设置: {self.timeouts['deploy_start']}")
-            start_status_code, start_response = self.agent_manager.call_agent_api(
-                agent_key, 'POST', f'/api/services/{service_name}/start', {},
-                timeout_type='deploy_start'
+            # 调用Agent的压缩文件部署接口（使用文件上传的超时）
+            self._add_task_log(task_id, 'INFO', f"上传文件，超时设置: {self.timeouts['file_upload']}")
+            status_code, response = self.agent_manager.call_agent_api(
+                agent_key, 'POST', '/api/services/zip', data=data, files=files,
+                timeout_type='file_upload'
             )
 
-            if start_status_code == 200:
-                self._update_task_status(task_id, 'success', 100, '压缩服务部署成功')
-                self._add_task_log(task_id, 'INFO', '压缩服务部署完成')
-            elif self._is_timeout_error(start_status_code, start_response):
-                self._add_task_log(task_id, 'WARN', f"启动压缩服务请求超时: {start_response}")
-                if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
-                    self._update_task_status(task_id, 'success', 100, '压缩服务部署成功（超时后状态确认）')
+            self._add_task_log(task_id, 'INFO', f"Agent响应状态码: {status_code}")
+            self._add_task_log(task_id, 'DEBUG', f"Agent响应内容: {json.dumps(response)[:200]}...")
+
+            if status_code == 201:
+                self._update_task_status(task_id, 'running', 70, '压缩服务创建成功，正在启动')
+
+                # 等待几秒让服务创建完成
+                time.sleep(3)
+
+                self._add_task_log(task_id, 'INFO', f"启动服务: {service_name}")
+
+                # 启动服务（使用较长的超时）
+                self._add_task_log(task_id, 'INFO', f"启动服务，超时设置: {self.timeouts['deploy_start']}")
+                start_status_code, start_response = self.agent_manager.call_agent_api(
+                    agent_key, 'POST', f'/api/services/{service_name}/start', {},
+                    timeout_type='deploy_start'
+                )
+
+                if start_status_code == 200:
+                    self._update_task_status(task_id, 'success', 100, '压缩服务部署成功')
+                    self._add_task_log(task_id, 'INFO', '压缩服务部署完成')
+                elif self._is_timeout_error(start_status_code, start_response):
+                    self._add_task_log(task_id, 'WARN', f"启动压缩服务请求超时: {start_response}")
+                    if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
+                        self._update_task_status(task_id, 'success', 100, '压缩服务部署成功（超时后状态确认）')
+                    else:
+                        error_msg = f'启动压缩服务超时，且轮询未就绪: {start_response}'
+                        self._update_task_status(task_id, 'failed', 70, error_msg)
+                        self._add_task_log(task_id, 'ERROR', error_msg)
                 else:
-                    error_msg = f'启动压缩服务超时，且轮询未就绪: {start_response}'
+                    error_msg = f'启动压缩服务失败: {start_response}'
                     self._update_task_status(task_id, 'failed', 70, error_msg)
                     self._add_task_log(task_id, 'ERROR', error_msg)
             else:
-                error_msg = f'启动压缩服务失败: {start_response}'
-                self._update_task_status(task_id, 'failed', 70, error_msg)
+                error_msg = f'创建压缩服务失败 (HTTP {status_code}): {response}'
+                self._update_task_status(task_id, 'failed', 30, error_msg)
                 self._add_task_log(task_id, 'ERROR', error_msg)
-        else:
-            error_msg = f'创建压缩服务失败 (HTTP {status_code}): {response}'
-            self._update_task_status(task_id, 'failed', 30, error_msg)
-            self._add_task_log(task_id, 'ERROR', error_msg)
+        finally:
+            self._notify_service_state_changed(agent_key, f"deploy_archive:{service_name}")
 
     def _undeploy_service(self, task_id: str, service_name: str, agent_key: str):
         """卸载服务"""
@@ -882,6 +901,8 @@ class TaskManager:
         except Exception as e:
             self.logger.error(f"卸载服务失败: {str(e)}")
             self._update_task_status(task_id, 'failed', 0, f'卸载失败: {str(e)}')
+        finally:
+            self._notify_service_state_changed(agent_key, f"undeploy:{service_name}")
 
 
     def get_task(self, task_id: str) -> Optional[Dict]:

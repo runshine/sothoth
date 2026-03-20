@@ -163,26 +163,30 @@ class DatabaseConnection:
                 self.connection = None
                 self._is_pooled = False
 
-    def execute(self, query: str, params: tuple = ()):
+    def execute(self, query: str, params: tuple = (), commit: bool = True):
         """执行SQL语句"""
         cursor = self.connection.cursor()
         try:
             cursor.execute(query, params)
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
             return cursor
         except Exception as e:
-            self.connection.rollback()
+            if commit:
+                self.connection.rollback()
             raise e
 
-    def executemany(self, query: str, params_list: List[tuple]):
+    def executemany(self, query: str, params_list: List[tuple], commit: bool = True):
         """批量执行SQL语句"""
         cursor = self.connection.cursor()
         try:
             cursor.executemany(query, params_list)
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
             return cursor
         except Exception as e:
-            self.connection.rollback()
+            if commit:
+                self.connection.rollback()
             raise e
 
     def fetch_one(self, query: str, params: tuple = ()):
@@ -748,10 +752,16 @@ class DatabaseManager:
         """执行事务（多个查询）- 使用持久化连接"""
         db = self.get_connection()
         try:
-            for query, params in queries:
-                db.execute(query, params)
-        except Exception as e:
-            raise e
+            cursor = db.connection.cursor()
+            try:
+                for query, params in queries:
+                    cursor.execute(query, params)
+                db.connection.commit()
+            except Exception:
+                db.connection.rollback()
+                raise
+            finally:
+                cursor.close()
         finally:
             db.close()
 

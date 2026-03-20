@@ -81,7 +81,8 @@ class WebAPIServer:
         self.template_manager = EnhancedTemplateManager(
             config['templates_root'],
             self.db_manager,
-            supported_formats
+            supported_formats,
+            self.redis_manager
         )
 
         # 8. 初始化Agent管理器（传递超时配置）
@@ -134,6 +135,7 @@ class WebAPIServer:
             heartbeat_interval_sec=int(config.get('task_heartbeat_interval_sec', 15)),
             enable_task_workers=bool(config.get('enable_task_workers', True))
         )
+        self.task_manager.set_service_sync_callback(self._sync_single_agent_services_by_key)
 
         # 10. 初始化代理管理器（新增，传递超时配置）
         self.proxy_manager = EnhancedProxyManager(self.agent_manager, agent_api_timeouts)
@@ -1068,6 +1070,40 @@ class WebAPIServer:
             user_ctx.get('user_id', ''),
             user_ctx.get('username', '')
         )
+
+    def _with_template_write_lock(self, template_names: List[str], callback, timeout: int = 120):
+        normalized = sorted({str(name).strip() for name in (template_names or []) if str(name).strip()})
+        if not normalized:
+            return callback()
+
+        acquired_locks = []
+        try:
+            for name in normalized:
+                lock = self.redis_manager.get_lock(f"template_write:{name}", timeout)
+                if not lock.acquire(block=True, block_timeout=timeout):
+                    raise BlockingIOError(f'模板 {name} 当前正在被其他副本修改，请稍后重试')
+                acquired_locks.append(lock)
+            return callback()
+        finally:
+            for lock in reversed(acquired_locks):
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
+    def _sync_single_agent_services_by_key(self, agent_key: str, reason: str = '') -> Optional[Dict[str, Any]]:
+        agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
+        if not agent:
+            self.logger.warning(f"任务完成后同步服务状态失败，Agent不存在: agent={agent_key}, reason={reason}")
+            return None
+        result = self._sync_single_agent_services(agent)
+        if result.get('ok'):
+            self.logger.info(f"任务完成后已同步服务状态: agent={agent_key}, reason={reason}")
+        else:
+            self.logger.warning(
+                f"任务完成后同步服务状态失败: agent={agent_key}, reason={reason}, result={result}"
+            )
+        return result
 
     def _service_exists_on_agent(self, agent_key: str, service_name: str) -> bool:
         """检查Agent上是否已存在同名服务。"""
@@ -4091,15 +4127,20 @@ class WebAPIServer:
             user_ctx = self._get_request_user_context()
             created_by = user_ctx.get('username', 'system')
 
-            # 获取当前用户
-            success, message = self.template_manager.create_template(
-                name, description, template_type, file_content, filename,
-                created_by,
-                visibility=visibility,
-                owner_id=user_ctx.get('user_id', ''),
-                owner_name=user_ctx.get('username', ''),
-                web_port_presets=web_port_presets
-            )
+            def _create_template():
+                return self.template_manager.create_template(
+                    name, description, template_type, file_content, filename,
+                    created_by,
+                    visibility=visibility,
+                    owner_id=user_ctx.get('user_id', ''),
+                    owner_name=user_ctx.get('username', ''),
+                    web_port_presets=web_port_presets
+                )
+
+            try:
+                success, message = self._with_template_write_lock([name], _create_template)
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if success:
                 return jsonify({
@@ -4202,14 +4243,23 @@ class WebAPIServer:
             if web_port_presets is not None and not isinstance(web_port_presets, list):
                 return jsonify({'error': 'web_port_presets 必须是数组'}), 400
 
-            success, message, updated = self.template_manager.update_template_basic(
-                template_id=template_id,
-                new_name=new_name,
-                description=description,
-                visibility=visibility,
-                web_port_presets=web_port_presets,
-                updated_by=user_ctx.get('username', 'system')
-            )
+            def _update_template_basic():
+                return self.template_manager.update_template_basic(
+                    template_id=template_id,
+                    new_name=new_name,
+                    description=description,
+                    visibility=visibility,
+                    web_port_presets=web_port_presets,
+                    updated_by=user_ctx.get('username', 'system')
+                )
+
+            try:
+                success, message, updated = self._with_template_write_lock(
+                    [template.get('name'), new_name],
+                    _update_template_basic
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
             if not success:
                 return jsonify({'error': message}), 400
             updated = self.template_manager.decorate_template_permissions(
@@ -4258,11 +4308,20 @@ class WebAPIServer:
             if not isinstance(web_port_presets, list):
                 return jsonify({'error': 'web_port_presets 必须是数组'}), 400
 
-            success, message, updated = self.template_manager.update_template_basic(
-                template_id=template_id,
-                web_port_presets=web_port_presets,
-                updated_by=user_ctx.get('username', 'system')
-            )
+            def _update_web_ports():
+                return self.template_manager.update_template_basic(
+                    template_id=template_id,
+                    web_port_presets=web_port_presets,
+                    updated_by=user_ctx.get('username', 'system')
+                )
+
+            try:
+                success, message, updated = self._with_template_write_lock(
+                    [template.get('name')],
+                    _update_web_ports
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
             if not success:
                 return jsonify({'error': message}), 400
 
@@ -4328,9 +4387,15 @@ class WebAPIServer:
             if not yaml_content:
                 return jsonify({'error': 'YAML内容不能为空'}), 400
 
-            success, message = self.template_manager.update_yaml_content(
-                name, yaml_content, user_ctx.get('username', 'system')
-            )
+            def _update_yaml():
+                return self.template_manager.update_yaml_content(
+                    name, yaml_content, user_ctx.get('username', 'system')
+                )
+
+            try:
+                success, message = self._with_template_write_lock([name], _update_yaml)
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if success:
                 # 返回更新后的模板信息
@@ -4560,7 +4625,13 @@ class WebAPIServer:
                 return jsonify({'error': '模板不存在'}), 404
             if not self._check_template_manageable(template, user_ctx):
                 return jsonify({'error': '无权限删除该模板，仅拥有者可删除'}), 403
-            success, message = self.template_manager.delete_template(name)
+            try:
+                success, message = self._with_template_write_lock(
+                    [name],
+                    lambda: self.template_manager.delete_template(name)
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if success:
                 return jsonify({'message': message})
@@ -4586,15 +4657,21 @@ class WebAPIServer:
                 return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
             description = data.get('description', '')
 
-            success, message = self.template_manager.copy_template(
-                source_name=name,
-                target_name=target_name,
-                created_by=user_ctx.get('username', 'system'),
-                owner_id=user_ctx.get('user_id', ''),
-                owner_name=user_ctx.get('username', ''),
-                visibility=visibility,
-                description=description
-            )
+            try:
+                success, message = self._with_template_write_lock(
+                    [name, target_name],
+                    lambda: self.template_manager.copy_template(
+                        source_name=name,
+                        target_name=target_name,
+                        created_by=user_ctx.get('username', 'system'),
+                        owner_id=user_ctx.get('user_id', ''),
+                        owner_name=user_ctx.get('username', ''),
+                        visibility=visibility,
+                        description=description
+                    )
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if success:
                 return jsonify({
@@ -4798,9 +4875,15 @@ class WebAPIServer:
                 # 获取当前用户
                 updated_by = user_ctx.get('username', 'system')
 
-                success, message, update_info = self.template_manager.update_template_file(
-                    name, file_path, actual_content, encoding, updated_by
-                )
+                try:
+                    success, message, update_info = self._with_template_write_lock(
+                        [name],
+                        lambda: self.template_manager.update_template_file(
+                            name, file_path, actual_content, encoding, updated_by
+                        )
+                    )
+                except BlockingIOError as e:
+                    return jsonify({'error': str(e)}), 409
 
                 if success:
                     # 获取更新后的文件信息
@@ -4916,9 +4999,15 @@ class WebAPIServer:
                 content = file_content
                 encoding = 'binary'
 
-            success, message, update_info = self.template_manager.update_template_file(
-                name, target_path, content, encoding, updated_by
-            )
+            try:
+                success, message, update_info = self._with_template_write_lock(
+                    [name],
+                    lambda: self.template_manager.update_template_file(
+                        name, target_path, content, encoding, updated_by
+                    )
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if not success and not overwrite:
                 # 检查是否是文件已存在的错误
@@ -4970,9 +5059,15 @@ class WebAPIServer:
                 # 获取当前用户
                 deleted_by = user_ctx.get('username', 'system')
 
-                success, message, delete_info = self.template_manager.delete_template_file(
-                    name, file_path, deleted_by
-                )
+                try:
+                    success, message, delete_info = self._with_template_write_lock(
+                        [name],
+                        lambda: self.template_manager.delete_template_file(
+                            name, file_path, deleted_by
+                        )
+                    )
+                except BlockingIOError as e:
+                    return jsonify({'error': str(e)}), 409
 
                 if success:
                     return jsonify({
@@ -5010,9 +5105,15 @@ class WebAPIServer:
                 # 获取当前用户
                 deleted_by = user_ctx.get('username', 'system')
 
-                success, message, delete_info = self.template_manager.delete_template_directory(
-                    name, dir_path, deleted_by, force
-                )
+                try:
+                    success, message, delete_info = self._with_template_write_lock(
+                        [name],
+                        lambda: self.template_manager.delete_template_directory(
+                            name, dir_path, deleted_by, force
+                        )
+                    )
+                except BlockingIOError as e:
+                    return jsonify({'error': str(e)}), 409
 
                 if success:
                     return jsonify({
@@ -5050,7 +5151,13 @@ class WebAPIServer:
                 parsed_compose = metadata.get('parsed_compose')
                 if not parsed_compose:
                     # 尝试解析
-                    success, msg = self.template_manager.parse_template_compose(name)
+                    try:
+                        success, msg = self._with_template_write_lock(
+                            [name],
+                            lambda: self.template_manager.parse_template_compose(name)
+                        )
+                    except BlockingIOError as e:
+                        return jsonify({'error': str(e)}), 409
                     if success:
                         # 重新获取
                         template = self.template_manager.get_template(name)
@@ -5101,7 +5208,13 @@ class WebAPIServer:
                     return jsonify({'error': '无权限重新解析该模板，仅拥有者可操作'}), 403
 
                 # 执行解析
-                success, message = self.template_manager.parse_template_compose(name)
+                try:
+                    success, message = self._with_template_write_lock(
+                        [name],
+                        lambda: self.template_manager.parse_template_compose(name)
+                    )
+                except BlockingIOError as e:
+                    return jsonify({'error': str(e)}), 409
 
                 if success:
                     # 返回更新后的模板信息

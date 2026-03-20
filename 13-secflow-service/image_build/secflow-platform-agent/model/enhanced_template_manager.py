@@ -2,10 +2,12 @@ import logging
 import tarfile
 import tempfile
 import hashlib
+from contextlib import ExitStack
 
 
 from .db import DatabaseManager
 from .constants import COMPRESSION_EXT_MAPPING, SUPPORTED_FORMATS
+from .redis_manager import RedisManager
 import io
 import zipfile
 import shutil
@@ -207,9 +209,12 @@ class DockerComposeParser:
 class EnhancedTemplateManager:
     """完整增强版模板管理器，支持多种压缩格式"""
 
-    def __init__(self, templates_root: str, db_manager: DatabaseManager, supported_formats: List[str] = None):
+    def __init__(self, templates_root: str, db_manager: DatabaseManager,
+                 supported_formats: List[str] = None,
+                 redis_manager: Optional[RedisManager] = None):
         self.templates_root = Path(templates_root)
         self.db = db_manager
+        self.redis_manager = redis_manager
         self.templates_root.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger(__name__)
 
@@ -218,6 +223,21 @@ class EnhancedTemplateManager:
         self.compression_map = COMPRESSION_EXT_MAPPING
 
         self.logger.info(f"模板管理器初始化，支持格式: {', '.join(self.supported_formats)}")
+
+    def _template_lock_names(self, names: List[str]) -> List[str]:
+        return sorted({str(name or '').strip() for name in names if str(name or '').strip()})
+
+    def _with_template_locks(self, names: List[str], callback, timeout: int = 120):
+        lock_names = self._template_lock_names(names)
+        if not lock_names or not self.redis_manager:
+            return callback()
+
+        with ExitStack() as stack:
+            for name in lock_names:
+                lock = stack.enter_context(self.redis_manager.get_lock(f"template_write:{name}", timeout=timeout))
+                if not lock.is_acquired():
+                    return False, f"模板 '{name}' 正在被其他实例修改，请稍后重试"
+            return callback()
 
     def _normalize_web_port_presets(self, presets: Any) -> List[Dict[str, Any]]:
         """规范化模板预制Web端口配置。"""
