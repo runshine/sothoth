@@ -48,13 +48,22 @@ spec:
             path: /api/agent/health
             port: 8080
           initialDelaySeconds: 30
+          timeoutSeconds: 5
           periodSeconds: 30
         readinessProbe:
           httpGet:
             path: /api/agent/health
             port: 8080
-          initialDelaySeconds: 30
+          initialDelaySeconds: 15
+          timeoutSeconds: 5
           periodSeconds: 30
+        startupProbe:
+          httpGet:
+            path: /api/agent/health
+            port: 8080
+          timeoutSeconds: 5
+          periodSeconds: 10
+          failureThreshold: 18
 
       volumes:
       - name: secflow-platform-agent-nfs-pvc
