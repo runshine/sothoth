@@ -43,7 +43,7 @@ jobs:
 
       - name: Build image on native runner
         run: |
-          docker build \
+          DOCKER_BUILDKIT=0 docker build \
             -f 100-agent-service-image/01-secflow-agent-service-agent-helper/Dockerfile \
             -t runshine0819/secflow-agent-service-agent-helper:latest-${{ matrix.arch }} \
             -t ghcr.io/runshine/secflow-agent-service-agent-helper:latest-${{ matrix.arch }} \
