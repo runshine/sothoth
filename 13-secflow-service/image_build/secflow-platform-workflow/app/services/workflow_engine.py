@@ -1,4 +1,4 @@
-"""
+﻿"""
 Workflow execution engine for SecFlow
 Handles dependency management, topological execution, and node lifecycle
 """
@@ -16,7 +16,7 @@ from app.models.database import (
     WorkflowStatus, NodeStatus, NodeType,
     AppTemplate, JobTemplate
 )
-from app.services.k8s_service_client import K8SServiceClient, get_k8s_service_client
+from app.services.workflow_status_client import get_workflow_status_client
 
 logger = logging.getLogger(__name__)
 
@@ -34,12 +34,11 @@ class WorkflowEngine:
     def __init__(self, instance_id: str, db: Session, k8s_client=None):
         self.instance_id = instance_id
         self.db = db
-        # 使用K8S微服务调用模式
-        if k8s_client is None:
-            self.k8s_client = get_k8s_service_client()
-            logger.info("使用K8S微服务调用模式")
-        else:
-            self.k8s_client = k8s_client
+        # K8S operations are migrated to workflow-status service; keep parameter for compatibility.
+        self.k8s_client = k8s_client
+        # 鍒濆鍖栫姸鎬佹湇鍔″鎴风
+        self.status_client = get_workflow_status_client()
+        self._monitoring_started = False
         self.instance: Optional[WorkflowInstance] = None
         self.nodes: List[WorkflowNodeInstance] = []
         self.node_map: Dict[str, WorkflowNodeInstance] = {}
@@ -175,7 +174,7 @@ class WorkflowEngine:
                 if dep_node.status != NodeStatus.SUCCEEDED:
                     return False
             else:
-                # APP must be ready (Pod全部就绪)
+                # APP must be ready (Pod鍏ㄩ儴灏辩华)
                 if dep_node.status != NodeStatus.READY:
                     return False
 
@@ -183,102 +182,249 @@ class WorkflowEngine:
 
     async def sync_node_status_from_k8s(self, node: WorkflowNodeInstance):
         """
-        Sync node status from K8S to database
-
-        For APP nodes:
-        - PENDING: Pod未运行
-        - NOT_READY: Pod已运行但未就绪
-        - READY: Pod全部就绪
-
-        For JOB nodes:
-        - PENDING: 等待执行
-        - RUNNING: 执行中
-        - SUCCEEDED: 执行成功
-        - FAILED: 执行失败
+        Sync node status via workflow-status service and persist to local DB cache.
         """
         if not node.k8s_resource_name:
             return
 
         try:
-            if node.node_type == NodeType.APP:
-                status = self.k8s_client.get_deployment_status(
-                    self.instance.project_id, node.k8s_resource_name
-                )
-                if status:
-                    logger.debug(f"Deployment {node.k8s_resource_name} status: {status}")
+            result = await self.status_client.sync_node_status(
+                node_id=node.node_id,
+                project_id=self.instance.project_id,
+                instance_id=self.instance_id,
+                node_type=node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type),
+                k8s_resource_name=node.k8s_resource_name,
+                timeout_seconds=node.timeout_seconds,
+            )
 
-                    # Deployment is ready when ready_replicas >= replicas
-                    ready_replicas = status.get("ready_replicas", 0) or status.get("ready_replica", 0)
-                    replicas = status.get("replicas", 0) or status.get("replica", 0)
-                    available_replicas = status.get("available_replicas", 0) or status.get("available_replica", 0)
+            if not result or not result.get("status"):
+                return
 
-                    logger.info(f"Deployment {node.k8s_resource_name}: replicas={replicas}, ready={ready_replicas}, available={available_replicas}")
-
-                    # 根据Pod状态确定节点状态
-                    # STOPPED状态的节点不自动更新（用户主动停止）
-                    # FAILED状态的节点需要重新检查，因为K8S资源可能已恢复
-                    if node.status == NodeStatus.STOPPED:
+            status_mapping = {
+                "Pending": NodeStatus.PENDING,
+                "Not_ready": NodeStatus.NOT_READY,
+                "Ready": NodeStatus.READY,
+                "Running": NodeStatus.RUNNING,
+                "Succeeded": NodeStatus.SUCCEEDED,
+                "Failed": NodeStatus.FAILED,
+                "Stopped": NodeStatus.STOPPED,
+            }
+            mapped_status = status_mapping.get(result.get("status"))
+            if mapped_status and node.status != NodeStatus.STOPPED:
+                node.status = mapped_status
+                node.message = result.get("message", "")
+                if result.get("started_at"):
+                    try:
+                        node.started_at = datetime.fromisoformat(result["started_at"].replace("Z", "+00:00"))
+                    except Exception:
                         pass
-                    elif ready_replicas >= replicas and replicas > 0:
-                        # Pod全部就绪 -> READY
-                        if node.status != NodeStatus.READY:
-                            node.status = NodeStatus.READY
-                            node.message = "Deployment is ready"
-                    elif available_replicas > 0 or ready_replicas > 0:
-                        # Pod已运行但未全部就绪 -> NOT_READY
-                        if node.status != NodeStatus.NOT_READY:
-                            node.status = NodeStatus.NOT_READY
-                            node.message = f"Deployment is running but not ready ({ready_replicas}/{replicas} ready)"
-                    else:
-                        # Pod未运行 -> PENDING
-                        if node.status != NodeStatus.PENDING:
-                            node.status = NodeStatus.PENDING
-                            node.message = f"Waiting for Pod to start ({ready_replicas}/{replicas})"
-            else:
-                # JOB节点
-                status = self.k8s_client.get_job_status(
-                    self.instance.project_id, node.k8s_resource_name
-                )
-                if status:
-                    # Check timeout
-                    if node.started_at:
-                        elapsed = (datetime.utcnow() - node.started_at).total_seconds()
-                        timeout = node.timeout_seconds or 3600  # Default 1 hour if not specified
-                        if elapsed > timeout:
-                            # Timeout - mark as failed (job still running or stuck)
-                            if status.get("status") in ["Pending", "Running"]:
-                                node.status = NodeStatus.FAILED
-                                node.finished_at = datetime.utcnow()
-                                node.message = f"Job timeout after {elapsed:.0f}s (expected {timeout}s)"
-
-                    k8s_status = status.get("status", "")
-                    if k8s_status == "Succeeded":
-                        if node.status != NodeStatus.SUCCEEDED:
-                            node.status = NodeStatus.SUCCEEDED
-                            node.finished_at = datetime.utcnow()
-                            node.message = "Job completed successfully"
-                    elif k8s_status == "Failed":
-                        if node.status != NodeStatus.FAILED:
-                            node.status = NodeStatus.FAILED
-                            node.finished_at = datetime.utcnow()
-                            node.message = f"Job failed: {status.get('failed', 0)} failures"
-                    elif k8s_status == "Running":
-                        if node.status != NodeStatus.RUNNING:
-                            node.status = NodeStatus.RUNNING
-                            if not node.started_at:
-                                node.started_at = datetime.utcnow()
-                            node.message = "Job is running"
-
-            self.db.commit()
+                if result.get("finished_at"):
+                    try:
+                        node.finished_at = datetime.fromisoformat(result["finished_at"].replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+                self.db.commit()
 
         except Exception as e:
-            logger.error(f"Error syncing node {node.node_id} status: {e}")
+            logger.error(f"Error syncing node {node.node_id} status via workflow-status: {e}")
+
+    # ============ Sync status via workflow-status service ===========
+
+    async def _record_nodes_to_status_service(self):
+        """Record the initial status of all nodes to the workflow-status service."""
+        for node in self.nodes:
+            try:
+                await self.status_client.record_node(
+                    node_id=node.node_id,
+                    instance_id=self.instance_id,
+                    project_id=self.instance.project_id,
+                    node_type="app" if node.node_type == NodeType.APP else "job",
+                    k8s_resource_name=node.k8s_resource_name,
+                    k8s_resource_type="Deployment" if node.node_type == NodeType.APP else "Job",
+                    initial_status="Pending"
+                )
+                logger.debug(f"Node {node.node_id} recorded to workflow-status service")
+            except Exception as e:
+                logger.warning(f"Failed to record node {node.node_id} to workflow-status service: {e}")
+
+    async def sync_node_status_from_service(self, node: WorkflowNodeInstance):
+        """
+        Sync node status via the workflow-status service.
+
+        Unlike sync_node_status_from_k8s, this method delegates the status
+        query to the workflow-status service, which can pull from K8S and
+        persist the synchronized result in its own status database.
+        """
+        if not node.k8s_resource_name:
+            return
+
+        try:
+            # 璋冪敤鐘舵€佹湇鍔″悓姝ョ姸鎬?
+            result = await self.status_client.sync_node_status(
+                node_id=node.node_id,
+                project_id=self.instance.project_id,
+                instance_id=self.instance_id,
+                node_type="app" if node.node_type == NodeType.APP else "job",
+                k8s_resource_name=node.k8s_resource_name,
+                timeout_seconds=node.timeout_seconds
+            )
+
+            # 鏇存柊鏈湴鏁版嵁搴撶紦瀛橈紙鐢ㄤ簬宸ヤ綔娴佹墽琛岄€昏緫锛?
+            if result:
+                # 鐘舵€佹湇鍔¤繑鍥炵殑鐘舵€佹牸寮忓彲鑳戒笉鍚岋紝闇€瑕佽浆鎹?
+                status = result.get("status", "Pending")
+                # 杞崲鐘舵€佹牸寮忥紙棣栧瓧姣嶅ぇ鍐欒浆灏忓啓锛?
+                status_lower = status.lower() if status else "pending"
+
+                # 鏄犲皠鐘舵€?
+                status_map = {
+                    "pending": NodeStatus.PENDING,
+                    "not_ready": NodeStatus.NOT_READY,
+                    "ready": NodeStatus.READY,
+                    "running": NodeStatus.RUNNING,
+                    "succeeded": NodeStatus.SUCCEEDED,
+                    "failed": NodeStatus.FAILED,
+                }
+                node.status = status_map.get(status_lower, node.status)
+                node.message = result.get("message")
+
+                # 澶勭悊鏃堕棿瀛楁
+                if result.get("started_at"):
+                    try:
+                        started_at_str = result["started_at"]
+                        if isinstance(started_at_str, str):
+                            node.started_at = datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+
+                if result.get("finished_at"):
+                    try:
+                        finished_at_str = result["finished_at"]
+                        if isinstance(finished_at_str, str):
+                            node.finished_at = datetime.fromisoformat(finished_at_str.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+
+                self.db.commit()
+                logger.debug(f"閫氳繃鐘舵€佹湇鍔″悓姝ヨ妭鐐?{node.node_id} 鐘舵€? {status}")
+
+        except Exception as e:
+            logger.error(f"閫氳繃鐘舵€佹湇鍔″悓姝ヨ妭鐐?{node.node_id} 鐘舵€佸け璐? {e}")
+
+    async def sync_all_nodes_status_from_service(self):
+        """
+        閫氳繃 workflow-status 寰湇鍔℃壒閲忓悓姝ユ墍鏈夎妭鐐圭姸鎬?
+
+        浼樺厛浣跨敤鎵归噺鍚屾鎺ュ彛锛屽け璐ユ椂闄嶇骇涓洪€愪釜鍚屾
+        """
+        # 鏋勫缓鑺傜偣淇℃伅鍒楄〃
+        nodes_info = [
+            {
+                "node_id": node.node_id,
+                "node_type": "app" if node.node_type == NodeType.APP else "job",
+                "k8s_resource_name": node.k8s_resource_name,
+                "timeout_seconds": node.timeout_seconds
+            }
+            for node in self.nodes
+        ]
+
+        try:
+            # 璋冪敤鐘舵€佹湇鍔℃壒閲忓悓姝?
+            result = await self.status_client.sync_all_nodes(
+                instance_id=self.instance_id,
+                project_id=self.instance.project_id,
+                nodes=nodes_info
+            )
+
+            # 鏇存柊鏈湴鏁版嵁搴撶紦瀛?
+            if result and result.get("nodes"):
+                for node_result in result["nodes"]:
+                    node = self.node_map.get(node_result.get("node_id"))
+                    if node:
+                        status = node_result.get("status", "Pending")
+                        status_lower = status.lower() if status else "pending"
+
+                        status_map = {
+                            "pending": NodeStatus.PENDING,
+                            "not_ready": NodeStatus.NOT_READY,
+                            "ready": NodeStatus.READY,
+                            "running": NodeStatus.RUNNING,
+                            "succeeded": NodeStatus.SUCCEEDED,
+                            "failed": NodeStatus.FAILED,
+                        }
+                        node.status = status_map.get(status_lower, node.status)
+                        node.message = node_result.get("message")
+
+            # 鏇存柊宸ヤ綔娴佺姸鎬?
+            workflow_status = result.get("workflow_status", {})
+            if workflow_status:
+                self._update_local_workflow_status(workflow_status)
+            else:
+                self._update_workflow_status()
+
+            logger.info(f"Synced status for {len(nodes_info)} nodes via workflow-status service")
+
+        except Exception as e:
+            logger.error(f"鎵归噺鍚屾鑺傜偣鐘舵€佸け璐? {e}锛岄檷绾т负閫愪釜鍚屾")
+            # 闄嶇骇锛氶€愪釜鍚屾
+            for node in self.nodes:
+                if node.status in [NodeStatus.PENDING, NodeStatus.NOT_READY, NodeStatus.RUNNING, NodeStatus.FAILED]:
+                    await self.sync_node_status_from_service(node)
+            self._update_workflow_status()
+
+    def _update_local_workflow_status(self, workflow_status: Dict):
+        """
+        鏍规嵁鐘舵€佹湇鍔¤繑鍥炴洿鏂版湰鍦板伐浣滄祦鐘舵€?
+
+        鏂扮姸鎬佺郴缁熶笅锛岀洿鎺ヨ皟鐢╛update_workflow_status()鏍规嵁APP鑺傜偣鐘舵€佽绠?
+        杩欓噷鍙洿鏂癿essage鍜宖inished_at
+
+        Args:
+            workflow_status: 鐘舵€佹湇鍔¤繑鍥炵殑宸ヤ綔娴佺姸鎬佷俊鎭?
+        """
+        # 鏂扮姸鎬佺郴缁燂細鐘舵€佺敱APP鑺傜偣鍐冲畾锛岄€氳繃_update_workflow_status璁＄畻
+        # 杩欓噷鍙鐞唌essage鍜宖inished_at
+
+        if workflow_status.get("finished_at"):
+            try:
+                finished_at_str = workflow_status["finished_at"]
+                if isinstance(finished_at_str, str):
+                    self.instance.finished_at = datetime.fromisoformat(finished_at_str.replace("Z", "+00:00"))
+            except Exception:
+                pass
+
+        if workflow_status.get("message"):
+            self.instance.message = workflow_status.get("message")
+
+        # 鏍规嵁APP鑺傜偣鐘舵€佽绠楀伐浣滄祦鐘舵€?
+        self._update_workflow_status()
+        logger.info("Updated local workflow status cache from workflow-status service")
+
+    async def get_node_status_from_service(self, node_id: str) -> Optional[Dict]:
+        """
+        浠庣姸鎬佹湇鍔¤幏鍙栬妭鐐圭姸鎬?
+
+        Args:
+            node_id: 鑺傜偣ID
+
+        Returns:
+            鑺傜偣鐘舵€佷俊鎭瓧鍏?
+        """
+        try:
+            result = await self.status_client.get_node_status(
+                node_id=node_id,
+                project_id=self.instance.project_id
+            )
+            return result
+        except Exception as e:
+            logger.error(f"浠庣姸鎬佹湇鍔¤幏鍙栬妭鐐?{node_id} 鐘舵€佸け璐? {e}")
+            return None
 
     async def sync_all_nodes_status(self):
         """Sync all node status from K8S and update workflow status"""
         for node in self.nodes:
-            # 同步非终态状态的节点（PENDING, NOT_READY, RUNNING, FAILED）
-            # FAILED状态的节点也需要同步，因为可能K8S资源已经恢复
+            # 鍚屾闈炵粓鎬佺姸鎬佺殑鑺傜偣锛圥ENDING, NOT_READY, RUNNING, FAILED锛?
+            # FAILED鐘舵€佺殑鑺傜偣涔熼渶瑕佸悓姝ワ紝鍥犱负鍙兘K8S璧勬簮宸茬粡鎭㈠
             if node.status in [NodeStatus.PENDING, NodeStatus.NOT_READY, NodeStatus.RUNNING, NodeStatus.FAILED]:
                 await self.sync_node_status_from_k8s(node)
 
@@ -286,92 +432,89 @@ class WorkflowEngine:
         self._update_workflow_status()
 
     def _update_workflow_status(self):
-        """Update workflow instance status based on node statuses
+        """Update workflow instance status based on APP nodes only
 
-        APP节点状态: PENDING, NOT_READY, READY, STOPPED, FAILED
-        JOB节点状态: PENDING, RUNNING, SUCCEEDED, FAILED
-
-        工作流状态判断逻辑（优先级从高到低）:
-        1. FAILED: 有任何节点失败
-        2. RUNNING: 有节点正在执行中（JOB的RUNNING 或 APP的NOT_READY）
-        3. SUCCEEDED: 全部节点完成（READY 或 SUCCEEDED）
-        4. STOPPED: 有节点被停止
-        5. PENDING: 其他情况（有PENDING节点，但没有正在执行的节点）
+        宸ヤ綔娴佺姸鎬佸彧鏍规嵁APP鑺傜偣鍒ゆ柇:
+        - pending: 鎵€鏈堿PP鑺傜偣閮戒负pending
+        - unready: 鏈堿PP鑺傜偣涓簉eady/not_ready/failed/stopped锛堥潪鍏ㄩ儴pending锛?
+        - ready: 鎵€鏈堿PP鑺傜偣閮戒负ready
         """
         if not self.nodes:
             return
 
-        # Count nodes by status
-        pending_count = sum(1 for n in self.nodes if n.status == NodeStatus.PENDING)
-        not_ready_count = sum(1 for n in self.nodes if n.status == NodeStatus.NOT_READY)
-        ready_count = sum(1 for n in self.nodes if n.status == NodeStatus.READY)
-        running_count = sum(1 for n in self.nodes if n.status == NodeStatus.RUNNING)
-        succeeded_count = sum(1 for n in self.nodes if n.status == NodeStatus.SUCCEEDED)
-        failed_count = sum(1 for n in self.nodes if n.status == NodeStatus.FAILED)
-        stopped_count = sum(1 for n in self.nodes if n.status == NodeStatus.STOPPED)
+        # 鍙幏鍙朅PP绫诲瀷鐨勮妭鐐?
+        app_nodes = [n for n in self.nodes if n.node_type == NodeType.APP]
 
-        total = len(self.nodes)
-        logger.info(f"Workflow {self.instance_id} node status: pending={pending_count}, not_ready={not_ready_count}, "
-                    f"ready={ready_count}, running={running_count}, succeeded={succeeded_count}, "
-                    f"failed={failed_count}, stopped={stopped_count}")
+        if not app_nodes:
+            # 娌℃湁APP鑺傜偣锛屾牴鎹甁ob鑺傜偣鐘舵€佸垽鏂?
+            job_nodes = [n for n in self.nodes if n.node_type == NodeType.JOB]
+            if not job_nodes:
+                return
 
-        # 如果工作流当前是 PENDING 状态，且所有节点都是 PENDING 状态，保持不变
-        # 这表示工作流尚未初始化，不应该自动改变状态
-        if self.instance.status == WorkflowStatus.PENDING and pending_count == total:
-            logger.info(f"Workflow {self.instance_id} remains PENDING (not initialized yet)")
+            # 缁熻Job鑺傜偣鐘舵€?
+            pending_count = sum(1 for n in job_nodes if n.status == NodeStatus.PENDING)
+            succeeded_count = sum(1 for n in job_nodes if n.status == NodeStatus.SUCCEEDED)
+            running_count = sum(1 for n in job_nodes if n.status == NodeStatus.RUNNING)
+            failed_count = sum(1 for n in job_nodes if n.status == NodeStatus.FAILED)
+            total = len(job_nodes)
+
+            logger.info(f"Workflow {self.instance_id} JOB node status: pending={pending_count}, "
+                        f"running={running_count}, succeeded={succeeded_count}, failed={failed_count}")
+
+            # 鍒ゆ柇宸ヤ綔娴佺姸鎬?
+            if succeeded_count == total:
+                self.instance.status = WorkflowStatus.READY
+                self.instance.message = "All JOB nodes succeeded"
+                logger.info(f"Workflow {self.instance_id} marked as READY (all JOB nodes succeeded)")
+            elif pending_count == total:
+                self.instance.status = WorkflowStatus.PENDING
+                self.instance.message = "All JOB nodes are pending"
+                logger.info(f"Workflow {self.instance_id} marked as PENDING (all JOB nodes pending)")
+            else:
+                # 姝ｅ湪鎵ц鎴栨湁澶辫触
+                self.instance.status = WorkflowStatus.PENDING
+                if failed_count > 0:
+                    self.instance.message = "Some JOB nodes failed"
+                else:
+                    self.instance.message = f"JOB nodes: {succeeded_count} succeeded, {running_count} running, {pending_count} pending"
+                logger.info(f"Workflow {self.instance_id} marked as PENDING (JOB nodes in progress)")
+
+            self.db.commit()
             return
 
-        # 计算正在执行的节点数量
-        # APP节点的NOT_READY状态（Pod正在启动但未就绪）也算作正在执行
-        # JOB节点的RUNNING状态算作正在执行
-        executing_count = running_count + not_ready_count
+        # 缁熻APP鑺傜偣鐘舵€?
+        pending_count = sum(1 for n in app_nodes if n.status == NodeStatus.PENDING)
+        ready_count = sum(1 for n in app_nodes if n.status == NodeStatus.READY)
+        not_ready_count = sum(1 for n in app_nodes if n.status == NodeStatus.NOT_READY)
+        failed_count = sum(1 for n in app_nodes if n.status == NodeStatus.FAILED)
+        stopped_count = sum(1 for n in app_nodes if n.status == NodeStatus.STOPPED)
 
-        # Determine workflow status
-        if failed_count > 0:
-            # 优先级1: 有任何节点失败 -> 工作流失败
-            self.instance.status = WorkflowStatus.FAILED
-            if self.instance.finished_at is None:
-                self.instance.finished_at = datetime.utcnow()
-            failed_nodes = [n.name for n in self.nodes if n.status == NodeStatus.FAILED]
-            self.instance.message = f"Workflow failed: nodes {failed_nodes} failed"
-            logger.warning(f"Workflow {self.instance_id} marked as FAILED")
-        elif executing_count > 0:
-            # 优先级2: 有节点正在执行中（JOB的RUNNING 或 APP的NOT_READY）-> 工作流运行中
-            if self.instance.status != WorkflowStatus.RUNNING:
-                self.instance.status = WorkflowStatus.RUNNING
-                if self.instance.started_at is None:
-                    self.instance.started_at = datetime.utcnow()
-                # 根据节点类型显示不同的消息
-                if not_ready_count > 0 and running_count > 0:
-                    self.instance.message = f"Workflow is running ({not_ready_count} app(s) starting, {running_count} job(s) running)"
-                elif not_ready_count > 0:
-                    self.instance.message = f"Workflow is running ({not_ready_count} app(s) starting)"
-                else:
-                    self.instance.message = f"Workflow is running ({running_count} job(s) running)"
-                logger.info(f"Workflow {self.instance_id} marked as RUNNING")
-        elif pending_count == 0 and executing_count == 0:
-            # 优先级3/4: 没有正在执行的节点，也没有等待的节点
-            if ready_count + succeeded_count == total:
-                # 全部节点完成（APP的READY 或 JOB的SUCCEEDED）-> 工作流成功
-                self.instance.status = WorkflowStatus.SUCCEEDED
-                if self.instance.finished_at is None:
-                    self.instance.finished_at = datetime.utcnow()
-                self.instance.message = "All nodes completed successfully"
-                logger.info(f"Workflow {self.instance_id} marked as SUCCEEDED")
+        total = len(app_nodes)
+        logger.info(f"Workflow {self.instance_id} APP node status: pending={pending_count}, "
+                    f"not_ready={not_ready_count}, ready={ready_count}, "
+                    f"failed={failed_count}, stopped={stopped_count}")
+
+        # 鍒ゆ柇宸ヤ綔娴佺姸鎬?
+        if ready_count == total:
+            # 鎵€鏈堿PP鑺傜偣閮絩eady
+            self.instance.status = WorkflowStatus.READY
+            self.instance.message = "All APP nodes are ready"
+            logger.info(f"Workflow {self.instance_id} marked as READY")
+        elif pending_count == total:
+            # 鎵€鏈堿PP鑺傜偣閮絧ending
+            self.instance.status = WorkflowStatus.PENDING
+            self.instance.message = "All APP nodes are pending"
+            logger.info(f"Workflow {self.instance_id} marked as PENDING")
+        else:
+            # 鏈堿PP鑺傜偣涓嶆槸pending涔熶笉鏄叏閮╮eady
+            self.instance.status = WorkflowStatus.UNREADY
+            if failed_count > 0:
+                self.instance.message = f"Some APP nodes failed or not ready"
             elif stopped_count > 0:
-                # 有节点被停止 -> 工作流停止
-                self.instance.status = WorkflowStatus.STOPPED
-                if self.instance.finished_at is None:
-                    self.instance.finished_at = datetime.utcnow()
-                self.instance.message = "Workflow stopped"
-                logger.info(f"Workflow {self.instance_id} marked as STOPPED")
-        elif pending_count > 0 or (pending_count > 0 and ready_count + succeeded_count > 0):
-            # 优先级5: 有PENDING节点，但没有正在执行的节点 -> 工作流等待中
-            # 这种情况表示：部分节点完成，部分节点等待执行（如等待依赖满足）
-            if self.instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.RUNNING]:
-                self.instance.status = WorkflowStatus.PENDING
-                self.instance.message = "Workflow waiting for nodes to start"
-                logger.info(f"Workflow {self.instance_id} marked as PENDING (waiting)")
+                self.instance.message = f"Some APP nodes are stopped"
+            else:
+                self.instance.message = f"APP nodes: {ready_count} ready, {not_ready_count} not ready, {pending_count} pending"
+            logger.info(f"Workflow {self.instance_id} marked as UNREADY")
 
         self.db.commit()
 
@@ -610,12 +753,12 @@ class WorkflowEngine:
         """
         Start a single node by creating K8S resources
 
-        APP节点：
-        - 已初始化（有k8s_resource_name）：检查Deployment状态，设置PENDING/NOT_READY/READY
-        - 未初始化：不应该是这种情况，应该先调用initialize
+        APP鑺傜偣锛?
+        - 宸插垵濮嬪寲锛堟湁k8s_resource_name锛夛細妫€鏌eployment鐘舵€侊紝璁剧疆PENDING/NOT_READY/READY
+        - 鏈垵濮嬪寲锛氫笉搴旇鏄繖绉嶆儏鍐碉紝搴旇鍏堣皟鐢╥nitialize
 
-        JOB节点：
-        - 创建Job并设置为RUNNING
+        JOB鑺傜偣锛?
+        - 鍒涘缓Job骞惰缃负RUNNING
         """
         from datetime import datetime
 
@@ -640,47 +783,45 @@ class WorkflowEngine:
 
         try:
             if node.node_type == NodeType.APP:
-                # APP节点：检查已存在的Deployment状态
+                # APP鑺傜偣锛氭鏌ュ凡瀛樺湪鐨凞eployment鐘舵€?
                 node.k8s_resource_type = "Deployment"
 
                 if not node.k8s_resource_name:
-                    # APP节点未初始化，应该先调用initialize
+                    # APP鑺傜偣鏈垵濮嬪寲锛屽簲璇ュ厛璋冪敤initialize
                     node.status = NodeStatus.FAILED
                     node.message = "APP node not initialized, call initialize first"
                     self.db.commit()
                     return False
 
-                # 检查Deployment状态
                 k8s_name = node.k8s_resource_name
-                status = self.k8s_client.get_deployment_status(self.instance.project_id, k8s_name)
 
-                if status:
-                    ready_replicas = status.get("ready_replicas", 0) or status.get("ready_replica", 0)
-                    replicas = status.get("replicas", 0) or status.get("replica", 0)
-                    available_replicas = status.get("available_replicas", 0) or status.get("available_replica", 0)
-
-                    if ready_replicas >= replicas and replicas > 0:
-                        node.status = NodeStatus.READY
-                        node.message = "Deployment is ready"
-                    elif available_replicas > 0 or ready_replicas > 0:
-                        node.status = NodeStatus.NOT_READY
-                        node.message = f"Deployment is running but not ready ({ready_replicas}/{replicas} ready)"
-                    else:
-                        node.status = NodeStatus.PENDING
-                        node.message = f"Waiting for Pod to start ({ready_replicas}/{replicas})"
-                else:
-                    # Deployment不存在
+                result = await self.status_client.start_node(
+                    node_id=node.node_id,
+                    project_id=self.instance.project_id,
+                    instance_id=self.instance_id,
+                    node_type="app",
+                    k8s_resource_name=k8s_name,
+                )
+                if not result.get("success"):
                     node.status = NodeStatus.FAILED
-                    node.message = f"Deployment {k8s_name} not found"
+                    node.message = result.get("error", "Failed to check APP node status")
                     self.db.commit()
                     return False
 
+                status_str = result.get("status", "Pending")
+                status_mapping = {
+                    "Pending": NodeStatus.PENDING,
+                    "Not_ready": NodeStatus.NOT_READY,
+                    "Ready": NodeStatus.READY,
+                }
+                node.status = status_mapping.get(status_str, NodeStatus.PENDING)
+                node.message = result.get("message", "")
                 self.db.commit()
-                logger.info(f"Checked APP node {node.node_id} ({k8s_name}), status: {node.status}")
+                logger.info(f"Checked APP node {node.node_id} via workflow-status, status: {node.status}")
                 return True
 
             else:  # JOB
-                # JOB节点：创建Job
+                # JOB鑺傜偣锛氬垱寤篔ob
                 node.k8s_resource_type = "Job"
 
                 # Build container configurations
@@ -690,43 +831,37 @@ class WorkflowEngine:
                 k8s_name = f"wf-{self.instance.id[:8]}-{node.node_id[:8]}"
                 node.k8s_resource_name = k8s_name
 
-                # 先检查 Job 是否已存在
-                existing_job = self.k8s_client.get_job_status(self.instance.project_id, k8s_name)
-                
-                if existing_job:
-                    # Job 已存在，获取状态
-                    logger.info(f"Job {k8s_name} already exists with status: {existing_job['status']}")
-                    if existing_job['status'] == "Succeeded":
-                        node.status = NodeStatus.SUCCEEDED
-                        node.message = "Job already completed successfully"
-                    elif existing_job['status'] == "Failed":
-                        node.status = NodeStatus.FAILED
-                        node.message = "Job already failed"
-                    else:
-                        node.status = NodeStatus.RUNNING
-                        node.message = "Job already running"
-                    node.started_at = datetime.utcnow()
-                    self.db.commit()
-                    return True
+                # 鏋勫缓 job_config
+                job_config = {
+                    "containers": containers,
+                    "ttl_seconds_after_finished": template.ttl_seconds_after_finished if hasattr(template, 'ttl_seconds_after_finished') else 3600,
+                    "backoff_limit": template.backoff_limit if hasattr(template, 'backoff_limit') else 3
+                }
 
-                # Create job with multiple container
-                success, error = self.k8s_client.create_job(
+                result = await self.status_client.start_node(
+                    node_id=node.node_id,
                     project_id=self.instance.project_id,
-                    name=k8s_name,
-                    containers=containers,
-                    ttl_seconds_after_finished=template.ttl_seconds_after_finished if hasattr(template, 'ttl_seconds_after_finished') else 3600,
-                    backoff_limit=template.backoff_limit if hasattr(template, 'backoff_limit') else 3
+                    instance_id=self.instance_id,
+                    node_type="job",
+                    k8s_resource_name=k8s_name,
+                    job_config=job_config,
                 )
+                if not result.get("success"):
+                    raise RuntimeError(result.get("error", "Failed to start job node"))
 
-                if not success:
-                    raise RuntimeError(f"Failed to create job: {error}")
-
-                node.status = NodeStatus.RUNNING
+                status_str = result.get("status", "Running")
+                status_mapping = {
+                    "Pending": NodeStatus.PENDING,
+                    "Running": NodeStatus.RUNNING,
+                    "Succeeded": NodeStatus.SUCCEEDED,
+                    "Failed": NodeStatus.FAILED,
+                }
+                node.status = status_mapping.get(status_str, NodeStatus.RUNNING)
                 node.started_at = datetime.utcnow()
-                node.message = "Job started successfully"
+                node.message = result.get("message", "Job started successfully")
                 self.db.commit()
 
-                logger.info(f"Started JOB node {node.node_id} ({k8s_name}) with {len(containers)} containers")
+                logger.info(f"Started JOB node {node.node_id} via workflow-status, status={node.status}")
                 return True
 
         except Exception as e:
@@ -759,96 +894,104 @@ class WorkflowEngine:
         """
         logger.info(f"Starting workflow execution for instance {self.instance_id}")
 
-        # 1. Check for cycle
-        cycle = self.detect_cycle()
-        if cycle:
-            error_msg = f"Cycle detected in workflow: {' -> '.join(cycle)}"
-            logger.error(error_msg)
-            self.instance.status = WorkflowStatus.FAILED
-            self.instance.message = error_msg
+        # 鍚姩鐩戞帶
+        await self._start_monitoring()
+
+        try:
+            # 1. Check for cycle
+            cycle = self.detect_cycle()
+            if cycle:
+                error_msg = f"Cycle detected in workflow: {' -> '.join(cycle)}"
+                logger.error(error_msg)
+                self.instance.status = WorkflowStatus.UNREADY
+                self.instance.message = error_msg
+                self.db.commit()
+                raise ValueError(error_msg)
+
+            # 2. Build in-degree map
+            in_degree = self.get_in_degree()
+
+            # 3. Find starting nodes (in-degree = 0)
+            ready = [node for node in self.nodes if in_degree[node.node_id] == 0]
+
+            if not ready:
+                logger.warning("No starting nodes found (all nodes have dependencies)")
+
+            # 4. Execution loop
+            self.instance.status = WorkflowStatus.UNREADY
             self.db.commit()
-            raise ValueError(error_msg)
 
-        # 2. Build in-degree map
-        in_degree = self.get_in_degree()
+            workflow_failed = False
+            failed_node_id = None
 
-        # 3. Find starting nodes (in-degree = 0)
-        ready = [node for node in self.nodes if in_degree[node.node_id] == 0]
+            while ready:
+                logger.info(f"Starting {len(ready)} ready nodes: {[n.node_id for n in ready]}")
 
-        if not ready:
-            logger.warning("No starting nodes found (all nodes have dependencies)")
+                # Start all ready nodes concurrently
+                start_tasks = [self.start_node(node) for node in ready]
+                results = await asyncio.gather(*start_tasks, return_exceptions=True)
 
-        # 4. Execution loop
-        self.instance.status = WorkflowStatus.RUNNING
-        self.db.commit()
+                for node, result in zip(ready, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"Node {node.node_id} failed to start: {result}")
+                        node.status = NodeStatus.FAILED
+                        node.message = str(result)
+                        self.db.commit()
 
-        workflow_failed = False
-        failed_node_id = None
+                # Wait for at least one node to complete before proceeding
+                await self._wait_for_progress()
 
-        while ready:
-            logger.info(f"Starting {len(ready)} ready nodes: {[n.node_id for n in ready]}")
+                # Sync status from K8S
+                await self.sync_all_nodes_status()
 
-            # Start all ready nodes concurrently
-            start_tasks = [self.start_node(node) for node in ready]
-            results = await asyncio.gather(*start_tasks, return_exceptions=True)
+                # Check for workflow completion
+                if self._is_workflow_complete():
+                    break
 
-            for node, result in zip(ready, results):
-                if isinstance(result, Exception):
-                    logger.error(f"Node {node.node_id} failed to start: {result}")
-                    node.status = NodeStatus.FAILED
-                    node.message = str(result)
-                    self.db.commit()
+                # Check if any node has failed
+                if self._has_workflow_failed():
+                    workflow_failed = True
+                    # Find the first failed node
+                    for node in self.nodes:
+                        if node.status == NodeStatus.FAILED:
+                            failed_node_id = node.node_id
+                            break
+                    logger.warning(f"Node {failed_node_id} failed, waiting for remaining nodes to timeout...")
+                    # Wait for remaining running nodes to timeout
+                    await self._wait_for_remaining_timeout()
+                    break
 
-            # Wait for at least one node to complete before proceeding
-            await self._wait_for_progress()
-
-            # Sync status from K8S
-            await self.sync_all_nodes_status()
-
-            # Check for workflow completion
-            if self._is_workflow_complete():
-                break
-
-            # Check if any node has failed
-            if self._has_workflow_failed():
-                workflow_failed = True
-                # Find the first failed node
+                # Find new ready nodes
+                new_ready = []
                 for node in self.nodes:
-                    if node.status == NodeStatus.FAILED:
-                        failed_node_id = node.node_id
-                        break
-                logger.warning(f"Node {failed_node_id} failed, waiting for remaining nodes to timeout...")
-                # Wait for remaining running nodes to timeout
-                await self._wait_for_remaining_timeout()
-                break
+                    if node.status == NodeStatus.PENDING:
+                        deps = self.dependency_graph.get(node.node_id, [])
+                        all_deps_done = all(
+                            self.node_map[dep_id].status in self.COMPLETED_STATUSES
+                            for dep_id in deps
+                        )
+                        if all_deps_done:
+                            new_ready.append(node)
 
-            # Find new ready nodes
-            new_ready = []
-            for node in self.nodes:
-                if node.status == NodeStatus.PENDING:
-                    deps = self.dependency_graph.get(node.node_id, [])
-                    all_deps_done = all(
-                        self.node_map[dep_id].status in self.COMPLETED_STATUSES
-                        for dep_id in deps
-                    )
-                    if all_deps_done:
-                        new_ready.append(node)
+                ready = new_ready
 
-            ready = new_ready
+            # Final status update
+            if self._is_workflow_complete():
+                self.instance.status = WorkflowStatus.READY
+                self.instance.finished_at = datetime.utcnow()
+                self.instance.message = "All nodes completed successfully"
+                logger.info(f"Workflow {self.instance_id} completed successfully")
+            elif workflow_failed or self._has_workflow_failed():
+                self.instance.status = WorkflowStatus.UNREADY
+                self.instance.finished_at = datetime.utcnow()
+                self.instance.message = f"Workflow failed: node {failed_node_id} failed"
+                logger.error(f"Workflow {self.instance_id} failed")
 
-        # Final status update
-        if self._is_workflow_complete():
-            self.instance.status = WorkflowStatus.SUCCEEDED
-            self.instance.finished_at = datetime.utcnow()
-            self.instance.message = "All nodes completed successfully"
-            logger.info(f"Workflow {self.instance_id} completed successfully")
-        elif workflow_failed or self._has_workflow_failed():
-            self.instance.status = WorkflowStatus.FAILED
-            self.instance.finished_at = datetime.utcnow()
-            self.instance.message = f"Workflow failed: node {failed_node_id} failed"
-            logger.error(f"Workflow {self.instance_id} failed")
+            self.db.commit()
 
-        self.db.commit()
+        finally:
+            # 鍋滄鐩戞帶
+            await self._stop_monitoring()
 
     async def _wait_for_progress(self, timeout: float = 30.0):
         """
@@ -961,3 +1104,63 @@ class WorkflowEngine:
         outputs["pvc_names"] = pvc_names
 
         return outputs
+
+    # ============ 鐩戞帶鐩稿叧鏂规硶 ============
+
+    async def _start_monitoring(self):
+        """Start workflow status monitoring."""
+        try:
+            # 鏋勫缓鑺傜偣淇℃伅鍒楄〃
+            nodes_info = [
+                {
+                    "node_id": node.node_id,
+                    "node_type": "app" if node.node_type == NodeType.APP else "job",
+                    "k8s_resource_name": node.k8s_resource_name,
+                    "timeout_seconds": node.timeout_seconds
+                }
+                for node in self.nodes
+            ]
+
+            result = await self.status_client.start_monitoring(
+                instance_id=self.instance_id,
+                project_id=self.instance.project_id,
+                nodes=nodes_info,
+                poll_interval=10
+            )
+
+            if result.get("success"):
+                self._monitoring_started = True
+                logger.info(f"宸插惎鍔ㄧ洃鎺? instance_id={self.instance_id}")
+            else:
+                logger.warning(f"鍚姩鐩戞帶澶辫触: {result.get('error')}")
+
+        except Exception as e:
+            logger.warning(f"鍚姩鐩戞帶寮傚父: {e}")
+
+    async def _stop_monitoring(self):
+        """Stop workflow status monitoring."""
+        if not self._monitoring_started:
+            return
+
+        try:
+            success = await self.status_client.stop_monitoring(self.instance_id)
+            if success:
+                logger.info(f"宸插仠姝㈢洃鎺? instance_id={self.instance_id}")
+            self._monitoring_started = False
+
+        except Exception as e:
+            logger.warning(f"鍋滄鐩戞帶寮傚父: {e}")
+
+    async def _sync_node_status_to_service(self, node: WorkflowNodeInstance):
+        """Push a single node status update to the workflow-status service."""
+        try:
+            await self.status_client.sync_node_status(
+                node_id=node.node_id,
+                project_id=self.instance.project_id,
+                instance_id=self.instance_id,
+                node_type="app" if node.node_type == NodeType.APP else "job",
+                k8s_resource_name=node.k8s_resource_name,
+                timeout_seconds=node.timeout_seconds
+            )
+        except Exception as e:
+            logger.warning(f"鍚屾鑺傜偣鐘舵€佸け璐? {e}")

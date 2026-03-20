@@ -57,6 +57,9 @@ from app.schemas.schemas import (
     SuccessResponse,
     ErrorResponse,
     HealthResponse,
+    # Callback
+    NodeStatusCallbackRequest,
+    NodeStatusCallbackResponse,
 )
 
 __all__ = [
@@ -103,4 +106,6 @@ __all__ = [
     "HealthResponse",
     "WorkflowSyncRecordResponse",
     "WorkflowSyncRecordListResponse",
+    "NodeStatusCallbackRequest",
+    "NodeStatusCallbackResponse",
 ]

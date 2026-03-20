@@ -49,26 +49,16 @@ class ImagePullPolicy:
 
 
 class WorkflowStatus:
-    """Workflow instance status
+    """Workflow instance status based on APP nodes
 
-    Status flow:
-    - pending -> initializing (when initialize is triggered)
-    - initializing -> initialized (after initialize completes) or failed (if init fails)
-    - initialized -> running (after start)
-    - running -> succeeded (all nodes complete) or failed (any node fails) or stopped (manual stop)
-    - stopped -> running (after start again)
-
-    For persistent mode with trigger:
-    - initialized/running -> can be triggered multiple times
-    - trigger keeps workflow in running state during execution
+    Status is determined by APP node statuses only:
+    - pending: 所有APP节点都为pending（或没有APP节点）
+    - unready: 有APP节点为ready/not_ready/failed/stopped（非全部pending）
+    - ready: 所有APP节点都为ready
     """
-    PENDING = "pending"          # 刚创建，未初始化
-    INITIALIZING = "initializing"  # 正在初始化中
-    INITIALIZED = "initialized"  # 已初始化，Deployment/Service已创建
-    RUNNING = "running"          # 运行中
-    SUCCEEDED = "succeeded"      # 执行成功
-    FAILED = "failed"            # 执行失败
-    STOPPED = "stopped"          # 已停止
+    PENDING = "pending"    # 所有APP节点都为pending
+    UNREADY = "unready"    # 有APP节点为ready/not_ready/failed/stopped
+    READY = "ready"        # 所有APP节点都为ready
 
 
 class NodeStatus:

@@ -36,6 +36,7 @@ class AuthServiceConfig(BaseModel):
     host: str
     port: int
     validate_token_path: str = "/api/auth/validate-token"
+    validate_human_token_path: str = "/api/auth/validate-human-token"
     service_machine_token: Optional[str] = None
     timeout: int = 10
     token_cache_enabled: bool = True
@@ -45,6 +46,11 @@ class AuthServiceConfig(BaseModel):
     def validate_url(self) -> str:
         """Generate token validation URL"""
         return f"http://{self.host}:{self.port}{self.validate_token_path}"
+
+    @property
+    def validate_human_url(self) -> str:
+        """Generate human-token validation URL"""
+        return f"http://{self.host}:{self.port}{self.validate_human_token_path}"
 
 
 class RegistryMenuLevelConfig(BaseModel):

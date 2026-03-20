@@ -1,4 +1,4 @@
-"""
+﻿"""
 Workflow instance API routes
 Manages workflow execution including creation, running, stopping, deletion, and log retrieval
 """
@@ -8,7 +8,7 @@ from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from app.api.dependencies import get_current_user, generate_id
 from app.models import (
@@ -22,11 +22,12 @@ from app.schemas import (
     WorkflowInstanceResponse, WorkflowInstanceListResponse,
     WorkflowNodeCreate, WorkflowNodeUpdate, WorkflowNodeInstanceResponse,
     WorkflowEdgesUpdateRequest, WorkflowInstanceInitializeRequest,
-    LogQueryRequest, PodLogResponse, SuccessResponse
+    LogQueryRequest, PodLogResponse, SuccessResponse,
+    NodeStatusCallbackRequest, NodeStatusCallbackResponse,
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
 from app.services import WorkflowEngine
-from app.services.k8s_service_client import get_k8s_service_client
+from app.services.workflow_status_client import get_workflow_status_client
 from app.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -34,12 +35,39 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/workflow-instances", tags=["Workflow Instances"])
 
 
-def get_k8s_client():
-    """获取K8S微服务客户端"""
-    return get_k8s_service_client()
+def get_status_client():
+    """Get workflow-status client, fail fast when disabled."""
+    config = get_config()
+    if not config.workflow_status_service or not config.workflow_status_service.enabled:
+        raise InternalError("workflow-status service is required but disabled")
+    return get_workflow_status_client()
 
 
-# ============ Ingress Controller 代理接口 ============
+async def ensure_project_namespace(project_id: str):
+    """Ensure project namespace by workflow-status service."""
+    result = await get_status_client().ensure_namespace(project_id)
+    if not result.get("success"):
+        raise InternalError(f"Namespace verification failed: {result.get('message', 'unknown error')}")
+
+
+def build_lifecycle_nodes(nodes: List[WorkflowNodeInstance]) -> List[Dict[str, Any]]:
+    """Build nodes payload for workflow lifecycle APIs."""
+    payload: List[Dict[str, Any]] = []
+    for node in nodes:
+        if not node.k8s_resource_name:
+            continue
+        payload.append({
+            "node_id": node.node_id,
+            "node_type": node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type),
+            "k8s_resource_name": node.k8s_resource_name,
+            "k8s_resource_type": node.k8s_resource_type,
+            "service_name": node.service_name,
+            "has_ingress": bool(node.ingress_type),
+        })
+    return payload
+
+
+# ============ Ingress Controller 处理接口 ============
 
 
 @router.get("/ingress-controllers", summary="获取可用的Ingress Controller列表")
@@ -49,17 +77,17 @@ async def get_ingress_controllers(
     """
     获取集群中可用的Ingress Controller列表
 
-    代理调用k8s微服务接口，返回Ingress Controller的名称、外部IP、端口等信息。
+    处理调用k8s服务端接口，返回Ingress Controller的名称、外网IP、端口等信息。
     供前端在创建节点时选择Ingress配置使用。
     """
-    k8s_client = get_k8s_client()
-    controllers = k8s_client.get_ingress_controllers()
+    status_client = get_status_client()
+    controllers = await status_client.get_ingress_controllers()
     return {"total": len(controllers), "items": controllers}
 
 
 @router.get("/statistics", summary="获取工作流统计信息")
 async def get_workflow_statistics(
-    project_id: Optional[str] = Query(None, description="项目ID，不传则统计所有项目"),
+    project_id: Optional[str] = Query(None, description="项目ID，不传则统计所有条目"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -83,12 +111,8 @@ async def get_workflow_statistics(
     status_distribution = {}
     status_list = [
         WorkflowStatus.PENDING,
-        WorkflowStatus.INITIALIZING,
-        WorkflowStatus.INITIALIZED,
-        WorkflowStatus.RUNNING,
-        WorkflowStatus.SUCCEEDED,
-        WorkflowStatus.FAILED,
-        WorkflowStatus.STOPPED
+        WorkflowStatus.UNREADY,
+        WorkflowStatus.READY,
     ]
     for status in status_list:
         count = db.query(func.count(WorkflowInstance.id)).filter(
@@ -135,11 +159,11 @@ async def initialize_workflow_instance(
 
     对于不同类型的节点，初始化逻辑不同：
 
-    JOB类型节点:
+    JOB类型节点：
     - 直接上报初始化成功
     - 不创建任何K8S资源（Job在start时创建并执行）
 
-    APP类型节点:
+    APP类型节点：
     - 必须在模板中定义Service（create_service=True 且 service_ports不为空）
     - 必须在模板中定义service_name（用于创建Service）
     - 创建对应的Deployment
@@ -150,7 +174,7 @@ async def initialize_workflow_instance(
     - 初始化成功后状态变为INITIALIZED
     - 创建完成后可通过start API启动工作流
 
-    强制初始化 (force=True):
+    强制初始化(force=True):
     - 如果工作流已经初始化过（状态为INITIALIZED或STOPPED），会先删除已存在的K8S资源
     - 然后重新创建Deployment和Service
     - 用于重新初始化场景
@@ -169,7 +193,7 @@ async def initialize_workflow_instance(
         raise ForbiddenError("No permission to initialize this instance")
 
     # 检查状态和强制初始化参数
-    # 新状态系统：pending/unready/ready
+    # 新状态体系：pending/unready/ready
     force = request.force
 
     # 检查是否需要强制初始化
@@ -181,14 +205,10 @@ async def initialize_workflow_instance(
             f"Workflow instance already initialized. Use force=True to re-initialize (this will delete existing resources)"
         )
 
-    k8s_client = get_k8s_client()
+    status_client = get_status_client()
+    await ensure_project_namespace(instance.project_id)
 
-    # 验证namespace
-    namespace_exists, namespace_error = k8s_client.ensure_namespace(instance.project_id)
-    if not namespace_exists:
-        raise InternalError(f"Namespace验证失败: {namespace_error}")
-
-    # 设置状态为unready（初始化中/已初始化但未完全就绪）
+    # 设置状态为unready（初始化中：已开始初始化但未完全就绪）
     instance.status = WorkflowStatus.UNREADY
     instance.message = "Initializing workflow instance..."
     db.commit()
@@ -215,56 +235,49 @@ async def initialize_workflow_instance(
 
     init_logs.append(f"节点总数: {len(nodes)}")
 
-    # 如果强制初始化，先删除已存在的K8S资源
+    # 如果强制初始化，先通过 workflow-status 服务删除已有资源
     if force and instance.status in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         init_logs.append(f"[{datetime.utcnow().isoformat()}] 强制初始化: 删除已存在的K8S资源")
-        logger.info(f"Force initialization: deleting existing K8S resources for instance {instance_id}")
+        logger.info(f"Force initialization cleanup via workflow-status: instance={instance_id}")
+        existing_nodes = build_lifecycle_nodes(nodes)
+        if existing_nodes:
+            cleanup_result = await status_client.deinitialize_workflow(
+                instance_id=instance_id,
+                project_id=instance.project_id,
+                nodes=existing_nodes,
+            )
+            if not cleanup_result.get("success", False):
+                raise InternalError(
+                    f"Force cleanup failed: {cleanup_result.get('message') or cleanup_result.get('error', 'unknown error')}"
+                )
+
         for node in nodes:
-            if node.k8s_resource_name:
-                try:
-                    if node.k8s_resource_type == "Deployment":
-                        k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
-                        logger.info(f"Deleted Deployment {node.k8s_resource_name} for node {node.id}")
-                        init_logs.append(f"  - 删除 Deployment {node.k8s_resource_name}")
-                        if node.service_name:
-                            k8s_client.delete_service(instance.project_id, node.service_name)
-                            logger.info(f"Deleted Service {node.service_name} for node {node.id}")
-                            init_logs.append(f"  - 删除 Service {node.service_name}")
-                            # 删除关联的 Ingress
-                            if node.ingress_type:
-                                k8s_client.delete_ingress(instance.project_id, node.service_name)
-                                logger.info(f"Deleted Ingress {node.service_name} for node {node.id}")
-                                init_logs.append(f"  - 删除 Ingress {node.service_name}")
-                    elif node.k8s_resource_type == "Job":
-                        k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
-                        logger.info(f"Deleted Job {node.k8s_resource_name} for node {node.id}")
-                        init_logs.append(f"  - 删除 Job {node.k8s_resource_name}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete K8S resource {node.k8s_resource_name}: {e}")
-                    init_logs.append(f"  - 删除失败 {node.k8s_resource_name}: {e}")
-                # 清空节点资源信息
-                node.k8s_resource_name = None
-                node.k8s_resource_type = None
-                node.service_name = None
-                node.ingress_type = None
-                node.ingress_host = None
-                node.ingress_ip = None
-                node.status = NodeStatus.PENDING
+            node.k8s_resource_name = None
+            node.k8s_resource_type = None
+            node.service_name = None
+            node.ingress_type = None
+            node.ingress_host = None
+            node.ingress_ip = None
+            node.status = NodeStatus.PENDING
+            node.message = None
         db.commit()
 
     initialized_nodes = []
     errors = []
 
+    # 构建节点配置列表（用于调用workflow-status 服务）
+    nodes_info = []
+    nodes_to_process = []  # 保存需要处理的节点对象
+
     for node in nodes:
-        # 处理JOB类型节点：直接上报初始化成功
+        # 处理JOB类型节点
         if node.node_type == NodeType.JOB:
-            logger.info(f"JOB node {node.id} initialized successfully (no K8S resources needed)")
-            init_logs.append(f"[{datetime.utcnow().isoformat()}] 初始化节点 {node.name} (ID: {node.id})")
-            init_logs.append(f"  类型: JOB, 无需创建K8S资源")
-            init_logs.append(f"  成功: JOB节点初始化完成")
-            node.status = NodeStatus.PENDING
-            node.message = "JOB node initialized successfully"
-            initialized_nodes.append(node.id)
+            nodes_info.append({
+                "node_id": node.node_id,
+                "node_type": "job",
+                "node_name": node.name,
+            })
+            nodes_to_process.append(node)
             continue
 
         # 处理APP类型节点
@@ -275,18 +288,17 @@ async def initialize_workflow_instance(
             continue
 
         try:
-            init_logs.append(f"[{datetime.utcnow().isoformat()}] 初始化节点 {node.name} (ID: {node.id})")
-
             # 获取应用模板
             template = db.query(AppTemplate).filter(AppTemplate.id == node.template_id).first()
             if not template:
                 error_msg = f"App template {node.template_id} not found for node {node.id}"
                 errors.append(error_msg)
-                init_logs.append(f"  错误: {error_msg}")
+                init_logs.append(f"[{datetime.utcnow().isoformat()}] 错误: {error_msg}")
+                node.status = NodeStatus.FAILED
+                node.message = error_msg
                 continue
 
             # 从节点配置中获取服务相关参数
-            # 查找当前节点在instance.nodes中的配置
             node_config = None
             for n in instance.nodes:
                 if n.get("id") == node.node_id or n.get("node_id") == node.node_id:
@@ -296,220 +308,150 @@ async def initialize_workflow_instance(
             if not node_config:
                 error_msg = f"Node configuration not found for node {node.id}"
                 errors.append(error_msg)
-                init_logs.append(f"  错误: {error_msg}")
+                init_logs.append(f"[{datetime.utcnow().isoformat()}] 错误: {error_msg}")
                 node.status = NodeStatus.FAILED
                 node.message = error_msg
                 continue
 
             # 检查是否创建Service
             create_service = node_config.get("create_service", True)
+            service_name = None
+            service_ports = []
+
             if create_service:
-                # 检查service_name
                 service_name = node_config.get("service_name")
                 if not service_name or not service_name.strip():
                     error_msg = f"Service name is required when create_service is True for node {node.id}"
                     errors.append(error_msg)
-                    init_logs.append(f"  错误: {error_msg}")
+                    init_logs.append(f"[{datetime.utcnow().isoformat()}] 错误: {error_msg}")
                     node.status = NodeStatus.FAILED
                     node.message = error_msg
                     continue
 
-                # 检查service_ports
                 service_ports = node_config.get("service_ports", [])
                 if not service_ports or len(service_ports) == 0:
                     error_msg = f"Service ports cannot be empty when create_service is True for node {node.id}"
                     errors.append(error_msg)
-                    init_logs.append(f"  错误: {error_msg}")
+                    init_logs.append(f"[{datetime.utcnow().isoformat()}] 错误: {error_msg}")
                     node.status = NodeStatus.FAILED
                     node.message = error_msg
                     continue
 
             # 构建容器配置
             containers = _build_containers_from_template(template, node)
-            init_logs.append(f"  模板: {template.name}, 容器数: {len(containers)}, replicas: {template.replicas}")
 
             # 生成Deployment名称
             deployment_name = f"wf-{instance_id[:8]}-{node.node_id[:8]}"
-            node.k8s_resource_name = deployment_name
-            node.k8s_resource_type = "Deployment"
 
-            # 创建Deployment
-            # 使用节点配置中的service_ports（如果需要创建Service的话）
-            deployment_ports = service_ports if create_service else []
-            # 确保replicas至少为1
-            replicas = template.replicas if template.replicas and template.replicas > 0 else 1
-            init_logs.append(f"  创建Deployment: {deployment_name}, replicas: {replicas}")
-            success, error_msg = k8s_client.create_deployment(
-                project_id=instance.project_id,
-                name=deployment_name,
-                containers=containers,
-                ports=deployment_ports,
-                replicas=replicas
-            )
-
-            if not success:
-                errors.append(f"Failed to create Deployment for node {node.id}: {error_msg}")
-                init_logs.append(f"  错误: 创建Deployment失败 - {error_msg}")
-                node.status = NodeStatus.FAILED
-                node.message = f"Failed to create Deployment: {error_msg}"
-                continue
-
-            init_logs.append(f"  成功: 创建Deployment {deployment_name}")
-
-            # 转换端口格式: ServicePort schema使用target_port (snake_case)
-            # 但create_service期望targetPort (camelCase)
+            # 转换端口格式
             k8s_service_ports = []
             for p in service_ports:
                 port_config = {
                     "name": p.get("name", f"port-{p.get('port')}"),
                     "port": p.get("port"),
-                    "targetPort": p.get("target_port", p.get("port")),  # 转换为camelCase
+                    "targetPort": p.get("target_port", p.get("port")),
                     "protocol": p.get("protocol", "TCP")
                 }
                 k8s_service_ports.append(port_config)
 
-            # 获取service_type，默认ClusterIP
+            # 获取service_type
             service_type = node_config.get("service_type", "ClusterIP")
-            # Convert ServiceType enum to string if needed
             if hasattr(service_type, "value"):
                 service_type = service_type.value
 
-            success, error_msg = k8s_client.create_service(
-                project_id=instance.project_id,
-                name=service_name,
-                selector={"app": deployment_name},
-                ports=k8s_service_ports,
-                service_type=service_type
-            )
+            # 确保replicas至少为1
+            replicas = template.replicas if template.replicas and template.replicas > 0 else 1
 
-            if success:
-                node.service_name = service_name
-                init_logs.append(f"  成功: 创建Service {service_name}")
+            # Ingress配置
+            ingress_type = node_config.get("ingress_type")
+            ingress_host = node_config.get("ingress_host")
+            ingress_host_prefix = node_config.get("ingress_host_prefix") or service_name
+            ingress_ip = node_config.get("ingress_ip")
 
-                # 创建Ingress (如果配置了)
-                ingress_type = node_config.get("ingress_type")
-                ingress_host = node_config.get("ingress_host")
-                ingress_host_prefix = node_config.get("ingress_host_prefix") or service_name
-                ingress_ip = node_config.get("ingress_ip")
+            ingress_config = None
+            if ingress_type:
+                ingress_config = {
+                    "host": ingress_host,
+                    "host_prefix": ingress_host_prefix,
+                    "ingress_type": ingress_type,
+                    "ingress_ip": ingress_ip
+                }
 
-                if ingress_type:
-                    # Ingress名称与Service名称相同
-                    ingress_name = service_name
-                    # 获取第一个端口作为Ingress后端端口
-                    first_port = service_ports[0].get("port", 80) if service_ports else 80
+            node_info = {
+                "node_id": node.node_id,
+                "node_type": "app",
+                "node_name": node.name,
+                "deployment_name": deployment_name,
+                "service_name": service_name,
+                "ingress_config": ingress_config,
+                "containers": containers,
+                "volume_mounts": template.volume_mounts if hasattr(template, 'volume_mounts') else None,
+                "replicas": replicas,
+                "service_ports": k8s_service_ports,
+                "service_type": service_type
+            }
 
-                    ingress_success, ingress_error = k8s_client.create_ingress(
-                        project_id=instance.project_id,
-                        name=ingress_name,
-                        service_name=service_name,
-                        service_port=first_port,
-                        host=ingress_host,
-                        host_prefix=ingress_host_prefix,
-                        ingress_type=ingress_type,
-                        ingress_ip=ingress_ip
-                    )
+            nodes_info.append(node_info)
+            nodes_to_process.append(node)
 
-                    if ingress_success:
-                        node.ingress_type = ingress_type
-                        node.ingress_host = ingress_host
-                        node.ingress_ip = ingress_ip
-                        init_logs.append(f"  成功: 创建Ingress {ingress_name} (host: {ingress_host})")
-                    else:
-                        init_logs.append(f"  警告: 创建Ingress失败 - {ingress_error}")
-                        logger.warning(f"Failed to create Ingress for node {node.id}: {ingress_error}")
-
-                # 检查Deployment状态来确定节点状态
-                # PENDING: Pod未运行
-                # NOT_READY: Pod已运行但未就绪
-                # READY: Pod全部就绪
-                try:
-                    deployment_status = k8s_client.get_deployment_status(instance.project_id, deployment_name)
-                    if deployment_status:
-                        ready_replicas = deployment_status.get("ready_replicas", 0) or deployment_status.get("ready_replica", 0)
-                        replicas = deployment_status.get("replicas", 0) or deployment_status.get("replica", 0)
-                        available_replicas = deployment_status.get("available_replicas", 0) or deployment_status.get("available_replica", 0)
-
-                        init_logs.append(f"  Deployment状态: replicas={replicas}, ready={ready_replicas}, available={available_replicas}")
-
-                        if ready_replicas >= replicas and replicas > 0:
-                            # Pod全部就绪
-                            node.status = NodeStatus.READY
-                            node.message = "Deployment is ready"
-                            init_logs.append(f"  节点状态: READY (Pod已就绪)")
-                        elif available_replicas > 0 or ready_replicas > 0:
-                            # Pod已运行但未全部就绪
-                            node.status = NodeStatus.NOT_READY
-                            node.message = "Deployment is running but not ready"
-                            init_logs.append(f"  节点状态: NOT_READY (Pod运行中但未就绪)")
-                        else:
-                            # Pod未运行
-                            node.status = NodeStatus.PENDING
-                            node.message = "Deployment created, waiting for Pod"
-                            init_logs.append(f"  节点状态: PENDING (等待Pod启动)")
-                    else:
-                        # 无法获取状态，默认PENDING
-                        node.status = NodeStatus.PENDING
-                        node.message = "APP node initialized successfully"
-                        init_logs.append(f"  节点状态: PENDING (无法获取Deployment状态)")
-                except Exception as status_error:
-                    logger.warning(f"Failed to get deployment status: {status_error}")
-                    node.status = NodeStatus.PENDING
-                    node.message = "APP node initialized successfully"
-                    init_logs.append(f"  节点状态: PENDING (获取状态异常: {status_error})")
-
-                initialized_nodes.append(node.id)
-                logger.info(f"Initialized node {node.id} with Deployment {deployment_name} and Service {service_name}")
-
-                # 记录节点到workflow-status服务
-                config = get_config()
-                if config.workflow_status_service and config.workflow_status_service.enabled:
-                    status_client = get_workflow_status_client()
-                    try:
-                        # 记录节点初始状态
-                        await status_client.record_node(
-                            node_id=node.node_id,
-                            instance_id=str(instance.id),
-                            project_id=instance.project_id,
-                            node_type="app",
-                            k8s_resource_name=deployment_name,
-                            k8s_resource_type="Deployment",
-                            initial_status=node.status.value if hasattr(node.status, 'value') else str(node.status),
-                            init_logs=None
-                        )
-                        # 保存初始化日志到状态服务
-                        node_init_logs = f"节点 {node.node_id} 初始化:\n"
-                        node_init_logs += f"  Deployment: {deployment_name}\n"
-                        node_init_logs += f"  Service: {service_name}\n"
-                        node_init_logs += f"  状态: {node.status.value if hasattr(node.status, 'value') else str(node.status)}\n"
-                        await status_client.save_init_logs(node_id=node.node_id, logs=node_init_logs)
-                        logger.info(f"节点 {node.node_id} 已记录到workflow-status服务")
-                    except Exception as status_error:
-                        logger.warning(f"记录节点到workflow-status服务失败: {status_error}")
-            else:
-                # Service创建失败，删除已创建的Deployment，上报初始化失败
-                error_msg = f"Failed to create Service {service_name}: {error_msg}"
-                errors.append(error_msg)
-                init_logs.append(f"  错误: 创建Service失败 - {error_msg}")
-                node.status = NodeStatus.FAILED
-                node.message = error_msg
-                # 尝试清理已创建的Deployment
-                try:
-                    k8s_client.delete_deployment(instance.project_id, deployment_name)
-                    init_logs.append(f"  清理: 已删除Deployment {deployment_name}")
-                except Exception as cleanup_error:
-                    logger.warning(f"Failed to cleanup Deployment {deployment_name}: {cleanup_error}")
-                    init_logs.append(f"  清理失败: 删除Deployment {deployment_name} 失败 - {cleanup_error}")
-                continue
+            init_logs.append(f"[{datetime.utcnow().isoformat()}] 准备初始化节点 {node.name}: Deployment={deployment_name}, Service={service_name}")
 
         except Exception as e:
-            logger.error(f"Error initializing node {node.id}: {e}")
-            error_msg = f"Error initializing node {node.id}: {str(e)}"
+            logger.error(f"Error preparing node {node.id}: {e}")
+            error_msg = f"Error preparing node {node.id}: {str(e)}"
             errors.append(error_msg)
-            init_logs.append(f"  异常: {error_msg}")
+            init_logs.append(f"[{datetime.utcnow().isoformat()}] 异常: {error_msg}")
             node.status = NodeStatus.FAILED
             node.message = error_msg
 
-    db.commit()
+    # 调用 workflow-status 服务初始化工作流
+    if nodes_info:
+        init_logs.append(f"[{datetime.utcnow().isoformat()}] 调用 workflow-status 服务初始化工作流")
+        result = await status_client.initialize_workflow(
+            instance_id=instance_id,
+            project_id=instance.project_id,
+            nodes=nodes_info,
+        )
+
+        logger.info(f"initialize_workflow result: {result}")
+
+        if result.get("nodes"):
+            for node_result in result.get("nodes", []):
+                result_node_id = node_result.get("node_id")
+                node = next((n for n in nodes_to_process if n.node_id == result_node_id), None)
+                if not node:
+                    continue
+
+                if node_result.get("success", False):
+                    node.k8s_resource_name = node_result.get("k8s_resource_name")
+                    node.k8s_resource_type = "Deployment" if node.node_type == NodeType.APP else "Job"
+                    node.service_name = node_result.get("service_name")
+
+                    result_status = str(node_result.get("status", "Pending")).lower()
+                    if result_status == "ready":
+                        node.status = NodeStatus.READY
+                    elif result_status in ["not_ready", "notready"]:
+                        node.status = NodeStatus.NOT_READY
+                    elif result_status == "running":
+                        node.status = NodeStatus.RUNNING
+                    elif result_status == "succeeded":
+                        node.status = NodeStatus.SUCCEEDED
+                    else:
+                        node.status = NodeStatus.PENDING
+
+                    node.message = node_result.get("message", "Node initialized successfully")
+                    initialized_nodes.append(node.id)
+                    init_logs.append(f"[{datetime.utcnow().isoformat()}] 节点 {result_node_id} 初始化成功")
+                else:
+                    node.status = NodeStatus.FAILED
+                    node.message = node_result.get("error", "Node initialization failed")
+                    errors.append(f"Node {result_node_id}: {node.message}")
+                    init_logs.append(f"[{datetime.utcnow().isoformat()}] 节点 {result_node_id} 初始化失败: {node.message}")
+
+        if not result.get("success", False):
+            errors.append(result.get("message", result.get("error", "workflow-status initialization failed")))
+
+        db.commit()
 
     # 更新工作流状态（根据APP节点状态计算）
     init_logs.append(f"[{datetime.utcnow().isoformat()}] 初始化完成")
@@ -524,10 +466,31 @@ async def initialize_workflow_instance(
         init_logs.append(f"结果: 全部失败 - {'; '.join(errors)}")
         logger.error(f"Workflow {instance_id} initialization failed: {errors}")
     elif not app_nodes:
-        # 没有APP节点
-        instance.status = WorkflowStatus.PENDING
-        instance.message = "No app nodes to initialize"
-        init_logs.append(f"结果: 无APP节点")
+        # 没有APP节点，根据Job节点状态判断
+        job_nodes = [n for n in nodes if n.node_type == NodeType.JOB]
+        if not job_nodes:
+            # 没有任何节点
+            instance.status = WorkflowStatus.PENDING
+            instance.message = "No nodes in workflow"
+            init_logs.append(f"结果: 无节点")
+        elif all(n.status == NodeStatus.SUCCEEDED for n in job_nodes):
+            # 所有Job节点都执行成功
+            instance.status = WorkflowStatus.READY
+            instance.message = f"All {len(job_nodes)} JOB nodes succeeded"
+            init_logs.append(f"结果: 所有JOB节点执行成功 - {len(job_nodes)} 个")
+        elif all(n.status == NodeStatus.PENDING for n in job_nodes):
+            # 所有Job节点都在等待
+            instance.status = WorkflowStatus.PENDING
+            instance.message = f"All {len(job_nodes)} JOB nodes pending"
+            init_logs.append(f"结果: 所有JOB节点等待 - {len(job_nodes)} 个")
+        else:
+            # Job节点正在执行或有失败
+            succeeded_count = sum(1 for n in job_nodes if n.status == NodeStatus.SUCCEEDED)
+            running_count = sum(1 for n in job_nodes if n.status == NodeStatus.RUNNING)
+            failed_count = sum(1 for n in job_nodes if n.status == NodeStatus.FAILED)
+            instance.status = WorkflowStatus.PENDING
+            instance.message = f"JOB nodes: {succeeded_count} succeeded, {running_count} running, {failed_count} failed"
+            init_logs.append(f"结果: JOB节点执行中 - {succeeded_count} 成功, {running_count} 执行中, {failed_count} 失败")
     else:
         # 根据APP节点状态计算工作流状态
         ready_count = sum(1 for n in app_nodes if n.status == NodeStatus.READY)
@@ -640,7 +603,14 @@ def _build_containers_from_template(template: AppTemplate, node: WorkflowNodeIns
 
 def check_instance_permission(instance: WorkflowInstance, user_id: str) -> bool:
     """Check if user has permission to access workflow instance"""
-    return instance.created_by == user_id
+    # Backward compatibility:
+    # historical instances were created by service account "system".
+    # These instances should be accessible after project-based listing.
+    if instance.created_by == user_id:
+        return True
+    if instance.created_by == "system":
+        return True
+    return False
 
 
 def build_instance_response(instance: WorkflowInstance, db: Session) -> Dict[str, Any]:
@@ -694,7 +664,7 @@ def build_instance_response(instance: WorkflowInstance, db: Session) -> Dict[str
         "last_run_at": instance.last_run_at.isoformat() if instance.last_run_at else None,
         "nodes": nodes_data,
         "edges": instance.edges or [],
-        "has_warning": instance.has_warning,  # 告警标记
+        "has_warning": instance.has_warning,  # 警告标记
         "last_sync_at": instance.last_sync_at.isoformat() if instance.last_sync_at else None,
         "created_by": instance.created_by,
         "started_at": instance.started_at.isoformat() if instance.started_at else None,
@@ -737,9 +707,6 @@ def build_node_relationships(nodes: List[WorkflowNodeInstance], edges: List[Dict
         # Find source node and add target to its downstream_node_ids
         for node in nodes:
             if node.id == source or node.node_id == source:  # Support both id and node_id
-                if target not in node.downstream_node_ids:
-                    node.downstream_node_ids.append(target)
-                break
                 if target not in node.downstream_node_ids:
                     node.downstream_node_ids.append(target)
                 break
@@ -904,13 +871,15 @@ async def list_workflow_instances(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List workflow instance"""
-    user_id = str(current_user.get("id", ""))
+    """List workflow instances by selected project."""
+    query = db.query(WorkflowInstance)
 
-    query = db.query(WorkflowInstance).filter(WorkflowInstance.created_by == user_id)
+    # Frontend flow queries instances through project dropdown.
+    # If no project is selected, return empty result to avoid cross-project listing.
+    if not project_id:
+        return WorkflowInstanceListResponse(total=0, items=[])
 
-    if project_id:
-        query = query.filter(WorkflowInstance.project_id == project_id)
+    query = query.filter(WorkflowInstance.project_id == project_id)
     if status:
         query = query.filter(WorkflowInstance.status == status)
 
@@ -1034,8 +1003,8 @@ async def start_workflow_instance(
     if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         raise ValidationError(f"Cannot start instance in status: {instance.status}. Valid states: pending, unready, ready")
 
-    # 如果是从ready状态启动（重新执行），重置 JOB 节点状态
-    # 注：新状态系统下不再有STOPPED状态，READY状态可以重新执行
+    # 如果是从 ready 状态启动（重新执行），重置 JOB 节点状态
+    if instance.status == WorkflowStatus.READY:
         await _reset_job_nodes_for_retrigger(instance_id, instance.project_id)
 
     # Update run count and last run time
@@ -1048,7 +1017,7 @@ async def start_workflow_instance(
     try:
         from app.models import get_session_factory
 
-        # 为后台任务创建独立的 Session
+        # 为后续操作创建独立的 Session
         bg_session = get_session_factory()()
 
         engine = WorkflowEngine(instance_id, bg_session)
@@ -1057,11 +1026,8 @@ async def start_workflow_instance(
         # 将节点记录到状态服务
         await engine._record_nodes_to_status_service()
 
-        # 验证namespace
-        namespace_exists, namespace_error = engine.k8s_client.ensure_namespace(instance.project_id)
-        if not namespace_exists:
-            bg_session.close()
-            raise InternalError(f"Namespace验证失败: {namespace_error}")
+        # 校验 namespace (via workflow-status proxy)
+        await ensure_project_namespace(instance.project_id)
 
         # Execute workflow (this runs asynchronously with its own session)
         async def run_workflow_with_session():
@@ -1114,7 +1080,7 @@ async def sync_workflow_status(
         raise ForbiddenError("No permission to access this instance")
 
     # 允许在任何状态下同步状态，以便用户可以手动触发状态同步
-    # 这对于异常状态恢复、状态校验等场景非常有用
+    # 这对于异常状态恢复、状态校准等场景非常有用
 
     from datetime import datetime
     sync_start_time = datetime.utcnow()
@@ -1129,31 +1095,28 @@ async def sync_workflow_status(
 
         sync_logs.append(f"工作流状态: {instance.status}, 节点数: {len(engine.nodes)}")
 
-        # 检查资源残留和状态一致性
+        # 检查资源泄露和状态一致性
         # 1. 检查数据库中记录的资源是否在K8S集群中存在
-        # 2. 主动查询K8S集群中与该工作流相关的资源（可能存在资源泄露）
-        k8s_client = get_k8s_client()
+        # 2. 主动查询集群中与该工作流相关的资源（可能存在资源泄露）
+        status_client = get_status_client()
 
-        # 获取所有可能与该工作流相关的资源名称前缀
         instance_prefix = f"wf-{instance_id[:8]}-"
 
-        # 主动查询K8S集群中的资源
-        try:
-            all_deployments = k8s_client.list_deployments(instance.project_id)
-            all_services = k8s_client.list_services(instance.project_id)
-            all_jobs = k8s_client.list_jobs(instance.project_id)
-            sync_logs.append(f"查询K8S资源: Deployments={len(all_deployments)}, Services={len(all_services)}, Jobs={len(all_jobs)}")
-        except Exception as e:
-            logger.warning(f"Failed to list K8S resources: {e}")
-            sync_logs.append(f"查询K8S资源失败: {e}")
-            all_deployments = []
-            all_services = []
-            all_jobs = []
+        resources = await status_client.list_project_resources(
+            project_id=instance.project_id,
+            instance_prefix=instance_prefix,
+        )
+        all_deployments = resources.get("deployments", [])
+        all_services = resources.get("services", [])
+        all_jobs = resources.get("jobs", [])
+        sync_logs.append(
+            f"查询K8S资源: Deployments={len(all_deployments)}, Services={len(all_services)}, Jobs={len(all_jobs)}"
+        )
 
         # 筛选出属于该工作流的资源
-        workflow_deployments = [d for d in all_deployments if d.get("name", "").startswith(instance_prefix)]
-        workflow_services = [s for s in all_services if s.get("name", "").startswith(instance_prefix)]
-        workflow_jobs = [j for j in all_jobs if j.get("name", "").startswith(instance_prefix)]
+        workflow_deployments = [d for d in all_deployments if (d.get("name") or "").startswith(instance_prefix)]
+        workflow_services = [s for s in all_services if (s.get("name") or "").startswith(instance_prefix)]
+        workflow_jobs = [j for j in all_jobs if (j.get("name") or "").startswith(instance_prefix)]
 
         sync_logs.append(f"工作流相关资源: Deployments={len(workflow_deployments)}, Services={len(workflow_services)}, Jobs={len(workflow_jobs)}")
 
@@ -1184,7 +1147,7 @@ async def sync_workflow_status(
         missing_services = list(db_service_names - k8s_service_names)  # 数据库有但K8S没有（资源丢失）
         missing_jobs = list(db_job_names - k8s_job_names)  # 数据库有但K8S没有（资源丢失）
 
-        # 构建告警消息
+        # 构建警告信息
         warnings = []
         if orphan_deployments:
             warnings.append(f"泄露的Deployment: {orphan_deployments}")
@@ -1209,10 +1172,10 @@ async def sync_workflow_status(
             sync_logs.append(f"结果: 发现不一致 - {'; '.join(warnings)}")
             logger.warning(f"Workflow {instance_id}: {warning_msg}")
         elif instance.has_warning:
-            # 清除之前的告警标记
+            # 清除之前的警告标记
             instance.has_warning = False
             instance.message = "状态同步完成，资源状态一致"
-            sync_logs.append("结果: 资源状态一致，已清除告警")
+            sync_logs.append("结果: 资源状态一致，已清除警告")
         else:
             sync_logs.append("结果: 资源状态一致")
 
@@ -1233,7 +1196,7 @@ async def sync_workflow_status(
 
         # 注意: sync_status 只负责同步状态，不创建任何K8S资源
         # 就绪节点的启动应该由 start API 或 execute_workflow 来处理
-        # 这里不再调用 start_node 来避免在同步状态时创建资源
+        # 这里不再调用 start_node 避免在同步状态时创建资源
 
     except Exception as e:
         logger.error(f"Error syncing workflow status: {e}")
@@ -1291,6 +1254,7 @@ async def get_workflow_sync_records(
     )
 
 
+
 @router.post("/{instance_id}/stop", response_model=WorkflowInstanceResponse)
 async def stop_workflow_instance(
     instance_id: str,
@@ -1316,40 +1280,35 @@ async def stop_workflow_instance(
     if instance.status not in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         raise ValidationError(f"Cannot stop instance in status: {instance.status}. Valid states: unready, ready")
 
-    # 获取K8S客户端（自动选择模式）
-    config = get_config()
-    if config.k8s_service and config.k8s_service.enabled:
-        from app.services.k8s_service_client import get_k8s_service_client
-        k8s_client = get_k8s_service_client()
-    else:
-        k8s_client = get_k8s_client()
+    nodes = db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.instance_id == instance_id
+    ).all()
+    nodes_info = build_lifecycle_nodes(nodes)
 
-    # Stop all nodes
+    result = await get_status_client().stop_workflow(
+        instance_id=instance_id,
+        project_id=instance.project_id,
+        nodes=nodes_info if nodes_info else None,
+    )
+    logger.info(f"stop_workflow result: {result}")
+    if not result.get("success", False):
+        logger.warning(f"stop_workflow returned non-success: {result}")
+
+    # Update local database node status
     nodes = db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.instance_id == instance_id
     ).all()
 
     for node in nodes:
-        if node.k8s_resource_name:
-            try:
-                if node.k8s_resource_type == "Deployment":
-                    k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
-                    if node.service_name:
-                        k8s_client.delete_service(instance.project_id, node.service_name)
-                        # 删除关联的 Ingress
-                        if node.ingress_type:
-                            k8s_client.delete_ingress(instance.project_id, node.service_name)
-                elif node.k8s_resource_type == "Job":
-                    k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
+        node.status = NodeStatus.PENDING
+        from datetime import datetime
+        node.finished_at = datetime.utcnow()
+        node.k8s_resource_name = None
+        node.k8s_resource_type = None
+        node.service_name = None
+        node.ingress_type = None
 
-                node.status = NodeStatus.PENDING
-                from datetime import datetime
-                node.finished_at = datetime.utcnow()
-            except Exception as e:
-                logger.error(f"Failed to stop node {node.id}: {e}")
-                node.message = str(e)
-
-    # 停止后状态设为PENDING（资源已删除）
+    # Set status to PENDING after stop (resources deleted)
     instance.status = WorkflowStatus.PENDING
     db.commit()
     db.refresh(instance)
@@ -1365,19 +1324,19 @@ async def uninitialize_workflow_instance(
     db: Session = Depends(get_db)
 ):
     """
-    反初始化工作流实例
+    Uninitialize workflow instance
 
-    - 删除所有已创建的 K8S 资源（Deployment、Service、Job）
-    - 清空节点的 K8S 资源信息
-    - 将所有节点状态重置为 PENDING
-    - 将工作流状态重置为 PENDING
+    - Delete all created K8S resources (deployment, service, job)
+    - Clear node K8S resource information
+    - Reset all node status to PENDING
+    - Reset workflow status to PENDING
 
-    前置条件:
-    - 状态为 UNREADY 或 READY
+    Prerequisites:
+    - Status is UNREADY or READY
 
-    用途:
-    - 完全重置工作流到初始状态
-    - 清理所有 K8S 资源后重新配置
+    Usage:
+    - Fully reset workflow to initial state
+    - Re-deploy after cleaning up all K8S resources
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -1388,7 +1347,7 @@ async def uninitialize_workflow_instance(
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to uninitialize this instance")
 
-    # 检查状态 - 只能在已初始化的状态下反初始化
+    # Check status - only uninitialize in initialized states
     valid_states = [
         WorkflowStatus.UNREADY,
         WorkflowStatus.READY
@@ -1399,71 +1358,25 @@ async def uninitialize_workflow_instance(
             f"Valid states: unready, ready"
         )
 
-    k8s_client = get_k8s_client()
-
-    # 获取所有节点
+    # Get all nodes
     nodes = db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.instance_id == instance_id
     ).all()
 
     deleted_count = 0
     errors = []
+    nodes_info = build_lifecycle_nodes(nodes)
+    result = await get_status_client().deinitialize_workflow(
+        instance_id=instance_id,
+        project_id=instance.project_id,
+        nodes=nodes_info if nodes_info else None,
+    )
+    deleted_count = result.get("succeeded_nodes", 0)
+    if not result.get("success", False):
+        errors.append(result.get("message", result.get("error", "Unknown error")))
+    logger.info(f"deinitialize_workflow result: {result}")
 
     for node in nodes:
-        # 删除 K8S 资源 - 每种资源类型独立删除，互不影响
-        if node.k8s_resource_name:
-            # 删除 Deployment
-            if node.k8s_resource_type == "Deployment":
-                try:
-                    k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
-                    logger.info(f"Deleted Deployment {node.k8s_resource_name} for node {node.id}")
-                    deleted_count += 1
-                except Exception as e:
-                    error_msg = f"Failed to delete Deployment {node.k8s_resource_name}: {e}"
-                    logger.error(error_msg)
-                    errors.append(error_msg)
-
-                # 删除可能关联的 Service
-                # Service 可能有多个名称:
-                # 1. node.service_name (记录的名称)
-                # 2. k8s_resource_name (与 deployment 同名)
-                # 3. svc-{k8s_resource_name} (旧命名方式)
-                possible_service_names = set()
-                if node.service_name:
-                    possible_service_names.add(node.service_name)
-                possible_service_names.add(node.k8s_resource_name)  # 与 deployment 同名
-                possible_service_names.add(f"svc-{node.k8s_resource_name}")  # 旧命名方式
-
-                for svc_name in possible_service_names:
-                    try:
-                        k8s_client.delete_service(instance.project_id, svc_name)
-                        logger.info(f"Deleted Service {svc_name} for node {node.id}")
-                        deleted_count += 1
-                    except Exception as e:
-                        # Service 不存在或删除失败，只记录 debug 日志
-                        logger.debug(f"Service {svc_name} delete skipped: {e}")
-
-                # 删除关联的 Ingress
-                if node.ingress_type and node.service_name:
-                    try:
-                        k8s_client.delete_ingress(instance.project_id, node.service_name)
-                        logger.info(f"Deleted Ingress {node.service_name} for node {node.id}")
-                        deleted_count += 1
-                    except Exception as e:
-                        logger.debug(f"Ingress {node.service_name} delete skipped: {e}")
-
-            # 删除 Job
-            elif node.k8s_resource_type == "Job":
-                try:
-                    k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
-                    logger.info(f"Deleted Job {node.k8s_resource_name} for node {node.id}")
-                    deleted_count += 1
-                except Exception as e:
-                    error_msg = f"Failed to delete Job {node.k8s_resource_name}: {e}"
-                    logger.error(error_msg)
-                    errors.append(error_msg)
-
-        # 清空节点资源信息并重置状态
         node.k8s_resource_name = None
         node.k8s_resource_type = None
         node.service_name = None
@@ -1475,7 +1388,7 @@ async def uninitialize_workflow_instance(
         node.finished_at = None
         node.message = None
 
-    # 重置工作流状态
+    # Reset workflow status
     instance.status = WorkflowStatus.PENDING
     instance.started_at = None
     instance.finished_at = None
@@ -1517,31 +1430,23 @@ async def delete_workflow_instance(
 
     # Delete K8S resources if initialized (unready or ready)
     if instance.status in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
-        k8s_client = get_k8s_client()
         nodes = db.query(WorkflowNodeInstance).filter(
             WorkflowNodeInstance.instance_id == instance_id
         ).all()
 
-        for node in nodes:
-            if node.k8s_resource_name:
-                try:
-                    if node.k8s_resource_type == "Deployment":
-                        k8s_client.delete_deployment(instance.project_id, node.k8s_resource_name)
-                        if node.service_name:
-                            k8s_client.delete_service(instance.project_id, node.service_name)
-                            # 删除关联的 Ingress
-                            if node.ingress_type:
-                                k8s_client.delete_ingress(instance.project_id, node.service_name)
-                    elif node.k8s_resource_type == "Job":
-                        k8s_client.delete_job(instance.project_id, node.k8s_resource_name)
-                except Exception as e:
-                    logger.error(f"Failed to delete K8S resource for node {node.id}: {e}")
+        nodes_info = build_lifecycle_nodes(nodes)
+        result = await get_status_client().deinitialize_workflow(
+            instance_id=instance_id,
+            project_id=instance.project_id,
+            nodes=nodes_info if nodes_info else None,
+        )
+        logger.info(f"deinitialize_workflow for delete result: {result}")
 
     # Delete all sync records first (foreign key constraint requires this)
     db.query(WorkflowSyncRecord).filter(
         WorkflowSyncRecord.instance_id == instance_id
     ).delete()
-    
+
     # Delete all node instances (foreign key constraint requires this)
     db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.instance_id == instance_id
@@ -1592,38 +1497,25 @@ async def get_node_logs(
     if not node.k8s_resource_name:
         raise ValidationError("Node has not been started yet")
 
-    k8s_client = get_k8s_client()
-
-    # Get pod for the node
-    if node.k8s_resource_type == "Deployment":
-        pods = k8s_client.get_deployment_pods(instance.project_id, node.k8s_resource_name)
-    else:  # Job
-        pods = k8s_client.get_job_pods(instance.project_id, node.k8s_resource_name)
-
-    if not pods:
-        raise NotFoundError("Pod", f"No pods found for node {node_id}")
-
-    # Get logs from the first pod
-    pod_name = pods[0]["name"]
-    logs = k8s_client.get_pod_logs(
+    resource_type = "deployment" if node.k8s_resource_type == "Deployment" else "job"
+    log_result = await get_status_client().get_resource_logs(
         project_id=instance.project_id,
-        pod_name=pod_name,
-        container=container,
+        resource_type=resource_type,
+        resource_name=node.k8s_resource_name,
         tail_lines=tail_lines,
+        container=container,
         previous=previous,
-        timestamps=timestamps
     )
-
-    if logs is None:
-        raise InternalError("Failed to retrieve pod logs")
+    if log_result.get("error"):
+        raise InternalError(f"Failed to retrieve pod logs: {log_result['error']}")
 
     return PodLogResponse(
         resource_name=node.k8s_resource_name,
-        pod_name=pod_name,
-        namespace=k8s_client.get_project_namespace(instance.project_id),
-        logs=logs,
+        pod_name=log_result.get("pod_name"),
+        namespace=log_result.get("namespace"),
+        logs=log_result.get("logs", ""),
         container=container,
-        previous=previous
+        previous=previous,
     )
 
 
@@ -1635,11 +1527,7 @@ async def get_node_init_logs(
     db: Session = Depends(get_db)
 ):
     """
-    获取工作流节点的初始化日志
-
-    - 返回节点初始化过程中记录的详细日志
-    - 包含初始化时间、创建的资源、错误信息等
-    - 用于排查初始化失败的原因
+    Get initialization logs of workflow node.
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -1663,25 +1551,25 @@ async def get_node_init_logs(
         "node_name": node.name,
         "status": node.status,
         "message": node.message,
-        "init_logs": node.init_logs or "暂无初始化日志"
+        "init_logs": node.init_logs or "No initialization logs available",
     }
 
 
 # ============ Trigger Endpoints ============
 
 async def _reset_job_nodes_for_retrigger(instance_id: str, project_id: str):
-    """重新触发工作流时重置 JOB 节点状态"""
+    """Reset JOB node status when retriggering workflow"""
     status_client = get_workflow_status_client()
 
     try:
         result = await status_client.reset_job_nodes(
             instance_id=instance_id,
             project_id=project_id,
-            reset_logs=False  # 保留日志
+            reset_logs=False  # Keep logs
         )
-        logger.info(f"重置 JOB 节点状态: instance_id={instance_id}, reset_count={result.get('reset_count', 0)}")
+        logger.info(f"Reset JOB node status, instance_id={instance_id}, reset_count={result.get('reset_count', 0)}")
     except Exception as e:
-        logger.warning(f"重置 JOB 节点状态失败: {e}")
+        logger.warning(f"Failed to reset JOB node status: {e}")
 
 
 @router.post("/trigger/{instance_id}", response_model=SuccessResponse)
@@ -1716,30 +1604,23 @@ async def trigger_workflow_by_http(
     # Valid states: unready (can trigger), ready (can trigger)
     if instance.status == WorkflowStatus.PENDING:
         raise ValidationError(f"Workflow instance {instance_id} is not initialized. Call initialize first.")
-    if instance.status == WorkflowStatus.PENDING:
-        raise ValidationError(f"Workflow instance {instance_id} is not initialized. Call initialize first.")
 
-    # 重置 JOB 节点状态（用于重新触发场景）
+    # Reset JOB node status (for retrigger scenarios)
     await _reset_job_nodes_for_retrigger(instance_id, instance.project_id)
 
     # Start workflow
     try:
-        from app.models import get_session_factory
-
-        # 为后台任务创建独立的 Session
+        # Create independent Session for background task
         bg_session = get_session_factory()()
 
         engine = WorkflowEngine(instance_id, bg_session)
         await engine.initialize()
 
-        # 将节点记录到状态服务
+        # Record nodes to status service
         await engine._record_nodes_to_status_service()
 
-        # Verify namespace exists
-        namespace_exists, namespace_error = engine.k8s_client.ensure_namespace(instance.project_id)
-        if not namespace_exists:
-            bg_session.close()
-            raise InternalError(f"Namespace验证失败: {namespace_error}")
+        # Verify namespace exists via workflow-status proxy
+        await ensure_project_namespace(instance.project_id)
 
         # Update run count and last run time
         instance.run_count += 1
@@ -2078,10 +1959,7 @@ async def update_workflow_node(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Update workflow node configuration
-
-    Note: 只能在 pending 状态下修改节点配置，初始化后不允许修改
-    """
+    """Update workflow node configuration"""
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
     if not instance:
@@ -2175,7 +2053,7 @@ async def delete_workflow_node(
 ):
     """Delete workflow node
 
-    Note: 只能在 pending 状态下删除节点，初始化后不允许删除
+    Note: Only delete nodes in pending state, not allowed after initialization
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -2241,8 +2119,6 @@ async def update_workflow_edge(
     - action: "add" - add new edge
     - action: "update" - update existing edge
     - action: "delete" - delete edge
-
-    Note: 只能在 pending 状态下修改边（节点依赖关系），初始化后不允许修改
     """
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
@@ -2334,7 +2210,7 @@ async def update_workflow_edge(
 
 # ============ Callback API (for workflow-status service) ============
 
-# 状态映射：workflow-status 状态 -> workflow NodeStatus
+# Status mapping: workflow-status status -> workflow NodeStatus
 STATUS_MAPPING = {
     "pending": NodeStatus.PENDING,
     "Pending": NodeStatus.PENDING,
@@ -2353,44 +2229,41 @@ STATUS_MAPPING = {
 }
 
 
-@router.post("/callback/status", response_model=NodeStatusCallbackResponse, summary="接收节点状态回调")
+@router.post("/callback/status", response_model=NodeStatusCallbackResponse, summary="Receive node status callback")
 async def receive_node_status_callback(
     request: NodeStatusCallbackRequest,
     db: Session = Depends(get_db)
 ):
     """
-    接收来自 workflow-status 服务的节点状态回调
+    Receive node status callback from workflow-status service.
 
-    workflow-status 服务在从 K8S 同步到节点状态变化后，通过此接口通知 workflow 服务更新本地数据库。
-
-    此接口设计为幂等：相同状态的重复调用不会产生副作用。
+    This endpoint is idempotent: repeated callbacks with the same status
+    will not trigger duplicated updates.
     """
-    # 查询节点实例
     node = db.query(WorkflowNodeInstance).filter(
-        WorkflowNodeInstance.id == request.node_id
+        or_(
+            WorkflowNodeInstance.id == request.node_id,
+            WorkflowNodeInstance.node_id == request.node_id,
+        )
     ).first()
 
     if not node:
         logger.warning(f"Callback received for non-existent node: {request.node_id}")
         raise NotFoundError("Workflow node instance", request.node_id)
 
-    # 验证 instance_id 匹配
     if node.instance_id != request.instance_id:
         logger.warning(
             f"Callback instance_id mismatch: node {request.node_id} "
-            f"belongs to {node.instance_id}, but callback says {request.instance_id}"
+            f"belongs to {node.instance_id}, callback={request.instance_id}"
         )
         raise ValidationError(f"instance_id mismatch: node belongs to {node.instance_id}")
 
-    # 映射状态
     new_status = STATUS_MAPPING.get(request.status)
     if not new_status:
         logger.warning(f"Unknown status in callback: {request.status}")
         raise ValidationError(f"Unknown status: {request.status}")
 
-    # 幂等性检查：如果状态相同，直接返回成功
     if node.status == new_status:
-        logger.debug(f"Node {request.node_id} already in status {new_status}, skipping update")
         return NodeStatusCallbackResponse(
             success=True,
             node_id=request.node_id,
@@ -2398,30 +2271,42 @@ async def receive_node_status_callback(
             message="Status unchanged (idempotent)"
         )
 
-    # 记录旧状态
     old_status = node.status
-
-    # 更新节点状态
     node.status = new_status
-
-    # 更新时间字段
     if request.started_at:
         node.started_at = request.started_at
     if request.finished_at:
         node.finished_at = request.finished_at
-
-    # 更新消息
     if request.message:
         node.message = request.message
+
+    # Keep workflow instance status aligned with latest node cache.
+    instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == node.instance_id).first()
+    if instance:
+        instance_nodes = db.query(WorkflowNodeInstance).filter(
+            WorkflowNodeInstance.instance_id == node.instance_id
+        ).all()
+        app_nodes = [n for n in instance_nodes if n.node_type == NodeType.APP]
+        if app_nodes:
+            if all(n.status == NodeStatus.READY for n in app_nodes):
+                instance.status = WorkflowStatus.READY
+            elif all(n.status == NodeStatus.PENDING for n in app_nodes):
+                instance.status = WorkflowStatus.PENDING
+            else:
+                instance.status = WorkflowStatus.UNREADY
+        else:
+            job_nodes = [n for n in instance_nodes if n.node_type == NodeType.JOB]
+            if job_nodes and all(n.status == NodeStatus.SUCCEEDED for n in job_nodes):
+                instance.status = WorkflowStatus.READY
+            elif job_nodes and all(n.status == NodeStatus.PENDING for n in job_nodes):
+                instance.status = WorkflowStatus.PENDING
+            else:
+                instance.status = WorkflowStatus.UNREADY if job_nodes else WorkflowStatus.PENDING
 
     db.commit()
     db.refresh(node)
 
-    logger.info(
-        f"Node status updated via callback: {request.node_id} "
-        f"{old_status} -> {new_status}"
-    )
-
+    logger.info(f"Node status updated via callback: {request.node_id} {old_status} -> {new_status}")
     return NodeStatusCallbackResponse(
         success=True,
         node_id=request.node_id,

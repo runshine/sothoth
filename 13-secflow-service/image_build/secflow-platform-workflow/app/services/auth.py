@@ -91,7 +91,7 @@ class AuthService:
         try:
             headers = {"Authorization": f"Bearer {token}"}
             response = self.client.post(
-                self.config.validate_url,
+                self.config.validate_human_url,
                 headers=headers
             )
 
@@ -135,7 +135,7 @@ class AuthService:
             try:
                 headers = {"Authorization": f"Bearer {token}"}
                 response = await client.post(
-                    self.config.validate_url,
+                    self.config.validate_human_url,
                     headers=headers
                 )
 
