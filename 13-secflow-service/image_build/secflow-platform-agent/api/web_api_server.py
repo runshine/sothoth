@@ -5418,6 +5418,17 @@ class WebAPIServer:
 
         # 运行Flask应用
         self.logger.info(f"启动WEB API服务器，监听 {self.config['host']}:{self.config['port']}")
+        if not self.config.get('enable_platform_ws_tunnel_server', False):
+            self.logger.info("使用线程化Flask/Werkzeug服务器提供HTTP API；平台内置ws-tunnel专用服务默认关闭")
+            self.app.run(
+                host=self.config['host'],
+                port=self.config['port'],
+                debug=self.config['debug'],
+                use_reloader=False,
+                threaded=True
+            )
+            return
+
         try:
             from gevent import pywsgi
             from geventwebsocket.handler import WebSocketHandler
@@ -5539,7 +5550,8 @@ class WebAPIServer:
                 host=self.config['host'],
                 port=self.config['port'],
                 debug=self.config['debug'],
-                use_reloader=False
+                use_reloader=False,
+                threaded=True
             )
 
 
