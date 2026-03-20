@@ -11,7 +11,7 @@ services:
     # 环境变量配置
     environment:
       - TIMEOUT=180
-      - PORT=20001
+      - REST_PORT=20001
       - WORKDIR=/app
       - DISABLE_TELEMETRY=true
       - DISABLE_COST_WARNINGS=true

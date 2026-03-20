@@ -3,6 +3,8 @@
 # 入口脚本
 #set -e
 
+cd /root
+
 resolve_node_global_bin() {
     local bin_name="$1"
     local resolved=""
@@ -42,7 +44,7 @@ echo "=========================================="
 echo "Remote Command Executor Container"
 echo "=========================================="
 echo "Timeout: ${TIMEOUT} seconds"
-echo "Port: ${PORT}"
+echo "Port: ${REST_PORT}"
 echo "Workdir: ${WORKDIR}"
 echo "Container ID: $(cat /proc/self/cgroup | head -1 | cut -d/ -f3)"
 echo "=========================================="
@@ -82,7 +84,9 @@ fi
 
 # 启动 code-server
 if [ -n "${CODE_SERVER_BIN}" ]; then
+    export PASSWORD=${CODE_SERVER_PASSWORD}
     nohup "${CODE_SERVER_BIN}" \
+        --port ${CODE_SERVER_PORT} \
         --bind-addr 0.0.0.0:${CODE_SERVER_PORT} \
         --auth password \
         --disable-telemetry \
@@ -108,9 +112,9 @@ if [ -d "/host" ]; then
 fi
 
 # 启动服务
-echo "Starting API service on port ${PORT}..."
+echo "Starting API service on port ${REST_PORT}..."
 exec gunicorn \
-    --bind 0.0.0.0:${PORT} \
+    --bind 0.0.0.0:${REST_PORT} \
     --workers 4 \
     --timeout ${TIMEOUT} \
     --access-logfile - \
