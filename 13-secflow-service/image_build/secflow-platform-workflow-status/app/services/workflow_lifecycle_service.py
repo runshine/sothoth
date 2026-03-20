@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 from app.services.node_lifecycle_service import get_node_lifecycle_service
+from app.services.status_sync_service import get_status_sync_service
+from app.services.workflow_monitor_engine import get_workflow_monitor_engine
 from app.models.database import (
     NodeStatusRecord,
     WorkflowStatusRecord,
@@ -32,6 +34,7 @@ class WorkflowLifecycleService:
 
     def __init__(self):
         self.node_lifecycle_service = get_node_lifecycle_service()
+        self.status_sync_service = get_status_sync_service()
 
     async def initialize_workflow(
         self,
@@ -161,6 +164,13 @@ class WorkflowLifecycleService:
             f"success={overall_success}, succeeded={succeeded_count}, failed={failed_count}"
         )
 
+        await self._ensure_app_monitoring(
+            instance_id=instance_id,
+            project_id=project_id,
+            node_configs=nodes,
+            results=results,
+        )
+
         return WorkflowLifecycleResponse(
             success=overall_success,
             instance_id=instance_id,
@@ -198,6 +208,8 @@ class WorkflowLifecycleService:
         )
 
         # 获取节点信息
+        await self._stop_workflow_monitoring(instance_id)
+
         if nodes is None:
             nodes = await self._get_nodes_from_db(instance_id, project_id)
 
@@ -332,6 +344,8 @@ class WorkflowLifecycleService:
         )
 
         # 获取节点信息
+        await self._stop_workflow_monitoring(instance_id)
+
         if nodes is None:
             nodes = await self._get_nodes_from_db(instance_id, project_id)
 
@@ -437,6 +451,91 @@ class WorkflowLifecycleService:
             nodes=results,
             message=message
         )
+
+    async def _ensure_app_monitoring(
+        self,
+        instance_id: str,
+        project_id: str,
+        node_configs: List[Dict[str, Any]],
+        results: List[WorkflowNodeResult],
+    ) -> None:
+        """Start APP monitoring after initialize so logs/status begin syncing immediately."""
+        result_map = {result.node_id: result for result in results}
+        app_nodes = []
+
+        for node_config in node_configs:
+            node_id = node_config.get("node_id")
+            node_type = node_config.get("node_type", NodeType.APP)
+            node_type_value = node_type.value if hasattr(node_type, "value") else str(node_type)
+            if (node_type_value or "").lower() != "app":
+                continue
+
+            result = result_map.get(node_id)
+            if not result or not result.success or not result.k8s_resource_name:
+                continue
+
+            app_nodes.append(
+                {
+                    "node_id": node_id,
+                    "node_type": "app",
+                    "k8s_resource_name": result.k8s_resource_name,
+                    "timeout_seconds": None,
+                }
+            )
+
+        if not app_nodes:
+            await self._stop_workflow_monitoring(instance_id)
+            logger.info(
+                f"[WorkflowLifecycle] No APP nodes eligible for monitoring: instance_id={instance_id}"
+            )
+            return
+
+        try:
+            monitor_engine = get_workflow_monitor_engine()
+            session_id = await monitor_engine.start_monitoring(
+                instance_id=instance_id,
+                project_id=project_id,
+                nodes=app_nodes,
+                poll_interval=10,
+            )
+            logger.info(
+                f"[WorkflowLifecycle] APP monitoring started: instance_id={instance_id}, "
+                f"session_id={session_id}, nodes={len(app_nodes)}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[WorkflowLifecycle] Failed to start APP monitoring: "
+                f"instance_id={instance_id}, error={e}"
+            )
+            return
+
+        try:
+            await self.status_sync_service.sync_all_nodes(
+                instance_id=instance_id,
+                project_id=project_id,
+                nodes=app_nodes,
+            )
+            logger.info(
+                f"[WorkflowLifecycle] Initial APP status sync finished after initialize: "
+                f"instance_id={instance_id}"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[WorkflowLifecycle] Initial APP status sync failed after initialize: "
+                f"instance_id={instance_id}, error={e}"
+            )
+
+    async def _stop_workflow_monitoring(self, instance_id: str) -> None:
+        """Best-effort stop for the workflow monitoring session."""
+        try:
+            stopped = await get_workflow_monitor_engine().stop_monitoring(instance_id)
+            if stopped:
+                logger.info(f"[WorkflowLifecycle] Monitoring stopped: instance_id={instance_id}")
+        except Exception as e:
+            logger.warning(
+                f"[WorkflowLifecycle] Failed to stop monitoring: "
+                f"instance_id={instance_id}, error={e}"
+            )
 
     async def _ensure_workflow_status_record(
         self,
