@@ -1218,16 +1218,18 @@ class AgentManager:
             agents_list = list(agents_map.values())
             for item in agents_list:
                 status = (item.get('status') or 'unknown').lower()
-                updated_at_raw = item.get('updated_at')
-                if status == 'online' and updated_at_raw:
+                stale_ref_raw = item.get('last_seen') or item.get('updated_at')
+                if status == 'online' and stale_ref_raw:
                     try:
-                        updated_at = datetime.fromisoformat(str(updated_at_raw).replace('Z', '+00:00'))
-                        if updated_at.tzinfo is not None:
-                            updated_at = updated_at.astimezone().replace(tzinfo=None)
-                        if datetime.now() - updated_at > timedelta(minutes=5):
+                        stale_ref = datetime.fromisoformat(str(stale_ref_raw).replace('Z', '+00:00'))
+                        # last_seen 由应用层写入，updated_at 可能来自数据库；二者都按本地朴素时间比较，
+                        # 避免 MySQL session 时区与应用时区不一致时把在线节点误判为离线。
+                        if stale_ref.tzinfo is not None:
+                            stale_ref = stale_ref.astimezone().replace(tzinfo=None)
+                        if datetime.now() - stale_ref > timedelta(minutes=5):
                             status = 'offline'
                             item['status'] = 'offline'
-                            item['status_reason'] = '节点超过5分钟未在Nacos刷新，已自动视为离线'
+                            item['status_reason'] = '节点超过5分钟未上报心跳，已自动视为离线'
                     except Exception:
                         pass
                 item['is_allowed'] = status == 'online'
