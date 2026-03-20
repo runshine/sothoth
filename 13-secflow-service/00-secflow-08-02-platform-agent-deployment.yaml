@@ -44,20 +44,26 @@ spec:
             memory: "256Mi"
             cpu: "500m"
         livenessProbe:
-          tcpSocket:
+          httpGet:
+            path: /api/agent/health
             port: 8080
+            scheme: HTTP
           initialDelaySeconds: 30
           timeoutSeconds: 5
           periodSeconds: 30
         readinessProbe:
-          tcpSocket:
+          httpGet:
+            path: /api/agent/health
             port: 8080
+            scheme: HTTP
           initialDelaySeconds: 15
           timeoutSeconds: 5
           periodSeconds: 30
         startupProbe:
-          tcpSocket:
+          httpGet:
+            path: /api/agent/health
             port: 8080
+            scheme: HTTP
           timeoutSeconds: 5
           periodSeconds: 10
           failureThreshold: 18
