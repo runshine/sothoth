@@ -867,6 +867,9 @@ async def create_dynamic_agent_ingress_route(
     proxy_send_timeout = int(request.proxy_send_timeout if request.proxy_send_timeout is not None else conf.default_proxy_send_timeout)
     proxy_read_timeout = int(request.proxy_read_timeout if request.proxy_read_timeout is not None else conf.default_proxy_read_timeout)
     ssl_redirect = bool(conf.default_ssl_redirect if request.ssl_redirect is None else request.ssl_redirect)
+    backend_protocol = str(request.backend_protocol or (request.metadata or {}).get("backend_protocol") or "http").strip().lower()
+    if backend_protocol not in {"http", "https"}:
+        backend_protocol = "http"
 
     existing = get_agent_ingress_route_by_unique_key(db, project_id, request.agent_key, target_port, host, path)
     conflicting_route = get_agent_ingress_route_by_host_path(db, project_id, host, path)
@@ -910,6 +913,7 @@ async def create_dynamic_agent_ingress_route(
         "service_name": service_name,
         "tls_enabled": tls_enabled,
         "tls_secret_name": tls_secret_name,
+        "backend_protocol": backend_protocol,
         "websocket_enabled": websocket_enabled,
         "owner_service": request.owner_service,
         "created_by": request.created_by or current_user.get("user_id"),
@@ -941,6 +945,7 @@ async def create_dynamic_agent_ingress_route(
             service_port=service_port,
             tls_enabled=tls_enabled,
             tls_secret_name=tls_secret_name,
+            backend_protocol=backend_protocol,
             websocket_enabled=websocket_enabled,
             proxy_body_size=proxy_body_size,
             proxy_connect_timeout=proxy_connect_timeout,
@@ -952,8 +957,10 @@ async def create_dynamic_agent_ingress_route(
         update_agent_ingress_route(db, route_id, {
             "status": "ready",
             "access_url": access_url,
+            "backend_protocol": backend_protocol,
             "metadata": {
                 **(request.metadata or {}),
+                "backend_protocol": backend_protocol,
                 "k8s_result": {
                     "ingress": k8s_result.get("ingress", {}),
                     "service": k8s_result.get("service", {}),

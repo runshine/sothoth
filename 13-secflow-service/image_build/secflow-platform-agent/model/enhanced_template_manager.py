@@ -257,24 +257,33 @@ class EnhancedTemplateManager:
             if port <= 0 or port > 65535:
                 continue
 
-            protocol = str(item.get('protocol') or 'http').strip().lower()
-            if protocol not in ('http', 'https'):
-                protocol = 'http'
+            backend_protocol = str(
+                item.get('backend_protocol') or item.get('protocol') or 'http'
+            ).strip().lower()
+            if backend_protocol not in ('http', 'https'):
+                backend_protocol = 'http'
+
+            ingress_tls_enabled = bool(
+                item.get('ingress_tls_enabled',
+                         item.get('tls_enabled', True))
+            )
 
             entry = {
                 'port': port,
-                'protocol': protocol,
+                'protocol': backend_protocol,
+                'backend_protocol': backend_protocol,
                 'name': str(item.get('name') or '').strip()[:64],
                 'description': str(item.get('description') or '').strip()[:256],
                 'path': str(item.get('path') or '/').strip() or '/',
                 'websocket_enabled': bool(item.get('websocket_enabled', True)),
-                'tls_enabled': bool(item.get('tls_enabled', protocol == 'https'))
+                'tls_enabled': ingress_tls_enabled,
+                'ingress_tls_enabled': ingress_tls_enabled
             }
             normalized.append(entry)
 
         dedup: Dict[str, Dict[str, Any]] = {}
         for p in normalized:
-            dedup[f"{p['port']}:{p['protocol']}"] = p
+            dedup[f"{p['port']}:{p['backend_protocol']}:{int(bool(p['ingress_tls_enabled']))}:{p['path']}"] = p
         return list(dedup.values())[:32]
 
     @staticmethod

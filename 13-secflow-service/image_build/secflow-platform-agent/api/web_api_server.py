@@ -3637,6 +3637,7 @@ class WebAPIServer:
                     'service_port': int(data.get('service_port') or target_port),
                     'tls_enabled': data.get('tls_enabled'),
                     'tls_secret_name': data.get('tls_secret_name'),
+                    'backend_protocol': data.get('backend_protocol') or metadata.get('backend_protocol'),
                     'websocket_enabled': data.get('websocket_enabled', True),
                     'proxy_body_size': data.get('proxy_body_size'),
                     'proxy_connect_timeout': data.get('proxy_connect_timeout'),

@@ -569,6 +569,7 @@ class KubernetesService:
         service_port: int = 80,
         tls_enabled: bool = False,
         tls_secret_name: str = None,
+        backend_protocol: str = "HTTP",
         websocket_enabled: bool = False,
         proxy_body_size: str = "10m",
         proxy_connect_timeout: int = 60,
@@ -591,6 +592,7 @@ class KubernetesService:
             service_port: Service端口（Ingress指向此端口）
             tls_enabled: 是否启用TLS
             tls_secret_name: TLS Secret名称
+            backend_protocol: 后端服务协议（HTTP/HTTPS）
             websocket_enabled: 是否启用WebSocket支持
             proxy_body_size: 最大上传文件大小
             proxy_connect_timeout: 连接超时时间（秒）
@@ -677,6 +679,12 @@ class KubernetesService:
                 "nginx.ingress.kubernetes.io/proxy-read-timeout": str(proxy_read_timeout),
             }
 
+            backend_protocol_normalized = str(backend_protocol or "HTTP").strip().upper()
+            if backend_protocol_normalized not in {"HTTP", "HTTPS"}:
+                backend_protocol_normalized = "HTTP"
+            if backend_protocol_normalized == "HTTPS":
+                annotations["nginx.ingress.kubernetes.io/backend-protocol"] = "HTTPS"
+
             # WebSocket 支持
             if websocket_enabled:
                 annotations["nginx.ingress.kubernetes.io/proxy-http-version"] = "1.1"
@@ -730,7 +738,8 @@ class KubernetesService:
                 "ingress": ingress_result,
                 "service": service_result,
                 "endpoints": endpoints_result,
-                "access_url": f"{'https' if tls_enabled else 'http'}://{host}{path}"
+                "access_url": f"{'https' if tls_enabled else 'http'}://{host}{path}",
+                "backend_protocol": backend_protocol_normalized
             }
 
         except Exception as e:

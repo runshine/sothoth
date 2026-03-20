@@ -260,6 +260,7 @@ class AgentIngressRouteCreateRequest(BaseModel):
     service_port: Optional[int] = Field(default=None, description="Ingress后端service端口")
     tls_enabled: Optional[bool] = Field(default=None, description="是否启用TLS")
     tls_secret_name: Optional[str] = Field(default=None, description="TLS Secret名")
+    backend_protocol: Optional[str] = Field(default=None, description="后端服务协议: http 或 https")
     websocket_enabled: Optional[bool] = Field(default=None, description="是否开启WebSocket转发")
     proxy_body_size: Optional[str] = Field(default=None, description="Nginx代理body大小")
     proxy_connect_timeout: Optional[int] = Field(default=None, description="Nginx连接超时")
@@ -289,6 +290,7 @@ class AgentIngressRouteInfo(BaseModel):
     service_name: str
     tls_enabled: bool
     tls_secret_name: Optional[str] = None
+    backend_protocol: Optional[str] = None
     websocket_enabled: bool
     status: str
     access_url: Optional[str] = None
