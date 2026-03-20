@@ -63,6 +63,12 @@ app:
   debug: false
   secret_key: "your-secret-key-change-this-in-production"
 
+# Auto Verify Configuration
+auto_verify:
+  enabled: true
+  interval_seconds: 60
+  batch_size: 20
+
 # Logging Configuration
 logging:
   level: "INFO"

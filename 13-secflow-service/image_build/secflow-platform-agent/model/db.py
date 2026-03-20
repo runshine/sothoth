@@ -163,26 +163,30 @@ class DatabaseConnection:
                 self.connection = None
                 self._is_pooled = False
 
-    def execute(self, query: str, params: tuple = ()):
+    def execute(self, query: str, params: tuple = (), commit: bool = True):
         """执行SQL语句"""
         cursor = self.connection.cursor()
         try:
             cursor.execute(query, params)
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
             return cursor
         except Exception as e:
-            self.connection.rollback()
+            if commit:
+                self.connection.rollback()
             raise e
 
-    def executemany(self, query: str, params_list: List[tuple]):
+    def executemany(self, query: str, params_list: List[tuple], commit: bool = True):
         """批量执行SQL语句"""
         cursor = self.connection.cursor()
         try:
             cursor.executemany(query, params_list)
-            self.connection.commit()
+            if commit:
+                self.connection.commit()
             return cursor
         except Exception as e:
-            self.connection.rollback()
+            if commit:
+                self.connection.rollback()
             raise e
 
     def fetch_one(self, query: str, params: tuple = ()):
@@ -350,6 +354,8 @@ class DatabaseManager:
                                service_name VARCHAR(100) NOT NULL,
                                agent_key VARCHAR(32) NOT NULL,
                                project_id VARCHAR(100),
+                               template_name VARCHAR(255),
+                               extra_params JSON,
                                status VARCHAR(20) NOT NULL DEFAULT 'pending',
                                progress INT DEFAULT 0,
                                message TEXT,
@@ -357,11 +363,18 @@ class DatabaseManager:
                                started_at TIMESTAMP NULL,
                                completed_at TIMESTAMP NULL,
                                pod_id VARCHAR(100),
+                               worker_id VARCHAR(100),
+                               worker_pod_id VARCHAR(100),
+                               lease_until TIMESTAMP NULL,
+                               heartbeat_at TIMESTAMP NULL,
+                               attempt_count INT DEFAULT 0,
                                INDEX idx_tasks_task_id (task_id),
                                INDEX idx_tasks_status (status),
                                INDEX idx_tasks_agent_key (agent_key),
                                INDEX idx_tasks_project (project_id),
-                               INDEX idx_tasks_created (created_at)
+                               INDEX idx_tasks_created (created_at),
+                               INDEX idx_tasks_worker (worker_id),
+                               INDEX idx_tasks_lease (lease_until)
                            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                            ''')
             else:
@@ -373,19 +386,28 @@ class DatabaseManager:
                                service_name TEXT NOT NULL,
                                agent_key TEXT NOT NULL,
                                project_id TEXT,
+                               template_name TEXT,
+                               extra_params TEXT,
                                status TEXT NOT NULL DEFAULT 'pending',
                                progress INTEGER DEFAULT 0,
                                message TEXT,
                                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                                started_at TIMESTAMP,
                                completed_at TIMESTAMP,
-                               pod_id TEXT
+                               pod_id TEXT,
+                               worker_id TEXT,
+                               worker_pod_id TEXT,
+                               lease_until TIMESTAMP,
+                               heartbeat_at TIMESTAMP,
+                               attempt_count INTEGER DEFAULT 0
                            )
                            ''')
                 # 为SQLite创建索引
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_task_id ON {table_tasks}(task_id)')
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_status ON {table_tasks}(status)')
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_agent_key ON {table_tasks}(agent_key)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_worker ON {table_tasks}(worker_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_lease ON {table_tasks}(lease_until)')
 
             # 创建任务日志表
             table_task_logs = f"{prefix}task_logs"
@@ -573,6 +595,7 @@ class DatabaseManager:
             # 兼容历史数据库：补齐新增列
             self._ensure_agent_status_columns(db, table_agent_status)
             self._ensure_template_columns(db, table_templates)
+            self._ensure_task_columns(db, table_tasks)
 
             self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}, 表前缀: {prefix}）")
         finally:
@@ -662,26 +685,98 @@ class DatabaseManager:
         except Exception as e:
             self.logger.error(f"检查/迁移 {table_name} 模板字段失败: {str(e)}")
 
+    def _ensure_task_columns(self, db: DatabaseConnection, table_name: str):
+        """确保 tasks 表包含多副本 worker 调度所需字段。"""
+        try:
+            required = {
+                'template_name': "VARCHAR(255) NULL" if self.db_type == 'mysql' else "TEXT",
+                'extra_params': "JSON NULL" if self.db_type == 'mysql' else "TEXT",
+                'worker_id': "VARCHAR(100) NULL" if self.db_type == 'mysql' else "TEXT",
+                'worker_pod_id': "VARCHAR(100) NULL" if self.db_type == 'mysql' else "TEXT",
+                'lease_until': "TIMESTAMP NULL" if self.db_type == 'mysql' else "TIMESTAMP",
+                'heartbeat_at': "TIMESTAMP NULL" if self.db_type == 'mysql' else "TIMESTAMP",
+                'attempt_count': "INT DEFAULT 0" if self.db_type == 'mysql' else "INTEGER DEFAULT 0",
+            }
+
+            if self.db_type == 'mysql':
+                columns = db.fetch_all(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE() AND table_name = %s
+                    """,
+                    (table_name,)
+                )
+                existing = {item['COLUMN_NAME'] for item in columns}
+                for column, ddl in required.items():
+                    if column not in existing:
+                        db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {ddl}")
+                        self.logger.info(f"数据库迁移: 已为 {table_name} 添加 {column} 列")
+                index_map = {
+                    'idx_tasks_worker': 'worker_id',
+                    'idx_tasks_lease': 'lease_until',
+                }
+                existing_indexes = db.fetch_all(
+                    """
+                    SELECT INDEX_NAME
+                    FROM information_schema.statistics
+                    WHERE table_schema = DATABASE() AND table_name = %s
+                    """,
+                    (table_name,)
+                )
+                existing_index_names = {item['INDEX_NAME'] for item in existing_indexes}
+                for idx_name, column in index_map.items():
+                    if idx_name not in existing_index_names:
+                        db.execute(f"CREATE INDEX {idx_name} ON {table_name}({column})")
+            else:
+                columns = db.fetch_all(f"PRAGMA table_info({table_name})")
+                existing = {item['name'] for item in columns}
+                for column, ddl in required.items():
+                    if column not in existing:
+                        db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {ddl}")
+                        self.logger.info(f"数据库迁移: 已为 {table_name} 添加 {column} 列")
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_worker ON {table_name}(worker_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_lease ON {table_name}(lease_until)')
+        except Exception as e:
+            self.logger.error(f"检查/迁移 {table_name} 任务字段失败: {str(e)}")
+
     def execute_query(self, query: str, params: tuple = ()):
         """执行查询 - 使用持久化连接"""
         db = self.get_connection()
-        return db.execute(query, params)
+        try:
+            return db.execute(query, params)
+        finally:
+            db.close()
 
     def execute_transaction(self, queries: List[Tuple[str, tuple]]):
         """执行事务（多个查询）- 使用持久化连接"""
         db = self.get_connection()
         try:
-            for query, params in queries:
-                db.execute(query, params)
-        except Exception as e:
-            raise e
+            cursor = db.connection.cursor()
+            try:
+                for query, params in queries:
+                    cursor.execute(query, params)
+                db.connection.commit()
+            except Exception:
+                db.connection.rollback()
+                raise
+            finally:
+                cursor.close()
+        finally:
+            db.close()
 
     def fetch_one(self, query: str, params: tuple = ()):
         """获取单条记录 - 使用持久化连接"""
         db = self.get_connection()
-        return db.fetch_one(query, params)
+        try:
+            return db.fetch_one(query, params)
+        finally:
+            db.close()
 
     def fetch_all(self, query: str, params: tuple = ()):
         """获取所有记录 - 使用持久化连接"""
         db = self.get_connection()
-        return db.fetch_all(query, params)
+        try:
+            return db.fetch_all(query, params)
+        finally:
+            db.close()

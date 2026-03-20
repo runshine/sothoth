@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
     },
     'redis_url': 'redis://localhost:6379/0',
     'redis_enabled': True,  # 是否启用Redis
+    'redis_strict_mode': False,  # 多副本场景下要求Redis可用，否则分布式锁直接失败
     'nacos_url': 'http://localhost:8848',
     'nacos_namespace': 'public',
     'k8s_service_url': 'http://secflow-platform-k8s:10010',
@@ -54,7 +55,14 @@ DEFAULT_CONFIG = {
     'daemon_read_timeout_sec': 8,
     'refresh_interval': 30,
     'service_sync_interval': 30,
+    'enable_background_refresh': True,
+    'leader_lock_timeout_sec': 90,
     'max_workers': 10,
+    'enable_task_workers': True,
+    'task_worker_count': 5,
+    'task_poll_interval_sec': 2,
+    'task_lease_sec': 120,
+    'task_heartbeat_interval_sec': 15,
     'upload_max_size': 100 * 1024 * 1024,
     'token_expiration': 24 * 3600,
     'log_level': 'INFO',
@@ -68,12 +76,14 @@ DEFAULT_CONFIG = {
     'agent_api_timeouts': {
         'default': (10, 30),           # 默认：连接10秒，读取30秒
         'health_check': (5, 10),       # 健康检查：连接5秒，读取10秒
-        'deploy_create': (10, 60),     # 创建服务：连接10秒，读取60秒
-        'deploy_start': (10, 900),     # 启动服务：连接10秒，读取900秒（15分钟）
-        'deploy_stop': (10, 120),      # 停止服务：连接10秒，读取120秒
-        'deploy_delete': (10, 60),     # 删除服务：连接10秒，读取60秒
-        'undeploy': (10, 180),         # 卸载服务：连接10秒，读取180秒
-        'file_upload': (10, 600),      # 文件上传：连接10秒，读取600秒（10分钟）
+        'deploy_create': (10, 7200),   # 创建服务：连接10秒，读取7200秒（2小时）
+        'deploy_start': (10, 7200),    # 启动服务：连接10秒，读取7200秒（2小时）
+        'deploy_stop': (10, 7200),     # 停止服务：连接10秒，读取7200秒（2小时）
+        'deploy_delete': (10, 7200),   # 删除服务：连接10秒，读取7200秒（2小时）
+        'undeploy': (10, 7200),        # 卸载服务：连接10秒，读取7200秒（2小时）
+        'file_upload': (10, 7200),     # 部署文件上传：连接10秒，读取7200秒（2小时）
+        'deploy_start_grace_sec': 7200,        # 启动超时后的状态轮询等待上限（秒）
+        'deploy_start_poll_interval_sec': 15,  # 启动后状态轮询间隔（秒）
         'stream': (10, 3600),          # 流式响应：连接10秒，读取3600秒（1小时）
         'proxy': (10, 300),            # 代理请求：连接10秒，读取300秒
     },

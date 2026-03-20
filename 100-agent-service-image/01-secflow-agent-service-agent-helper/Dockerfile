@@ -10,6 +10,7 @@ ENV PORT=20001
 ENV WORKDIR=/app
 ENV CODE_SERVER_PORT=20003
 ENV CODE_SERVER_PASSWORD=
+ENV NVM_DIR=/root/.nvm
 
 # 创建工作目录
 WORKDIR ${WORKDIR}
@@ -59,22 +60,21 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
-RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
-        apt-get update && apt-get install -y nodejs npm && apt-get clean && rm -rf /var/lib/apt/lists/* ;\
-        bash -c ". $HOME/.nvm/nvm.sh ; curl -fsSL https://bun.com/install | bash" \
-        npm install -g @anthropic-ai/claude-code ; \
-        npm install -g code-server ; \
-        npm install -g claude-a2a ; \
+RUN set -eux; \
+    if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
+        apt-get update && apt-get install -y nodejs npm && apt-get clean && rm -rf /var/lib/apt/lists/*; \
+        npm install --unsafe-perm -g @anthropic-ai/claude-code; \
+        npm install --unsafe-perm -g code-server; \
+        npm install --unsafe-perm -g claude-a2a; \
+        npm install -g @openai/codex; \
     else \
-        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash ; \
-        bash -c ". $HOME/.nvm/nvm.sh && nvm install 24" ; \
-        bash -c ". $HOME/.nvm/nvm.sh && node -v" ; \
-        bash -c ". $HOME/.nvm/nvm.sh && npm -v" ; \
-        bash -c ". $HOME/.nvm/nvm.sh && npm install -g @anthropic-ai/claude-code" ; \
-        bash -c ". $HOME/.nvm/nvm.sh && npm install -g code-server" ; \
-        bash -c ". $HOME/.nvm/nvm.sh && npm install -g claude-a2a" ; \
-        echo ". $HOME/.nvm/nvm.sh" >> /root/.bashrc ;\
-    fi
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash; \
+        bash -lc ". \"$NVM_DIR/nvm.sh\" && nvm install 20 && nvm alias default 20 && nvm use --silent default && npm install --unsafe-perm -g @anthropic-ai/claude-code && npm install -g @openai/codex && npm install --unsafe-perm -g claude-a2a"; \
+        curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone; \
+        echo ". \"$NVM_DIR/nvm.sh\"" >> /root/.bashrc; \
+    fi; \
+    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude-a2a; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a"; \
+    echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
 
 # 创建 code-server 配置目录
 RUN mkdir -p /root/.config/code-server && \

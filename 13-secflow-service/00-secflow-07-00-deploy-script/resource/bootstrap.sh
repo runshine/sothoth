@@ -160,7 +160,7 @@ download() {
 download_package_file(){
   filename=$1
   target=$2
-  download "${UPSTREAM}/api/packages/files/download/by-conditions/redirect?system=${OS}&architecture=${ARCH}&filename=${filename}" "${target}"
+  download "${UPSTREAM}/api/packages/files/download/by-conditions/redirect?system=${OS}&architecture=${ARCH}&filename=${filename}&force=true" "${target}"
 }
 
 download_script_file(){

@@ -1,16 +1,22 @@
 import logging
 import os
+import re
 import threading
 import time
 import base64
 import hashlib
+import secrets
 import uuid
+from collections import OrderedDict
 import requests
+import websocket as ws_client
 from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
+from geventwebsocket import Resource, WebSocketApplication
+from geventwebsocket.exceptions import WebSocketError
 import io
 import zipfile
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, parse_qs
 
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
@@ -30,12 +36,26 @@ from model.model import AgentInfo
 from flask import send_file, redirect, Response
 # ===================== Flask应用 =====================
 
+
+def _build_random_host_prefix(base: str, suffix_len: int = 6) -> str:
+    sanitized = ''.join(ch if str(ch).isalnum() else '-' for ch in str(base or '').lower()).strip('-') or 'route'
+    random_part = secrets.token_hex(max(1, suffix_len // 2))[:suffix_len]
+    return f"{sanitized[:28]}-{random_part}".strip('-')
+
 class WebAPIServer:
     """WEB API服务器（支持多种压缩格式）"""
 
     def __init__(self, config: Dict):
         self.config = config
         self.logger = self._setup_logger()
+        self.started_at = datetime.now()
+        self.cached_component_health = {
+            'database': 'unknown',
+            'redis': 'unknown',
+            'nacos': 'unknown',
+        }
+        self.cached_health_status = 'starting'
+        self.health_state_lock = threading.Lock()
 
         # 1. 检查所有连接
         self._check_startup_connections()
@@ -49,7 +69,8 @@ class WebAPIServer:
         # 4. 初始化Redis管理器
         self.redis_manager = RedisManager(
             config.get('redis_url', 'redis://localhost:6379/0'),
-            config.get('redis_enabled', True)
+            config.get('redis_enabled', True),
+            config.get('redis_strict_mode', False)
         )
 
         # 5. 初始化数据库管理器
@@ -60,19 +81,22 @@ class WebAPIServer:
         self.template_manager = EnhancedTemplateManager(
             config['templates_root'],
             self.db_manager,
-            supported_formats
+            supported_formats,
+            self.redis_manager
         )
 
         # 8. 初始化Agent管理器（传递超时配置）
         agent_api_timeouts = config.get('agent_api_timeouts', {
             'default': (10, 30),
             'health_check': (5, 10),
-            'deploy_create': (10, 60),
-            'deploy_start': (10, 900),
-            'deploy_stop': (10, 120),
-            'deploy_delete': (10, 60),
-            'undeploy': (10, 180),
-            'file_upload': (10, 600),
+            'deploy_create': (10, 7200),
+            'deploy_start': (10, 7200),
+            'deploy_stop': (10, 7200),
+            'deploy_delete': (10, 7200),
+            'undeploy': (10, 7200),
+            'file_upload': (10, 7200),
+            'deploy_start_grace_sec': 7200,
+            'deploy_start_poll_interval_sec': 15,
             'stream': (10, 3600),
             'proxy': (10, 300),
         })
@@ -104,6 +128,14 @@ class WebAPIServer:
             config.get('max_secflow_agent_task_logs', 1000),
             agent_api_timeouts
         )
+        self.task_manager.configure_runtime(
+            worker_count=int(config.get('task_worker_count', config.get('max_workers', 5))),
+            poll_interval_sec=int(config.get('task_poll_interval_sec', 2)),
+            lease_sec=int(config.get('task_lease_sec', 120)),
+            heartbeat_interval_sec=int(config.get('task_heartbeat_interval_sec', 15)),
+            enable_task_workers=bool(config.get('enable_task_workers', True))
+        )
+        self.task_manager.set_service_sync_callback(self._sync_single_agent_services_by_key)
 
         # 10. 初始化代理管理器（新增，传递超时配置）
         self.proxy_manager = EnhancedProxyManager(self.agent_manager, agent_api_timeouts)
@@ -121,6 +153,7 @@ class WebAPIServer:
         # 12. 后台刷新线程
         self.refresh_thread = None
         self.should_stop = False
+        self.refresh_leader_lock_key = config.get('refresh_leader_lock_key', 'platform_agent_refresh_leader')
 
         self.logger.info(f"当前POD ID: {config['pod_id']}")
         self.logger.info(f"使用数据库: {config['database'].get('type', 'sqlite').upper()}")
@@ -219,6 +252,14 @@ class WebAPIServer:
         else:
             self.logger.warning(f"⚠ {redis_message}，Redis功能将禁用")
 
+        with self.health_state_lock:
+            self.cached_component_health = {
+                'database': 'connected' if db_success else 'disconnected',
+                'redis': 'connected' if redis_success else 'disconnected',
+                'nacos': 'connected' if nacos_success else 'disconnected',
+            }
+            self.cached_health_status = 'healthy' if db_success and nacos_success else 'unhealthy'
+
         self.logger.info("所有启动连接检查完成")
 
     def _call_k8s_service(self, method: str, path: str, project_id: str,
@@ -249,6 +290,22 @@ class WebAPIServer:
             headers=req_headers,
             timeout=(5, self.k8s_service_timeout_sec)
         )
+
+    def _resolve_request_ws_scheme(self) -> str:
+        """根据请求上下文推断前端应使用的WS协议。"""
+        forwarded_proto = (request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
+        if forwarded_proto == 'https':
+            return 'wss'
+        if forwarded_proto == 'http':
+            return 'ws'
+        return 'wss' if (request.scheme or 'http').lower() == 'https' else 'ws'
+
+    def _resolve_request_host(self) -> str:
+        """优先使用反向代理头里的Host。"""
+        forwarded_host = (request.headers.get('X-Forwarded-Host') or '').split(',')[0].strip()
+        if forwarded_host:
+            return forwarded_host
+        return request.host
 
     def _normalize_service_ports(self, ports: Any) -> Dict[str, str]:
         if isinstance(ports, dict):
@@ -582,6 +639,148 @@ class WebAPIServer:
             return payload
         return []
 
+    def _extract_route_metadata(self, route: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = route.get('metadata') or {}
+        if isinstance(metadata, dict):
+            return metadata
+        if isinstance(metadata, str):
+            try:
+                parsed = json.loads(metadata)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _is_agent_console_ingress_route(self, route: Dict[str, Any]) -> bool:
+        metadata = self._extract_route_metadata(route)
+        scope = str(metadata.get('ingress_scope') or '').strip().lower()
+        if scope == 'agent_console':
+            return True
+        if scope == 'service_binding':
+            return False
+
+        source = str(metadata.get('source') or '').strip().lower()
+        if source in ('agent-detail', 'agent-cluster', 'agent-mgmt', 'agent'):
+            return True
+        if source in ('service-mgmt', 'service-management', 'service'):
+            return False
+
+        target_port = int(route.get('target_port') or 0)
+        if target_port in (11197, 11198):
+            return True
+
+        owner_service = str(route.get('owner_service') or '').strip().lower()
+        if owner_service == 'platform-agent' and not self._is_service_bound_ingress_route(route):
+            return True
+        return False
+
+    def _is_service_bound_ingress_route(self, route: Dict[str, Any]) -> bool:
+        metadata = self._extract_route_metadata(route)
+        scope = str(metadata.get('ingress_scope') or '').strip().lower()
+        if scope == 'service_binding':
+            return True
+        if scope == 'agent_console':
+            return False
+
+        source = str(metadata.get('source') or '').strip().lower()
+        if source in ('service-mgmt', 'service-management', 'service'):
+            return True
+        if source in ('agent-detail', 'agent-cluster', 'agent-mgmt', 'agent'):
+            return False
+
+        service_name = str(
+            metadata.get('service_name')
+            or metadata.get('associated_service_name')
+            or metadata.get('bind_service_name')
+            or ''
+        ).strip()
+        if service_name:
+            return True
+        return False
+
+    def _find_agent_console_ingress_route(
+        self,
+        project_id: str,
+        agent_key: str,
+        target_port: int,
+        auth_header: Optional[str] = None,
+        include_deleted: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        all_routes = self._list_project_ingress_routes(
+            project_id=project_id,
+            include_deleted=include_deleted,
+            auth_header=auth_header
+        )
+        for route in all_routes:
+            if str(route.get('agent_key') or '').strip() != agent_key:
+                continue
+            if int(route.get('target_port') or 0) != int(target_port):
+                continue
+            if not self._is_agent_console_ingress_route(route):
+                continue
+            if not include_deleted and str(route.get('status') or '').lower() == 'deleted':
+                continue
+            return route
+        return None
+
+    def _ensure_agent_console_ingress_route(
+        self,
+        project_id: str,
+        agent: Any,
+        target_port: int,
+        auth_header: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        agent_key = str(getattr(agent, 'key', '') or '').strip()
+        if not agent_key or not project_id:
+            return None
+
+        existing = self._find_agent_console_ingress_route(
+            project_id=project_id,
+            agent_key=agent_key,
+            target_port=target_port,
+            auth_header=auth_header,
+            include_deleted=False
+        )
+        if existing and str(existing.get('status') or '').lower() == 'ready':
+            return existing
+
+        payload = {
+            'agent_key': agent_key,
+            'external_ips': [agent.ip_address],
+            'target_port': int(target_port),
+            'host_prefix': _build_random_host_prefix(f"{agent_key}-{int(target_port)}"),
+            'path': '/',
+            'path_type': 'Prefix',
+            'service_port': int(target_port),
+            'websocket_enabled': True,
+            'owner_service': 'platform-agent',
+            'metadata': {
+                'agent_hostname': getattr(agent, 'hostname', ''),
+                'source': 'agent-detail',
+                'ingress_scope': 'agent_console',
+                'source_api': '/api/agent/agent/<agent_key>/services/<service_name>/exec/ws-connection',
+            }
+        }
+        resp = self._call_k8s_service(
+            method='POST',
+            path='/api/k8s/agent-ingress-routes',
+            project_id=project_id,
+            payload=payload,
+            headers={'Authorization': auth_header} if auth_header else None
+        )
+        if resp.status_code >= 300:
+            raise RuntimeError(f"create ingress route failed: {resp.status_code}, body={resp.text[:300]}")
+        created = resp.json() if resp.content else {}
+        if isinstance(created, dict) and created.get('route_id'):
+            return created
+        return self._find_agent_console_ingress_route(
+            project_id=project_id,
+            agent_key=agent_key,
+            target_port=target_port,
+            auth_header=auth_header,
+            include_deleted=False
+        )
+
     def _get_project_active_service_keys(self, project_id: str) -> set:
         """获取项目内当前有效服务键集合：{agent_key::service_name}。"""
         table_name = self.db_manager.get_table_name('agent_services')
@@ -598,8 +797,79 @@ class WebAPIServer:
                 keys.add(f"{ak}::{sn}")
         return keys
 
+    def _prepare_agent_exec_ws_tunnel(
+        self,
+        agent_key: str,
+        service_name: str,
+        project_id: str,
+        container_name: str,
+        shell: str,
+        mode: str,
+        user: str
+    ) -> Tuple[Any, str, str]:
+        agent = self.agent_manager.get_agent(agent_key)
+        if not agent:
+            raise RuntimeError(f'Agent {agent_key} not found')
+        if project_id and agent.project_id != project_id:
+            raise RuntimeError(f'Agent {agent_key} does not belong to project {project_id}')
+        if agent.status != 'online':
+            raise RuntimeError(f'Agent {agent_key} is {agent.status}')
+
+        service_status, service_payload = self.agent_manager.call_agent_api(
+            agent_key,
+            'GET',
+            f'/api/services/{quote(service_name, safe="")}',
+            None,
+            timeout_type='health_check'
+        )
+        if service_status != 200:
+            detail = ''
+            if isinstance(service_payload, dict):
+                detail = str(service_payload.get('error') or service_payload.get('message') or '')
+            elif isinstance(service_payload, str):
+                detail = service_payload
+            msg = f'服务不存在或不可访问: {service_name}'
+            if detail:
+                msg = f'{msg} ({detail})'
+            raise RuntimeError(msg)
+
+        supported, probe_status, probe_detail = self._probe_agent_exec_ws_capability(
+            agent, service_name, container_name, shell, mode, user
+        )
+        if not supported:
+            raise RuntimeError(
+                f'当前Agent未提供服务终端WS接口: status={probe_status}, detail={probe_detail}'
+            )
+
+        query = {
+            'token': self.agent_manager.agent_auth_token,
+            'container': container_name,
+            'shell': shell,
+            'mode': mode
+        }
+        if user:
+            query['user'] = user
+        upstream_ws_url = (
+            f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}"
+            f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(query)}"
+        )
+        tunnel_tag = (
+            f"agent={agent_key}, service={service_name}, project={project_id or '-'}, "
+            f"container={container_name or '-'}, mode={mode}, shell={shell}, user={user or '-'}"
+        )
+        return agent, upstream_ws_url, tunnel_tag
+
     def _sync_all_agent_services(self):
         """从所有在线Agent拉取服务清单并写入聚合表。"""
+        summary = {
+            'total_agents': 0,
+            'online_agents': 0,
+            'offline_agents': 0,
+            'ok_count': 0,
+            'fail_count': 0,
+            'synced_services': 0,
+            'results': []
+        }
         try:
             page = 1
             per_page = 1000
@@ -613,34 +883,45 @@ class WebAPIServer:
                     break
                 page += 1
 
-            synced_agents = 0
-            synced_services = 0
-            stale_agents = 0
+            summary['total_agents'] = len(agents)
 
             for agent_data in agents:
                 if agent_data.get('status') != 'online':
+                    summary['offline_agents'] += 1
                     if agent_data.get('key'):
                         self._mark_agent_services_stale(agent_data.get('key'))
                     continue
+                summary['online_agents'] += 1
                 agent = self.agent_manager.get_agent(agent_data.get('key'))
                 if not agent:
+                    summary['fail_count'] += 1
+                    summary['results'].append({
+                        'ok': False,
+                        'agent_key': agent_data.get('key', ''),
+                        'reason_code': 'agent_not_loaded',
+                        'reason': 'Agent对象未加载',
+                        'status_code': 404
+                    })
                     continue
 
                 sync_result = self._sync_single_agent_services(agent)
+                summary['results'].append(sync_result)
                 if not sync_result.get('ok'):
-                    stale_agents += 1
+                    summary['fail_count'] += 1
                     continue
-                synced_agents += 1
-                synced_services += int(sync_result.get('upserted', 0))
+                summary['ok_count'] += 1
+                summary['synced_services'] += int(sync_result.get('upserted', 0))
                 self.logger.debug(
                     f"服务聚合同步: agent={agent.key}, seen={sync_result.get('seen', 0)}, upserted={sync_result.get('upserted', 0)}"
                 )
 
             self.logger.info(
-                f"服务聚合同步完成: agents={synced_agents}, services={synced_services}, stale_agents={stale_agents}"
+                f"服务聚合同步完成: total={summary['total_agents']}, online={summary['online_agents']}, "
+                f"ok={summary['ok_count']}, fail={summary['fail_count']}, services={summary['synced_services']}"
             )
         except Exception as e:
             self.logger.error(f"服务聚合同步失败: {e}", exc_info=True)
+        return summary
 
     def _sync_single_agent_services(self, agent: Any) -> Dict[str, Any]:
         """强制同步单个Agent的服务状态。"""
@@ -790,6 +1071,40 @@ class WebAPIServer:
             user_ctx.get('username', '')
         )
 
+    def _with_template_write_lock(self, template_names: List[str], callback, timeout: int = 120):
+        normalized = sorted({str(name).strip() for name in (template_names or []) if str(name).strip()})
+        if not normalized:
+            return callback()
+
+        acquired_locks = []
+        try:
+            for name in normalized:
+                lock = self.redis_manager.get_lock(f"template_write:{name}", timeout)
+                if not lock.acquire(block=True, block_timeout=timeout):
+                    raise BlockingIOError(f'模板 {name} 当前正在被其他副本修改，请稍后重试')
+                acquired_locks.append(lock)
+            return callback()
+        finally:
+            for lock in reversed(acquired_locks):
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
+    def _sync_single_agent_services_by_key(self, agent_key: str, reason: str = '') -> Optional[Dict[str, Any]]:
+        agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
+        if not agent:
+            self.logger.warning(f"任务完成后同步服务状态失败，Agent不存在: agent={agent_key}, reason={reason}")
+            return None
+        result = self._sync_single_agent_services(agent)
+        if result.get('ok'):
+            self.logger.info(f"任务完成后已同步服务状态: agent={agent_key}, reason={reason}")
+        else:
+            self.logger.warning(
+                f"任务完成后同步服务状态失败: agent={agent_key}, reason={reason}, result={result}"
+            )
+        return result
+
     def _service_exists_on_agent(self, agent_key: str, service_name: str) -> bool:
         """检查Agent上是否已存在同名服务。"""
         try:
@@ -816,6 +1131,55 @@ class WebAPIServer:
             # 无法确定时不阻断请求，交由后续流程处理
             return False
 
+    def _probe_agent_exec_ws_capability(self, agent: AgentInfo, service_name: str,
+                                        container_name: str, shell: str, mode: str, user: str) -> Tuple[bool, int, str]:
+        """
+        预探测Agent是否支持服务终端WS接口。
+        这里不能再用普通 HTTP GET 探测 Flask-Sock 路由。
+        当前 nacos_client 的 `/api/services/<name>/exec/ws` 对非 Upgrade 请求会直接返回 404，
+        但真实 WebSocket 握手是可用的。这里改为做一次短连接握手探测：
+        - 握手成功: 视为支持
+        - 握手失败且上游明确 404: 视为不支持
+        - 其他状态码: 认为端点存在，但本次握手因参数/容器状态等原因失败
+        """
+        try:
+            query = {
+                'token': self.agent_manager.agent_auth_token,
+                'container': container_name or '',
+                'shell': shell or '/bin/sh',
+                'mode': mode or 'shell'
+            }
+            if user:
+                query['user'] = user
+
+            probe_ws_url = (
+                f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}"
+                f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(query)}"
+            )
+            ws = None
+            try:
+                ws = ws_client.create_connection(
+                    probe_ws_url,
+                    timeout=5,
+                    enable_multithread=True,
+                    header=[f"X-Auth-Token: {self.agent_manager.agent_auth_token}"]
+                )
+                return True, 101, ''
+            finally:
+                if ws is not None:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+        except ws_client.WebSocketBadStatusException as e:
+            status_code = int(getattr(e, 'status_code', 500) or 500)
+            detail = str(e)
+            if status_code == 404:
+                return False, 404, detail
+            return True, status_code, detail
+        except Exception as e:
+            return False, 500, str(e)
+
     def _check_deploy_duplicate(self, service_name: str, agent_key: str, project_id: str) -> Optional[Dict[str, Any]]:
         """统一部署防重检查：进行中的部署任务 + Agent已存在服务。"""
         active_task = self.task_manager.find_active_task_for_service(
@@ -836,6 +1200,9 @@ class WebAPIServer:
             }
 
         return None
+
+    def _deploy_lock_key(self, project_id: str, agent_key: str, service_name: str, task_type: str = 'deploy') -> str:
+        return f"{task_type}:{project_id}:{agent_key}:{service_name}"
 
     def _record_service_sync_log(self, scope: str, status: str = 'ok',
                                  project_id: Optional[str] = None, agent_key: Optional[str] = None,
@@ -863,42 +1230,23 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/health', methods=['GET'])
         def health_check():
-            """健康检查端点"""
-            db_ok = False
-            try:
-                db = self.db_manager.get_connection()
-                db.fetch_one("SELECT 1")
-                db_ok = True
-            except:
-                pass
-
-            redis_ok = False
-            if self.redis_manager.enabled:
-                redis_ok = self.redis_manager.test_connection()
-
-            nacos_ok = False
-            try:
-                result, _ = ConnectionChecker.check_nacos(
-                    self.config['nacos_url'],
-                    self.config.get('nacos_namespace', 'public')
-                )
-                nacos_ok = result
-            except:
-                pass
-
-            # 计算总体状态
-            status = 'healthy' if db_ok and nacos_ok else 'unhealthy'
-
+            """
+            轻量健康检查端点。
+            供 K8S liveness/readiness/startup probe 使用，不在探针路径中同步探测
+            MySQL / Redis / Nacos，避免外部依赖抖动拖垮进程存活判断。
+            深度连通性检查仍通过 /api/agent/system/connections 暴露。
+            """
+            with self.health_state_lock:
+                status = self.cached_health_status
+                components = dict(self.cached_component_health)
             return jsonify({
                 'status': status,
                 'timestamp': datetime.now().isoformat(),
+                'started_at': self.started_at.isoformat(),
                 'pod_id': self.config['pod_id'],
                 'database_type': self.config['database'].get('type', 'sqlite'),
-                'components': {
-                    'database': 'connected' if db_ok else 'disconnected',
-                    'redis': 'connected' if redis_ok else 'disconnected',
-                    'nacos': 'connected' if nacos_ok else 'disconnected'
-                },
+                'probe_mode': 'shallow',
+                'components': components,
                 'supported_formats': self.config.get('supported_formats', SUPPORTED_FORMATS)
             })
 
@@ -967,8 +1315,12 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/agents/refresh', methods=['POST'])
         def refresh_agents():
-            self.agent_manager.refresh_agents()
-            return jsonify({'message': 'Agent列表刷新完成'})
+            executed, message = self._run_refresh_cycle(include_service_sync=True)
+            status_code = 200 if executed else 202
+            return jsonify({
+                'executed': executed,
+                'message': message
+            }), status_code
 
         # 在_register_routes方法中添加以下路由
         @self.app.route('/api/agent/agents/cleanup', methods=['POST'])
@@ -985,7 +1337,7 @@ class WebAPIServer:
                 cleanup_k8s_resources = bool(data.get('cleanup_k8s_resources', True))
 
                 # 先获取统计信息（按project过滤）
-                offline_count, total_count = self.agent_manager.get_offline_agents_count(project_id)
+                offline_count, total_count = self.agent_manager.get_offline_agents_count(project_id, force=force)
 
                 if offline_count == 0:
                     return jsonify({
@@ -1009,7 +1361,7 @@ class WebAPIServer:
                     })
 
                 # 执行清理操作（按project过滤）
-                success, message, cleanup_info = self.agent_manager.cleanup_offline_agents(project_id)
+                success, message, cleanup_info = self.agent_manager.cleanup_offline_agents(project_id, force=force)
 
                 if success:
                     k8s_cleanup = {
@@ -1392,26 +1744,31 @@ class WebAPIServer:
                 return jsonify({'error': 'project_id不能为空'}), 400
 
             # Validate that agent belongs to the project
-            agent = self.agent_manager.get_agent(data['agent_key'])
+            agent = self.agent_manager.get_agent(data['agent_key']) or self.agent_manager.ensure_agent_exists(data['agent_key'])
             if not agent:
                 return jsonify({'error': f"Agent {data['agent_key']} 不存在"}), 404
             if agent.project_id != project_id:
                 return jsonify({'error': f"Agent {data['agent_key']} 不属于项目 {project_id}"}), 403
 
-            duplicate = self._check_deploy_duplicate(
-                data['service_name'], data['agent_key'], project_id
-            )
-            if duplicate:
-                return jsonify({
-                    'error': duplicate.get('message') or '重复部署被拒绝',
-                    'code': 'DUPLICATE_DEPLOYMENT',
-                    'details': duplicate
-                }), 409
+            lock_key = self._deploy_lock_key(project_id, data['agent_key'], data['service_name'], 'deploy')
+            with self.redis_manager.get_lock(lock_key, timeout=int(self.config.get('lock_timeout', 30))) as lock:
+                if not lock.is_acquired():
+                    return jsonify({'error': '部署请求正在处理中，请稍后重试', 'code': 'LOCK_NOT_ACQUIRED'}), 409
 
-            task_id = self.task_manager.create_task(
-                'deploy', data['service_name'], data['agent_key'],
-                data['template_name'], data.get('extra_params'), project_id
-            )
+                duplicate = self._check_deploy_duplicate(
+                    data['service_name'], data['agent_key'], project_id
+                )
+                if duplicate:
+                    return jsonify({
+                        'error': duplicate.get('message') or '重复部署被拒绝',
+                        'code': 'DUPLICATE_DEPLOYMENT',
+                        'details': duplicate
+                    }), 409
+
+                task_id = self.task_manager.create_task(
+                    'deploy', data['service_name'], data['agent_key'],
+                    data['template_name'], data.get('extra_params'), project_id
+                )
 
             return jsonify({
                 'task_id': task_id,
@@ -1461,7 +1818,7 @@ class WebAPIServer:
                     continue
 
                 # Validate that agent belongs to the project
-                agent = self.agent_manager.get_agent(agent_key)
+                agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
                 if not agent:
                     errors.append({
                         'index': idx,
@@ -1494,23 +1851,36 @@ class WebAPIServer:
                     continue
                 request_level_seen.add(dedup_key)
 
-                duplicate = self._check_deploy_duplicate(service_name, agent_key, project_id)
-                if duplicate:
-                    errors.append({
-                        'index': idx,
-                        'service_name': service_name,
-                        'agent_key': agent_key,
-                        'template_name': template_name,
-                        'code': 'DUPLICATE_DEPLOYMENT',
-                        'error': duplicate.get('message') or '重复部署被拒绝',
-                        'details': duplicate
-                    })
-                    continue
-
                 try:
-                    task_id = self.task_manager.create_task(
-                        'deploy', service_name, agent_key, template_name, extra_params, project_id
-                    )
+                    lock_key = self._deploy_lock_key(project_id, agent_key, service_name, 'deploy')
+                    with self.redis_manager.get_lock(lock_key, timeout=int(self.config.get('lock_timeout', 30))) as lock:
+                        if not lock.is_acquired():
+                            errors.append({
+                                'index': idx,
+                                'service_name': service_name,
+                                'agent_key': agent_key,
+                                'template_name': template_name,
+                                'code': 'LOCK_NOT_ACQUIRED',
+                                'error': '部署请求正在处理中，请稍后重试'
+                            })
+                            continue
+
+                        duplicate = self._check_deploy_duplicate(service_name, agent_key, project_id)
+                        if duplicate:
+                            errors.append({
+                                'index': idx,
+                                'service_name': service_name,
+                                'agent_key': agent_key,
+                                'template_name': template_name,
+                                'code': 'DUPLICATE_DEPLOYMENT',
+                                'error': duplicate.get('message') or '重复部署被拒绝',
+                                'details': duplicate
+                            })
+                            continue
+
+                        task_id = self.task_manager.create_task(
+                            'deploy', service_name, agent_key, template_name, extra_params, project_id
+                        )
                     results.append({
                         'index': idx,
                         'task_id': task_id,
@@ -1553,16 +1923,21 @@ class WebAPIServer:
                 return jsonify({'error': 'project_id不能为空'}), 400
 
             # Validate that agent belongs to the project
-            agent = self.agent_manager.get_agent(data['agent_key'])
+            agent = self.agent_manager.get_agent(data['agent_key']) or self.agent_manager.ensure_agent_exists(data['agent_key'])
             if not agent:
                 return jsonify({'error': f"Agent {data['agent_key']} 不存在"}), 404
             if agent.project_id != project_id:
                 return jsonify({'error': f"Agent {data['agent_key']} 不属于项目 {project_id}"}), 403
 
-            task_id = self.task_manager.create_task(
-                'undeploy', data['service_name'], data['agent_key'],
-                None, None, project_id
-            )
+            lock_key = self._deploy_lock_key(project_id, data['agent_key'], data['service_name'], 'undeploy')
+            with self.redis_manager.get_lock(lock_key, timeout=int(self.config.get('lock_timeout', 30))) as lock:
+                if not lock.is_acquired():
+                    return jsonify({'error': '卸载请求正在处理中，请稍后重试', 'code': 'LOCK_NOT_ACQUIRED'}), 409
+
+                task_id = self.task_manager.create_task(
+                    'undeploy', data['service_name'], data['agent_key'],
+                    None, None, project_id
+                )
 
             return jsonify({
                 'task_id': task_id,
@@ -1894,6 +2269,7 @@ class WebAPIServer:
                 project_id = request.args.get('project_id')
                 container_name = request.args.get('container', '')
                 shell = request.args.get('shell', '/bin/sh')
+                mode = request.args.get('mode', 'shell')
                 user = request.args.get('user', '')
 
                 agent = self.agent_manager.get_agent(agent_key)
@@ -1906,53 +2282,103 @@ class WebAPIServer:
                 if agent.status != 'online':
                     return jsonify({'error': f'Agent {agent_key} is {agent.status}'}), 503
 
-                # 优先使用已创建的11197动态Ingress（支持HTTPS/WSS）
+                # 预先校验服务是否存在，避免前端拿到ws_url后立刻1005断开却看不到具体原因。
+                service_status, service_payload = self.agent_manager.call_agent_api(
+                    agent_key,
+                    'GET',
+                    f'/api/services/{quote(service_name, safe="")}',
+                    None,
+                    timeout_type='health_check'
+                )
+                if service_status != 200:
+                    detail = ''
+                    if isinstance(service_payload, dict):
+                        detail = str(service_payload.get('error') or service_payload.get('message') or '')
+                    elif isinstance(service_payload, str):
+                        detail = service_payload
+                    msg = f'服务不存在或不可访问: {service_name}'
+                    if detail:
+                        msg = f'{msg} ({detail})'
+                    return jsonify({
+                        'error': msg,
+                        'agent_key': agent_key,
+                        'service_name': service_name,
+                        'upstream_status': service_status
+                    }), 404
+
+                supported, probe_status, probe_detail = self._probe_agent_exec_ws_capability(
+                    agent, service_name, container_name, shell, mode, user
+                )
+                if not supported:
+                    return jsonify({
+                        'error': '当前Agent未提供服务终端WS接口，无法建立实时终端连接',
+                        'agent_key': agent_key,
+                        'service_name': service_name,
+                        'agent_ip': agent.ip_address,
+                        'upstream_status': probe_status,
+                        'upstream_detail': probe_detail
+                    }), 400
+
+                tunnel_query = {
+                    'project_id': project_id or '',
+                    'container': container_name,
+                    'shell': shell,
+                    'mode': mode
+                }
+                if user:
+                    tunnel_query['user'] = user
+
+                ws_scheme = self._resolve_request_ws_scheme()
+                host = self._resolve_request_host()
+                tunnel_path = f"/api/agent/agent/{quote(agent_key, safe='')}/services/{quote(service_name, safe='')}/exec/ws-tunnel"
+                tunnel_ws_url = f"{ws_scheme}://{host}{tunnel_path}?{urlencode(tunnel_query)}"
+
+                direct_query = {
+                    'token': self.agent_manager.agent_auth_token,
+                    'container': container_name,
+                    'shell': shell,
+                    'mode': mode
+                }
+                if user:
+                    direct_query['user'] = user
+
+                direct_ws_url = (
+                    f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}"
+                    f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(direct_query)}"
+                )
+
                 ingress_ws_url = None
                 ingress_http_url = None
                 ingress_route = None
+                auth_header = request.headers.get('Authorization')
                 if project_id:
                     try:
-                        auth_header = request.headers.get('Authorization')
-                        resp = self._call_k8s_service(
-                            method='GET',
-                            path='/api/k8s/agent-ingress-routes',
+                        ingress_route = self._ensure_agent_console_ingress_route(
                             project_id=project_id,
-                            params={'agent_key': agent_key},
-                            headers={'Authorization': auth_header} if auth_header else None
+                            agent=agent,
+                            target_port=int(self.agent_manager.agent_api_port),
+                            auth_header=auth_header
                         )
-                        if resp.ok:
-                            route_items = (resp.json() or {}).get('items') or []
-                            for item in route_items:
-                                if int(item.get('target_port') or 0) == self.agent_manager.agent_api_port:
-                                    ingress_route = item
-                                    host = (item.get('host') or '').strip()
-                                    path = (item.get('path') or '/').rstrip('/')
-                                    if host:
-                                        qs = {
-                                            'token': self.agent_manager.agent_auth_token,
-                                            'container': container_name,
-                                            'shell': shell
-                                        }
-                                        if user:
-                                            qs['user'] = user
-                                        query = urlencode(qs)
-                                        scheme = 'wss' if bool(item.get('tls_enabled', True)) else 'ws'
-                                        ingress_ws_url = f"{scheme}://{host}{path}/api/services/{quote(service_name, safe='')}/exec/ws?{query}"
-                                        ingress_http_url = f"{'https' if scheme == 'wss' else 'http'}://{host}{path}"
-                                    break
-                    except Exception as ingress_err:
-                        self.logger.warning(f"获取11197动态Ingress失败: {ingress_err}")
+                        if ingress_route and str(ingress_route.get('status') or '').lower() == 'ready':
+                            route_host = str(ingress_route.get('host') or '').strip()
+                            access_url = str(ingress_route.get('access_url') or '').strip()
+                            route_path = str(ingress_route.get('path') or '/').strip() or '/'
+                            ingress_http_url = access_url or (f"https://{route_host}{route_path}" if route_host else None)
+                            if route_host:
+                                route_ws_scheme = 'wss' if bool(ingress_route.get('tls_enabled')) or access_url.startswith('https://') else 'ws'
+                                ingress_ws_url = (
+                                    f"{route_ws_scheme}://{route_host}"
+                                    f"/api/services/{quote(service_name, safe='')}/exec/ws?{urlencode(direct_query)}"
+                                )
+                    except Exception as e:
+                        self.logger.warning(f"查询/创建Agent ingress路由失败，回退平台WS中转: agent={agent_key}, err={e}")
 
-                # 回退直连（HTTP场景可用；HTTPS页面可能被浏览器拦截ws://mixed content）
-                qs = {
-                    'token': self.agent_manager.agent_auth_token,
-                    'container': container_name,
-                    'shell': shell
-                }
-                if user:
-                    qs['user'] = user
-                query = urlencode(qs)
-                direct_ws_url = f"ws://{agent.ip_address}:{self.agent_manager.agent_api_port}/api/services/{quote(service_name, safe='')}/exec/ws?{query}"
+                ws_url = ingress_ws_url or tunnel_ws_url
+                note = (
+                    '终端连接优先使用Agent Ingress直连通道（browser -> agent ingress -> agent）。'
+                    if ingress_ws_url else
+                    '终端连接使用平台内置WS中转通道（browser -> platform-agent -> agent），支持HTTP/HTTPS。'
+                )
 
                 return jsonify({
                     'agent_key': agent_key,
@@ -1962,18 +2388,28 @@ class WebAPIServer:
                     'project_id': project_id,
                     'container': container_name,
                     'shell': shell,
+                    'mode': mode,
                     'user': user,
-                    'ws_url': ingress_ws_url or direct_ws_url,
+                    'ws_url': ws_url,
                     'direct_ws_url': direct_ws_url,
                     'ingress_ws_url': ingress_ws_url,
                     'ingress_http_url': ingress_http_url,
                     'ingress_route': ingress_route,
                     'rest_exec_url': f"/api/agent/agent/{agent_key}/services/{quote(service_name, safe='')}/exec",
-                    'note': 'HTTPS页面建议使用wss ingress地址；若返回ws://直连，浏览器可能因mixed content拒绝连接。'
+                    'note': note
                 })
             except Exception as e:
                 self.logger.error(f"获取服务Exec WS连接信息失败: {str(e)}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/exec/ws-tunnel', methods=['GET'])
+        def agent_service_exec_ws_tunnel(agent_key, service_name):
+            """服务终端WebSocket中转说明入口（真正的WS升级由专用WebSocket应用处理）"""
+            return jsonify({
+                'error': 'WebSocket upgrade required',
+                'message': '请通过WebSocket连接访问该地址',
+                'path': f"/api/agent/agent/{agent_key}/services/{service_name}/exec/ws-tunnel"
+            }), 426
 
         @self.app.route('/api/agent/services/global', methods=['GET'])
         def list_global_services():
@@ -2134,11 +2570,12 @@ class WebAPIServer:
                 include_deleted = request.args.get('include_deleted', 'false').lower() == 'true'
                 auth_header = request.headers.get('Authorization')
 
-                items = self._list_project_ingress_routes(
+                all_items = self._list_project_ingress_routes(
                     project_id=project_id,
                     include_deleted=include_deleted,
                     auth_header=auth_header
                 )
+                items = [item for item in all_items if self._is_service_bound_ingress_route(item)]
                 active_service_keys = self._get_project_active_service_keys(project_id)
 
                 enhanced_items: List[Dict[str, Any]] = []
@@ -2148,12 +2585,7 @@ class WebAPIServer:
                 error_count = 0
 
                 for item in items:
-                    metadata = item.get('metadata') or {}
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except Exception:
-                            metadata = {}
+                    metadata = self._extract_route_metadata(item)
                     assoc_service = str(metadata.get('service_name') or '').strip()
                     assoc_key = f"{item.get('agent_key', '')}::{assoc_service}" if assoc_service else ''
                     service_exists = bool(assoc_service) and assoc_key in active_service_keys
@@ -2245,17 +2677,17 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id is required'}), 400
 
                 auth_header = request.headers.get('Authorization')
-                routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=False, auth_header=auth_header)
+                all_routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=False, auth_header=auth_header)
+                routes = [item for item in all_routes if self._is_service_bound_ingress_route(item)]
                 active_service_keys = self._get_project_active_service_keys(project_id)
 
                 stale_routes: List[Dict[str, Any]] = []
                 for item in routes:
-                    metadata = item.get('metadata') or {}
-                    if isinstance(metadata, str):
-                        try:
-                            metadata = json.loads(metadata)
-                        except Exception:
-                            metadata = {}
+                    route_status = str(item.get('status') or '').strip().lower()
+                    if route_status == 'error':
+                        stale_routes.append(item)
+                        continue
+                    metadata = self._extract_route_metadata(item)
                     assoc_service = str(metadata.get('service_name') or '').strip()
                     if not assoc_service:
                         stale_routes.append(item)
@@ -2314,7 +2746,8 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id is required'}), 400
 
                 auth_header = request.headers.get('Authorization')
-                routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=include_deleted, auth_header=auth_header)
+                all_routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=include_deleted, auth_header=auth_header)
+                routes = [item for item in all_routes if self._is_service_bound_ingress_route(item)]
                 deleted = 0
                 failed: List[Dict[str, Any]] = []
                 for route in routes:
@@ -2343,6 +2776,224 @@ class WebAPIServer:
                 }), 200 if len(failed) == 0 else 207
             except Exception as e:
                 self.logger.error(f"清空服务Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/global/ingress', methods=['GET'])
+        def list_global_agent_ingress():
+            """查询项目级 Agent 节点入口 Ingress（仅11197/11198）。"""
+            try:
+                project_id = request.args.get('project_id')
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+                include_deleted = request.args.get('include_deleted', 'false').lower() == 'true'
+                auth_header = request.headers.get('Authorization')
+
+                all_items = self._list_project_ingress_routes(
+                    project_id=project_id,
+                    include_deleted=include_deleted,
+                    auth_header=auth_header
+                )
+                items = [item for item in all_items if self._is_agent_console_ingress_route(item)]
+
+                agents, _ = self.agent_manager.list_agents(page=1, per_page=5000, project_id=project_id)
+                online_keys = {str(a.get('key') or '').strip() for a in agents if str(a.get('status') or '').lower() == 'online'}
+
+                enhanced_items: List[Dict[str, Any]] = []
+                stale_count = 0
+                deleted_count = 0
+                ready_count = 0
+                error_count = 0
+                port_11197_count = 0
+                port_11198_count = 0
+
+                for item in items:
+                    target_port = int(item.get('target_port') or 0)
+                    agent_key = str(item.get('agent_key') or '').strip()
+                    is_deleted = bool(item.get('deleted_at')) or str(item.get('status') or '').lower() == 'deleted'
+                    is_online = agent_key in online_keys if agent_key else False
+                    is_stale = (not is_deleted) and (not is_online)
+
+                    if target_port == 11197:
+                        port_11197_count += 1
+                    elif target_port == 11198:
+                        port_11198_count += 1
+                    if is_deleted:
+                        deleted_count += 1
+                    if str(item.get('status') or '').lower() == 'ready':
+                        ready_count += 1
+                    if str(item.get('status') or '').lower() == 'error':
+                        error_count += 1
+                    if is_stale:
+                        stale_count += 1
+
+                    enhanced_items.append({
+                        **item,
+                        'agent_online': is_online,
+                        'is_stale_agent_ingress': is_stale,
+                    })
+
+                return jsonify({
+                    'project_id': project_id,
+                    'items': enhanced_items,
+                    'stats': {
+                        'total': len(enhanced_items),
+                        'ready': ready_count,
+                        'error': error_count,
+                        'deleted': deleted_count,
+                        'stale_agent_ingress': stale_count,
+                        'port_11197': port_11197_count,
+                        'port_11198': port_11198_count,
+                    }
+                })
+            except Exception as e:
+                self.logger.error(f"查询Agent节点Ingress视图失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/global/ingress/delete-batch', methods=['POST'])
+        def delete_global_agent_ingress_batch():
+            """批量删除 Agent 节点入口 Ingress。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                route_ids = data.get('route_ids') or []
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                if not isinstance(route_ids, list) or len(route_ids) == 0:
+                    return jsonify({'error': 'route_ids must be a non-empty array'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for rid in route_ids:
+                    route_id = str(rid or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'requested': len(route_ids),
+                    'deleted': deleted,
+                    'failed': failed
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"批量删除Agent节点Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/global/ingress/cleanup-stale', methods=['POST'])
+        def cleanup_stale_agent_ingress():
+            """一键删除所有离线节点关联的Agent入口Ingress。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                dry_run = bool(data.get('dry_run', False))
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                all_routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=False, auth_header=auth_header)
+                routes = [item for item in all_routes if self._is_agent_console_ingress_route(item)]
+                agents, _ = self.agent_manager.list_agents(page=1, per_page=5000, project_id=project_id)
+                online_keys = {str(a.get('key') or '').strip() for a in agents if str(a.get('status') or '').lower() == 'online'}
+
+                stale_routes: List[Dict[str, Any]] = []
+                for item in routes:
+                    agent_key = str(item.get('agent_key') or '').strip()
+                    if not agent_key or agent_key not in online_keys:
+                        stale_routes.append(item)
+
+                if dry_run:
+                    return jsonify({
+                        'project_id': project_id,
+                        'dry_run': True,
+                        'to_delete_count': len(stale_routes),
+                        'items': stale_routes,
+                    })
+
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for route in stale_routes:
+                    route_id = str(route.get('route_id') or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'dry_run': False,
+                    'target_count': len(stale_routes),
+                    'deleted': deleted,
+                    'failed': failed,
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"清理无效Agent入口Ingress失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/global/ingress/clear-all', methods=['POST'])
+        def clear_all_agent_ingress():
+            """清空项目所有Agent入口Ingress（仅11197/11198）。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                include_deleted = bool(data.get('include_deleted', False))
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                auth_header = request.headers.get('Authorization')
+                all_routes = self._list_project_ingress_routes(project_id=project_id, include_deleted=include_deleted, auth_header=auth_header)
+                routes = [item for item in all_routes if self._is_agent_console_ingress_route(item)]
+                deleted = 0
+                failed: List[Dict[str, Any]] = []
+                for route in routes:
+                    route_id = str(route.get('route_id') or '').strip()
+                    if not route_id:
+                        continue
+                    try:
+                        resp = self._call_k8s_service(
+                            method='DELETE',
+                            path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                            project_id=project_id,
+                            headers={'Authorization': auth_header} if auth_header else None
+                        )
+                        if resp.status_code < 300:
+                            deleted += 1
+                        else:
+                            failed.append({'route_id': route_id, 'status_code': resp.status_code, 'body': resp.text[:200]})
+                    except Exception as inner:
+                        failed.append({'route_id': route_id, 'error': str(inner)})
+
+                return jsonify({
+                    'project_id': project_id,
+                    'requested': len(routes),
+                    'deleted': deleted,
+                    'failed': failed
+                }), 200 if len(failed) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"清空Agent入口Ingress失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/services/global/sync', methods=['POST'])
@@ -2462,14 +3113,29 @@ class WebAPIServer:
                         'results': results
                     })
                 else:
-                    self._sync_all_agent_services()
+                    summary = self._sync_all_agent_services()
+                    details = summary.get('results') or []
+                    total = int(summary.get('online_agents') or 0)
+                    ok_count = int(summary.get('ok_count') or 0)
+                    fail_count = int(summary.get('fail_count') or 0)
                     self._record_service_sync_log(
                         scope='global',
-                        status='ok',
+                        status='ok' if fail_count == 0 else 'partial',
                         stale_only=False,
-                        message='global service sync triggered'
+                        total=total,
+                        ok_count=ok_count,
+                        fail_count=fail_count,
+                        message='global service sync completed',
+                        details=details
                     )
-                    return jsonify({'message': 'global service sync triggered', 'status': 'ok'})
+                    return jsonify({
+                        'message': 'global service sync completed',
+                        'status': 'ok' if fail_count == 0 else 'partial',
+                        'total': total,
+                        'ok_count': ok_count,
+                        'fail_count': fail_count,
+                        'results': details
+                    })
             except Exception as e:
                 self.logger.error(f"手动触发服务聚合同步失败: {e}", exc_info=True)
                 try:
@@ -2482,14 +3148,36 @@ class WebAPIServer:
                     pass
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/services/global/sync/history', methods=['GET'])
+        @self.app.route('/api/agent/services/global/sync/history', methods=['GET', 'DELETE'])
         def get_global_service_sync_history():
             """查询服务强制同步历史记录。"""
             try:
+                table_name = self.db_manager.get_table_name('service_sync_logs')
+
+                if request.method == 'DELETE':
+                    project_id = request.args.get('project_id')
+                    where = []
+                    params: List[Any] = []
+                    if project_id:
+                        where.append("project_id = " + ("%s" if self.db_manager.db_type == 'mysql' else "?"))
+                        params.append(project_id)
+                    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+                    count_sql = f"SELECT COUNT(*) as count FROM {table_name} {where_sql}"
+                    count_result = self.db_manager.fetch_one(count_sql, tuple(params))
+                    target_count = int(count_result.get('count', 0) if count_result else 0)
+
+                    delete_sql = f"DELETE FROM {table_name} {where_sql}"
+                    self.db_manager.execute_query(delete_sql, tuple(params))
+                    return jsonify({
+                        'message': 'sync history cleared',
+                        'project_id': project_id,
+                        'deleted_count': target_count
+                    })
+
                 page = max(int(request.args.get('page', 1)), 1)
                 per_page = min(max(int(request.args.get('per_page', 20)), 1), 200)
                 project_id = request.args.get('project_id')
-                table_name = self.db_manager.get_table_name('service_sync_logs')
 
                 where = []
                 params: List[Any] = []
@@ -2554,6 +3242,33 @@ class WebAPIServer:
                 })
             except Exception as e:
                 self.logger.error(f"查询服务同步历史失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/services/global/sync/history/<sync_id>', methods=['DELETE'])
+        def delete_global_service_sync_history_item(sync_id):
+            """删除单条服务强制同步历史记录。"""
+            try:
+                sync_id = str(sync_id or '').strip()
+                if not sync_id:
+                    return jsonify({'error': 'sync_id is required'}), 400
+
+                table_name = self.db_manager.get_table_name('service_sync_logs')
+                placeholder = "%s" if self.db_manager.db_type == 'mysql' else "?"
+                count_row = self.db_manager.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name} WHERE sync_id = {placeholder}",
+                    (sync_id,)
+                )
+                exists = int(count_row.get('count', 0) if count_row else 0) > 0
+                if not exists:
+                    return jsonify({'error': 'sync history not found'}), 404
+
+                self.db_manager.execute_query(
+                    f"DELETE FROM {table_name} WHERE sync_id = {placeholder}",
+                    (sync_id,)
+                )
+                return jsonify({'message': 'sync history deleted', 'sync_id': sync_id})
+            except Exception as e:
+                self.logger.error(f"删除服务同步历史失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/report/services/full', methods=['POST'])
@@ -2848,12 +3563,26 @@ class WebAPIServer:
 
                 target_port = int(data.get('target_port', self.agent_ttyd_port))
                 external_ips = data.get('external_ips') or [agent.ip_address]
+                metadata = {
+                    **(data.get('metadata') or {}),
+                    'agent_hostname': agent.hostname,
+                    'source_api': '/api/agent/agent/<agent_key>/ingress-routes'
+                }
+                ingress_scope = str(metadata.get('ingress_scope') or '').strip().lower()
+                if not ingress_scope:
+                    if target_port in (11197, 11198):
+                        ingress_scope = 'agent_console'
+                    elif str(metadata.get('service_name') or '').strip():
+                        ingress_scope = 'service_binding'
+                    else:
+                        ingress_scope = 'agent_console'
+                metadata['ingress_scope'] = ingress_scope
                 payload = {
                     'agent_key': agent_key,
                     'external_ips': external_ips,
                     'target_port': target_port,
                     'host': data.get('host'),
-                    'host_prefix': data.get('host_prefix') or f"{agent_key}-{target_port}",
+                    'host_prefix': data.get('host_prefix') or _build_random_host_prefix(f"{agent_key}-{target_port}"),
                     'path': data.get('path', '/'),
                     'path_type': data.get('path_type', 'Prefix'),
                     'ingress_type': data.get('ingress_type'),
@@ -2870,11 +3599,7 @@ class WebAPIServer:
                     'owner_service': 'platform-agent',
                     'created_by': data.get('created_by'),
                     'force_recreate': bool(data.get('force_recreate', False)),
-                    'metadata': {
-                        **(data.get('metadata') or {}),
-                        'agent_hostname': agent.hostname,
-                        'source_api': '/api/agent/agent/<agent_key>/ingress-routes'
-                    }
+                    'metadata': metadata
                 }
 
                 auth_header = request.headers.get('Authorization')
@@ -3406,15 +4131,20 @@ class WebAPIServer:
             user_ctx = self._get_request_user_context()
             created_by = user_ctx.get('username', 'system')
 
-            # 获取当前用户
-            success, message = self.template_manager.create_template(
-                name, description, template_type, file_content, filename,
-                created_by,
-                visibility=visibility,
-                owner_id=user_ctx.get('user_id', ''),
-                owner_name=user_ctx.get('username', ''),
-                web_port_presets=web_port_presets
-            )
+            def _create_template():
+                return self.template_manager.create_template(
+                    name, description, template_type, file_content, filename,
+                    created_by,
+                    visibility=visibility,
+                    owner_id=user_ctx.get('user_id', ''),
+                    owner_name=user_ctx.get('username', ''),
+                    web_port_presets=web_port_presets
+                )
+
+            try:
+                success, message = self._with_template_write_lock([name], _create_template)
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if success:
                 return jsonify({
@@ -3517,14 +4247,23 @@ class WebAPIServer:
             if web_port_presets is not None and not isinstance(web_port_presets, list):
                 return jsonify({'error': 'web_port_presets 必须是数组'}), 400
 
-            success, message, updated = self.template_manager.update_template_basic(
-                template_id=template_id,
-                new_name=new_name,
-                description=description,
-                visibility=visibility,
-                web_port_presets=web_port_presets,
-                updated_by=user_ctx.get('username', 'system')
-            )
+            def _update_template_basic():
+                return self.template_manager.update_template_basic(
+                    template_id=template_id,
+                    new_name=new_name,
+                    description=description,
+                    visibility=visibility,
+                    web_port_presets=web_port_presets,
+                    updated_by=user_ctx.get('username', 'system')
+                )
+
+            try:
+                success, message, updated = self._with_template_write_lock(
+                    [template.get('name'), new_name],
+                    _update_template_basic
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
             if not success:
                 return jsonify({'error': message}), 400
             updated = self.template_manager.decorate_template_permissions(
@@ -3533,6 +4272,83 @@ class WebAPIServer:
                 user_ctx.get('username', '')
             )
             return jsonify({'message': message, 'template': updated, 'status': 'success'})
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/web-ports', methods=['GET', 'PUT'])
+        def manage_template_web_ports_by_id(template_id):
+            """按模板ID查询/更新WEB端口预设。"""
+            user_ctx = self._get_request_user_context()
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
+
+            if request.method == 'GET':
+                metadata = template.get('metadata') or {}
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except Exception:
+                        metadata = {}
+                raw_presets = metadata.get('web_port_presets') if isinstance(metadata, dict) else []
+                presets = self.template_manager._normalize_web_port_presets(raw_presets)
+                return jsonify({
+                    'template_id': template_id,
+                    'template_name': template.get('name'),
+                    'web_port_presets': presets,
+                    'permissions': {
+                        'can_manage': self._check_template_manageable(template, user_ctx)
+                    }
+                })
+
+            # PUT
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
+
+            data = request.get_json(silent=True) or {}
+            web_port_presets = data.get('web_port_presets')
+            if web_port_presets is None:
+                return jsonify({'error': 'web_port_presets is required'}), 400
+            if not isinstance(web_port_presets, list):
+                return jsonify({'error': 'web_port_presets 必须是数组'}), 400
+
+            def _update_web_ports():
+                return self.template_manager.update_template_basic(
+                    template_id=template_id,
+                    web_port_presets=web_port_presets,
+                    updated_by=user_ctx.get('username', 'system')
+                )
+
+            try:
+                success, message, updated = self._with_template_write_lock(
+                    [template.get('name')],
+                    _update_web_ports
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
+            if not success:
+                return jsonify({'error': message}), 400
+
+            updated = self.template_manager.decorate_template_permissions(
+                updated,
+                user_ctx.get('user_id', ''),
+                user_ctx.get('username', '')
+            )
+            metadata = updated.get('metadata') or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+            normalized = self.template_manager._normalize_web_port_presets(
+                metadata.get('web_port_presets') if isinstance(metadata, dict) else []
+            )
+            return jsonify({
+                'message': 'WEB端口已更新',
+                'status': 'success',
+                'template': updated,
+                'web_port_presets': normalized
+            })
 
         @self.app.route('/api/agent/templates/<name>/yaml', methods=['GET'])
         def get_template_yaml(name):
@@ -3575,9 +4391,15 @@ class WebAPIServer:
             if not yaml_content:
                 return jsonify({'error': 'YAML内容不能为空'}), 400
 
-            success, message = self.template_manager.update_yaml_content(
-                name, yaml_content, user_ctx.get('username', 'system')
-            )
+            def _update_yaml():
+                return self.template_manager.update_yaml_content(
+                    name, yaml_content, user_ctx.get('username', 'system')
+                )
+
+            try:
+                success, message = self._with_template_write_lock([name], _update_yaml)
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if success:
                 # 返回更新后的模板信息
@@ -3807,7 +4629,13 @@ class WebAPIServer:
                 return jsonify({'error': '模板不存在'}), 404
             if not self._check_template_manageable(template, user_ctx):
                 return jsonify({'error': '无权限删除该模板，仅拥有者可删除'}), 403
-            success, message = self.template_manager.delete_template(name)
+            try:
+                success, message = self._with_template_write_lock(
+                    [name],
+                    lambda: self.template_manager.delete_template(name)
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if success:
                 return jsonify({'message': message})
@@ -3833,15 +4661,21 @@ class WebAPIServer:
                 return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
             description = data.get('description', '')
 
-            success, message = self.template_manager.copy_template(
-                source_name=name,
-                target_name=target_name,
-                created_by=user_ctx.get('username', 'system'),
-                owner_id=user_ctx.get('user_id', ''),
-                owner_name=user_ctx.get('username', ''),
-                visibility=visibility,
-                description=description
-            )
+            try:
+                success, message = self._with_template_write_lock(
+                    [name, target_name],
+                    lambda: self.template_manager.copy_template(
+                        source_name=name,
+                        target_name=target_name,
+                        created_by=user_ctx.get('username', 'system'),
+                        owner_id=user_ctx.get('user_id', ''),
+                        owner_name=user_ctx.get('username', ''),
+                        visibility=visibility,
+                        description=description
+                    )
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if success:
                 return jsonify({
@@ -4045,9 +4879,15 @@ class WebAPIServer:
                 # 获取当前用户
                 updated_by = user_ctx.get('username', 'system')
 
-                success, message, update_info = self.template_manager.update_template_file(
-                    name, file_path, actual_content, encoding, updated_by
-                )
+                try:
+                    success, message, update_info = self._with_template_write_lock(
+                        [name],
+                        lambda: self.template_manager.update_template_file(
+                            name, file_path, actual_content, encoding, updated_by
+                        )
+                    )
+                except BlockingIOError as e:
+                    return jsonify({'error': str(e)}), 409
 
                 if success:
                     # 获取更新后的文件信息
@@ -4163,9 +5003,15 @@ class WebAPIServer:
                 content = file_content
                 encoding = 'binary'
 
-            success, message, update_info = self.template_manager.update_template_file(
-                name, target_path, content, encoding, updated_by
-            )
+            try:
+                success, message, update_info = self._with_template_write_lock(
+                    [name],
+                    lambda: self.template_manager.update_template_file(
+                        name, target_path, content, encoding, updated_by
+                    )
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
 
             if not success and not overwrite:
                 # 检查是否是文件已存在的错误
@@ -4217,9 +5063,15 @@ class WebAPIServer:
                 # 获取当前用户
                 deleted_by = user_ctx.get('username', 'system')
 
-                success, message, delete_info = self.template_manager.delete_template_file(
-                    name, file_path, deleted_by
-                )
+                try:
+                    success, message, delete_info = self._with_template_write_lock(
+                        [name],
+                        lambda: self.template_manager.delete_template_file(
+                            name, file_path, deleted_by
+                        )
+                    )
+                except BlockingIOError as e:
+                    return jsonify({'error': str(e)}), 409
 
                 if success:
                     return jsonify({
@@ -4257,9 +5109,15 @@ class WebAPIServer:
                 # 获取当前用户
                 deleted_by = user_ctx.get('username', 'system')
 
-                success, message, delete_info = self.template_manager.delete_template_directory(
-                    name, dir_path, deleted_by, force
-                )
+                try:
+                    success, message, delete_info = self._with_template_write_lock(
+                        [name],
+                        lambda: self.template_manager.delete_template_directory(
+                            name, dir_path, deleted_by, force
+                        )
+                    )
+                except BlockingIOError as e:
+                    return jsonify({'error': str(e)}), 409
 
                 if success:
                     return jsonify({
@@ -4293,35 +5151,51 @@ class WebAPIServer:
                 if isinstance(metadata, str):
                     metadata = json.loads(metadata)
 
-                # 检查是否已解析
+                def reload_template_metadata() -> None:
+                    nonlocal template, metadata
+                    template = self.template_manager.get_template(name)
+                    metadata = template.get('metadata', {})
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+
+                def parse_under_lock():
+                    try:
+                        return self._with_template_write_lock(
+                            [name],
+                            lambda: self.template_manager.parse_template_compose(name)
+                        )
+                    except BlockingIOError as e:
+                        return None, str(e)
+
                 parsed_compose = metadata.get('parsed_compose')
-                if not parsed_compose:
-                    # 尝试解析
-                    success, msg = self.template_manager.parse_template_compose(name)
+
+                # 检查是否过期；如果已过期则自动重新解析，而不是继续返回旧缓存。
+                stale_check_ok, is_stale, _ = self.template_manager.check_parse_staleness(name)
+                needs_parse = not parsed_compose or (stale_check_ok and is_stale)
+
+                if needs_parse:
+                    success, msg = parse_under_lock()
+                    if success is None:
+                        return jsonify({'error': msg}), 409
                     if success:
-                        # 重新获取
-                        template = self.template_manager.get_template(name)
-                        metadata = template.get('metadata', {})
-                        if isinstance(metadata, str):
-                            metadata = json.loads(metadata)
+                        reload_template_metadata()
                         parsed_compose = metadata.get('parsed_compose')
+                        stale_check_ok, is_stale, _ = self.template_manager.check_parse_staleness(name)
                     else:
+                        reload_template_metadata()
                         return jsonify({
                             'error': '解析失败',
                             'details': metadata.get('parse_error', msg),
                             'parse_status': 'error'
                         }), 400
 
-                # 检查是否过期
-                success, is_stale, _ = self.template_manager.check_parse_staleness(name)
-
                 return jsonify({
                     'template_name': name,
                     'parsed_compose': parsed_compose,
-                    'parse_status': 'stale' if is_stale else metadata.get('parse_status', 'success'),
+                    'parse_status': 'stale' if (stale_check_ok and is_stale) else metadata.get('parse_status', 'success'),
                     'parsed_at': metadata.get('parsed_at'),
                     'parse_error': metadata.get('parse_error'),
-                    'is_stale': is_stale if success else None
+                    'is_stale': is_stale if stale_check_ok else None
                 })
 
             except Exception as e:
@@ -4348,7 +5222,13 @@ class WebAPIServer:
                     return jsonify({'error': '无权限重新解析该模板，仅拥有者可操作'}), 403
 
                 # 执行解析
-                success, message = self.template_manager.parse_template_compose(name)
+                try:
+                    success, message = self._with_template_write_lock(
+                        [name],
+                        lambda: self.template_manager.parse_template_compose(name)
+                    )
+                except BlockingIOError as e:
+                    return jsonify({'error': str(e)}), 409
 
                 if success:
                     # 返回更新后的模板信息
@@ -4497,22 +5377,36 @@ class WebAPIServer:
                 return jsonify({'error': '模板不存在'}), 404
             return parse_template(template['name'])
 
+    def _run_refresh_cycle(self, include_service_sync: bool = False) -> Tuple[bool, str]:
+        """执行一次leader-only刷新周期。"""
+        try:
+            lock_timeout = int(self.config.get('leader_lock_timeout_sec', 90))
+            with self.redis_manager.get_lock(self.refresh_leader_lock_key, timeout=lock_timeout) as lock:
+                if not lock.is_acquired():
+                    msg = f"POD {self.config.get('pod_id')} 未获得刷新领导锁，跳过本轮"
+                    self.logger.debug(msg)
+                    return False, msg
+
+                self.agent_manager.refresh_agents(use_distributed_lock=False)
+                if include_service_sync:
+                    self._sync_all_agent_services()
+                return True, "Agent列表刷新完成"
+        except Exception as e:
+            self.logger.error(f"执行刷新周期失败: {str(e)}")
+            return False, f"刷新失败: {str(e)}"
+
     def _refresh_loop(self):
         """后台刷新循环"""
         service_sync_interval = int(self.config.get('service_sync_interval', self.config.get('refresh_interval', 30)))
         service_sync_elapsed = service_sync_interval
         while not self.should_stop:
             try:
-                self.agent_manager.refresh_agents()
-            except Exception as e:
-                self.logger.error(f"刷新Agent列表失败: {str(e)}")
-
-            try:
-                if service_sync_elapsed >= service_sync_interval:
-                    self._sync_all_agent_services()
+                include_service_sync = service_sync_elapsed >= service_sync_interval
+                executed, _ = self._run_refresh_cycle(include_service_sync=include_service_sync)
+                if executed and include_service_sync:
                     service_sync_elapsed = 0
             except Exception as e:
-                self.logger.error(f"刷新服务聚合失败: {str(e)}")
+                self.logger.error(f"后台刷新循环失败: {str(e)}")
 
             # 等待下一次刷新
             for _ in range(self.config['refresh_interval']):
@@ -4523,6 +5417,9 @@ class WebAPIServer:
 
     def start_refresh_thread(self):
         """启动后台刷新线程"""
+        if not self.config.get('enable_background_refresh', True):
+            self.logger.info("后台刷新线程已禁用")
+            return
         self.should_stop = False
         self.refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self.refresh_thread.start()
@@ -4535,19 +5432,154 @@ class WebAPIServer:
             self.refresh_thread.join(timeout=5)
             self.logger.info("后台刷新线程已停止")
 
+    def shutdown(self):
+        """停止后台组件。"""
+        self.stop_refresh_thread()
+        self.task_manager.stop_workers()
+
     def run(self):
         """运行服务器"""
         # 启动后台刷新线程
         self.start_refresh_thread()
+        self.task_manager.start_workers()
 
         # 运行Flask应用
         self.logger.info(f"启动WEB API服务器，监听 {self.config['host']}:{self.config['port']}")
-        self.app.run(
-            host=self.config['host'],
-            port=self.config['port'],
-            debug=self.config['debug'],
-            use_reloader=False
-        )
+        if not self.config.get('enable_platform_ws_tunnel_server', False):
+            self.logger.info("使用线程化Flask/Werkzeug服务器提供HTTP API；平台内置ws-tunnel专用服务默认关闭")
+            self.app.run(
+                host=self.config['host'],
+                port=self.config['port'],
+                debug=self.config['debug'],
+                use_reloader=False,
+                threaded=True
+            )
+            return
+
+        try:
+            from gevent import pywsgi
+            from geventwebsocket.handler import WebSocketHandler
+
+            server_ref = self
+
+            class AgentExecWsTunnelApplication(WebSocketApplication):
+                _path_re = re.compile(
+                    r'^/api/agent/agent/(?P<agent_key>[^/]+)/services/(?P<service_name>[^/]+)/exec/ws-tunnel$'
+                )
+
+                def __init__(self, ws):
+                    super().__init__(ws)
+                    self.server = server_ref
+                    self.upstream = None
+                    self.upstream_thread = None
+                    self.stop_event = threading.Event()
+                    self.close_lock = threading.Lock()
+                    self.tunnel_tag = 'agent=-, service=-'
+
+                def _close_both(self):
+                    with self.close_lock:
+                        try:
+                            if self.upstream is not None:
+                                self.upstream.close()
+                        except Exception:
+                            pass
+                        try:
+                            if self.ws is not None:
+                                self.ws.close()
+                        except Exception:
+                            pass
+
+                def on_open(self):
+                    environ = self.ws.environ or {}
+                    path = str(environ.get('PATH_INFO') or '')
+                    match = self._path_re.match(path)
+                    if not match:
+                        raise RuntimeError(f'invalid ws tunnel path: {path}')
+
+                    agent_key = match.group('agent_key')
+                    service_name = match.group('service_name')
+                    query = parse_qs(str(environ.get('QUERY_STRING') or ''), keep_blank_values=True)
+                    project_id = (query.get('project_id') or [''])[0]
+                    container_name = (query.get('container') or [''])[0]
+                    shell = (query.get('shell') or ['/bin/sh'])[0]
+                    mode = (query.get('mode') or ['shell'])[0]
+                    user = (query.get('user') or [''])[0]
+
+                    _, upstream_ws_url, tunnel_tag = self.server._prepare_agent_exec_ws_tunnel(
+                        agent_key=agent_key,
+                        service_name=service_name,
+                        project_id=project_id,
+                        container_name=container_name,
+                        shell=shell,
+                        mode=mode,
+                        user=user
+                    )
+                    self.tunnel_tag = tunnel_tag
+                    self.server.logger.info(f"终端中转WS打开: {self.tunnel_tag}, upstream={upstream_ws_url}")
+
+                    self.upstream = ws_client.create_connection(
+                        upstream_ws_url,
+                        timeout=15,
+                        enable_multithread=True
+                    )
+
+                    def _pump_upstream():
+                        try:
+                            while not self.stop_event.is_set():
+                                data = self.upstream.recv()
+                                if data is None:
+                                    break
+                                if data == '':
+                                    continue
+                                self.ws.send(data)
+                        except Exception as e:
+                            if not self.stop_event.is_set():
+                                self.server.logger.info(f"终端中转WS上行关闭: {self.tunnel_tag}, err={e!r}")
+                        finally:
+                            self.stop_event.set()
+                            self._close_both()
+
+                    self.upstream_thread = threading.Thread(target=_pump_upstream, daemon=True)
+                    self.upstream_thread.start()
+
+                def on_message(self, message, *args, **kwargs):
+                    if self.stop_event.is_set():
+                        return
+                    if message is None or message == '':
+                        return
+                    try:
+                        self.upstream.send(message)
+                    except Exception as e:
+                        self.server.logger.info(f"终端中转WS下行关闭: {self.tunnel_tag}, err={e!r}")
+                        self.stop_event.set()
+                        self._close_both()
+                        raise
+
+                def on_close(self, *args, **kwargs):
+                    self.server.logger.info(f"终端中转WS关闭: {self.tunnel_tag}")
+                    self.stop_event.set()
+                    self._close_both()
+
+            application = Resource(OrderedDict([
+                (r'^/api/agent/agent/[^/]+/services/[^/]+/exec/ws-tunnel$', AgentExecWsTunnelApplication),
+                (r'^/.*', self.app),
+            ]))
+
+            server = pywsgi.WSGIServer(
+                (self.config['host'], self.config['port']),
+                application,
+                handler_class=WebSocketHandler
+            )
+            server.serve_forever()
+        except Exception as e:
+            self.logger.warning(f"gevent WebSocket server不可用，回退Flask开发服务器: {e}")
+            self.app.run(
+                host=self.config['host'],
+                port=self.config['port'],
+                debug=self.config['debug'],
+                use_reloader=False,
+                threaded=True
+            )
 
 
 def adjust_timeout_config(config: Dict) -> Dict:
@@ -4555,12 +5587,14 @@ def adjust_timeout_config(config: Dict) -> Dict:
     default_timeouts = {
         'default': (10, 30),
         'health_check': (5, 10),
-        'deploy_create': (10, 60),
-        'deploy_start': (10, 900),
-        'deploy_stop': (10, 120),
-        'deploy_delete': (10, 60),
-        'undeploy': (10, 180),
-        'file_upload': (10, 600),
+        'deploy_create': (10, 7200),
+        'deploy_start': (10, 7200),
+        'deploy_stop': (10, 7200),
+        'deploy_delete': (10, 7200),
+        'undeploy': (10, 7200),
+        'file_upload': (10, 7200),
+        'deploy_start_grace_sec': 7200,
+        'deploy_start_poll_interval_sec': 15,
         'stream': (10, 3600),
         'proxy': (10, 300),
     }

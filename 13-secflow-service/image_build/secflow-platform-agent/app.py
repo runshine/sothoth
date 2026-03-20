@@ -7,10 +7,21 @@ WEB API服务器 - Docker Compose服务管理中心
 
 
 import sys
+import os
 import argparse
 import json
 from model.constants import *
 from api.web_api_server import adjust_timeout_config,WebAPIServer
+
+
+def _resolve_runtime_pod_id(config: dict, cli_pod_id: str = None) -> str:
+    if cli_pod_id:
+        return cli_pod_id
+    for env_key in ('POD_NAME', 'HOSTNAME'):
+        env_value = os.environ.get(env_key)
+        if env_value:
+            return env_value
+    return config.get('pod_id', 'webapi-server')
 
 # ===================== 主函数 =====================
 
@@ -46,8 +57,7 @@ def main():
         config['port'] = args.port
     if args.debug:
         config['debug'] = args.debug
-    if args.pod_id:
-        config['pod_id'] = args.pod_id
+    config['pod_id'] = _resolve_runtime_pod_id(config, args.pod_id)
     if args.skip_connection_check:
         config['skip_connection_check'] = True
 
@@ -60,7 +70,11 @@ def main():
         config['agent_api_timeouts']['proxy'] = (10, args.timeout)
 
     if args.deploy_timeout:
-        config['agent_api_timeouts']['deploy_start'] = (10, args.deploy_timeout)
+        deploy_read_timeout = int(args.deploy_timeout)
+        deploy_timeout_tuple = (10, deploy_read_timeout)
+        for key in ('deploy_create', 'deploy_start', 'deploy_stop', 'deploy_delete', 'undeploy', 'file_upload'):
+            config['agent_api_timeouts'][key] = deploy_timeout_tuple
+        config['agent_api_timeouts']['deploy_start_grace_sec'] = deploy_read_timeout
 
     # 打印启动信息
     print("=" * 60)
@@ -86,7 +100,7 @@ def main():
     except KeyboardInterrupt:
         print("\n正在关闭服务器...")
         if 'server' in locals():
-            server.stop_refresh_thread()
+            server.shutdown()
         sys.exit(0)
     except Exception as e:
         print(f"\n服务器启动失败: {e}")

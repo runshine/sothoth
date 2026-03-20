@@ -68,12 +68,14 @@ class AgentManager:
         self.timeouts = agent_api_timeouts or {
             'default': (10, 30),
             'health_check': (5, 10),
-            'deploy_create': (10, 60),
-            'deploy_start': (10, 900),
-            'deploy_stop': (10, 120),
-            'deploy_delete': (10, 60),
-            'undeploy': (10, 180),
-            'file_upload': (10, 600),
+            'deploy_create': (10, 7200),
+            'deploy_start': (10, 7200),
+            'deploy_stop': (10, 7200),
+            'deploy_delete': (10, 7200),
+            'undeploy': (10, 7200),
+            'file_upload': (10, 7200),
+            'deploy_start_grace_sec': 7200,
+            'deploy_start_poll_interval_sec': 15,
             'stream': (10, 3600),
             'proxy': (10, 300),
         }
@@ -457,6 +459,35 @@ class AgentManager:
             self.logger.error(f"获取Nacos服务列表异常: {str(e)}")
             return []
 
+    def _has_healthy_nacos_client_instance(self, service_name: str, expected_ip: str = None) -> bool:
+        """检查服务在 nacos-client 集群下是否仍有健康实例，避免残留 service name 重新带回失效 Agent。"""
+        try:
+            url = f"{self.nacos_url}/nacos/v1/ns/instance/list"
+            params = {
+                'serviceName': service_name,
+                'groupName': 'DEFAULT_GROUP',
+                'namespaceId': self.nacos_namespace,
+                'clusters': 'nacos-client'
+            }
+            response = requests.get(url, params=params, timeout=5, auth=self.nacos_auth)
+            if response.status_code != 200:
+                self.logger.debug(f"检查Nacos健康实例失败: service={service_name}, status={response.status_code}")
+                return False
+
+            payload = response.json() if response.content else {}
+            for host in payload.get('hosts') or []:
+                if expected_ip and str(host.get('ip') or '').strip() != expected_ip:
+                    continue
+                if host.get('healthy') is False:
+                    continue
+                if host.get('enabled') is False:
+                    continue
+                return True
+            return False
+        except Exception as e:
+            self.logger.debug(f"检查Nacos健康实例异常: service={service_name}, err={e}")
+            return False
+
     def _check_secflow_agent_agent_status(self, agent: AgentInfo) -> bool:
         try:
             # 首先检查是否有有效的agent_key
@@ -522,64 +553,127 @@ class AgentManager:
             agent.status = 'error'
             return False
 
-    def refresh_agents(self):
+    def refresh_agents(self, use_distributed_lock: bool = True):
         """刷新Agent列表（使用分布式锁确保只有一个POD执行刷新）"""
         lock_key = "agent_refresh_lock"
 
         try:
-            # 获取分布式锁（如果Redis不可用，会返回虚拟锁）
-            with self.redis_manager.get_lock(lock_key, timeout=30) as lock:
-                if lock.is_acquired():
-                    pass
-                else:
-                    self.logger.warning(f"POD {self.pod_id} 无法获取锁，跳过本次刷新...")
-                    return
-
-                services = self._fetch_nacos_services()
-                new_agents = {}
-
-                for service in services:
-                    result = self._parse_agent_name(service)
-                    if result:
-                        project_id, hostname, ip_address = result
-
-                        # 使用新方法获取agent_key，传入service_name
-                        agent_key = self._get_agent_key(hostname, ip_address, service)
-
-                        # 如果没有获取到有效的agent_key，跳过这个agent
-                        if not agent_key:
-                            self.logger.debug(f"跳过无效的agent: {hostname} ({ip_address}), 服务: {service}")
-                            continue
-
-                        agent = AgentInfo(
-                            key=agent_key,
-                            ip_address=ip_address,
-                            hostname=hostname,
-                            project_id=project_id,
-                            full_name=service,
-                            status='unknown',
-                            pod_id=self.pod_id
-                        )
-
-                        self._check_secflow_agent_agent_status(agent)
-                        self._save_agent_to_db(agent)
-                        new_agents[agent_key] = agent
-
-                with self.lock:
-                    for key, new_agent in new_agents.items():
-                        self.agents[key] = new_agent
-                        self._update_project(new_agent.project_id, key)
-
-                    removed_keys = [k for k in self.agents.keys() if k not in new_agents]
-                    for key in removed_keys:
-                        del self.agents[key]
-
-                self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个有效Agent")
-
+            if use_distributed_lock:
+                # 获取分布式锁（如果Redis不可用，会返回虚拟锁）
+                with self.redis_manager.get_lock(lock_key, timeout=30) as lock:
+                    if not lock.is_acquired():
+                        self.logger.warning(f"POD {self.pod_id} 无法获取锁，跳过本次刷新...")
+                        return
+                    self._refresh_agents_without_lock()
+            else:
+                self._refresh_agents_without_lock()
         except Exception as e:
             self.logger.error(f"刷新Agent列表异常: {str(e)}")
 
-    def cleanup_offline_agents(self, project_id: str = None) -> Tuple[bool, str, Dict]:
+    def _refresh_agents_without_lock(self):
+        services = self._fetch_nacos_services()
+        if not services:
+            self.logger.warning("本轮未从Nacos获取到任何Agent服务，跳过缺失Agent下线收敛")
+            return
+
+        new_agents = {}
+
+        for service in services:
+            result = self._parse_agent_name(service)
+            if result:
+                project_id, hostname, ip_address = result
+
+                if not self._has_healthy_nacos_client_instance(service, ip_address):
+                    self.logger.debug(f"跳过无健康实例的agent服务: {service}")
+                    continue
+
+                # 使用新方法获取agent_key，传入service_name
+                agent_key = self._get_agent_key(hostname, ip_address, service)
+
+                # 如果没有获取到有效的agent_key，跳过这个agent
+                if not agent_key:
+                    self.logger.debug(f"跳过无效的agent: {hostname} ({ip_address}), 服务: {service}")
+                    continue
+
+                agent = AgentInfo(
+                    key=agent_key,
+                    ip_address=ip_address,
+                    hostname=hostname,
+                    project_id=project_id,
+                    full_name=service,
+                    status='unknown',
+                    pod_id=self.pod_id
+                )
+
+                self._check_secflow_agent_agent_status(agent)
+                self._save_agent_to_db(agent)
+                new_agents[agent_key] = agent
+
+        self._mark_missing_agents_offline(set(new_agents.keys()))
+
+        with self.lock:
+            for key, new_agent in new_agents.items():
+                self.agents[key] = new_agent
+                self._update_project(new_agent.project_id, key)
+
+            removed_keys = [k for k in self.agents.keys() if k not in new_agents]
+            for key in removed_keys:
+                del self.agents[key]
+
+        self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个有效Agent")
+
+    def _mark_missing_agents_offline(self, active_keys: set):
+        """将本轮Nacos未发现但数据库中仍标记在线的Agent收敛为离线。"""
+        try:
+            table_name = self.db.get_table_name('agent_status')
+            rows = self.db.fetch_all(
+                f"SELECT agent_key, project_id, status FROM {table_name}"
+            ) or []
+
+            missing_online_keys = [
+                row['agent_key']
+                for row in rows
+                if row.get('agent_key')
+                and row.get('agent_key') not in active_keys
+                and (row.get('status') or '').lower() == 'online'
+            ]
+
+            if not missing_online_keys:
+                return
+
+            self.logger.info(f"将 {len(missing_online_keys)} 个未在Nacos中发现的旧在线Agent标记为offline")
+
+            if self.db.db_type == 'mysql':
+                placeholders = ','.join(['%s'] * len(missing_online_keys))
+                self.db.execute_query(
+                    f"UPDATE {table_name} "
+                    f"SET status = 'offline', pod_id = %s, updated_at = NOW() "
+                    f"WHERE agent_key IN ({placeholders})",
+                    (self.pod_id, *missing_online_keys)
+                )
+            else:
+                placeholders = ','.join(['?'] * len(missing_online_keys))
+                self.db.execute_query(
+                    f"UPDATE {table_name} "
+                    f"SET status = 'offline', pod_id = ?, updated_at = datetime('now') "
+                    f"WHERE agent_key IN ({placeholders})",
+                    (self.pod_id, *missing_online_keys)
+                )
+
+            with self.lock:
+                for agent_key in missing_online_keys:
+                    agent = self.agents.get(agent_key)
+                    if agent:
+                        agent.status = 'offline'
+                        agent.pod_id = self.pod_id
+                    for project in self.projects.values():
+                        if agent_key in project.agents:
+                            self._update_project(project.id, agent_key)
+
+        except Exception as e:
+            self.logger.error(f"收敛缺失Agent离线状态失败: {str(e)}")
+
+    def cleanup_offline_agents(self, project_id: str = None, force: bool = False) -> Tuple[bool, str, Dict]:
         """
         清除指定project下掉线的agent
 
@@ -601,11 +695,19 @@ class AgentManager:
 
                 # 构建查询条件
                 if project_id:
-                    where_clause = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
-                    where_clause_sqlite = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+                    if force:
+                        where_clause = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown')"
+                        where_clause_sqlite = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown')"
+                    else:
+                        where_clause = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                        where_clause_sqlite = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
                 else:
-                    where_clause = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
-                    where_clause_sqlite = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+                    if force:
+                        where_clause = " WHERE status IN ('offline', 'error', 'timeout', 'unknown')"
+                        where_clause_sqlite = " WHERE status IN ('offline', 'error', 'timeout', 'unknown')"
+                    else:
+                        where_clause = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                        where_clause_sqlite = " WHERE status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
 
                 # 查询所有掉线的agent
                 table_name = self.db.get_table_name('agent_status')
@@ -633,7 +735,7 @@ class AgentManager:
                         'timestamp': datetime.now().isoformat()
                     }
 
-                self.logger.info(f"找到 {len(offline_agents)} 个掉线agent需要清理")
+                self.logger.info(f"找到 {len(offline_agents)} 个掉线agent需要清理 force={force}")
 
                 # 记录清理信息
                 cleaned_agents = []
@@ -702,6 +804,7 @@ class AgentManager:
                 cleanup_info = {
                     'cleaned_count': cleaned_count,
                     'offline_count': len(offline_agents),
+                    'force': force,
                     'timestamp': datetime.now().isoformat(),
                     'pod_id': self.pod_id,
                     'cleaned_agents': cleaned_agents,
@@ -716,7 +819,7 @@ class AgentManager:
             self.logger.error(f"清除掉线agent失败: {str(e)}", exc_info=True)
             return False, f"清理失败: {str(e)}", {}
 
-    def get_offline_agents_count(self, project_id: str = None) -> Tuple[int, int]:
+    def get_offline_agents_count(self, project_id: str = None, force: bool = False) -> Tuple[int, int]:
         """
         获取掉线agent的统计信息
 
@@ -729,31 +832,37 @@ class AgentManager:
         try:
             # 构建过滤条件
             table_name = self.db.get_table_name('agent_status')
-            project_filter = ""
             params = []
             if project_id:
-                project_filter = " WHERE project_id = %s"
                 params.append(project_id)
 
             # 获取总agent数
             if self.db.db_type == 'mysql':
+                project_filter = " WHERE project_id = %s" if project_id else ""
                 total_result = self.db.fetch_one(
                     f"SELECT COUNT(*) as count FROM {table_name}{project_filter}",
                     tuple(params) if params else None
                 )
-                offline_filter = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < NOW() - INTERVAL 5 MINUTE"
+                offline_filter = " WHERE status IN ('offline', 'error', 'timeout', 'unknown')"
+                if project_id:
+                    offline_filter = " WHERE project_id = %s AND status IN ('offline', 'error', 'timeout', 'unknown')"
+                if not force:
+                    offline_filter += " AND updated_at < NOW() - INTERVAL 5 MINUTE"
                 offline_result = self.db.fetch_one(
                     f"SELECT COUNT(*) as count FROM {table_name}{offline_filter}",
                     tuple(params) if params else None
                 )
             else:
-                placeholders = "?" * len(params) if params else ""
-                project_filter_sql = f" WHERE project_id = {placeholders}" if project_id else ""
+                project_filter_sql = " WHERE project_id = ?" if project_id else ""
                 total_result = self.db.fetch_one(
                     f"SELECT COUNT(*) as count FROM {table_name}{project_filter_sql}",
                     tuple(params) if params else None
                 )
-                offline_filter_sql = f" WHERE project_id = {placeholders} AND status IN ('offline', 'error', 'timeout', 'unknown') AND updated_at < datetime('now', '-5 minutes')"
+                offline_filter_sql = " WHERE status IN ('offline', 'error', 'timeout', 'unknown')"
+                if project_id:
+                    offline_filter_sql = " WHERE project_id = ? AND status IN ('offline', 'error', 'timeout', 'unknown')"
+                if not force:
+                    offline_filter_sql += " AND updated_at < datetime('now', '-5 minutes')"
                 offline_result = self.db.fetch_one(
                     f"SELECT COUNT(*) as count FROM {table_name}{offline_filter_sql}",
                     tuple(params) if params else None
@@ -848,26 +957,38 @@ class AgentManager:
             return self.projects.get(project_id)
 
     def list_projects(self) -> List[Dict]:
-        with self.lock:
-            return [project.to_dict() for project in self.projects.values()]
+        table_name = self.db.get_table_name('agent_status')
+        try:
+            rows = self.db.fetch_all(
+                f"SELECT project_id, COUNT(*) AS agent_count, "
+                f"SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) AS online_agents, "
+                f"MAX(updated_at) AS last_refresh "
+                f"FROM {table_name} GROUP BY project_id ORDER BY project_id ASC"
+            ) or []
+            return [
+                {
+                    'id': row.get('project_id') or '',
+                    'agent_count': int(row.get('agent_count') or 0),
+                    'online_agents': int(row.get('online_agents') or 0),
+                    'last_refresh': str(row.get('last_refresh')) if row.get('last_refresh') else None,
+                    'agents': []
+                }
+                for row in rows if row.get('project_id') is not None
+            ]
+        except Exception:
+            with self.lock:
+                return [project.to_dict() for project in self.projects.values()]
 
     def get_project_agents(self, project_id: str) -> List[Dict]:
-        with self.lock:
-            project = self.projects.get(project_id)
-            if not project:
-                return []
-
-            agents = []
-            for agent_key in project.agents:
-                agent = self.agents.get(agent_key)
-                if agent:
-                    agents.append(agent.to_dict())
-
-            return agents
+        agents, _ = self.list_agents(1, 10000, project_id)
+        return agents
 
     def get_agent(self, key: str) -> Optional[AgentInfo]:
         with self.lock:
-            return self.agents.get(key)
+            agent = self.agents.get(key)
+        if agent:
+            return agent
+        return self.ensure_agent_exists(key)
 
     def ensure_agent_exists(self, agent_key: str) -> Optional[AgentInfo]:
         """
@@ -999,101 +1120,151 @@ class AgentManager:
 
     def list_agents(self, page: int = 1, per_page: int = 20,
                     project_id: str = None) -> Tuple[List[Dict], int]:
-        with self.lock:
-            if project_id:
-                table_name = self.db.get_table_name('agent_status')
-                if self.db.db_type == 'mysql':
-                    rows = self.db.fetch_all(
-                        f"SELECT * FROM {table_name} WHERE project_id = %s ORDER BY updated_at DESC",
-                        (project_id,)
-                    )
+        table_name = self.db.get_table_name('agent_status')
+
+        def _decode_row(row: Dict) -> Optional[Dict]:
+            key = row.get('agent_key')
+            if not key:
+                return None
+
+            data = {
+                'key': key,
+                'ip_address': row.get('ip_address'),
+                'hostname': row.get('hostname'),
+                'project_id': row.get('project_id'),
+                'full_name': row.get('full_name'),
+                'status': row.get('status') or 'unknown',
+                'pod_id': row.get('pod_id'),
+                'updated_at': str(row.get('updated_at')) if row.get('updated_at') else None,
+            }
+
+            last_seen = row.get('last_seen')
+            if last_seen:
+                data['last_seen'] = str(last_seen)
+
+            system_info = row.get('system_info')
+            if system_info:
+                if isinstance(system_info, str):
+                    try:
+                        data['system_info'] = json.loads(system_info)
+                    except Exception:
+                        data['system_info'] = {}
                 else:
-                    rows = self.db.fetch_all(
-                        f"SELECT * FROM {table_name} WHERE project_id = ? ORDER BY updated_at DESC",
-                        (project_id,)
-                    )
+                    data['system_info'] = system_info
 
-                agents_map: Dict[str, Dict] = {}
+            daemon_info = row.get('daemon_info')
+            if daemon_info:
+                if isinstance(daemon_info, str):
+                    try:
+                        data['daemon_info'] = json.loads(daemon_info)
+                    except Exception:
+                        data['daemon_info'] = {}
+                else:
+                    data['daemon_info'] = daemon_info
 
-                for row in rows or []:
-                    key = row.get('agent_key')
-                    if not key:
-                        continue
+            services = row.get('services')
+            if services:
+                if isinstance(services, str):
+                    try:
+                        data['services'] = json.loads(services)
+                    except Exception:
+                        data['services'] = []
+                else:
+                    data['services'] = services
 
-                    data = {
-                        'key': key,
-                        'ip_address': row.get('ip_address'),
-                        'hostname': row.get('hostname'),
-                        'project_id': row.get('project_id'),
-                        'full_name': row.get('full_name'),
-                        'status': row.get('status') or 'unknown',
-                        'pod_id': row.get('pod_id'),
-                    }
+            return data
 
-                    last_seen = row.get('last_seen')
-                    if last_seen:
-                        data['last_seen'] = str(last_seen)
-
-                    system_info = row.get('system_info')
-                    if system_info:
-                        if isinstance(system_info, str):
-                            try:
-                                data['system_info'] = json.loads(system_info)
-                            except Exception:
-                                data['system_info'] = {}
-                        else:
-                            data['system_info'] = system_info
-
-                    daemon_info = row.get('daemon_info')
-                    if daemon_info:
-                        if isinstance(daemon_info, str):
-                            try:
-                                data['daemon_info'] = json.loads(daemon_info)
-                            except Exception:
-                                data['daemon_info'] = {}
-                        else:
-                            data['daemon_info'] = daemon_info
-
-                    services = row.get('services')
-                    if services:
-                        if isinstance(services, str):
-                            try:
-                                data['services'] = json.loads(services)
-                            except Exception:
-                                data['services'] = []
-                        else:
-                            data['services'] = services
-
-                    agents_map[key] = data
-
-                # 用内存中的最新状态覆盖同key数据（如果存在）
-                for key, agent in self.agents.items():
-                    if agent.project_id != project_id:
-                        continue
-                    agents_map[key] = {
-                        **agents_map.get(key, {}),
-                        **agent.to_dict()
-                    }
-
-                agents_list = list(agents_map.values())
-                for item in agents_list:
-                    status = (item.get('status') or 'unknown').lower()
-                    item['is_allowed'] = status == 'online'
-                    item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
-                    item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
-
-                total = len(agents_list)
-                start_idx = (page - 1) * per_page
-                end_idx = start_idx + per_page
-                return agents_list[start_idx:end_idx], total
+        memory_agents: Dict[str, Dict] = {}
+        lock_acquired = self.lock.acquire(timeout=0.2)
+        try:
+            if lock_acquired:
+                memory_agents = {
+                    key: agent.to_dict()
+                    for key, agent in self.agents.items()
+                    if (not project_id) or agent.project_id == project_id
+                }
             else:
-                agents_list = list(self.agents.values())
-                total = len(agents_list)
-                start_idx = (page - 1) * per_page
-                end_idx = start_idx + per_page
-                paginated_agents = agents_list[start_idx:end_idx]
+                self.logger.warning(
+                    f"list_agents 获取内存锁超时，回退到数据库快照: project_id={project_id or '*'}"
+                )
+        finally:
+            if lock_acquired:
+                self.lock.release()
 
-                return [agent.to_dict() for agent in paginated_agents], total
+        if project_id:
+            if self.db.db_type == 'mysql':
+                rows = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} WHERE project_id = %s ORDER BY updated_at DESC",
+                    (project_id,)
+                )
+            else:
+                rows = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} WHERE project_id = ? ORDER BY updated_at DESC",
+                    (project_id,)
+                )
+
+            agents_map: Dict[str, Dict] = {}
+            for row in rows or []:
+                decoded = _decode_row(row)
+                if decoded:
+                    agents_map[decoded['key']] = decoded
+
+            for key, agent_data in memory_agents.items():
+                agents_map[key] = {
+                    **agents_map.get(key, {}),
+                    **agent_data
+                }
+
+            agents_list = list(agents_map.values())
+            for item in agents_list:
+                status = (item.get('status') or 'unknown').lower()
+                updated_at_raw = item.get('updated_at')
+                if status == 'online' and updated_at_raw:
+                    try:
+                        updated_at = datetime.fromisoformat(str(updated_at_raw).replace('Z', '+00:00'))
+                        if updated_at.tzinfo is not None:
+                            updated_at = updated_at.astimezone().replace(tzinfo=None)
+                        if datetime.now() - updated_at > timedelta(minutes=5):
+                            status = 'offline'
+                            item['status'] = 'offline'
+                            item['status_reason'] = '节点超过5分钟未在Nacos刷新，已自动视为离线'
+                    except Exception:
+                        pass
+                item['is_allowed'] = status == 'online'
+                item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
+                item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
+
+            total = len(agents_list)
+            start_idx = (page - 1) * per_page
+            end_idx = start_idx + per_page
+            return agents_list[start_idx:end_idx], total
+
+        if self.db.db_type == 'mysql':
+            rows = self.db.fetch_all(
+                f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
+            )
+        else:
+            rows = self.db.fetch_all(
+                f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
+            )
+
+        agents_map: Dict[str, Dict] = {}
+        for row in rows or []:
+            decoded = _decode_row(row)
+            if decoded:
+                agents_map[decoded['key']] = decoded
+
+        for key, agent_data in memory_agents.items():
+            agents_map[key] = {
+                **agents_map.get(key, {}),
+                **agent_data
+            }
+
+        agents_list = list(agents_map.values())
+        total = len(agents_list)
+        start_idx = (page - 1) * per_page
+        end_idx = start_idx + per_page
+        return agents_list[start_idx:end_idx], total
 
     def call_agent_api(self, agent_key: str, method: str, endpoint: str,
                        data: Any = None, params: Dict = None,

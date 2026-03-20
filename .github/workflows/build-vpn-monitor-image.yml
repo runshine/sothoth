@@ -6,8 +6,19 @@ on:
     paths:
       - .github/workflows/build-vpn-monitor-image.yml
       - 02-vpn-access-service/image_build/vpn-monitor/**
+
 jobs:
-  build-vpn-monitor-image:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      date_tag: ${{ steps.date.outputs.date_tag }}
+    steps:
+      - name: Generate date tag
+        id: date
+        run: echo "date_tag=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+
+  build-amd64:
+    needs: prepare
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -15,17 +26,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Generate date tag
-        id: date
-        run: echo "date_tag=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
-
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -39,16 +39,100 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push vpn-monitor-image
-        uses: docker/build-push-action@v5
-        with:
-          context: 02-vpn-access-service/image_build/vpn-monitor
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            runshine0819/vpn-monitor:latest
-            ghcr.io/runshine/vpn-monitor:latest
-            runshine0819/vpn-monitor:${{ steps.date.outputs.date_tag }}
-            ghcr.io/runshine/vpn-monitor:${{ steps.date.outputs.date_tag }}
-          file: 02-vpn-access-service/image_build/vpn-monitor/Dockerfile
+      - name: Build amd64 image
+        run: |
+          docker build \
+            --file 02-vpn-access-service/image_build/vpn-monitor/Dockerfile \
+            --tag runshine0819/vpn-monitor:amd64-latest \
+            --tag ghcr.io/runshine/vpn-monitor:amd64-latest \
+            --tag runshine0819/vpn-monitor:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/vpn-monitor:amd64-${{ needs.prepare.outputs.date_tag }} \
+            02-vpn-access-service/image_build/vpn-monitor
 
+      - name: Push amd64 image
+        run: |
+          docker push runshine0819/vpn-monitor:amd64-latest
+          docker push ghcr.io/runshine/vpn-monitor:amd64-latest
+          docker push runshine0819/vpn-monitor:amd64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/vpn-monitor:amd64-${{ needs.prepare.outputs.date_tag }}
+
+  build-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build arm64 image
+        run: |
+          docker build \
+            --file 02-vpn-access-service/image_build/vpn-monitor/Dockerfile \
+            --tag runshine0819/vpn-monitor:arm64-latest \
+            --tag ghcr.io/runshine/vpn-monitor:arm64-latest \
+            --tag runshine0819/vpn-monitor:arm64-${{ needs.prepare.outputs.date_tag }} \
+            --tag ghcr.io/runshine/vpn-monitor:arm64-${{ needs.prepare.outputs.date_tag }} \
+            02-vpn-access-service/image_build/vpn-monitor
+
+      - name: Push arm64 image
+        run: |
+          docker push runshine0819/vpn-monitor:arm64-latest
+          docker push ghcr.io/runshine/vpn-monitor:arm64-latest
+          docker push runshine0819/vpn-monitor:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker push ghcr.io/runshine/vpn-monitor:arm64-${{ needs.prepare.outputs.date_tag }}
+
+  merge-manifest:
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest (latest)
+        run: |
+          docker manifest create runshine0819/vpn-monitor:latest \
+            --amend runshine0819/vpn-monitor:amd64-latest \
+            --amend runshine0819/vpn-monitor:arm64-latest
+          docker manifest create ghcr.io/runshine/vpn-monitor:latest \
+            --amend ghcr.io/runshine/vpn-monitor:amd64-latest \
+            --amend ghcr.io/runshine/vpn-monitor:arm64-latest
+          docker manifest push runshine0819/vpn-monitor:latest
+          docker manifest push ghcr.io/runshine/vpn-monitor:latest
+
+      - name: Create and push multi-arch manifest (date tag)
+        run: |
+          docker manifest create runshine0819/vpn-monitor:${{ needs.prepare.outputs.date_tag }} \
+            --amend runshine0819/vpn-monitor:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend runshine0819/vpn-monitor:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker manifest create ghcr.io/runshine/vpn-monitor:${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/vpn-monitor:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/vpn-monitor:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker manifest push runshine0819/vpn-monitor:${{ needs.prepare.outputs.date_tag }}
+          docker manifest push ghcr.io/runshine/vpn-monitor:${{ needs.prepare.outputs.date_tag }}

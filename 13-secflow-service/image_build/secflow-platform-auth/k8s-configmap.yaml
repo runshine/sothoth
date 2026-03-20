@@ -25,3 +25,10 @@ data:
       secret_key: "secflow-jwt-secret-key-change-in-production"
       algorithm: "HS256"
       access_token_expire_minutes: 1440
+
+    # Project Service Configuration
+    project_service:
+      host: "secflow-platform-project"
+      port: 80
+      project_list_path: "/api/project/list"
+      timeout: 10

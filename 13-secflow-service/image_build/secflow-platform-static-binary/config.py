@@ -109,6 +109,13 @@ class LoggingConfig(BaseModel):
     format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
 
+class AutoVerifyConfig(BaseModel):
+    """自动校验配置"""
+    enabled: bool = True
+    interval_seconds: int = 60
+    batch_size: int = 20
+
+
 class Config(BaseModel):
     """主配置类"""
     database: DatabaseConfig
@@ -116,6 +123,7 @@ class Config(BaseModel):
     registry: RegistryConfig
     storage: StorageConfig
     app: AppConfig
+    auto_verify: AutoVerifyConfig = AutoVerifyConfig()
     logging: LoggingConfig = LoggingConfig()
 
 

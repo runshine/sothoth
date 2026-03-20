@@ -30,6 +30,13 @@ data:
     service_auth:
       machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
       machine_token_record_file: "/tmp/secflow-machine-token.txt"
+
+    # Project Service Configuration
+    project_service:
+      host: "secflow-platform-project"
+      port: 80
+      project_list_path: "/api/project/list"
+      timeout: 10
     
     # 服务注册配置
     registry:

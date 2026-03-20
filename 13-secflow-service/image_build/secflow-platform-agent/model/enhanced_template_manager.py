@@ -2,10 +2,12 @@ import logging
 import tarfile
 import tempfile
 import hashlib
+from contextlib import ExitStack
 
 
 from .db import DatabaseManager
 from .constants import COMPRESSION_EXT_MAPPING, SUPPORTED_FORMATS
+from .redis_manager import RedisManager
 import io
 import zipfile
 import shutil
@@ -207,9 +209,12 @@ class DockerComposeParser:
 class EnhancedTemplateManager:
     """完整增强版模板管理器，支持多种压缩格式"""
 
-    def __init__(self, templates_root: str, db_manager: DatabaseManager, supported_formats: List[str] = None):
+    def __init__(self, templates_root: str, db_manager: DatabaseManager,
+                 supported_formats: List[str] = None,
+                 redis_manager: Optional[RedisManager] = None):
         self.templates_root = Path(templates_root)
         self.db = db_manager
+        self.redis_manager = redis_manager
         self.templates_root.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger(__name__)
 
@@ -218,6 +223,21 @@ class EnhancedTemplateManager:
         self.compression_map = COMPRESSION_EXT_MAPPING
 
         self.logger.info(f"模板管理器初始化，支持格式: {', '.join(self.supported_formats)}")
+
+    def _template_lock_names(self, names: List[str]) -> List[str]:
+        return sorted({str(name or '').strip() for name in names if str(name or '').strip()})
+
+    def _with_template_locks(self, names: List[str], callback, timeout: int = 120):
+        lock_names = self._template_lock_names(names)
+        if not lock_names or not self.redis_manager:
+            return callback()
+
+        with ExitStack() as stack:
+            for name in lock_names:
+                lock = stack.enter_context(self.redis_manager.get_lock(f"template_write:{name}", timeout=timeout))
+                if not lock.is_acquired():
+                    return False, f"模板 '{name}' 正在被其他实例修改，请稍后重试"
+            return callback()
 
     def _normalize_web_port_presets(self, presets: Any) -> List[Dict[str, Any]]:
         """规范化模板预制Web端口配置。"""
@@ -376,6 +396,14 @@ class EnhancedTemplateManager:
             if not safe_path:
                 return False, f"无效的文件路径: {file_path}", {}
 
+            if template_type == 'yaml' and safe_path.suffix.lower() in ['.yaml', '.yml']:
+                main_file = Path(template.get('file_path') or '')
+                if main_file.exists() and safe_path.resolve() != main_file.resolve():
+                    return False, f"yaml模板仅允许编辑主文件: {main_file.name}", {
+                        'expected_path': str(main_file.name),
+                        'requested_path': str(safe_path.relative_to(template_dir))
+                    }
+
             # 确保父目录存在
             safe_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -472,6 +500,11 @@ class EnhancedTemplateManager:
                 )
 
             self.logger.info(f"模板文件更新成功: {template_name}/{file_path}, 大小: {file_size} 字节")
+            if template_type == 'yaml' and safe_path.suffix.lower() in ['.yaml', '.yml']:
+                removed = self._cleanup_extra_yaml_files_for_yaml_template(template)
+                if removed:
+                    update_info['removed_extra_yaml_files'] = removed
+                    self.logger.info(f"模板 '{template_name}' 已清理多余YAML: {removed}")
             return True, f"文件更新成功", update_info
 
         except Exception as e:
@@ -1837,9 +1870,22 @@ class EnhancedTemplateManager:
         v = (value or 'shared').strip().lower()
         return v if v in ('shared', 'private') else 'shared'
 
+    @staticmethod
+    def _is_super_admin(user_id: str = '', username: str = '') -> bool:
+        """
+        超级管理员判定：
+        - UID=1 强制为管理员（核心规则）
+        - 兼容：用户名 admin 也视为管理员
+        """
+        uid = str(user_id or '').strip()
+        uname = str(username or '').strip().lower()
+        return uid == '1' or uname == 'admin'
+
     def can_view_template(self, template: Optional[Dict], user_id: str = '', username: str = '') -> bool:
         if not template:
             return False
+        if self._is_super_admin(user_id, username):
+            return True
         visibility = self._normalize_visibility(template.get('visibility'))
         if visibility == 'shared':
             return True
@@ -1854,6 +1900,8 @@ class EnhancedTemplateManager:
     def can_manage_template(self, template: Optional[Dict], user_id: str = '', username: str = '') -> bool:
         if not template:
             return False
+        if self._is_super_admin(user_id, username):
+            return True
         owner_id = str(template.get('owner_id') or '').strip()
         owner_name = str(template.get('owner_name') or '').strip()
         if owner_id and user_id and owner_id == str(user_id).strip():
@@ -1882,6 +1930,38 @@ class EnhancedTemplateManager:
             if file_path.is_file():
                 total_size += file_path.stat().st_size
         return total_size
+
+    def _cleanup_extra_yaml_files_for_yaml_template(self, template: Dict) -> List[str]:
+        """
+        yaml类型模板只保留主YAML（file_path），清理同目录下其他yaml/yml文件。
+        返回被删除的相对路径列表。
+        """
+        removed: List[str] = []
+        try:
+            if not template or template.get('type') != 'yaml':
+                return removed
+            name = str(template.get('name') or '').strip()
+            if not name:
+                return removed
+            template_dir = self.templates_root / name
+            if not template_dir.exists():
+                return removed
+            main_file = Path(template.get('file_path') or '')
+            if not main_file.exists():
+                return removed
+            main_resolved = main_file.resolve()
+            candidates = list(template_dir.rglob('*.yaml')) + list(template_dir.rglob('*.yml'))
+            for p in candidates:
+                try:
+                    if p.resolve() == main_resolved:
+                        continue
+                    p.unlink()
+                    removed.append(str(p.relative_to(template_dir)))
+                except Exception:
+                    continue
+        except Exception as e:
+            self.logger.warning(f"清理多余YAML文件失败: {str(e)}")
+        return removed
 
     def get_template_file(self, name: str) -> Optional[Path]:
         """获取模板文件路径（兼容旧接口）"""
@@ -1920,6 +2000,9 @@ class EnhancedTemplateManager:
                 return False, f"模板文件不存在: {file_path}", ""
 
             if template_type == 'yaml':
+                removed = self._cleanup_extra_yaml_files_for_yaml_template(template)
+                if removed:
+                    self.logger.info(f"模板 '{name}' 清理多余YAML: {removed}")
                 # 直接读取YAML文件
                 with open(file_path, 'r', encoding='utf-8') as f:
                     yaml_content = f.read()
@@ -2005,6 +2088,10 @@ class EnhancedTemplateManager:
                 )
 
                 self.logger.info(f"YAML模板 '{name}' 更新成功，新大小: {new_size} 字节")
+
+                removed = self._cleanup_extra_yaml_files_for_yaml_template(template)
+                if removed:
+                    self.logger.info(f"模板 '{name}' 已清理多余YAML: {removed}")
 
                 # 重新解析 docker-compose
                 try:
@@ -2357,9 +2444,18 @@ class EnhancedTemplateManager:
         table_name = self.db.get_table_name('service_templates')
         user_id = str(user_id or '').strip()
         username = str(username or '').strip()
+        is_super_admin = self._is_super_admin(user_id, username)
 
         if self.db.db_type == 'mysql':
-            if user_id or username:
+            if is_super_admin:
+                templates = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+                    (per_page, offset)
+                )
+                count_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name}"
+                )
+            elif user_id or username:
                 where_clause = "visibility = 'shared' OR owner_id = %s OR owner_name = %s"
                 templates = self.db.fetch_all(
                     f"SELECT * FROM {table_name} WHERE ({where_clause}) ORDER BY updated_at DESC LIMIT %s OFFSET %s",
@@ -2378,7 +2474,15 @@ class EnhancedTemplateManager:
                     f"SELECT COUNT(*) as count FROM {table_name} WHERE visibility = 'shared'"
                 )
         else:
-            if user_id or username:
+            if is_super_admin:
+                templates = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                    (per_page, offset)
+                )
+                count_result = self.db.fetch_one(
+                    f"SELECT COUNT(*) as count FROM {table_name}"
+                )
+            elif user_id or username:
                 where_clause = "visibility = 'shared' OR owner_id = ? OR owner_name = ?"
                 templates = self.db.fetch_all(
                     f"SELECT * FROM {table_name} WHERE ({where_clause}) ORDER BY updated_at DESC LIMIT ? OFFSET ?",
