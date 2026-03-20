@@ -1063,115 +1063,138 @@ class AgentManager:
 
     def list_agents(self, page: int = 1, per_page: int = 20,
                     project_id: str = None) -> Tuple[List[Dict], int]:
-        with self.lock:
-            if project_id:
-                table_name = self.db.get_table_name('agent_status')
-                if self.db.db_type == 'mysql':
-                    rows = self.db.fetch_all(
-                        f"SELECT * FROM {table_name} WHERE project_id = %s ORDER BY updated_at DESC",
-                        (project_id,)
-                    )
+        table_name = self.db.get_table_name('agent_status')
+
+        def _decode_row(row: Dict) -> Optional[Dict]:
+            key = row.get('agent_key')
+            if not key:
+                return None
+
+            data = {
+                'key': key,
+                'ip_address': row.get('ip_address'),
+                'hostname': row.get('hostname'),
+                'project_id': row.get('project_id'),
+                'full_name': row.get('full_name'),
+                'status': row.get('status') or 'unknown',
+                'pod_id': row.get('pod_id'),
+            }
+
+            last_seen = row.get('last_seen')
+            if last_seen:
+                data['last_seen'] = str(last_seen)
+
+            system_info = row.get('system_info')
+            if system_info:
+                if isinstance(system_info, str):
+                    try:
+                        data['system_info'] = json.loads(system_info)
+                    except Exception:
+                        data['system_info'] = {}
                 else:
-                    rows = self.db.fetch_all(
-                        f"SELECT * FROM {table_name} WHERE project_id = ? ORDER BY updated_at DESC",
-                        (project_id,)
-                    )
+                    data['system_info'] = system_info
 
-                agents_map: Dict[str, Dict] = {}
+            daemon_info = row.get('daemon_info')
+            if daemon_info:
+                if isinstance(daemon_info, str):
+                    try:
+                        data['daemon_info'] = json.loads(daemon_info)
+                    except Exception:
+                        data['daemon_info'] = {}
+                else:
+                    data['daemon_info'] = daemon_info
 
-                for row in rows or []:
-                    key = row.get('agent_key')
-                    if not key:
-                        continue
+            services = row.get('services')
+            if services:
+                if isinstance(services, str):
+                    try:
+                        data['services'] = json.loads(services)
+                    except Exception:
+                        data['services'] = []
+                else:
+                    data['services'] = services
 
-                    data = {
-                        'key': key,
-                        'ip_address': row.get('ip_address'),
-                        'hostname': row.get('hostname'),
-                        'project_id': row.get('project_id'),
-                        'full_name': row.get('full_name'),
-                        'status': row.get('status') or 'unknown',
-                        'pod_id': row.get('pod_id'),
-                    }
+            return data
 
-                    last_seen = row.get('last_seen')
-                    if last_seen:
-                        data['last_seen'] = str(last_seen)
-
-                    system_info = row.get('system_info')
-                    if system_info:
-                        if isinstance(system_info, str):
-                            try:
-                                data['system_info'] = json.loads(system_info)
-                            except Exception:
-                                data['system_info'] = {}
-                        else:
-                            data['system_info'] = system_info
-
-                    daemon_info = row.get('daemon_info')
-                    if daemon_info:
-                        if isinstance(daemon_info, str):
-                            try:
-                                data['daemon_info'] = json.loads(daemon_info)
-                            except Exception:
-                                data['daemon_info'] = {}
-                        else:
-                            data['daemon_info'] = daemon_info
-
-                    services = row.get('services')
-                    if services:
-                        if isinstance(services, str):
-                            try:
-                                data['services'] = json.loads(services)
-                            except Exception:
-                                data['services'] = []
-                        else:
-                            data['services'] = services
-
-                    agents_map[key] = data
-
-                # 用内存中的最新状态覆盖同key数据（如果存在）
-                for key, agent in self.agents.items():
-                    if agent.project_id != project_id:
-                        continue
-                    agents_map[key] = {
-                        **agents_map.get(key, {}),
-                        **agent.to_dict()
-                    }
-
-                agents_list = list(agents_map.values())
-                for item in agents_list:
-                    status = (item.get('status') or 'unknown').lower()
-                    item['is_allowed'] = status == 'online'
-                    item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
-                    item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
-
-                total = len(agents_list)
-                start_idx = (page - 1) * per_page
-                end_idx = start_idx + per_page
-                return agents_list[start_idx:end_idx], total
+        memory_agents: Dict[str, Dict] = {}
+        lock_acquired = self.lock.acquire(timeout=0.2)
+        try:
+            if lock_acquired:
+                memory_agents = {
+                    key: agent.to_dict()
+                    for key, agent in self.agents.items()
+                    if (not project_id) or agent.project_id == project_id
+                }
             else:
-                table_name = self.db.get_table_name('agent_status')
-                if self.db.db_type == 'mysql':
-                    rows = self.db.fetch_all(
-                        f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
-                    )
-                else:
-                    rows = self.db.fetch_all(
-                        f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
-                    )
-                agents_list = []
-                for row in rows or []:
-                    key = row.get('agent_key')
-                    if not key:
-                        continue
-                    agent = self.ensure_agent_exists(key)
-                    if agent:
-                        agents_list.append(agent.to_dict())
-                total = len(agents_list)
-                start_idx = (page - 1) * per_page
-                end_idx = start_idx + per_page
-                return agents_list[start_idx:end_idx], total
+                self.logger.warning(
+                    f"list_agents 获取内存锁超时，回退到数据库快照: project_id={project_id or '*'}"
+                )
+        finally:
+            if lock_acquired:
+                self.lock.release()
+
+        if project_id:
+            if self.db.db_type == 'mysql':
+                rows = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} WHERE project_id = %s ORDER BY updated_at DESC",
+                    (project_id,)
+                )
+            else:
+                rows = self.db.fetch_all(
+                    f"SELECT * FROM {table_name} WHERE project_id = ? ORDER BY updated_at DESC",
+                    (project_id,)
+                )
+
+            agents_map: Dict[str, Dict] = {}
+            for row in rows or []:
+                decoded = _decode_row(row)
+                if decoded:
+                    agents_map[decoded['key']] = decoded
+
+            for key, agent_data in memory_agents.items():
+                agents_map[key] = {
+                    **agents_map.get(key, {}),
+                    **agent_data
+                }
+
+            agents_list = list(agents_map.values())
+            for item in agents_list:
+                status = (item.get('status') or 'unknown').lower()
+                item['is_allowed'] = status == 'online'
+                item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
+                item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
+
+            total = len(agents_list)
+            start_idx = (page - 1) * per_page
+            end_idx = start_idx + per_page
+            return agents_list[start_idx:end_idx], total
+
+        if self.db.db_type == 'mysql':
+            rows = self.db.fetch_all(
+                f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
+            )
+        else:
+            rows = self.db.fetch_all(
+                f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
+            )
+
+        agents_map: Dict[str, Dict] = {}
+        for row in rows or []:
+            decoded = _decode_row(row)
+            if decoded:
+                agents_map[decoded['key']] = decoded
+
+        for key, agent_data in memory_agents.items():
+            agents_map[key] = {
+                **agents_map.get(key, {}),
+                **agent_data
+            }
+
+        agents_list = list(agents_map.values())
+        total = len(agents_list)
+        start_idx = (page - 1) * per_page
+        end_idx = start_idx + per_page
+        return agents_list[start_idx:end_idx], total
 
     def call_agent_api(self, agent_key: str, method: str, endpoint: str,
                        data: Any = None, params: Dict = None,
