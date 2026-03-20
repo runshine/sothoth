@@ -1131,6 +1131,43 @@ class WebAPIServer:
             # 无法确定时不阻断请求，交由后续流程处理
             return False
 
+    def _service_exists_in_snapshot(self, agent_key: str, service_name: str) -> bool:
+        """检查平台已同步的服务快照中是否存在同名服务。"""
+        try:
+            table_name = self.db_manager.get_table_name('agent_services')
+            if self.db_manager.db_type == 'mysql':
+                row = self.db_manager.fetch_one(
+                    f"""
+                    SELECT id
+                    FROM {table_name}
+                    WHERE agent_key = %s
+                      AND service_name = %s
+                      AND is_deleted = 0
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (agent_key, service_name)
+                )
+            else:
+                row = self.db_manager.fetch_one(
+                    f"""
+                    SELECT id
+                    FROM {table_name}
+                    WHERE agent_key = ?
+                      AND service_name = ?
+                      AND is_deleted = 0
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (agent_key, service_name)
+                )
+            return bool(row)
+        except Exception as e:
+            self.logger.warning(
+                f"检查平台服务快照是否重复失败: agent={agent_key}, service={service_name}, error={e}"
+            )
+            return False
+
     def _probe_agent_exec_ws_capability(self, agent: AgentInfo, service_name: str,
                                         container_name: str, shell: str, mode: str, user: str) -> Tuple[bool, int, str]:
         """
@@ -1181,7 +1218,7 @@ class WebAPIServer:
             return False, 500, str(e)
 
     def _check_deploy_duplicate(self, service_name: str, agent_key: str, project_id: str) -> Optional[Dict[str, Any]]:
-        """统一部署防重检查：进行中的部署任务 + Agent已存在服务。"""
+        """统一部署防重检查：进行中的部署任务 + Agent/平台快照中已存在服务。"""
         active_task = self.task_manager.find_active_task_for_service(
             'deploy', service_name, agent_key, project_id
         )
@@ -1196,7 +1233,13 @@ class WebAPIServer:
         if self._service_exists_on_agent(agent_key, service_name):
             return {
                 'reason': 'existing_service',
-                'message': f'服务 {service_name} 在节点 {agent_key} 上已存在，禁止重复部署'
+                'message': f'服务 {service_name} 在节点 {agent_key} 上已存在，禁止重复部署，请先手动删除后再部署'
+            }
+
+        if self._service_exists_in_snapshot(agent_key, service_name):
+            return {
+                'reason': 'existing_service_snapshot',
+                'message': f'服务 {service_name} 在节点 {agent_key} 的平台快照中已存在，禁止重复部署，请先手动删除后再部署'
             }
 
         return None

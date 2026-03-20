@@ -138,6 +138,22 @@ class TaskManager:
             return 404, {'error': 'service not found in list'}, ''
         return code, resp, ''
 
+    def _fail_if_service_already_exists(self, task_id: str, agent_key: str, service_name: str) -> bool:
+        """部署前做严格防重检查：若目标节点已有同名服务，直接失败。"""
+        try:
+            code, payload, _ = self._get_service_status(agent_key, service_name)
+            if code == 200:
+                message = f'服务 {service_name} 在节点 {agent_key} 上已存在，请先手动删除后再部署'
+                self._update_task_status(task_id, 'failed', 20, message)
+                self._add_task_log(
+                    task_id, 'ERROR',
+                    f"{message}; duplicate_payload={str(payload)[:300]}"
+                )
+                return True
+        except Exception as e:
+            self._add_task_log(task_id, 'WARN', f"部署前重复检查异常，继续后续流程: {e}")
+        return False
+
     def _wait_service_ready_after_start_timeout(self, task_id: str, agent_key: str, service_name: str) -> bool:
         """
         start接口超时后的兜底检查。
@@ -603,6 +619,9 @@ class TaskManager:
             self._add_task_log(task_id, 'INFO', f"服务名称: {service_name}")
             self._add_task_log(task_id, 'INFO', f"使用模板: {template_name}")
 
+            if self._fail_if_service_already_exists(task_id, agent_key, service_name):
+                return
+
             # 2. 检查模板是否存在
             if not template_name:
                 self._update_task_status(task_id, 'failed', 0, '未指定模板名称')
@@ -715,56 +734,9 @@ class TaskManager:
                     )
 
             elif status_code == 409:
-                # 服务已存在，重新创建
-                self._update_task_status(task_id, 'running', 70, '服务已存在，尝试重新创建')
-                self._add_task_log(task_id, 'INFO', '停止现有服务')
-
-                # 先停止并删除现有服务
-                self.agent_manager.call_agent_api(
-                    agent_key, 'POST', f'/api/services/{service_name}/stop', {},
-                    timeout_type='deploy_stop'
-                )
-
-                time.sleep(3)
-
-                self._add_task_log(task_id, 'INFO', '删除现有服务')
-                self.agent_manager.call_agent_api(
-                    agent_key, 'DELETE', f'/api/services/{service_name}', {},
-                    timeout_type='deploy_delete'
-                )
-
-                time.sleep(2)
-
-                # 重新创建服务
-                self._add_task_log(task_id, 'INFO', '重新创建服务')
-                status_code, response = self.agent_manager.call_agent_api(
-                    agent_key, 'POST', '/api/services/yaml', data,
-                    timeout_type='deploy_create'
-                )
-
-                if status_code == 201:
-                    # 启动服务
-                    time.sleep(2)
-                    start_status_code, start_response = self.agent_manager.call_agent_api(
-                        agent_key, 'POST', f'/api/services/{service_name}/start', {},
-                        timeout_type='deploy_start'
-                    )
-
-                    if start_status_code == 200:
-                        self._update_task_status(task_id, 'success', 100, '服务重新部署成功')
-                    elif self._is_timeout_error(start_status_code, start_response):
-                        self._add_task_log(task_id, 'WARN', f"重建后启动请求超时: {start_response}")
-                        if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
-                            self._update_task_status(task_id, 'success', 100, '服务重新部署成功（超时后状态确认）')
-                        else:
-                            error_msg = f'重新部署后启动服务超时，且轮询未就绪: {start_response}'
-                            self._update_task_status(task_id, 'failed', 70, error_msg)
-                    else:
-                        error_msg = f'重新部署后启动服务失败: {start_response}'
-                        self._update_task_status(task_id, 'failed', 70, error_msg)
-                else:
-                    error_msg = f'重新创建服务失败: {response}'
-                    self._update_task_status(task_id, 'failed', 70, error_msg)
+                error_msg = f'服务已存在，禁止重复部署，请先手动删除后再部署: {service_name}'
+                self._update_task_status(task_id, 'failed', 30, error_msg)
+                self._add_task_log(task_id, 'ERROR', f"{error_msg}; agent_response={response}")
 
             else:
                 error_msg = f'创建服务失败 (HTTP {status_code}): {response}'
@@ -849,6 +821,10 @@ class TaskManager:
                     error_msg = f'启动压缩服务失败: {start_response}'
                     self._update_task_status(task_id, 'failed', 70, error_msg)
                     self._add_task_log(task_id, 'ERROR', error_msg)
+            elif status_code == 409:
+                error_msg = f'服务已存在，禁止重复部署，请先手动删除后再部署: {service_name}'
+                self._update_task_status(task_id, 'failed', 30, error_msg)
+                self._add_task_log(task_id, 'ERROR', f"{error_msg}; agent_response={response}")
             else:
                 error_msg = f'创建压缩服务失败 (HTTP {status_code}): {response}'
                 self._update_task_status(task_id, 'failed', 30, error_msg)
