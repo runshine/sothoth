@@ -78,7 +78,16 @@ class TaskManager:
         self.services_root.mkdir(parents=True, exist_ok=True)
         self.executor = ThreadPoolExecutor(max_workers=5)
         self.active_tasks: Dict[str, Future] = {}
+        self.active_task_lock = threading.Lock()
         self.logger = logging.getLogger(__name__)
+        self.worker_id = f"{self.pod_id}:{uuid.uuid4().hex[:8]}"
+        self.worker_poll_interval_sec = 2
+        self.task_lease_sec = 120
+        self.task_heartbeat_interval_sec = 15
+        self.enable_task_workers = True
+        self.worker_dispatch_thread: Optional[threading.Thread] = None
+        self.worker_heartbeat_thread: Optional[threading.Thread] = None
+        self.worker_stop_event = threading.Event()
 
         self._cleanup_old_logs()
 
@@ -186,42 +195,239 @@ class TaskManager:
         except Exception as e:
             self.logger.error(f"清理过期任务日志失败: {str(e)}")
 
+    def configure_runtime(self, worker_count: int = 5, poll_interval_sec: int = 2,
+                          lease_sec: int = 120, heartbeat_interval_sec: int = 15,
+                          enable_task_workers: bool = True):
+        """配置任务 worker 运行时参数。"""
+        worker_count = max(1, int(worker_count or 1))
+        if getattr(self.executor, '_max_workers', worker_count) != worker_count:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor = ThreadPoolExecutor(max_workers=worker_count)
+        self.worker_poll_interval_sec = max(1, int(poll_interval_sec or 2))
+        self.task_lease_sec = max(30, int(lease_sec or 120))
+        self.task_heartbeat_interval_sec = max(5, int(heartbeat_interval_sec or 15))
+        self.enable_task_workers = bool(enable_task_workers)
+
+    def start_workers(self):
+        """启动数据库驱动的任务 worker。"""
+        if not self.enable_task_workers:
+            self.logger.info("任务 worker 已禁用")
+            return
+        if self.worker_dispatch_thread and self.worker_dispatch_thread.is_alive():
+            return
+        self.worker_stop_event.clear()
+        self.worker_dispatch_thread = threading.Thread(target=self._worker_dispatch_loop, daemon=True)
+        self.worker_heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self.worker_dispatch_thread.start()
+        self.worker_heartbeat_thread.start()
+        self.logger.info(
+            f"任务 worker 已启动: worker_id={self.worker_id}, max_workers={getattr(self.executor, '_max_workers', 5)}, "
+            f"lease={self.task_lease_sec}s"
+        )
+
+    def stop_workers(self):
+        """停止任务 worker。"""
+        self.worker_stop_event.set()
+        if self.worker_dispatch_thread:
+            self.worker_dispatch_thread.join(timeout=5)
+        if self.worker_heartbeat_thread:
+            self.worker_heartbeat_thread.join(timeout=5)
+        self.executor.shutdown(wait=False, cancel_futures=False)
+        self.logger.info("任务 worker 已停止")
+
+    def _db_now_plus_expr(self, seconds: int) -> str:
+        if self.db.db_type == 'mysql':
+            return f"DATE_ADD(NOW(), INTERVAL {int(seconds)} SECOND)"
+        return f"datetime('now', '+{int(seconds)} seconds')"
+
+    def _db_now_minus_expr(self, seconds: int) -> str:
+        if self.db.db_type == 'mysql':
+            return f"DATE_SUB(NOW(), INTERVAL {int(seconds)} SECOND)"
+        return f"datetime('now', '-{int(seconds)} seconds')"
+
+    def _claim_runnable_task(self) -> Optional[Dict]:
+        """从数据库中原子领取一个待执行任务。"""
+        table_tasks = self.db.get_table_name('tasks')
+        conn = self.db.get_connection()
+        try:
+            placeholder = '%s' if self.db.db_type == 'mysql' else '?'
+            now_sql = 'NOW()' if self.db.db_type == 'mysql' else "datetime('now')"
+            candidates_query = (
+                f"SELECT task_id FROM {table_tasks} "
+                f"WHERE completed_at IS NULL "
+                f"AND (status = {placeholder} "
+                f"OR (status = {placeholder} "
+                f"AND (lease_until IS NULL OR lease_until < {now_sql}))) "
+                f"ORDER BY created_at ASC LIMIT 10"
+            )
+            params = ('pending', 'running')
+            candidates = conn.fetch_all(candidates_query, params) or []
+            for row in candidates:
+                task_id = row.get('task_id')
+                if not task_id:
+                    continue
+                if self.db.db_type == 'mysql':
+                    cursor = conn.execute(
+                        f"UPDATE {table_tasks} SET "
+                        "status = %s, "
+                        "worker_id = %s, "
+                        "worker_pod_id = %s, "
+                        f"lease_until = {self._db_now_plus_expr(self.task_lease_sec)}, "
+                        "heartbeat_at = NOW(), "
+                        "started_at = COALESCE(started_at, NOW()), "
+                        "attempt_count = COALESCE(attempt_count, 0) + 1 "
+                        "WHERE task_id = %s AND completed_at IS NULL AND "
+                        "(status = %s OR (status = %s AND (lease_until IS NULL OR lease_until < NOW())))",
+                        ( 'running', self.worker_id, self.pod_id, task_id, 'pending', 'running')
+                    )
+                else:
+                    cursor = conn.execute(
+                        f"UPDATE {table_tasks} SET "
+                        "status = ?, "
+                        "worker_id = ?, "
+                        "worker_pod_id = ?, "
+                        f"lease_until = {self._db_now_plus_expr(self.task_lease_sec)}, "
+                        "heartbeat_at = datetime('now'), "
+                        "started_at = COALESCE(started_at, datetime('now')), "
+                        "attempt_count = COALESCE(attempt_count, 0) + 1 "
+                        "WHERE task_id = ? AND completed_at IS NULL AND "
+                        "(status = ? OR (status = ? AND (lease_until IS NULL OR lease_until < datetime('now'))))",
+                        ('running', self.worker_id, self.pod_id, task_id, 'pending', 'running')
+                    )
+                if getattr(cursor, 'rowcount', 0) == 1:
+                    claimed = conn.fetch_one(
+                        f"SELECT * FROM {table_tasks} WHERE task_id = {'%s' if self.db.db_type == 'mysql' else '?'}",
+                        (task_id,)
+                    )
+                    if claimed:
+                        return claimed
+            return None
+        finally:
+            conn.close()
+
+    def _touch_active_task_leases(self):
+        """续约当前 Pod 正在执行的任务。"""
+        with self.active_task_lock:
+            task_ids = [task_id for task_id, future in self.active_tasks.items() if not future.done()]
+        if not task_ids:
+            return
+
+        table_tasks = self.db.get_table_name('tasks')
+        conn = self.db.get_connection()
+        try:
+            for task_id in task_ids:
+                if self.db.db_type == 'mysql':
+                    conn.execute(
+                        f"UPDATE {table_tasks} SET heartbeat_at = NOW(), "
+                        f"lease_until = {self._db_now_plus_expr(self.task_lease_sec)} "
+                        "WHERE task_id = %s AND worker_id = %s AND status = 'running'",
+                        (task_id, self.worker_id)
+                    )
+                else:
+                    conn.execute(
+                        f"UPDATE {table_tasks} SET heartbeat_at = datetime('now'), "
+                        f"lease_until = {self._db_now_plus_expr(self.task_lease_sec)} "
+                        "WHERE task_id = ? AND worker_id = ? AND status = 'running'",
+                        (task_id, self.worker_id)
+                    )
+        finally:
+            conn.close()
+
+    def _heartbeat_loop(self):
+        while not self.worker_stop_event.is_set():
+            try:
+                self._touch_active_task_leases()
+            except Exception as e:
+                self.logger.error(f"任务 heartbeat 失败: {e}")
+            self.worker_stop_event.wait(self.task_heartbeat_interval_sec)
+
+    def _worker_dispatch_loop(self):
+        while not self.worker_stop_event.is_set():
+            try:
+                with self.active_task_lock:
+                    running = sum(1 for future in self.active_tasks.values() if not future.done())
+                    capacity = max(0, getattr(self.executor, '_max_workers', 5) - running)
+                for _ in range(capacity):
+                    task = self._claim_runnable_task()
+                    if not task:
+                        break
+                    task_id = task.get('task_id')
+                    future = self.executor.submit(
+                        self._run_claimed_task,
+                        task_id,
+                        task.get('task_type'),
+                        task.get('service_name'),
+                        task.get('agent_key'),
+                        task.get('project_id')
+                    )
+                    with self.active_task_lock:
+                        self.active_tasks[task_id] = future
+                    future.add_done_callback(lambda _f, tid=task_id: self._on_task_future_done(tid))
+            except Exception as e:
+                self.logger.error(f"任务 worker 调度失败: {e}", exc_info=True)
+            self.worker_stop_event.wait(self.worker_poll_interval_sec)
+
+    def _on_task_future_done(self, task_id: str):
+        with self.active_task_lock:
+            self.active_tasks.pop(task_id, None)
+
+    def _run_claimed_task(self, task_id: str, task_type: str, service_name: str,
+                          agent_key: str, project_id: Optional[str]):
+        try:
+            task = self.get_task(task_id)
+            if not task:
+                return
+            template_name = task.get('template_name')
+            extra_params_raw = task.get('extra_params')
+            extra_params = None
+            if extra_params_raw:
+                if isinstance(extra_params_raw, str):
+                    try:
+                        extra_params = json.loads(extra_params_raw)
+                    except Exception:
+                        extra_params = None
+                elif isinstance(extra_params_raw, dict):
+                    extra_params = extra_params_raw
+            self._execute_task(task_id, task_type, service_name, agent_key, template_name, extra_params)
+        except Exception as e:
+            self.logger.error(f"执行领取任务失败: {task_id}, err={e}", exc_info=True)
+            self._update_task_status(task_id, 'failed', 0, f'任务执行异常: {str(e)}')
+
     def create_task(self, task_type: str, service_name: str, agent_key: str,
                     template_name: str = None, extra_params: Dict = None,
                     project_id: str = None) -> str:
         task_id = str(uuid.uuid4())
         table_tasks = self.db.get_table_name('tasks')
+        extra_params_json = json.dumps(extra_params, ensure_ascii=False) if extra_params is not None else None
 
         # Use provided project_id or get from agent
         if not project_id:
-            agent = self.agent_manager.get_agent(agent_key)
+            agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
             project_id = agent.project_id if agent else ''
 
         if self.db.db_type == 'mysql':
             self.db.execute_query('''
                                   INSERT INTO {}
-                                  (task_id, task_type, service_name, agent_key, project_id,
+                                  (task_id, task_type, service_name, agent_key, project_id, template_name, extra_params,
                                    status, progress, message, created_at, pod_id)
-                                  VALUES (%s, %s, %s, %s, %s, 'pending', 0, '', NOW(), %s)
-                                  '''.format(table_tasks), (task_id, task_type, service_name, agent_key, project_id, self.pod_id))
+                                  VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', 0, '', NOW(), %s)
+                                  '''.format(table_tasks), (
+                                      task_id, task_type, service_name, agent_key, project_id,
+                                      template_name, extra_params_json, self.pod_id
+                                  ))
         else:
             self.db.execute_query('''
                                   INSERT INTO {}
-                                  (task_id, task_type, service_name, agent_key, project_id,
+                                  (task_id, task_type, service_name, agent_key, project_id, template_name, extra_params,
                                    status, progress, message, created_at, pod_id)
-                                  VALUES (?, ?, ?, ?, ?, 'pending', 0, '', datetime('now'), ?)
-                                  '''.format(table_tasks), (task_id, task_type, service_name, agent_key, project_id, self.pod_id))
+                                  VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', datetime('now'), ?)
+                                  '''.format(table_tasks), (
+                                      task_id, task_type, service_name, agent_key, project_id,
+                                      template_name, extra_params_json, self.pod_id
+                                  ))
 
         # 添加任务日志
         self._add_task_log(task_id, 'INFO', f"任务创建: {task_type} {service_name} on agent {agent_key}")
-
-        future = self.executor.submit(
-            self._execute_task, task_id, task_type, service_name,
-            agent_key, template_name, extra_params
-        )
-
-        self.active_tasks[task_id] = future
-        future.add_done_callback(lambda f: self.active_tasks.pop(task_id, None))
 
         return task_id
 
@@ -331,6 +537,10 @@ class TaskManager:
             update_fields.append("started_at = NOW()" if self.db.db_type == 'mysql' else "started_at = datetime('now')")
         elif status in ['success', 'failed', 'cancelled']:
             update_fields.append("completed_at = NOW()" if self.db.db_type == 'mysql' else "completed_at = datetime('now')")
+            update_fields.append("lease_until = NULL")
+            update_fields.append("heartbeat_at = NULL")
+            update_fields.append("worker_id = NULL")
+            update_fields.append("worker_pod_id = NULL")
 
         if update_fields:
             query = f"UPDATE {table_tasks} SET {', '.join(update_fields)} WHERE task_id = "
@@ -371,7 +581,7 @@ class TaskManager:
             self._update_task_status(task_id, 'running', 10, '开始部署')
 
             # 1. 检查Agent是否存在
-            agent = self.agent_manager.get_agent(agent_key)
+            agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
             if not agent:
                 self._update_task_status(task_id, 'failed', 0, f'Agent {agent_key} 不存在')
                 return
@@ -632,7 +842,7 @@ class TaskManager:
         try:
             self._update_task_status(task_id, 'running', 10, '开始卸载服务')
 
-            agent = self.agent_manager.get_agent(agent_key)
+            agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
             if not agent:
                 self._update_task_status(task_id, 'failed', 0, f'Agent {agent_key} 不存在')
                 return
@@ -782,6 +992,10 @@ class TaskManager:
         try:
             table_tasks = self.db.get_table_name('tasks')
             table_logs = self.db.get_table_name('task_logs')
+            task = self.get_task(task_id)
+            if task and str(task.get('status') or '').lower() == 'running':
+                self.logger.warning(f"拒绝删除运行中的任务: {task_id}")
+                return False
             if self.db.db_type == 'mysql':
                 self.db.execute_transaction([
                     (f"DELETE FROM {table_logs} WHERE task_id = %s", (task_id,)),
@@ -793,9 +1007,10 @@ class TaskManager:
                     (f"DELETE FROM {table_tasks} WHERE task_id = ?", (task_id,))
                 ])
 
-            future = self.active_tasks.pop(task_id, None)
-            if future and not future.done():
-                future.cancel()
+            with self.active_task_lock:
+                future = self.active_tasks.pop(task_id, None)
+                if future and not future.done():
+                    future.cancel()
 
             self.logger.info(f"任务 {task_id} 删除成功")
             return True
@@ -828,35 +1043,41 @@ class TaskManager:
             if not task_ids:
                 return 0
 
+            running_ids = set()
+            for task_id in task_ids:
+                task = self.get_task(task_id)
+                if task and str(task.get('status') or '').lower() == 'running':
+                    running_ids.add(task_id)
+            deletable_ids = [task_id for task_id in task_ids if task_id not in running_ids]
+            if not deletable_ids:
+                self.logger.warning(f"项目任务清空跳过，全部为运行中任务: project_id={project_id}")
+                return 0
+
             # 批量删除日志和任务
             if self.db.db_type == 'mysql':
+                placeholders = ','.join(['%s'] * len(deletable_ids))
                 self.db.execute_transaction([
-                    (
-                        f"DELETE {table_logs} FROM {table_logs} "
-                        f"INNER JOIN {table_tasks} ON {table_logs}.task_id = {table_tasks}.task_id "
-                        f"WHERE {table_tasks}.project_id = %s",
-                        (project_id,)
-                    ),
-                    (f"DELETE FROM {table_tasks} WHERE project_id = %s", (project_id,))
+                    (f"DELETE FROM {table_logs} WHERE task_id IN ({placeholders})", tuple(deletable_ids)),
+                    (f"DELETE FROM {table_tasks} WHERE task_id IN ({placeholders})", tuple(deletable_ids))
                 ])
             else:
+                placeholders = ','.join(['?'] * len(deletable_ids))
                 self.db.execute_transaction([
-                    (
-                        f"DELETE FROM {table_logs} WHERE task_id IN "
-                        f"(SELECT task_id FROM {table_tasks} WHERE project_id = ?)",
-                        (project_id,)
-                    ),
-                    (f"DELETE FROM {table_tasks} WHERE project_id = ?", (project_id,))
+                    (f"DELETE FROM {table_logs} WHERE task_id IN ({placeholders})", tuple(deletable_ids)),
+                    (f"DELETE FROM {table_tasks} WHERE task_id IN ({placeholders})", tuple(deletable_ids))
                 ])
 
             # 取消活跃任务future
-            for task_id in task_ids:
-                future = self.active_tasks.pop(task_id, None)
-                if future and not future.done():
-                    future.cancel()
+            with self.active_task_lock:
+                for task_id in deletable_ids:
+                    future = self.active_tasks.pop(task_id, None)
+                    if future and not future.done():
+                        future.cancel()
 
-            self.logger.info(f"项目任务清空成功: project_id={project_id}, deleted={len(task_ids)}")
-            return len(task_ids)
+            self.logger.info(
+                f"项目任务清空成功: project_id={project_id}, deleted={len(deletable_ids)}, skipped_running={len(running_ids)}"
+            )
+            return len(deletable_ids)
         except Exception as e:
             self.logger.error(f"按项目清空任务失败: project_id={project_id}, err={str(e)}", exc_info=True)
             return 0

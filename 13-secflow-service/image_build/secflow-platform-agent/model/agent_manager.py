@@ -553,66 +553,68 @@ class AgentManager:
             agent.status = 'error'
             return False
 
-    def refresh_agents(self):
+    def refresh_agents(self, use_distributed_lock: bool = True):
         """刷新Agent列表（使用分布式锁确保只有一个POD执行刷新）"""
         lock_key = "agent_refresh_lock"
 
         try:
-            # 获取分布式锁（如果Redis不可用，会返回虚拟锁）
-            with self.redis_manager.get_lock(lock_key, timeout=30) as lock:
-                if lock.is_acquired():
-                    pass
-                else:
-                    self.logger.warning(f"POD {self.pod_id} 无法获取锁，跳过本次刷新...")
-                    return
-
-                services = self._fetch_nacos_services()
-                new_agents = {}
-
-                for service in services:
-                    result = self._parse_agent_name(service)
-                    if result:
-                        project_id, hostname, ip_address = result
-
-                        if not self._has_healthy_nacos_client_instance(service, ip_address):
-                            self.logger.debug(f"跳过无健康实例的agent服务: {service}")
-                            continue
-
-                        # 使用新方法获取agent_key，传入service_name
-                        agent_key = self._get_agent_key(hostname, ip_address, service)
-
-                        # 如果没有获取到有效的agent_key，跳过这个agent
-                        if not agent_key:
-                            self.logger.debug(f"跳过无效的agent: {hostname} ({ip_address}), 服务: {service}")
-                            continue
-
-                        agent = AgentInfo(
-                            key=agent_key,
-                            ip_address=ip_address,
-                            hostname=hostname,
-                            project_id=project_id,
-                            full_name=service,
-                            status='unknown',
-                            pod_id=self.pod_id
-                        )
-
-                        self._check_secflow_agent_agent_status(agent)
-                        self._save_agent_to_db(agent)
-                        new_agents[agent_key] = agent
-
-                with self.lock:
-                    for key, new_agent in new_agents.items():
-                        self.agents[key] = new_agent
-                        self._update_project(new_agent.project_id, key)
-
-                    removed_keys = [k for k in self.agents.keys() if k not in new_agents]
-                    for key in removed_keys:
-                        del self.agents[key]
-
-                self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个有效Agent")
-
+            if use_distributed_lock:
+                # 获取分布式锁（如果Redis不可用，会返回虚拟锁）
+                with self.redis_manager.get_lock(lock_key, timeout=30) as lock:
+                    if not lock.is_acquired():
+                        self.logger.warning(f"POD {self.pod_id} 无法获取锁，跳过本次刷新...")
+                        return
+                    self._refresh_agents_without_lock()
+            else:
+                self._refresh_agents_without_lock()
         except Exception as e:
             self.logger.error(f"刷新Agent列表异常: {str(e)}")
+
+    def _refresh_agents_without_lock(self):
+        services = self._fetch_nacos_services()
+        new_agents = {}
+
+        for service in services:
+            result = self._parse_agent_name(service)
+            if result:
+                project_id, hostname, ip_address = result
+
+                if not self._has_healthy_nacos_client_instance(service, ip_address):
+                    self.logger.debug(f"跳过无健康实例的agent服务: {service}")
+                    continue
+
+                # 使用新方法获取agent_key，传入service_name
+                agent_key = self._get_agent_key(hostname, ip_address, service)
+
+                # 如果没有获取到有效的agent_key，跳过这个agent
+                if not agent_key:
+                    self.logger.debug(f"跳过无效的agent: {hostname} ({ip_address}), 服务: {service}")
+                    continue
+
+                agent = AgentInfo(
+                    key=agent_key,
+                    ip_address=ip_address,
+                    hostname=hostname,
+                    project_id=project_id,
+                    full_name=service,
+                    status='unknown',
+                    pod_id=self.pod_id
+                )
+
+                self._check_secflow_agent_agent_status(agent)
+                self._save_agent_to_db(agent)
+                new_agents[agent_key] = agent
+
+        with self.lock:
+            for key, new_agent in new_agents.items():
+                self.agents[key] = new_agent
+                self._update_project(new_agent.project_id, key)
+
+            removed_keys = [k for k in self.agents.keys() if k not in new_agents]
+            for key in removed_keys:
+                del self.agents[key]
+
+        self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个有效Agent")
 
     def cleanup_offline_agents(self, project_id: str = None, force: bool = False) -> Tuple[bool, str, Dict]:
         """
@@ -898,26 +900,38 @@ class AgentManager:
             return self.projects.get(project_id)
 
     def list_projects(self) -> List[Dict]:
-        with self.lock:
-            return [project.to_dict() for project in self.projects.values()]
+        table_name = self.db.get_table_name('agent_status')
+        try:
+            rows = self.db.fetch_all(
+                f"SELECT project_id, COUNT(*) AS agent_count, "
+                f"SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) AS online_agents, "
+                f"MAX(updated_at) AS last_refresh "
+                f"FROM {table_name} GROUP BY project_id ORDER BY project_id ASC"
+            ) or []
+            return [
+                {
+                    'id': row.get('project_id') or '',
+                    'agent_count': int(row.get('agent_count') or 0),
+                    'online_agents': int(row.get('online_agents') or 0),
+                    'last_refresh': str(row.get('last_refresh')) if row.get('last_refresh') else None,
+                    'agents': []
+                }
+                for row in rows if row.get('project_id') is not None
+            ]
+        except Exception:
+            with self.lock:
+                return [project.to_dict() for project in self.projects.values()]
 
     def get_project_agents(self, project_id: str) -> List[Dict]:
-        with self.lock:
-            project = self.projects.get(project_id)
-            if not project:
-                return []
-
-            agents = []
-            for agent_key in project.agents:
-                agent = self.agents.get(agent_key)
-                if agent:
-                    agents.append(agent.to_dict())
-
-            return agents
+        agents, _ = self.list_agents(1, 10000, project_id)
+        return agents
 
     def get_agent(self, key: str) -> Optional[AgentInfo]:
         with self.lock:
-            return self.agents.get(key)
+            agent = self.agents.get(key)
+        if agent:
+            return agent
+        return self.ensure_agent_exists(key)
 
     def ensure_agent_exists(self, agent_key: str) -> Optional[AgentInfo]:
         """
@@ -1137,13 +1151,27 @@ class AgentManager:
                 end_idx = start_idx + per_page
                 return agents_list[start_idx:end_idx], total
             else:
-                agents_list = list(self.agents.values())
+                table_name = self.db.get_table_name('agent_status')
+                if self.db.db_type == 'mysql':
+                    rows = self.db.fetch_all(
+                        f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
+                    )
+                else:
+                    rows = self.db.fetch_all(
+                        f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
+                    )
+                agents_list = []
+                for row in rows or []:
+                    key = row.get('agent_key')
+                    if not key:
+                        continue
+                    agent = self.ensure_agent_exists(key)
+                    if agent:
+                        agents_list.append(agent.to_dict())
                 total = len(agents_list)
                 start_idx = (page - 1) * per_page
                 end_idx = start_idx + per_page
-                paginated_agents = agents_list[start_idx:end_idx]
-
-                return [agent.to_dict() for agent in paginated_agents], total
+                return agents_list[start_idx:end_idx], total
 
     def call_agent_api(self, agent_key: str, method: str, endpoint: str,
                        data: Any = None, params: Dict = None,

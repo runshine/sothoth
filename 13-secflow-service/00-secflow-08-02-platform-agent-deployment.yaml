@@ -4,7 +4,7 @@ metadata:
   name: secflow-platform-agent
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       name: secflow-platform-agent
@@ -18,6 +18,11 @@ spec:
       - name: secflow-platform-agent
         image: ghcr.io/runshine/secflow-platform-agent:latest  # 包含kubectl命令
         imagePullPolicy: Always
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         command:
         - /bin/sh
         - -c

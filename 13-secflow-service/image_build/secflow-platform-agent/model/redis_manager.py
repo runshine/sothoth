@@ -153,9 +153,10 @@ class RedisDistributedLock:
 class RedisManager:
     """Redis管理器"""
 
-    def __init__(self, redis_url: str, enabled: bool = True):
+    def __init__(self, redis_url: str, enabled: bool = True, strict_mode: bool = False):
         self.redis_url = redis_url
         self.enabled = enabled
+        self.strict_mode = strict_mode
         self.client = None
         self.logger = logging.getLogger(__name__)
 
@@ -213,18 +214,15 @@ class RedisManager:
     def _get_dummy_lock(self, lock_key: str, timeout: int = 30) -> RedisDistributedLock:
         """获取虚拟锁（用于单实例或Redis不可用的情况）"""
         class DummyRedisLock:
-            def __init__(self, lock_key: str):
+            def __init__(self, lock_key: str, acquired: bool):
                 self.lock_key = lock_key
-                self._acquired = True
+                self._acquired = acquired
                 self.logger = logging.getLogger(__name__)
 
             def acquire(self, *args, **kwargs) -> bool:
-                #self.logger.debug(f"虚拟锁已获取: {self.lock_key}")
-                self._acquired = True
-                return True
+                return self._acquired
 
             def release(self) -> bool:
-                #self.logger.debug(f"虚拟锁已释放: {self.lock_key}")
                 self._acquired = False
                 return True
 
@@ -237,4 +235,7 @@ class RedisManager:
             def __exit__(self, exc_type, exc_val, exc_tb):
                 self.release()
 
-        return DummyRedisLock(lock_key)
+        acquired = not self.strict_mode
+        if not acquired:
+            self.logger.error(f"Redis严格模式已启用，锁不可用: {lock_key}")
+        return DummyRedisLock(lock_key, acquired)

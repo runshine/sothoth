@@ -61,7 +61,8 @@ class WebAPIServer:
         # 4. 初始化Redis管理器
         self.redis_manager = RedisManager(
             config.get('redis_url', 'redis://localhost:6379/0'),
-            config.get('redis_enabled', True)
+            config.get('redis_enabled', True),
+            config.get('redis_strict_mode', False)
         )
 
         # 5. 初始化数据库管理器
@@ -118,6 +119,13 @@ class WebAPIServer:
             config.get('max_secflow_agent_task_logs', 1000),
             agent_api_timeouts
         )
+        self.task_manager.configure_runtime(
+            worker_count=int(config.get('task_worker_count', config.get('max_workers', 5))),
+            poll_interval_sec=int(config.get('task_poll_interval_sec', 2)),
+            lease_sec=int(config.get('task_lease_sec', 120)),
+            heartbeat_interval_sec=int(config.get('task_heartbeat_interval_sec', 15)),
+            enable_task_workers=bool(config.get('enable_task_workers', True))
+        )
 
         # 10. 初始化代理管理器（新增，传递超时配置）
         self.proxy_manager = EnhancedProxyManager(self.agent_manager, agent_api_timeouts)
@@ -135,6 +143,7 @@ class WebAPIServer:
         # 12. 后台刷新线程
         self.refresh_thread = None
         self.should_stop = False
+        self.refresh_leader_lock_key = config.get('refresh_leader_lock_key', 'platform_agent_refresh_leader')
 
         self.logger.info(f"当前POD ID: {config['pod_id']}")
         self.logger.info(f"使用数据库: {config['database'].get('type', 'sqlite').upper()}")
@@ -1140,6 +1149,9 @@ class WebAPIServer:
 
         return None
 
+    def _deploy_lock_key(self, project_id: str, agent_key: str, service_name: str, task_type: str = 'deploy') -> str:
+        return f"{task_type}:{project_id}:{agent_key}:{service_name}"
+
     def _record_service_sync_log(self, scope: str, status: str = 'ok',
                                  project_id: Optional[str] = None, agent_key: Optional[str] = None,
                                  stale_only: bool = False, total: int = 0, ok_count: int = 0,
@@ -1695,26 +1707,31 @@ class WebAPIServer:
                 return jsonify({'error': 'project_id不能为空'}), 400
 
             # Validate that agent belongs to the project
-            agent = self.agent_manager.get_agent(data['agent_key'])
+            agent = self.agent_manager.get_agent(data['agent_key']) or self.agent_manager.ensure_agent_exists(data['agent_key'])
             if not agent:
                 return jsonify({'error': f"Agent {data['agent_key']} 不存在"}), 404
             if agent.project_id != project_id:
                 return jsonify({'error': f"Agent {data['agent_key']} 不属于项目 {project_id}"}), 403
 
-            duplicate = self._check_deploy_duplicate(
-                data['service_name'], data['agent_key'], project_id
-            )
-            if duplicate:
-                return jsonify({
-                    'error': duplicate.get('message') or '重复部署被拒绝',
-                    'code': 'DUPLICATE_DEPLOYMENT',
-                    'details': duplicate
-                }), 409
+            lock_key = self._deploy_lock_key(project_id, data['agent_key'], data['service_name'], 'deploy')
+            with self.redis_manager.get_lock(lock_key, timeout=int(self.config.get('lock_timeout', 30))) as lock:
+                if not lock.is_acquired():
+                    return jsonify({'error': '部署请求正在处理中，请稍后重试', 'code': 'LOCK_NOT_ACQUIRED'}), 409
 
-            task_id = self.task_manager.create_task(
-                'deploy', data['service_name'], data['agent_key'],
-                data['template_name'], data.get('extra_params'), project_id
-            )
+                duplicate = self._check_deploy_duplicate(
+                    data['service_name'], data['agent_key'], project_id
+                )
+                if duplicate:
+                    return jsonify({
+                        'error': duplicate.get('message') or '重复部署被拒绝',
+                        'code': 'DUPLICATE_DEPLOYMENT',
+                        'details': duplicate
+                    }), 409
+
+                task_id = self.task_manager.create_task(
+                    'deploy', data['service_name'], data['agent_key'],
+                    data['template_name'], data.get('extra_params'), project_id
+                )
 
             return jsonify({
                 'task_id': task_id,
@@ -1764,7 +1781,7 @@ class WebAPIServer:
                     continue
 
                 # Validate that agent belongs to the project
-                agent = self.agent_manager.get_agent(agent_key)
+                agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
                 if not agent:
                     errors.append({
                         'index': idx,
@@ -1797,23 +1814,36 @@ class WebAPIServer:
                     continue
                 request_level_seen.add(dedup_key)
 
-                duplicate = self._check_deploy_duplicate(service_name, agent_key, project_id)
-                if duplicate:
-                    errors.append({
-                        'index': idx,
-                        'service_name': service_name,
-                        'agent_key': agent_key,
-                        'template_name': template_name,
-                        'code': 'DUPLICATE_DEPLOYMENT',
-                        'error': duplicate.get('message') or '重复部署被拒绝',
-                        'details': duplicate
-                    })
-                    continue
-
                 try:
-                    task_id = self.task_manager.create_task(
-                        'deploy', service_name, agent_key, template_name, extra_params, project_id
-                    )
+                    lock_key = self._deploy_lock_key(project_id, agent_key, service_name, 'deploy')
+                    with self.redis_manager.get_lock(lock_key, timeout=int(self.config.get('lock_timeout', 30))) as lock:
+                        if not lock.is_acquired():
+                            errors.append({
+                                'index': idx,
+                                'service_name': service_name,
+                                'agent_key': agent_key,
+                                'template_name': template_name,
+                                'code': 'LOCK_NOT_ACQUIRED',
+                                'error': '部署请求正在处理中，请稍后重试'
+                            })
+                            continue
+
+                        duplicate = self._check_deploy_duplicate(service_name, agent_key, project_id)
+                        if duplicate:
+                            errors.append({
+                                'index': idx,
+                                'service_name': service_name,
+                                'agent_key': agent_key,
+                                'template_name': template_name,
+                                'code': 'DUPLICATE_DEPLOYMENT',
+                                'error': duplicate.get('message') or '重复部署被拒绝',
+                                'details': duplicate
+                            })
+                            continue
+
+                        task_id = self.task_manager.create_task(
+                            'deploy', service_name, agent_key, template_name, extra_params, project_id
+                        )
                     results.append({
                         'index': idx,
                         'task_id': task_id,
@@ -1856,16 +1886,21 @@ class WebAPIServer:
                 return jsonify({'error': 'project_id不能为空'}), 400
 
             # Validate that agent belongs to the project
-            agent = self.agent_manager.get_agent(data['agent_key'])
+            agent = self.agent_manager.get_agent(data['agent_key']) or self.agent_manager.ensure_agent_exists(data['agent_key'])
             if not agent:
                 return jsonify({'error': f"Agent {data['agent_key']} 不存在"}), 404
             if agent.project_id != project_id:
                 return jsonify({'error': f"Agent {data['agent_key']} 不属于项目 {project_id}"}), 403
 
-            task_id = self.task_manager.create_task(
-                'undeploy', data['service_name'], data['agent_key'],
-                None, None, project_id
-            )
+            lock_key = self._deploy_lock_key(project_id, data['agent_key'], data['service_name'], 'undeploy')
+            with self.redis_manager.get_lock(lock_key, timeout=int(self.config.get('lock_timeout', 30))) as lock:
+                if not lock.is_acquired():
+                    return jsonify({'error': '卸载请求正在处理中，请稍后重试', 'code': 'LOCK_NOT_ACQUIRED'}), 409
+
+                task_id = self.task_manager.create_task(
+                    'undeploy', data['service_name'], data['agent_key'],
+                    None, None, project_id
+                )
 
             return jsonify({
                 'task_id': task_id,
@@ -5224,16 +5259,17 @@ class WebAPIServer:
         service_sync_elapsed = service_sync_interval
         while not self.should_stop:
             try:
-                self.agent_manager.refresh_agents()
+                lock_timeout = int(self.config.get('leader_lock_timeout_sec', 90))
+                with self.redis_manager.get_lock(self.refresh_leader_lock_key, timeout=lock_timeout) as lock:
+                    if not lock.is_acquired():
+                        self.logger.debug(f"POD {self.config.get('pod_id')} 未获得刷新领导锁，跳过本轮")
+                    else:
+                        self.agent_manager.refresh_agents(use_distributed_lock=False)
+                        if service_sync_elapsed >= service_sync_interval:
+                            self._sync_all_agent_services()
+                            service_sync_elapsed = 0
             except Exception as e:
-                self.logger.error(f"刷新Agent列表失败: {str(e)}")
-
-            try:
-                if service_sync_elapsed >= service_sync_interval:
-                    self._sync_all_agent_services()
-                    service_sync_elapsed = 0
-            except Exception as e:
-                self.logger.error(f"刷新服务聚合失败: {str(e)}")
+                self.logger.error(f"后台刷新循环失败: {str(e)}")
 
             # 等待下一次刷新
             for _ in range(self.config['refresh_interval']):
@@ -5244,6 +5280,9 @@ class WebAPIServer:
 
     def start_refresh_thread(self):
         """启动后台刷新线程"""
+        if not self.config.get('enable_background_refresh', True):
+            self.logger.info("后台刷新线程已禁用")
+            return
         self.should_stop = False
         self.refresh_thread = threading.Thread(target=self._refresh_loop, daemon=True)
         self.refresh_thread.start()
@@ -5256,10 +5295,16 @@ class WebAPIServer:
             self.refresh_thread.join(timeout=5)
             self.logger.info("后台刷新线程已停止")
 
+    def shutdown(self):
+        """停止后台组件。"""
+        self.stop_refresh_thread()
+        self.task_manager.stop_workers()
+
     def run(self):
         """运行服务器"""
         # 启动后台刷新线程
         self.start_refresh_thread()
+        self.task_manager.start_workers()
 
         # 运行Flask应用
         self.logger.info(f"启动WEB API服务器，监听 {self.config['host']}:{self.config['port']}")
