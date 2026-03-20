@@ -1315,8 +1315,12 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/agents/refresh', methods=['POST'])
         def refresh_agents():
-            self.agent_manager.refresh_agents()
-            return jsonify({'message': 'Agent列表刷新完成'})
+            executed, message = self._run_refresh_cycle(include_service_sync=True)
+            status_code = 200 if executed else 202
+            return jsonify({
+                'executed': executed,
+                'message': message
+            }), status_code
 
         # 在_register_routes方法中添加以下路由
         @self.app.route('/api/agent/agents/cleanup', methods=['POST'])
@@ -5147,41 +5151,51 @@ class WebAPIServer:
                 if isinstance(metadata, str):
                     metadata = json.loads(metadata)
 
-                # 检查是否已解析
-                parsed_compose = metadata.get('parsed_compose')
-                if not parsed_compose:
-                    # 尝试解析
+                def reload_template_metadata() -> None:
+                    nonlocal template, metadata
+                    template = self.template_manager.get_template(name)
+                    metadata = template.get('metadata', {})
+                    if isinstance(metadata, str):
+                        metadata = json.loads(metadata)
+
+                def parse_under_lock():
                     try:
-                        success, msg = self._with_template_write_lock(
+                        return self._with_template_write_lock(
                             [name],
                             lambda: self.template_manager.parse_template_compose(name)
                         )
                     except BlockingIOError as e:
-                        return jsonify({'error': str(e)}), 409
+                        return None, str(e)
+
+                parsed_compose = metadata.get('parsed_compose')
+
+                # 检查是否过期；如果已过期则自动重新解析，而不是继续返回旧缓存。
+                stale_check_ok, is_stale, _ = self.template_manager.check_parse_staleness(name)
+                needs_parse = not parsed_compose or (stale_check_ok and is_stale)
+
+                if needs_parse:
+                    success, msg = parse_under_lock()
+                    if success is None:
+                        return jsonify({'error': msg}), 409
                     if success:
-                        # 重新获取
-                        template = self.template_manager.get_template(name)
-                        metadata = template.get('metadata', {})
-                        if isinstance(metadata, str):
-                            metadata = json.loads(metadata)
+                        reload_template_metadata()
                         parsed_compose = metadata.get('parsed_compose')
+                        stale_check_ok, is_stale, _ = self.template_manager.check_parse_staleness(name)
                     else:
+                        reload_template_metadata()
                         return jsonify({
                             'error': '解析失败',
                             'details': metadata.get('parse_error', msg),
                             'parse_status': 'error'
                         }), 400
 
-                # 检查是否过期
-                success, is_stale, _ = self.template_manager.check_parse_staleness(name)
-
                 return jsonify({
                     'template_name': name,
                     'parsed_compose': parsed_compose,
-                    'parse_status': 'stale' if is_stale else metadata.get('parse_status', 'success'),
+                    'parse_status': 'stale' if (stale_check_ok and is_stale) else metadata.get('parse_status', 'success'),
                     'parsed_at': metadata.get('parsed_at'),
                     'parse_error': metadata.get('parse_error'),
-                    'is_stale': is_stale if success else None
+                    'is_stale': is_stale if stale_check_ok else None
                 })
 
             except Exception as e:
@@ -5363,21 +5377,34 @@ class WebAPIServer:
                 return jsonify({'error': '模板不存在'}), 404
             return parse_template(template['name'])
 
+    def _run_refresh_cycle(self, include_service_sync: bool = False) -> Tuple[bool, str]:
+        """执行一次leader-only刷新周期。"""
+        try:
+            lock_timeout = int(self.config.get('leader_lock_timeout_sec', 90))
+            with self.redis_manager.get_lock(self.refresh_leader_lock_key, timeout=lock_timeout) as lock:
+                if not lock.is_acquired():
+                    msg = f"POD {self.config.get('pod_id')} 未获得刷新领导锁，跳过本轮"
+                    self.logger.debug(msg)
+                    return False, msg
+
+                self.agent_manager.refresh_agents(use_distributed_lock=False)
+                if include_service_sync:
+                    self._sync_all_agent_services()
+                return True, "Agent列表刷新完成"
+        except Exception as e:
+            self.logger.error(f"执行刷新周期失败: {str(e)}")
+            return False, f"刷新失败: {str(e)}"
+
     def _refresh_loop(self):
         """后台刷新循环"""
         service_sync_interval = int(self.config.get('service_sync_interval', self.config.get('refresh_interval', 30)))
         service_sync_elapsed = service_sync_interval
         while not self.should_stop:
             try:
-                lock_timeout = int(self.config.get('leader_lock_timeout_sec', 90))
-                with self.redis_manager.get_lock(self.refresh_leader_lock_key, timeout=lock_timeout) as lock:
-                    if not lock.is_acquired():
-                        self.logger.debug(f"POD {self.config.get('pod_id')} 未获得刷新领导锁，跳过本轮")
-                    else:
-                        self.agent_manager.refresh_agents(use_distributed_lock=False)
-                        if service_sync_elapsed >= service_sync_interval:
-                            self._sync_all_agent_services()
-                            service_sync_elapsed = 0
+                include_service_sync = service_sync_elapsed >= service_sync_interval
+                executed, _ = self._run_refresh_cycle(include_service_sync=include_service_sync)
+                if executed and include_service_sync:
+                    service_sync_elapsed = 0
             except Exception as e:
                 self.logger.error(f"后台刷新循环失败: {str(e)}")
 
