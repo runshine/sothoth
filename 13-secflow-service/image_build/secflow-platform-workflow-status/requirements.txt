@@ -1,0 +1,19 @@
+# SecFlow 工作流状态管理服务依赖
+
+# FastAPI框架
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+
+# 数据库
+sqlalchemy==2.0.25
+pymysql==1.1.0
+
+# 认证
+httpx==0.26.0
+
+# 配置
+pyyaml==6.0.1
+pydantic==2.5.3
+
+# 日志
+python-json-logger==2.0.7
