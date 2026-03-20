@@ -1042,7 +1042,11 @@ class WebAPIServer:
         header_username = str(request.headers.get('X-Username') or '').strip()
         if not user_id and header_user_id:
             user_id = header_user_id
-        if not username and header_username:
+        # 用户名展示/归属需要保留原始大小写，优先使用透传头中的原值；
+        # JWT payload 若已被其它链路归一化为小写，不应覆盖这里的展示语义。
+        if header_username:
+            username = header_username
+        elif not username:
             username = header_username
 
         # 兜底兼容，避免空身份影响历史流程
