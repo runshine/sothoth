@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-platform-vuln
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  selector:
+    name: secflow-platform-vuln
+  ports:
+  - name: secflow-platform-vuln
+    port: 80
+    targetPort: 8080
+    protocol: TCP

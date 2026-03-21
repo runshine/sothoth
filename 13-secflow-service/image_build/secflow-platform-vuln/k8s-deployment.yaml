@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-platform-vuln
+  namespace: secflow-ns
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      name: secflow-platform-vuln
+  template:
+    metadata:
+      labels:
+        name: secflow-platform-vuln
+    spec:
+      containers:
+      - name: secflow-platform-vuln
+        image: ghcr.io/runshine/secflow-platform-vuln:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: secflow-platform-vuln-config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+        - name: secflow-platform-vuln-data
+          mountPath: /data
+        readinessProbe:
+          httpGet:
+            path: /api/vuln/ready
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 20
+        livenessProbe:
+          httpGet:
+            path: /api/vuln/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+      volumes:
+      - name: secflow-platform-vuln-config
+        configMap:
+          name: secflow-platform-vuln-config
+          items:
+          - key: config.yaml
+            path: config.yaml
+      - name: secflow-platform-vuln-data
+        persistentVolumeClaim:
+          claimName: secflow-platform-vuln-data-nfs-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-platform-vuln
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  selector:
+    name: secflow-platform-vuln
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
