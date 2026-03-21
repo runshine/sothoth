@@ -797,6 +797,136 @@ class WebAPIServer:
                 keys.add(f"{ak}::{sn}")
         return keys
 
+    def _extract_service_binding_name(self, route: Dict[str, Any]) -> str:
+        metadata = self._extract_route_metadata(route)
+        return str(
+            metadata.get('service_name')
+            or metadata.get('associated_service_name')
+            or metadata.get('bind_service_name')
+            or route.get('associated_service_name')
+            or ''
+        ).strip()
+
+    def _extract_service_runtime_state(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ''
+
+        candidates = [
+            payload.get('status'),
+            payload.get('state'),
+            payload.get('service_status'),
+            payload.get('effective_state'),
+        ]
+        real_status = payload.get('real_status')
+        if isinstance(real_status, dict):
+            candidates.extend([
+                real_status.get('status'),
+                real_status.get('state'),
+            ])
+
+        for value in candidates:
+            text = str(value or '').strip().lower()
+            if text:
+                return text
+        return ''
+
+    @staticmethod
+    def _is_service_stopped_state(state: str) -> bool:
+        return str(state or '').strip().lower() in {
+            'stopped',
+            'stopping',
+            'exited',
+            'dead',
+            'inactive',
+            'removed',
+            'not_running',
+        }
+
+    def _can_ignore_stop_response(self, status_code: int, payload: Any) -> bool:
+        if status_code in (200, 202, 204, 404):
+            return True
+
+        text_parts: List[str] = []
+        if isinstance(payload, dict):
+            text_parts.extend([
+                str(payload.get('error') or ''),
+                str(payload.get('message') or ''),
+                str(payload.get('detail') or ''),
+            ])
+        elif payload is not None:
+            text_parts.append(str(payload))
+
+        text = ' '.join(text_parts).strip().lower()
+        benign_markers = (
+            'already stopped',
+            'already stopping',
+            'is not running',
+            'not running',
+            'service not found',
+            'no such service',
+            '已经停止',
+            '已停止',
+            '未运行',
+            '不存在',
+        )
+        return any(marker in text for marker in benign_markers)
+
+    def _delete_service_bound_ingress_routes(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        auth_header: Optional[str] = None
+    ) -> Dict[str, Any]:
+        all_routes = self._list_project_ingress_routes(
+            project_id=project_id,
+            include_deleted=False,
+            auth_header=auth_header
+        )
+        matched_routes = []
+        for route in all_routes:
+            if not self._is_service_bound_ingress_route(route):
+                continue
+            if str(route.get('agent_key') or '').strip() != str(agent_key or '').strip():
+                continue
+            if self._extract_service_binding_name(route) != str(service_name or '').strip():
+                continue
+            route_id = str(route.get('route_id') or '').strip()
+            if not route_id:
+                continue
+            matched_routes.append(route)
+
+        deleted = 0
+        failed: List[Dict[str, Any]] = []
+        for route in matched_routes:
+            route_id = str(route.get('route_id') or '').strip()
+            try:
+                resp = self._call_k8s_service(
+                    method='DELETE',
+                    path=f'/api/k8s/agent-ingress-routes/{route_id}',
+                    project_id=project_id,
+                    headers={'Authorization': auth_header} if auth_header else None
+                )
+                if resp.status_code < 300:
+                    deleted += 1
+                else:
+                    failed.append({
+                        'route_id': route_id,
+                        'status_code': resp.status_code,
+                        'body': resp.text[:200]
+                    })
+            except Exception as e:
+                failed.append({
+                    'route_id': route_id,
+                    'error': str(e)
+                })
+
+        return {
+            'matched': len(matched_routes),
+            'deleted': deleted,
+            'failed': failed,
+        }
+
     def _prepare_agent_exec_ws_tunnel(
         self,
         agent_key: str,
@@ -2290,6 +2420,143 @@ class WebAPIServer:
                 response.headers[key] = value
             response.status_code = status_code
             return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/start', methods=['POST'])
+        def agent_service_start(agent_key, service_name):
+            """启动Agent服务（快捷方式）"""
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='POST',
+                endpoint=f'/api/services/{quote(service_name, safe="")}/start',
+                request_data=request.get_json(silent=True) or {}
+            )
+            if status_code < 300:
+                try:
+                    self._sync_single_agent_services_by_key(agent_key, reason=f'api_start:{service_name}')
+                except Exception:
+                    self.logger.warning(f"启动服务后同步快照失败: agent={agent_key}, service={service_name}", exc_info=True)
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'content-length':
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/stop', methods=['POST'])
+        def agent_service_stop(agent_key, service_name):
+            """停止Agent服务（快捷方式）"""
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='POST',
+                endpoint=f'/api/services/{quote(service_name, safe="")}/stop',
+                request_data=request.get_json(silent=True) or {}
+            )
+            if status_code < 300 or self._can_ignore_stop_response(status_code, response_data):
+                try:
+                    self._sync_single_agent_services_by_key(agent_key, reason=f'api_stop:{service_name}')
+                except Exception:
+                    self.logger.warning(f"停止服务后同步快照失败: agent={agent_key}, service={service_name}", exc_info=True)
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'content-length':
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>', methods=['DELETE'])
+        def agent_service_delete(agent_key, service_name):
+            """删除Agent服务：先停服务，再删服务，并同步删除绑定的Ingress。"""
+            try:
+                agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
+
+                project_id = str(request.args.get('project_id') or getattr(agent, 'project_id', '') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+                if str(getattr(agent, 'project_id', '') or '').strip() != project_id:
+                    return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
+
+                encoded_service_name = quote(service_name, safe="")
+                service_status_code, service_payload = self.agent_manager.call_agent_api(
+                    agent_key,
+                    'GET',
+                    f'/api/services/{encoded_service_name}',
+                    None,
+                    timeout_type='health_check'
+                )
+
+                runtime_state = self._extract_service_runtime_state(service_payload)
+                stop_result: Dict[str, Any] = {
+                    'attempted': False,
+                    'status_code': None,
+                    'response': None,
+                }
+                if service_status_code == 200 and not self._is_service_stopped_state(runtime_state):
+                    stop_result['attempted'] = True
+                    stop_status_code, stop_payload = self.agent_manager.call_agent_api(
+                        agent_key,
+                        'POST',
+                        f'/api/services/{encoded_service_name}/stop',
+                        {},
+                        timeout_type='undeploy'
+                    )
+                    stop_result['status_code'] = stop_status_code
+                    stop_result['response'] = stop_payload
+                    if not self._can_ignore_stop_response(stop_status_code, stop_payload):
+                        return jsonify({
+                            'error': f'停止服务失败，无法继续删除: {service_name}',
+                            'code': 'STOP_BEFORE_DELETE_FAILED',
+                            'details': stop_result
+                        }), 409
+
+                delete_status_code, delete_payload = self.agent_manager.call_agent_api(
+                    agent_key,
+                    'DELETE',
+                    f'/api/services/{encoded_service_name}',
+                    {},
+                    timeout_type='undeploy'
+                )
+                if delete_status_code not in (200, 204, 404):
+                    return jsonify({
+                        'error': f'删除服务失败: {service_name}',
+                        'code': 'DELETE_SERVICE_FAILED',
+                        'details': {
+                            'status_code': delete_status_code,
+                            'response': delete_payload,
+                        }
+                    }), delete_status_code
+
+                auth_header = request.headers.get('Authorization')
+                ingress_cleanup = self._delete_service_bound_ingress_routes(
+                    project_id=project_id,
+                    agent_key=agent_key,
+                    service_name=service_name,
+                    auth_header=auth_header
+                )
+
+                try:
+                    self._sync_single_agent_services_by_key(agent_key, reason=f'api_delete:{service_name}')
+                except Exception:
+                    self.logger.warning(f"删除服务后同步快照失败: agent={agent_key}, service={service_name}", exc_info=True)
+
+                response_status = 200 if len(ingress_cleanup.get('failed', [])) == 0 else 207
+                return jsonify({
+                    'message': f'服务 {service_name} 删除完成',
+                    'agent_key': agent_key,
+                    'project_id': project_id,
+                    'service_name': service_name,
+                    'service_status_before_delete': runtime_state or ('missing' if service_status_code == 404 else 'unknown'),
+                    'service_deleted': True,
+                    'service_delete_status_code': delete_status_code,
+                    'stop_result': stop_result,
+                    'ingress_cleanup': ingress_cleanup,
+                }), response_status
+            except Exception as e:
+                self.logger.error(f"删除Agent服务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/exec', methods=['POST'])
         def agent_service_exec(agent_key, service_name):
