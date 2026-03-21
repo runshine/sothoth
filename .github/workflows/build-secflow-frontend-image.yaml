@@ -4,6 +4,8 @@ on:
     branches:
       - 'v2.*'
     paths:
+      # Frontend is tracked as a submodule in the main repo; workflow file updates
+      # are kept as an explicit CI trigger path for submodule pointer changes.
       - .github/workflows/build-secflow-frontend-image.yaml
       - 13-secflow-service/image_build/secflow-frontend
       - 13-secflow-service/image_build/secflow-frontend/**
