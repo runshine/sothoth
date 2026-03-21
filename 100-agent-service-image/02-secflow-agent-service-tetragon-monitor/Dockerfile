@@ -1,9 +1,8 @@
 # 构建阶段
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 ARG TARGETARCH
 ARG TARGETVARIANT
-ARG TARGETPLATFORM
 
 WORKDIR /app
 
@@ -11,20 +10,6 @@ WORKDIR /app
 ENV GO111MODULE=on \
     CGO_ENABLED=0 \
     GOOS=linux
-
-# 根据目标架构设置GOARCH和GOARM
-RUN case ${TARGETARCH} in \
-        arm) \
-            case ${TARGETVARIANT} in \
-                5) export GOARCH=arm GOARM=5 ;; \
-                6) export GOARCH=arm GOARM=6 ;; \
-                7) export GOARCH=arm GOARM=7 ;; \
-                *) export GOARCH=arm GOARM=6 ;; \
-            esac ;; \
-        arm64) export GOARCH=arm64 ;; \
-        amd64) export GOARCH=amd64 ;; \
-        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
-    esac
 
 RUN apk add --no-cache git
 
@@ -39,10 +24,24 @@ RUN go mod tidy
 RUN go mod download
 
 # 构建应用
-RUN go build -a -installsuffix cgo -ldflags="-w -s" -o tetragon-monitor .
+RUN set -eux; \
+    case "${TARGETARCH}" in \
+        amd64) export GOARCH=amd64 ;; \
+        arm64) export GOARCH=arm64 ;; \
+        arm) \
+            export GOARCH=arm; \
+            case "${TARGETVARIANT#v}" in \
+                5) export GOARM=5 ;; \
+                6) export GOARM=6 ;; \
+                7|"") export GOARM=7 ;; \
+                *) echo "Unsupported arm variant: ${TARGETVARIANT}" && exit 1 ;; \
+            esac ;; \
+        *) echo "Unsupported architecture: ${TARGETARCH}" && exit 1 ;; \
+    esac; \
+    go build -a -installsuffix cgo -ldflags="-w -s" -o tetragon-monitor .
 
-# 运行阶段 - 使用多架构基础镜像
-FROM --platform=$TARGETPLATFORM alpine:3.17
+# 运行阶段
+FROM alpine:3.17
 
 # 添加必要的工具
 RUN apk add --no-cache \
