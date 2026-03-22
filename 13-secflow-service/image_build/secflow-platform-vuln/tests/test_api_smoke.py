@@ -16,6 +16,7 @@ os.environ["SECFLOW_VULN_SKIP_STARTUP"] = "1"
 from app.main import app  # noqa: E402
 from app.api.dependencies import get_current_subject  # noqa: E402
 from app.api import cases as cases_api  # noqa: E402
+from app.api import actions as actions_api  # noqa: E402
 from app.models.database import Base, get_db  # noqa: E402
 
 
@@ -53,13 +54,16 @@ def client():
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_subject] = override_subject
     original_ensure_project_access = cases_api.ensure_project_access
+    original_actions_project_access = actions_api.ensure_project_access
     cases_api.ensure_project_access = override_project_access
+    actions_api.ensure_project_access = override_project_access
 
     with TestClient(app) as test_client:
         yield test_client
 
     app.dependency_overrides.clear()
     cases_api.ensure_project_access = original_ensure_project_access
+    actions_api.ensure_project_access = original_actions_project_access
 
 
 def test_health(client: TestClient):
@@ -168,3 +172,178 @@ def test_mock_dispatch_and_callback(client: TestClient):
     assert detail.status_code == 200
     assert detail.json()["decision_status"] == "suspected"
     assert detail.json()["current_stage"] == "verify"
+
+    control_resp = client.post(
+        f"/api/vuln/actions/{action_id}/control",
+        json={"operation": "retry"},
+    )
+    assert control_resp.status_code == 200
+    assert control_resp.json()["action"]["execution_status"] == "queued"
+
+
+def test_dashboard_manual_task_and_decision_flow(client: TestClient):
+    service_resp = client.post(
+        "/api/vuln/services/register",
+        json={
+            "service_id": "svc-validator-01",
+            "service_name": "Validator",
+            "service_type": "validator",
+            "endpoint": "http://validator",
+            "healthcheck_url": "http://validator/health",
+            "callback_mode": "push",
+            "auth_mode": "machine_token",
+            "version": "1.0.0",
+            "meta": {},
+            "capabilities": [
+                {
+                    "capability_code": "validation-default",
+                    "action_type": "validation",
+                    "priority": 100,
+                    "timeout_seconds": 300,
+                    "concurrency_limit": 2,
+                    "input_schema_meta": {},
+                    "output_schema_meta": {},
+                    "meta": {},
+                }
+            ],
+        },
+    )
+    assert service_resp.status_code == 200
+
+    case_resp = client.post(
+        "/api/vuln/cases",
+        json={
+            "project_id": "demo-project",
+            "title": "Ops case",
+            "summary": "ops summary",
+            "severity": "high",
+            "confidence": 90,
+            "source_meta": {"source_service": "manual"},
+            "target_meta": {"asset_type": "service", "asset_locator": "svc://demo"},
+            "display_meta": {},
+            "created_by_type": "human",
+            "created_by": "tester",
+        },
+    )
+    assert case_resp.status_code == 200
+    case_id = case_resp.json()["id"]
+
+    dispatch_resp = client.post(
+        f"/api/vuln/cases/{case_id}/actions/dispatch",
+        json={"action_type": "validation"},
+    )
+    assert dispatch_resp.status_code == 200
+    assert dispatch_resp.json()["count"] == 1
+
+    queue_resp = client.get(
+        "/api/vuln/actions/ops/queue",
+        params={"project_id": "demo-project", "execution_status": "queued"},
+    )
+    assert queue_resp.status_code == 200
+    assert queue_resp.json()["total"] >= 1
+
+    recommend_resp = client.get(f"/api/vuln/cases/{case_id}/recommended-actions")
+    assert recommend_resp.status_code == 200
+    assert recommend_resp.json()["total"] >= 1
+
+    auto_resp = client.post(f"/api/vuln/cases/{case_id}/orchestrate/auto")
+    assert auto_resp.status_code == 200
+
+    task_resp = client.post(
+        f"/api/vuln/cases/{case_id}/manual-tasks",
+        json={
+            "task_type": "manual_review",
+            "title": "Review this case",
+            "summary": "Need analyst confirmation",
+            "assignee": "alice",
+            "context": {"origin": "smoke-test"},
+        },
+    )
+    assert task_resp.status_code == 200
+    assert task_resp.json()["task"]["status"] == "open"
+    task_id = task_resp.json()["task"]["id"]
+
+    task_status_resp = client.post(
+        f"/api/vuln/cases/{case_id}/manual-tasks/{task_id}/status",
+        json={"status": "completed"},
+    )
+    assert task_status_resp.status_code == 200
+    assert task_status_resp.json()["task"]["status"] == "completed"
+
+    decision_resp = client.post(
+        f"/api/vuln/cases/{case_id}/decisions",
+        json={
+            "decision_status": "confirmed",
+            "summary": "Human analyst confirmed",
+        },
+    )
+    assert decision_resp.status_code == 200
+    assert decision_resp.json()["case"]["decision_status"] == "confirmed"
+
+    stage_resp = client.post(
+        f"/api/vuln/cases/{case_id}/stage-transition",
+        json={"to_stage": "track", "reason": "manual_promote"},
+    )
+    assert stage_resp.status_code == 200
+    assert stage_resp.json()["case"]["current_stage"] == "track"
+
+    task_list = client.get("/api/vuln/cases/ops/manual-tasks", params={"project_id": "demo-project"})
+    assert task_list.status_code == 200
+    assert task_list.json()["total"] == 1
+
+    overview = client.get("/api/vuln/cases/ops/dashboard/overview", params={"project_id": "demo-project"})
+    assert overview.status_code == 200
+    assert overview.json()["metrics"]["total_cases"] == 1
+    assert overview.json()["metrics"]["manual_tasks_open"] == 0
+
+
+def test_failed_result_creates_automation_manual_task(client: TestClient):
+    case_resp = client.post(
+        "/api/vuln/cases",
+        json={
+            "project_id": "demo-project",
+            "title": "Automation follow-up case",
+            "summary": "summary",
+            "severity": "medium",
+            "confidence": 60,
+            "source_meta": {},
+            "target_meta": {},
+            "display_meta": {},
+            "created_by_type": "human",
+            "created_by": "tester",
+        },
+    )
+    case_id = case_resp.json()["id"]
+
+    action_resp = client.post(f"/api/vuln/actions/mock-dispatch/{case_id}")
+    assert action_resp.status_code == 200
+    action_id = action_resp.json()["action_id"]
+
+    callback_resp = client.post(
+        f"/api/vuln/actions/{action_id}/callback",
+        json={
+            "source_service_id": "svc-validator-01",
+            "result_type": "validation",
+            "status": "failed",
+            "summary": "validation engine crashed",
+            "confidence": 20,
+            "result_meta": {"phase": "replay"},
+            "raw_payload": {},
+            "artifact_refs": [],
+        },
+    )
+    assert callback_resp.status_code == 200
+
+    detail = client.get(f"/api/vuln/cases/{case_id}")
+    assert detail.status_code == 200
+    assert detail.json()["current_status"] == "waiting_manual"
+    assert len(detail.json()["manual_tasks"]) == 1
+    assert detail.json()["manual_tasks"][0]["task_type"] == "manual_validation"
+
+    timeline = client.get(f"/api/vuln/cases/{case_id}/timeline")
+    assert timeline.status_code == 200
+    assert any(
+        item["payload"].get("event_type") == "automation_rule_applied"
+        for item in timeline.json()["items"]
+        if item["item_type"] == "event"
+    )

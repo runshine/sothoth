@@ -4,23 +4,63 @@ import json
 from datetime import datetime, timedelta
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.api.dependencies import get_current_subject
+from app.api.dependencies import ensure_project_access, get_current_subject
 from app.config import get_config
-from app.models.database import ActionExecution, Case, Result, get_db
-from app.schemas import ActionCallbackRequest
+from app.models.database import ActionExecution, Case, CaseEvent, Result, get_db
+from app.schemas import ActionCallbackRequest, ActionControlRequest
 from app.services.lifecycle_engine import apply_action_result
 
 router = APIRouter(prefix="/api/vuln/actions", tags=["actions"])
+
+
+@router.get("/ops/queue")
+async def list_action_queue(
+    project_id: str | None = Query(None),
+    execution_status: str | None = Query(None),
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    _, token = user_and_token
+    query = db.query(ActionExecution, Case).join(Case, Case.id == ActionExecution.case_id)
+    if project_id:
+        await ensure_project_access(project_id, token)
+        query = query.filter(Case.project_id == project_id)
+    if execution_status:
+        query = query.filter(ActionExecution.execution_status == execution_status)
+
+    rows = query.order_by(ActionExecution.created_at.desc()).all()
+    return {
+        "items": [
+            {
+                "id": action.id,
+                "case_id": case.id,
+                "case_title": case.title,
+                "project_id": case.project_id,
+                "stage": action.stage,
+                "action_type": action.action_type,
+                "target_service_id": action.target_service_id,
+                "dispatch_status": action.dispatch_status,
+                "execution_status": action.execution_status,
+                "result_summary": action.result_summary,
+                "retry_count": action.retry_count,
+                "timeout_at": action.timeout_at,
+                "created_at": action.created_at,
+                "completed_at": action.completed_at,
+            }
+            for action, case in rows
+        ],
+        "total": len(rows),
+    }
 
 
 @router.post("/{action_id}/callback")
 async def action_callback(
     action_id: str,
     request: ActionCallbackRequest,
-    _: tuple[dict, str] = Depends(get_current_subject),
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
     db: Session = Depends(get_db),
 ):
     action = db.query(ActionExecution).filter(ActionExecution.id == action_id).first()
@@ -30,6 +70,8 @@ async def action_callback(
     case = db.query(Case).filter(Case.id == action.case_id).first()
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
+    _, token = user_and_token
+    await ensure_project_access(case.project_id, token)
 
     action.dispatch_status = "acknowledged"
     action.execution_status = request.status if request.status in {"succeeded", "failed", "partial"} else "succeeded"
@@ -55,6 +97,67 @@ async def action_callback(
     apply_action_result(db, case, request)
     db.commit()
     return {"status": "ok", "action_id": action_id}
+
+
+@router.post("/{action_id}/control")
+async def control_action(
+    action_id: str,
+    request: ActionControlRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    user, token = user_and_token
+    action = db.query(ActionExecution).filter(ActionExecution.id == action_id).first()
+    if action is None:
+        raise HTTPException(status_code=404, detail="action not found")
+
+    case = db.query(Case).filter(Case.id == action.case_id).first()
+    if case is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    await ensure_project_access(case.project_id, token)
+
+    operation = request.operation.lower()
+    if operation == "retry":
+        action.dispatch_status = "dispatched"
+        action.execution_status = "queued"
+        action.result_summary = None
+        action.completed_at = None
+        action.started_at = datetime.utcnow()
+        action.retry_count = (action.retry_count or 0) + 1
+        action.timeout_at = datetime.utcnow() + timedelta(seconds=get_config().engine.action_timeout_default)
+        case.current_status = "waiting_external"
+    elif operation == "cancel":
+        action.execution_status = "cancelled"
+        action.dispatch_status = "acknowledged"
+        action.completed_at = datetime.utcnow()
+        action.result_summary = action.result_summary or "action cancelled by operator"
+    else:
+        raise HTTPException(status_code=400, detail="unsupported operation")
+
+    db.add(CaseEvent(
+        id=uuid4().hex,
+        case_id=case.id,
+        event_type="action_controlled",
+        summary=f"{action.action_type} {operation}",
+        payload_json=json.dumps(
+            {
+                "action_id": action.id,
+                "operation": operation,
+                "operator": user.get("username"),
+            },
+            ensure_ascii=False,
+        ),
+    ))
+    db.commit()
+    return {
+        "status": "ok",
+        "action": {
+            "id": action.id,
+            "execution_status": action.execution_status,
+            "dispatch_status": action.dispatch_status,
+            "retry_count": action.retry_count,
+        },
+    }
 
 
 @router.post("/mock-dispatch/{case_id}")

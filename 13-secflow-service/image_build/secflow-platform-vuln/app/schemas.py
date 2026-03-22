@@ -70,6 +70,37 @@ class CaseResponse(BaseModel):
     updated_at: datetime
 
 
+class StageTransitionRequest(BaseModel):
+    to_stage: str
+    reason: Optional[str] = None
+
+
+class DecisionRequest(BaseModel):
+    decision_status: str
+    summary: Optional[str] = None
+
+
+class ManualTaskCreateRequest(BaseModel):
+    task_type: str
+    title: str
+    summary: Optional[str] = None
+    assignee: Optional[str] = None
+    due_at: Optional[datetime] = None
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class ManualTaskStatusUpdateRequest(BaseModel):
+    status: str
+
+
+class RoutedActionDispatchRequest(BaseModel):
+    action_type: Optional[str] = None
+    service_id: Optional[str] = None
+    stage: Optional[str] = None
+    input_meta: dict[str, Any] = Field(default_factory=dict)
+    input_artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class ActionCallbackRequest(BaseModel):
     source_service_id: Optional[str] = None
     result_type: str
@@ -81,6 +112,10 @@ class ActionCallbackRequest(BaseModel):
     result_meta: dict[str, Any] = Field(default_factory=dict)
     raw_payload: dict[str, Any] = Field(default_factory=dict)
     artifact_refs: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ActionControlRequest(BaseModel):
+    operation: str
 
 
 class TimelineItem(BaseModel):
