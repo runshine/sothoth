@@ -1,11 +1,15 @@
 """Menu registry service."""
 
 import asyncio
+import logging
 from typing import Optional
 
 import httpx
 
 from app.config import get_config
+
+
+logger = logging.getLogger(__name__)
 
 
 class RegistryService:
@@ -39,19 +43,29 @@ class RegistryService:
         if not self.config.enabled:
             return
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(f"{self.config.menu_service_url}/api/menu/register", json=self._register_payload())
+            response = await client.post(f"{self.config.menu_service_url}/api/menu/register", json=self._register_payload())
+            if response.status_code not in (200, 201):
+                raise RuntimeError(f"menu register failed: {response.status_code} {response.text}")
 
     async def heartbeat(self) -> None:
         if not self.config.enabled:
             return
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(f"{self.config.menu_service_url}/api/menu/heartbeat/{self.config.service_id}")
+            response = await client.post(f"{self.config.menu_service_url}/api/menu/heartbeat/{self.config.service_id}")
+            if response.status_code == 404:
+                logger.warning("Menu heartbeat returned 404 for %s, re-registering service", self.config.service_id)
+                await self.register()
+                return
+            if response.status_code != 200:
+                raise RuntimeError(f"menu heartbeat failed: {response.status_code} {response.text}")
 
     async def unregister(self) -> None:
         if not self.config.enabled:
             return
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.delete(f"{self.config.menu_service_url}/api/menu/unregister/{self.config.service_id}")
+            response = await client.delete(f"{self.config.menu_service_url}/api/menu/unregister/{self.config.service_id}")
+            if response.status_code not in (200, 404):
+                raise RuntimeError(f"menu unregister failed: {response.status_code} {response.text}")
 
     async def _loop(self) -> None:
         while self._running:

@@ -1,103 +1,113 @@
 # SecFlow 漏洞生命周期编排引擎架构设计
 
-## 1. 定位
+## 1. 设计目标
 
-`secflow-platform-vuln` 是漏洞生命周期编排引擎，而不是单一漏洞分析微服务。
+`secflow-platform-vuln` 的目标不是“实现一种漏洞能力”，而是提供一个平台级漏洞生命周期引擎。
 
-平台职责：
+目标包括：
 
-- 注册并管理外部漏洞能力微服务
-- 驱动漏洞生命周期流程自动化运转
-- 派发 Action 并接收结果回调
-- 汇聚分析、验证、POC、EXP、仿真、反馈等结果
-- 提供统一的时间线、决策、审计和人工介入框架
+- 用统一模型承接不同漏洞能力服务
+- 用统一状态机驱动漏洞生命周期
+- 用统一 `Action/Result` 契约协调外部执行
+- 用统一时间线和人工任务承接自动化与人工协作
+- 用统一附件与元数据支撑前端展示和长期扩展
 
-平台不负责：
+## 2. 角色划分
 
-- 自身完成漏洞分析
-- 自身生成 POC 或 EXP
-- 自身实现去重
-- 强制定义源码/二进制等固定漏洞结构
+### 2.1 平台引擎负责
 
-## 2. 系统架构
+- 服务注册与能力发现
+- 生命周期状态机
+- `Action` 派发与运行记录
+- `Result` 收敛与自动规则推进
+- 人工任务、人工裁决、项目级运营视图
+- 审计与时间线
+- 平台附件元数据与共享存储抽象
+
+### 2.2 外部能力服务负责
+
+- 漏洞分析
+- AI 分析
+- 静态分析
+- 逆向分析
+- 黑盒/运行时验证
+- POC/EXP 生成
+- 仿真与 Proof 验证
+- 反馈优化处理
+
+### 2.3 平台当前不负责
+
+- 去重实现
+- 扫描器本身
+- POC/EXP 生成执行
+- 固化源码/二进制等漏洞结构
+- 对象存储后端实现
+
+## 3. 总体架构
 
 ```mermaid
 flowchart TB
-    subgraph External["外部系统"]
-        Auth["Auth Service"]
-        Project["Project Service"]
-        Menu["Menu Registry"]
-        MySQL["MySQL"]
-        SharedPVC["Shared RWX PVC"]
-    end
-
-    subgraph VulnEngine["SecFlow Platform Vuln"]
+    subgraph Platform["secflow-platform-vuln"]
         API["API Layer"]
+        AuthDeps["Auth / Project Access"]
         Registry["Service Registry"]
         Engine["Lifecycle Engine"]
-        Dispatcher["Action Dispatcher"]
-        Callback["Result Callback Router"]
+        Actions["Action Execution Runtime"]
+        Rules["Automation Rules"]
+        Timeline["Timeline / Manual Task / Decision"]
+        Meta[(MySQL Metadata)]
         Storage["Shared PVC Storage Backend"]
-        DB[(Metadata Tables)]
     end
 
-    subgraph CapabilityServices["能力微服务"]
-        Analyzer["Analyzer Services"]
-        Validator["Validator Services"]
-        POC["POC/EXP Services"]
-        Simulator["Simulation Services"]
-        Human["Manual Operator"]
+    subgraph Capability["Registered Capability Services"]
+        Analyzer["Analyzer"]
+        Validator["Validator"]
+        POC["POC / EXP"]
+        Simulator["Simulator"]
+        Feedback["Feedback Processor"]
     end
 
-    Auth <--> API
-    Project <--> API
-    Menu <--> Registry
+    subgraph PlatformDeps["Platform Dependencies"]
+        Auth["secflow-platform-auth"]
+        Project["secflow-platform-project"]
+        Menu["secflow-platform-menu"]
+        PVC["RWX PVC"]
+    end
+
+    User["Frontend / Operator"] --> API
+    API --> AuthDeps
+    AuthDeps --> Auth
+    AuthDeps --> Project
+    API --> Registry
     API --> Engine
-    Engine --> Dispatcher
-    Dispatcher --> Analyzer
-    Dispatcher --> Validator
-    Dispatcher --> POC
-    Dispatcher --> Simulator
-    Human --> API
-    Analyzer --> Callback
-    Validator --> Callback
-    POC --> Callback
-    Simulator --> Callback
-    Callback --> Engine
-    API <--> DB
-    Registry <--> DB
-    Engine <--> DB
-    Storage <--> SharedPVC
-    API <--> Storage
-    Callback <--> Storage
-    DB <--> MySQL
+    Engine --> Actions
+    Engine --> Rules
+    Rules --> Timeline
+    API --> Timeline
+    Registry --> Meta
+    Actions --> Meta
+    Timeline --> Meta
+    API --> Meta
+    Storage --> PVC
+    API --> Storage
+    Menu <-- API
+
+    Actions --> Analyzer
+    Actions --> Validator
+    Actions --> POC
+    Actions --> Simulator
+    Actions --> Feedback
+
+    Analyzer --> API
+    Validator --> API
+    POC --> API
+    Simulator --> API
+    Feedback --> API
 ```
 
-## 3. 核心对象
+## 4. 生命周期模型
 
-### 3.1 Case
-
-漏洞主对象，表示平台层面的生命周期管理单元。
-
-### 3.2 Workflow Run
-
-一个 Case 对应一次生命周期运行实例，用于保存当前阶段和上下文。
-
-### 3.3 Action Execution
-
-平台派发给外部能力服务的执行单元。
-
-### 3.4 Result
-
-外部能力服务回传的统一结果对象。
-
-### 3.5 Artifact
-
-平台自己的附件对象，当前存储在共享 PVC 中，后续可平滑切换到 S3。
-
-## 4. 生命周期阶段
-
-第一版主阶段如下：
+当前主阶段：
 
 1. `ingest`
 2. `normalize`
@@ -109,17 +119,113 @@ flowchart TB
 8. `track`
 9. `archive`
 
-说明：
+含义：
 
-- `route` 是平台调度入口
-- `analyze`、`verify`、`prove` 支持并行和重复进入
-- 外部服务和人工都可以驱动阶段推进
+- `ingest`
+  - 平台接收新漏洞事实，创建 `Case`
+- `normalize`
+  - 统一补齐平台级元数据
+- `route`
+  - 根据阶段和能力服务决定可派发动作
+- `analyze`
+  - 进入分析类能力阶段
+- `verify`
+  - 进入验证和仿真能力阶段
+- `prove`
+  - 进入 POC/EXP/Proof 阶段
+- `decide`
+  - 进入人工裁决或决策收敛阶段
+- `track`
+  - 进入反馈、跟踪和后续运营阶段
+- `archive`
+  - 归档
 
-## 5. 数据模型
+## 5. 自动规则设计
+
+当前引擎已经实现第一版自动规则：
+
+- `Case` 创建后自动从 `ingest -> normalize`
+- `Result` 携带 `suggested_stage` 时自动推进阶段
+- `normalize/route` 收到结果时默认推进到 `analyze`
+- `analyze` 收到结果时默认推进到 `verify`
+- `verify` 收到 `poc/exp` 结果时可推进到 `prove`
+- `poc/exp` 成功结果会推进到 `decide`
+- 明确的 `confirmed/false_positive/accepted_risk` 会推进到 `track`
+- `failed` 结果会自动生成 `manual_validation` 任务
+- 低置信度成功结果会自动生成 `manual_review` 任务
+- 规则命中会写入 `automation_rule_applied` 时间线事件
+
+## 6. Action/Result 模型
+
+### 6.1 Action
+
+平台把所有外部调度都抽象为 `ActionExecution`。
+
+关键字段：
+
+- `action_type`
+- `target_service_id`
+- `capability_code`
+- `dispatch_status`
+- `execution_status`
+- `input_meta_json`
+- `input_artifact_refs_json`
+- `retry_count`
+- `timeout_at`
+
+### 6.2 Result
+
+外部服务统一通过回调提交结果，平台统一保存为 `Result`。
+
+关键字段：
+
+- `result_type`
+- `status`
+- `summary`
+- `confidence`
+- `result_meta_json`
+- `raw_payload_json`
+- `artifact_refs_json`
+- `suggested_stage`
+- `suggested_decision`
+
+这让平台不需要知道“这个结果到底来自源码扫描、逆向分析还是 POC 生成”，只需要统一承接元数据。
+
+## 7. 服务注册与能力发现
+
+每个外部能力服务需要先注册到平台：
+
+- `service_id`
+- `service_name`
+- `service_type`
+- `endpoint`
+- `healthcheck_url`
+- `callback_mode`
+- `auth_mode`
+- `version`
+- `capabilities`
+
+每个 capability 包含：
+
+- `capability_code`
+- `action_type`
+- `priority`
+- `timeout_seconds`
+- `concurrency_limit`
+- `input_schema_meta`
+- `output_schema_meta`
+
+平台基于注册能力提供：
+
+- 手动按路由派发
+- 当前阶段推荐动作
+- 一键自动编排
+
+## 8. 数据模型
 
 统一表前缀：`secflow_vuln_`
 
-核心表：
+当前核心表：
 
 - `secflow_vuln_case`
 - `secflow_vuln_case_event`
@@ -131,38 +237,90 @@ flowchart TB
 - `secflow_vuln_result`
 - `secflow_vuln_artifact`
 - `secflow_vuln_stage_history`
-- `secflow_vuln_decision`
 - `secflow_vuln_manual_task`
-- `secflow_vuln_feedback`
-- `secflow_vuln_comment`
-- `secflow_vuln_relation`
 
-## 6. 存储设计
+保留但尚未全面启用的设计位：
 
-当前阶段：
+- 决策增强
+- 反馈实体
+- 评论实体
+- 关系实体
+- 去重框架字段
 
-- k8s 多实例共享同一个 RWX PVC
-- 平台文件目录基于 `project_id/case_id/artifact_id` 组织
+## 9. 元数据设计
 
-后续扩展：
+平台尽量不把漏洞域做死，统一使用元数据承载：
 
-- 存储接口抽象为 `StorageBackend`
-- 新增 `S3StorageBackend` 后无须改变业务模型
+- `source_meta_json`
+- `target_meta_json`
+- `display_meta_json`
+- `result_meta_json`
+- `raw_payload_json`
+- `artifact_refs_json`
+- `context_json`
 
-## 7. 去重框架
+这让前端可以按能力增强展示：
 
-平台只预留去重字段与关系，不在当前版本实现去重逻辑。
+- 能识别 HTTP、代码片段、POC 结果时走增强渲染
+- 不能识别时退化为通用 JSON/文本/附件展示
 
-保留字段：
+## 10. 存储设计
 
-- `dedup_status`
-- `dedup_meta`
-- `canonical_case_id`
-- `dedup_group_id`
+当前实现：
 
-## 8. 设计原则
+- k8s 多实例共享一个 RWX PVC
+- 平台文件元数据保存在 `secflow_vuln_artifact`
+- 平台文件后端抽象为共享 PVC
 
-- 平台负责编排，不与具体能力强耦合
-- 结果以元数据和统一回调结构保存
-- 前端展示按能力增强，后端不固化细分漏洞类型
-- 所有扩展优先通过注册能力和 Action/Result 契约接入
+设计目标：
+
+- 当前适配 k8s 多副本
+- 未来可平滑切换到 S3/MinIO
+- 不复用分析类资源服务存储
+
+## 11. 前端工作台信息架构
+
+当前前端已实现漏洞引擎工作台，主要视图包括：
+
+- 总览
+- Case 运行
+- 能力服务
+- 人工任务
+- Action 队列
+
+核心交互包括：
+
+- 创建 Case
+- 注册服务
+- 查看推荐动作
+- 一键自动编排
+- 模拟外部回调
+- Action 重试/取消
+- 人工任务推进
+- 人工裁决
+
+## 12. k8s 部署拓扑
+
+当前部署要点：
+
+- `secflow-platform-vuln` Deployment 多副本
+- 独立 `Service`
+- 独立 `/api/vuln` Ingress 前缀
+- 独立 RWX PVC
+- `health` / `ready` 探针
+
+当前线上镜像标签已同步为：
+
+- `ghcr.io/runshine/secflow-platform-vuln:20260322`
+- `ghcr.io/runshine/secflow-frontend:20260322`
+
+## 13. 演进方向
+
+建议后续继续演进：
+
+- 把自动规则从代码提取为可配置策略
+- 引入真实附件上传与读取接口
+- 补全反馈、评论、关系实体
+- 引入对象存储后端
+- 增加前端路由级多页工作台
+- 增加更细粒度的能力运行监控

@@ -102,6 +102,20 @@ def test_register_service_and_list(client: TestClient):
     assert listed.status_code == 200
     assert listed.json()["total"] == 1
 
+    detail = client.get("/api/vuln/services/svc-analyzer-01")
+    assert detail.status_code == 200
+    assert detail.json()["service_id"] == "svc-analyzer-01"
+
+    heartbeat = client.post("/api/vuln/services/heartbeat/svc-analyzer-01")
+    assert heartbeat.status_code == 200
+
+    unregister = client.delete("/api/vuln/services/unregister/svc-analyzer-01")
+    assert unregister.status_code == 200
+
+    listed_after = client.get("/api/vuln/services")
+    assert listed_after.status_code == 200
+    assert listed_after.json()["total"] == 0
+
 
 def test_create_case_and_timeline(client: TestClient):
     payload = {
@@ -179,6 +193,13 @@ def test_mock_dispatch_and_callback(client: TestClient):
     )
     assert control_resp.status_code == 200
     assert control_resp.json()["action"]["execution_status"] == "queued"
+
+    cancel_resp = client.post(
+        f"/api/vuln/actions/{action_id}/control",
+        json={"operation": "cancel"},
+    )
+    assert cancel_resp.status_code == 200
+    assert cancel_resp.json()["action"]["execution_status"] == "cancelled"
 
 
 def test_dashboard_manual_task_and_decision_flow(client: TestClient):
@@ -347,3 +368,110 @@ def test_failed_result_creates_automation_manual_task(client: TestClient):
         for item in timeline.json()["items"]
         if item["item_type"] == "event"
     )
+
+
+def test_low_confidence_success_creates_manual_review_task(client: TestClient):
+    case_resp = client.post(
+        "/api/vuln/cases",
+        json={
+            "project_id": "demo-project",
+            "title": "Low confidence follow-up case",
+            "summary": "summary",
+            "severity": "medium",
+            "confidence": 60,
+            "source_meta": {},
+            "target_meta": {},
+            "display_meta": {},
+            "created_by_type": "human",
+            "created_by": "tester",
+        },
+    )
+    case_id = case_resp.json()["id"]
+
+    action_resp = client.post(f"/api/vuln/actions/mock-dispatch/{case_id}")
+    assert action_resp.status_code == 200
+    action_id = action_resp.json()["action_id"]
+
+    callback_resp = client.post(
+        f"/api/vuln/actions/{action_id}/callback",
+        json={
+            "source_service_id": "svc-analyzer-01",
+            "result_type": "analysis",
+            "status": "succeeded",
+            "summary": "analysis completed with weak confidence",
+            "confidence": 30,
+            "result_meta": {"phase": "analysis"},
+            "raw_payload": {},
+            "artifact_refs": [],
+        },
+    )
+    assert callback_resp.status_code == 200
+
+    detail = client.get(f"/api/vuln/cases/{case_id}")
+    assert detail.status_code == 200
+    assert detail.json()["current_status"] == "waiting_manual"
+    assert len(detail.json()["manual_tasks"]) == 1
+    assert detail.json()["manual_tasks"][0]["task_type"] == "manual_review"
+
+
+def test_recommended_actions_marks_active_service_action_pair(client: TestClient):
+    register_resp = client.post(
+        "/api/vuln/services/register",
+        json={
+            "service_id": "svc-ai-01",
+            "service_name": "AI Analyzer",
+            "service_type": "analyzer",
+            "endpoint": "http://ai-analyzer",
+            "healthcheck_url": "http://ai-analyzer/health",
+            "callback_mode": "push",
+            "auth_mode": "machine_token",
+            "version": "1.0.0",
+            "meta": {},
+            "capabilities": [
+                {
+                    "capability_code": "ai-analysis-default",
+                    "action_type": "ai_analysis",
+                    "priority": 10,
+                    "timeout_seconds": 300,
+                    "concurrency_limit": 2,
+                    "input_schema_meta": {},
+                    "output_schema_meta": {},
+                    "meta": {},
+                }
+            ],
+        },
+    )
+    assert register_resp.status_code == 200
+
+    case_resp = client.post(
+        "/api/vuln/cases",
+        json={
+            "project_id": "demo-project",
+            "title": "Recommendation case",
+            "summary": "summary",
+            "severity": "high",
+            "confidence": 80,
+            "source_meta": {},
+            "target_meta": {},
+            "display_meta": {},
+            "created_by_type": "human",
+            "created_by": "tester",
+        },
+    )
+    case_id = case_resp.json()["id"]
+
+    dispatch_resp = client.post(
+        f"/api/vuln/cases/{case_id}/actions/dispatch",
+        json={"action_type": "ai_analysis", "service_id": "svc-ai-01"},
+    )
+    assert dispatch_resp.status_code == 200
+    assert dispatch_resp.json()["count"] == 1
+
+    recommended = client.get(f"/api/vuln/cases/{case_id}/recommended-actions")
+    assert recommended.status_code == 200
+    pairs = [
+        item for item in recommended.json()["items"]
+        if item["service_id"] == "svc-ai-01" and item["action_type"] == "ai_analysis"
+    ]
+    assert len(pairs) == 1
+    assert pairs[0]["already_active"] is True

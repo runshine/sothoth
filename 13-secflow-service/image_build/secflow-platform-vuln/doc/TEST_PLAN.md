@@ -2,95 +2,136 @@
 
 ## 1. 测试目标
 
-验证 `secflow-platform-vuln` 在第一期范围内满足以下能力：
+验证 `secflow-platform-vuln` 当前实现满足以下目标：
 
-- 服务可在目标运行环境中成功导入和启动
-- 服务注册、Case 创建、Action 回调、时间线查询形成闭环
-- 前端新增漏洞引擎工作台页面可成功编译
-- k8s 部署清单结构完整，适配多实例共享 PVC
-- GitHub Actions 多架构构建链路可触发并产出镜像
+- 服务在 `conda sothoth` 环境可正常导入和启动
+- 服务注册、Case、Action、Result、人工任务形成最小闭环
+- 自动推进规则不会破坏基础生命周期
+- 前端漏洞引擎工作台可以通过类型检查和生产构建
+- GitHub Actions 能构建 x64/aarch64 镜像
+- k8s 中服务、探针、Ingress、滚动升级正常
 
 ## 2. 测试分层
 
-### 2.1 静态与结构测试
+### 2.1 后端接口与烟雾测试
 
-- Python 语法检查
-- TypeScript 类型检查
-- GitHub Actions 工作流结构检查
-- k8s YAML 基本命名与资源结构检查
+重点覆盖：
 
-### 2.2 单元与接口烟雾测试
-
-后端重点覆盖：
-
-- `GET /api/vuln/health`
-- `POST /api/vuln/services/register`
-- `GET /api/vuln/services`
-- `POST /api/vuln/cases`
-- `GET /api/vuln/cases/{id}`
-- `GET /api/vuln/cases/{id}/timeline`
-- `POST /api/vuln/actions/{id}/callback`
+- 健康检查
+- 服务注册与查询
+- Case 创建、详情、时间线
+- Action mock 派发、回调、控制
+- 项目级 dashboard
+- 人工任务创建、状态更新
+- 人工裁决
+- 自动规则触发后的人工作业生成
+- 项目级 Action 队列
 
 测试方式：
 
-- 使用 sqlite + `StaticPool` 构造轻量测试数据库
-- 对认证和项目访问做可控 override
-- 验证生命周期的最小闭环
+- `sqlite + StaticPool`
+- 覆盖 auth/project 访问控制依赖
+- 通过 `pytest` 做接口级 smoke test
 
-### 2.3 前端构建测试
+### 2.2 前端构建测试
 
 - `npm run lint`
 - `npm run build`
 
+验证内容：
+
+- `vuln` API 类型和调用链正常
+- 工作台多视图组件可正常构建
+- 组件拆分后不引入 TypeScript 错误
+
+### 2.3 环境导入测试
+
+在 `sothoth` conda 环境验证：
+
+- 配置加载
+- FastAPI 应用导入
+- 依赖初始化流程
+
+### 2.4 CI 构建测试
+
+验证 GitHub Actions：
+
+- `build-secflow-platform-vuln-image`
+- `build-secflow-frontend-image`
+
+要求：
+
+- amd64 构建成功
+- arm64 构建成功
+- manifest 合并成功
+
+### 2.5 k8s 运行时测试
+
 验证：
 
-- 新增 `vuln` API 接口未破坏现有工程
-- 漏洞引擎工作台页面类型和构建通过
-
-### 2.4 环境与运行时测试
-
-- 在 `conda sothoth` 环境中进行真实导入
-- 验证配置文件与 FastAPI 应用对象可正常加载
-
-### 2.5 集群验证
-
-部署后验证：
-
-- Pod Ready/Running
-- Service 正常暴露
-- Ingress 路由配置正确
-- `health` 与 `ready` 接口返回正常
+- Deployment 滚动发布成功
+- 新 Pod 镜像正确
+- `health` / `ready` 探针通过
+- Ingress 路由可访问
+- 事件和日志无明显错误
 
 ## 3. 当前已执行测试
 
 ### 后端
 
-- `conda run -n sothoth python -m py_compile ...`
-- `conda run -n sothoth pytest 13-secflow-service/image_build/secflow-platform-vuln/tests -q`
+执行命令：
 
-结果：
+```bash
+conda run --no-capture-output -n sothoth pytest 13-secflow-service/image_build/secflow-platform-vuln/tests -q
+```
 
-- 4 个 smoke tests 全部通过
+当前结果：
+
+- `6 passed`
 
 ### 前端
 
-- `npm -C 13-secflow-service/image_build/secflow-frontend run lint`
-- `npm -C 13-secflow-service/image_build/secflow-frontend run build`
+执行命令：
 
-结果：
+```bash
+npm -C 13-secflow-service/image_build/secflow-frontend run lint
+npm -C 13-secflow-service/image_build/secflow-frontend run build
+```
+
+当前结果：
 
 - lint 通过
 - build 通过
+- 仅保留现有工程的大 bundle warning
 
-### 运行环境
+### GitHub Actions
 
-- 在 `sothoth` conda 环境中验证配置导入和 `app.main:app` 导入成功
+最近一次已验证通过的构建：
 
-## 4. 后续建议补充测试
+- `build-secflow-platform-vuln-image`
+- `build-secflow-frontend-image`
 
-- 服务注册心跳与超时摘除测试
-- 生命周期阶段推进规则测试
-- Action 自动派发测试
-- Artifact 存储路径与元数据测试
-- 前端交互测试
-- k8s 集群联调自动化测试
+两条流水都完成了：
+
+- amd64
+- arm64
+- multi-arch manifest
+
+### 集群验证
+
+已验证：
+
+- `secflow-platform-vuln` 使用 `ghcr.io/runshine/secflow-platform-vuln:20260322`
+- `secflow-platform-frontend` 使用 `ghcr.io/runshine/secflow-frontend:20260322`
+- 两个 Deployment 均已 Ready
+- `GET /api/vuln/health` 返回正常
+- `GET /api/frontend/health` 返回正常
+
+## 4. 建议继续补充的测试
+
+- 自动编排推荐规则的更细粒度单元测试
+- 更多 `decision_status` 和阶段回退场景
+- 真实附件上传/存储测试
+- 更复杂的 capability 路由选择测试
+- Playwright 或 Cypress 前端交互测试
+- k8s 发布后自动健康回归测试
