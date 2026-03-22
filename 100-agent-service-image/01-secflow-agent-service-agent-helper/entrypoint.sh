@@ -3,7 +3,26 @@
 # 入口脚本
 #set -e
 
-cd /root
+cd "${WORKDIR:-/app}" 2>/dev/null || cd /app || cd /root
+
+REST_PORT="${REST_PORT:-20001}"
+TTYD_PORT="${TTYD_PORT:-20002}"
+CODE_SERVER_PORT="${CODE_SERVER_PORT:-20003}"
+
+TTYD_PID=""
+CODE_SERVER_PID=""
+CLAUDE_A2A_PID=""
+
+cleanup_children() {
+    for pid in "$TTYD_PID" "$CODE_SERVER_PID" "$CLAUDE_A2A_PID"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+trap cleanup_children EXIT INT TERM
 
 resolve_node_global_bin() {
     local bin_name="$1"
@@ -61,7 +80,8 @@ echo "----------------------"
 mount | grep -E "/host|/proc|/sys|/dev"
 echo "----------------------"
 
-nohup ttyd -p 20002 -w / -W  /bin/bash 2>&1 >> /tmp/ttyd.log &
+ttyd -p "${TTYD_PORT}" -w / -W /bin/bash >> /tmp/ttyd.log 2>&1 &
+TTYD_PID=$!
 
 # 启动 code-server
 echo "Starting code-server on port ${CODE_SERVER_PORT}..."
@@ -85,14 +105,15 @@ fi
 # 启动 code-server
 if [ -n "${CODE_SERVER_BIN}" ]; then
     export PASSWORD=${CODE_SERVER_PASSWORD}
-    nohup "${CODE_SERVER_BIN}" \
+    "${CODE_SERVER_BIN}" \
         --port ${CODE_SERVER_PORT} \
         --bind-addr 0.0.0.0:${CODE_SERVER_PORT} \
         --auth password \
         --disable-telemetry \
         --disable-update-check \
         "${CODE_SERVER_WORKDIR}" \
-        2>&1 >> /tmp/code-server.log &
+        >> /tmp/code-server.log 2>&1 &
+    CODE_SERVER_PID=$!
     echo "code-server started with workdir: ${CODE_SERVER_WORKDIR}"
     echo "code-server password: ${CODE_SERVER_PASSWORD}"
 else
@@ -100,7 +121,8 @@ else
 fi
 
 if [ -n "${CLAUDE_A2A_BIN}" ]; then
-    nohup "${CLAUDE_A2A_BIN}" 2>&1 >> /tmp/claude-a2a.log &
+    "${CLAUDE_A2A_BIN}" >> /tmp/claude-a2a.log 2>&1 &
+    CLAUDE_A2A_PID=$!
 else
     echo "WARNING: claude-a2a binary not found; skip starting claude-a2a" >&2
 fi

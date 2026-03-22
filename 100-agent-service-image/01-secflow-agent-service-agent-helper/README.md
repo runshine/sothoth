@@ -72,7 +72,7 @@ docker-compose logs -f
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `TIMEOUT` | 180 | 命令执行超时时间（秒） |
-| `PORT` | 20001 | API 服务端口 |
+| `REST_PORT` | 20001 | API 服务端口 |
 | `WORKDIR` | /app | 容器工作目录 |
 
 ### code-server 配置

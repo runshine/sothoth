@@ -12,7 +12,8 @@ services:
     # 环境变量配置
     environment:
       - TIMEOUT=180
-      - PORT=20001
+      - REST_PORT=20001
+      - TTYD_PORT=20002
       - WORKDIR=/app
       - ALLOWED_COMMANDS=  # 留空表示允许所有（生产环境建议设置）
       - ANTHROPIC_BASE_URL="http://172.31.29.10:3456"

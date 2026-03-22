@@ -12,6 +12,7 @@ services:
     environment:
       - TIMEOUT=180
       - REST_PORT=20001
+      - TTYD_PORT=20002
       - WORKDIR=/app
       - DISABLE_TELEMETRY=true
       - DISABLE_COST_WARNINGS=true
