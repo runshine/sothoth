@@ -3832,7 +3832,7 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/agent/<agent_key>/ingress-routes', methods=['GET'])
         def list_agent_ingress_routes(agent_key):
-            """列出Agent动态Ingress路由"""
+            """列出 Agent 节点入口 Ingress 路由（仅 agent_console）。"""
             try:
                 project_id = request.args.get('project_id')
                 if not project_id:
@@ -3852,7 +3852,17 @@ class WebAPIServer:
                     params={'agent_key': agent_key},
                     headers={'Authorization': auth_header} if auth_header else None
                 )
-                return jsonify(resp.json()), resp.status_code
+                payload = resp.json() if resp.content else {}
+                if resp.status_code >= 300:
+                    return jsonify(payload), resp.status_code
+
+                items = payload.get('items') or []
+                filtered_items = [item for item in items if self._is_agent_console_ingress_route(item)]
+                return jsonify({
+                    **payload,
+                    'items': filtered_items,
+                    'total': len(filtered_items),
+                }), resp.status_code
             except requests.RequestException as e:
                 self.logger.error(f"查询动态Ingress路由失败: {e}")
                 return jsonify({'error': f'k8s service unavailable: {e}'}), 502
@@ -3935,7 +3945,7 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/agent/<agent_key>/ingress-routes/<route_id>', methods=['DELETE'])
         def delete_agent_ingress_route(agent_key, route_id):
-            """删除Agent动态Ingress路由"""
+            """删除 Agent 节点入口 Ingress 路由（仅 agent_console）。"""
             try:
                 project_id = request.args.get('project_id')
                 if not project_id:
@@ -3948,6 +3958,23 @@ class WebAPIServer:
                     return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
 
                 auth_header = request.headers.get('Authorization')
+                list_resp = self._call_k8s_service(
+                    method='GET',
+                    path='/api/k8s/agent-ingress-routes',
+                    project_id=project_id,
+                    params={'agent_key': agent_key},
+                    headers={'Authorization': auth_header} if auth_header else None
+                )
+                if list_resp.status_code >= 300:
+                    return jsonify(list_resp.json()), list_resp.status_code
+
+                items = (list_resp.json() or {}).get('items') or []
+                target_item = next((item for item in items if str(item.get('route_id') or '') == str(route_id)), None)
+                if not target_item:
+                    return jsonify({'error': f'Ingress route {route_id} not found'}), 404
+                if not self._is_agent_console_ingress_route(target_item):
+                    return jsonify({'error': '该路由属于服务 Ingress，请前往集群服务发现页面管理'}), 403
+
                 resp = self._call_k8s_service(
                     method='DELETE',
                     path=f'/api/k8s/agent-ingress-routes/{route_id}',
