@@ -12,6 +12,7 @@ ENV WORKDIR=/app
 ENV CODE_SERVER_PORT=20003
 ENV CODE_SERVER_PASSWORD=
 ENV NVM_DIR=/root/.nvm
+ENV PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # 创建工作目录
 WORKDIR ${WORKDIR}
@@ -74,6 +75,7 @@ RUN set -eux; \
         curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone; \
         echo ". \"$NVM_DIR/nvm.sh\"" >> /root/.bashrc; \
     fi; \
+    if [ -x /root/.local/bin/code-server ]; then ln -sf /root/.local/bin/code-server /usr/local/bin/code-server; fi; \
     bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude-a2a; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a"; \
     echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
 

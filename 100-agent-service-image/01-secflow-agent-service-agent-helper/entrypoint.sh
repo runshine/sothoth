@@ -35,6 +35,19 @@ resolve_node_global_bin() {
         return 0
     fi
 
+    # code-server 官方安装脚本默认放到 ~/.local/bin
+    if [ -x "${HOME}/.local/bin/${bin_name}" ]; then
+        echo "${HOME}/.local/bin/${bin_name}"
+        return 0
+    fi
+
+    # 再尝试 ~/.local/lib/<tool>/bin/<tool> 这种布局
+    resolved="$(find "${HOME}/.local/lib" -maxdepth 4 -type f -path '*/bin/'"${bin_name}" 2>/dev/null | sort | tail -n 1)"
+    if [ -n "$resolved" ]; then
+        echo "$resolved"
+        return 0
+    fi
+
     # 尝试加载nvm并激活常见版本
     export NVM_DIR="${HOME}/.nvm"
     if [ -s "${NVM_DIR}/nvm.sh" ]; then
