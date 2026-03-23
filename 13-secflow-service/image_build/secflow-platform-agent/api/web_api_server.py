@@ -2529,6 +2529,17 @@ class WebAPIServer:
                         }
                     }), delete_status_code
 
+                binding_table = self.db_manager.get_table_name('service_template_bindings')
+                try:
+                    self.db_manager.execute_query(
+                        f"DELETE FROM {binding_table} WHERE project_id = %s AND agent_key = %s AND service_name = %s"
+                        if self.db_manager.db_type == 'mysql' else
+                        f"DELETE FROM {binding_table} WHERE project_id = ? AND agent_key = ? AND service_name = ?",
+                        (project_id, agent_key, service_name)
+                    )
+                except Exception:
+                    self.logger.warning(f"删除服务模板绑定失败: project={project_id}, agent={agent_key}, service={service_name}", exc_info=True)
+
                 auth_header = request.headers.get('Authorization')
                 ingress_cleanup = self._delete_service_bound_ingress_routes(
                     project_id=project_id,
@@ -2780,92 +2791,164 @@ class WebAPIServer:
                     query_sql += " LIMIT ? OFFSET ?"
                 rows = self.db_manager.fetch_all(query_sql, tuple(params + [per_page, offset]))
 
-                # 预加载模板映射：通过服务名推断模板（service_name 规则通常为 <normalized_template_name>-<agent_suffix>）
+                # 预加载模板映射：只使用部署时记录或Agent显式上报的模板信息，不再依赖名称/镜像猜测
                 template_table = self.db_manager.get_table_name('service_templates')
                 template_rows = self.db_manager.fetch_all(
                     f"SELECT id, name FROM {template_table} ORDER BY id ASC",
                     tuple()
                 ) or []
-
-                def _normalize_template_name(name: str) -> str:
-                    text = (name or '').strip().lower()
-                    text = re.sub(r'[^a-z0-9-_]', '-', text)
-                    text = re.sub(r'-+', '-', text).strip('-')
-                    return text[:48]
-
-                normalized_templates: List[Dict[str, Any]] = []
+                templates_by_name: Dict[str, Dict[str, Any]] = {}
                 for tpl in template_rows:
                     tpl_name = str(tpl.get('name') or '').strip()
                     if not tpl_name:
                         continue
-                    normalized_templates.append({
+                    templates_by_name[tpl_name] = {
                         'id': tpl.get('id'),
-                        'name': tpl_name,
-                        'normalized': _normalize_template_name(tpl_name)
-                    })
-
-                def _resolve_template(service_name: str, raw_payload: Any = None, image_name: str = '') -> Dict[str, Any]:
-                    svc = (service_name or '').strip().lower()
-                    candidates: List[str] = []
-                    if svc:
-                        candidates.append(svc)
-
-                    direct_image = str(image_name or '').strip().lower()
-                    if direct_image:
-                        image_basename = direct_image.split('/')[-1]
-                        image_repo = image_basename.split(':')[0].strip()
-                        if image_repo:
-                            candidates.append(image_repo)
-
-                    try:
-                        payload = raw_payload if isinstance(raw_payload, dict) else {}
-                        real_status = payload.get('real_status') if isinstance(payload, dict) else {}
-                        containers = real_status.get('containers') if isinstance(real_status, dict) else []
-                        if isinstance(containers, list):
-                            for container in containers:
-                                if not isinstance(container, dict):
-                                    continue
-                                project_name = str(container.get('Project') or '').strip().lower()
-                                if project_name:
-                                    candidates.append(project_name)
-                                image_name = str(container.get('Image') or '').strip().lower()
-                                if image_name:
-                                    image_basename = image_name.split('/')[-1]
-                                    image_repo = image_basename.split(':')[0].strip()
-                                    if image_repo:
-                                        candidates.append(image_repo)
-                    except Exception:
-                        pass
-
-                    if not candidates:
-                        return {'template_id': None, 'template_name': ''}
-
-                    normalized_candidates = []
-                    seen_candidates = set()
-                    for candidate in candidates:
-                        normalized = _normalize_template_name(candidate)
-                        if normalized and normalized not in seen_candidates:
-                            normalized_candidates.append(normalized)
-                            seen_candidates.add(normalized)
-
-                    # 优先最长前缀匹配，避免短模板名误匹配
-                    best = None
-                    best_len = -1
-                    for candidate in normalized_candidates:
-                        for tpl in normalized_templates:
-                            prefix = tpl.get('normalized') or ''
-                            if not prefix:
-                                continue
-                            if candidate == prefix or candidate.startswith(prefix + '-'):
-                                if len(prefix) > best_len:
-                                    best = tpl
-                                    best_len = len(prefix)
-                    if not best:
-                        return {'template_id': None, 'template_name': ''}
-                    return {
-                        'template_id': best.get('id'),
-                        'template_name': best.get('name') or ''
+                        'name': tpl_name
                     }
+
+                binding_table = self.db_manager.get_table_name('service_template_bindings')
+                binding_rows = self.db_manager.fetch_all(
+                    f"SELECT project_id, agent_key, service_name, template_id, template_name FROM {binding_table} WHERE project_id = %s"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"SELECT project_id, agent_key, service_name, template_id, template_name FROM {binding_table} WHERE project_id = ?",
+                    (project_id,)
+                ) or []
+                bindings_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+                for row in binding_rows:
+                    key = (
+                        str(row.get('project_id') or '').strip(),
+                        str(row.get('agent_key') or '').strip(),
+                        str(row.get('service_name') or '').strip()
+                    )
+                    bindings_map[key] = {
+                        'template_id': row.get('template_id'),
+                        'template_name': str(row.get('template_name') or '').strip()
+                    }
+
+                task_table = self.db_manager.get_table_name('tasks')
+
+                def _resolve_template(project_id_value: str, agent_key_value: str, service_name: str, raw_payload: Any = None) -> Dict[str, Any]:
+                    key = (
+                        str(project_id_value or '').strip(),
+                        str(agent_key_value or '').strip(),
+                        str(service_name or '').strip()
+                    )
+
+                    binding = bindings_map.get(key)
+                    if binding and str(binding.get('template_name') or '').strip():
+                        return {
+                            'template_id': binding.get('template_id'),
+                            'template_name': str(binding.get('template_name') or '').strip()
+                        }
+
+                    payload = raw_payload if isinstance(raw_payload, dict) else {}
+                    payload_template_name = str(payload.get('template_name') or '').strip()
+                    payload_template_id = payload.get('template_id')
+                    if payload_template_name:
+                        known_template = templates_by_name.get(payload_template_name)
+                        resolved = {
+                            'template_id': payload_template_id if payload_template_id not in (None, '') else (known_template or {}).get('id'),
+                            'template_name': payload_template_name
+                        }
+                        bindings_map[key] = resolved
+                        try:
+                            self.db_manager.execute_query(
+                                f"""
+                                INSERT INTO {binding_table}
+                                (project_id, agent_key, service_name, template_id, template_name, source)
+                                VALUES (%s, %s, %s, %s, %s, 'agent_report')
+                                ON DUPLICATE KEY UPDATE
+                                    template_id = VALUES(template_id),
+                                    template_name = VALUES(template_name),
+                                    source = VALUES(source),
+                                    updated_at = NOW()
+                                """ if self.db_manager.db_type == 'mysql' else
+                                f"""
+                                INSERT INTO {binding_table}
+                                (project_id, agent_key, service_name, template_id, template_name, source, created_at, updated_at)
+                                VALUES (?, ?, ?, ?, ?, 'agent_report', ?, ?)
+                                ON CONFLICT(project_id, agent_key, service_name) DO UPDATE SET
+                                    template_id=excluded.template_id,
+                                    template_name=excluded.template_name,
+                                    source=excluded.source,
+                                    updated_at=excluded.updated_at
+                                """,
+                                (
+                                    key[0], key[1], key[2], resolved.get('template_id'), resolved.get('template_name')
+                                ) if self.db_manager.db_type == 'mysql' else
+                                (
+                                    key[0], key[1], key[2], resolved.get('template_id'), resolved.get('template_name'),
+                                    datetime.now().isoformat(), datetime.now().isoformat()
+                                )
+                            )
+                        except Exception:
+                            self.logger.warning(f"写入Agent上报模板绑定失败: {key}", exc_info=True)
+                        return resolved
+
+                    task_row = self.db_manager.fetch_one(
+                        f"""
+                        SELECT template_name
+                        FROM {task_table}
+                        WHERE project_id = %s AND agent_key = %s AND service_name = %s
+                          AND task_type = 'deploy' AND status = 'success' AND template_name IS NOT NULL AND template_name <> ''
+                        ORDER BY completed_at DESC, created_at DESC
+                        LIMIT 1
+                        """ if self.db_manager.db_type == 'mysql' else
+                        f"""
+                        SELECT template_name
+                        FROM {task_table}
+                        WHERE project_id = ? AND agent_key = ? AND service_name = ?
+                          AND task_type = 'deploy' AND status = 'success' AND template_name IS NOT NULL AND template_name <> ''
+                        ORDER BY completed_at DESC, created_at DESC
+                        LIMIT 1
+                        """,
+                        key
+                    )
+                    if task_row:
+                        template_name = str(task_row.get('template_name') if isinstance(task_row, dict) else task_row['template_name'] or '').strip()
+                        if template_name:
+                            known_template = templates_by_name.get(template_name)
+                            resolved = {
+                                'template_id': (known_template or {}).get('id'),
+                                'template_name': template_name
+                            }
+                            bindings_map[key] = resolved
+                            try:
+                                self.db_manager.execute_query(
+                                    f"""
+                                    INSERT INTO {binding_table}
+                                    (project_id, agent_key, service_name, template_id, template_name, source)
+                                    VALUES (%s, %s, %s, %s, %s, 'task_history')
+                                    ON DUPLICATE KEY UPDATE
+                                        template_id = VALUES(template_id),
+                                        template_name = VALUES(template_name),
+                                        source = VALUES(source),
+                                        updated_at = NOW()
+                                    """ if self.db_manager.db_type == 'mysql' else
+                                    f"""
+                                    INSERT INTO {binding_table}
+                                    (project_id, agent_key, service_name, template_id, template_name, source, created_at, updated_at)
+                                    VALUES (?, ?, ?, ?, ?, 'task_history', ?, ?)
+                                    ON CONFLICT(project_id, agent_key, service_name) DO UPDATE SET
+                                        template_id=excluded.template_id,
+                                        template_name=excluded.template_name,
+                                        source=excluded.source,
+                                        updated_at=excluded.updated_at
+                                    """,
+                                    (
+                                        key[0], key[1], key[2], resolved.get('template_id'), resolved.get('template_name')
+                                    ) if self.db_manager.db_type == 'mysql' else
+                                    (
+                                        key[0], key[1], key[2], resolved.get('template_id'), resolved.get('template_name'),
+                                        datetime.now().isoformat(), datetime.now().isoformat()
+                                    )
+                                )
+                            except Exception:
+                                self.logger.warning(f"回填服务模板绑定失败: {key}", exc_info=True)
+                            return resolved
+
+                    return {'template_id': None, 'template_name': ''}
 
                 items = []
                 for row in rows:
@@ -2892,9 +2975,10 @@ class WebAPIServer:
                             raw_payload = raw_json
 
                     resolved_template = _resolve_template(
+                        str(row.get('project_id') or ''),
+                        str(row.get('agent_key') or ''),
                         str(row.get('service_name') or ''),
-                        raw_payload,
-                        str(row.get('image') or '')
+                        raw_payload
                     )
 
                     items.append({

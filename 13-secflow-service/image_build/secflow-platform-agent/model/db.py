@@ -592,6 +592,49 @@ class DatabaseManager:
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_project ON {table_sync_logs}(project_id)')
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_agent ON {table_sync_logs}(agent_key)')
 
+            # 创建服务实例与模板绑定表
+            table_service_bindings = f"{prefix}service_template_bindings"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_service_bindings} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               service_name VARCHAR(200) NOT NULL,
+                               template_id INT NULL,
+                               template_name VARCHAR(255) NOT NULL,
+                               source_task_id VARCHAR(64),
+                               source VARCHAR(32) DEFAULT 'deploy',
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               UNIQUE KEY uniq_binding (project_id, agent_key, service_name),
+                               INDEX idx_bindings_project (project_id),
+                               INDEX idx_bindings_agent (agent_key),
+                               INDEX idx_bindings_template (template_name)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_service_bindings} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               service_name TEXT NOT NULL,
+                               template_id INTEGER,
+                               template_name TEXT NOT NULL,
+                               source_task_id TEXT,
+                               source TEXT DEFAULT 'deploy',
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS uniq_binding ON {table_service_bindings}(project_id, agent_key, service_name)'
+                )
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_bindings_project ON {table_service_bindings}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_bindings_agent ON {table_service_bindings}(agent_key)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_bindings_template ON {table_service_bindings}(template_name)')
+
             # 兼容历史数据库：补齐新增列
             self._ensure_agent_status_columns(db, table_agent_status)
             self._ensure_template_columns(db, table_templates)

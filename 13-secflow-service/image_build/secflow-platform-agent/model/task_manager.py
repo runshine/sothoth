@@ -192,6 +192,93 @@ class TaskManager:
         self._add_task_log(task_id, 'ERROR', f"轮询超时，服务仍未进入running: {service_name}")
         return False
 
+    def _get_template_id_by_name(self, template_name: str) -> Optional[int]:
+        template_name = str(template_name or '').strip()
+        if not template_name:
+            return None
+        table_name = self.db.get_table_name('service_templates')
+        row = self.db.fetch_one(
+            f"SELECT id FROM {table_name} WHERE name = %s" if self.db.db_type == 'mysql' else
+            f"SELECT id FROM {table_name} WHERE name = ?",
+            (template_name,)
+        )
+        if not row:
+            return None
+        try:
+            return int(row.get('id') if isinstance(row, dict) else row['id'])
+        except Exception:
+            return None
+
+    def _upsert_service_template_binding(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        template_name: str,
+        template_id: Optional[int] = None,
+        source_task_id: str = ''
+    ):
+        project_id = str(project_id or '').strip()
+        agent_key = str(agent_key or '').strip()
+        service_name = str(service_name or '').strip()
+        template_name = str(template_name or '').strip()
+        if not project_id or not agent_key or not service_name or not template_name:
+            return
+
+        table_name = self.db.get_table_name('service_template_bindings')
+        if self.db.db_type == 'mysql':
+            self.db.execute_query(
+                f"""
+                INSERT INTO {table_name}
+                (project_id, agent_key, service_name, template_id, template_name, source_task_id, source)
+                VALUES (%s, %s, %s, %s, %s, %s, 'deploy')
+                ON DUPLICATE KEY UPDATE
+                    template_id = VALUES(template_id),
+                    template_name = VALUES(template_name),
+                    source_task_id = VALUES(source_task_id),
+                    source = VALUES(source),
+                    updated_at = NOW()
+                """,
+                (project_id, agent_key, service_name, template_id, template_name, source_task_id)
+            )
+        else:
+            now_ts = datetime.now().isoformat()
+            self.db.execute_query(
+                f"""
+                INSERT INTO {table_name}
+                (project_id, agent_key, service_name, template_id, template_name, source_task_id, source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'deploy', ?, ?)
+                ON CONFLICT(project_id, agent_key, service_name) DO UPDATE SET
+                    template_id=excluded.template_id,
+                    template_name=excluded.template_name,
+                    source_task_id=excluded.source_task_id,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                (project_id, agent_key, service_name, template_id, template_name, source_task_id, now_ts, now_ts)
+            )
+
+    def _delete_service_template_binding(self, project_id: str, agent_key: str, service_name: str):
+        project_id = str(project_id or '').strip()
+        agent_key = str(agent_key or '').strip()
+        service_name = str(service_name or '').strip()
+        if not project_id or not agent_key or not service_name:
+            return
+        table_name = self.db.get_table_name('service_template_bindings')
+        self.db.execute_query(
+            f"DELETE FROM {table_name} WHERE project_id = %s AND agent_key = %s AND service_name = %s"
+            if self.db.db_type == 'mysql' else
+            f"DELETE FROM {table_name} WHERE project_id = ? AND agent_key = ? AND service_name = ?",
+            (project_id, agent_key, service_name)
+        )
+
+    def _get_project_id(self, agent_key: str) -> str:
+        try:
+            agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
+            return str(getattr(agent, 'project_id', '') or '').strip()
+        except Exception:
+            return ''
+
     def _cleanup_old_logs(self):
         try:
             cutoff_date = (datetime.now() - timedelta(days=7)).isoformat()
@@ -635,16 +722,17 @@ class TaskManager:
                 return
 
             template_type = template['type']
+            template_id = template.get('id')
             self._add_task_log(task_id, 'INFO', f"模板类型: {template_type}")
 
             # 3. 根据模板类型处理
             if template_type == 'yaml':
                 # YAML模板部署
-                self._deploy_yaml_template(task_id, service_name, agent_key, template_name, extra_params)
+                self._deploy_yaml_template(task_id, service_name, agent_key, template_name, template_id, extra_params)
 
             elif template_type == 'archive':
                 # 压缩模板部署（支持多种格式）
-                self._deploy_archive_template(task_id, service_name, agent_key, template_name, extra_params)
+                self._deploy_archive_template(task_id, service_name, agent_key, template_name, template_id, extra_params)
 
             else:
                 error_msg = f'不支持的模板类型: {template_type}'
@@ -655,7 +743,8 @@ class TaskManager:
             self._update_task_status(task_id, 'failed', 0, f'部署失败: {str(e)}')
             self._add_task_log(task_id, 'ERROR', f"异常详情: {traceback.format_exc()}")
     def _deploy_yaml_template(self, task_id: str, service_name: str, agent_key: str,
-                              template_name: str, extra_params: Dict = None):
+                              template_name: str, template_id: Optional[int] = None,
+                              extra_params: Dict = None):
         """部署YAML模板"""
         try:
             # 获取YAML内容
@@ -669,7 +758,9 @@ class TaskManager:
             # 准备部署数据
             data = {
                 'name': service_name,
-                'yaml': yaml_content
+                'yaml': yaml_content,
+                'template_name': template_name,
+                'template_id': template_id
             }
 
             # 添加额外参数（如果有）
@@ -701,12 +792,28 @@ class TaskManager:
                 )
 
                 if start_status_code == 200:
+                    self._upsert_service_template_binding(
+                        self._get_project_id(agent_key),
+                        agent_key,
+                        service_name,
+                        template_name,
+                        template_id=template_id,
+                        source_task_id=task_id
+                    )
                     self._update_task_status(task_id, 'success', 100, '服务部署成功')
                     self._add_task_log(task_id, 'INFO', '服务部署完成')
                 elif self._is_timeout_error(start_status_code, start_response):
                     # start接口超时不等于服务启动失败：避免误清理，先轮询服务实际状态
                     self._add_task_log(task_id, 'WARN', f"启动请求超时: {start_response}")
                     if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
+                        self._upsert_service_template_binding(
+                            self._get_project_id(agent_key),
+                            agent_key,
+                            service_name,
+                            template_name,
+                            template_id=template_id,
+                            source_task_id=task_id
+                        )
                         self._update_task_status(task_id, 'success', 100, '服务部署成功（超时后状态确认）')
                     else:
                         error_msg = f'启动服务超时，且轮询未就绪: {start_response}'
@@ -746,7 +853,8 @@ class TaskManager:
             self._notify_service_state_changed(agent_key, f"deploy_yaml:{service_name}")
 
     def _deploy_archive_template(self, task_id: str, service_name: str, agent_key: str,
-                                 template_name: str, extra_params: Dict = None):
+                                 template_name: str, template_id: Optional[int] = None,
+                                 extra_params: Dict = None):
         """部署压缩模板（支持多种格式）"""
         try:
             self._update_task_status(task_id, 'running', 30, '处理压缩模板')
@@ -772,7 +880,9 @@ class TaskManager:
             }
 
             data = {
-                'name': service_name
+                'name': service_name,
+                'template_name': template_name,
+                'template_id': template_id
             }
 
             # 添加额外参数
@@ -807,11 +917,27 @@ class TaskManager:
                 )
 
                 if start_status_code == 200:
+                    self._upsert_service_template_binding(
+                        self._get_project_id(agent_key),
+                        agent_key,
+                        service_name,
+                        template_name,
+                        template_id=template_id,
+                        source_task_id=task_id
+                    )
                     self._update_task_status(task_id, 'success', 100, '压缩服务部署成功')
                     self._add_task_log(task_id, 'INFO', '压缩服务部署完成')
                 elif self._is_timeout_error(start_status_code, start_response):
                     self._add_task_log(task_id, 'WARN', f"启动压缩服务请求超时: {start_response}")
                     if self._wait_service_ready_after_start_timeout(task_id, agent_key, service_name):
+                        self._upsert_service_template_binding(
+                            self._get_project_id(agent_key),
+                            agent_key,
+                            service_name,
+                            template_name,
+                            template_id=template_id,
+                            source_task_id=task_id
+                        )
                         self._update_task_status(task_id, 'success', 100, '压缩服务部署成功（超时后状态确认）')
                     else:
                         error_msg = f'启动压缩服务超时，且轮询未就绪: {start_response}'
@@ -867,6 +993,11 @@ class TaskManager:
             )
 
             if delete_status_code in [200, 204, 404]:
+                self._delete_service_template_binding(
+                    self._get_project_id(agent_key),
+                    agent_key,
+                    service_name
+                )
                 self._update_task_status(task_id, 'success', 100, '服务卸载成功')
                 self._add_task_log(task_id, 'INFO', '服务卸载完成')
             else:
