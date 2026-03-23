@@ -309,6 +309,46 @@ class NodeTaskCollectResponse(BaseModel):
     logs: NodeLogResponse
 
 
+class InstanceNodeLogsQueryRequest(BaseModel):
+    """Query node log records within one workflow instance."""
+    project_id: str
+    node_ids: List[str]
+    node_id: Optional[str] = None
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=20, ge=1, le=100)
+
+
+class InstanceNodeLogRecord(BaseModel):
+    """Stored node log record."""
+    id: str
+    task_id: Optional[str] = None
+    node_id: str
+    instance_id: str
+    project_id: str
+    node_type: str
+    k8s_resource_name: Optional[str] = None
+    k8s_resource_type: Optional[str] = None
+    status: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    message: Optional[str] = None
+    init_logs: Dict[str, Any] = Field(default_factory=dict)
+    execution_logs: Dict[str, Any] = Field(default_factory=dict)
+    log_updated_at: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class InstanceNodeLogsQueryResponse(BaseModel):
+    """Paginated workflow instance node log records."""
+    total: int
+    page: int
+    page_size: int
+    items: List[InstanceNodeLogRecord]
+
+
 # ============ 缁熻妯″紡 ============
 
 class StatusStatistics(BaseModel):
@@ -598,6 +638,7 @@ class WorkflowInitializeRequest(BaseModel):
 class WorkflowNodeResult(BaseModel):
     """WorkflowNodeResult model."""
     node_id: str
+    task_id: Optional[str] = None
     success: bool
     status: str
     message: Optional[str] = None

@@ -486,6 +486,7 @@ class StatusSyncService:
                 node_type = node.get("node_type")
                 k8s_resource_name = node.get("k8s_resource_name")
                 timeout_seconds = node.get("timeout_seconds")
+                task_id = node.get("task_id")
 
                 if not node_id or not k8s_resource_name:
                     continue
@@ -497,7 +498,8 @@ class StatusSyncService:
                     instance_id=instance_id,
                     node_type=node_type,
                     k8s_resource_name=k8s_resource_name,
-                    timeout_seconds=timeout_seconds
+                    timeout_seconds=timeout_seconds,
+                    task_id=task_id,
                 )
                 updated_nodes.append(result)
 
@@ -710,7 +712,8 @@ class StatusSyncService:
         self,
         node_id: str,
         status: str,
-        message: Optional[str] = None
+        message: Optional[str] = None,
+        task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         更新节点状态
@@ -728,15 +731,10 @@ class StatusSyncService:
         """
         db = get_db_session()
         try:
-            record = db.query(NodeStatusRecord).filter(
-                NodeStatusRecord.node_id == node_id
-            ).order_by(
-                NodeStatusRecord.created_at.desc(),
-                NodeStatusRecord.id.desc(),
-            ).first()
+            record = self._get_record(db, node_id=node_id, task_id=task_id)
 
             if not record:
-                raise ValueError(f"Node status record not found: {node_id}")
+                raise ValueError(f"Node status record not found: {task_id or node_id}")
 
             old_status = record.status
 
@@ -758,7 +756,7 @@ class StatusSyncService:
             record.message = message or f"Status updated to {status}"
 
             # Job节点完成或失败时记录结束时间
-            if status in ["Succeeded", "Failed"]:
+            if status in ["Succeeded", "Failed", "Stopped"]:
                 record.finished_at = datetime.utcnow()
 
             db.commit()
@@ -866,7 +864,8 @@ class StatusSyncService:
         node_id: str,
         logs: str,
         pod_name: Optional[str] = None,
-        container: Optional[str] = None
+        container: Optional[str] = None,
+        task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         保存节点初始化日志
@@ -882,15 +881,10 @@ class StatusSyncService:
         """
         db = get_db_session()
         try:
-            record = db.query(NodeStatusRecord).filter(
-                NodeStatusRecord.node_id == node_id
-            ).order_by(
-                NodeStatusRecord.created_at.desc(),
-                NodeStatusRecord.id.desc(),
-            ).first()
+            record = self._get_record(db, node_id=node_id, task_id=task_id)
 
             if not record:
-                raise ValueError(f"Node status record not found: {node_id}")
+                raise ValueError(f"Node status record not found: {task_id or node_id}")
 
             # 保存为JSON格式
             self._save_logs_to_record(
@@ -918,7 +912,8 @@ class StatusSyncService:
         node_id: str,
         logs: str,
         pod_name: Optional[str] = None,
-        container: Optional[str] = None
+        container: Optional[str] = None,
+        task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         保存节点执行日志
@@ -934,15 +929,10 @@ class StatusSyncService:
         """
         db = get_db_session()
         try:
-            record = db.query(NodeStatusRecord).filter(
-                NodeStatusRecord.node_id == node_id
-            ).order_by(
-                NodeStatusRecord.created_at.desc(),
-                NodeStatusRecord.id.desc(),
-            ).first()
+            record = self._get_record(db, node_id=node_id, task_id=task_id)
 
             if not record:
-                raise ValueError(f"Node status record not found: {node_id}")
+                raise ValueError(f"Node status record not found: {task_id or node_id}")
 
             # 保存为JSON格式
             self._save_logs_to_record(
@@ -967,7 +957,8 @@ class StatusSyncService:
 
     async def get_stored_logs(
         self,
-        node_id: str
+        node_id: Optional[str] = None,
+        task_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         获取节点存储的日志
@@ -980,24 +971,75 @@ class StatusSyncService:
         """
         db = get_db_session()
         try:
-            record = db.query(NodeStatusRecord).filter(
-                NodeStatusRecord.node_id == node_id
-            ).order_by(
-                NodeStatusRecord.created_at.desc(),
-                NodeStatusRecord.id.desc(),
-            ).first()
+            if not node_id and not task_id:
+                raise ValueError("Either node_id or task_id is required")
+
+            record = self._get_record(db, node_id=node_id, task_id=task_id)
 
             if not record:
-                raise ValueError(f"Node status record not found: {node_id}")
+                raise ValueError(f"Node status record not found: {task_id or node_id}")
 
             return {
                 "task_id": record.task_id,
-                "node_id": node_id,
+                "node_id": record.node_id,
                 "init_logs": record.init_logs or "",
                 "execution_logs": record.execution_logs or "",
                 "log_updated_at": record.log_updated_at.isoformat() if record.log_updated_at else None
             }
 
+        finally:
+            db.close()
+
+    async def query_instance_node_logs(
+        self,
+        instance_id: str,
+        project_id: str,
+        node_ids: List[str],
+        node_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        """Query stored node log records for one workflow instance."""
+        normalized_node_ids = [item for item in dict.fromkeys(node_ids or []) if item]
+        if not normalized_node_ids:
+            return {
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "items": [],
+            }
+
+        if node_id and node_id not in normalized_node_ids:
+            return {
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "items": [],
+            }
+
+        db = get_db_session()
+        try:
+            query = db.query(NodeStatusRecord).filter(
+                NodeStatusRecord.instance_id == instance_id,
+                NodeStatusRecord.project_id == project_id,
+                NodeStatusRecord.node_id.in_(normalized_node_ids),
+            )
+
+            if node_id:
+                query = query.filter(NodeStatusRecord.node_id == node_id)
+
+            total = query.count()
+            records = query.order_by(
+                NodeStatusRecord.created_at.desc(),
+                NodeStatusRecord.id.desc(),
+            ).offset((page - 1) * page_size).limit(page_size).all()
+
+            return {
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "items": [record.to_dict() for record in records],
+            }
         finally:
             db.close()
 

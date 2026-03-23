@@ -233,6 +233,7 @@ class WorkflowMonitorEngine:
                 node_type = node.get("node_type")
                 k8s_resource_name = node.get("k8s_resource_name")
                 timeout_seconds = node.get("timeout_seconds")
+                task_id = node.get("task_id")
 
                 if not node_id:
                     continue
@@ -244,7 +245,8 @@ class WorkflowMonitorEngine:
                     instance_id=session.instance_id,
                     node_type=node_type,
                     k8s_resource_name=k8s_resource_name,
-                    timeout_seconds=timeout_seconds
+                    timeout_seconds=timeout_seconds,
+                    task_id=task_id,
                 )
 
                 # 如果是JOB节点且已完成，尝试获取并保存日志
@@ -274,9 +276,10 @@ class WorkflowMonitorEngine:
         """保存JOB节点执行日志"""
         node_id = node.get("node_id")
         k8s_resource_name = node.get("k8s_resource_name")
+        task_id = node.get("task_id")
         try:
             # 检查是否已经保存过日志
-            stored_logs = await self._sync_service.get_stored_logs(node_id=node_id)
+            stored_logs = await self._sync_service.get_stored_logs(node_id=node_id, task_id=task_id)
             if stored_logs and stored_logs.get("execution_logs") and stored_logs.get("execution_logs", {}).get("logs"):
                 logger.debug(f"节点 {node_id} 已有执行日志，跳过保存")
                 return
@@ -307,7 +310,8 @@ class WorkflowMonitorEngine:
                 await self._sync_service.save_execution_logs(
                     node_id=node_id,
                     logs=logs,
-                    pod_name=pod_name
+                    pod_name=pod_name,
+                    task_id=task_id,
                 )
                 logger.info(f"已保存节点 {node_id} 执行日志 (Pod: {pod_name})")
 

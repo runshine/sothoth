@@ -24,6 +24,9 @@ from app.models.database import (
 from app.schemas.schemas import (
     BatchSyncRequest,
     BatchSyncResponse,
+    InstanceNodeLogRecord,
+    InstanceNodeLogsQueryRequest,
+    InstanceNodeLogsQueryResponse,
     NodeHistoryEntry,
     NodeHistoryResponse,
     NodeInitialRequest,
@@ -420,6 +423,37 @@ async def get_instance_nodes(
     return NodeListResponse(total=len(records), nodes=[NodeStatusInfo(**r.to_dict()) for r in records])
 
 
+@router.post(
+    "/instances/{instance_id}/node-logs/query",
+    response_model=InstanceNodeLogsQueryResponse,
+    summary="Query workflow instance node logs",
+    description="Query paginated stored node log records for one workflow instance.",
+)
+async def query_instance_node_logs(
+    instance_id: str,
+    request: InstanceNodeLogsQueryRequest = Body(...),
+    user: dict = Depends(get_current_user),
+):
+    try:
+        result = await get_status_sync_service().query_instance_node_logs(
+            instance_id=instance_id,
+            project_id=request.project_id,
+            node_ids=request.node_ids,
+            node_id=request.node_id,
+            page=request.page,
+            page_size=request.page_size,
+        )
+        return InstanceNodeLogsQueryResponse(
+            total=result["total"],
+            page=result["page"],
+            page_size=result["page_size"],
+            items=[InstanceNodeLogRecord(**item) for item in result["items"]],
+        )
+    except Exception as e:
+        logger.error(f"Failed to query instance node logs: {e}")
+        raise InternalError(f"Failed to query instance node logs: {str(e)}")
+
+
 @router.get(
     "/nodes/{node_id}/logs",
     response_model=NodeLogResponse,
@@ -598,11 +632,12 @@ async def get_statistics(
 async def save_init_logs(
     node_id: str,
     logs: str = Body(..., embed=True),
+    task_id: Optional[str] = Query(None, description="Task ID"),
     user: dict = Depends(get_current_user),
 ):
     try:
-        await get_status_sync_service().save_init_logs(node_id=node_id, logs=logs)
-        return {"success": True, "node_id": node_id}
+        await get_status_sync_service().save_init_logs(node_id=node_id, logs=logs, task_id=task_id)
+        return {"success": True, "node_id": node_id, "task_id": task_id}
     except ValueError:
         raise NotFoundError("Node", node_id)
     except Exception as e:
@@ -618,11 +653,12 @@ async def save_init_logs(
 async def save_execution_logs(
     node_id: str,
     logs: str = Body(..., embed=True),
+    task_id: Optional[str] = Query(None, description="Task ID"),
     user: dict = Depends(get_current_user),
 ):
     try:
-        await get_status_sync_service().save_execution_logs(node_id=node_id, logs=logs)
-        return {"success": True, "node_id": node_id}
+        await get_status_sync_service().save_execution_logs(node_id=node_id, logs=logs, task_id=task_id)
+        return {"success": True, "node_id": node_id, "task_id": task_id}
     except ValueError:
         raise NotFoundError("Node", node_id)
     except Exception as e:

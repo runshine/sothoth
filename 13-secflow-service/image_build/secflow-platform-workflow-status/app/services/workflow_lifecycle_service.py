@@ -36,6 +36,139 @@ class WorkflowLifecycleService:
         self.node_lifecycle_service = get_node_lifecycle_service()
         self.status_sync_service = get_status_sync_service()
 
+    def _normalize_status(self, status: Any, default: str = "Pending") -> str:
+        if status is None:
+            return default
+        if hasattr(status, "value"):
+            status = status.value
+        status_value = str(status).strip()
+        return status_value or default
+
+    def _resolve_task_status(self, operation: str, success: bool, status: Any) -> str:
+        normalized_status = self._normalize_status(status, default="Failed" if not success else "Pending")
+        if success and operation in {"deinitialize", "stop"}:
+            return "Stopped"
+        if not success and normalized_status in {"Pending", "Unknown"}:
+            return "Failed"
+        return normalized_status
+
+    def _build_lifecycle_logs(
+        self,
+        operation: str,
+        node_id: str,
+        instance_id: str,
+        project_id: str,
+        node_type: str,
+        success: bool,
+        status: str,
+        message: Optional[str],
+        error: Optional[str],
+        k8s_resource_name: Optional[str] = None,
+        service_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        lines = [
+            f"operation={operation}",
+            f"node_id={node_id}",
+            f"instance_id={instance_id}",
+            f"project_id={project_id}",
+            f"node_type={node_type}",
+            f"success={success}",
+            f"status={status}",
+            f"timestamp={datetime.utcnow().isoformat()}",
+        ]
+        if k8s_resource_name:
+            lines.append(f"k8s_resource_name={k8s_resource_name}")
+        if service_name:
+            lines.append(f"service_name={service_name}")
+        if message:
+            lines.append(f"message={message}")
+        if error:
+            lines.append(f"error={error}")
+        if metadata:
+            for key, value in metadata.items():
+                if value not in (None, "", [], {}):
+                    lines.append(f"{key}={value}")
+        return "\n".join(lines)
+
+    async def _record_lifecycle_task(
+        self,
+        operation: str,
+        node_id: str,
+        instance_id: str,
+        project_id: str,
+        node_type: str,
+        success: bool,
+        status: Any,
+        message: Optional[str] = None,
+        error: Optional[str] = None,
+        k8s_resource_name: Optional[str] = None,
+        service_name: Optional[str] = None,
+        has_ingress: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        normalized_node_type = self._normalize_status(node_type, default=NodeType.APP)
+        task_status = self._resolve_task_status(operation, success, status)
+        task_message = message or error or f"Workflow {operation}"
+        task_metadata = {
+            "service_name": service_name,
+            "has_ingress": has_ingress,
+            "lifecycle_operation": operation,
+        }
+        if metadata:
+            task_metadata.update(metadata)
+
+        record = await self.status_sync_service.create_node_task_record(
+            node_id=node_id,
+            instance_id=instance_id,
+            project_id=project_id,
+            node_type=normalized_node_type,
+            k8s_resource_name=k8s_resource_name,
+            initial_status=task_status,
+            metadata=task_metadata,
+        )
+        task_id = record["task_id"]
+        logs = self._build_lifecycle_logs(
+            operation=operation,
+            node_id=node_id,
+            instance_id=instance_id,
+            project_id=project_id,
+            node_type=normalized_node_type,
+            success=success,
+            status=task_status,
+            message=message,
+            error=error,
+            k8s_resource_name=k8s_resource_name,
+            service_name=service_name,
+            metadata=metadata,
+        )
+
+        if operation == "initialize":
+            await self.status_sync_service.save_init_logs(
+                node_id=node_id,
+                logs=logs,
+                task_id=task_id,
+            )
+        else:
+            await self.status_sync_service.save_execution_logs(
+                node_id=node_id,
+                logs=logs,
+                task_id=task_id,
+            )
+
+        await self.status_sync_service.update_node_status(
+            node_id=node_id,
+            status=task_status,
+            message=task_message,
+            task_id=task_id,
+        )
+
+        return {
+            "task_id": task_id,
+            "status": task_status,
+            "message": task_message,
+        }
+
     async def initialize_workflow(
         self,
         instance_id: str,
@@ -92,21 +225,26 @@ class WorkflowLifecycleService:
                 )
 
                 # 记录节点初始状态
-                await self._record_node_initial_status(
+                task_record = await self._record_lifecycle_task(
+                    operation="initialize",
                     node_id=node_id,
                     instance_id=instance_id,
                     project_id=project_id,
                     node_type=node_type,
+                    success=result.success,
+                    status=result.status,
+                    message=result.message,
+                    error=result.error,
                     k8s_resource_name=result.k8s_resource_name,
                     service_name=result.service_name,
-                    initial_status=result.status
                 )
 
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
+                    task_id=task_record["task_id"],
                     success=result.success,
-                    status=result.status,
-                    message=result.message,
+                    status=task_record["status"],
+                    message=task_record["message"],
                     k8s_resource_name=result.k8s_resource_name,
                     service_name=result.service_name,
                     error=result.error
@@ -124,10 +262,25 @@ class WorkflowLifecycleService:
                 error_msg = f"节点初始化异常: {str(e)}"
                 logger.error(f"[WorkflowLifecycle] {error_msg}", exc_info=True)
 
+                task_record = await self._record_lifecycle_task(
+                    operation="initialize",
+                    node_id=node_id,
+                    instance_id=instance_id,
+                    project_id=project_id,
+                    node_type=node_type,
+                    success=False,
+                    status="Failed",
+                    error=error_msg,
+                    k8s_resource_name=node_config.get("deployment_name"),
+                    service_name=node_config.get("service_name"),
+                )
+
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
+                    task_id=task_record["task_id"],
                     success=False,
-                    status=AppNodeStatus.PENDING,
+                    status=task_record["status"],
+                    message=task_record["message"],
                     error=error_msg
                 )
 
@@ -254,17 +407,27 @@ class WorkflowLifecycleService:
                 )
 
                 # 更新节点状态为已清理
-                await self._update_node_status(
+                task_record = await self._record_lifecycle_task(
+                    operation="deinitialize",
                     node_id=node_id,
-                    status="Stopped",
-                    message="Workflow deinitialized"
+                    instance_id=instance_id,
+                    project_id=project_id,
+                    node_type=node_type,
+                    success=result.success,
+                    status="Stopped" if result.success else "Failed",
+                    message=result.message or "Workflow deinitialized",
+                    error=result.error,
+                    k8s_resource_name=k8s_resource_name,
+                    service_name=service_name,
+                    has_ingress=has_ingress,
                 )
 
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
+                    task_id=task_record["task_id"],
                     success=result.success,
-                    status="Stopped",
-                    message=result.message,
+                    status=task_record["status"],
+                    message=task_record["message"],
                     k8s_resource_name=k8s_resource_name,
                     error=result.error
                 )
@@ -281,10 +444,26 @@ class WorkflowLifecycleService:
                 error_msg = f"节点反初始化异常: {str(e)}"
                 logger.error(f"[WorkflowLifecycle] {error_msg}", exc_info=True)
 
+                task_record = await self._record_lifecycle_task(
+                    operation="deinitialize",
+                    node_id=node_id,
+                    instance_id=instance_id,
+                    project_id=project_id,
+                    node_type=node_type,
+                    success=False,
+                    status="Failed",
+                    error=error_msg,
+                    k8s_resource_name=k8s_resource_name,
+                    service_name=service_name,
+                    has_ingress=has_ingress,
+                )
+
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
+                    task_id=task_record["task_id"],
                     success=False,
-                    status="Unknown",
+                    status=task_record["status"],
+                    message=task_record["message"],
                     error=error_msg
                 )
 
@@ -389,17 +568,27 @@ class WorkflowLifecycleService:
                 )
 
                 # 更新节点状态为Stopped
-                await self._update_node_status(
+                task_record = await self._record_lifecycle_task(
+                    operation="stop",
                     node_id=node_id,
-                    status="Stopped",
-                    message="Workflow stopped"
+                    instance_id=instance_id,
+                    project_id=project_id,
+                    node_type=node_type,
+                    success=result.success,
+                    status="Stopped" if result.success else "Failed",
+                    message=result.message or "Workflow stopped",
+                    error=result.error,
+                    k8s_resource_name=k8s_resource_name,
+                    service_name=service_name,
+                    has_ingress=has_ingress,
                 )
 
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
+                    task_id=task_record["task_id"],
                     success=result.success,
-                    status="Stopped",
-                    message=result.message,
+                    status=task_record["status"],
+                    message=task_record["message"],
                     k8s_resource_name=k8s_resource_name,
                     error=result.error
                 )
@@ -416,10 +605,26 @@ class WorkflowLifecycleService:
                 error_msg = f"节点停止异常: {str(e)}"
                 logger.error(f"[WorkflowLifecycle] {error_msg}", exc_info=True)
 
+                task_record = await self._record_lifecycle_task(
+                    operation="stop",
+                    node_id=node_id,
+                    instance_id=instance_id,
+                    project_id=project_id,
+                    node_type=node_type,
+                    success=False,
+                    status="Failed",
+                    error=error_msg,
+                    k8s_resource_name=k8s_resource_name,
+                    service_name=service_name,
+                    has_ingress=has_ingress,
+                )
+
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
+                    task_id=task_record["task_id"],
                     success=False,
-                    status="Stopped",
+                    status=task_record["status"],
+                    message=task_record["message"],
                     error=error_msg
                 )
 
@@ -477,6 +682,7 @@ class WorkflowLifecycleService:
             app_nodes.append(
                 {
                     "node_id": node_id,
+                    "task_id": result.task_id,
                     "node_type": "app",
                     "k8s_resource_name": result.k8s_resource_name,
                     "timeout_seconds": None,
@@ -579,7 +785,18 @@ class WorkflowLifecycleService:
             records = db.query(NodeStatusRecord).filter(
                 NodeStatusRecord.instance_id == instance_id,
                 NodeStatusRecord.project_id == project_id
+            ).order_by(
+                NodeStatusRecord.created_at.desc(),
+                NodeStatusRecord.id.desc(),
             ).all()
+
+            latest_records = []
+            seen_node_ids = set()
+            for record in records:
+                if record.node_id in seen_node_ids:
+                    continue
+                seen_node_ids.add(record.node_id)
+                latest_records.append(record)
 
             return [
                 {
@@ -591,7 +808,7 @@ class WorkflowLifecycleService:
                     "has_ingress": r.extra_data.get("has_ingress", False) if r.extra_data else False,
                     "metadata": r.extra_data
                 }
-                for r in records
+                for r in latest_records
             ]
         finally:
             db.close()
