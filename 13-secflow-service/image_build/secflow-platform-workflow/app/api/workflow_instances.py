@@ -774,7 +774,7 @@ async def create_workflow_instance(
     trigger_url = None
     trigger_type_val = instance_data.trigger_type.value if hasattr(instance_data.trigger_type, 'value') else instance_data.trigger_type
     if trigger_type_val == "http" and instance_data.trigger_enabled:
-        trigger_url = f"/api/workflow/trigger/{instance_id}"
+        trigger_url = f"/api/workflow/workflow-instances/trigger/{instance_id}"
 
     # Convert nodes and edges to dict for storage
     nodes_dict = []
@@ -1616,94 +1616,161 @@ async def get_node_init_logs(
 # ============ Trigger Endpoints ============
 
 async def _reset_job_nodes_for_retrigger(instance_id: str, project_id: str):
-    """Reset JOB node status when retriggering workflow"""
+    """Reset latest JOB status snapshots for legacy re-trigger flows."""
     status_client = get_workflow_status_client()
 
     try:
         result = await status_client.reset_job_nodes(
             instance_id=instance_id,
             project_id=project_id,
-            reset_logs=False  # Keep logs
+            reset_logs=False,
         )
-        logger.info(f"Reset JOB node status, instance_id={instance_id}, reset_count={result.get('reset_count', 0)}")
+        logger.info(
+            "Reset legacy JOB node snapshots, instance_id=%s, reset_count=%s",
+            instance_id,
+            result.get("reset_count", 0),
+        )
     except Exception as e:
-        logger.warning(f"Failed to reset JOB node status: {e}")
+        logger.warning("Failed to reset JOB node status snapshots: %s", e)
 
 
-@router.post("/trigger/{instance_id}", response_model=SuccessResponse)
-async def trigger_workflow_by_http(
+def _build_trigger_node_payloads(
+    instance: WorkflowInstance,
+    db: Session,
+) -> tuple[List[WorkflowNodeInstance], List[Dict[str, Any]]]:
+    """Build executable node payloads for workflow-status trigger orchestration."""
+    nodes = db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.instance_id == instance.id
+    ).all()
+
+    payloads: List[Dict[str, Any]] = []
+    for node in nodes:
+        payload: Dict[str, Any] = {
+            "node_id": node.node_id,
+            "node_name": node.name,
+            "node_type": node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type),
+            "depends_on": node.depends_on or [],
+            "k8s_resource_name": node.k8s_resource_name,
+            "service_name": node.service_name,
+            "timeout_seconds": node.timeout_seconds,
+        }
+
+        if node.node_type == NodeType.JOB:
+            template = db.query(JobTemplate).filter(JobTemplate.id == node.template_id).first()
+            if not template:
+                raise ValidationError(f"Job template {node.template_id} not found for node {node.node_id}")
+            payload["job_config"] = {
+                "containers": _build_containers_from_template(template, node),
+                "ttl_seconds_after_finished": template.ttl_seconds_after_finished,
+                "backoff_limit": template.backoff_limit,
+            }
+
+        payloads.append(payload)
+
+    if not payloads:
+        raise ValidationError("Workflow instance has no nodes to trigger")
+
+    return nodes, payloads
+
+
+def _validate_trigger_instance(
+    instance: WorkflowInstance,
+    *,
+    require_http_trigger: bool,
+) -> None:
+    if instance.status == WorkflowStatus.PENDING:
+        raise ValidationError(f"Workflow instance {instance.id} is not initialized. Call initialize first.")
+
+    if instance.run_mode == "persistent" and not instance.is_active:
+        raise ValidationError(f"Workflow instance {instance.id} is not active")
+
+    if require_http_trigger:
+        if not instance.trigger_enabled:
+            raise ValidationError(f"Trigger is not enabled for workflow instance {instance.id}")
+        if instance.trigger_type != "http":
+            raise ValidationError(f"Workflow instance {instance.id} is not configured for HTTP trigger")
+
+
+async def _dispatch_workflow_trigger(
+    instance: WorkflowInstance,
+    db: Session,
+) -> SuccessResponse:
+    await ensure_project_namespace(instance.project_id)
+
+    node_instances, trigger_nodes = _build_trigger_node_payloads(instance, db)
+
+    from datetime import datetime
+
+    for node in node_instances:
+        if node.node_type != NodeType.JOB:
+            continue
+        node.status = NodeStatus.PENDING
+        node.message = "Reset for trigger execution"
+        node.started_at = None
+        node.finished_at = None
+        node.k8s_resource_name = None
+        node.k8s_resource_type = "Job"
+
+    instance.run_count += 1
+    instance.last_run_at = datetime.utcnow()
+    instance.started_at = datetime.utcnow()
+    instance.finished_at = None
+    instance.status = WorkflowStatus.UNREADY
+    instance.message = "Workflow trigger accepted"
+    db.commit()
+
+    try:
+        result = await get_status_client().trigger_workflow_execution(
+            instance_id=instance.id,
+            project_id=instance.project_id,
+            run_mode=instance.run_mode,
+            nodes=trigger_nodes,
+            edges=instance.edges or [],
+        )
+        if not result.get("success", False):
+            raise InternalError(result.get("message", "Workflow trigger request rejected by workflow-status"))
+    except Exception as e:
+        instance.message = f"Trigger dispatch failed: {str(e)}"
+        db.commit()
+        raise
+
+    logger.info("Triggered workflow instance %s via workflow-status", instance.id)
+    return SuccessResponse(message=f"Workflow {instance.id} triggered successfully")
+
+
+@router.post("/{instance_id}/trigger", response_model=SuccessResponse)
+async def trigger_workflow_instance(
     instance_id: str,
-    db: Session = Depends(get_db)
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    """
-    Trigger workflow execution via HTTP endpoint
-
-    - For persistent mode workflows with HTTP trigger enabled
-    - Can be called without authentication (internal use)
-    - Returns immediately, workflow runs asynchronously
-    - Valid states: unready (can trigger), ready (can trigger), pending (reject - not initialized)
-    """
+    """Trigger workflow execution from the authenticated UI."""
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
     if not instance:
         raise NotFoundError("Workflow instance", instance_id)
 
-    # Check if trigger is enabled
-    if not instance.trigger_enabled:
-        raise ValidationError(f"Trigger is not enabled for workflow instance {instance_id}")
+    user_id = str(current_user.get("id", ""))
+    if not check_instance_permission(instance, user_id):
+        raise ForbiddenError("No permission to trigger this instance")
 
-    if not instance.is_active:
-        raise ValidationError(f"Workflow instance {instance_id} is not active")
+    _validate_trigger_instance(instance, require_http_trigger=False)
+    return await _dispatch_workflow_trigger(instance, db)
 
-    if instance.trigger_type != "http":
-        raise ValidationError(f"Workflow instance {instance_id} is not configured for HTTP trigger")
 
-    # Check if workflow can be triggered
-    # Valid states: unready (can trigger), ready (can trigger)
-    if instance.status == WorkflowStatus.PENDING:
-        raise ValidationError(f"Workflow instance {instance_id} is not initialized. Call initialize first.")
+@router.post("/trigger/{instance_id}", response_model=SuccessResponse)
+async def trigger_workflow_by_http(
+    instance_id: str,
+    db: Session = Depends(get_db),
+):
+    """Trigger workflow execution via public HTTP endpoint."""
+    instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
-    # Reset JOB node status (for retrigger scenarios)
-    await _reset_job_nodes_for_retrigger(instance_id, instance.project_id)
+    if not instance:
+        raise NotFoundError("Workflow instance", instance_id)
 
-    # Start workflow
-    try:
-        # Create independent Session for background task
-        bg_session = get_session_factory()()
-
-        engine = WorkflowEngine(instance_id, bg_session)
-        await engine.initialize()
-
-        # Record nodes to status service
-        await engine._record_nodes_to_status_service()
-
-        # Verify namespace exists via workflow-status proxy
-        await ensure_project_namespace(instance.project_id)
-
-        # Update run count and last run time
-        instance.run_count += 1
-        from datetime import datetime
-        instance.last_run_at = datetime.utcnow()
-
-        # Execute workflow asynchronously with its own session
-        async def run_workflow_with_session():
-            try:
-                await engine.execute_workflow()
-            finally:
-                bg_session.close()
-
-        asyncio.create_task(run_workflow_with_session())
-
-        logger.info(f"Triggered workflow instance {instance_id} via HTTP trigger")
-
-    except ValueError as e:
-        raise ValidationError(str(e))
-    except Exception as e:
-        logger.error(f"Failed to trigger workflow {instance_id}: {e}")
-        raise InternalError(f"Failed to trigger workflow: {str(e)}")
-
-    db.commit()
-    return SuccessResponse(message=f"Workflow {instance_id} triggered successfully")
+    _validate_trigger_instance(instance, require_http_trigger=True)
+    return await _dispatch_workflow_trigger(instance, db)
 
 
 @router.post("/{instance_id}/activate", response_model=WorkflowInstanceResponse)

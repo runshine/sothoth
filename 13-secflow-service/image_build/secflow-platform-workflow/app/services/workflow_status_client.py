@@ -255,6 +255,22 @@ class WorkflowStatusClient:
         }
         return await self._request_json("POST", "/nodes/reset-job", json=payload)
 
+    async def trigger_workflow_execution(
+        self,
+        instance_id: str,
+        project_id: str,
+        run_mode: str,
+        nodes: List[Dict[str, Any]],
+        edges: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        payload = {
+            "project_id": project_id,
+            "run_mode": run_mode,
+            "nodes": nodes,
+            "edges": edges or [],
+        }
+        return await self._request_json("POST", f"/instances/{instance_id}/trigger", json=payload)
+
 
 _workflow_status_client: Optional[WorkflowStatusClient] = None
 
