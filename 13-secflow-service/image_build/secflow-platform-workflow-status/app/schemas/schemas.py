@@ -671,6 +671,34 @@ class WorkflowStopRequest(BaseModel):
     nodes: Optional[List[Dict[str, Any]]] = None
 
 
+class WorkflowTriggerNodeConfig(BaseModel):
+    """Trigger-time executable node configuration."""
+    node_id: str
+    node_name: str
+    node_type: str
+    depends_on: List[str] = []
+    k8s_resource_name: Optional[str] = None
+    service_name: Optional[str] = None
+    timeout_seconds: Optional[int] = None
+    job_config: Optional[Dict[str, Any]] = None
+
+
+class WorkflowTriggerRequest(BaseModel):
+    """Workflow trigger execution request."""
+    project_id: str
+    run_mode: str
+    nodes: List[WorkflowTriggerNodeConfig]
+    edges: List[Dict[str, Any]] = []
+
+
+class WorkflowTriggerResponse(BaseModel):
+    """Workflow trigger execution response."""
+    success: bool
+    instance_id: str
+    project_id: str
+    message: Optional[str] = None
+
+
 # ============ 鑺傜偣鍚姩鎿嶄綔妯″紡 ============
 
 class NodeStartRequest(BaseModel):

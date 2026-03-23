@@ -1083,6 +1083,7 @@ class StatusSyncService:
         container: Optional[str] = None,
         previous: bool = False,
         persist: bool = True,
+        log_field_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Fetch logs for the specific task record and optionally persist them."""
         db = get_db_session()
@@ -1127,7 +1128,7 @@ class StatusSyncService:
             ) or ""
 
             if persist:
-                log_field = "init_logs" if (record.node_type or "").lower() == "app" else "execution_logs"
+                log_field = log_field_override or ("init_logs" if (record.node_type or "").lower() == "app" else "execution_logs")
                 self._save_logs_to_record(
                     record=record,
                     log_field=log_field,
@@ -1303,10 +1304,17 @@ class StatusSyncService:
                 NodeStatusRecord.instance_id == instance_id,
                 NodeStatusRecord.project_id == project_id,
                 NodeStatusRecord.node_type == "job"
+            ).order_by(
+                NodeStatusRecord.created_at.desc(),
+                NodeStatusRecord.id.desc(),
             ).all()
 
             reset_nodes = []
+            seen_node_ids = set()
             for record in records:
+                if record.node_id in seen_node_ids:
+                    continue
+                seen_node_ids.add(record.node_id)
                 old_status = record.status
 
                 # 只重置非Pending状态的节点

@@ -39,6 +39,9 @@ from app.schemas.schemas import (
     WorkflowLifecycleResponse,
     WorkflowDeinitializeRequest,
     WorkflowStopRequest,
+    WorkflowTriggerNodeConfig,
+    WorkflowTriggerRequest,
+    WorkflowTriggerResponse,
     NodeStartRequest,
     NodeStartResponse,
 )
@@ -74,4 +77,7 @@ __all__ = [
     "WorkflowLifecycleResponse",
     "WorkflowDeinitializeRequest",
     "WorkflowStopRequest",
+    "WorkflowTriggerNodeConfig",
+    "WorkflowTriggerRequest",
+    "WorkflowTriggerResponse",
 ]

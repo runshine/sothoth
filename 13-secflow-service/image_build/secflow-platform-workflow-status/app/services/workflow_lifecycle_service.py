@@ -91,6 +91,151 @@ class WorkflowLifecycleService:
                     lines.append(f"{key}={value}")
         return "\n".join(lines)
 
+    def _build_task_metadata(
+        self,
+        operation: str,
+        service_name: Optional[str] = None,
+        has_ingress: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        task_metadata = {
+            "service_name": service_name,
+            "has_ingress": has_ingress,
+            "lifecycle_operation": operation,
+        }
+        if metadata:
+            task_metadata.update(metadata)
+        return task_metadata
+
+    async def _create_lifecycle_task_record(
+        self,
+        operation: str,
+        node_id: str,
+        instance_id: str,
+        project_id: str,
+        node_type: str,
+        k8s_resource_name: Optional[str] = None,
+        service_name: Optional[str] = None,
+        has_ingress: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+        initial_status: Any = "Pending",
+    ) -> Dict[str, Any]:
+        normalized_node_type = self._normalize_status(node_type, default=NodeType.APP)
+        task_metadata = self._build_task_metadata(
+            operation=operation,
+            service_name=service_name,
+            has_ingress=has_ingress,
+            metadata=metadata,
+        )
+        record = await self.status_sync_service.create_node_task_record(
+            node_id=node_id,
+            instance_id=instance_id,
+            project_id=project_id,
+            node_type=normalized_node_type,
+            k8s_resource_name=k8s_resource_name,
+            initial_status=self._normalize_status(initial_status, default="Pending"),
+            metadata=task_metadata,
+        )
+        return {
+            "task_id": record["task_id"],
+            "metadata": task_metadata,
+        }
+
+    async def _collect_runtime_logs_for_task(
+        self,
+        task_id: str,
+        project_id: str,
+        log_field_override: Optional[str] = None,
+    ) -> bool:
+        try:
+            log_result = await self.status_sync_service.get_task_logs(
+                task_id=task_id,
+                project_id=project_id,
+                tail_lines=500,
+                persist=True,
+                log_field_override=log_field_override,
+            )
+            return bool(log_result.get("logs")) and bool(log_result.get("pod_name"))
+        except Exception as e:
+            logger.debug(
+                f"[WorkflowLifecycle] Failed to collect runtime logs: "
+                f"task_id={task_id}, project_id={project_id}, error={e}"
+            )
+            return False
+
+    async def _finalize_lifecycle_task_record(
+        self,
+        task_id: str,
+        operation: str,
+        node_id: str,
+        instance_id: str,
+        project_id: str,
+        node_type: str,
+        success: bool,
+        status: Any,
+        message: Optional[str] = None,
+        error: Optional[str] = None,
+        k8s_resource_name: Optional[str] = None,
+        service_name: Optional[str] = None,
+        has_ingress: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+        persist_summary_logs: bool = True,
+    ) -> Dict[str, Any]:
+        normalized_node_type = self._normalize_status(node_type, default=NodeType.APP)
+        task_status = self._resolve_task_status(operation, success, status)
+        task_message = message or error or f"Workflow {operation}"
+        logs = self._build_lifecycle_logs(
+            operation=operation,
+            node_id=node_id,
+            instance_id=instance_id,
+            project_id=project_id,
+            node_type=normalized_node_type,
+            success=success,
+            status=task_status,
+            message=message,
+            error=error,
+            k8s_resource_name=k8s_resource_name,
+            service_name=service_name,
+            metadata=metadata,
+        )
+
+        if persist_summary_logs:
+            if operation == "initialize":
+                collected_real_logs = False
+                if normalized_node_type.lower() == NodeType.APP and success and k8s_resource_name:
+                    collected_real_logs = await self._collect_runtime_logs_for_task(
+                        task_id=task_id,
+                        project_id=project_id,
+                    )
+
+                # APP 节点初始化成功时，init_logs 只保留真实 Pod/容器日志。
+                # 如果此刻 Pod 还没起来，就先留空，后续由监控同步补抓真实日志。
+                if not collected_real_logs and (normalized_node_type.lower() != NodeType.APP or not success):
+                    await self.status_sync_service.save_init_logs(
+                        node_id=node_id,
+                        logs=logs,
+                        task_id=task_id,
+                    )
+            else:
+                await self.status_sync_service.save_execution_logs(
+                    node_id=node_id,
+                    logs=logs,
+                    task_id=task_id,
+                )
+
+        await self.status_sync_service.update_node_status(
+            node_id=node_id,
+            status=task_status,
+            message=task_message,
+            task_id=task_id,
+        )
+
+        return {
+            "task_id": task_id,
+            "status": task_status,
+            "message": task_message,
+        }
+
     async def _record_lifecycle_task(
         self,
         operation: str,
@@ -107,86 +252,34 @@ class WorkflowLifecycleService:
         has_ingress: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        normalized_node_type = self._normalize_status(node_type, default=NodeType.APP)
-        task_status = self._resolve_task_status(operation, success, status)
-        task_message = message or error or f"Workflow {operation}"
-        task_metadata = {
-            "service_name": service_name,
-            "has_ingress": has_ingress,
-            "lifecycle_operation": operation,
-        }
-        if metadata:
-            task_metadata.update(metadata)
-
-        record = await self.status_sync_service.create_node_task_record(
-            node_id=node_id,
-            instance_id=instance_id,
-            project_id=project_id,
-            node_type=normalized_node_type,
-            k8s_resource_name=k8s_resource_name,
-            initial_status=task_status,
-            metadata=task_metadata,
-        )
-        task_id = record["task_id"]
-        logs = self._build_lifecycle_logs(
+        task_context = await self._create_lifecycle_task_record(
             operation=operation,
             node_id=node_id,
             instance_id=instance_id,
             project_id=project_id,
-            node_type=normalized_node_type,
+            node_type=node_type,
+            k8s_resource_name=k8s_resource_name,
+            service_name=service_name,
+            has_ingress=has_ingress,
+            metadata=metadata,
+            initial_status=status,
+        )
+        return await self._finalize_lifecycle_task_record(
+            task_id=task_context["task_id"],
+            operation=operation,
+            node_id=node_id,
+            instance_id=instance_id,
+            project_id=project_id,
+            node_type=node_type,
             success=success,
-            status=task_status,
+            status=status,
             message=message,
             error=error,
             k8s_resource_name=k8s_resource_name,
             service_name=service_name,
+            has_ingress=has_ingress,
             metadata=metadata,
         )
-
-        if operation == "initialize":
-            collected_real_logs = False
-            if normalized_node_type.lower() == NodeType.APP and success and k8s_resource_name:
-                try:
-                    log_result = await self.status_sync_service.get_task_logs(
-                        task_id=task_id,
-                        project_id=project_id,
-                        tail_lines=500,
-                        persist=True,
-                    )
-                    collected_real_logs = bool(log_result.get("logs")) and bool(log_result.get("pod_name"))
-                except Exception as e:
-                    logger.debug(
-                        f"[WorkflowLifecycle] Failed to collect init Pod logs immediately: "
-                        f"node_id={node_id}, task_id={task_id}, error={e}"
-                    )
-
-            # APP 节点初始化成功时，init_logs 只保留真实 Pod/容器日志。
-            # 如果此刻 Pod 还没起来，就先留空，后续由监控同步补抓真实日志。
-            if not collected_real_logs and (normalized_node_type.lower() != NodeType.APP or not success):
-                await self.status_sync_service.save_init_logs(
-                    node_id=node_id,
-                    logs=logs,
-                    task_id=task_id,
-                )
-        else:
-            await self.status_sync_service.save_execution_logs(
-                node_id=node_id,
-                logs=logs,
-                task_id=task_id,
-            )
-
-        await self.status_sync_service.update_node_status(
-            node_id=node_id,
-            status=task_status,
-            message=task_message,
-            task_id=task_id,
-        )
-
-        return {
-            "task_id": task_id,
-            "status": task_status,
-            "message": task_message,
-        }
 
     async def initialize_workflow(
         self,
@@ -414,7 +507,26 @@ class WorkflowLifecycleService:
                 metadata = node_info.get("metadata") or {}
                 has_ingress = metadata.get("has_ingress", False)
 
+            task_id: Optional[str] = None
             try:
+                task_context = await self._create_lifecycle_task_record(
+                    operation="deinitialize",
+                    node_id=node_id,
+                    instance_id=instance_id,
+                    project_id=project_id,
+                    node_type=node_type,
+                    k8s_resource_name=k8s_resource_name,
+                    service_name=service_name,
+                    has_ingress=has_ingress,
+                    initial_status=node_info.get("status", "Pending"),
+                )
+                task_id = task_context["task_id"]
+                await self._collect_runtime_logs_for_task(
+                    task_id=task_id,
+                    project_id=project_id,
+                    log_field_override="execution_logs",
+                )
+
                 result = await self.node_lifecycle_service.uninitialize_node(
                     node_id=node_id,
                     instance_id=instance_id,
@@ -425,21 +537,38 @@ class WorkflowLifecycleService:
                     has_ingress=has_ingress
                 )
 
-                # 更新节点状态为已清理
-                task_record = await self._record_lifecycle_task(
-                    operation="deinitialize",
-                    node_id=node_id,
-                    instance_id=instance_id,
-                    project_id=project_id,
-                    node_type=node_type,
-                    success=result.success,
-                    status="Stopped" if result.success else "Failed",
-                    message=result.message or "Workflow deinitialized",
-                    error=result.error,
-                    k8s_resource_name=k8s_resource_name,
-                    service_name=service_name,
-                    has_ingress=has_ingress,
-                )
+                if task_id:
+                    task_record = await self._finalize_lifecycle_task_record(
+                        task_id=task_id,
+                        operation="deinitialize",
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        project_id=project_id,
+                        node_type=node_type,
+                        success=result.success,
+                        status="Stopped" if result.success else "Failed",
+                        message=result.message or "Workflow deinitialized",
+                        error=result.error,
+                        k8s_resource_name=k8s_resource_name,
+                        service_name=service_name,
+                        has_ingress=has_ingress,
+                        persist_summary_logs=False,
+                    )
+                else:
+                    task_record = await self._record_lifecycle_task(
+                        operation="deinitialize",
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        project_id=project_id,
+                        node_type=node_type,
+                        success=result.success,
+                        status="Stopped" if result.success else "Failed",
+                        message=result.message or "Workflow deinitialized",
+                        error=result.error,
+                        k8s_resource_name=k8s_resource_name,
+                        service_name=service_name,
+                        has_ingress=has_ingress,
+                    )
 
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
@@ -463,19 +592,36 @@ class WorkflowLifecycleService:
                 error_msg = f"节点反初始化异常: {str(e)}"
                 logger.error(f"[WorkflowLifecycle] {error_msg}", exc_info=True)
 
-                task_record = await self._record_lifecycle_task(
-                    operation="deinitialize",
-                    node_id=node_id,
-                    instance_id=instance_id,
-                    project_id=project_id,
-                    node_type=node_type,
-                    success=False,
-                    status="Failed",
-                    error=error_msg,
-                    k8s_resource_name=k8s_resource_name,
-                    service_name=service_name,
-                    has_ingress=has_ingress,
-                )
+                if task_id:
+                    task_record = await self._finalize_lifecycle_task_record(
+                        task_id=task_id,
+                        operation="deinitialize",
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        project_id=project_id,
+                        node_type=node_type,
+                        success=False,
+                        status="Failed",
+                        error=error_msg,
+                        k8s_resource_name=k8s_resource_name,
+                        service_name=service_name,
+                        has_ingress=has_ingress,
+                        persist_summary_logs=False,
+                    )
+                else:
+                    task_record = await self._record_lifecycle_task(
+                        operation="deinitialize",
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        project_id=project_id,
+                        node_type=node_type,
+                        success=False,
+                        status="Failed",
+                        error=error_msg,
+                        k8s_resource_name=k8s_resource_name,
+                        service_name=service_name,
+                        has_ingress=has_ingress,
+                    )
 
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
@@ -575,7 +721,26 @@ class WorkflowLifecycleService:
                 metadata = node_info.get("metadata") or {}
                 has_ingress = metadata.get("has_ingress", False)
 
+            task_id: Optional[str] = None
             try:
+                task_context = await self._create_lifecycle_task_record(
+                    operation="stop",
+                    node_id=node_id,
+                    instance_id=instance_id,
+                    project_id=project_id,
+                    node_type=node_type,
+                    k8s_resource_name=k8s_resource_name,
+                    service_name=service_name,
+                    has_ingress=has_ingress,
+                    initial_status=node_info.get("status", "Pending"),
+                )
+                task_id = task_context["task_id"]
+                await self._collect_runtime_logs_for_task(
+                    task_id=task_id,
+                    project_id=project_id,
+                    log_field_override="execution_logs",
+                )
+
                 result = await self.node_lifecycle_service.stop_node(
                     node_id=node_id,
                     instance_id=instance_id,
@@ -586,21 +751,38 @@ class WorkflowLifecycleService:
                     has_ingress=has_ingress
                 )
 
-                # 更新节点状态为Stopped
-                task_record = await self._record_lifecycle_task(
-                    operation="stop",
-                    node_id=node_id,
-                    instance_id=instance_id,
-                    project_id=project_id,
-                    node_type=node_type,
-                    success=result.success,
-                    status="Stopped" if result.success else "Failed",
-                    message=result.message or "Workflow stopped",
-                    error=result.error,
-                    k8s_resource_name=k8s_resource_name,
-                    service_name=service_name,
-                    has_ingress=has_ingress,
-                )
+                if task_id:
+                    task_record = await self._finalize_lifecycle_task_record(
+                        task_id=task_id,
+                        operation="stop",
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        project_id=project_id,
+                        node_type=node_type,
+                        success=result.success,
+                        status="Stopped" if result.success else "Failed",
+                        message=result.message or "Workflow stopped",
+                        error=result.error,
+                        k8s_resource_name=k8s_resource_name,
+                        service_name=service_name,
+                        has_ingress=has_ingress,
+                        persist_summary_logs=False,
+                    )
+                else:
+                    task_record = await self._record_lifecycle_task(
+                        operation="stop",
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        project_id=project_id,
+                        node_type=node_type,
+                        success=result.success,
+                        status="Stopped" if result.success else "Failed",
+                        message=result.message or "Workflow stopped",
+                        error=result.error,
+                        k8s_resource_name=k8s_resource_name,
+                        service_name=service_name,
+                        has_ingress=has_ingress,
+                    )
 
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
@@ -624,19 +806,36 @@ class WorkflowLifecycleService:
                 error_msg = f"节点停止异常: {str(e)}"
                 logger.error(f"[WorkflowLifecycle] {error_msg}", exc_info=True)
 
-                task_record = await self._record_lifecycle_task(
-                    operation="stop",
-                    node_id=node_id,
-                    instance_id=instance_id,
-                    project_id=project_id,
-                    node_type=node_type,
-                    success=False,
-                    status="Failed",
-                    error=error_msg,
-                    k8s_resource_name=k8s_resource_name,
-                    service_name=service_name,
-                    has_ingress=has_ingress,
-                )
+                if task_id:
+                    task_record = await self._finalize_lifecycle_task_record(
+                        task_id=task_id,
+                        operation="stop",
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        project_id=project_id,
+                        node_type=node_type,
+                        success=False,
+                        status="Failed",
+                        error=error_msg,
+                        k8s_resource_name=k8s_resource_name,
+                        service_name=service_name,
+                        has_ingress=has_ingress,
+                        persist_summary_logs=False,
+                    )
+                else:
+                    task_record = await self._record_lifecycle_task(
+                        operation="stop",
+                        node_id=node_id,
+                        instance_id=instance_id,
+                        project_id=project_id,
+                        node_type=node_type,
+                        success=False,
+                        status="Failed",
+                        error=error_msg,
+                        k8s_resource_name=k8s_resource_name,
+                        service_name=service_name,
+                        has_ingress=has_ingress,
+                    )
 
                 node_result = WorkflowNodeResult(
                     node_id=node_id,
