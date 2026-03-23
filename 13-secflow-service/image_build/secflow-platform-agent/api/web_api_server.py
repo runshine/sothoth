@@ -2804,11 +2804,18 @@ class WebAPIServer:
                         'normalized': _normalize_template_name(tpl_name)
                     })
 
-                def _resolve_template(service_name: str, raw_payload: Any = None) -> Dict[str, Any]:
+                def _resolve_template(service_name: str, raw_payload: Any = None, image_name: str = '') -> Dict[str, Any]:
                     svc = (service_name or '').strip().lower()
                     candidates: List[str] = []
                     if svc:
                         candidates.append(svc)
+
+                    direct_image = str(image_name or '').strip().lower()
+                    if direct_image:
+                        image_basename = direct_image.split('/')[-1]
+                        image_repo = image_basename.split(':')[0].strip()
+                        if image_repo:
+                            candidates.append(image_repo)
 
                     try:
                         payload = raw_payload if isinstance(raw_payload, dict) else {}
@@ -2884,7 +2891,11 @@ class WebAPIServer:
                         elif isinstance(raw_json, dict):
                             raw_payload = raw_json
 
-                    resolved_template = _resolve_template(str(row.get('service_name') or ''), raw_payload)
+                    resolved_template = _resolve_template(
+                        str(row.get('service_name') or ''),
+                        raw_payload,
+                        str(row.get('image') or '')
+                    )
 
                     items.append({
                         'id': row.get('service_uid'),
