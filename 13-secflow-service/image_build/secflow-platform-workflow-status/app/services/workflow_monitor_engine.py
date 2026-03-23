@@ -249,6 +249,9 @@ class WorkflowMonitorEngine:
                     task_id=task_id,
                 )
 
+                if node_type and node_type.lower() == "app":
+                    await self._backfill_app_init_logs(session, node)
+
                 # 如果是JOB节点且已完成，尝试获取并保存日志
                 if node_type and node_type.lower() == "job":
                     current_status = result.get("status", "")
@@ -271,6 +274,28 @@ class WorkflowMonitorEngine:
             )
         except Exception as e:
             logger.error(f"同步工作流整体状态失败: {e}")
+
+    async def _backfill_app_init_logs(self, session: MonitorSession, node: Dict):
+        """Use real Pod logs to replace APP init summaries or empty init logs."""
+        node_id = node.get("node_id")
+        task_id = node.get("task_id")
+        if not node_id or not task_id:
+            return
+
+        try:
+            stored_logs = await self._sync_service.get_stored_logs(node_id=node_id, task_id=task_id)
+            init_logs = stored_logs.get("init_logs") or {}
+            if init_logs.get("logs") and init_logs.get("pod_name"):
+                return
+
+            await self._sync_service.get_task_logs(
+                task_id=task_id,
+                project_id=session.project_id,
+                tail_lines=500,
+                persist=True,
+            )
+        except Exception as e:
+            logger.debug(f"APP 节点初始化日志补抓失败: node_id={node_id}, error={e}")
 
     async def _save_job_logs(self, session: MonitorSession, node: Dict):
         """保存JOB节点执行日志"""

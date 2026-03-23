@@ -144,11 +144,30 @@ class WorkflowLifecycleService:
         )
 
         if operation == "initialize":
-            await self.status_sync_service.save_init_logs(
-                node_id=node_id,
-                logs=logs,
-                task_id=task_id,
-            )
+            collected_real_logs = False
+            if normalized_node_type.lower() == NodeType.APP and success and k8s_resource_name:
+                try:
+                    log_result = await self.status_sync_service.get_task_logs(
+                        task_id=task_id,
+                        project_id=project_id,
+                        tail_lines=500,
+                        persist=True,
+                    )
+                    collected_real_logs = bool(log_result.get("logs")) and bool(log_result.get("pod_name"))
+                except Exception as e:
+                    logger.debug(
+                        f"[WorkflowLifecycle] Failed to collect init Pod logs immediately: "
+                        f"node_id={node_id}, task_id={task_id}, error={e}"
+                    )
+
+            # APP 节点初始化成功时，init_logs 只保留真实 Pod/容器日志。
+            # 如果此刻 Pod 还没起来，就先留空，后续由监控同步补抓真实日志。
+            if not collected_real_logs and (normalized_node_type.lower() != NodeType.APP or not success):
+                await self.status_sync_service.save_init_logs(
+                    node_id=node_id,
+                    logs=logs,
+                    task_id=task_id,
+                )
         else:
             await self.status_sync_service.save_execution_logs(
                 node_id=node_id,

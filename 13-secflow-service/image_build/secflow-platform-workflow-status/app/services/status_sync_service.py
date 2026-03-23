@@ -304,9 +304,10 @@ class StatusSyncService:
             status: 当前状态
         """
         try:
-            # 检查是否已有日志
-            if record.init_logs and record.init_logs.get("logs"):
-                logger.debug(f"节点 {record.node_id} 已有初始化日志，跳过获取")
+            # 只有当前已经保存了真实 Pod 日志时才跳过。
+            # 旧的生命周期摘要日志没有 pod_name，允许后续被真实容器日志覆盖。
+            if record.init_logs and record.init_logs.get("logs") and record.init_logs.get("pod_name"):
+                logger.debug(f"节点 {record.node_id} 已有 Pod 初始化日志，跳过获取")
                 return
 
             # 获取Pod列表
