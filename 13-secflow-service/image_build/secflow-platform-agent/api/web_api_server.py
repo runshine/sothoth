@@ -2804,22 +2804,55 @@ class WebAPIServer:
                         'normalized': _normalize_template_name(tpl_name)
                     })
 
-                def _resolve_template(service_name: str) -> Dict[str, Any]:
+                def _resolve_template(service_name: str, raw_payload: Any = None) -> Dict[str, Any]:
                     svc = (service_name or '').strip().lower()
-                    if not svc:
+                    candidates: List[str] = []
+                    if svc:
+                        candidates.append(svc)
+
+                    try:
+                        payload = raw_payload if isinstance(raw_payload, dict) else {}
+                        real_status = payload.get('real_status') if isinstance(payload, dict) else {}
+                        containers = real_status.get('containers') if isinstance(real_status, dict) else []
+                        if isinstance(containers, list):
+                            for container in containers:
+                                if not isinstance(container, dict):
+                                    continue
+                                project_name = str(container.get('Project') or '').strip().lower()
+                                if project_name:
+                                    candidates.append(project_name)
+                                image_name = str(container.get('Image') or '').strip().lower()
+                                if image_name:
+                                    image_basename = image_name.split('/')[-1]
+                                    image_repo = image_basename.split(':')[0].strip()
+                                    if image_repo:
+                                        candidates.append(image_repo)
+                    except Exception:
+                        pass
+
+                    if not candidates:
                         return {'template_id': None, 'template_name': ''}
+
+                    normalized_candidates = []
+                    seen_candidates = set()
+                    for candidate in candidates:
+                        normalized = _normalize_template_name(candidate)
+                        if normalized and normalized not in seen_candidates:
+                            normalized_candidates.append(normalized)
+                            seen_candidates.add(normalized)
 
                     # 优先最长前缀匹配，避免短模板名误匹配
                     best = None
                     best_len = -1
-                    for tpl in normalized_templates:
-                        prefix = tpl.get('normalized') or ''
-                        if not prefix:
-                            continue
-                        if svc == prefix or svc.startswith(prefix + '-'):
-                            if len(prefix) > best_len:
-                                best = tpl
-                                best_len = len(prefix)
+                    for candidate in normalized_candidates:
+                        for tpl in normalized_templates:
+                            prefix = tpl.get('normalized') or ''
+                            if not prefix:
+                                continue
+                            if candidate == prefix or candidate.startswith(prefix + '-'):
+                                if len(prefix) > best_len:
+                                    best = tpl
+                                    best_len = len(prefix)
                     if not best:
                         return {'template_id': None, 'template_name': ''}
                     return {
@@ -2840,7 +2873,18 @@ class WebAPIServer:
                         elif isinstance(raw_ports, dict):
                             ports = raw_ports
 
-                    resolved_template = _resolve_template(str(row.get('service_name') or ''))
+                    raw_payload = {}
+                    raw_json = row.get('raw_json')
+                    if raw_json:
+                        if isinstance(raw_json, str):
+                            try:
+                                raw_payload = json.loads(raw_json)
+                            except Exception:
+                                raw_payload = {}
+                        elif isinstance(raw_json, dict):
+                            raw_payload = raw_json
+
+                    resolved_template = _resolve_template(str(row.get('service_name') or ''), raw_payload)
 
                     items.append({
                         'id': row.get('service_uid'),
