@@ -23,6 +23,7 @@ from app.schemas import (
     WorkflowNodeCreate, WorkflowNodeUpdate, WorkflowNodeInstanceResponse,
     WorkflowEdgesUpdateRequest, WorkflowInstanceInitializeRequest,
     LogQueryRequest, PodLogResponse, SuccessResponse,
+    WorkflowInstanceNodeLogEntry, WorkflowInstanceNodeLogListResponse,
     NodeStatusCallbackRequest, NodeStatusCallbackResponse,
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
@@ -1516,6 +1517,63 @@ async def get_node_logs(
         logs=log_result.get("logs", ""),
         container=container,
         previous=previous,
+    )
+
+
+@router.get("/{instance_id}/logs", response_model=WorkflowInstanceNodeLogListResponse)
+async def get_workflow_instance_logs(
+    instance_id: str,
+    node_id: Optional[str] = Query(None, description="Filter by node ID"),
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Page size"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get stored node log records for one workflow instance."""
+    instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
+
+    if not instance:
+        raise NotFoundError("Workflow instance", instance_id)
+
+    user_id = str(current_user.get("id", ""))
+    if not check_instance_permission(instance, user_id):
+        raise ForbiddenError("No permission to access this instance")
+
+    nodes = db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.instance_id == instance_id
+    ).all()
+
+    node_map = {node.id: node.name for node in nodes}
+    node_ids = list(node_map.keys())
+
+    if not node_ids:
+        return WorkflowInstanceNodeLogListResponse(total=0, page=page, page_size=page_size, items=[])
+
+    if node_id and node_id not in node_map:
+        return WorkflowInstanceNodeLogListResponse(total=0, page=page, page_size=page_size, items=[])
+
+    result = await get_status_client().query_instance_node_logs(
+        instance_id=instance_id,
+        project_id=instance.project_id,
+        node_ids=node_ids,
+        node_id=node_id,
+        page=page,
+        page_size=page_size,
+    )
+
+    items = []
+    for item in result.get("items", []):
+        enriched_item = {
+            **item,
+            "node_name": node_map.get(item.get("node_id")),
+        }
+        items.append(WorkflowInstanceNodeLogEntry(**enriched_item))
+
+    return WorkflowInstanceNodeLogListResponse(
+        total=result.get("total", 0),
+        page=result.get("page", page),
+        page_size=result.get("page_size", page_size),
+        items=items,
     )
 
 

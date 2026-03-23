@@ -52,6 +52,8 @@ from app.schemas.schemas import (
     # Logs
     PodLogResponse,
     LogQueryRequest,
+    WorkflowInstanceNodeLogEntry,
+    WorkflowInstanceNodeLogListResponse,
     # Auth & Common
     TokenUser,
     SuccessResponse,
@@ -100,6 +102,8 @@ __all__ = [
     "AppWorkflowListResponse",
     "PodLogResponse",
     "LogQueryRequest",
+    "WorkflowInstanceNodeLogEntry",
+    "WorkflowInstanceNodeLogListResponse",
     "TokenUser",
     "SuccessResponse",
     "ErrorResponse",

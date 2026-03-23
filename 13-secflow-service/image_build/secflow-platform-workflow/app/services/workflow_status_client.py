@@ -124,6 +124,24 @@ class WorkflowStatusClient:
                 return None
             raise
 
+    async def query_instance_node_logs(
+        self,
+        instance_id: str,
+        project_id: str,
+        node_ids: List[str],
+        node_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Dict[str, Any]:
+        payload = {
+            "project_id": project_id,
+            "node_ids": node_ids,
+            "node_id": node_id,
+            "page": page,
+            "page_size": page_size,
+        }
+        return await self._request_json("POST", f"/instances/{instance_id}/node-logs/query", json=payload)
+
     async def get_ingress_controllers(self) -> List[Dict[str, Any]]:
         data = await self._request_json("GET", "/infra/ingress-controllers")
         return data.get("items", [])

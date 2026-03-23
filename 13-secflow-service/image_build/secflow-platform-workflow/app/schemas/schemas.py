@@ -636,6 +636,38 @@ class LogQueryRequest(BaseModel):
     timestamps: bool = Field(default=True, description="Include timestamps")
 
 
+class WorkflowInstanceNodeLogEntry(BaseModel):
+    """Workflow instance node log record."""
+    id: str
+    task_id: Optional[str] = None
+    node_id: str
+    node_name: Optional[str] = None
+    instance_id: str
+    project_id: str
+    node_type: str
+    k8s_resource_name: Optional[str] = None
+    k8s_resource_type: Optional[str] = None
+    status: str
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    message: Optional[str] = None
+    init_logs: Dict[str, Any] = Field(default_factory=dict)
+    execution_logs: Dict[str, Any] = Field(default_factory=dict)
+    log_updated_at: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class WorkflowInstanceNodeLogListResponse(BaseModel):
+    """Paginated workflow instance node log records."""
+    total: int
+    page: int
+    page_size: int
+    items: List[WorkflowInstanceNodeLogEntry]
+
+
 # ============ Auth Schemas ============
 
 class TokenUser(BaseModel):
