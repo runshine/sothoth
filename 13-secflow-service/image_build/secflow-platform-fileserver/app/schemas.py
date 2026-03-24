@@ -11,7 +11,7 @@ class SuccessResponse(BaseModel):
 
 
 class TokenUser(BaseModel):
-    id: str
+    id: int | str
     username: Optional[str] = None
     is_active: bool = True
     created_at: Optional[datetime] = None
