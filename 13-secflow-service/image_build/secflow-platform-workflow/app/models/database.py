@@ -445,6 +445,63 @@ class WorkflowSyncRecord(Base):
         }
 
 
+class WorkflowNodeDomainBinding(Base):
+    """节点域名绑定记录。"""
+    __tablename__ = f"{TABLE_PREFIX}workflow_node_domain_binding"
+    __table_args__ = (
+        Index(
+            f"idx_{TABLE_PREFIX}wf_node_domain_binding_unique",
+            "instance_id",
+            "node_instance_id",
+            "domain",
+            unique=True,
+        ),
+    )
+
+    id = Column(String(64), primary_key=True)
+    instance_id = Column(String(64), ForeignKey(f"{TABLE_PREFIX}workflow_instance.id"), nullable=False, index=True)
+    node_instance_id = Column(String(64), nullable=False, index=True)
+    node_id = Column(String(64), nullable=False, index=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    service_name = Column(String(128))
+    ingress_name = Column(String(128))
+    ingress_type = Column(String(20))
+    domain = Column(String(256), nullable=False, index=True)
+    ingress_ip = Column(String(64))
+    service_port = Column(Integer)
+    target_port = Column(Integer)
+    binding_status = Column(String(20), default="configured", nullable=False)
+    message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return (
+            f"<WorkflowNodeDomainBinding(instance_id={self.instance_id}, "
+            f"node_instance_id={self.node_instance_id}, domain={self.domain})>"
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "instance_id": self.instance_id,
+            "node_instance_id": self.node_instance_id,
+            "node_id": self.node_id,
+            "project_id": self.project_id,
+            "service_name": self.service_name,
+            "ingress_name": self.ingress_name,
+            "ingress_type": self.ingress_type,
+            "domain": self.domain,
+            "ingress_ip": self.ingress_ip,
+            "service_port": self.service_port,
+            "target_port": self.target_port,
+            "binding_status": self.binding_status,
+            "message": self.message,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 # ============ Dependency Injection ============
 
 def get_db():

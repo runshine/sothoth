@@ -339,6 +339,7 @@ class WorkflowNodeConfig(BaseModel):
 
     # Ingress configuration (optional, for app type nodes with service)
     # These fields are only used when node_type is "app" and create_service is True
+    create_ingress: bool = Field(default=False, description="Whether to create K8s Ingress")
     ingress_type: Optional[str] = Field(None, description="Ingress type: nginx or None")
     ingress_host: Optional[str] = Field(None, description="Ingress hostname (e.g., myapp.example.com)")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller external IP (for user to access the service)")
@@ -346,12 +347,21 @@ class WorkflowNodeConfig(BaseModel):
     @model_validator(mode='after')
     def validate_service_config(self):
         """Validate service configuration when create_service is True and node_type is app"""
+        if self.node_type == NodeType.APP and self.create_ingress and not self.create_service:
+            raise ValueError("create_service must be True when create_ingress is True")
         if self.node_type == NodeType.APP and self.create_service:
             errors = []
             if not self.service_name or not self.service_name.strip():
                 errors.append("service_name is required when create_service is True")
             if not self.service_ports or len(self.service_ports) == 0:
                 errors.append("service_ports cannot be empty when create_service is True")
+            if self.create_ingress:
+                if not self.ingress_type or self.ingress_type != "nginx":
+                    errors.append("ingress_type must be nginx when create_ingress is True")
+                if not self.ingress_host or not self.ingress_host.strip():
+                    errors.append("ingress_host is required when create_ingress is True")
+                if not self.ingress_ip or not self.ingress_ip.strip():
+                    errors.append("ingress_ip is required when create_ingress is True")
             if errors:
                 raise ValueError("; ".join(errors))
         return self
@@ -454,6 +464,7 @@ class WorkflowNodeCreate(BaseModel):
 
     # Ingress configuration (optional, for app type nodes with service)
     # These fields are only used when node_type is "app" and create_service is True
+    create_ingress: bool = Field(default=False, description="Whether to create K8s Ingress")
     ingress_type: Optional[str] = Field(None, description="Ingress type: nginx or None")
     ingress_host: Optional[str] = Field(None, description="Ingress hostname (e.g., myapp.example.com)")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller external IP (for user to access the service)")
@@ -461,12 +472,21 @@ class WorkflowNodeCreate(BaseModel):
     @model_validator(mode='after')
     def validate_service_config(self):
         """Validate service configuration when create_service is True and node_type is app"""
+        if self.node_type == NodeType.APP and self.create_ingress and not self.create_service:
+            raise ValueError("create_service must be True when create_ingress is True")
         if self.node_type == NodeType.APP and self.create_service:
             errors = []
             if not self.service_name or not self.service_name.strip():
                 errors.append("service_name is required when create_service is True")
             if not self.service_ports or len(self.service_ports) == 0:
                 errors.append("service_ports cannot be empty when create_service is True")
+            if self.create_ingress:
+                if not self.ingress_type or self.ingress_type != "nginx":
+                    errors.append("ingress_type must be nginx when create_ingress is True")
+                if not self.ingress_host or not self.ingress_host.strip():
+                    errors.append("ingress_host is required when create_ingress is True")
+                if not self.ingress_ip or not self.ingress_ip.strip():
+                    errors.append("ingress_ip is required when create_ingress is True")
             if errors:
                 raise ValueError("; ".join(errors))
         return self
@@ -495,6 +515,7 @@ class WorkflowNodeUpdate(BaseModel):
     service_type: Optional[ServiceType] = Field(None, description="K8s Service type")
 
     # Ingress configuration (optional, for app type nodes with service)
+    create_ingress: Optional[bool] = Field(None, description="Whether to create K8s Ingress")
     ingress_type: Optional[str] = Field(None, description="Ingress type: nginx or None")
     ingress_host: Optional[str] = Field(None, description="Ingress hostname (e.g., myapp.example.com)")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller external IP (for user to access the service)")
@@ -502,12 +523,21 @@ class WorkflowNodeUpdate(BaseModel):
     @model_validator(mode='after')
     def validate_service_config(self):
         """Validate service configuration when create_service is True"""
+        if self.create_ingress is True and self.create_service is False:
+            raise ValueError("create_service must be True when create_ingress is True")
         if self.create_service is True:
             errors = []
             if not self.service_name or not self.service_name.strip():
                 errors.append("service_name is required when create_service is True")
             if not self.service_ports or len(self.service_ports) == 0:
                 errors.append("service_ports cannot be empty when create_service is True")
+            if self.create_ingress is True:
+                if not self.ingress_type or self.ingress_type != "nginx":
+                    errors.append("ingress_type must be nginx when create_ingress is True")
+                if not self.ingress_host or not self.ingress_host.strip():
+                    errors.append("ingress_host is required when create_ingress is True")
+                if not self.ingress_ip or not self.ingress_ip.strip():
+                    errors.append("ingress_ip is required when create_ingress is True")
             if errors:
                 raise ValueError("; ".join(errors))
         return self
@@ -572,10 +602,44 @@ class WorkflowNodeInstanceResponse(BaseModel):
     service_ports: List[ServicePort] = []
     service_type: Optional[str] = None
     # Ingress configuration (optional)
+    create_ingress: bool = False
     ingress_type: Optional[str] = None
     ingress_host: Optional[str] = None
     ingress_ip: Optional[str] = None
     created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class WorkflowNodeIngressBindingRequest(BaseModel):
+    """Bind a custom domain to a node ingress."""
+    create_ingress: bool = Field(default=True, description="Whether to create K8s Ingress")
+    ingress_type: str = Field(default="nginx", description="Ingress type")
+    ingress_host: str = Field(..., min_length=1, description="Custom domain")
+    ingress_ip: str = Field(..., min_length=1, description="Selected ingress IP")
+    path: str = Field(default="/", description="Ingress path")
+    path_type: str = Field(default="Prefix", description="Ingress path type")
+
+
+class WorkflowNodeDomainBindingResponse(BaseModel):
+    """节点域名绑定记录响应。"""
+    id: str
+    instance_id: str
+    node_instance_id: str
+    node_id: str
+    project_id: str
+    service_name: Optional[str] = None
+    ingress_name: Optional[str] = None
+    ingress_type: Optional[str] = None
+    domain: str
+    ingress_ip: Optional[str] = None
+    service_port: Optional[int] = None
+    target_port: Optional[int] = None
+    binding_status: str
+    message: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

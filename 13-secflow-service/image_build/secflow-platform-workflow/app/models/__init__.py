@@ -4,6 +4,7 @@ Models package
 
 from app.models.database import (
     WorkflowSyncRecord,
+    WorkflowNodeDomainBinding,
     Base,
     AppTemplate,
     JobTemplate,
@@ -29,6 +30,7 @@ __all__ = [
     "WorkflowInstance",
     "WorkflowNodeInstance",
     "WorkflowSyncRecord",
+    "WorkflowNodeDomainBinding",
     "TemplateScope",
     "ImagePullPolicy",
     "WorkflowStatus",

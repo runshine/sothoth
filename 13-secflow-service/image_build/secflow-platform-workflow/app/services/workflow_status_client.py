@@ -146,6 +146,36 @@ class WorkflowStatusClient:
         data = await self._request_json("GET", "/infra/ingress-controllers")
         return data.get("items", [])
 
+    async def get_service_access_info(self, project_id: str, service_name: str) -> Dict[str, Any]:
+        return await self._request_json("GET", f"/projects/{project_id}/services/{service_name}/access")
+
+    async def bind_ingress_domain(
+        self,
+        project_id: str,
+        ingress_name: str,
+        service_name: str,
+        service_port: int,
+        host: str,
+        ingress_type: str = "nginx",
+        ingress_ip: Optional[str] = None,
+        path: str = "/",
+        path_type: str = "Prefix",
+    ) -> Dict[str, Any]:
+        payload = {
+            "service_name": service_name,
+            "service_port": service_port,
+            "host": host,
+            "ingress_type": ingress_type,
+            "ingress_ip": ingress_ip,
+            "path": path,
+            "path_type": path_type,
+        }
+        return await self._request_json(
+            "POST",
+            f"/projects/{project_id}/ingresses/{ingress_name}/bind-domain",
+            json=payload,
+        )
+
     async def ensure_namespace(self, project_id: str) -> Dict[str, Any]:
         return await self._request_json("GET", f"/projects/{project_id}/namespace/ensure")
 
