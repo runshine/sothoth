@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-platform-fileserver
+  namespace: secflow-ns
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      name: secflow-platform-fileserver
+  template:
+    metadata:
+      labels:
+        name: secflow-platform-fileserver
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: secflow-platform-fileserver
+        image: ghcr.io/runshine/secflow-platform-fileserver:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: secflow-platform-fileserver-config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+        - name: secflow-platform-fileserver-data-nfs-pvc
+          mountPath: /data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/fileserver/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/fileserver/health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 15
+      volumes:
+      - name: secflow-platform-fileserver-config
+        configMap:
+          name: secflow-platform-fileserver-config
+          items:
+            - key: config.yaml
+              path: config.yaml
+      - name: secflow-platform-fileserver-data-nfs-pvc
+        persistentVolumeClaim:
+          claimName: secflow-platform-fileserver-data-nfs-pvc

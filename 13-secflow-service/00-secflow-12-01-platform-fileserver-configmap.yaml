@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-platform-fileserver-config
+  namespace: secflow-ns
+data:
+  config.yaml: |
+    # SecFlow File Server Configuration
+    database:
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+      table_prefix: "secflow_"
+      pool_size: 10
+      max_overflow: 20
+    auth_service:
+      host: "secflow-platform-auth"
+      port: 80
+      validate_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+      timeout: 10
+      token_cache_enabled: true
+      token_cache_ttl_minutes: 15
+    project_service:
+      host: "secflow-platform-project"
+      port: 80
+      get_project_path: "/api/project"
+      timeout: 10
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu"
+      service_id: "secflow-platform-fileserver"
+      service_name: "文件管理服务"
+      host: "secflow-platform-fileserver"
+      port: 80
+      maturity: "已上线"
+      description: "按项目和子项目管理大规模文件的上传、查询、下载与整理"
+      api_prefix: "/api/fileserver"
+      menu:
+        id: "fileserver-manage"
+        path: "/fileserver"
+        icon: "folder-open"
+        order: 5
+        level1:
+          name: "系统管理"
+          name_en: "System"
+        level2:
+          name: "资源管理"
+          name_en: "Resource Management"
+        level3:
+          name: "文件管理"
+          name_en: "File Management"
+    storage:
+      root_dir: "/data"
+      temp_dir: "/data/tmp"
+      max_upload_size: 2147483648
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+    logging:
+      level: "INFO"
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

@@ -8,6 +8,7 @@ kubectl rollout restart deployment/secflow-platform-deploy-script -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-frontend -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-k8s -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-menu -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-fileserver -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-project -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-resource -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-static-binary -n secflow-ns
