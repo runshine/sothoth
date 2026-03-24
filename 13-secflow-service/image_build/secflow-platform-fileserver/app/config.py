@@ -141,3 +141,7 @@ def get_config() -> Config:
     if _config is None:
         return load_config()
     return _config
+
+
+def get_data_pvc_name() -> Optional[str]:
+    return os.environ.get("DATA_PVC_NAME")

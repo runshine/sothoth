@@ -10,6 +10,11 @@ class SuccessResponse(BaseModel):
     message: str
 
 
+class StoragePVCResponse(BaseModel):
+    mount_path: str
+    pvc_name: Optional[str]
+
+
 class TokenUser(BaseModel):
     id: int | str
     username: Optional[str] = None

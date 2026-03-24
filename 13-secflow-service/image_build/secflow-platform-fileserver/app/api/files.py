@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.config import get_config
+from app.config import get_config, get_data_pvc_name
 from app.exception import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
 from app.model import FileDirectory, FileSubproject, ManagedFile, get_db
 from app.schemas import (
@@ -23,6 +23,7 @@ from app.schemas import (
     FileMoveRequest,
     FileRenameRequest,
     FileResponse as ManagedFileResponse,
+    StoragePVCResponse,
     SubprojectCreate,
     SubprojectListResponse,
     SubprojectResponse,
@@ -46,6 +47,16 @@ async def health_check():
 @router.get("/ready")
 async def ready_check():
     return {"status": "ready"}
+
+
+@router.get("/storage/pvc", response_model=StoragePVCResponse)
+async def get_storage_pvc(
+    current_user: TokenUser = Depends(get_current_user),
+):
+    return StoragePVCResponse(
+        mount_path=get_config().storage.root_dir,
+        pvc_name=get_data_pvc_name(),
+    )
 
 
 def sanitize_name(name: str) -> str:

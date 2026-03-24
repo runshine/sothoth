@@ -20,6 +20,9 @@ spec:
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
+        env:
+        - name: DATA_PVC_NAME
+          value: secflow-platform-fileserver-data-nfs-pvc
         volumeMounts:
         - name: secflow-platform-fileserver-config
           mountPath: /app/config.yaml

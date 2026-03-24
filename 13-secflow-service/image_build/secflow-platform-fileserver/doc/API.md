@@ -8,20 +8,21 @@
 |------|------|----------|------|
 | 1 | GET | `/api/fileserver/health` | 健康检查 |
 | 2 | GET | `/api/fileserver/ready` | 就绪检查 |
-| 3 | POST | `/api/fileserver/subprojects` | 创建子项目 |
-| 4 | GET | `/api/fileserver/subprojects?project_id={project_id}` | 查询子项目列表 |
-| 5 | GET | `/api/fileserver/subprojects/{subproject_id}?project_id={project_id}` | 查询单个子项目 |
-| 6 | PUT | `/api/fileserver/subprojects/{subproject_id}?project_id={project_id}` | 修改子项目 |
-| 7 | DELETE | `/api/fileserver/subprojects/{subproject_id}?project_id={project_id}` | 删除空子项目 |
-| 8 | POST | `/api/fileserver/directories` | 创建目录 |
-| 9 | GET | `/api/fileserver/directories/tree?project_id={project_id}&subproject_id={subproject_id}` | 查询目录树 |
-| 10 | POST | `/api/fileserver/files/upload` | 上传文件 |
-| 11 | GET | `/api/fileserver/files?project_id={project_id}&subproject_id={subproject_id}&directory_id={directory_id}` | 查询目录下文件 |
-| 12 | GET | `/api/fileserver/files/{file_id}` | 查询文件详情 |
-| 13 | GET | `/api/fileserver/files/{file_id}/download` | 下载文件 |
-| 14 | POST | `/api/fileserver/files/{file_id}/rename` | 重命名文件 |
-| 15 | POST | `/api/fileserver/files/{file_id}/move` | 移动文件 |
-| 16 | DELETE | `/api/fileserver/files/{file_id}` | 删除文件 |
+| 3 | GET | `/api/fileserver/storage/pvc` | 查询 `/data` 挂载的 PVC 名称 |
+| 4 | POST | `/api/fileserver/subprojects` | 创建子项目 |
+| 5 | GET | `/api/fileserver/subprojects?project_id={project_id}` | 查询子项目列表 |
+| 6 | GET | `/api/fileserver/subprojects/{subproject_id}?project_id={project_id}` | 查询单个子项目 |
+| 7 | PUT | `/api/fileserver/subprojects/{subproject_id}?project_id={project_id}` | 修改子项目 |
+| 8 | DELETE | `/api/fileserver/subprojects/{subproject_id}?project_id={project_id}` | 删除空子项目 |
+| 9 | POST | `/api/fileserver/directories` | 创建目录 |
+| 10 | GET | `/api/fileserver/directories/tree?project_id={project_id}&subproject_id={subproject_id}` | 查询目录树 |
+| 11 | POST | `/api/fileserver/files/upload` | 上传文件 |
+| 12 | GET | `/api/fileserver/files?project_id={project_id}&subproject_id={subproject_id}&directory_id={directory_id}` | 查询目录下文件 |
+| 13 | GET | `/api/fileserver/files/{file_id}` | 查询文件详情 |
+| 14 | GET | `/api/fileserver/files/{file_id}/download` | 下载文件 |
+| 15 | POST | `/api/fileserver/files/{file_id}/rename` | 重命名文件 |
+| 16 | POST | `/api/fileserver/files/{file_id}/move` | 移动文件 |
+| 17 | DELETE | `/api/fileserver/files/{file_id}` | 删除文件 |
 
 ## 概述
 
@@ -42,6 +43,24 @@
 
 ```http
 Authorization: Bearer <human_token>
+```
+
+## 0. 存储信息
+
+### 0.1 查询 `/data` 挂载 PVC
+
+```http
+GET /api/fileserver/storage/pvc
+Authorization: Bearer <token>
+```
+
+响应：
+
+```json
+{
+  "mount_path": "/data",
+  "pvc_name": "secflow-platform-fileserver-data-nfs-pvc"
+}
 ```
 
 ## 1. 子项目管理
