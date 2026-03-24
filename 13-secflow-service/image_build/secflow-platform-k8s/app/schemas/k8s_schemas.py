@@ -225,6 +225,17 @@ class IngressSimpleCreateRequest(BaseModel):
     path_type: str = Field(default="Prefix", description="路径类型: Prefix, Exact, ImplementationSpecific")
 
 
+class IngressDomainBindingRequest(BaseModel):
+    """将自定义域名与指定 Ingress/IP 绑定。"""
+    service_name: str = Field(..., description="后端 Service 名称")
+    service_port: int = Field(..., description="后端 Service 端口")
+    host: str = Field(..., min_length=1, description="自定义域名")
+    ingress_type: str = Field(default="nginx", description="Ingress 类型: nginx")
+    ingress_ip: Optional[str] = Field(default=None, description="选中的 Ingress Controller 外部 IP")
+    path: str = Field(default="/", description="路由路径")
+    path_type: str = Field(default="Prefix", description="路径类型")
+
+
 class IngressExternalCreateRequest(BaseModel):
     """Ingress外部端点创建请求（路由到外部IP:端口）"""
     name: str = Field(..., description="Ingress名称")

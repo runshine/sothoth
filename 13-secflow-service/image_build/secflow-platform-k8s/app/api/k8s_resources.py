@@ -1,4 +1,4 @@
-"""
+﻿"""
 K8S资源管理API路由
 提供对Kubernetes资源的增删查改接口
 """
@@ -46,6 +46,7 @@ from app.schemas import (
     IngressCreateRequest,
     IngressUpdateRequest,
     IngressSimpleCreateRequest,
+    IngressDomainBindingRequest,
     IngressExternalCreateRequest,
     AgentIngressRouteCreateRequest,
     AgentIngressRouteListResponse,
@@ -580,13 +581,13 @@ async def proxy_service(
     """代理HTTP请求到K8S Service"""
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
     k8s = get_k8s_service()
-    
+
     # 获取请求体
     body = None
     if request and request.method in ["POST", "PUT", "PATCH"]:
         body = await request.body()
         body = body.decode('utf-8') if body else None
-    
+
     # 代理请求
     result = k8s.proxy_service_request(
         namespace=namespace,
@@ -597,7 +598,7 @@ async def proxy_service(
         body=body,
         headers=dict(request.headers) if request else {}
     )
-    
+
     return result
 
 
@@ -713,6 +714,36 @@ async def create_simple_ingress(
         ingress_ip=request.ingress_ip,
         path=request.path,
         path_type=request.path_type
+    )
+
+
+@router.post("/ingresses/{ingress_name}/bind-domain", response_model=IngressInfo, summary="绑定Ingress域名")
+async def bind_ingress_domain(
+    ingress_name: str,
+    request: IngressDomainBindingRequest,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    为指定 Ingress 绑定或更新域名。
+
+    供 workflow / workflow-status 微服务调用，统一通过 k8s 微服务完成
+    Ingress 域名和选中 Ingress IP 的绑定。
+    """
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+
+    k8s = get_k8s_service()
+    return k8s.bind_domain_to_ingress(
+        namespace=namespace,
+        ingress_name=ingress_name,
+        service_name=request.service_name,
+        service_port=request.service_port,
+        host=request.host,
+        ingress_type=request.ingress_type,
+        ingress_ip=request.ingress_ip,
+        path=request.path,
+        path_type=request.path_type,
     )
 
 
@@ -2024,3 +2055,4 @@ async def websocket_attach_pod(
 
         ws_manager.disconnect(client_id)
         logger.info(f"Attach连接关闭: {client_id}")
+

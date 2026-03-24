@@ -22,6 +22,8 @@ from app.models.database import get_project_namespace
 
 logger = logging.getLogger(__name__)
 
+INGRESS_IP_ANNOTATION = "secflow.sothoth.io/selected-ingress-ip"
+
 
 class KubernetesServiceError(Exception):
     """K8S服务错误"""
@@ -481,12 +483,72 @@ class KubernetesService:
     def create_ingress(self, namespace: str, manifest: Dict) -> Dict:
         """创建Ingress"""
         try:
-            from kubernetes.client import V1Ingress
             ing = self._dict_to_v1_ingress(manifest)
             result = self.networking_v1.create_namespaced_ingress(namespace=namespace, body=ing)
             return self._ingress_to_dict(result)
         except ApiException as e:
             self._handle_api_exception(e, "Ingress", "创建")
+
+    def replace_ingress(self, namespace: str, name: str, manifest: Dict) -> Dict:
+        """更新已存在的 Ingress。"""
+        try:
+            ing = self._dict_to_v1_ingress(manifest)
+            result = self.networking_v1.replace_namespaced_ingress(name=name, namespace=namespace, body=ing)
+            return self._ingress_to_dict(result)
+        except ApiException as e:
+            self._handle_api_exception(e, "Ingress", "更新")
+
+    def _build_simple_ingress_manifest(
+        self,
+        namespace: str,
+        name: str,
+        service_name: str,
+        service_port: int,
+        host: str,
+        ingress_type: str = "nginx",
+        ingress_ip: Optional[str] = None,
+        path: str = "/",
+        path_type: str = "Prefix"
+    ) -> Dict[str, Any]:
+        annotations: Dict[str, str] = {}
+        if ingress_ip:
+            annotations[INGRESS_IP_ANNOTATION] = ingress_ip
+
+        return {
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "annotations": annotations,
+                "labels": {
+                    "app": name,
+                    "managed-by": "secflow-workflow"
+                }
+            },
+            "spec": {
+                "ingressClassName": ingress_type,
+                "rules": [
+                    {
+                        "host": host,
+                        "http": {
+                            "paths": [
+                                {
+                                    "path": path,
+                                    "path_type": path_type,
+                                    "backend": {
+                                        "service": {
+                                            "name": service_name,
+                                            "port": {
+                                                "number": service_port
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
 
     def create_simple_ingress(
         self,
@@ -554,7 +616,79 @@ class KubernetesService:
             }
         }
 
+        if ingress_ip:
+            manifest["metadata"]["annotations"][INGRESS_IP_ANNOTATION] = ingress_ip
+
         return self.create_ingress(namespace, manifest)
+
+    def replace_ingress(self, namespace: str, name: str, manifest: Dict) -> Dict:
+        """更新已存在的 Ingress。"""
+        try:
+            ing = self._dict_to_v1_ingress(manifest)
+            result = self.networking_v1.replace_namespaced_ingress(name=name, namespace=namespace, body=ing)
+            return self._ingress_to_dict(result)
+        except ApiException as e:
+            self._handle_api_exception(e, "Ingress", "更新")
+
+    def bind_domain_to_ingress(
+        self,
+        namespace: str,
+        ingress_name: str,
+        service_name: str,
+        service_port: int,
+        host: str,
+        ingress_type: str = "nginx",
+        ingress_ip: Optional[str] = None,
+        path: str = "/",
+        path_type: str = "Prefix"
+    ) -> Dict:
+        """为指定 Ingress 创建或更新域名绑定。"""
+        manifest = {
+            "metadata": {
+                "name": ingress_name,
+                "namespace": namespace,
+                "annotations": {},
+                "labels": {
+                    "app": ingress_name,
+                    "managed-by": "secflow-workflow"
+                }
+            },
+            "spec": {
+                "ingressClassName": ingress_type,
+                "rules": [
+                    {
+                        "host": host,
+                        "http": {
+                            "paths": [
+                                {
+                                    "path": path,
+                                    "path_type": path_type,
+                                    "backend": {
+                                        "service": {
+                                            "name": service_name,
+                                            "port": {
+                                                "number": service_port
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+        if ingress_ip:
+            manifest["metadata"]["annotations"][INGRESS_IP_ANNOTATION] = ingress_ip
+
+        try:
+            self.networking_v1.read_namespaced_ingress(name=ingress_name, namespace=namespace)
+        except ApiException as e:
+            if e.status == 404:
+                return self.create_ingress(namespace, manifest)
+            self._handle_api_exception(e, "Ingress", "查询")
+
+        return self.replace_ingress(namespace, ingress_name, manifest)
 
     def create_external_ingress(
         self,
@@ -2569,7 +2703,8 @@ class KubernetesService:
                 "type": service.spec.type,
                 "cluster_ip": service.spec.cluster_ip,
                 "ports": [],
-                "access_urls": []
+                "access_urls": [],
+                "ingress_accesses": []
             }
             
             # 解析端口信息
@@ -2632,6 +2767,43 @@ class KubernetesService:
                         "port": port.port
                     })
             
+            ingresses = self.list_ingresses(namespace) or []
+            for ing in ingresses:
+                annotations = ing.get("annotations") or ing.get("annotation") or {}
+                ingress_ip = annotations.get(INGRESS_IP_ANNOTATION)
+                rules = ing.get("rules") or ing.get("rule") or []
+
+                for rule in rules:
+                    host = rule.get("host")
+                    for path_info in rule.get("paths", []):
+                        backend_service = ((path_info.get("backend") or {}).get("service") or {})
+                        if backend_service.get("name") != service_name:
+                            continue
+
+                        path = path_info.get("path") or "/"
+                        ingress_access = {
+                            "ingress_name": ing.get("name"),
+                            "ingress_class_name": ing.get("ingress_class_name"),
+                            "host": host,
+                            "path": path,
+                            "path_type": path_info.get("path_type"),
+                            "service_name": service_name,
+                            "service_port": ((backend_service.get("port") or {}).get("number")),
+                            "selected_ip": ingress_ip,
+                            "url": f"http://{host}{path}" if host else None,
+                        }
+                        access_info["ingress_accesses"].append(ingress_access)
+                        if host:
+                            access_info["access_urls"].append({
+                                "type": "Ingress",
+                                "port_name": backend_service.get("name"),
+                                "url": f"http://{host}{path}",
+                                "host": host,
+                                "path": path,
+                                "selected_ip": ingress_ip,
+                                "ingress_name": ing.get("name"),
+                            })
+
             return access_info
         except ApiException as e:
             self._handle_api_exception(e, "Service访问信息", "获取")
