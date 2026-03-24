@@ -49,16 +49,6 @@ async def ready_check():
     return {"status": "ready"}
 
 
-@router.get("/storage/pvc", response_model=StoragePVCResponse)
-async def get_storage_pvc(
-    current_user: TokenUser = Depends(get_current_user),
-):
-    return StoragePVCResponse(
-        mount_path=get_config().storage.root_dir,
-        pvc_name=get_data_pvc_name(),
-    )
-
-
 def sanitize_name(name: str) -> str:
     value = (name or "").strip()
     if not value:
@@ -85,6 +75,16 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Token
         raise UnauthorizedError("Token无效或已过期")
     except AuthServiceError as exc:
         raise UnauthorizedError(str(exc))
+
+
+@router.get("/storage/pvc", response_model=StoragePVCResponse)
+async def get_storage_pvc(
+    current_user: TokenUser = Depends(get_current_user),
+):
+    return StoragePVCResponse(
+        mount_path=get_config().storage.root_dir,
+        pvc_name=get_data_pvc_name(),
+    )
 
 
 async def verify_project_access(project_id: str, authorization: Optional[str]) -> dict:
