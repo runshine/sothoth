@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/workflow-status", tags=["Workflow Lifecycle"])
 
 
+def to_plain_dict(value):
+    """Return a plain dict for either Pydantic models or raw dict payloads."""
+    if value is None:
+        return None
+    return value.model_dump() if hasattr(value, "model_dump") else value
+
+
 async def get_current_user(
     authorization: Optional[str] = Header(None),
 ) -> dict:
@@ -74,13 +81,13 @@ async def initialize_workflow(
                     "node_name": node.node_name,
                     "deployment_name": node.deployment_name,
                     "service_name": node.service_name,
-                    "ingress_config": node.ingress_config.model_dump() if node.ingress_config else None,
+                    "ingress_config": to_plain_dict(node.ingress_config),
                     "containers": node.containers if node.containers else [],
                     "volume_mounts": node.volume_mounts,
                     "replicas": node.replicas,
                     "service_ports": node.service_ports if node.service_ports else [],
                     "service_type": node.service_type,
-                    "job_config": node.job_config.model_dump() if node.job_config else None,
+                    "job_config": to_plain_dict(node.job_config),
                 }
             )
 

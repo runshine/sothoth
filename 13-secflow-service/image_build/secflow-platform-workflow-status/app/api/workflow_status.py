@@ -153,6 +153,55 @@ async def list_project_resources(
 
 
 @router.get(
+    "/projects/{project_id}/services/{service_name}/access",
+    summary="Get service access info",
+    description="Proxy service and ingress access info from K8S service.",
+)
+async def get_service_access_info(
+    project_id: str,
+    service_name: str,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        access_info = get_k8s_client().get_service_access_info(project_id, service_name)
+        return access_info
+    except Exception as e:
+        logger.error(f"Failed to get service access info: {e}")
+        raise InternalError(f"Failed to get service access info: {str(e)}")
+
+
+@router.post(
+    "/projects/{project_id}/ingresses/{ingress_name}/bind-domain",
+    summary="Bind ingress domain",
+    description="Create or update ingress domain binding through K8S service.",
+)
+async def bind_ingress_domain(
+    project_id: str,
+    ingress_name: str,
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user),
+):
+    try:
+        success, error, data = get_k8s_client().bind_ingress_domain(
+            project_id=project_id,
+            name=ingress_name,
+            service_name=payload.get("service_name"),
+            service_port=payload.get("service_port"),
+            host=payload.get("host"),
+            ingress_type=payload.get("ingress_type", "nginx"),
+            ingress_ip=payload.get("ingress_ip"),
+            path=payload.get("path", "/"),
+            path_type=payload.get("path_type", "Prefix"),
+        )
+        if not success:
+            raise InternalError(error or "Failed to bind ingress domain")
+        return data or {"success": True}
+    except Exception as e:
+        logger.error(f"Failed to bind ingress domain: {e}")
+        raise InternalError(f"Failed to bind ingress domain: {str(e)}")
+
+
+@router.get(
     "/projects/{project_id}/resources/{resource_type}/{resource_name}/logs",
     summary="Get resource logs",
     description="Get pod logs by deployment/job resource.",

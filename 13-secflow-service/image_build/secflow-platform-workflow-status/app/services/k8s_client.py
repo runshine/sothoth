@@ -293,6 +293,20 @@ class K8SClient:
             logger.error(f"获取 Ingress Controller 列表异常: {e}")
             return []
 
+    def get_service_access_info(self, project_id: str, service_name: str) -> Dict[str, Any]:
+        """获取 Service 访问与 Ingress 访问信息。"""
+        try:
+            url = f"{self._get_base_url()}/services/{service_name}/access?project_id={project_id}"
+            response = self.client.get(url)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPError as e:
+            logger.error(f"获取 Service 访问详情失败: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"获取 Service 访问详情异常: {e}")
+            raise
+
     # ============ Namespace 操作 ============
 
     def get_project_namespace(self, project_id: str) -> str:
@@ -684,6 +698,46 @@ class K8SClient:
             error_msg = f"创建Ingress {name} 异常: {str(e)}"
             logger.error(error_msg)
             return False, error_msg
+
+    def bind_ingress_domain(
+        self,
+        project_id: str,
+        name: str,
+        service_name: str,
+        service_port: int,
+        host: str,
+        ingress_type: str = "nginx",
+        ingress_ip: Optional[str] = None,
+        path: str = "/",
+        path_type: str = "Prefix"
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """为指定 Ingress 绑定域名与所选 IP。"""
+        try:
+            url = f"{self._get_base_url()}/ingresses/{name}/bind-domain?project_id={project_id}"
+            payload = {
+                "service_name": service_name,
+                "service_port": service_port,
+                "host": host,
+                "ingress_type": ingress_type,
+                "ingress_ip": ingress_ip,
+                "path": path,
+                "path_type": path_type,
+            }
+            response = self.client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"Ingress {name} 域名绑定成功")
+            return True, None, data
+        except httpx.HTTPError as e:
+            error_msg = f"Ingress {name} 域名绑定失败: {e}"
+            if hasattr(e, "response") and e.response is not None:
+                error_msg = f"Ingress {name} 域名绑定失败: {e.response.text}"
+            logger.error(error_msg)
+            return False, error_msg, None
+        except Exception as e:
+            error_msg = f"Ingress {name} 域名绑定异常: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg, None
 
     def delete_ingress(self, project_id: str, name: str) -> bool:
         """删除Ingress"""
