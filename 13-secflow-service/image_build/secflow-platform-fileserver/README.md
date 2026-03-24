@@ -6,3 +6,4 @@
 - 上传、查询、下载、删除、移动、重命名
 - 多 Pod 共享 RWX 存储
 - 通过 auth/project 服务完成鉴权与项目访问校验
+- 文件按 `/data/files/{project_id}/{subproject_id}/{logical_path}/{original_filename}` 结构落盘

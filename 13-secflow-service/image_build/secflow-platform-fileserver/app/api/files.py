@@ -153,16 +153,24 @@ def build_directory_tree(directories: List[FileDirectory]) -> List[DirectoryTree
     return roots
 
 
-def storage_relative_path(project_id: str, subproject_id: int, sha256: str, file_id: int, filename: str) -> str:
-    safe_filename = filename.replace("/", "_").replace("\\", "_")
-    return os.path.join(
-        "files",
-        project_id,
-        str(subproject_id),
-        sha256[:2],
-        sha256[:4],
-        f"{file_id}_{safe_filename}",
-    )
+def normalize_directory_path(directory: Optional[FileDirectory]) -> str:
+    if directory is None or not directory.path_key:
+        return ""
+    return directory.path_key.strip("/")
+
+
+def storage_relative_path(
+    project_id: str,
+    subproject_id: int,
+    directory: Optional[FileDirectory],
+    filename: str,
+) -> str:
+    parts = ["files", project_id, str(subproject_id)]
+    directory_path = normalize_directory_path(directory)
+    if directory_path:
+        parts.extend(part for part in directory_path.split("/") if part)
+    parts.append(filename.replace("/", "_").replace("\\", "_"))
+    return os.path.join(*parts)
 
 
 def absolute_storage_path(storage_key: str) -> str:
@@ -338,7 +346,7 @@ async def upload_file(
 ):
     await verify_project_access(project_id, authorization)
     require_subproject(db, project_id, subproject_id)
-    require_directory(db, project_id, subproject_id, directory_id)
+    directory = require_directory(db, project_id, subproject_id, directory_id)
     filename = sanitize_name(file.filename or "unnamed")
 
     config = get_config()
@@ -360,7 +368,7 @@ async def upload_file(
         subproject_id=subproject_id,
         directory_id=directory_id,
         filename=filename,
-        original_filename=filename,
+        original_filename=file.filename or filename,
         content_type=file.content_type,
         size=total_size,
         sha256=sha256,
@@ -370,7 +378,7 @@ async def upload_file(
     db.add(file_record)
     db.flush()
 
-    storage_key = storage_relative_path(project_id, subproject_id, sha256, file_record.id, filename)
+    storage_key = storage_relative_path(project_id, subproject_id, directory, filename)
     target_path = absolute_storage_path(storage_key)
     os.makedirs(os.path.dirname(target_path), exist_ok=True)
     os.replace(temp_path, target_path)
@@ -455,7 +463,8 @@ async def rename_file(
         raise ConflictError(f"目录下已存在同名文件: {new_name}")
 
     old_path = absolute_storage_path(file_record.storage_key)
-    new_storage_key = storage_relative_path(file_record.project_id, file_record.subproject_id, file_record.sha256, file_record.id, new_name)
+    directory = require_directory(db, file_record.project_id, file_record.subproject_id, file_record.directory_id)
+    new_storage_key = storage_relative_path(file_record.project_id, file_record.subproject_id, directory, new_name)
     new_path = absolute_storage_path(new_storage_key)
     os.makedirs(os.path.dirname(new_path), exist_ok=True)
     if os.path.exists(old_path):
@@ -485,7 +494,19 @@ async def move_file(
     ).first()
     if existing:
         raise ConflictError(f"目标目录下已存在同名文件: {file_record.filename}")
+    old_path = absolute_storage_path(file_record.storage_key)
+    new_storage_key = storage_relative_path(
+        file_record.project_id,
+        file_record.subproject_id,
+        target_directory,
+        file_record.filename,
+    )
+    new_path = absolute_storage_path(new_storage_key)
+    os.makedirs(os.path.dirname(new_path), exist_ok=True)
+    if os.path.exists(old_path):
+        os.replace(old_path, new_path)
     file_record.directory_id = target_directory.id if target_directory else None
+    file_record.storage_key = new_storage_key
     db.commit()
     db.refresh(file_record)
     return file_record
