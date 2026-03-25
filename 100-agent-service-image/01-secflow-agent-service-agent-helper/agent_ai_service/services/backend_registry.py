@@ -11,6 +11,7 @@ from agent_ai_service.persistence.file_store import JsonFileStore
 DEFAULT_BACKENDS = {
     'claude': {
         'name': 'claude',
+        'backend_type': 'claude',
         'command': 'claude',
         'args': [],
         'env': {},
@@ -19,6 +20,7 @@ DEFAULT_BACKENDS = {
     },
     'codex': {
         'name': 'codex',
+        'backend_type': 'codex',
         'command': 'codex',
         'args': [],
         'env': {},
@@ -27,6 +29,7 @@ DEFAULT_BACKENDS = {
     },
     'opencode': {
         'name': 'opencode',
+        'backend_type': 'opencode',
         'command': 'opencode',
         'args': [],
         'env': {},
@@ -35,6 +38,7 @@ DEFAULT_BACKENDS = {
     },
     'claude-a2a': {
         'name': 'claude-a2a',
+        'backend_type': 'claude-a2a',
         'command': 'claude-a2a',
         'args': [],
         'env': {},
@@ -79,7 +83,11 @@ class BackendRegistry:
         existing = backends.get(name, {})
         merged = {
             'name': name,
-            'command': payload.get('command', existing.get('command', name)),
+            'backend_type': payload.get('backend_type', existing.get('backend_type', existing.get('name', name))),
+            'command': payload.get(
+                'command',
+                existing.get('command', payload.get('backend_type', existing.get('backend_type', name)))
+            ),
             'args': payload.get('args', existing.get('args', [])),
             'env': payload.get('env', existing.get('env', {})),
             'enabled': bool(payload.get('enabled', existing.get('enabled', True))),
@@ -127,6 +135,11 @@ class BackendRegistry:
         cfg = self.get(name)
         if not cfg:
             raise KeyError(name)
+        if 'backend_type' not in cfg:
+            cfg = {
+                **cfg,
+                'backend_type': cfg.get('name', name),
+            }
         return BackendConfig(**cfg)
 
     def env_keys(self, name: str) -> List[str]:

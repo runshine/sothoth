@@ -322,6 +322,29 @@ class WebAPIServer:
             return normalized
         return {}
 
+    def _normalize_service_tags(self, tags: Any) -> List[str]:
+        if isinstance(tags, str):
+            try:
+                parsed = json.loads(tags)
+                if isinstance(parsed, list):
+                    tags = parsed
+                else:
+                    tags = [item.strip() for item in tags.split(',')]
+            except Exception:
+                tags = [item.strip() for item in tags.split(',')]
+        elif not isinstance(tags, (list, tuple, set)):
+            tags = []
+
+        seen = set()
+        normalized: List[str] = []
+        for item in tags:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
     def _normalize_agent_service_payload(self, agent: Any, service: Dict[str, Any], source: str = 'pull') -> Dict[str, Any]:
         service_name = str(service.get('name') or service.get('service_name') or service.get('id') or '').strip()
         if not service_name:
@@ -333,6 +356,7 @@ class WebAPIServer:
         service_uid = hashlib.sha1(service_uid_raw.encode('utf-8')).hexdigest()
 
         ports = self._normalize_service_ports(service.get('ports'))
+        tags = self._normalize_service_tags(service.get('tags'))
         image = service.get('image') or ''
         status = service.get('status') or service.get('state') or 'unknown'
 
@@ -345,6 +369,7 @@ class WebAPIServer:
             'service_name': service_name,
             'image': str(image),
             'status': str(status),
+            'tags_json': json.dumps(tags, ensure_ascii=False),
             'ports_json': json.dumps(ports, ensure_ascii=False),
             'raw_json': json.dumps(service, ensure_ascii=False),
             'source': source,
@@ -408,14 +433,15 @@ class WebAPIServer:
             self.db_manager.execute_query(f'''
                 INSERT INTO {table_name}
                 (service_uid, project_id, agent_key, agent_hostname, agent_ip, service_name,
-                 image, status, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, pod_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, NOW(), NOW(), %s)
+                 image, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, pod_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, NOW(), NOW(), %s)
                 ON DUPLICATE KEY UPDATE
                     project_id = VALUES(project_id),
                     agent_hostname = VALUES(agent_hostname),
                     agent_ip = VALUES(agent_ip),
                     image = VALUES(image),
                     status = VALUES(status),
+                    tags_json = VALUES(tags_json),
                     ports_json = VALUES(ports_json),
                     raw_json = VALUES(raw_json),
                     source = VALUES(source),
@@ -426,21 +452,22 @@ class WebAPIServer:
             ''', (
                 payload['service_uid'], payload['project_id'], payload['agent_key'],
                 payload['agent_hostname'], payload['agent_ip'], payload['service_name'],
-                payload['image'], payload['status'], payload['ports_json'], payload['raw_json'],
+                payload['image'], payload['status'], payload['tags_json'], payload['ports_json'], payload['raw_json'],
                 payload['source'], payload['pod_id']
             ))
         else:
             self.db_manager.execute_query(f'''
                 INSERT INTO {table_name}
                 (service_uid, project_id, agent_key, agent_hostname, agent_ip, service_name,
-                 image, status, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, updated_at, pod_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                 image, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, updated_at, pod_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 ON CONFLICT(service_uid) DO UPDATE SET
                     project_id=excluded.project_id,
                     agent_hostname=excluded.agent_hostname,
                     agent_ip=excluded.agent_ip,
                     image=excluded.image,
                     status=excluded.status,
+                    tags_json=excluded.tags_json,
                     ports_json=excluded.ports_json,
                     raw_json=excluded.raw_json,
                     source=excluded.source,
@@ -451,7 +478,7 @@ class WebAPIServer:
             ''', (
                 payload['service_uid'], payload['project_id'], payload['agent_key'],
                 payload['agent_hostname'], payload['agent_ip'], payload['service_name'],
-                payload['image'], payload['status'], payload['ports_json'], payload['raw_json'],
+                payload['image'], payload['status'], payload['tags_json'], payload['ports_json'], payload['raw_json'],
                 payload['source'], now_ts, now_ts, now_ts, payload['pod_id']
             ))
 
@@ -829,6 +856,194 @@ class WebAPIServer:
             if text:
                 return text
         return ''
+
+    def _parse_ports_json(self, raw_ports: Any) -> Dict[str, str]:
+        if isinstance(raw_ports, dict):
+            return {str(k): str(v) for k, v in raw_ports.items()}
+        if isinstance(raw_ports, str):
+            try:
+                parsed = json.loads(raw_ports)
+                if isinstance(parsed, dict):
+                    return {str(k): str(v) for k, v in parsed.items()}
+            except Exception:
+                return {}
+        return {}
+
+    def _has_ai_helper_tag(self, tags: Any) -> bool:
+        return 'AI_AGENT_HELPER' in self._normalize_service_tags(tags)
+
+    def _resolve_helper_rest_port(self, service_row: Dict[str, Any]) -> int:
+        ports = self._parse_ports_json(service_row.get('ports_json'))
+        for value in ports.values():
+            text = str(value or '').strip()
+            if not text:
+                continue
+            if ':' in text:
+                first = text.split(':', 1)[0]
+                if first.isdigit():
+                    return int(first)
+            if text.isdigit():
+                port = int(text)
+                if port == 20001:
+                    return port
+        return 20001
+
+    def _get_ai_helper_service_row(self, project_id: str, agent_key: str, service_name: str) -> Optional[Dict[str, Any]]:
+        table_name = self.db_manager.get_table_name('agent_services')
+        row = self.db_manager.fetch_one(
+            f"""
+            SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                   service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                   first_seen_at, last_seen_at, updated_at
+            FROM {table_name}
+            WHERE project_id = %s AND agent_key = %s AND service_name = %s
+            LIMIT 1
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                   service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                   first_seen_at, last_seen_at, updated_at
+            FROM {table_name}
+            WHERE project_id = ? AND agent_key = ? AND service_name = ?
+            LIMIT 1
+            """,
+            (project_id, agent_key, service_name)
+        )
+        if not row:
+            return None
+        if not self._has_ai_helper_tag(row.get('tags_json')):
+            return None
+        return row
+
+    def _call_ai_helper_api(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        method: str,
+        endpoint: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: Tuple[int, int] = (10, 300),
+    ) -> Tuple[Dict[str, Any], int]:
+        row = self._get_ai_helper_service_row(project_id, agent_key, service_name)
+        if not row:
+            raise ValueError(f'AI helper service not found: {agent_key}/{service_name}')
+
+        agent_ip = str(row.get('agent_ip') or '').strip()
+        if not agent_ip:
+            raise ValueError(f'AI helper service has no agent IP: {agent_key}/{service_name}')
+
+        rest_port = self._resolve_helper_rest_port(row)
+        target = f"http://{agent_ip}:{rest_port}{endpoint}"
+        response = requests.request(method.upper(), target, json=payload, timeout=timeout)
+        try:
+            data = response.json() if response.content else {}
+        except Exception:
+            data = {'raw': response.text}
+        return data, response.status_code
+
+    def _serialize_ai_helper_item(self, row: Dict[str, Any], health_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        tags = self._normalize_service_tags(row.get('tags_json'))
+        health_payload = health_payload or {}
+        summary = health_payload.get('summary') if isinstance(health_payload, dict) else {}
+        agents = health_payload.get('agents') if isinstance(health_payload, dict) else []
+        active_agent = None
+        if isinstance(summary, dict):
+            active_agent = summary.get('default_backend')
+        if not active_agent and isinstance(health_payload, dict):
+            active_agent = health_payload.get('default_agent_id')
+        return {
+            'id': row.get('service_uid'),
+            'project_id': row.get('project_id'),
+            'agent_key': row.get('agent_key'),
+            'agent_hostname': row.get('agent_hostname'),
+            'agent_ip': row.get('agent_ip'),
+            'service_name': row.get('service_name'),
+            'image': row.get('image') or '',
+            'status': row.get('status') or 'unknown',
+            'tags': tags,
+            'active_agent_id': active_agent,
+            'ai_agent_count': len(agents) if isinstance(agents, list) else 0,
+            'health': health_payload,
+            'last_seen_at': row.get('last_seen_at'),
+            'updated_at': row.get('updated_at'),
+        }
+
+    def _create_ai_batch(self, project_id: str, created_by: str, payload: Dict[str, Any]) -> str:
+        batch_id = uuid.uuid4().hex
+        table_name = self.db_manager.get_table_name('ai_agent_session_batches')
+        request_json = json.dumps(payload, ensure_ascii=False)
+        now_ts = datetime.now().isoformat()
+        self.db_manager.execute_query(
+            f"INSERT INTO {table_name} (batch_id, project_id, created_by, status, request_json) VALUES (%s, %s, %s, 'running', %s)"
+            if self.db_manager.db_type == 'mysql' else
+            f"INSERT INTO {table_name} (batch_id, project_id, created_by, status, request_json, created_at, updated_at) VALUES (?, ?, ?, 'running', ?, ?, ?)",
+            (batch_id, project_id, created_by, request_json)
+            if self.db_manager.db_type == 'mysql' else
+            (batch_id, project_id, created_by, request_json, now_ts, now_ts)
+        )
+        return batch_id
+
+    def _upsert_ai_batch_item(
+        self,
+        batch_id: str,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        helper_session_id: Optional[str],
+        helper_agent_ids: List[str],
+        status: str,
+        last_error: str = '',
+    ):
+        table_name = self.db_manager.get_table_name('ai_agent_session_batch_items')
+        helper_agent_ids_json = json.dumps(helper_agent_ids, ensure_ascii=False)
+        now_ts = datetime.now().isoformat()
+        self.db_manager.execute_query(
+            f"""
+            INSERT INTO {table_name}
+            (batch_id, project_id, agent_key, service_name, helper_session_id, helper_agent_ids_json, status, last_error)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                helper_session_id = VALUES(helper_session_id),
+                helper_agent_ids_json = VALUES(helper_agent_ids_json),
+                status = VALUES(status),
+                last_error = VALUES(last_error),
+                updated_at = NOW()
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            INSERT INTO {table_name}
+            (batch_id, project_id, agent_key, service_name, helper_session_id, helper_agent_ids_json, status, last_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(batch_id, agent_key, service_name) DO UPDATE SET
+                helper_session_id=excluded.helper_session_id,
+                helper_agent_ids_json=excluded.helper_agent_ids_json,
+                status=excluded.status,
+                last_error=excluded.last_error,
+                updated_at=excluded.updated_at
+            """,
+            (batch_id, project_id, agent_key, service_name, helper_session_id, helper_agent_ids_json, status, last_error)
+            if self.db_manager.db_type == 'mysql' else
+            (batch_id, project_id, agent_key, service_name, helper_session_id, helper_agent_ids_json, status, last_error, now_ts, now_ts)
+        )
+
+    def _append_ai_batch_round(self, batch_id: str, round_no: int, role: str, content: str, response_payload: Dict[str, Any]):
+        table_name = self.db_manager.get_table_name('ai_agent_session_batch_messages')
+        response_json = json.dumps(response_payload, ensure_ascii=False)
+        self.db_manager.execute_query(
+            f"INSERT INTO {table_name} (batch_id, round_no, role, content, response_json) VALUES (%s, %s, %s, %s, %s)"
+            if self.db_manager.db_type == 'mysql' else
+            f"INSERT INTO {table_name} (batch_id, round_no, role, content, response_json) VALUES (?, ?, ?, ?, ?)",
+            (batch_id, round_no, role, content, response_json)
+        )
+
+    def _load_ai_batch(self, batch_id: str) -> Optional[Dict[str, Any]]:
+        table_name = self.db_manager.get_table_name('ai_agent_session_batches')
+        return self.db_manager.fetch_one(
+            f"SELECT * FROM {table_name} WHERE batch_id = %s LIMIT 1"
+            if self.db_manager.db_type == 'mysql' else
+            f"SELECT * FROM {table_name} WHERE batch_id = ? LIMIT 1",
+            (batch_id,)
+        )
 
     @staticmethod
     def _is_service_stopped_state(state: str) -> bool:
@@ -2778,7 +2993,7 @@ class WebAPIServer:
 
                 query_sql = f'''
                     SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
-                           service_name, image, status, ports_json, raw_json, source, is_stale,
+                           service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
                            first_seen_at, last_seen_at, updated_at
                     FROM {table_name}
                     WHERE {where_sql}
@@ -2953,6 +3168,7 @@ class WebAPIServer:
                 items = []
                 for row in rows:
                     ports = {}
+                    tags = []
                     raw_ports = row.get('ports_json')
                     if raw_ports:
                         if isinstance(raw_ports, str):
@@ -2962,6 +3178,10 @@ class WebAPIServer:
                                 ports = {}
                         elif isinstance(raw_ports, dict):
                             ports = raw_ports
+
+                    raw_tags = row.get('tags_json')
+                    if raw_tags:
+                        tags = self._normalize_service_tags(raw_tags)
 
                     raw_payload = {}
                     raw_json = row.get('raw_json')
@@ -2994,6 +3214,7 @@ class WebAPIServer:
                         'template_id': resolved_template.get('template_id'),
                         'template_name': resolved_template.get('template_name'),
                         'status': row.get('status') or 'unknown',
+                        'tags': tags,
                         'ports': ports,
                         'is_stale': bool(row.get('is_stale')),
                         'source': row.get('source'),
@@ -3011,6 +3232,549 @@ class WebAPIServer:
                 })
             except Exception as e:
                 self.logger.error(f"聚合服务查询失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers', methods=['GET'])
+        def list_ai_helpers():
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+
+                target_agent_key = str(request.args.get('agent_key') or '').strip()
+                health_status = str(request.args.get('health_status') or '').strip().lower()
+                table_name = self.db_manager.get_table_name('agent_services')
+                rows = self.db_manager.fetch_all(
+                    f"""
+                    SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                           service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                           first_seen_at, last_seen_at, updated_at
+                    FROM {table_name}
+                    WHERE project_id = %s AND is_stale = 0
+                    ORDER BY last_seen_at DESC
+                    """ if self.db_manager.db_type == 'mysql' else
+                    f"""
+                    SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                           service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                           first_seen_at, last_seen_at, updated_at
+                    FROM {table_name}
+                    WHERE project_id = ? AND is_stale = 0
+                    ORDER BY last_seen_at DESC
+                    """,
+                    (project_id,)
+                ) or []
+
+                items = []
+                for row in rows:
+                    if target_agent_key and str(row.get('agent_key') or '').strip() != target_agent_key:
+                        continue
+                    if not self._has_ai_helper_tag(row.get('tags_json')):
+                        continue
+                    health_payload: Dict[str, Any] = {}
+                    health_label = 'unknown'
+                    try:
+                        health_payload, health_code = self._call_ai_helper_api(
+                            project_id,
+                            str(row.get('agent_key') or ''),
+                            str(row.get('service_name') or ''),
+                            'GET',
+                            '/api/ai-agents/health',
+                            None,
+                            timeout=(5, 20),
+                        )
+                        health_label = 'healthy' if health_code < 300 else 'unhealthy'
+                    except Exception as exc:
+                        health_payload = {'status': 'unreachable', 'error': str(exc)}
+                        health_label = 'unhealthy'
+                    if health_status and health_status != health_label:
+                        continue
+                    item = self._serialize_ai_helper_item(row, health_payload=health_payload)
+                    item['health_status'] = health_label
+                    items.append(item)
+
+                return jsonify({
+                    'project_id': project_id,
+                    'items': items,
+                    'total': len(items),
+                })
+            except Exception as e:
+                self.logger.error(f"查询AI helper列表失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>', methods=['GET'])
+        def get_ai_helper_detail(agent_key, service_name):
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+                row = self._get_ai_helper_service_row(project_id, agent_key, service_name)
+                if not row:
+                    return jsonify({'error': 'AI helper service not found'}), 404
+                health_payload, health_code = self._call_ai_helper_api(project_id, agent_key, service_name, 'GET', '/api/ai-agents/health', None, timeout=(5, 20))
+                detail = self._serialize_ai_helper_item(row, health_payload=health_payload)
+                detail['health_status'] = 'healthy' if health_code < 300 else 'unhealthy'
+                agents_payload, agents_code = self._call_ai_helper_api(project_id, agent_key, service_name, 'GET', '/api/ai-agents', None, timeout=(5, 30))
+                detail['agents'] = agents_payload.get('items', []) if agents_code < 300 and isinstance(agents_payload, dict) else []
+                return jsonify(detail)
+            except Exception as e:
+                self.logger.error(f"查询AI helper详情失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/agents', methods=['GET', 'POST'])
+        def ai_helper_agents(agent_key, service_name):
+            project_id = str(request.args.get('project_id') or (request.get_json(silent=True) or {}).get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            try:
+                if request.method == 'GET':
+                    data, status_code = self._call_ai_helper_api(project_id, agent_key, service_name, 'GET', '/api/ai-agents')
+                else:
+                    payload = request.get_json(silent=True) or {}
+                    data, status_code = self._call_ai_helper_api(project_id, agent_key, service_name, 'POST', '/api/ai-agents', payload)
+                return jsonify(data), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"AI helper agents代理失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/agents/<agent_id>', methods=['GET', 'PUT', 'DELETE'])
+        def ai_helper_agent_detail(agent_key, service_name, agent_id):
+            payload = request.get_json(silent=True) or {}
+            project_id = str(request.args.get('project_id') or payload.get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            endpoint = f"/api/ai-agents/{quote(agent_id, safe='')}"
+            method = request.method
+            try:
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    method,
+                    endpoint,
+                    payload if method in ('PUT', 'DELETE') else None,
+                )
+                return jsonify(data), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"AI helper单Agent代理失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/agents/<agent_id>/<action>', methods=['POST'])
+        def ai_helper_agent_actions(agent_key, service_name, agent_id, action):
+            if action not in ('activate', 'start', 'stop'):
+                return jsonify({'error': 'unsupported action'}), 404
+            payload = request.get_json(silent=True) or {}
+            project_id = str(request.args.get('project_id') or payload.get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            try:
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'POST',
+                    f"/api/ai-agents/{quote(agent_id, safe='')}/{action}",
+                    payload,
+                )
+                return jsonify(data), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"AI helper Agent动作失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/agents/<agent_id>/env', methods=['GET', 'PUT', 'DELETE'])
+        def ai_helper_agent_env(agent_key, service_name, agent_id):
+            payload = request.get_json(silent=True) or {}
+            project_id = str(request.args.get('project_id') or payload.get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            try:
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    request.method,
+                    f"/api/ai-agents/{quote(agent_id, safe='')}/env",
+                    payload if request.method in ('PUT', 'DELETE') else None,
+                )
+                return jsonify(data), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"AI helper Agent env代理失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/sessions', methods=['GET', 'POST'])
+        def ai_helper_sessions(agent_key, service_name):
+            payload = request.get_json(silent=True) or {}
+            project_id = str(payload.get('project_id') or request.args.get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            try:
+                if request.method == 'GET':
+                    data, status_code = self._call_ai_helper_api(
+                        project_id,
+                        agent_key,
+                        service_name,
+                        'GET',
+                        '/api/ai-agents/sessions',
+                        None,
+                    )
+                else:
+                    data, status_code = self._call_ai_helper_api(
+                        project_id,
+                        agent_key,
+                        service_name,
+                        'POST',
+                        '/api/ai-agents/sessions',
+                        payload,
+                    )
+                return jsonify(data), status_code
+            except Exception as e:
+                self.logger.error(f"AI helper会话代理失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/sessions/<session_id>', methods=['GET'])
+        def get_ai_helper_session(agent_key, service_name, session_id):
+            project_id = str(request.args.get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            try:
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'GET',
+                    f"/api/ai-agents/sessions/{quote(session_id, safe='')}",
+                    None,
+                )
+                return jsonify(data), status_code
+            except Exception as e:
+                self.logger.error(f"查询AI helper会话失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/sessions/<session_id>/messages', methods=['POST'])
+        def send_ai_helper_session_message(agent_key, service_name, session_id):
+            payload = request.get_json(silent=True) or {}
+            project_id = str(payload.get('project_id') or request.args.get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            try:
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'POST',
+                    f"/api/ai-agents/sessions/{quote(session_id, safe='')}/messages",
+                    payload,
+                )
+                return jsonify(data), status_code
+            except Exception as e:
+                self.logger.error(f"发送AI helper会话消息失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/sessions/batch', methods=['POST'])
+        def create_ai_helper_batch_session():
+            try:
+                payload = request.get_json(silent=True) or {}
+                project_id = str(payload.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                table_name = self.db_manager.get_table_name('agent_services')
+                rows = self.db_manager.fetch_all(
+                    f"SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip, service_name, image, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, updated_at FROM {table_name} WHERE project_id = %s AND is_stale = 0"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip, service_name, image, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, updated_at FROM {table_name} WHERE project_id = ? AND is_stale = 0",
+                    (project_id,)
+                ) or []
+                requested_helpers = payload.get('helpers') or []
+                requested_map = {
+                    f"{str(item.get('agent_key') or '').strip()}::{str(item.get('service_name') or '').strip()}": item
+                    for item in requested_helpers if isinstance(item, dict)
+                }
+
+                helper_rows = []
+                for row in rows:
+                    if not self._has_ai_helper_tag(row.get('tags_json')):
+                        continue
+                    key = f"{str(row.get('agent_key') or '').strip()}::{str(row.get('service_name') or '').strip()}"
+                    if requested_map and key not in requested_map:
+                        continue
+                    helper_rows.append(row)
+
+                user_ctx = self._get_request_user_context()
+                batch_id = self._create_ai_batch(project_id, user_ctx.get('username', 'system'), payload)
+                results = []
+                success_count = 0
+                for row in helper_rows:
+                    helper_request = requested_map.get(f"{row.get('agent_key')}::{row.get('service_name')}", {})
+                    helper_payload = {
+                        'agent_id': helper_request.get('agent_id'),
+                        'agent_ids': helper_request.get('agent_ids') or payload.get('agent_ids'),
+                        'metadata': payload.get('metadata') or {},
+                    }
+                    try:
+                        data, status_code = self._call_ai_helper_api(
+                            project_id,
+                            str(row.get('agent_key') or ''),
+                            str(row.get('service_name') or ''),
+                            'POST',
+                            '/api/ai-agents/sessions',
+                            helper_payload,
+                        )
+                        ok = status_code < 300 and isinstance(data, dict) and bool(data.get('session_id'))
+                        if ok:
+                            success_count += 1
+                        agent_ids = data.get('agent_ids') if isinstance(data, dict) else []
+                        self._upsert_ai_batch_item(
+                            batch_id,
+                            project_id,
+                            str(row.get('agent_key') or ''),
+                            str(row.get('service_name') or ''),
+                            data.get('session_id') if isinstance(data, dict) else None,
+                            agent_ids if isinstance(agent_ids, list) else [],
+                            'success' if ok else 'failed',
+                            '' if ok else str(data),
+                        )
+                        results.append({
+                            'agent_key': row.get('agent_key'),
+                            'service_name': row.get('service_name'),
+                            'success': ok,
+                            'status_code': status_code,
+                            'helper_session_id': data.get('session_id') if isinstance(data, dict) else None,
+                            'helper_agent_ids': agent_ids if isinstance(agent_ids, list) else [],
+                            'response': data,
+                        })
+                    except Exception as exc:
+                        self._upsert_ai_batch_item(
+                            batch_id,
+                            project_id,
+                            str(row.get('agent_key') or ''),
+                            str(row.get('service_name') or ''),
+                            None,
+                            [],
+                            'failed',
+                            str(exc),
+                        )
+                        results.append({
+                            'agent_key': row.get('agent_key'),
+                            'service_name': row.get('service_name'),
+                            'success': False,
+                            'error': str(exc),
+                        })
+
+                batch_table = self.db_manager.get_table_name('ai_agent_session_batches')
+                final_status = 'success' if results and success_count == len(results) else ('partial_success' if success_count > 0 or not results else 'failed')
+                self.db_manager.execute_query(
+                    f"UPDATE {batch_table} SET status = %s WHERE batch_id = %s"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"UPDATE {batch_table} SET status = ? , updated_at = ? WHERE batch_id = ?",
+                    (final_status, batch_id)
+                    if self.db_manager.db_type == 'mysql' else
+                    (final_status, datetime.now().isoformat(), batch_id)
+                )
+                return jsonify({
+                    'batch_id': batch_id,
+                    'project_id': project_id,
+                    'status': final_status,
+                    'results': results,
+                }), 201
+            except Exception as e:
+                self.logger.error(f"创建AI helper批量会话失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/sessions/batch/<batch_id>', methods=['GET'])
+        def get_ai_helper_batch(batch_id):
+            try:
+                batch = self._load_ai_batch(batch_id)
+                if not batch:
+                    return jsonify({'error': 'batch not found'}), 404
+                items_table = self.db_manager.get_table_name('ai_agent_session_batch_items')
+                items = self.db_manager.fetch_all(
+                    f"SELECT * FROM {items_table} WHERE batch_id = %s ORDER BY agent_key, service_name"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"SELECT * FROM {items_table} WHERE batch_id = ? ORDER BY agent_key, service_name",
+                    (batch_id,)
+                ) or []
+                normalized_items = []
+                for item in items:
+                    agent_ids = []
+                    raw = item.get('helper_agent_ids_json')
+                    if raw:
+                        try:
+                            agent_ids = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+                        except Exception:
+                            agent_ids = []
+                    normalized_items.append({
+                        'agent_key': item.get('agent_key'),
+                        'service_name': item.get('service_name'),
+                        'helper_session_id': item.get('helper_session_id'),
+                        'helper_agent_ids': agent_ids,
+                        'status': item.get('status'),
+                        'last_error': item.get('last_error') or '',
+                        'updated_at': item.get('updated_at'),
+                    })
+                return jsonify({
+                    'batch_id': batch.get('batch_id'),
+                    'project_id': batch.get('project_id'),
+                    'status': batch.get('status'),
+                    'created_by': batch.get('created_by'),
+                    'created_at': batch.get('created_at'),
+                    'updated_at': batch.get('updated_at'),
+                    'items': normalized_items,
+                })
+            except Exception as e:
+                self.logger.error(f"查询AI helper批次详情失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/sessions/batch/<batch_id>/messages', methods=['GET', 'POST'])
+        def ai_helper_batch_messages(batch_id):
+            try:
+                batch = self._load_ai_batch(batch_id)
+                if not batch:
+                    return jsonify({'error': 'batch not found'}), 404
+
+                items_table = self.db_manager.get_table_name('ai_agent_session_batch_items')
+                messages_table = self.db_manager.get_table_name('ai_agent_session_batch_messages')
+
+                if request.method == 'GET':
+                    rows = self.db_manager.fetch_all(
+                        f"SELECT round_no, role, content, response_json, created_at FROM {messages_table} WHERE batch_id = %s ORDER BY round_no ASC"
+                        if self.db_manager.db_type == 'mysql' else
+                        f"SELECT round_no, role, content, response_json, created_at FROM {messages_table} WHERE batch_id = ? ORDER BY round_no ASC",
+                        (batch_id,)
+                    ) or []
+                    rounds = []
+                    for row in rows:
+                        payload = {}
+                        raw = row.get('response_json')
+                        if raw:
+                            try:
+                                payload = json.loads(raw) if isinstance(raw, str) else raw
+                            except Exception:
+                                payload = {'raw': raw}
+                        rounds.append({
+                            'round_no': row.get('round_no'),
+                            'role': row.get('role'),
+                            'content': row.get('content') or '',
+                            'response': payload,
+                            'created_at': row.get('created_at'),
+                        })
+                    return jsonify({'batch_id': batch_id, 'items': rounds, 'total': len(rounds)})
+
+                payload = request.get_json(silent=True) or {}
+                content = str(payload.get('content') or '').strip()
+                role = str(payload.get('role') or 'user').strip() or 'user'
+                if not content:
+                    return jsonify({'error': 'content is required'}), 400
+
+                item_rows = self.db_manager.fetch_all(
+                    f"SELECT * FROM {items_table} WHERE batch_id = %s ORDER BY agent_key, service_name"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"SELECT * FROM {items_table} WHERE batch_id = ? ORDER BY agent_key, service_name",
+                    (batch_id,)
+                ) or []
+                round_rows = self.db_manager.fetch_all(
+                    f"SELECT MAX(round_no) as max_round FROM {messages_table} WHERE batch_id = %s"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"SELECT MAX(round_no) as max_round FROM {messages_table} WHERE batch_id = ?",
+                    (batch_id,)
+                ) or []
+                next_round = int((round_rows[0].get('max_round') if round_rows else 0) or 0) + 1
+
+                results = []
+                success_count = 0
+                for item in item_rows:
+                    helper_session_id = str(item.get('helper_session_id') or '').strip()
+                    if not helper_session_id:
+                        results.append({
+                            'agent_key': item.get('agent_key'),
+                            'service_name': item.get('service_name'),
+                            'success': False,
+                            'error': item.get('last_error') or 'missing helper_session_id',
+                        })
+                        continue
+                    try:
+                        helper_agent_ids = []
+                        raw_helper_agent_ids = item.get('helper_agent_ids_json')
+                        if raw_helper_agent_ids:
+                            try:
+                                helper_agent_ids = json.loads(raw_helper_agent_ids) if isinstance(raw_helper_agent_ids, str) else list(raw_helper_agent_ids or [])
+                            except Exception:
+                                helper_agent_ids = []
+                        data, status_code = self._call_ai_helper_api(
+                            str(batch.get('project_id') or ''),
+                            str(item.get('agent_key') or ''),
+                            str(item.get('service_name') or ''),
+                            'POST',
+                            f"/api/ai-agents/sessions/{quote(helper_session_id, safe='')}/messages",
+                            {'role': role, 'content': content},
+                        )
+                        ok = status_code < 300
+                        success_count += 1 if ok else 0
+                        self._upsert_ai_batch_item(
+                            batch_id,
+                            str(batch.get('project_id') or ''),
+                            str(item.get('agent_key') or ''),
+                            str(item.get('service_name') or ''),
+                            helper_session_id,
+                            helper_agent_ids,
+                            'success' if ok else 'failed',
+                            '' if ok else str(data),
+                        )
+                        results.append({
+                            'agent_key': item.get('agent_key'),
+                            'service_name': item.get('service_name'),
+                            'success': ok,
+                            'status_code': status_code,
+                            'response': data,
+                        })
+                    except Exception as exc:
+                        self._upsert_ai_batch_item(
+                            batch_id,
+                            str(batch.get('project_id') or ''),
+                            str(item.get('agent_key') or ''),
+                            str(item.get('service_name') or ''),
+                            helper_session_id,
+                            [],
+                            'failed',
+                            str(exc),
+                        )
+                        results.append({
+                            'agent_key': item.get('agent_key'),
+                            'service_name': item.get('service_name'),
+                            'success': False,
+                            'error': str(exc),
+                        })
+
+                aggregate = {
+                    'batch_id': batch_id,
+                    'round_no': next_round,
+                    'role': role,
+                    'content': content,
+                    'results': results,
+                    'partial_success': 0 < success_count < len(results),
+                    'success': bool(results) and success_count == len(results),
+                }
+                self._append_ai_batch_round(batch_id, next_round, role, content, aggregate)
+                batch_table = self.db_manager.get_table_name('ai_agent_session_batches')
+                new_status = 'success' if results and success_count == len(results) else ('partial_success' if success_count > 0 else 'failed')
+                self.db_manager.execute_query(
+                    f"UPDATE {batch_table} SET status = %s WHERE batch_id = %s"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"UPDATE {batch_table} SET status = ?, updated_at = ? WHERE batch_id = ?",
+                    (new_status, batch_id)
+                    if self.db_manager.db_type == 'mysql' else
+                    (new_status, datetime.now().isoformat(), batch_id)
+                )
+                return jsonify(aggregate)
+            except Exception as e:
+                self.logger.error(f"处理AI helper批次消息失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/services/global/ingress', methods=['GET'])

@@ -65,3 +65,17 @@ def detailed_health():
         'runtime': data,
         'processes': process_manager.list_states(),
     })
+
+
+@bp.get('/api/ai-agents/health')
+def ai_agent_health():
+    data = runtime.service_health()
+    return jsonify({
+        'status': 'healthy',
+        'service': 'agent-ai-service',
+        'default_agent_id': data.get('default_backend'),
+        'agents': data.get('items', []),
+        'backend_total': data.get('backend_total'),
+        'backend_running': data.get('backend_running'),
+        'backend_installed': data.get('backend_installed'),
+    })

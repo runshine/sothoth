@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 @dataclass
 class BackendConfig:
     name: str
+    backend_type: str
     command: str
     args: List[str] = field(default_factory=list)
     env: Dict[str, str] = field(default_factory=dict)

@@ -500,6 +500,7 @@ class DatabaseManager:
                                service_name VARCHAR(200) NOT NULL,
                                image TEXT,
                                status VARCHAR(32) DEFAULT 'unknown',
+                               tags_json JSON,
                                ports_json JSON,
                                raw_json JSON,
                                source VARCHAR(32) DEFAULT 'pull',
@@ -527,6 +528,7 @@ class DatabaseManager:
                                service_name TEXT NOT NULL,
                                image TEXT,
                                status TEXT DEFAULT 'unknown',
+                               tags_json TEXT,
                                ports_json TEXT,
                                raw_json TEXT,
                                source TEXT DEFAULT 'pull',
@@ -635,8 +637,111 @@ class DatabaseManager:
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_bindings_agent ON {table_service_bindings}(agent_key)')
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_bindings_template ON {table_service_bindings}(template_name)')
 
+            table_ai_batches = f"{prefix}ai_agent_session_batches"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_batches} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               batch_id VARCHAR(64) UNIQUE NOT NULL,
+                               project_id VARCHAR(100) NOT NULL,
+                               created_by VARCHAR(100),
+                               status VARCHAR(32) DEFAULT 'pending',
+                               request_json JSON,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               INDEX idx_ai_batches_project (project_id),
+                               INDEX idx_ai_batches_status (status)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_batches} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               batch_id TEXT UNIQUE NOT NULL,
+                               project_id TEXT NOT NULL,
+                               created_by TEXT,
+                               status TEXT DEFAULT 'pending',
+                               request_json TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_batches_project ON {table_ai_batches}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_batches_status ON {table_ai_batches}(status)')
+
+            table_ai_batch_items = f"{prefix}ai_agent_session_batch_items"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_batch_items} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               batch_id VARCHAR(64) NOT NULL,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               service_name VARCHAR(200) NOT NULL,
+                               helper_session_id VARCHAR(128),
+                               helper_agent_ids_json JSON,
+                               status VARCHAR(32) DEFAULT 'pending',
+                               last_error TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               UNIQUE KEY uniq_ai_batch_item (batch_id, agent_key, service_name),
+                               INDEX idx_ai_batch_items_project (project_id),
+                               INDEX idx_ai_batch_items_status (status)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_batch_items} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               batch_id TEXT NOT NULL,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               service_name TEXT NOT NULL,
+                               helper_session_id TEXT,
+                               helper_agent_ids_json TEXT,
+                               status TEXT DEFAULT 'pending',
+                               last_error TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS uniq_ai_batch_item ON {table_ai_batch_items}(batch_id, agent_key, service_name)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_batch_items_project ON {table_ai_batch_items}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_batch_items_status ON {table_ai_batch_items}(status)')
+
+            table_ai_batch_messages = f"{prefix}ai_agent_session_batch_messages"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_batch_messages} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               batch_id VARCHAR(64) NOT NULL,
+                               round_no INT NOT NULL,
+                               role VARCHAR(20) DEFAULT 'user',
+                               content TEXT,
+                               response_json JSON,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               UNIQUE KEY uniq_ai_batch_round (batch_id, round_no),
+                               INDEX idx_ai_batch_messages_batch (batch_id)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_batch_messages} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               batch_id TEXT NOT NULL,
+                               round_no INTEGER NOT NULL,
+                               role TEXT DEFAULT 'user',
+                               content TEXT,
+                               response_json TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS uniq_ai_batch_round ON {table_ai_batch_messages}(batch_id, round_no)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_batch_messages_batch ON {table_ai_batch_messages}(batch_id)')
+
             # 兼容历史数据库：补齐新增列
             self._ensure_agent_status_columns(db, table_agent_status)
+            self._ensure_agent_services_columns(db, table_agent_services)
             self._ensure_template_columns(db, table_templates)
             self._ensure_task_columns(db, table_tasks)
 
@@ -727,6 +832,31 @@ class DatabaseManager:
                 )
         except Exception as e:
             self.logger.error(f"检查/迁移 {table_name} 模板字段失败: {str(e)}")
+
+    def _ensure_agent_services_columns(self, db: DatabaseConnection, table_name: str):
+        """确保 agent_services 表包含 tags_json 字段。"""
+        try:
+            if self.db_type == 'mysql':
+                columns = db.fetch_all(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE() AND table_name = %s
+                    """,
+                    (table_name,)
+                )
+                existing = {item['COLUMN_NAME'] for item in columns}
+                if 'tags_json' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN tags_json JSON NULL")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 tags_json 列")
+            else:
+                columns = db.fetch_all(f"PRAGMA table_info({table_name})")
+                existing = {item['name'] for item in columns}
+                if 'tags_json' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN tags_json TEXT")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 tags_json 列")
+        except Exception as e:
+            self.logger.error(f"检查/迁移 {table_name} 服务聚合字段失败: {str(e)}")
 
     def _ensure_task_columns(self, db: DatabaseConnection, table_name: str):
         """确保 tasks 表包含多副本 worker 调度所需字段。"""

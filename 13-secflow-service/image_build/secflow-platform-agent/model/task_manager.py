@@ -228,6 +228,36 @@ class TaskManager:
         except Exception:
             return None
 
+    @staticmethod
+    def _normalize_service_tags(tags: Any) -> List[str]:
+        if isinstance(tags, str):
+            try:
+                parsed = json.loads(tags)
+                if isinstance(parsed, list):
+                    tags = parsed
+                else:
+                    tags = [item.strip() for item in tags.split(',')]
+            except Exception:
+                tags = [item.strip() for item in tags.split(',')]
+        elif not isinstance(tags, (list, tuple, set)):
+            tags = []
+        seen = set()
+        normalized: List[str] = []
+        for item in tags:
+            text = str(item).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            normalized.append(text)
+        return normalized
+
+    def _resolve_template_service_tags(self, template_name: str, template: Optional[Dict[str, Any]]) -> List[str]:
+        metadata = template.get('metadata') if isinstance(template, dict) else {}
+        tags = self._normalize_service_tags((metadata or {}).get('service_tags'))
+        if template_name == 'secflow-agent-service-agent-helper' and 'AI_AGENT_HELPER' not in tags:
+            tags.append('AI_AGENT_HELPER')
+        return tags
+
     def _upsert_service_template_binding(
         self,
         project_id: str,
@@ -742,6 +772,10 @@ class TaskManager:
 
             template_type = template['type']
             template_id = template.get('id')
+            resolved_tags = self._resolve_template_service_tags(template_name, template)
+            if resolved_tags:
+                extra_params = dict(extra_params or {})
+                extra_params['tags'] = resolved_tags
             self._add_task_log(task_id, 'INFO', f"模板类型: {template_type}")
 
             # 3. 根据模板类型处理

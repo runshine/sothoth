@@ -24,7 +24,7 @@ class BackendRuntimeService:
             'opencode': OpencodeAdapter,
             'claude-a2a': ClaudeA2AAdapter,
         }
-        adapter_cls = mapping.get(name, ClaudeAdapter)
+        adapter_cls = mapping.get(model.backend_type, ClaudeAdapter)
         return adapter_cls(model)
 
     def list_backends(self) -> Dict[str, Any]:
@@ -36,6 +36,7 @@ class BackendRuntimeService:
             items.append({
                 'name': name,
                 'enabled': bool(cfg.get('enabled', True)),
+                'backend_type': cfg.get('backend_type', name),
                 'installed': adapter.check_installed(),
                 'running': status.get('running', False),
                 'pid': status.get('pid'),
@@ -60,6 +61,7 @@ class BackendRuntimeService:
         return {
             'name': name,
             'enabled': bool(cfg.get('enabled', True)),
+            'backend_type': cfg.get('backend_type', name),
             'installed': adapter.check_installed(),
             'running': status.get('running', False),
             'pid': status.get('pid'),
