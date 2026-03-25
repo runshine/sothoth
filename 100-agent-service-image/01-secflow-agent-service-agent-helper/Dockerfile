@@ -80,7 +80,7 @@ RUN set -eux; \
         echo ". \"$NVM_DIR/nvm.sh\"" >> /root/.bashrc; \
     fi; \
     if [ -x /root/.local/bin/code-server ]; then ln -sf /root/.local/bin/code-server /usr/local/bin/code-server; fi; \
-    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude-a2a; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a"; \
+    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude claude-a2a codex opencode; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a || true; command -v claude || true; command -v codex || true"; \
     echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
 
 # 创建 code-server 配置目录

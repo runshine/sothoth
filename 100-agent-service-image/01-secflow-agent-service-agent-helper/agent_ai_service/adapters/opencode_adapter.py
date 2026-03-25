@@ -1,10 +1,9 @@
-import shutil
-
 from agent_ai_service.adapters.base import BaseBackendAdapter
+from agent_ai_service.services.bin_resolver import binary_installed
 
 
 class OpencodeAdapter(BaseBackendAdapter):
     backend_type = 'opencode'
 
     def check_installed(self) -> bool:
-        return shutil.which(self.config.command) is not None
+        return binary_installed(self.config.command)

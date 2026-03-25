@@ -259,7 +259,7 @@ User=root
 WorkingDirectory=$ROOT_DIR
 ExecStart="$ROOT_DIR/bin/sothothv2_agent" -config "$ROOT_DIR/config/sothothv2_agent.ini" -foreground
 PIDFile=$ROOT_DIR/var/run/sothothv2_agent.pid
-Restart=yes
+Restart=always
 KillMode=mixed
 TimeoutSec=300
 

@@ -1,10 +1,10 @@
-import shutil
 import subprocess
 
 from flask import Blueprint, jsonify
 
 from agent_ai_service.config import settings
 from agent_ai_service.api.backends import runtime, process_manager
+from agent_ai_service.services.bin_resolver import binary_installed
 
 bp = Blueprint('health', __name__)
 
@@ -12,8 +12,8 @@ bp = Blueprint('health', __name__)
 @bp.get('/health')
 def health_check():
     backend_health = runtime.service_health()
-    ttyd_ok = shutil.which('ttyd') is not None
-    code_server_ok = shutil.which('code-server') is not None or shutil.which('/root/.local/bin/code-server') is not None
+    ttyd_ok = binary_installed('ttyd')
+    code_server_ok = binary_installed('code-server')
     return jsonify({
         'status': 'healthy',
         'service': 'agent-ai-service',
