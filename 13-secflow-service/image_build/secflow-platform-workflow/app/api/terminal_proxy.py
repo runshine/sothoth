@@ -6,6 +6,7 @@
 import asyncio
 import logging
 from typing import Optional
+from urllib.parse import urlencode
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from fastapi.websockets import WebSocketState
@@ -57,14 +58,14 @@ def get_upstream_websocket_url(
 ) -> str:
     """构建 K8s 微服务的 WebSocket URL"""
     config = get_config()
-    k8s_base_url = config.k8s_service.base_url.replace("http://", "").replace("https://", "")
-
-    # 构建 URL
-    url = f"ws://{k8s_base_url}/api/k8s/ws/pods/{pod_name}/exec?project_id={project_id}&command={command}"
+    ws_scheme = "wss" if getattr(config.k8s_service, "scheme", "http") == "https" else "ws"
+    k8s_host = config.k8s_service.host
+    k8s_port = config.k8s_service.port
+    query = {"project_id": project_id, "command": command}
     if container:
-        url += f"&container={container}"
+        query["container"] = container
 
-    return url
+    return f"{ws_scheme}://{k8s_host}:{k8s_port}/api/k8s/ws/pods/{pod_name}/exec?{urlencode(query)}"
 
 
 async def proxy_terminal_stream(
@@ -268,16 +269,14 @@ async def get_terminal_websocket_address(
     """
     config = get_config()
 
-    # 获取当前服务的协议和主机
-    ws_protocol = "ws"
-    # 如果前端通过 HTTPS 访问，则使用 wss
-
-    # 构建地址
-    k8s_base_url = config.k8s_service.base_url.replace("http://", "ws://").replace("https://", "wss://")
-
-    ws_url = f"{k8s_base_url}/api/k8s/ws/pods/{pod_name}/exec?project_id={project_id}&command={command or '/bin/bash'}"
+    ws_scheme = "wss" if getattr(config.k8s_service, "scheme", "http") == "https" else "ws"
+    query = {"project_id": project_id, "command": command or "/bin/bash"}
     if container:
-        ws_url += f"&container={container}"
+        query["container"] = container
+    ws_url = (
+        f"{ws_scheme}://{config.k8s_service.host}:{config.k8s_service.port}"
+        f"/api/k8s/ws/pods/{pod_name}/exec?{urlencode(query)}"
+    )
 
     return {
         "ws_url": ws_url,
