@@ -9,21 +9,29 @@ from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.api.dependencies import get_current_user, generate_id
+from app.api.workflow_instances import (
+    get_instance_node_config,
+    get_primary_service_ports,
+    upsert_node_domain_binding,
+    delete_node_domain_bindings,
+)
 from app.models import (
     get_db, WorkflowInstance, WorkflowNodeInstance,
     WorkflowStatus, NodeStatus, NodeType, AppTemplate,
-    WorkflowSyncRecord
+    WorkflowSyncRecord, WorkflowNodeDomainBinding
 )
 from app.schemas import (
     AppWorkflowCreate, AppWorkflowUpdate,
     AppWorkflowResponse, AppWorkflowListResponse,
     AppWorkflowNodeResponse,
-    SuccessResponse
+    SuccessResponse,
+    WorkflowNodeIngressBindingRequest,
+    WorkflowNodeDomainBindingResponse,
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
-from app.services import WorkflowEngine
 from app.services.workflow_status_client import get_workflow_status_client
 from app.config import get_config
 
@@ -42,7 +50,14 @@ def get_status_client():
 
 def check_instance_permission(instance: WorkflowInstance, user_id: str) -> bool:
     """Check if user has permission to access workflow instance"""
-    return instance.created_by == user_id
+    # Backward compatibility:
+    # historical instances were created by service account "system".
+    # These instances should remain accessible after project-scoped listing.
+    if instance.created_by == user_id:
+        return True
+    if instance.created_by == "system":
+        return True
+    return False
 
 
 def build_app_workflow_response(
@@ -51,7 +66,17 @@ def build_app_workflow_response(
     template: Optional[AppTemplate] = None
 ) -> Dict[str, Any]:
     """Build single app workflow response"""
-    node_config = instance.nodes[0] if instance.nodes else {}
+    node_config = get_instance_node_config(instance, node.id)
+    service_name = node_config.get("service_name") or node.service_name
+    ingress_type = node_config.get("ingress_type") or node.ingress_type
+    ingress_host = node_config.get("ingress_host") or node.ingress_host
+    ingress_ip = node_config.get("ingress_ip") or node.ingress_ip
+    create_ingress = node_config.get("create_ingress")
+    if create_ingress is None:
+        create_ingress = bool(ingress_type or ingress_host or ingress_ip)
+    create_service = node_config.get("create_service")
+    if create_service is None:
+        create_service = True
 
     return {
         "id": instance.id,
@@ -67,6 +92,7 @@ def build_app_workflow_response(
             "template_id": node.template_id,
             "status": node.status,
             "k8s_resource_name": node.k8s_resource_name,
+            "k8s_resource_type": node.k8s_resource_type,
             "service_name": node.service_name,
             "message": node.message,
             "started_at": node.started_at.isoformat() if node.started_at else None,
@@ -75,12 +101,28 @@ def build_app_workflow_response(
             "env_vars": node.env_vars or [],
             "volume_mounts": node.volume_mounts or [],
             "resources": node.resources,
+            "timeout_seconds": node.timeout_seconds,
+            "create_service": create_service,
+            "create_ingress": create_ingress,
+            "service_ports": node_config.get("service_ports", []),
+            "service_type": node_config.get("service_type"),
+            "ingress_type": ingress_type,
+            "ingress_host": ingress_host,
+            "ingress_ip": ingress_ip,
+            "init_logs": node.init_logs,
         },
-        "service_name": node.service_name,
+        "service_name": service_name,
         "service_ports": node_config.get("service_ports", []),
-        "ingress_type": node.ingress_type,
-        "ingress_host": node.ingress_host,
-        "ingress_ip": node.ingress_ip,
+        "service_type": node_config.get("service_type"),
+        "replicas": node_config.get("replicas"),
+        "env_vars": node.env_vars or [],
+        "volume_mounts": node.volume_mounts or [],
+        "resources": node.resources,
+        "create_service": create_service,
+        "create_ingress": create_ingress,
+        "ingress_type": ingress_type,
+        "ingress_host": ingress_host,
+        "ingress_ip": ingress_ip,
         "template_id": node.template_id,
         "template_name": template.name if template else None,
         "created_by": instance.created_by,
@@ -90,6 +132,83 @@ def build_app_workflow_response(
         "finished_at": instance.finished_at.isoformat() if instance.finished_at else None,
         "message": instance.message,
     }
+
+
+def build_app_access_info_payload(
+    instance: WorkflowInstance,
+    node: WorkflowNodeInstance,
+    node_config: Dict[str, Any],
+    access_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a resilient access-info payload for one app workflow."""
+    service_name = node_config.get("service_name") or node.service_name
+    service_ports = node_config.get("service_ports") or []
+    base_payload = access_info or {}
+    base_payload.setdefault("name", service_name)
+    base_payload.setdefault("type", node_config.get("service_type") or "ClusterIP")
+    base_payload.setdefault("cluster_ip", None)
+    base_payload.setdefault("namespace", f"secflow-{instance.project_id}")
+    base_payload.setdefault("ports", [])
+    base_payload.setdefault("access_urls", [])
+    base_payload.setdefault("ingress_accesses", [])
+
+    if not base_payload["ports"] and service_ports:
+        base_payload["ports"] = [
+            {
+                "name": port.get("name"),
+                "protocol": port.get("protocol", "TCP"),
+                "port": port.get("port"),
+                "target_port": port.get("target_port", port.get("targetPort")),
+                "node_port": port.get("node_port"),
+            }
+            for port in service_ports
+        ]
+
+    return base_payload
+
+
+def get_app_workflow_instance(
+    db: Session,
+    instance_id: str,
+) -> WorkflowInstance:
+    instance = db.query(WorkflowInstance).filter(
+        WorkflowInstance.id == instance_id,
+        WorkflowInstance.run_mode == "simple_app"
+    ).first()
+    if not instance:
+        raise NotFoundError("App workflow", instance_id)
+    return instance
+
+
+def get_app_workflow_node(
+    db: Session,
+    instance_id: str,
+) -> WorkflowNodeInstance:
+    node = db.query(WorkflowNodeInstance).filter(
+        WorkflowNodeInstance.instance_id == instance_id
+    ).first()
+    if not node:
+        raise InternalError(f"Workflow node not found for instance {instance_id}")
+    return node
+
+
+def sync_app_instance_status_from_node(
+    instance: WorkflowInstance,
+    node: WorkflowNodeInstance,
+) -> None:
+    """Keep app instance status aligned with node status and resource existence."""
+    if not node.k8s_resource_name:
+        instance.status = WorkflowStatus.PENDING
+        instance.message = "Workflow is pending initialization"
+        return
+
+    if node.status == NodeStatus.READY:
+        instance.status = WorkflowStatus.READY
+        instance.message = "Workflow is ready"
+        return
+
+    instance.status = WorkflowStatus.UNREADY
+    instance.message = "Workflow is unready"
 
 
 # ============ Create App Workflow ============
@@ -148,6 +267,7 @@ async def create_app_workflow(
         "resources": workflow_data.resources.model_dump() if workflow_data.resources and hasattr(workflow_data.resources, 'model_dump') else (workflow_data.resources.dict() if workflow_data.resources else None),
         "replicas": workflow_data.replicas,
         "timeout_seconds": workflow_data.timeout_seconds,
+        "create_ingress": bool(workflow_data.ingress_type and workflow_data.ingress_host),
         "ingress_type": workflow_data.ingress_type,
         "ingress_host": workflow_data.ingress_host,
         "ingress_ip": workflow_data.ingress_ip,
@@ -207,17 +327,22 @@ async def list_app_workflows(
     db: Session = Depends(get_db)
 ):
     """查询单应用工作流列表"""
-    user_id = str(current_user.get("id", ""))
+    # 前端通过当前工作项目维度查询应用实例。
+    # 未指定项目时返回空集合，避免跨项目拉取。
+    if not project_id:
+        return AppWorkflowListResponse(total=0, items=[])
+
+    normalized_status_filter = (status_filter or "").strip().lower()
+    if normalized_status_filter in {"", "undefined", "null", "all"}:
+        normalized_status_filter = ""
 
     query = db.query(WorkflowInstance).filter(
-        WorkflowInstance.created_by == user_id,
+        WorkflowInstance.project_id == project_id,
         WorkflowInstance.run_mode == "simple_app"  # 只查询单应用工作流
     )
 
-    if project_id:
-        query = query.filter(WorkflowInstance.project_id == project_id)
-    if status_filter:
-        query = query.filter(WorkflowInstance.status == status_filter)
+    if normalized_status_filter:
+        query = query.filter(WorkflowInstance.status == normalized_status_filter)
 
     instances = query.order_by(WorkflowInstance.created_at.desc()).all()
 
@@ -261,29 +386,220 @@ async def get_app_workflow(
     db: Session = Depends(get_db)
 ):
     """查询单应用工作流详情"""
-    instance = db.query(WorkflowInstance).filter(
-        WorkflowInstance.id == instance_id,
-        WorkflowInstance.run_mode == "simple_app"
-    ).first()
-
-    if not instance:
-        raise NotFoundError("App workflow", instance_id)
+    instance = get_app_workflow_instance(db, instance_id)
 
     user_id = str(current_user.get("id", ""))
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to access this workflow")
 
-    node = db.query(WorkflowNodeInstance).filter(
-        WorkflowNodeInstance.instance_id == instance_id
-    ).first()
-
-    if not node:
-        raise InternalError(f"Workflow node not found for instance {instance_id}")
+    node = get_app_workflow_node(db, instance_id)
 
     template = db.query(AppTemplate).filter(
         AppTemplate.id == node.template_id
     ).first()
 
+    return build_app_workflow_response(instance, node, template)
+
+
+@router.get("/{instance_id}/access-info", summary="获取单应用实例访问服务信息")
+async def get_app_workflow_access_info(
+    instance_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """通过 workflow-status 查询单应用实例的 Service/Ingress 访问信息。"""
+    instance = get_app_workflow_instance(db, instance_id)
+
+    user_id = str(current_user.get("id", ""))
+    if not check_instance_permission(instance, user_id):
+        raise ForbiddenError("No permission to access this workflow")
+
+    node = get_app_workflow_node(db, instance_id)
+    node_config = get_instance_node_config(instance, node.id)
+    service_name = node_config.get("service_name") or node.service_name
+    if not service_name:
+        raise ValidationError("This app workflow has no service configured")
+
+    access_info: Dict[str, Any]
+    try:
+        access_info = await get_status_client().get_service_access_info(instance.project_id, service_name)
+    except Exception as exc:
+        logger.warning("Failed to query live service access info for app workflow %s: %s", instance_id, exc)
+        access_info = {"error": str(exc)}
+
+    access_info = build_app_access_info_payload(instance, node, node_config, access_info)
+
+    domain_bindings = db.query(WorkflowNodeDomainBinding).filter(
+        WorkflowNodeDomainBinding.instance_id == instance.id,
+        WorkflowNodeDomainBinding.node_instance_id == node.id,
+    ).order_by(WorkflowNodeDomainBinding.updated_at.desc()).all()
+
+    configured_ingress = {
+        "create_ingress": node_config.get("create_ingress", bool(node.ingress_type or node.ingress_host or node.ingress_ip)),
+        "ingress_type": node_config.get("ingress_type") or node.ingress_type,
+        "ingress_host": node_config.get("ingress_host") or node.ingress_host,
+        "ingress_ip": node_config.get("ingress_ip") or node.ingress_ip,
+    }
+
+    fallback_binding = domain_bindings[0] if domain_bindings else None
+    fallback_host = (fallback_binding.domain if fallback_binding else None) or configured_ingress.get("ingress_host")
+    fallback_ip = (fallback_binding.ingress_ip if fallback_binding else None) or configured_ingress.get("ingress_ip")
+    fallback_type = (
+        (fallback_binding.ingress_type if fallback_binding else None)
+        or configured_ingress.get("ingress_type")
+        or "nginx"
+    )
+
+    if configured_ingress.get("create_ingress") and fallback_host and not access_info["ingress_accesses"]:
+        ingress_name = f"ing-{service_name}"
+        ingress_item = {
+            "ingress_name": ingress_name,
+            "ingress_class_name": fallback_type,
+            "host": fallback_host,
+            "path": "/",
+            "path_type": "Prefix",
+            "service_name": service_name,
+            "service_port": fallback_binding.service_port if fallback_binding else None,
+            "selected_ip": fallback_ip,
+            "url": f"http://{fallback_host}/",
+            "source": "binding_record" if fallback_binding else "configured",
+        }
+        access_info["ingress_accesses"].append(ingress_item)
+        if not any(
+            (item.get("type") == "Ingress" and item.get("host") == fallback_host)
+            for item in access_info["access_urls"]
+        ):
+            access_info["access_urls"].append(
+                {
+                    "type": "Ingress",
+                    "port_name": service_name,
+                    "url": f"http://{fallback_host}/",
+                    "host": fallback_host,
+                    "path": "/",
+                    "selected_ip": fallback_ip,
+                    "ingress_name": ingress_name,
+                    "source": "binding_record" if fallback_binding else "configured",
+                }
+            )
+
+    access_info["node_id"] = node.id
+    access_info["node_name"] = node.name
+    access_info["configured_ingress"] = configured_ingress
+    access_info["domain_bindings"] = [binding.to_dict() for binding in domain_bindings]
+    return access_info
+
+
+@router.get(
+    "/{instance_id}/domain-bindings",
+    response_model=List[WorkflowNodeDomainBindingResponse],
+    summary="获取单应用实例域名绑定记录",
+)
+async def list_app_workflow_domain_bindings(
+    instance_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    instance = get_app_workflow_instance(db, instance_id)
+
+    user_id = str(current_user.get("id", ""))
+    if not check_instance_permission(instance, user_id):
+        raise ForbiddenError("No permission to access this workflow")
+
+    node = get_app_workflow_node(db, instance_id)
+    records = db.query(WorkflowNodeDomainBinding).filter(
+        WorkflowNodeDomainBinding.instance_id == instance_id,
+        WorkflowNodeDomainBinding.node_instance_id == node.id,
+    ).order_by(WorkflowNodeDomainBinding.updated_at.desc()).all()
+
+    return [WorkflowNodeDomainBindingResponse(**record.to_dict()) for record in records]
+
+
+@router.post("/{instance_id}/ingress-binding", response_model=AppWorkflowResponse, summary="绑定单应用实例 Ingress 域名")
+async def bind_app_workflow_ingress(
+    instance_id: str,
+    request: WorkflowNodeIngressBindingRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    instance = get_app_workflow_instance(db, instance_id)
+
+    user_id = str(current_user.get("id", ""))
+    if not check_instance_permission(instance, user_id):
+        raise ForbiddenError("No permission to update this workflow")
+
+    node = get_app_workflow_node(db, instance_id)
+    node_config = get_instance_node_config(instance, node.id)
+    if not node_config:
+        raise NotFoundError("Workflow node config", node.id)
+
+    node_config["create_ingress"] = request.create_ingress
+    node_config["ingress_type"] = request.ingress_type
+    node_config["ingress_host"] = request.ingress_host
+    node_config["ingress_ip"] = request.ingress_ip
+    node.ingress_type = request.ingress_type if request.create_ingress else None
+    node.ingress_host = request.ingress_host if request.create_ingress else None
+    node.ingress_ip = request.ingress_ip if request.create_ingress else None
+
+    if not request.create_ingress:
+        node_config["ingress_type"] = None
+        node_config["ingress_host"] = None
+        node_config["ingress_ip"] = None
+        delete_node_domain_bindings(db, instance_id, node.id)
+        flag_modified(instance, "nodes")
+        db.commit()
+        db.refresh(instance)
+        template = db.query(AppTemplate).filter(AppTemplate.id == node.template_id).first()
+        return build_app_workflow_response(instance, node, template)
+
+    if node.k8s_resource_name and node.service_name:
+        service_port, target_port = get_primary_service_ports(node_config)
+        if not service_port:
+            raise ValidationError("service_ports cannot be empty when binding ingress")
+        ingress_name = f"ing-{node.service_name}"
+        await get_status_client().bind_ingress_domain(
+            project_id=instance.project_id,
+            ingress_name=ingress_name,
+            service_name=node.service_name,
+            service_port=service_port,
+            host=request.ingress_host,
+            ingress_type=request.ingress_type,
+            ingress_ip=request.ingress_ip,
+            path=request.path,
+            path_type=request.path_type,
+        )
+        upsert_node_domain_binding(
+            db,
+            instance,
+            node,
+            domain=request.ingress_host,
+            ingress_ip=request.ingress_ip,
+            ingress_type=request.ingress_type,
+            service_name=node.service_name,
+            service_port=service_port,
+            target_port=target_port,
+            binding_status="active",
+            message="Ingress domain bound successfully",
+        )
+    else:
+        service_port, target_port = get_primary_service_ports(node_config)
+        upsert_node_domain_binding(
+            db,
+            instance,
+            node,
+            domain=request.ingress_host,
+            ingress_ip=request.ingress_ip,
+            ingress_type=request.ingress_type,
+            service_name=node.service_name or node_config.get("service_name"),
+            service_port=service_port,
+            target_port=target_port,
+            binding_status="configured",
+            message="Ingress config saved, waiting for node initialization",
+        )
+
+    flag_modified(instance, "nodes")
+    db.commit()
+    db.refresh(instance)
+    template = db.query(AppTemplate).filter(AppTemplate.id == node.template_id).first()
     return build_app_workflow_response(instance, node, template)
 
 
@@ -297,13 +613,7 @@ async def update_app_workflow(
     db: Session = Depends(get_db)
 ):
     """更新单应用工作流配置"""
-    instance = db.query(WorkflowInstance).filter(
-        WorkflowInstance.id == instance_id,
-        WorkflowInstance.run_mode == "simple_app"
-    ).first()
-
-    if not instance:
-        raise NotFoundError("App workflow", instance_id)
+    instance = get_app_workflow_instance(db, instance_id)
 
     user_id = str(current_user.get("id", ""))
     if not check_instance_permission(instance, user_id):
@@ -313,12 +623,7 @@ async def update_app_workflow(
     if instance.status not in [WorkflowStatus.PENDING, WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         raise ValidationError(f"Cannot update workflow in status: {instance.status}")
 
-    node = db.query(WorkflowNodeInstance).filter(
-        WorkflowNodeInstance.instance_id == instance_id
-    ).first()
-
-    if not node:
-        raise InternalError(f"Workflow node not found for instance {instance_id}")
+    node = get_app_workflow_node(db, instance_id)
 
     # 更新工作流字段
     if workflow_data.name is not None:
@@ -328,7 +633,9 @@ async def update_app_workflow(
         instance.description = workflow_data.description
 
     # 更新节点配置
-    node_config = instance.nodes[0] if instance.nodes else {}
+    node_config = get_instance_node_config(instance, node.id)
+    if not node_config:
+        node_config = instance.nodes[0] if instance.nodes else {}
 
     if workflow_data.service_name is not None:
         node.service_name = workflow_data.service_name
@@ -354,9 +661,47 @@ async def update_app_workflow(
         node_config["resources"] = node.resources
     if workflow_data.replicas is not None:
         node_config["replicas"] = workflow_data.replicas
+    if workflow_data.timeout_seconds is not None:
+        node.timeout_seconds = workflow_data.timeout_seconds
+        node_config["timeout_seconds"] = workflow_data.timeout_seconds
+    if workflow_data.ingress_type is not None:
+        node.ingress_type = workflow_data.ingress_type
+        node_config["ingress_type"] = workflow_data.ingress_type
+    if workflow_data.ingress_host is not None:
+        node.ingress_host = workflow_data.ingress_host
+        node_config["ingress_host"] = workflow_data.ingress_host
+    if workflow_data.ingress_ip is not None:
+        node.ingress_ip = workflow_data.ingress_ip
+        node_config["ingress_ip"] = workflow_data.ingress_ip
+    if any(value is not None for value in (workflow_data.ingress_type, workflow_data.ingress_host, workflow_data.ingress_ip)):
+        node_config["create_ingress"] = bool(node_config.get("ingress_type") and node_config.get("ingress_host"))
+
+    latest_create_ingress = node_config.get(
+        "create_ingress",
+        bool(node.ingress_type or node.ingress_host or node.ingress_ip),
+    )
+    latest_domain = node_config.get("ingress_host") or node.ingress_host
+    if not latest_create_ingress or not latest_domain:
+        delete_node_domain_bindings(db, instance_id, node.id)
+    else:
+        service_port, target_port = get_primary_service_ports(node_config)
+        upsert_node_domain_binding(
+            db,
+            instance,
+            node,
+            domain=latest_domain,
+            ingress_ip=node_config.get("ingress_ip") or node.ingress_ip,
+            ingress_type=node_config.get("ingress_type") or node.ingress_type,
+            service_name=node_config.get("service_name") or node.service_name,
+            service_port=service_port,
+            target_port=target_port,
+            binding_status="active" if node.k8s_resource_name else "configured",
+            message="Ingress config updated on app workflow",
+        )
 
     # 更新 instance.nodes
     instance.nodes = [node_config]
+    flag_modified(instance, "nodes")
 
     db.commit()
     db.refresh(instance)
@@ -378,13 +723,7 @@ async def delete_app_workflow(
     db: Session = Depends(get_db)
 ):
     """删除单应用工作流"""
-    instance = db.query(WorkflowInstance).filter(
-        WorkflowInstance.id == instance_id,
-        WorkflowInstance.run_mode == "simple_app"
-    ).first()
-
-    if not instance:
-        raise NotFoundError("App workflow", instance_id)
+    instance = get_app_workflow_instance(db, instance_id)
 
     user_id = str(current_user.get("id", ""))
     if not check_instance_permission(instance, user_id):
@@ -392,9 +731,7 @@ async def delete_app_workflow(
 
     # 删除 K8S 资源（如果已初始化）
     if instance.status in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
-        node = db.query(WorkflowNodeInstance).filter(
-            WorkflowNodeInstance.instance_id == instance_id
-        ).first()
+        node = get_app_workflow_node(db, instance_id)
         if node and node.k8s_resource_name:
             result = await get_status_client().deinitialize_workflow(
                 instance_id=instance_id,
@@ -414,6 +751,9 @@ async def delete_app_workflow(
     db.query(WorkflowSyncRecord).filter(
         WorkflowSyncRecord.instance_id == instance_id
     ).delete()
+
+    node = get_app_workflow_node(db, instance_id)
+    delete_node_domain_bindings(db, instance_id, node.id)
 
     # 删除节点实例
     db.query(WorkflowNodeInstance).filter(
@@ -443,13 +783,7 @@ async def initialize_app_workflow(
     - 创建 Deployment 和 Service
     - 初始化成功后状态变为 INITIALIZED
     """
-    instance = db.query(WorkflowInstance).filter(
-        WorkflowInstance.id == instance_id,
-        WorkflowInstance.run_mode == "simple_app"
-    ).first()
-
-    if not instance:
-        raise NotFoundError("App workflow", instance_id)
+    instance = get_app_workflow_instance(db, instance_id)
 
     user_id = str(current_user.get("id", ""))
     if not check_instance_permission(instance, user_id):
@@ -463,12 +797,7 @@ async def initialize_app_workflow(
             "Workflow already initialized. Use force=True to re-initialize"
         )
 
-    node = db.query(WorkflowNodeInstance).filter(
-        WorkflowNodeInstance.instance_id == instance_id
-    ).first()
-
-    if not node:
-        raise InternalError(f"Workflow node not found for instance {instance_id}")
+    node = get_app_workflow_node(db, instance_id)
 
     status_client = get_status_client()
     namespace_result = await status_client.ensure_namespace(instance.project_id)
@@ -516,7 +845,9 @@ async def initialize_app_workflow(
 
     try:
         init_logs.append(f"[{datetime.utcnow().isoformat()}] 初始化节点 {node.name}")
-        node_config = instance.nodes[0] if instance.nodes else {}
+        node_config = get_instance_node_config(instance, node.id)
+        if not node_config:
+            node_config = instance.nodes[0] if instance.nodes else {}
         service_name = node_config.get("service_name") or node.service_name
         service_ports = node_config.get("service_ports", [])
         service_type = node_config.get("service_type", "ClusterIP")
@@ -583,20 +914,32 @@ async def initialize_app_workflow(
         node.ingress_type = ingress_type
         node.ingress_host = ingress_host
         node.ingress_ip = ingress_ip
+        if ingress_type and ingress_host:
+            service_port, target_port = get_primary_service_ports(node_config)
+            upsert_node_domain_binding(
+                db,
+                instance,
+                node,
+                domain=ingress_host,
+                ingress_ip=ingress_ip,
+                ingress_type=ingress_type,
+                service_name=node.service_name,
+                service_port=service_port,
+                target_port=target_port,
+                binding_status="active",
+                message="Ingress bound during initialization",
+            )
 
         result_status = str(node_result.get("status", "Pending")).lower()
         if result_status == "ready":
             node.status = NodeStatus.READY
-            instance.status = WorkflowStatus.READY
         elif result_status in ["not_ready", "notready"]:
             node.status = NodeStatus.NOT_READY
-            instance.status = WorkflowStatus.UNREADY
         else:
             node.status = NodeStatus.PENDING
-            instance.status = WorkflowStatus.PENDING
 
         node.message = node_result.get("message", "App workflow initialized successfully")
-        instance.message = "Successfully initialized app workflow"
+        sync_app_instance_status_from_node(instance, node)
         init_logs.append(f"[{datetime.utcnow().isoformat()}] 初始化完成")
 
     except Exception as e:
@@ -613,6 +956,76 @@ async def initialize_app_workflow(
     db.refresh(instance)
 
     logger.info(f"Initialized app workflow {instance_id}, status={instance.status}")
+
+    template = db.query(AppTemplate).filter(
+        AppTemplate.id == node.template_id
+    ).first()
+
+    return build_app_workflow_response(instance, node, template)
+
+
+@router.post("/{instance_id}/uninitialize", response_model=AppWorkflowResponse)
+async def uninitialize_app_workflow(
+    instance_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """反初始化单应用工作流并删除已创建的 K8S 资源。"""
+    instance = get_app_workflow_instance(db, instance_id)
+
+    user_id = str(current_user.get("id", ""))
+    if not check_instance_permission(instance, user_id):
+        raise ForbiddenError("No permission to uninitialize this workflow")
+
+    if instance.status not in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
+        raise ValidationError(
+            f"Cannot uninitialize workflow in status: {instance.status}. Valid states: unready, ready"
+        )
+
+    node = get_app_workflow_node(db, instance_id)
+
+    deleted_count = 0
+    errors = []
+    if node.k8s_resource_name:
+        result = await get_status_client().deinitialize_workflow(
+            instance_id=instance_id,
+            project_id=instance.project_id,
+            nodes=[{
+                "node_id": node.node_id,
+                "node_type": "app",
+                "k8s_resource_name": node.k8s_resource_name,
+                "k8s_resource_type": node.k8s_resource_type,
+                "service_name": node.service_name,
+                "has_ingress": bool(node.ingress_type),
+            }],
+        )
+        deleted_count = result.get("succeeded_nodes", 0)
+        if not result.get("success", False):
+            errors.append(result.get("message", result.get("error", "Unknown error")))
+        logger.info(f"uninitialize app workflow result: {result}")
+
+    node.k8s_resource_name = None
+    node.k8s_resource_type = None
+    node.status = NodeStatus.PENDING
+    node.started_at = None
+    node.finished_at = None
+    node.message = None
+
+    delete_node_domain_bindings(db, instance_id, node.id)
+
+    instance.status = WorkflowStatus.PENDING
+    instance.started_at = None
+    instance.finished_at = None
+
+    if errors:
+        instance.message = f"Uninitialize completed with errors: {'; '.join(errors)}"
+        logger.warning(f"Uninitialized app workflow {instance_id} with errors: {errors}")
+    else:
+        instance.message = f"Successfully uninitialized app workflow, deleted {deleted_count} K8S resources"
+        logger.info(f"Uninitialized app workflow {instance_id}, deleted {deleted_count} K8S resources")
+
+    db.commit()
+    db.refresh(instance)
 
     template = db.query(AppTemplate).filter(
         AppTemplate.id == node.template_id
@@ -705,13 +1118,7 @@ async def start_app_workflow(
     - 检查 Deployment 状态
     - 更新工作流状态为 RUNNING
     """
-    instance = db.query(WorkflowInstance).filter(
-        WorkflowInstance.id == instance_id,
-        WorkflowInstance.run_mode == "simple_app"
-    ).first()
-
-    if not instance:
-        raise NotFoundError("App workflow", instance_id)
+    instance = get_app_workflow_instance(db, instance_id)
 
     user_id = str(current_user.get("id", ""))
     if not check_instance_permission(instance, user_id):
@@ -720,12 +1127,7 @@ async def start_app_workflow(
     if instance.status not in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         raise ValidationError(f"Cannot start workflow in status: {instance.status}. Valid states: unready, ready")
 
-    node = db.query(WorkflowNodeInstance).filter(
-        WorkflowNodeInstance.instance_id == instance_id
-    ).first()
-
-    if not node:
-        raise InternalError(f"Workflow node not found for instance {instance_id}")
+    node = get_app_workflow_node(db, instance_id)
 
     # 更新运行计数
     instance.run_count += 1
@@ -787,13 +1189,7 @@ async def stop_app_workflow(
     db: Session = Depends(get_db)
 ):
     """停止单应用工作流"""
-    instance = db.query(WorkflowInstance).filter(
-        WorkflowInstance.id == instance_id,
-        WorkflowInstance.run_mode == "simple_app"
-    ).first()
-
-    if not instance:
-        raise NotFoundError("App workflow", instance_id)
+    instance = get_app_workflow_instance(db, instance_id)
 
     user_id = str(current_user.get("id", ""))
     if not check_instance_permission(instance, user_id):
@@ -802,12 +1198,9 @@ async def stop_app_workflow(
     if instance.status not in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         raise ValidationError(f"Cannot stop workflow in status: {instance.status}")
 
-    node = db.query(WorkflowNodeInstance).filter(
-        WorkflowNodeInstance.instance_id == instance_id
-    ).first()
+    node = get_app_workflow_node(db, instance_id)
 
-    if not node:
-        raise InternalError(f"Workflow node not found for instance {instance_id}")
+    node_config = get_instance_node_config(instance, node.id)
 
     if node.k8s_resource_name:
         result = await get_status_client().stop_workflow(
@@ -829,14 +1222,35 @@ async def stop_app_workflow(
     node.status = NodeStatus.PENDING
     node.k8s_resource_name = None
     node.k8s_resource_type = None
-    node.service_name = None
-    node.ingress_type = None
-    node.ingress_host = None
-    node.ingress_ip = None
     node.finished_at = datetime.utcnow()
+    node.message = "Workflow stopped"
+
+    latest_create_ingress = node_config.get(
+        "create_ingress",
+        bool(node.ingress_type or node.ingress_host or node.ingress_ip),
+    )
+    latest_domain = node_config.get("ingress_host") or node.ingress_host
+    if not latest_create_ingress or not latest_domain:
+        delete_node_domain_bindings(db, instance_id, node.id)
+    else:
+        service_port, target_port = get_primary_service_ports(node_config)
+        upsert_node_domain_binding(
+            db,
+            instance,
+            node,
+            domain=latest_domain,
+            ingress_ip=node_config.get("ingress_ip") or node.ingress_ip,
+            ingress_type=node_config.get("ingress_type") or node.ingress_type,
+            service_name=node_config.get("service_name") or node.service_name,
+            service_port=service_port,
+            target_port=target_port,
+            binding_status="configured",
+            message="Ingress config preserved after workflow stop",
+        )
 
     instance.status = WorkflowStatus.PENDING
     instance.finished_at = datetime.utcnow()
+    instance.message = "Workflow stopped"
     db.commit()
     db.refresh(instance)
 
@@ -858,24 +1272,13 @@ async def sync_app_workflow_status(
     db: Session = Depends(get_db)
 ):
     """同步单应用工作流状态"""
-    instance = db.query(WorkflowInstance).filter(
-        WorkflowInstance.id == instance_id,
-        WorkflowInstance.run_mode == "simple_app"
-    ).first()
-
-    if not instance:
-        raise NotFoundError("App workflow", instance_id)
+    instance = get_app_workflow_instance(db, instance_id)
 
     user_id = str(current_user.get("id", ""))
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to access this workflow")
 
-    node = db.query(WorkflowNodeInstance).filter(
-        WorkflowNodeInstance.instance_id == instance_id
-    ).first()
-
-    if not node:
-        raise InternalError(f"Workflow node not found for instance {instance_id}")
+    node = get_app_workflow_node(db, instance_id)
 
     try:
         if node.k8s_resource_name and node.k8s_resource_type == "Deployment":
@@ -897,11 +1300,7 @@ async def sync_app_workflow_status(
             node.message = sync_result.get("message", node.message)
 
         # 更新工作流状态
-        instance.status = WorkflowStatus.READY if node.status == NodeStatus.READY else WorkflowStatus.UNREADY
-        if node.status == NodeStatus.READY:
-            instance.message = "Workflow is ready"
-        else:
-            instance.message = "Workflow is unready"
+        sync_app_instance_status_from_node(instance, node)
 
         instance.last_sync_at = datetime.utcnow()
 
@@ -934,24 +1333,13 @@ async def get_app_workflow_logs(
     db: Session = Depends(get_db)
 ):
     """Get logs for a single-app workflow instance."""
-    instance = db.query(WorkflowInstance).filter(
-        WorkflowInstance.id == instance_id,
-        WorkflowInstance.run_mode == "simple_app"
-    ).first()
-
-    if not instance:
-        raise NotFoundError("App workflow", instance_id)
+    instance = get_app_workflow_instance(db, instance_id)
 
     user_id = str(current_user.get("id", ""))
     if not check_instance_permission(instance, user_id):
         raise ForbiddenError("No permission to access this workflow")
 
-    node = db.query(WorkflowNodeInstance).filter(
-        WorkflowNodeInstance.instance_id == instance_id
-    ).first()
-
-    if not node:
-        raise NotFoundError("Workflow node", f"instance {instance_id}")
+    node = get_app_workflow_node(db, instance_id)
 
     if not node.k8s_resource_name:
         raise ValidationError("Workflow has not been initialized yet")

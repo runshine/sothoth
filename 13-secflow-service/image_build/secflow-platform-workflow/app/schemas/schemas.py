@@ -827,6 +827,7 @@ class AppWorkflowUpdate(BaseModel):
     volume_mounts: Optional[List[VolumeMount]] = None
     resources: Optional[ResourceRequirements] = None
     replicas: Optional[int] = Field(None, ge=1)
+    timeout_seconds: Optional[int] = Field(None, ge=1)
 
     # Ingress配置（可选）
     ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
@@ -842,6 +843,7 @@ class AppWorkflowNodeResponse(BaseModel):
     template_id: str
     status: str
     k8s_resource_name: Optional[str] = None
+    k8s_resource_type: Optional[str] = None
     service_name: Optional[str] = None
     message: Optional[str] = None
     started_at: Optional[datetime] = None
@@ -853,6 +855,14 @@ class AppWorkflowNodeResponse(BaseModel):
     env_vars: List[EnvVar] = []
     volume_mounts: List[VolumeMount] = []
     resources: Optional[ResourceRequirements] = None
+    timeout_seconds: Optional[int] = None
+    create_service: bool = True
+    service_ports: List[ServicePort] = []
+    service_type: Optional[str] = None
+    create_ingress: bool = False
+    ingress_type: Optional[str] = None
+    ingress_host: Optional[str] = None
+    ingress_ip: Optional[str] = None
 
 
 class AppWorkflowResponse(BaseModel):
@@ -870,6 +880,16 @@ class AppWorkflowResponse(BaseModel):
     # Service信息
     service_name: Optional[str] = None
     service_ports: List[ServicePort] = []
+    service_type: Optional[str] = None
+    replicas: Optional[int] = None
+    env_vars: List[EnvVar] = []
+    volume_mounts: List[VolumeMount] = []
+    resources: Optional[ResourceRequirements] = None
+    create_service: bool = True
+    create_ingress: bool = False
+    ingress_type: Optional[str] = None
+    ingress_host: Optional[str] = None
+    ingress_ip: Optional[str] = None
 
     # 模板信息
     template_id: str
