@@ -50,6 +50,12 @@ data:
       timeout: 30
       scheme: "http"
 
+    workflow_status_service:
+    enabled: true
+    host: "secflow-platform-workflow-status"
+    port: 80
+    timeout: 30
+
     app:
       host: "0.0.0.0"
       port: 8080
