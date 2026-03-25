@@ -33,6 +33,8 @@ RUN apt-get update && apt-get install -y \
     procps psmisc htop net-tools iproute2 \
     # Python环境
     python3 python3-pip python3-dev \
+    # Node/npm 运行时
+    nodejs npm \
     # 其他实用工具
     jq tree tmux less file unzip openssl \
     # 清理缓存
@@ -68,19 +70,18 @@ RUN pip3 install --no-cache-dir -r requirements.txt --break-system-packages
 
 RUN set -eux; \
     if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v5" ]; then \
-        apt-get update && apt-get install -y nodejs npm && apt-get clean && rm -rf /var/lib/apt/lists/*; \
-        npm install --unsafe-perm -g @anthropic-ai/claude-code; \
         npm install --unsafe-perm -g code-server; \
-        npm install --unsafe-perm -g claude-a2a; \
-        npm install -g @openai/codex; \
     else \
         curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash; \
-        bash -lc ". \"$NVM_DIR/nvm.sh\" && nvm install 20 && nvm alias default 20 && nvm use --silent default && npm install --unsafe-perm -g @anthropic-ai/claude-code && npm install -g @openai/codex && npm install --unsafe-perm -g claude-a2a"; \
+        bash -lc ". \"$NVM_DIR/nvm.sh\" && nvm install 20 && nvm alias default 20 && nvm use --silent default"; \
         curl -fsSL https://code-server.dev/install.sh | sh -s -- --method=standalone; \
         echo ". \"$NVM_DIR/nvm.sh\"" >> /root/.bashrc; \
     fi; \
+    npm install --unsafe-perm -g @anthropic-ai/claude-code; \
+    npm install --unsafe-perm -g claude-a2a; \
+    npm install --unsafe-perm -g @openai/codex; \
     if [ -x /root/.local/bin/code-server ]; then ln -sf /root/.local/bin/code-server /usr/local/bin/code-server; fi; \
-    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude claude-a2a codex opencode; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v code-server; command -v claude-a2a || true; command -v claude || true; command -v codex || true"; \
+    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude claude-a2a codex opencode; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v node; command -v npm; command -v code-server; command -v claude; command -v claude-a2a; command -v codex"; \
     echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
 
 # 创建 code-server 配置目录
