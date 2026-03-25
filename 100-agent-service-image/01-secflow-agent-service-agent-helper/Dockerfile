@@ -88,7 +88,6 @@ RUN set -eux; \
     bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude claude-a2a codex opencode; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done"; \
     test -x /usr/local/bin/node; \
     test -x /usr/local/bin/npm; \
-    test -x /usr/local/bin/code-server; \
     test -x /usr/local/bin/claude; \
     test -x /usr/local/bin/claude-a2a; \
     test -x /usr/local/bin/codex; \
