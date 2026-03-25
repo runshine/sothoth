@@ -164,7 +164,7 @@ async def websocket_terminal_proxy(
 
     try:
         auth_service = get_auth_service()
-        current_user = auth_service.verify_token(token)
+        current_user = await auth_service.validate_token_async(token)
         if not current_user:
             await websocket.accept()
             await websocket.send_text("\x1b[31mError: Token无效或已过期\x1b[0m\r\n")
