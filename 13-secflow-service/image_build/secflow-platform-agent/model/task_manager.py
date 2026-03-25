@@ -106,6 +106,10 @@ class TaskManager:
         return state in {'running', 'active', 'healthy', 'started', 'up'}
 
     @staticmethod
+    def _is_transitional_state(state: str) -> bool:
+        return state in {'pulling', 'starting', 'pending', 'creating', 'downloading', 'restarting', 'activating'}
+
+    @staticmethod
     def _is_failed_state(state: str) -> bool:
         return state in {'failed', 'error', 'exited', 'stopped', 'dead'}
 
@@ -113,6 +117,17 @@ class TaskManager:
     def _normalize_service_state(payload: Any) -> str:
         if not isinstance(payload, dict):
             return ''
+        real_status = payload.get('real_status')
+        if isinstance(real_status, dict):
+            operation = real_status.get('operation')
+            if isinstance(operation, dict) and operation.get('active'):
+                phase = str(operation.get('phase') or '').strip().lower()
+                if phase:
+                    return phase
+            state = real_status.get('status') or real_status.get('state')
+            if isinstance(state, str) and state.strip():
+                return state.strip().lower()
+
         state = payload.get('status') or payload.get('state') or payload.get('service_status')
         if isinstance(state, str):
             return state.strip().lower()
@@ -182,6 +197,10 @@ class TaskManager:
             if code == 200 and self._is_running_state(state):
                 self._add_task_log(task_id, 'INFO', "服务在超时后已就绪，判定部署成功")
                 return True
+
+            if code == 200 and self._is_transitional_state(state):
+                time.sleep(poll_interval_sec)
+                continue
 
             if code == 200 and self._is_failed_state(state):
                 self._add_task_log(task_id, 'ERROR', f"服务状态异常: {state}")
