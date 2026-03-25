@@ -14,6 +14,11 @@ services:
       - REST_PORT=20001
       - TTYD_PORT=20002
       - WORKDIR=/app
+      - AGENT_HELPER_STATE_DIR=/app/data
+      - AGENT_DEFAULT_BACKEND=claude
+      - AGENT_BACKEND_INVOKE_TIMEOUT_SEC=300
+      - AGENT_BACKEND_IDLE_TIMEOUT_SEC=1800
+      - AGENT_HOUSEKEEPING_INTERVAL_SEC=30
       - DISABLE_TELEMETRY=true
       - DISABLE_COST_WARNINGS=true
       - API_TIMEOUT_MS=600000
@@ -23,6 +28,10 @@ services:
       - ANTHROPIC_AUTH_TOKEN=sk-12345678
       - CLAUDE_CODE_USE_BEDROCK=
       - CODE_SERVER_PORT=20003
+      - PROCESS_MONITOR_PORT=20004
+      - PROCESS_MONITOR_INTERVAL_SEC=15
+      - HOST_ROOT=/host
+      - PROCESS_MONITOR_PROC_ROOT=/host/proc
       - CODE_SERVER_PASSWORD=your-password-here  # 建议设置固定密码，留空则自动生成
 
     # 端口映射
@@ -30,6 +39,7 @@ services:
       - "20001:20001"
       - "20002:20002"
       - "20003:20003"
+      - "20004:20004"
     # 卷挂载 - 主机目录只读挂载
     volumes:
       # 主机根目录只读挂载
@@ -42,6 +52,7 @@ services:
 
       # 临时目录
       - /tmp:/tmp:rw
+      - ./data:/app/data
 
     # 内核能力
     cap_add:

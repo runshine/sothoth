@@ -10,6 +10,10 @@ ENV REST_PORT=20001
 ENV TTYD_PORT=20002
 ENV WORKDIR=/app
 ENV CODE_SERVER_PORT=20003
+ENV PROCESS_MONITOR_PORT=20004
+ENV PROCESS_MONITOR_INTERVAL_SEC=15
+ENV HOST_ROOT=/host
+ENV PROCESS_MONITOR_PROC_ROOT=/host/proc
 ENV CODE_SERVER_PASSWORD=
 ENV NVM_DIR=/root/.nvm
 ENV PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -85,7 +89,8 @@ RUN mkdir -p /root/.config/code-server && \
 
 
 # 复制应用代码
-COPY app.py .
+COPY agent_ai_service ./agent_ai_service
+COPY process_monitor_service ./process_monitor_service
 COPY entrypoint.sh .
 
 # 设置执行权限
@@ -101,6 +106,7 @@ USER root
 # 暴露端口
 EXPOSE ${REST_PORT}
 EXPOSE ${CODE_SERVER_PORT}
+EXPOSE ${PROCESS_MONITOR_PORT}
 
 # 启动脚本
 ENTRYPOINT ["./entrypoint.sh"]

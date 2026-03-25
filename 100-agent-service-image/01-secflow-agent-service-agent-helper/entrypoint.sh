@@ -8,13 +8,14 @@ cd "${WORKDIR:-/app}" 2>/dev/null || cd /app || cd /root
 REST_PORT="${REST_PORT:-20001}"
 TTYD_PORT="${TTYD_PORT:-20002}"
 CODE_SERVER_PORT="${CODE_SERVER_PORT:-20003}"
+PROCESS_MONITOR_PORT="${PROCESS_MONITOR_PORT:-20004}"
 
 TTYD_PID=""
 CODE_SERVER_PID=""
-CLAUDE_A2A_PID=""
+PROCESS_MONITOR_PID=""
 
 cleanup_children() {
-    for pid in "$TTYD_PID" "$CODE_SERVER_PID" "$CLAUDE_A2A_PID"; do
+    for pid in "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
@@ -28,27 +29,23 @@ resolve_node_global_bin() {
     local bin_name="$1"
     local resolved=""
 
-    # 先尝试当前PATH
     resolved="$(command -v "$bin_name" 2>/dev/null || true)"
     if [ -n "$resolved" ]; then
         echo "$resolved"
         return 0
     fi
 
-    # code-server 官方安装脚本默认放到 ~/.local/bin
     if [ -x "${HOME}/.local/bin/${bin_name}" ]; then
         echo "${HOME}/.local/bin/${bin_name}"
         return 0
     fi
 
-    # 再尝试 ~/.local/lib/<tool>/bin/<tool> 这种布局
     resolved="$(find "${HOME}/.local/lib" -maxdepth 4 -type f -path '*/bin/'"${bin_name}" 2>/dev/null | sort | tail -n 1)"
     if [ -n "$resolved" ]; then
         echo "$resolved"
         return 0
     fi
 
-    # 尝试加载nvm并激活常见版本
     export NVM_DIR="${HOME}/.nvm"
     if [ -s "${NVM_DIR}/nvm.sh" ]; then
         . "${NVM_DIR}/nvm.sh"
@@ -60,7 +57,6 @@ resolve_node_global_bin() {
         fi
     fi
 
-    # 兜底：直接在nvm目录下找最新安装的可执行文件
     if [ -d "${NVM_DIR}/versions/node" ]; then
         resolved="$(find "${NVM_DIR}/versions/node" -type f -path '*/bin/'"${bin_name}" 2>/dev/null | sort | tail -n 1)"
         if [ -n "$resolved" ]; then
@@ -73,49 +69,42 @@ resolve_node_global_bin() {
 }
 
 echo "=========================================="
-echo "Remote Command Executor Container"
+echo "Agent AI Service Container"
 echo "=========================================="
 echo "Timeout: ${TIMEOUT} seconds"
-echo "Port: ${REST_PORT}"
+echo "REST Port: ${REST_PORT}"
+echo "Process Monitor Port: ${PROCESS_MONITOR_PORT}"
 echo "Workdir: ${WORKDIR}"
 echo "Container ID: $(cat /proc/self/cgroup | head -1 | cut -d/ -f3)"
 echo "=========================================="
 
-# 检查调试工具
 echo "Available Debug Tools:"
 echo "----------------------"
-which gcc g++ clang gdb lldb strace ltrace make cmake python3
+which gcc g++ clang gdb lldb strace ltrace make cmake python3 || true
 echo "----------------------"
 
-# 挂载信息
 echo "Mount Information:"
 echo "----------------------"
-mount | grep -E "/host|/proc|/sys|/dev"
+mount | grep -E "/host|/proc|/sys|/dev" || true
 echo "----------------------"
 
 ttyd -p "${TTYD_PORT}" -w / -W /bin/bash >> /tmp/ttyd.log 2>&1 &
 TTYD_PID=$!
 
-# 启动 code-server
 echo "Starting code-server on port ${CODE_SERVER_PORT}..."
-
 CODE_SERVER_BIN="$(resolve_node_global_bin code-server || true)"
-CLAUDE_A2A_BIN="$(resolve_node_global_bin claude-a2a || true)"
+mkdir -p "${AGENT_HELPER_STATE_DIR:-/app/data}"
 
-# 设置 code-server 密码
 if [ -z "$CODE_SERVER_PASSWORD" ]; then
-    # 生成随机密码
     CODE_SERVER_PASSWORD=$(openssl rand -base64 12)
     echo "Generated code-server password: ${CODE_SERVER_PASSWORD}"
 fi
 
-# 确定 code-server 工作目录
 CODE_SERVER_WORKDIR="${WORKDIR}"
 if [ -d "/host" ]; then
     CODE_SERVER_WORKDIR="/host"
 fi
 
-# 启动 code-server
 if [ -n "${CODE_SERVER_BIN}" ]; then
     export PASSWORD=${CODE_SERVER_PASSWORD}
     "${CODE_SERVER_BIN}" \
@@ -133,25 +122,24 @@ else
     echo "WARNING: code-server binary not found; skip starting code-server" >&2
 fi
 
-if [ -n "${CLAUDE_A2A_BIN}" ]; then
-    "${CLAUDE_A2A_BIN}" >> /tmp/claude-a2a.log 2>&1 &
-    CLAUDE_A2A_PID=$!
-else
-    echo "WARNING: claude-a2a binary not found; skip starting claude-a2a" >&2
-fi
+# 智能体后端进程由 REST API 统一管理，不在入口脚本中自动启动
 
-# 设置权限
+echo "Starting Process monitor service on port ${PROCESS_MONITOR_PORT}..."
+python3 -m process_monitor_service.app >> /tmp/process-monitor.log 2>&1 &
+PROCESS_MONITOR_PID=$!
+
 if [ -d "/host" ]; then
     echo "Host directory mounted at /host"
     ls -la /host
 fi
 
-# 启动服务
-echo "Starting API service on port ${REST_PORT}..."
+echo "Starting Agent AI service on port ${REST_PORT}..."
+export PYTHONPATH="${WORKDIR}:${PYTHONPATH}"
 exec gunicorn \
+    --chdir ${WORKDIR} \
     --bind 0.0.0.0:${REST_PORT} \
-    --workers 4 \
+    --workers 1 \
     --timeout ${TIMEOUT} \
     --access-logfile - \
     --error-logfile - \
-    app:app
+    agent_ai_service.app:app

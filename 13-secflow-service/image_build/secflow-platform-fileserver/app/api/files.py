@@ -3,10 +3,11 @@
 import hashlib
 import logging
 import os
+import posixpath
 import tempfile
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, Header, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -188,6 +189,102 @@ def absolute_storage_path(storage_key: str) -> str:
     return os.path.join(get_config().storage.root_dir, storage_key)
 
 
+def sync_subproject_root(project_id: str, subproject_id: int) -> str:
+    return os.path.join(get_config().storage.root_dir, "files", project_id, str(subproject_id))
+
+
+def normalize_sync_path(path: str) -> tuple[str, str]:
+    raw = (path or "").strip()
+    if not raw:
+        raise ValidationError("同步路径不能为空")
+    normalized = posixpath.normpath(raw)
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    if normalized == "/":
+        return "", "/"
+    if normalized.startswith("/../") or normalized == "/..":
+        raise ValidationError("同步路径不能越权")
+    return normalized.lstrip("/"), normalized
+
+
+def sync_target_path(project_id: str, subproject_id: int, relative_path: str) -> str:
+    relative_no_lead, _ = normalize_sync_path(relative_path)
+    return os.path.join(sync_subproject_root(project_id, subproject_id), relative_no_lead)
+
+
+def compute_existing_sync_meta(target_path: str) -> dict[str, Any]:
+    if not os.path.lexists(target_path):
+        return {"exists": False}
+    if os.path.islink(target_path):
+        return {
+            "exists": True,
+            "entry_type": "symlink",
+            "symlink_target": os.readlink(target_path),
+            "size": 0,
+            "sha256": "",
+        }
+    if os.path.isdir(target_path):
+        return {
+            "exists": True,
+            "entry_type": "directory",
+            "size": 0,
+            "sha256": "",
+        }
+    sha256 = hashlib.sha256()
+    total = 0
+    with open(target_path, "rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            sha256.update(chunk)
+            total += len(chunk)
+    return {
+        "exists": True,
+        "entry_type": "file",
+        "size": total,
+        "sha256": sha256.hexdigest(),
+    }
+
+
+def build_sync_headers(meta: dict[str, Any]) -> dict[str, str]:
+    if not meta.get("exists"):
+        return {
+            "X-Sync-Exists": "false",
+        }
+    headers = {
+        "X-Sync-Exists": "true",
+        "X-Sync-Entry-Type": str(meta.get("entry_type") or ""),
+        "X-Sync-Size": str(meta.get("size") or 0),
+        "X-Sync-Sha256": str(meta.get("sha256") or ""),
+    }
+    if meta.get("symlink_target") is not None:
+        headers["X-Sync-Symlink-Target"] = str(meta.get("symlink_target") or "")
+    return headers
+
+
+async def persist_sync_stream(request: Request, destination_path: str) -> tuple[str, str, int]:
+    sha256 = hashlib.sha256()
+    total_size = 0
+    parent_dir = os.path.dirname(destination_path)
+    os.makedirs(parent_dir, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="sync_", suffix=".part", dir=parent_dir)
+    os.close(fd)
+    try:
+        with open(temp_path, "wb") as temp_file:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                sha256.update(chunk)
+                total_size += len(chunk)
+                temp_file.write(chunk)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    return temp_path, sha256.hexdigest(), total_size
+
+
 async def persist_upload(upload: UploadFile, destination_dir: str) -> tuple[str, str, int]:
     sha256 = hashlib.sha256()
     total_size = 0
@@ -209,6 +306,107 @@ async def persist_upload(upload: UploadFile, destination_dir: str) -> tuple[str,
     finally:
         await upload.close()
     return temp_path, sha256.hexdigest(), total_size
+
+
+@router.head("/sync/root/{project_id}/{subproject_id}/object")
+async def sync_head_object(project_id: str, subproject_id: int, path: str = Query(...)):
+    target_path = sync_target_path(project_id, subproject_id, path)
+    meta = compute_existing_sync_meta(target_path)
+    return Response(status_code=200 if meta.get("exists") else 404, headers=build_sync_headers(meta))
+
+
+@router.get("/sync/root/{project_id}/{subproject_id}/object/meta")
+async def sync_object_meta(project_id: str, subproject_id: int, path: str = Query(...)):
+    target_path = sync_target_path(project_id, subproject_id, path)
+    meta = compute_existing_sync_meta(target_path)
+    if not meta.get("exists"):
+        raise NotFoundError("同步对象", path)
+    return {
+        "path": normalize_sync_path(path)[1],
+        **meta,
+    }
+
+
+@router.post("/sync/root/{project_id}/{subproject_id}/mkdirs")
+async def sync_mkdirs(project_id: str, subproject_id: int, payload: dict[str, list[str]] = Body(...)):
+    paths = payload.get("paths") or []
+    created: list[str] = []
+    for item in paths:
+        relative_no_lead, normalized = normalize_sync_path(item)
+        target_dir = os.path.join(sync_subproject_root(project_id, subproject_id), relative_no_lead)
+        os.makedirs(target_dir, exist_ok=True)
+        created.append(normalized)
+    return {"ok": True, "created": created}
+
+
+@router.put("/sync/root/{project_id}/{subproject_id}/object")
+async def sync_put_object(
+    project_id: str,
+    subproject_id: int,
+    request: Request,
+    path: str = Query(...),
+    size: int = Query(0),
+    sha256: str = Query(""),
+):
+    normalized_relative_no_lead, normalized_relative = normalize_sync_path(path)
+    target_path = os.path.join(sync_subproject_root(project_id, subproject_id), normalized_relative_no_lead)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+    entry_type = (request.headers.get("X-Sync-Entry-Type") or "file").strip().lower()
+    existing = compute_existing_sync_meta(target_path)
+
+    if entry_type == "symlink":
+        symlink_target = request.headers.get("X-Sync-Symlink-Target", "")
+        if existing.get("exists") and existing.get("entry_type") == "symlink" and existing.get("symlink_target") == symlink_target:
+            return {
+                "path": normalized_relative,
+                "entry_type": "symlink",
+                "status": "skipped",
+                "size": 0,
+                "sha256": "",
+                "symlink_target": symlink_target,
+            }
+        if os.path.lexists(target_path):
+            if os.path.isdir(target_path) and not os.path.islink(target_path):
+                raise ConflictError(f"目标路径已存在目录，无法覆盖: {normalized_relative}")
+            os.remove(target_path)
+        os.symlink(symlink_target, target_path)
+        return {
+            "path": normalized_relative,
+            "entry_type": "symlink",
+            "status": "uploaded",
+            "size": 0,
+            "sha256": "",
+            "symlink_target": symlink_target,
+        }
+
+    if existing.get("exists") and existing.get("entry_type") == "file":
+        existing_size = int(existing.get("size") or 0)
+        existing_sha256 = str(existing.get("sha256") or "")
+        if existing_size == size and existing_sha256 and sha256 and existing_sha256 == sha256:
+            return {
+                "path": normalized_relative,
+                "entry_type": "file",
+                "status": "skipped",
+                "size": existing_size,
+                "sha256": existing_sha256,
+            }
+
+    temp_path, computed_sha256, computed_size = await persist_sync_stream(request, target_path)
+    if size and computed_size != size:
+        os.remove(temp_path)
+        raise ValidationError("上传文件大小不匹配", {"expected_size": size, "actual_size": computed_size})
+    if sha256 and computed_sha256 != sha256:
+        os.remove(temp_path)
+        raise ValidationError("上传文件摘要不匹配", {"expected_sha256": sha256, "actual_sha256": computed_sha256})
+    os.replace(temp_path, target_path)
+    return {
+        "path": normalized_relative,
+        "entry_type": "file",
+        "status": "uploaded",
+        "size": computed_size,
+        "sha256": computed_sha256,
+    }
 
 
 @router.post("/subprojects", response_model=SubprojectResponse)

@@ -1,0 +1,84 @@
+from __future__ import annotations
+
+from flask import Blueprint, jsonify, request
+
+from process_monitor_service.services.sync_runtime import sync_task_service
+
+bp = Blueprint('sync', __name__)
+
+
+def _json_error(message: str, status: int = 400):
+    return jsonify({'status': 'error', 'error': message}), status
+
+
+@bp.post('/api/sync/tasks')
+def create_task():
+    payload = request.get_json(silent=True) or {}
+    mode = payload.get('mode')
+    remote_root_url = (payload.get('remote_root_url') or '').strip()
+    if mode not in {'pid_files', 'path_files'}:
+        return _json_error('invalid_mode')
+    if not remote_root_url.startswith('http://') and not remote_root_url.startswith('https://'):
+        return _json_error('invalid_remote_root_url')
+    if mode == 'pid_files':
+        pids = payload.get('pids') or []
+        if not isinstance(pids, list) or not pids:
+            return _json_error('pids_required')
+        task = sync_task_service.create_task(mode, remote_root_url, pids=[int(item) for item in pids])
+    else:
+        paths = payload.get('paths') or []
+        if not isinstance(paths, list) or not paths:
+            return _json_error('paths_required')
+        task = sync_task_service.create_task(mode, remote_root_url, paths=[str(item) for item in paths])
+    return jsonify(task), 202
+
+
+@bp.get('/api/sync/tasks')
+def list_tasks():
+    status = request.args.get('status')
+    items = sync_task_service.list_tasks(status=status)
+    return jsonify({'total': len(items), 'items': items})
+
+
+@bp.get('/api/sync/tasks/<task_id>')
+def get_task(task_id: str):
+    task = sync_task_service.get_task(task_id)
+    if not task:
+        return _json_error('task_not_found', 404)
+    return jsonify(task)
+
+
+@bp.get('/api/sync/tasks/<task_id>/progress')
+def get_progress(task_id: str):
+    progress = sync_task_service.get_progress(task_id)
+    if not progress:
+        return _json_error('task_not_found', 404)
+    return jsonify(progress)
+
+
+@bp.get('/api/sync/tasks/<task_id>/events')
+def get_events(task_id: str):
+    cursor = int(request.args.get('cursor', 0))
+    limit = min(int(request.args.get('limit', 200)), 1000)
+    task = sync_task_service.get_task(task_id)
+    if not task:
+        return _json_error('task_not_found', 404)
+    return jsonify(sync_task_service.get_events(task_id, cursor=cursor, limit=limit))
+
+
+@bp.get('/api/sync/tasks/<task_id>/results')
+def get_results(task_id: str):
+    task = sync_task_service.get_task(task_id)
+    if not task:
+        return _json_error('task_not_found', 404)
+    items = sync_task_service.get_results(task_id)
+    return jsonify({'total': len(items), 'items': items})
+
+
+@bp.post('/api/sync/tasks/<task_id>/retry')
+def retry_task(task_id: str):
+    try:
+        task = sync_task_service.retry_task(task_id)
+    except KeyError:
+        return _json_error('task_not_found', 404)
+    return jsonify(task), 202
