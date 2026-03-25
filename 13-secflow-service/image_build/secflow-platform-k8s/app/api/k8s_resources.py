@@ -897,6 +897,11 @@ async def create_dynamic_agent_ingress_route(
     proxy_connect_timeout = int(request.proxy_connect_timeout if request.proxy_connect_timeout is not None else conf.default_proxy_connect_timeout)
     proxy_send_timeout = int(request.proxy_send_timeout if request.proxy_send_timeout is not None else conf.default_proxy_send_timeout)
     proxy_read_timeout = int(request.proxy_read_timeout if request.proxy_read_timeout is not None else conf.default_proxy_read_timeout)
+    if websocket_enabled:
+        if request.proxy_send_timeout is None:
+            proxy_send_timeout = max(proxy_send_timeout, 3600)
+        if request.proxy_read_timeout is None:
+            proxy_read_timeout = max(proxy_read_timeout, 3600)
     ssl_redirect = bool(conf.default_ssl_redirect if request.ssl_redirect is None else request.ssl_redirect)
     backend_protocol = str(request.backend_protocol or (request.metadata or {}).get("backend_protocol") or "http").strip().lower()
     if backend_protocol not in {"http", "https"}:
