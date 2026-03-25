@@ -80,6 +80,10 @@ RUN set -eux; \
     npm install --unsafe-perm -g @anthropic-ai/claude-code; \
     npm install --unsafe-perm -g claude-a2a; \
     npm install --unsafe-perm -g @openai/codex; \
+    NODE_GLOBAL_ROOT="$(npm root -g)"; \
+    if [ -f "$NODE_GLOBAL_ROOT/@anthropic-ai/claude-code/cli.js" ]; then chmod +x "$NODE_GLOBAL_ROOT/@anthropic-ai/claude-code/cli.js" && ln -sf "$NODE_GLOBAL_ROOT/@anthropic-ai/claude-code/cli.js" /usr/local/bin/claude; fi; \
+    if [ -f "$NODE_GLOBAL_ROOT/@openai/codex/bin/codex.js" ]; then chmod +x "$NODE_GLOBAL_ROOT/@openai/codex/bin/codex.js" && ln -sf "$NODE_GLOBAL_ROOT/@openai/codex/bin/codex.js" /usr/local/bin/codex; fi; \
+    if [ -f "$NODE_GLOBAL_ROOT/claude-a2a/dist/server.js" ]; then chmod +x "$NODE_GLOBAL_ROOT/claude-a2a/dist/server.js" && ln -sf "$NODE_GLOBAL_ROOT/claude-a2a/dist/server.js" /usr/local/bin/claude-a2a; fi; \
     if [ -x /root/.local/bin/code-server ]; then ln -sf /root/.local/bin/code-server /usr/local/bin/code-server; fi; \
     bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude claude-a2a codex opencode; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done; command -v node; command -v npm; command -v code-server; command -v claude; command -v claude-a2a; command -v codex"; \
     echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
