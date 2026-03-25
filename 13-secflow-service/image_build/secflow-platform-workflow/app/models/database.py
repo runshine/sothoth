@@ -30,7 +30,7 @@ Base = declarative_base()
 
 # Get table prefix from configuration
 _config = get_config()
-TABLE_PREFIX = _config.database.table_prefix if _config and _config.database else "secflow_platform_workflow_"
+TABLE_PREFIX ="secflow_workflow_"
 
 
 # ============ Enums ============
