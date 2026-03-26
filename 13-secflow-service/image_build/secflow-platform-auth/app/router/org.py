@@ -130,6 +130,99 @@ def can_move_member_between_departments(
     return True, ""
 
 
+def get_project_department_ids(db: Session, project_id: int) -> List[int]:
+    """获取项目绑定的部门ID列表。"""
+    rows = db.query(ProjectDepartment.department_id).filter(
+        ProjectDepartment.project_id == project_id
+    ).all()
+    return [row.department_id for row in rows]
+
+
+def get_project_departments(db: Session, project_id: int) -> List[Department]:
+    """获取项目绑定的部门列表。"""
+    return db.query(Department).join(ProjectDepartment).filter(
+        ProjectDepartment.project_id == project_id
+    ).all()
+
+
+def is_department_scope_allowed(allowed_department_ids: Optional[List[int]], target_department_ids: List[int]) -> bool:
+    """检查目标部门是否全部在允许范围内。"""
+    if allowed_department_ids is None:
+        return True
+
+    if not target_department_ids:
+        return False
+
+    allowed_id_set = set(allowed_department_ids)
+    return all(department_id in allowed_id_set for department_id in target_department_ids)
+
+
+def can_manage_org_project(
+    db: Session,
+    current_user: User,
+    project: Project,
+) -> tuple[bool, str]:
+    """普通管理员仅能管理绑定在自己部门树内的项目。"""
+    if is_super_admin(current_user):
+        return True, ""
+
+    if not is_ordinary_admin(current_user):
+        return False, "您没有权限管理项目"
+
+    manageable_ids = get_manageable_department_ids(db, current_user) or []
+    project_department_ids = get_project_department_ids(db, project.id)
+
+    if not project_department_ids:
+        return False, "普通管理员只能管理已绑定所属部门或下级部门的项目"
+
+    if not is_department_scope_allowed(manageable_ids, project_department_ids):
+        return False, "无权管理上级部门或其他部门的项目"
+
+    return True, ""
+
+
+def validate_project_assignment_scope(
+    db: Session,
+    current_user: User,
+    department_ids: List[int],
+    is_public: bool,
+) -> tuple[bool, str]:
+    """校验项目绑定部门是否在当前用户可管理范围内。"""
+    if is_super_admin(current_user):
+        return True, ""
+
+    if not is_ordinary_admin(current_user):
+        return False, "您没有权限管理项目"
+
+    if is_public:
+        return False, "普通管理员只能创建或维护绑定所属部门及下级部门的私有项目"
+
+    if not department_ids:
+        return False, "普通管理员必须为项目绑定所属部门或下级部门"
+
+    manageable_ids = get_manageable_department_ids(db, current_user) or []
+    if not is_department_scope_allowed(manageable_ids, department_ids):
+        return False, "只能选择所属部门及下级部门"
+
+    return True, ""
+
+
+def build_project_detail_response(db: Session, project: Project) -> ProjectDetailResponse:
+    """构建包含部门信息的项目响应。"""
+    from app.schema import DepartmentResponse
+
+    departments = get_project_departments(db, project.id)
+    return ProjectDetailResponse(
+        id=project.id,
+        name=project.name,
+        description=project.description,
+        is_public=project.is_public,
+        created_at=project.created_at,
+        updated_at=project.updated_at,
+        departments=[DepartmentResponse.from_orm(dept) for dept in departments]
+    )
+
+
 def check_circular_reference(db: Session, department_id: int, new_parent_id: int) -> bool:
     """检查是否存在循环引用"""
     visited = set()
@@ -177,7 +270,7 @@ def get_user_permissions(
         can_manage_roles=is_super_admin(current_user),
         can_manage_departments=is_super_admin(current_user),
         can_manage_department_members=is_super_admin(current_user) or is_ordinary_admin(current_user),
-        can_manage_org_projects=is_super_admin(current_user),
+        can_manage_org_projects=is_super_admin(current_user) or is_ordinary_admin(current_user),
     )
 
 
@@ -206,7 +299,7 @@ def get_user_department_info(db: Session, user_id: int) -> tuple[Optional[int], 
 def get_user_department_projects(
     authorization: str = Header(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """
     获取用户可见的项目列表
@@ -221,11 +314,7 @@ def get_user_department_projects(
             detail="缺少认证信息"
         )
 
-    # 获取当前用户的可访问部门（自己所属部门及其下级部门）
-    user_dept_ids = get_user_department_ids(db, current_user.id)
-
-    # 获取所有下级部门ID（用于判断非公开项目的可见性）
-    accessible_dept_ids = get_all_descendant_ids(db, user_dept_ids) if user_dept_ids else []
+    accessible_dept_ids = get_accessible_department_ids(db, current_user)
 
     try:
         # 调用project服务获取所有项目
@@ -276,7 +365,7 @@ def get_user_department_projects(
             # 非公开项目：仅项目创建者所属部门在当前用户可访问部门范围内时可见
             if owner_dept_id is None:
                 continue
-            if owner_dept_id in accessible_dept_ids:
+            if accessible_dept_ids is None or owner_dept_id in accessible_dept_ids:
                 roles = proj.get("roles", [])
                 result_projects.append(UserDepartmentProjectResponse(
                     id=proj.get("id"),
@@ -714,10 +803,30 @@ def remove_department_member(
 def create_project(
     project: ProjectCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """创建项目"""
-    from app.schema import DepartmentResponse
+    department_ids = list(dict.fromkeys(project.department_ids or []))
+
+    allowed, error_msg = validate_project_assignment_scope(
+        db,
+        current_user,
+        department_ids,
+        project.is_public,
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=error_msg
+        )
+
+    for department_id in department_ids:
+        department = db.query(Department).filter(Department.id == department_id).first()
+        if not department:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"部门不存在: {department_id}"
+            )
 
     # 创建项目
     db_project = Project(
@@ -730,13 +839,8 @@ def create_project(
     db.refresh(db_project)
 
     # 绑定部门（如果是私有项目）
-    if not project.is_public and project.department_ids:
-        for department_id in project.department_ids:
-            # 验证部门是否存在
-            department = db.query(Department).filter(Department.id == department_id).first()
-            if not department:
-                continue
-
+    if not project.is_public and department_ids:
+        for department_id in department_ids:
             # 创建项目-部门关联
             project_department = ProjectDepartment(
                 project_id=db_project.id,
@@ -745,32 +849,16 @@ def create_project(
             db.add(project_department)
 
     db.commit()
-
-    # 返回完整的项目信息（包含部门列表）
-    departments = db.query(Department).join(ProjectDepartment).filter(
-        ProjectDepartment.project_id == db_project.id
-    ).all()
-
-    return ProjectDetailResponse(
-        id=db_project.id,
-        name=db_project.name,
-        description=db_project.description,
-        is_public=db_project.is_public,
-        created_at=db_project.created_at,
-        updated_at=db_project.updated_at,
-        departments=[DepartmentResponse.from_orm(dept) for dept in departments]
-    )
+    return build_project_detail_response(db, db_project)
 
 
 @router.get("/projects/by-name/{project_name}", response_model=ProjectDetailResponse)
 def get_project_by_name(
     project_name: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """通过项目名称获取项目详情"""
-    from app.schema import DepartmentResponse
-
     # 验证项目是否存在
     project = db.query(Project).filter(Project.name == project_name).first()
     if not project:
@@ -779,50 +867,29 @@ def get_project_by_name(
             detail="项目不存在"
         )
 
-    # 获取项目绑定的部门
-    departments = db.query(Department).join(ProjectDepartment).filter(
-        ProjectDepartment.project_id == project.id
-    ).all()
+    allowed, error_msg = can_manage_org_project(db, current_user, project)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=error_msg
+        )
 
-    # 构建响应
-    response = ProjectDetailResponse(
-        id=project.id,
-        name=project.name,
-        description=project.description,
-        is_public=project.is_public,
-        created_at=project.created_at,
-        updated_at=project.updated_at,
-        departments=[DepartmentResponse.from_orm(dept) for dept in departments]
-    )
-    return response
+    return build_project_detail_response(db, project)
 
 
 @router.get("/projects", response_model=List[ProjectDetailResponse])
 def get_projects(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """获取项目列表"""
-    from app.schema import DepartmentResponse
-
     projects = db.query(Project).all()
     
-    # 为每个项目加载部门信息
     result = []
     for project in projects:
-        departments = db.query(Department).join(ProjectDepartment).filter(
-            ProjectDepartment.project_id == project.id
-        ).all()
-        
-        result.append(ProjectDetailResponse(
-            id=project.id,
-            name=project.name,
-            description=project.description,
-            is_public=project.is_public,
-            created_at=project.created_at,
-            updated_at=project.updated_at,
-            departments=[DepartmentResponse.from_orm(dept) for dept in departments]
-        ))
+        allowed, _ = can_manage_org_project(db, current_user, project)
+        if allowed:
+            result.append(build_project_detail_response(db, project))
     
     return result
 
@@ -831,7 +898,7 @@ def get_projects(
 def get_project(
     project_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """获取项目详情"""
     # 验证项目是否存在
@@ -842,22 +909,14 @@ def get_project(
             detail="项目不存在"
         )
     
-    # 获取项目绑定的部门
-    departments = db.query(Department).join(ProjectDepartment).filter(
-        ProjectDepartment.project_id == project_id
-    ).all()
-    
-    # 构建响应
-    response = ProjectDetailResponse(
-        id=project.id,
-        name=project.name,
-        description=project.description,
-        is_public=project.is_public,
-        created_at=project.created_at,
-        updated_at=project.updated_at,
-        departments=[DepartmentResponse.from_orm(dept) for dept in departments]
-    )
-    return response
+    allowed, error_msg = can_manage_org_project(db, current_user, project)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=error_msg
+        )
+
+    return build_project_detail_response(db, project)
 
 
 @router.put("/projects/{project_id}", response_model=ProjectResponse)
@@ -865,7 +924,7 @@ def update_project(
     project_id: int,
     project_update: ProjectUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """更新项目信息"""
     # 验证项目是否存在
@@ -874,6 +933,19 @@ def update_project(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="项目不存在"
+        )
+
+    allowed, error_msg = can_manage_org_project(db, current_user, db_project)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=error_msg
+        )
+
+    if is_ordinary_admin(current_user) and project_update.is_public:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="普通管理员不能将项目设置为公开项目"
         )
     
     # 更新项目信息
@@ -893,7 +965,7 @@ def update_project(
 def delete_project(
     project_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """删除项目"""
     # 验证项目是否存在
@@ -902,6 +974,13 @@ def delete_project(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="项目不存在"
+        )
+
+    allowed, error_msg = can_manage_org_project(db, current_user, project)
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=error_msg
         )
     
     # 删除项目-部门关联
