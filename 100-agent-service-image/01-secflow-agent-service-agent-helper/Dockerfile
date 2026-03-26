@@ -80,17 +80,28 @@ RUN set -eux; \
     npm install --unsafe-perm -g @anthropic-ai/claude-code; \
     npm install --unsafe-perm -g claude-a2a; \
     npm install --unsafe-perm -g @openai/codex; \
+    npm install --unsafe-perm -g opencode-ai; \
     NODE_GLOBAL_ROOT="$(npm root -g)"; \
-    if [ -f "$NODE_GLOBAL_ROOT/@anthropic-ai/claude-code/cli.js" ]; then printf '%s\n' '#!/bin/sh' "exec node \"$NODE_GLOBAL_ROOT/@anthropic-ai/claude-code/cli.js\" \"\$@\"" > /usr/local/bin/claude && chmod +x /usr/local/bin/claude; fi; \
-    if [ -f "$NODE_GLOBAL_ROOT/@openai/codex/bin/codex.js" ]; then printf '%s\n' '#!/bin/sh' "exec node \"$NODE_GLOBAL_ROOT/@openai/codex/bin/codex.js\" \"\$@\"" > /usr/local/bin/codex && chmod +x /usr/local/bin/codex; fi; \
-    if [ -f "$NODE_GLOBAL_ROOT/claude-a2a/dist/server.js" ]; then printf '%s\n' '#!/bin/sh' "exec node \"$NODE_GLOBAL_ROOT/claude-a2a/dist/server.js\" \"\$@\"" > /usr/local/bin/claude-a2a && chmod +x /usr/local/bin/claude-a2a; fi; \
+    write_wrapper() { \
+        bin_name="$1"; \
+        target="$2"; \
+        printf '%s\n' '#!/bin/sh' "exec node \"$target\" \"\$@\"" > "/usr/local/bin/${bin_name}"; \
+        chmod +x "/usr/local/bin/${bin_name}"; \
+    }; \
+    if [ -f "$NODE_GLOBAL_ROOT/@anthropic-ai/claude-code/cli.js" ]; then write_wrapper claude "$NODE_GLOBAL_ROOT/@anthropic-ai/claude-code/cli.js"; fi; \
+    if [ -f "$NODE_GLOBAL_ROOT/@openai/codex/bin/codex.js" ]; then write_wrapper codex "$NODE_GLOBAL_ROOT/@openai/codex/bin/codex.js"; fi; \
+    if [ -f "$NODE_GLOBAL_ROOT/claude-a2a/dist/server.js" ]; then write_wrapper claude-a2a "$NODE_GLOBAL_ROOT/claude-a2a/dist/server.js"; fi; \
+    if [ -f "$NODE_GLOBAL_ROOT/opencode-ai/dist/index.js" ]; then write_wrapper opencode "$NODE_GLOBAL_ROOT/opencode-ai/dist/index.js"; fi; \
     if [ -x /root/.local/bin/code-server ]; then ln -sf /root/.local/bin/code-server /usr/local/bin/code-server; fi; \
-    bash -lc "if [ -s \"$NVM_DIR/nvm.sh\" ]; then . \"$NVM_DIR/nvm.sh\" && nvm use --silent default >/dev/null 2>&1 || true; fi; for b in node npm npx code-server claude claude-a2a codex opencode; do p=\$(command -v \$b || true); if [ -n \"\$p\" ]; then ln -sf \"\$p\" \"/usr/local/bin/\$b\"; fi; done"; \
+    if command -v node >/dev/null 2>&1; then ln -sf "$(command -v node)" /usr/local/bin/node; fi; \
+    if command -v npm >/dev/null 2>&1; then ln -sf "$(command -v npm)" /usr/local/bin/npm; fi; \
+    if command -v npx >/dev/null 2>&1; then ln -sf "$(command -v npx)" /usr/local/bin/npx; fi; \
     test -x /usr/local/bin/node; \
     test -x /usr/local/bin/npm; \
     test -x /usr/local/bin/claude; \
     test -x /usr/local/bin/claude-a2a; \
     test -x /usr/local/bin/codex; \
+    test -x /usr/local/bin/opencode; \
     echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
 
 # 创建 code-server 配置目录
