@@ -85,6 +85,7 @@ RUN set -eux; \
     write_wrapper() { \
         bin_name="$1"; \
         target="$2"; \
+        rm -f "/usr/local/bin/${bin_name}"; \
         printf '%s\n' '#!/bin/sh' "exec node \"$target\" \"\$@\"" > "/usr/local/bin/${bin_name}"; \
         chmod +x "/usr/local/bin/${bin_name}"; \
     }; \
