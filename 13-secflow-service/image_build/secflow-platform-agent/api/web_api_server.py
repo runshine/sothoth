@@ -5326,7 +5326,9 @@ class WebAPIServer:
             template_type = request.form.get('type', 'auto')  # 默认为自动检测
             visibility = (request.form.get('visibility', 'shared') or 'shared').strip().lower()
             web_port_presets_raw = request.form.get('web_port_presets')
+            tags_raw = request.form.get('tags')
             web_port_presets = None
+            tags = None
             if visibility not in ('shared', 'private'):
                 return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
             if web_port_presets_raw:
@@ -5336,6 +5338,13 @@ class WebAPIServer:
                         return jsonify({'error': 'web_port_presets 必须是JSON数组'}), 400
                 except Exception:
                     return jsonify({'error': 'web_port_presets JSON格式错误'}), 400
+            if tags_raw:
+                try:
+                    tags = json.loads(tags_raw)
+                    if not isinstance(tags, list):
+                        return jsonify({'error': 'tags 必须是JSON数组'}), 400
+                except Exception:
+                    return jsonify({'error': 'tags JSON格式错误'}), 400
 
             if not name:
                 return jsonify({'error': '模板名称不能为空'}), 400
@@ -5383,7 +5392,8 @@ class WebAPIServer:
                     visibility=visibility,
                     owner_id=user_ctx.get('user_id', ''),
                     owner_name=user_ctx.get('username', ''),
-                    web_port_presets=web_port_presets
+                    web_port_presets=web_port_presets,
+                    tags=tags
                 )
 
             try:
@@ -5399,7 +5409,8 @@ class WebAPIServer:
                     'filename': filename,
                     'visibility': visibility,
                     'owner_id': user_ctx.get('user_id', ''),
-                    'owner_name': user_ctx.get('username', '')
+                    'owner_name': user_ctx.get('username', ''),
+                    'tags': tags or []
                 }), 201
             else:
                 return jsonify({'error': message}), 400
@@ -5487,10 +5498,13 @@ class WebAPIServer:
             description = data.get('description') if 'description' in data else None
             visibility = data.get('visibility') if 'visibility' in data else None
             web_port_presets = data.get('web_port_presets') if 'web_port_presets' in data else None
+            tags = data.get('tags') if 'tags' in data else None
             if visibility is not None and str(visibility).strip().lower() not in ('shared', 'private'):
                 return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
             if web_port_presets is not None and not isinstance(web_port_presets, list):
                 return jsonify({'error': 'web_port_presets 必须是数组'}), 400
+            if tags is not None and not isinstance(tags, list):
+                return jsonify({'error': 'tags 必须是数组'}), 400
 
             def _update_template_basic():
                 return self.template_manager.update_template_basic(
@@ -5499,6 +5513,7 @@ class WebAPIServer:
                     description=description,
                     visibility=visibility,
                     web_port_presets=web_port_presets,
+                    tags=tags,
                     updated_by=user_ctx.get('username', 'system')
                 )
 

@@ -287,6 +287,27 @@ class EnhancedTemplateManager:
         return list(dedup.values())[:32]
 
     @staticmethod
+    def _normalize_template_tags(tags: Any) -> List[str]:
+        if isinstance(tags, str):
+            try:
+                parsed = json.loads(tags)
+                if isinstance(parsed, list):
+                    tags = parsed
+                else:
+                    tags = [item.strip() for item in tags.split(',')]
+            except Exception:
+                tags = [item.strip() for item in tags.split(',')]
+        elif not isinstance(tags, (list, tuple, set)):
+            tags = []
+
+        normalized: List[str] = []
+        for item in tags:
+            value = str(item or '').strip()
+            if value and value not in normalized:
+                normalized.append(value)
+        return normalized[:64]
+
+    @staticmethod
     def _normalize_template_owner(template: Dict[str, Any]) -> Dict[str, Any]:
         """确保模板返回数据始终包含作者信息。"""
         item = dict(template or {})
@@ -1494,7 +1515,8 @@ class EnhancedTemplateManager:
     def create_template(self, name: str, description: str, template_type: str,
                         file_content: bytes, filename: str, created_by: str,
                         visibility: str = 'shared', owner_id: str = '', owner_name: str = '',
-                        web_port_presets: Optional[List[Dict[str, Any]]] = None) -> Tuple[bool, str]:
+                        web_port_presets: Optional[List[Dict[str, Any]]] = None,
+                        tags: Optional[List[str]] = None) -> Tuple[bool, str]:
         """创建模板（增强版，支持多种压缩格式）"""
         template_dir = None
         file_path = None
@@ -1643,6 +1665,7 @@ class EnhancedTemplateManager:
             }
             if web_port_presets is not None:
                 metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
+            metadata['tags'] = self._normalize_template_tags(tags)
 
             if template_type == 'archive' and found_yaml:
                 metadata['main_yaml_file'] = str(found_yaml.relative_to(template_dir))
@@ -1840,6 +1863,7 @@ class EnhancedTemplateManager:
                         template['metadata'] = {}
             else:
                 template['metadata'] = {}
+            template['tags'] = self._normalize_template_tags((template.get('metadata') or {}).get('tags'))
 
             # 获取文件信息
             file_path = Path(template['file_path'])
@@ -2574,6 +2598,7 @@ class EnhancedTemplateManager:
                               description: Optional[str] = None,
                               visibility: Optional[str] = None,
                               web_port_presets: Optional[List[Dict[str, Any]]] = None,
+                              tags: Optional[List[str]] = None,
                               updated_by: str = '') -> Tuple[bool, str, Optional[Dict]]:
         """更新模板基础信息（支持重命名）"""
         try:
@@ -2623,6 +2648,8 @@ class EnhancedTemplateManager:
             metadata['visibility'] = target_visibility
             if web_port_presets is not None:
                 metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
+            if tags is not None:
+                metadata['tags'] = self._normalize_template_tags(tags)
 
             table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':
@@ -2679,7 +2706,9 @@ class EnhancedTemplateManager:
                 created_by=created_by,
                 visibility=visibility,
                 owner_id=owner_id,
-                owner_name=owner_name
+                owner_name=owner_name,
+                web_port_presets=source_meta.get('web_port_presets'),
+                tags=self._normalize_template_tags(source_meta.get('tags'))
             )
         except Exception as e:
             self.logger.error(f"复制模板失败: {str(e)}", exc_info=True)
