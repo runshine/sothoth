@@ -11,13 +11,10 @@ from app.database import get_db
 from app.dependencies import get_current_super_admin, get_current_user
 from app.model import Department, DepartmentMember, Role, User, UserSession
 from app.rbac import (
-    PLATFORM_ROLE_PRIORITY,
-    attach_default_platform_role,
     ensure_platform_roles_seeded,
     filter_non_platform_roles,
-    get_platform_role_names,
     get_primary_platform_role,
-    normalize_role_name,
+    normalize_role,
     set_user_platform_role,
 )
 from app.schema import (
@@ -112,7 +109,7 @@ def create_user(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_super_admin)
 ):
-    """创建用户。新用户默认附带普通用户角色。"""
+    """创建用户。未绑定固定管理角色时即为普通用户。"""
     existing = db.query(User).filter(User.username == user_data.username).first()
     if existing:
         raise HTTPException(
@@ -135,7 +132,6 @@ def create_user(
         extra_roles = filter_non_platform_roles(roles)
 
     user.roles = list(extra_roles)
-    attach_default_platform_role(db, user)
 
     db.commit()
     db.refresh(user)
@@ -247,7 +243,7 @@ def bind_user_role(
 
     roles = _validate_role_ids_exist(db, role_data.role_ids)
     normalized_role_names = {
-        normalize_role_name(role.name)
+        normalize_role(role)
         for role in roles
     }
     if "super_admin" in normalized_role_names:
@@ -257,7 +253,6 @@ def bind_user_role(
         )
 
     user.roles = roles
-    attach_default_platform_role(db, user)
     user.updated_at = datetime.utcnow()
 
     db.commit()
@@ -286,7 +281,7 @@ def add_user_role(
         )
 
     roles = _validate_role_ids_exist(db, role_data.role_ids)
-    if any(normalize_role_name(role.name) == "super_admin" for role in roles):
+    if any(normalize_role(role) == "super_admin" for role in roles):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="超级管理员角色为保留角色，不能通过该接口直接分配"
@@ -300,7 +295,6 @@ def add_user_role(
             all_roles.append(role)
 
     user.roles = all_roles
-    attach_default_platform_role(db, user)
     user.updated_at = datetime.utcnow()
 
     db.commit()
@@ -329,7 +323,6 @@ def remove_user_role(
         )
 
     user.roles = [role for role in user.roles if role.id not in set(role_data.role_ids)]
-    attach_default_platform_role(db, user)
     user.updated_at = datetime.utcnow()
 
     db.commit()

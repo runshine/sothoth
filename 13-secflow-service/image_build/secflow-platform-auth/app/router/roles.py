@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.dependencies import get_current_super_admin
 from app.model import Role, User
-from app.rbac import PLATFORM_ROLE_DEFINITIONS, ensure_platform_roles_seeded
+from app.rbac import ensure_platform_roles_seeded, is_reserved_platform_role
 from app.schema import Message, RoleCreate, RoleResponse, RoleUpdate, RoleWithUsersResponse
 
 router = APIRouter(tags=["角色管理"])
@@ -92,7 +92,7 @@ def update_role(
             detail="角色不存在"
         )
 
-    is_reserved_role = role.name in PLATFORM_ROLE_DEFINITIONS
+    is_reserved_role = is_reserved_platform_role(role)
 
     # 检查新角色名是否被其他角色使用
     if role_data.name:
@@ -137,7 +137,7 @@ def delete_role(
             detail="角色不存在"
         )
 
-    if role.name in PLATFORM_ROLE_DEFINITIONS:
+    if is_reserved_platform_role(role):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="固定平台角色不允许删除"

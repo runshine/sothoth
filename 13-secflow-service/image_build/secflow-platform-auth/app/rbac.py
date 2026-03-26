@@ -12,6 +12,8 @@ from app.model import Role, User
 SUPER_ADMIN_ROLE = "super_admin"
 ORDINARY_ADMIN_ROLE = "ordinary_admin"
 ORDINARY_USER_ROLE = "ordinary_user"
+SUPER_ADMIN_ROLE_ID = 1
+ORDINARY_ADMIN_ROLE_ID = 0
 
 PLATFORM_ROLE_PRIORITY = {
     SUPER_ADMIN_ROLE: 3,
@@ -19,10 +21,15 @@ PLATFORM_ROLE_PRIORITY = {
     ORDINARY_USER_ROLE: 1,
 }
 
-PLATFORM_ROLE_DEFINITIONS: Dict[str, str] = {
-    SUPER_ADMIN_ROLE: "超级管理员：拥有用户权限中心与组织架构管理的完整控制权。",
-    ORDINARY_ADMIN_ROLE: "普通管理员：仅可在所属部门及下级部门范围内调整用户所属部门。",
-    ORDINARY_USER_ROLE: "普通用户：不具备用户权限中心访问权限。",
+FIXED_PLATFORM_ROLES: Dict[int, Dict[str, str]] = {
+    SUPER_ADMIN_ROLE_ID: {
+        "name": SUPER_ADMIN_ROLE,
+        "description": "超级管理员：拥有用户权限中心与组织架构管理的完整控制权。",
+    },
+    ORDINARY_ADMIN_ROLE_ID: {
+        "name": ORDINARY_ADMIN_ROLE,
+        "description": "普通管理员：仅可在所属部门及下级部门范围内调整用户所属部门。",
+    },
 }
 
 ROLE_ALIASES = {
@@ -38,6 +45,7 @@ ROLE_ALIASES = {
 }
 
 ASSIGNABLE_PLATFORM_ROLES = {ORDINARY_ADMIN_ROLE, ORDINARY_USER_ROLE}
+RESERVED_PLATFORM_ROLE_IDS = set(FIXED_PLATFORM_ROLES.keys())
 
 
 def normalize_role_name(role_name: Optional[str]) -> Optional[str]:
@@ -47,12 +55,28 @@ def normalize_role_name(role_name: Optional[str]) -> Optional[str]:
     return ROLE_ALIASES.get(role_name.strip().lower(), ROLE_ALIASES.get(role_name.strip()))
 
 
+def normalize_role(role: Optional[Role]) -> Optional[str]:
+    """Normalize a role record into the platform role namespace."""
+    if role is None:
+        return None
+    if role.id == SUPER_ADMIN_ROLE_ID:
+        return SUPER_ADMIN_ROLE
+    if role.id == ORDINARY_ADMIN_ROLE_ID:
+        return ORDINARY_ADMIN_ROLE
+    return normalize_role_name(role.name)
+
+
+def is_reserved_platform_role(role: Role) -> bool:
+    """Whether a role record is reserved for fixed platform RBAC."""
+    return role.id in RESERVED_PLATFORM_ROLE_IDS
+
+
 def get_platform_role_names(user: User) -> List[str]:
     """Return normalized platform roles attached to a user."""
     roles = {
         normalized
         for role in getattr(user, "roles", []) or []
-        for normalized in [normalize_role_name(role.name)]
+        for normalized in [normalize_role(role)]
         if normalized in PLATFORM_ROLE_PRIORITY
     }
     return sorted(roles, key=lambda name: PLATFORM_ROLE_PRIORITY[name], reverse=True)
@@ -67,7 +91,7 @@ def get_primary_platform_role(user: User) -> str:
 
 
 def is_super_admin(user: User) -> bool:
-    return get_primary_platform_role(user) == SUPER_ADMIN_ROLE or int(getattr(user, "id", 0) or 0) == 1
+    return get_primary_platform_role(user) == SUPER_ADMIN_ROLE
 
 
 def is_ordinary_admin(user: User) -> bool:
@@ -95,16 +119,30 @@ def ensure_super_admin(user: User):
 
 
 def ensure_platform_roles_seeded(db: Session):
-    """Ensure the fixed platform role records exist."""
+    """Ensure the fixed admin role records exist."""
     created = False
-    for role_name, description in PLATFORM_ROLE_DEFINITIONS.items():
-        existing = db.query(Role).filter(Role.name == role_name).first()
+    for role_id, role_meta in FIXED_PLATFORM_ROLES.items():
+        role_name = role_meta["name"]
+        description = role_meta["description"]
+
+        existing = db.query(Role).filter(Role.id == role_id).first()
         if existing:
-            if not existing.description:
+            if existing.name != role_name:
+                existing.name = role_name
+                created = True
+            if existing.description != description:
                 existing.description = description
                 created = True
             continue
-        db.add(Role(name=role_name, description=description))
+
+        existing_by_name = db.query(Role).filter(Role.name == role_name).first()
+        if existing_by_name:
+            if existing_by_name.description != description:
+                existing_by_name.description = description
+                created = True
+            continue
+
+        db.add(Role(id=role_id, name=role_name, description=description))
         created = True
 
     if created:
@@ -112,16 +150,22 @@ def ensure_platform_roles_seeded(db: Session):
 
 
 def get_or_create_platform_role(db: Session, role_name: str) -> Role:
-    """Fetch a fixed platform role, creating it if needed."""
+    """Fetch a fixed admin role, creating it if needed."""
     normalized = normalize_role_name(role_name)
-    if normalized not in PLATFORM_ROLE_DEFINITIONS:
+    target_role_id = {
+        SUPER_ADMIN_ROLE: SUPER_ADMIN_ROLE_ID,
+        ORDINARY_ADMIN_ROLE: ORDINARY_ADMIN_ROLE_ID,
+    }.get(normalized)
+    if target_role_id is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="无效的平台角色"
         )
 
     ensure_platform_roles_seeded(db)
-    role = db.query(Role).filter(Role.name == normalized).first()
+    role = db.query(Role).filter(Role.id == target_role_id).first()
+    if role is None:
+        role = db.query(Role).filter(Role.name == normalized).first()
     if role is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -131,12 +175,8 @@ def get_or_create_platform_role(db: Session, role_name: str) -> Role:
 
 
 def attach_default_platform_role(db: Session, user: User):
-    """Guarantee that a user has the default ordinary-user platform role."""
-    if any(normalize_role_name(role.name) in PLATFORM_ROLE_PRIORITY for role in user.roles):
-        return
-
-    ordinary_user_role = get_or_create_platform_role(db, ORDINARY_USER_ROLE)
-    user.roles = list(user.roles) + [ordinary_user_role]
+    """Ordinary users rely on no platform-role binding under the DB-driven scheme."""
+    return
 
 
 def set_user_platform_role(db: Session, user: User, role_name: str):
@@ -148,12 +188,16 @@ def set_user_platform_role(db: Session, user: User, role_name: str):
             detail="只允许分配普通管理员或普通用户角色"
         )
 
-    platform_role = get_or_create_platform_role(db, normalized)
     preserved_roles = [
         role for role in list(user.roles)
-        if normalize_role_name(role.name) not in PLATFORM_ROLE_PRIORITY
+        if normalize_role(role) not in PLATFORM_ROLE_PRIORITY
     ]
 
+    if normalized == ORDINARY_USER_ROLE:
+        user.roles = preserved_roles
+        return
+
+    platform_role = get_or_create_platform_role(db, normalized)
     next_roles = preserved_roles + [platform_role]
     deduped = []
     seen_ids = set()
@@ -167,4 +211,4 @@ def set_user_platform_role(db: Session, user: User, role_name: str):
 
 
 def filter_non_platform_roles(roles: Iterable[Role]) -> List[Role]:
-    return [role for role in roles if normalize_role_name(role.name) not in PLATFORM_ROLE_PRIORITY]
+    return [role for role in roles if normalize_role(role) not in PLATFORM_ROLE_PRIORITY]
