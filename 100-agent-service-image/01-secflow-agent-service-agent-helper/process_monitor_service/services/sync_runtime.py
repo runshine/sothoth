@@ -185,7 +185,7 @@ class SyncTaskService:
                     self._touch_progress(task_id, uploaded_bytes_inc=chunk_size)
                 payload = client.upload(candidate, progress_cb=on_progress)
                 sha256 = payload.get('sha256')
-                size = payload.get('size', candidate.size)
+                size = self._result_size(candidate, payload)
                 self._append_result(task_id, SyncResult(
                     item_id=candidate.relative_path,
                     source_path=candidate.host_path,
@@ -317,6 +317,21 @@ class SyncTaskService:
         refs.extend(candidate.pid_refs)
         refs.extend({'path': item, 'source_type': 'path'} for item in candidate.path_refs)
         return refs
+
+    def _result_size(self, candidate: SyncFileCandidate, payload: dict[str, Any]) -> int | None:
+        if candidate.entry_type != 'file':
+            return None
+        if candidate.size is not None:
+            return candidate.size
+        payload_size = payload.get('size')
+        if isinstance(payload_size, int):
+            return payload_size
+        if isinstance(payload_size, str) and payload_size.isdigit():
+            return int(payload_size)
+        try:
+            return os.path.getsize(candidate.real_path)
+        except OSError:
+            return None
 
     def _load_events(self) -> dict[str, list[dict[str, Any]]]:
         items: dict[str, list[dict[str, Any]]] = {}

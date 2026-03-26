@@ -15,6 +15,35 @@ from process_monitor_service.config import settings
 
 
 class ProcessService:
+    _MAX_TEXT_BYTES = 512 * 1024
+    _MAX_BINARY_BYTES = 256 * 1024
+    _PROC_TEXT_ENTRIES = ('cmdline', 'status', 'maps', 'mounts', 'limits', 'io')
+    _PROC_NET_ENTRIES = (
+        'arp',
+        'dev',
+        'if_inet6',
+        'igmp',
+        'igmp6',
+        'ipv6_route',
+        'netstat',
+        'packet',
+        'protocols',
+        'psched',
+        'ptype',
+        'raw',
+        'raw6',
+        'route',
+        'snmp',
+        'snmp6',
+        'sockstat',
+        'sockstat6',
+        'tcp',
+        'tcp6',
+        'udp',
+        'udp6',
+        'unix',
+    )
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._latest: dict[str, Any] = {'ts': 0, 'summary': {}}
@@ -77,9 +106,10 @@ class ProcessService:
         proc = psutil.Process(pid)
         procfs_root = self._proc_root / str(pid)
         return {
+            'pid': pid,
             'process': self._rich_info(proc),
             'procfs_root': str(procfs_root),
-            'procfs': self._walk_procfs(procfs_root),
+            'proc_entries': self._collect_proc_entries(procfs_root),
         }
 
     def send_signal(self, *, pids: list[int], signal_value: str | int | None = None, force: bool = False) -> dict[str, Any]:
@@ -170,7 +200,18 @@ class ProcessService:
         return Path('/proc')
 
     def _basic_info(self, proc: psutil.Process) -> dict[str, Any]:
-        info = proc.info
+        info = getattr(proc, 'info', None)
+        if info is None:
+            info = {
+                'ppid': self._safe_proc_value(proc, lambda current: current.ppid()),
+                'name': self._safe_proc_value(proc, lambda current: current.name(), ''),
+                'username': self._safe_proc_value(proc, lambda current: current.username(), ''),
+                'status': self._safe_proc_value(proc, lambda current: current.status(), 'unknown'),
+                'cmdline': self._safe_proc_value(proc, lambda current: current.cmdline(), []),
+                'cwd': self._safe_proc_value(proc, lambda current: current.cwd()),
+                'exe': self._safe_proc_value(proc, lambda current: current.exe()),
+                'create_time': self._safe_proc_value(proc, lambda current: current.create_time()),
+            }
         return {
             'pid': proc.pid,
             'ppid': info.get('ppid'),
@@ -187,23 +228,29 @@ class ProcessService:
         with proc.oneshot():
             result = self._basic_info(proc)
             result.update({
-                'uids': tuple(proc.uids()) if hasattr(proc, 'uids') else None,
-                'gids': tuple(proc.gids()) if hasattr(proc, 'gids') else None,
-                'terminal': proc.terminal(),
-                'num_threads': proc.num_threads(),
-                'threads': [thread._asdict() for thread in proc.threads()],
-                'open_files': [item._asdict() for item in proc.open_files()],
-                'connections': [item._asdict() for item in proc.net_connections(kind='all')],
-                'memory_info': proc.memory_info()._asdict(),
-                'memory_percent': proc.memory_percent(),
-                'cpu_times': proc.cpu_times()._asdict(),
-                'cpu_percent': proc.cpu_percent(interval=0.0),
-                'io_counters': proc.io_counters()._asdict() if proc.io_counters() else None,
-                'num_fds': proc.num_fds() if hasattr(proc, 'num_fds') else None,
-                'environ': proc.environ(),
-                'children': [child.pid for child in proc.children(recursive=True)],
+                'uids': self._safe_proc_value(proc, lambda current: tuple(current.uids()) if hasattr(current, 'uids') else None),
+                'gids': self._safe_proc_value(proc, lambda current: tuple(current.gids()) if hasattr(current, 'gids') else None),
+                'terminal': self._safe_proc_value(proc, lambda current: current.terminal()),
+                'num_threads': self._safe_proc_value(proc, lambda current: current.num_threads()),
+                'threads': self._safe_proc_value(proc, lambda current: [thread._asdict() for thread in current.threads()], []),
+                'open_files': self._safe_proc_value(proc, lambda current: [item._asdict() for item in current.open_files()], []),
+                'connections': self._safe_proc_value(proc, lambda current: [item._asdict() for item in current.net_connections(kind='all')], []),
+                'memory_info': self._safe_proc_value(proc, lambda current: current.memory_info()._asdict()),
+                'memory_percent': self._safe_proc_value(proc, lambda current: current.memory_percent()),
+                'cpu_times': self._safe_proc_value(proc, lambda current: current.cpu_times()._asdict()),
+                'cpu_percent': self._safe_proc_value(proc, lambda current: current.cpu_percent(interval=0.0)),
+                'io_counters': self._safe_proc_value(proc, lambda current: current.io_counters()._asdict() if current.io_counters() else None),
+                'num_fds': self._safe_proc_value(proc, lambda current: current.num_fds() if hasattr(current, 'num_fds') else None),
+                'environ': self._safe_proc_value(proc, lambda current: current.environ(), {}),
+                'children': self._safe_proc_value(proc, lambda current: [child.pid for child in current.children(recursive=True)], []),
             })
         return result
+
+    def _safe_proc_value(self, proc: psutil.Process, getter, default=None):
+        try:
+            return getter(proc)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            return default
 
     def _resolve_signal(self, signal_value: str | int | None, force: bool) -> int:
         if force:
@@ -221,10 +268,19 @@ class ProcessService:
             raise ValueError(f'unsupported_signal: {signal_value}')
         return int(getattr(signal, normalized))
 
-    def _walk_procfs(self, root: Path) -> dict[str, Any]:
+    def _collect_proc_entries(self, root: Path) -> dict[str, Any]:
         if not root.exists():
             raise FileNotFoundError(f'procfs_not_found: {root}')
-        return self._read_path(root)
+        entries: dict[str, Any] = {}
+        for name in self._PROC_TEXT_ENTRIES:
+            entries[name] = self._read_proc_file(root / name, parse_environ=False)
+        entries['environ'] = self._read_proc_file(root / 'environ', parse_environ=True)
+        entries['fd'] = self._read_fd_entries(root / 'fd')
+        entries['fdinfo'] = self._read_fdinfo_entries(root / 'fdinfo')
+        entries['net'] = self._read_net_entries(root / 'net')
+        entries['task'] = self._read_task_summary(root / 'task')
+        entries['map_files'] = self._read_dir_summary(root / 'map_files')
+        return entries
 
     def _read_path(self, path: Path) -> dict[str, Any]:
         try:
@@ -269,3 +325,115 @@ class ProcessService:
             'size': len(data),
             **content,
         }
+
+    def _read_proc_file(self, path: Path, *, parse_environ: bool = False) -> dict[str, Any]:
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return {'path': str(path), 'type': 'missing'}
+        except (PermissionError, OSError) as exc:
+            return {'path': str(path), 'type': 'file', 'error': str(exc)}
+        if parse_environ:
+            return {
+                'path': str(path),
+                'type': 'file',
+                'size': len(data),
+                'items': self._parse_environ_bytes(data),
+            }
+        if len(data) > self._MAX_TEXT_BYTES:
+            data = data[:self._MAX_TEXT_BYTES]
+            truncated = True
+        else:
+            truncated = False
+        try:
+            text = data.decode('utf-8')
+            return {
+                'path': str(path),
+                'type': 'file',
+                'size': len(data),
+                'encoding': 'utf-8',
+                'text': text,
+                'truncated': truncated,
+            }
+        except UnicodeDecodeError:
+            if len(data) > self._MAX_BINARY_BYTES:
+                data = data[:self._MAX_BINARY_BYTES]
+                truncated = True
+            return {
+                'path': str(path),
+                'type': 'file',
+                'size': len(data),
+                'encoding': 'base64',
+                'base64': base64.b64encode(data).decode('ascii'),
+                'truncated': truncated,
+            }
+
+    def _read_fd_entries(self, fd_dir: Path) -> dict[str, Any]:
+        if not fd_dir.exists():
+            return {'path': str(fd_dir), 'type': 'missing'}
+        entries: dict[str, Any] = {}
+        try:
+            for child in sorted(fd_dir.iterdir(), key=lambda item: item.name):
+                try:
+                    target = os.readlink(child)
+                    entries[child.name] = {'target': target}
+                except OSError as exc:
+                    entries[child.name] = {'error': str(exc)}
+        except (PermissionError, OSError) as exc:
+            return {'path': str(fd_dir), 'type': 'dir', 'error': str(exc)}
+        return {'path': str(fd_dir), 'type': 'dir', 'children': entries}
+
+    def _read_fdinfo_entries(self, fdinfo_dir: Path) -> dict[str, Any]:
+        if not fdinfo_dir.exists():
+            return {'path': str(fdinfo_dir), 'type': 'missing'}
+        entries: dict[str, Any] = {}
+        try:
+            for child in sorted(fdinfo_dir.iterdir(), key=lambda item: item.name):
+                entries[child.name] = self._read_proc_file(child, parse_environ=False)
+        except (PermissionError, OSError) as exc:
+            return {'path': str(fdinfo_dir), 'type': 'dir', 'error': str(exc)}
+        return {'path': str(fdinfo_dir), 'type': 'dir', 'children': entries}
+
+    def _read_net_entries(self, net_dir: Path) -> dict[str, Any]:
+        if not net_dir.exists():
+            return {'path': str(net_dir), 'type': 'missing'}
+        entries: dict[str, Any] = {}
+        for name in self._PROC_NET_ENTRIES:
+            child = net_dir / name
+            if child.exists():
+                entries[name] = self._read_proc_file(child, parse_environ=False)
+        return {'path': str(net_dir), 'type': 'dir', 'children': entries}
+
+    def _read_task_summary(self, task_dir: Path) -> dict[str, Any]:
+        if not task_dir.exists():
+            return {'path': str(task_dir), 'type': 'missing'}
+        items: list[dict[str, Any]] = []
+        try:
+            for child in sorted(task_dir.iterdir(), key=lambda item: item.name):
+                stat_entry = self._read_proc_file(child / 'status', parse_environ=False)
+                items.append({'tid': child.name, 'status': stat_entry})
+        except (PermissionError, OSError) as exc:
+            return {'path': str(task_dir), 'type': 'dir', 'error': str(exc)}
+        return {'path': str(task_dir), 'type': 'dir', 'items': items}
+
+    def _read_dir_summary(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {'path': str(path), 'type': 'missing'}
+        try:
+            names = [child.name for child in sorted(path.iterdir(), key=lambda item: item.name)]
+        except (PermissionError, OSError) as exc:
+            return {'path': str(path), 'type': 'dir', 'error': str(exc)}
+        return {'path': str(path), 'type': 'dir', 'count': len(names), 'items': names}
+
+    def _parse_environ_bytes(self, data: bytes) -> dict[str, str]:
+        items: dict[str, str] = {}
+        for raw in data.split(b'\x00'):
+            if not raw:
+                continue
+            text = raw.decode('utf-8', errors='replace')
+            if '=' in text:
+                key, value = text.split('=', 1)
+                items[key] = value
+            else:
+                items[text] = ''
+        return items

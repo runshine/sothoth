@@ -13,17 +13,38 @@ PROCESS_MONITOR_PORT="${PROCESS_MONITOR_PORT:-20004}"
 TTYD_PID=""
 CODE_SERVER_PID=""
 PROCESS_MONITOR_PID=""
+GUNICORN_PID=""
 
 cleanup_children() {
-    for pid in "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID"; do
+    for pid in "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
+            kill -TERM "$pid" 2>/dev/null || true
         fi
+    done
+
+    sleep 1
+
+    for pid in "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+        wait "$pid" 2>/dev/null || true
     done
 }
 
 trap cleanup_children EXIT INT TERM
+
+ensure_port_available() {
+    local port="$1"
+    local owner=""
+
+    owner="$(ss -ltnp 2>/dev/null | awk -v needle=":${port}" '$4 ~ needle {print $0}' | head -n 1)"
+    if [ -n "$owner" ]; then
+        echo "ERROR: port ${port} is already in use: ${owner}" >&2
+        return 1
+    fi
+    return 0
+}
 
 resolve_node_global_bin() {
     local bin_name="$1"
@@ -88,6 +109,11 @@ echo "----------------------"
 mount | grep -E "/host|/proc|/sys|/dev" || true
 echo "----------------------"
 
+ensure_port_available "${REST_PORT}" || exit 1
+ensure_port_available "${TTYD_PORT}" || exit 1
+ensure_port_available "${CODE_SERVER_PORT}" || exit 1
+ensure_port_available "${PROCESS_MONITOR_PORT}" || exit 1
+
 ttyd -p "${TTYD_PORT}" -w / -W /bin/bash >> /tmp/ttyd.log 2>&1 &
 TTYD_PID=$!
 
@@ -135,11 +161,19 @@ fi
 
 echo "Starting Agent AI service on port ${REST_PORT}..."
 export PYTHONPATH="${WORKDIR}:${PYTHONPATH}"
-exec gunicorn \
+gunicorn \
     --chdir ${WORKDIR} \
     --bind 0.0.0.0:${REST_PORT} \
     --workers 1 \
     --timeout ${TIMEOUT} \
     --access-logfile - \
     --error-logfile - \
-    agent_ai_service.app:app
+    agent_ai_service.app:app &
+GUNICORN_PID=$!
+
+wait -n "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID"
+exit_code=$?
+
+echo "A helper process exited unexpectedly, shutting down remaining processes..." >&2
+cleanup_children
+exit "${exit_code}"
