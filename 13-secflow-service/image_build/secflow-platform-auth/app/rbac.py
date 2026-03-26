@@ -13,7 +13,8 @@ SUPER_ADMIN_ROLE = "super_admin"
 ORDINARY_ADMIN_ROLE = "ordinary_admin"
 ORDINARY_USER_ROLE = "ordinary_user"
 SUPER_ADMIN_ROLE_ID = 1
-ORDINARY_ADMIN_ROLE_ID = 0
+ORDINARY_ADMIN_ROLE_ID = 2
+BOOTSTRAP_SUPER_ADMIN_USER_ID = 1
 
 PLATFORM_ROLE_PRIORITY = {
     SUPER_ADMIN_ROLE: 3,
@@ -91,7 +92,10 @@ def get_primary_platform_role(user: User) -> str:
 
 
 def is_super_admin(user: User) -> bool:
-    return get_primary_platform_role(user) == SUPER_ADMIN_ROLE
+    return (
+        int(getattr(user, "id", 0) or 0) == BOOTSTRAP_SUPER_ADMIN_USER_ID
+        or get_primary_platform_role(user) == SUPER_ADMIN_ROLE
+    )
 
 
 def is_ordinary_admin(user: User) -> bool:
@@ -146,6 +150,12 @@ def ensure_platform_roles_seeded(db: Session):
         created = True
 
     if created:
+        db.commit()
+
+    bootstrap_user = db.query(User).filter(User.id == BOOTSTRAP_SUPER_ADMIN_USER_ID).first()
+    bootstrap_role = db.query(Role).filter(Role.id == SUPER_ADMIN_ROLE_ID).first()
+    if bootstrap_user and bootstrap_role and all(role.id != bootstrap_role.id for role in bootstrap_user.roles):
+        bootstrap_user.roles = list(bootstrap_user.roles) + [bootstrap_role]
         db.commit()
 
 
