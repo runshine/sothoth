@@ -10,7 +10,9 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Integer,
     String,
+    Table,
     Text,
     create_engine,
     select,
@@ -20,6 +22,49 @@ from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 from app.config import get_config
 
 Base = declarative_base()
+
+
+secflow_user_user_role = Table(
+    "secflow_user_user_role",
+    Base.metadata,
+    Column("user_id", Integer, ForeignKey("secflow_user_users.id"), primary_key=True),
+    Column("role_id", Integer, ForeignKey("secflow_user_role.id"), primary_key=True),
+)
+
+
+class Role(Base):
+    """用户角色模型。"""
+    __tablename__ = "secflow_user_role"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), unique=True, index=True, nullable=False)
+    description = Column(String(500))
+
+
+class Department(Base):
+    """部门模型。"""
+    __tablename__ = "secflow_org_department"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(100), nullable=False)
+    description = Column(String(500))
+    parent_id = Column(Integer, ForeignKey("secflow_org_department.id"), nullable=True)
+
+    parent = relationship("Department", remote_side=[id], backref="children")
+
+
+class DepartmentMember(Base):
+    """部门成员模型。"""
+    __tablename__ = "secflow_org_department_member"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    department_id = Column(Integer, ForeignKey("secflow_org_department.id"), nullable=False, index=True)
+    role = Column(String(20), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    department = relationship("Department", backref="memberships")
 
 
 class Project(Base):
@@ -34,11 +79,13 @@ class Project(Base):
     k8s_namespace = Column(String(128))  # 关联的K8S Namespace名称
     status = Column(String(32), default="active")  # active, deleted
     is_public = Column(Boolean, default=False)  # 是否公开，False为私有，True为公开
+    department_id = Column(Integer, ForeignKey("secflow_org_department.id"), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # 关系
     role_binds = relationship("ProjectRoleBind", back_populates="project", lazy="joined")
+    department = relationship("Department", lazy="joined")
 
     def to_dict(self) -> dict:
         """转换为字典"""
@@ -51,6 +98,7 @@ class Project(Base):
             "k8s_namespace": self.k8s_namespace,
             "status": self.status,
             "is_public": self.is_public,
+            "department_id": self.department_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

@@ -16,6 +16,7 @@ class ProjectCreate(BaseModel):
     description: Optional[str] = Field(None, description="项目描述")
     k8s_namespace: Optional[str] = Field(None, description="关联的K8S Namespace名称")
     is_public: bool = Field(default=False, description="是否公开，False为私有，True为公开")
+    department_id: Optional[int] = Field(None, description="项目归属部门ID")
 
 
 class ProjectUpdate(BaseModel):
@@ -24,6 +25,7 @@ class ProjectUpdate(BaseModel):
     description: Optional[str] = Field(None, description="项目描述")
     k8s_namespace: Optional[str] = Field(None, description="关联的K8S Namespace名称")
     is_public: Optional[bool] = Field(None, description="是否公开，False为私有，True为公开")
+    department_id: Optional[int] = Field(None, description="项目归属部门ID")
 
 
 class ProjectRoleBindCreate(BaseModel):
@@ -49,6 +51,9 @@ class ProjectResponse(BaseModel):
     k8s_namespace: Optional[str]
     status: str
     is_public: bool = Field(default=False, description="是否公开，False为私有，True为公开")
+    department_id: Optional[int] = None
+    department_name: Optional[str] = None
+    can_manage: bool = False
     created_at: datetime
     updated_at: datetime
     roles: List[ProjectRoleBindResponse] = []
