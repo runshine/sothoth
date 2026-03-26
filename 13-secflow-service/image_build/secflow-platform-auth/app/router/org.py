@@ -305,8 +305,8 @@ def get_user_department_projects(
     获取用户可见的项目列表
 
     - 公开项目：所有人可见
-    - 非公开项目：仅项目创建者所属部门在当前用户可访问部门范围内时可见
-    - 返回这些项目的信息，包括创建者所属部门信息
+    - 非公开项目：仅项目归属部门在当前用户可访问部门范围内时可见
+    - 返回这些项目的信息，包括归属部门信息
     """
     if authorization is None:
         raise HTTPException(
@@ -332,8 +332,10 @@ def get_user_department_projects(
     for proj in projects_data:
         is_public = proj.get("is_public", False)
         owner_id_str = proj.get("owner_id")
+        project_department_id = proj.get("department_id")
+        project_department_name = proj.get("department_name")
+        can_manage = bool(proj.get("can_manage", False))
 
-        # 获取项目创建者的部门信息
         owner_dept_id = None
         owner_dept_name = None
         if owner_id_str:
@@ -355,6 +357,9 @@ def get_user_department_projects(
                 k8s_namespace=proj.get("k8s_namespace"),
                 status=proj.get("status"),
                 is_public=is_public,
+                department_id=project_department_id,
+                department_name=project_department_name,
+                can_manage=can_manage,
                 created_at=proj.get("created_at"),
                 updated_at=proj.get("updated_at"),
                 roles=roles,
@@ -362,10 +367,13 @@ def get_user_department_projects(
                 owner_department_name=owner_dept_name
             ))
         else:
-            # 非公开项目：仅项目创建者所属部门在当前用户可访问部门范围内时可见
-            if owner_dept_id is None:
+            # 非公开项目：仅项目归属部门在当前用户可访问部门范围内时可见
+            effective_department_id = project_department_id or owner_dept_id
+            effective_department_name = project_department_name or owner_dept_name
+
+            if effective_department_id is None:
                 continue
-            if accessible_dept_ids is None or owner_dept_id in accessible_dept_ids:
+            if accessible_dept_ids is None or effective_department_id in accessible_dept_ids:
                 roles = proj.get("roles", [])
                 result_projects.append(UserDepartmentProjectResponse(
                     id=proj.get("id"),
@@ -376,6 +384,9 @@ def get_user_department_projects(
                     k8s_namespace=proj.get("k8s_namespace"),
                     status=proj.get("status"),
                     is_public=is_public,
+                    department_id=effective_department_id,
+                    department_name=effective_department_name,
+                    can_manage=can_manage,
                     created_at=proj.get("created_at"),
                     updated_at=proj.get("updated_at"),
                     roles=roles,

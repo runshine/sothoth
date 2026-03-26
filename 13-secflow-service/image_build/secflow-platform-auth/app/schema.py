@@ -353,6 +353,9 @@ class ProjectServiceResponse(BaseModel):
     k8s_namespace: Optional[str]
     status: str
     is_public: bool = False
+    department_id: Optional[int] = None
+    department_name: Optional[str] = None
+    can_manage: bool = False
     created_at: datetime
     updated_at: datetime
     roles: List[ProjectRoleBindResponse] = []
@@ -381,6 +384,9 @@ class UserDepartmentProjectResponse(BaseModel):
     k8s_namespace: Optional[str]
     status: str
     is_public: bool
+    department_id: Optional[int] = None
+    department_name: Optional[str] = None
+    can_manage: bool = False
     created_at: datetime
     updated_at: datetime
     roles: List[ProjectRoleBindResponse] = []
