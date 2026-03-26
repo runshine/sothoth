@@ -1,19 +1,22 @@
 """认证路由"""
 
-from typing import List, Optional, Dict, Any
-from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, status, Header, Request
-from sqlalchemy.orm import Session
 import secrets
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
+from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies import get_current_super_admin
 from app.auth import create_access_token, decode_access_token, verify_machine_token, create_human_token, create_human_token_with_session, get_password_hash
 from app.config import config
+from app.model import Department, DepartmentMember, User, MachineToken, Role
+from app.rbac import get_primary_platform_role
 from app.schema import (
     LoginRequest, TokenResponse, MachineTokenRequest, MachineTokenCreate,
     MachineTokenResponse, MachineTokenDetailResponse, Message, UserResponse, UserCreate
 )
-from app.model import User, MachineToken, Role
 
 router = APIRouter(tags=["认证"])
 
@@ -38,8 +41,17 @@ def _extract_bearer_token(authorization: Optional[str]) -> str:
         raise credentials_exception
 
 
-def _build_human_user_payload(user: User) -> Dict[str, Any]:
+def _build_human_user_payload(user: User, db: Optional[Session] = None) -> Dict[str, Any]:
     """构建统一的人类用户响应结构。"""
+    membership = None
+    department = None
+    if db is not None:
+        membership = db.query(DepartmentMember).filter(
+            DepartmentMember.user_id == user.id
+        ).order_by(DepartmentMember.id.asc()).first()
+        if membership:
+            department = db.query(Department).filter(Department.id == membership.department_id).first()
+
     return {
         "id": user.id,
         "username": user.username,
@@ -47,6 +59,10 @@ def _build_human_user_payload(user: User) -> Dict[str, Any]:
         "created_at": user.created_at.isoformat() if user.created_at else None,
         "updated_at": user.updated_at.isoformat() if user.updated_at else None,
         "role": [r.name for r in user.roles] if getattr(user, "roles", None) else [],
+        "platform_role": get_primary_platform_role(user),
+        "department_member_id": membership.id if membership else None,
+        "department_id": membership.department_id if membership else None,
+        "department_name": department.name if department else None,
         "token_type": "human",
     }
 
@@ -159,7 +175,10 @@ def verify_token(db: Session = Depends(get_db)):
 
 
 @router.get("/machine-tokens", response_model=List[MachineTokenResponse])
-def list_machine_tokens(db: Session = Depends(get_db)):
+def list_machine_tokens(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
+):
     """
     获取所有机机Token列表
 
@@ -182,7 +201,11 @@ def list_machine_tokens(db: Session = Depends(get_db)):
 
 
 @router.delete("/machine-tokens/{token_id}", response_model=Message)
-def delete_machine_token(token_id: int, db: Session = Depends(get_db)):
+def delete_machine_token(
+    token_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
+):
     """
     删除机机Token
     """
@@ -238,7 +261,11 @@ def validate_human_token(
     # 获取用户信息
     user_id = payload.get("sub")
     if user_id is None:
-        raise credentials_exception
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token缺少用户标识",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     user = db.query(User).filter(User.id == int(user_id)).first()
     if user is None:
@@ -255,7 +282,7 @@ def validate_human_token(
         )
 
     # 返回用户信息
-    return user
+    return _build_human_user_payload(user, db)
 
 
 @router.post("/validate-machine-token", response_model=MachineTokenResponse)
@@ -321,7 +348,7 @@ def validate_token(
                 detail="用户不存在或已被禁用",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return _build_human_user_payload(user)
+        return _build_human_user_payload(user, db)
 
     # 2) 机机Token（数据库）
     db_token = verify_machine_token(db, token)

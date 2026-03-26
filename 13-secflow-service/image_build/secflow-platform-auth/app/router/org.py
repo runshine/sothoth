@@ -2,12 +2,19 @@
 
 import logging
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Header
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_current_user
-from app.model import User, Department, DepartmentMember, Project, ProjectDepartment
+from app.dependencies import get_current_super_admin, get_current_user_management_user
+from app.model import Department, DepartmentMember, Project, ProjectDepartment, User
+from app.rbac import (
+    can_access_user_management,
+    get_primary_platform_role,
+    is_ordinary_admin,
+    is_super_admin,
+)
 from app.schema import (
     DepartmentCreate, DepartmentUpdate, DepartmentResponse,
     DepartmentMemberCreate, DepartmentMemberUpdate, DepartmentMemberResponse,
@@ -33,8 +40,7 @@ def log_access_denied(user: User, resource_type: str, resource_id: int, reason: 
 
 def is_admin(user: User) -> bool:
     """检查用户是否为管理员"""
-    role_names = user.get_all_role_names()
-    return "admin" in role_names or "管理员" in role_names
+    return is_super_admin(user)
 
 
 def get_user_department_ids(db: Session, user_id: int) -> List[int]:
@@ -65,149 +71,63 @@ def get_all_descendant_ids(db: Session, department_ids: List[int]) -> List[int]:
 
 
 def get_accessible_department_ids(db: Session, user: User) -> List[int]:
-    """获取用户可访问的所有部门ID（用户所属部门及其下级部门）- 用于查看权限"""
-    if is_admin(user):
+    """获取用户可访问的所有部门ID。"""
+    if is_super_admin(user):
         return None
-    
+
+    if not is_ordinary_admin(user):
+        return []
+
     user_dept_ids = get_user_department_ids(db, user.id)
     if not user_dept_ids:
         return []
-    
+
     return get_all_descendant_ids(db, user_dept_ids)
 
 
 def get_manageable_department_ids(db: Session, user: User) -> List[int]:
-    """获取用户可管理的部门ID（用户作为组长或副组长的部门及其下级部门）- 用于部门成员管理权限"""
-    if is_admin(user):
+    """获取用户可管理的部门ID。普通管理员仅能管理所属部门及下级部门。"""
+    if is_super_admin(user):
         return None
-    
-    leader_memberships = db.query(DepartmentMember.department_id).filter(
-        DepartmentMember.user_id == user.id,
-        DepartmentMember.role.in_(["leader", "vice_leader"])
-    ).all()
-    leader_dept_ids = [m.department_id for m in leader_memberships]
-    
-    if not leader_dept_ids:
+
+    if not is_ordinary_admin(user):
         return []
-    
-    return get_all_descendant_ids(db, leader_dept_ids)
+
+    user_dept_ids = get_user_department_ids(db, user.id)
+    if not user_dept_ids:
+        return []
+
+    return get_all_descendant_ids(db, user_dept_ids)
 
 
 def get_department_structure_manageable_ids(db: Session, user: User) -> List[int]:
-    """获取用户可管理部门结构的部门ID（仅组长）- 用于部门结构管理权限"""
-    if is_admin(user):
+    """仅超级管理员可以管理部门结构。"""
+    if is_super_admin(user):
         return None
-    
-    leader_memberships = db.query(DepartmentMember.department_id).filter(
-        DepartmentMember.user_id == user.id,
-        DepartmentMember.role == "leader"
-    ).all()
-    leader_dept_ids = [m.department_id for m in leader_memberships]
-    
-    if not leader_dept_ids:
-        return []
-    
-    return get_all_descendant_ids(db, leader_dept_ids)
+    return []
 
 
-def is_department_leader(db: Session, user: User, department_id: int) -> bool:
-    """检查用户是否为指定部门的组长或副组长，或上级部门的组长"""
-    if is_admin(user):
-        return True
-    
-    # 检查用户是否是目标部门的组长或副组长
-    member = db.query(DepartmentMember).filter(
-        DepartmentMember.user_id == user.id,
-        DepartmentMember.department_id == department_id,
-        DepartmentMember.role.in_(["leader", "vice_leader"])
-    ).first()
-    if member:
-        return True
-    
-    # 检查用户是否是上级部门的组长
-    manageable_ids = get_manageable_department_ids(db, user)
-    if manageable_ids is not None and department_id in manageable_ids:
-        return True
-    
-    return False
-
-
-def get_user_role_in_department(db: Session, user: User, department_id: int) -> str | None:
-    """获取用户在指定部门的角色（包括上级部门组长的情况）"""
-    # 首先检查用户是否是目标部门的直接成员
-    member = db.query(DepartmentMember).filter(
-        DepartmentMember.user_id == user.id,
-        DepartmentMember.department_id == department_id
-    ).first()
-    if member:
-        return member.role
-    
-    # 检查用户是否是上级部门的组长
-    # 获取用户作为组长的所有部门
-    leader_memberships = db.query(DepartmentMember.department_id).filter(
-        DepartmentMember.user_id == user.id,
-        DepartmentMember.role == "leader"
-    ).all()
-    leader_dept_ids = [m.department_id for m in leader_memberships]
-    
-    if leader_dept_ids:
-        # 获取这些部门的所有下级部门
-        descendant_ids = get_all_descendant_ids(db, leader_dept_ids)
-        if department_id in descendant_ids:
-            return "leader"  # 上级部门组长视为组长权限
-    
-    return None
-
-
-def can_manage_member(db: Session, current_user: User, target_member: DepartmentMember) -> tuple[bool, str]:
-    """检查用户是否可以管理目标成员"""
-    if is_admin(current_user):
+def can_move_member_between_departments(
+    db: Session,
+    current_user: User,
+    target_member: DepartmentMember,
+    new_department_id: int,
+) -> tuple[bool, str]:
+    """普通管理员仅能移动其部门树内的普通成员。"""
+    if is_super_admin(current_user):
         return True, ""
-    
-    current_user_role = get_user_role_in_department(db, current_user, target_member.department_id)
-    if not current_user_role:
-        return False, "您不是该部门的成员"
-    
-    role_hierarchy = {"leader": 3, "vice_leader": 2, "member": 1}
-    current_level = role_hierarchy.get(current_user_role, 0)
-    target_level = role_hierarchy.get(target_member.role, 0)
-    
-    if current_level <= target_level:
-        role_names = {"leader": "组长", "vice_leader": "副组长", "member": "成员"}
-        target_role_name = role_names.get(target_member.role, "该成员")
-        return False, f"您无权管理{target_role_name}"
-    
+
+    manageable_ids = get_manageable_department_ids(db, current_user) or []
+    if target_member.department_id not in manageable_ids:
+        return False, "无权调整该用户的所属部门"
+
+    if new_department_id not in manageable_ids:
+        return False, "目标部门不在可管理范围内"
+
+    if target_member.role != "member":
+        return False, "普通管理员只能调整普通成员的所属部门"
+
     return True, ""
-
-
-def can_edit_role(db: Session, current_user: User, department_id: int) -> bool:
-    """检查用户是否可以编辑角色（管理员或组长，包括上级部门组长）"""
-    if is_admin(current_user):
-        return True
-    
-    # 检查用户是否是目标部门的直接组长
-    member = db.query(DepartmentMember).filter(
-        DepartmentMember.user_id == current_user.id,
-        DepartmentMember.department_id == department_id,
-        DepartmentMember.role == "leader"
-    ).first()
-    if member:
-        return True
-    
-    # 检查用户是否是上级部门的组长
-    leader_memberships = db.query(DepartmentMember.department_id).filter(
-        DepartmentMember.user_id == current_user.id,
-        DepartmentMember.role == "leader"
-    ).all()
-    leader_dept_ids = [m.department_id for m in leader_memberships]
-    
-    if leader_dept_ids:
-        # 获取这些部门的所有下级部门
-        descendant_ids = get_all_descendant_ids(db, leader_dept_ids)
-        if department_id in descendant_ids:
-            return True
-    
-    return False
 
 
 def check_circular_reference(db: Session, department_id: int, new_parent_id: int) -> bool:
@@ -235,7 +155,7 @@ def check_circular_reference(db: Session, department_id: int, new_parent_id: int
 @router.get("/user-permissions", response_model=UserPermissionInfo)
 def get_user_permissions(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """获取当前用户的权限信息"""
     is_user_admin = is_admin(current_user)
@@ -243,14 +163,21 @@ def get_user_permissions(
     manageable_dept_ids = get_manageable_department_ids(db, current_user)
     dept_structure_ids = get_department_structure_manageable_ids(db, current_user)
     role_names = current_user.get_all_role_names()
-    
+
     return UserPermissionInfo(
         user_id=current_user.id,
         is_admin=is_user_admin,
+        platform_role=get_primary_platform_role(current_user),
         department_ids=user_dept_ids,
         manageable_department_ids=manageable_dept_ids if manageable_dept_ids is not None else [],
         department_structure_manageable_ids=dept_structure_ids if dept_structure_ids is not None else [],
-        role_names=role_names
+        role_names=role_names,
+        can_access_user_management=can_access_user_management(current_user),
+        can_manage_users=is_super_admin(current_user),
+        can_manage_roles=is_super_admin(current_user),
+        can_manage_departments=is_super_admin(current_user),
+        can_manage_department_members=is_super_admin(current_user) or is_ordinary_admin(current_user),
+        can_manage_org_projects=is_super_admin(current_user),
     )
 
 
@@ -279,7 +206,7 @@ def get_user_department_info(db: Session, user_id: int) -> tuple[Optional[int], 
 def get_user_department_projects(
     authorization: str = Header(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     获取用户可见的项目列表
@@ -377,9 +304,9 @@ def get_user_department_projects(
 def create_department(
     department: DepartmentCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
-    """创建部门（管理员或组长可用）"""
+    """创建部门。仅超级管理员可用。"""
     # 验证父部门是否存在
     if department.parent_id is not None and department.parent_id != 0:
         parent_dept = db.query(Department).filter(Department.id == department.parent_id).first()
@@ -389,21 +316,8 @@ def create_department(
                 detail="父部门不存在"
             )
         
-        # 检查用户是否有权限在父部门下创建子部门
-        manageable_ids = get_department_structure_manageable_ids(db, current_user)
-        if manageable_ids is not None and department.parent_id not in manageable_ids:
-            log_access_denied(current_user, "部门", department.parent_id, "用户无权在该部门下创建子部门")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="您没有权限在该部门下创建子部门"
-            )
     else:
-        # 创建顶级部门需要管理员权限
-        if not is_admin(current_user):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="只有管理员可以创建顶级部门"
-            )
+        department.parent_id = None
     
     # 创建部门
     db_department = Department(
@@ -423,7 +337,7 @@ def create_department(
 @router.get("/departments", response_model=List[DepartmentResponse])
 def get_departments(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """获取部门列表（仅返回用户可访问的部门）"""
     accessible_ids = get_accessible_department_ids(db, current_user)
@@ -440,7 +354,7 @@ def get_departments(
 def get_department(
     department_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """获取部门详情"""
     accessible_ids = get_accessible_department_ids(db, current_user)
@@ -466,9 +380,9 @@ def update_department(
     department_id: int,
     department: DepartmentUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
-    """更新部门信息（管理员或组长可用）"""
+    """更新部门信息。仅超级管理员可用。"""
     # 验证部门是否存在
     db_department = db.query(Department).filter(Department.id == department_id).first()
     if not db_department:
@@ -478,14 +392,6 @@ def update_department(
         )
     
     # 检查用户是否有权限管理该部门
-    manageable_ids = get_department_structure_manageable_ids(db, current_user)
-    if manageable_ids is not None and department_id not in manageable_ids:
-        log_access_denied(current_user, "部门", department_id, "用户无权更新该部门信息")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="您没有权限更新该部门信息"
-        )
-    
     # 验证父部门是否存在
     if department.parent_id is not None:
         # 不能将自己设置为父部门
@@ -527,24 +433,15 @@ def update_department(
 def delete_department(
     department_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
-    """删除部门（管理员或组长可用）"""
+    """删除部门。仅超级管理员可用。"""
     # 验证部门是否存在
     db_department = db.query(Department).filter(Department.id == department_id).first()
     if not db_department:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="部门不存在"
-        )
-    
-    # 检查用户是否有权限管理该部门
-    manageable_ids = get_department_structure_manageable_ids(db, current_user)
-    if manageable_ids is not None and department_id not in manageable_ids:
-        log_access_denied(current_user, "部门", department_id, "用户无权删除该部门")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="您没有权限删除该部门"
         )
     
     # 检查是否有子部门
@@ -573,31 +470,15 @@ def delete_department(
 def add_department_member(
     member: DepartmentMemberCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
-    """添加部门成员（管理员或部门组长/副组长可用）"""
+    """添加部门成员。仅超级管理员可用。"""
     # 验证部门是否存在
     department = db.query(Department).filter(Department.id == member.department_id).first()
     if not department:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="部门不存在"
-        )
-    
-    # 验证权限：管理员或部门组长/副组长
-    if not is_department_leader(db, current_user, member.department_id):
-        log_access_denied(current_user, "部门成员", member.department_id, "用户无权添加该部门成员")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员或部门组长/副组长可以添加部门成员"
-        )
-    
-    # 副组长只能添加普通成员
-    user_role = get_user_role_in_department(db, current_user, member.department_id)
-    if user_role == "vice_leader" and member.role in ["leader", "vice_leader"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="副组长只能添加普通成员"
         )
     
     # 验证用户是否存在
@@ -661,7 +542,7 @@ def add_department_member(
 def get_department_members(
     department_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user_management_user)
 ):
     """获取部门成员列表"""
     accessible_ids = get_accessible_department_ids(db, current_user)
@@ -708,9 +589,9 @@ def update_department_member(
     member_id: int,
     member_update: DepartmentMemberUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user_management_user)
 ):
-    """更新部门成员角色（仅管理员或组长可用，副组长无权编辑角色）"""
+    """更新部门成员。普通管理员仅能在自己部门树内移动普通成员。"""
     # 验证成员是否存在
     db_member = db.query(DepartmentMember).filter(DepartmentMember.id == member_id).first()
     if not db_member:
@@ -719,28 +600,54 @@ def update_department_member(
             detail="部门成员不存在"
         )
     
-    # 验证权限：仅管理员或组长可以编辑角色（副组长无权）
-    if not can_edit_role(db, current_user, db_member.department_id):
-        log_access_denied(current_user, "部门成员角色", db_member.department_id, "副组长无权编辑角色")
+    if member_update.role is None and member_update.department_id is None:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="只有管理员或组长可以编辑成员角色，副组长无权执行此操作"
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="未提供需要更新的字段"
         )
-    
-    # 验证是否已经有组长
-    if member_update.role == "leader":
-        existing_leader = db.query(DepartmentMember).filter(
-            DepartmentMember.department_id == db_member.department_id,
-            DepartmentMember.role == "leader"
-        ).first()
-        if existing_leader and existing_leader.id != member_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="该部门已经有组长"
-            )
-    
+
     old_role = db_member.role
-    # 更新角色
+
+    if member_update.role is not None:
+        if not is_super_admin(current_user):
+            log_access_denied(current_user, "部门成员角色", db_member.department_id, "普通管理员无权编辑部门成员角色")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="只有超级管理员可以编辑部门成员角色"
+            )
+        if member_update.role == "leader":
+            existing_leader = db.query(DepartmentMember).filter(
+                DepartmentMember.department_id == db_member.department_id,
+                DepartmentMember.role == "leader"
+            ).first()
+            if existing_leader and existing_leader.id != member_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="该部门已经有组长"
+                )
+
+    if member_update.department_id is not None:
+        target_department = db.query(Department).filter(
+            Department.id == member_update.department_id
+        ).first()
+        if not target_department:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="目标部门不存在"
+            )
+
+        allowed, error_msg = can_move_member_between_departments(
+            db, current_user, db_member, member_update.department_id
+        )
+        if not allowed:
+            log_access_denied(current_user, "部门成员归属", db_member.department_id, error_msg)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=error_msg
+            )
+
+        db_member.department_id = member_update.department_id
+
     if member_update.role is not None:
         db_member.role = member_update.role
     
@@ -770,9 +677,9 @@ def update_department_member(
 def remove_department_member(
     member_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
-    """移除部门成员（管理员或部门组长/副组长可用，副组长只能移除普通成员）"""
+    """移除部门成员。仅超级管理员可用。"""
     # 验证成员是否存在
     db_member = db.query(DepartmentMember).filter(DepartmentMember.id == member_id).first()
     if not db_member:
@@ -786,15 +693,6 @@ def remove_department_member(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="不能移除自己作为部门成员"
-        )
-    
-    # 验证权限：检查是否可以管理该成员
-    can_manage, error_msg = can_manage_member(db, current_user, db_member)
-    if not can_manage:
-        log_access_denied(current_user, "部门成员", db_member.department_id, error_msg)
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=error_msg
         )
     
     # 获取信息用于日志
@@ -816,7 +714,7 @@ def remove_department_member(
 def create_project(
     project: ProjectCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
     """创建项目"""
     from app.schema import DepartmentResponse
@@ -837,15 +735,6 @@ def create_project(
             # 验证部门是否存在
             department = db.query(Department).filter(Department.id == department_id).first()
             if not department:
-                continue
-
-            # 验证用户是否为部门组长
-            leader = db.query(DepartmentMember).filter(
-                DepartmentMember.user_id == current_user.id,
-                DepartmentMember.department_id == department_id,
-                DepartmentMember.role == "leader"
-            ).first()
-            if not leader:
                 continue
 
             # 创建项目-部门关联
@@ -877,7 +766,7 @@ def create_project(
 def get_project_by_name(
     project_name: str,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
     """通过项目名称获取项目详情"""
     from app.schema import DepartmentResponse
@@ -889,26 +778,6 @@ def get_project_by_name(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="项目不存在"
         )
-
-    # 验证用户是否有权限访问
-    if not project.is_public:
-        # 检查用户是否属于绑定部门
-        user_departments = db.query(DepartmentMember.department_id).filter(
-            DepartmentMember.user_id == current_user.id
-        ).all()
-        department_ids = [dept.department_id for dept in user_departments]
-
-        project_departments = db.query(ProjectDepartment.department_id).filter(
-            ProjectDepartment.project_id == project.id
-        ).all()
-        project_dept_ids = [dept.department_id for dept in project_departments]
-
-        has_access = any(dept_id in department_ids for dept_id in project_dept_ids)
-        if not has_access:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="无权访问该项目"
-            )
 
     # 获取项目绑定的部门
     departments = db.query(Department).join(ProjectDepartment).filter(
@@ -931,27 +800,12 @@ def get_project_by_name(
 @router.get("/projects", response_model=List[ProjectDetailResponse])
 def get_projects(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
     """获取项目列表"""
     from app.schema import DepartmentResponse
-    
-    # 获取公开项目
-    public_projects = db.query(Project).filter(Project.is_public == True).all()
-    
-    # 获取用户所在部门的私有项目
-    user_departments = db.query(DepartmentMember.department_id).filter(
-        DepartmentMember.user_id == current_user.id
-    ).all()
-    department_ids = [dept.department_id for dept in user_departments]
-    
-    private_projects = db.query(Project).join(ProjectDepartment).filter(
-        Project.is_public == False,
-        ProjectDepartment.department_id.in_(department_ids)
-    ).all()
-    
-    # 合并项目列表
-    projects = list(set(public_projects + private_projects))
+
+    projects = db.query(Project).all()
     
     # 为每个项目加载部门信息
     result = []
@@ -977,7 +831,7 @@ def get_projects(
 def get_project(
     project_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
     """获取项目详情"""
     # 验证项目是否存在
@@ -987,26 +841,6 @@ def get_project(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="项目不存在"
         )
-    
-    # 验证用户是否有权限访问
-    if not project.is_public:
-        # 检查用户是否属于绑定部门
-        user_departments = db.query(DepartmentMember.department_id).filter(
-            DepartmentMember.user_id == current_user.id
-        ).all()
-        department_ids = [dept.department_id for dept in user_departments]
-        
-        project_departments = db.query(ProjectDepartment.department_id).filter(
-            ProjectDepartment.project_id == project_id
-        ).all()
-        project_dept_ids = [dept.department_id for dept in project_departments]
-        
-        has_access = any(dept_id in department_ids for dept_id in project_dept_ids)
-        if not has_access:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="无权访问该项目"
-            )
     
     # 获取项目绑定的部门
     departments = db.query(Department).join(ProjectDepartment).filter(
@@ -1031,7 +865,7 @@ def update_project(
     project_id: int,
     project_update: ProjectUpdate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
     """更新项目信息"""
     # 验证项目是否存在
@@ -1041,27 +875,6 @@ def update_project(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="项目不存在"
         )
-    
-    # 验证用户是否有权限更新
-    if not db_project.is_public:
-        # 检查用户是否属于绑定部门的组长
-        user_departments = db.query(DepartmentMember).filter(
-            DepartmentMember.user_id == current_user.id,
-            DepartmentMember.role == "leader"
-        ).all()
-        user_dept_ids = [dept.department_id for dept in user_departments]
-        
-        project_departments = db.query(ProjectDepartment.department_id).filter(
-            ProjectDepartment.project_id == project_id
-        ).all()
-        project_dept_ids = [dept.department_id for dept in project_departments]
-        
-        has_access = any(dept_id in user_dept_ids for dept_id in project_dept_ids)
-        if not has_access:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="无权更新该项目"
-            )
     
     # 更新项目信息
     if project_update.name is not None:
@@ -1080,7 +893,7 @@ def update_project(
 def delete_project(
     project_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_super_admin)
 ):
     """删除项目"""
     # 验证项目是否存在
@@ -1090,27 +903,6 @@ def delete_project(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="项目不存在"
         )
-    
-    # 验证用户是否有权限删除
-    if not project.is_public:
-        # 检查用户是否属于绑定部门的组长
-        user_departments = db.query(DepartmentMember).filter(
-            DepartmentMember.user_id == current_user.id,
-            DepartmentMember.role == "leader"
-        ).all()
-        user_dept_ids = [dept.department_id for dept in user_departments]
-        
-        project_departments = db.query(ProjectDepartment.department_id).filter(
-            ProjectDepartment.project_id == project_id
-        ).all()
-        project_dept_ids = [dept.department_id for dept in project_departments]
-        
-        has_access = any(dept_id in user_dept_ids for dept_id in project_dept_ids)
-        if not has_access:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="无权删除该项目"
-            )
     
     # 删除项目-部门关联
     db.query(ProjectDepartment).filter(ProjectDepartment.project_id == project_id).delete()

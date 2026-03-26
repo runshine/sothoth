@@ -181,6 +181,7 @@ def create_app():
     from app.database import init_db, verify_tables_exist, SessionLocal  # noqa: F401
     from app.model import MachineToken  # noqa: F401
     from app.config import config
+    from app.rbac import ensure_platform_roles_seeded
 
     logger.info(f"[Database] Initializing database...")
     # 初始化数据库，创建所有表
@@ -195,6 +196,13 @@ def create_app():
         raise
 
     logger.info(f"[Database] Database initialization completed")
+
+    def ensure_platform_roles_ready():
+        db = SessionLocal()
+        try:
+            ensure_platform_roles_seeded(db)
+        finally:
+            db.close()
 
     def ensure_machine_token_seeded():
         """
@@ -259,6 +267,7 @@ def create_app():
         finally:
             db.close()
 
+    ensure_platform_roles_ready()
     ensure_machine_token_seeded()
 
     # 创建FastAPI应用，使用 lifespan

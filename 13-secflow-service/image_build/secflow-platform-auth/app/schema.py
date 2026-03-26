@@ -32,6 +32,10 @@ class UserResponse(UserBase):
     created_at: datetime
     updated_at: datetime
     role: List[str] = []
+    platform_role: str = "ordinary_user"
+    department_member_id: Optional[int] = None
+    department_id: Optional[int] = None
+    department_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -188,6 +192,18 @@ class ChangeOwnPasswordRequest(BaseModel):
     new_password: str
 
 
+class PlatformRoleUpdateRequest(BaseModel):
+    """更新平台角色请求"""
+    role_name: str
+
+
+class PlatformRoleResponse(BaseModel):
+    """平台角色响应"""
+    user_id: int
+    platform_role: str
+    role_names: List[str]
+
+
 # ============ 通用模式 ============
 
 class Message(BaseModel):
@@ -246,6 +262,7 @@ class DepartmentMemberCreate(DepartmentMemberBase):
 class DepartmentMemberUpdate(BaseModel):
     """更新部门成员模式"""
     role: Optional[str] = None
+    department_id: Optional[int] = None
 
 
 class DepartmentMemberResponse(BaseModel):
@@ -301,10 +318,17 @@ class UserPermissionInfo(BaseModel):
     """用户权限信息响应模式"""
     user_id: int
     is_admin: bool
+    platform_role: str
     department_ids: List[int]
     manageable_department_ids: List[int]
     department_structure_manageable_ids: List[int]
     role_names: List[str]
+    can_access_user_management: bool
+    can_manage_users: bool
+    can_manage_roles: bool
+    can_manage_departments: bool
+    can_manage_department_members: bool
+    can_manage_org_projects: bool
 
 
 # ============ Project服务相关模式 ============

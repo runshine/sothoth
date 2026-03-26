@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.auth import decode_access_token, verify_machine_token
 from app.model import User
+from app.rbac import can_access_user_management, is_super_admin
 
 # Token类型
 TOKEN_TYPE_HUMAN = "human"
@@ -134,3 +135,27 @@ async def get_optional_user(
         return await get_current_user(authorization, db)
     except HTTPException:
         return None
+
+
+async def get_current_user_management_user(
+        current_user: User = Depends(get_current_user)
+) -> User:
+    """Require access to the user-management center."""
+    if not can_access_user_management(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="当前用户无权访问用户权限中心"
+        )
+    return current_user
+
+
+async def get_current_super_admin(
+        current_user: User = Depends(get_current_user)
+) -> User:
+    """Require the platform super-admin role."""
+    if not is_super_admin(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="只有超级管理员可以执行此操作"
+        )
+    return current_user

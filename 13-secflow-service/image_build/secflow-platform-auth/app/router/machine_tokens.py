@@ -6,19 +6,20 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.dependencies import get_machine_client
+from app.dependencies import get_current_super_admin
 from app.schema import (
     MachineTokenCreate, MachineTokenResponse, MachineTokenUpdate,
     MachineTokenDetailResponse, Message
 )
-from app.model import MachineToken
+from app.model import MachineToken, User
 
 router = APIRouter(tags=["机机Token管理"], prefix="/machine-tokens")
 
 
 @router.get("", response_model=List[MachineTokenResponse])
 def list_machine_tokens(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     获取机机Token列表
@@ -44,7 +45,8 @@ def list_machine_tokens(
 @router.get("/{token_id}", response_model=MachineTokenDetailResponse)
 def get_machine_token(
     token_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     获取机机Token详情
@@ -88,7 +90,8 @@ def get_machine_token(
 @router.post("", response_model=MachineTokenDetailResponse, status_code=status.HTTP_201_CREATED)
 def create_machine_token(
     token_data: MachineTokenCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     创建机机Token
@@ -130,7 +133,8 @@ def create_machine_token(
 def update_machine_token(
     token_id: int,
     token_data: MachineTokenUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     更新机机Token
@@ -167,7 +171,8 @@ def update_machine_token(
 @router.delete("/{token_id}", response_model=Message)
 def delete_machine_token(
     token_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     删除机机Token
@@ -190,7 +195,8 @@ def delete_machine_token(
 @router.post("/{token_id}/enable", response_model=Message)
 def enable_machine_token(
     token_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     启用机机Token
@@ -214,7 +220,8 @@ def enable_machine_token(
 @router.post("/{token_id}/disable", response_model=Message)
 def disable_machine_token(
     token_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     禁用机机Token
@@ -238,7 +245,8 @@ def disable_machine_token(
 @router.post("/{token_id}/regenerate", response_model=MachineTokenDetailResponse)
 def regenerate_machine_token(
     token_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
 ):
     """
     重新生成机机Token
