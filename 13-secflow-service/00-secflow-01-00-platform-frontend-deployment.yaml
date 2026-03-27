@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-frontend
-        image: ghcr.io/runshine/secflow-frontend:20260322  # 包含kubectl命令
+        image: ghcr.io/runshine/secflow-frontend:20260327  # 包含kubectl命令
         imagePullPolicy: Always
         ports:
           - containerPort: 8080
