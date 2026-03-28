@@ -90,6 +90,7 @@ class MenuManager:
     def __init__(
         self,
         heartbeat_timeout: float = 30.0,
+        service_retention_seconds: float = 3600.0,
         default_health_interval: float = 30.0,
         default_health_timeout: float = 2.0,
         health_failure_threshold: int = 2,
@@ -102,6 +103,7 @@ class MenuManager:
     ):
         self.services: Dict[str, ServiceInfo] = {}
         self.heartbeat_timeout = heartbeat_timeout
+        self.service_retention_seconds = max(service_retention_seconds, heartbeat_timeout)
         self.default_health_interval = default_health_interval
         self.default_health_timeout = default_health_timeout
         self.health_failure_threshold = health_failure_threshold
@@ -647,12 +649,27 @@ class MenuManager:
         """清理过期服务"""
         current_time = time.time()
         services = self._get_all_services()
-        expired = [sid for sid, s in services.items()
-                  if current_time - s.last_heartbeat > self.heartbeat_timeout]
-        for sid in expired:
+        removed = 0
+        retained = 0
+        for sid, service in services.items():
+            heartbeat_age = current_time - service.last_heartbeat
+            if heartbeat_age <= self.heartbeat_timeout:
+                continue
+
+            if heartbeat_age <= self.service_retention_seconds:
+                service.last_health_status = HealthStatus.STALE
+                service.last_health_error = "heartbeat timeout"
+                self._save_service(service)
+                retained += 1
+                continue
+
             self._delete_service(sid)
             logger.info(f"Service expired and removed: {sid}")
-        return len(expired)
+            removed += 1
+
+        if retained > 0:
+            logger.info("Marked %s expired services as stale", retained)
+        return removed
 
 
 # 创建Flask应用
@@ -918,6 +935,7 @@ def create_app(config: Dict = None) -> Flask:
     if config:
         menu_manager = MenuManager(
             heartbeat_timeout=config.get('heartbeat_timeout', 30.0),
+            service_retention_seconds=config.get('service_retention_seconds', 3600.0),
             default_health_interval=config.get('health_check_interval', 30.0),
             default_health_timeout=config.get('health_check_timeout', 2.0),
             health_failure_threshold=config.get('health_failure_threshold', 2),
@@ -979,6 +997,7 @@ if __name__ == '__main__':
     # 初始化菜单管理器
     menu_manager = MenuManager(
         heartbeat_timeout=config.get('heartbeat_timeout', 30.0),
+        service_retention_seconds=config.get('service_retention_seconds', 3600.0),
         default_health_interval=config.get('health_check_interval', 30.0),
         default_health_timeout=config.get('health_check_timeout', 2.0),
         health_failure_threshold=config.get('health_failure_threshold', 2),
