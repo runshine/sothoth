@@ -390,6 +390,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/configcenter
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-configcenter
+            port:
+              number: 80
+
       - path: /api/resource
         pathType: Prefix
         backend:

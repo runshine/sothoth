@@ -1,0 +1,49 @@
+# SecFlow Config Center Configuration
+database:
+  host: "mysql.sothothv2-ns.svc.cluster.local"
+  port: 3306
+  username: "secflow"
+  password: "Huawei12#$"
+  name: "secflow"
+  table_prefix: "secflow_"
+  pool_size: 10
+  max_overflow: 20
+auth_service:
+  host: "secflow-platform-auth"
+  port: 80
+  validate_token_path: "/api/auth/validate-token"
+  service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+  timeout: 10
+  token_cache_enabled: true
+  token_cache_ttl_minutes: 15
+registry:
+  enabled: true
+  menu_service_url: "http://secflow-platform-menu"
+  service_id: "secflow-platform-configcenter"
+  service_name: "配置中心服务"
+  host: "secflow-platform-configcenter"
+  port: 80
+  maturity: "开发中"
+  description: "统一管理平台级动态系统配置项"
+  api_prefix: "/api/configcenter"
+  menu:
+    id: "config-center-llm"
+    path: "/config-center/llm"
+    icon: "settings"
+    order: 1
+    level1:
+      name: "配置中心"
+      name_en: "Config Center"
+    level2:
+      name: "LLM 对接配置"
+      name_en: "LLM Integration"
+    level3:
+      name: null
+      name_en: null
+app:
+  host: "0.0.0.0"
+  port: 8080
+  debug: false
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

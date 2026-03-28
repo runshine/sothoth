@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-platform-configcenter
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  selector:
+    name: "secflow-platform-configcenter"
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: secflow-platform-configcenter
