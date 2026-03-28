@@ -240,6 +240,77 @@ class OutputPVCDeleteResponse(BaseModel):
     deleted_pvc: Optional[str] = None
 
 
+class PvcBrowserBreadcrumbItem(BaseModel):
+    """PVC 浏览器面包屑。"""
+    path: str
+    name: str
+
+
+class PvcBrowserNode(BaseModel):
+    """PVC 浏览器节点。"""
+    path: str
+    name: str
+    node_type: str
+    size: Optional[int] = None
+    updated_at: Optional[int] = None
+    content_type: Optional[str] = None
+    has_children: bool = False
+    children: List["PvcBrowserNode"] = Field(default_factory=list)
+
+
+class PvcBrowserRootResponse(BaseModel):
+    """PVC 浏览器根节点响应。"""
+    resource_id: int
+    pvc_name: str
+    total: int
+    items: List[PvcBrowserNode]
+
+
+class PvcBrowserChildrenResponse(BaseModel):
+    """PVC 浏览器目录子节点响应。"""
+    resource_id: int
+    pvc_name: str
+    current_path: str
+    breadcrumbs: List[PvcBrowserBreadcrumbItem]
+    directories: List[PvcBrowserNode]
+    files: List[PvcBrowserNode]
+
+
+class PvcBrowserFileResponse(BaseModel):
+    """PVC 浏览器文件读取响应。"""
+    path: str
+    filename: str
+    size: int
+    content_type: Optional[str] = None
+    truncated: bool = False
+    base64: str
+
+
+class PvcBrowserUploadResponse(BaseModel):
+    """PVC 浏览器上传响应。"""
+    message: str
+    path: str
+    size: int
+
+
+class OutputPVCBrowserCreateDirectoryRequest(BaseModel):
+    """创建 PVC 浏览器目录。"""
+    path: str = Field(default="/", description="父目录路径")
+    name: str = Field(..., description="目录名称")
+
+
+class OutputPVCBrowserRenameRequest(BaseModel):
+    """重命名 PVC 浏览器节点。"""
+    path: str = Field(..., description="当前节点路径")
+    target_name: str = Field(..., description="目标名称")
+
+
+class OutputPVCBrowserMoveRequest(BaseModel):
+    """移动 PVC 浏览器节点。"""
+    path: str = Field(..., description="当前节点路径")
+    target_path: str = Field(..., description="目标目录路径")
+
+
 # ============ 通用响应Schema ============
 
 class ErrorResponse(BaseModel):
@@ -258,4 +329,6 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     version: str
-    dependencies: dict
+
+
+PvcBrowserNode.model_rebuild()

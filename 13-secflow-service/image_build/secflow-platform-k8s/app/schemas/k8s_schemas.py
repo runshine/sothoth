@@ -97,8 +97,17 @@ class PodLogResponse(BaseModel):
 class PodExecRequest(BaseModel):
     """Pod执行请求"""
     container: Optional[str] = None
-    command: str
+    command: List[str]
+    stdin: Optional[str] = None
     timeout: int = 30
+    tty: bool = False
+
+
+class PodExecResponse(BaseModel):
+    """Pod执行响应"""
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = 0
 
 
 class PodCreateRequest(BaseModel):

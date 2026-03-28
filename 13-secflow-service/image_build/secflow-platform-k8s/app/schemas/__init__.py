@@ -18,6 +18,7 @@ from app.schemas.k8s_schemas import (
     PodLogRequest,
     PodLogResponse,
     PodExecRequest,
+    PodExecResponse,
     # Service
     ServicePort,
     ServiceInfo,
@@ -90,6 +91,7 @@ __all__ = [
     "PodLogRequest",
     "PodLogResponse",
     "PodExecRequest",
+    "PodExecResponse",
     "ServicePort",
     "ServiceInfo",
     "ServiceListResponse",

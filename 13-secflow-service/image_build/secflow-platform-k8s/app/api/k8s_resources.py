@@ -37,6 +37,8 @@ from app.schemas import (
     PodListResponse,
     PodInfo,
     PodLogResponse,
+    PodExecRequest,
+    PodExecResponse,
     ServiceListResponse,
     ServiceInfo,
     ServiceCreateRequest,
@@ -478,6 +480,30 @@ async def get_pod_metrics(
     k8s = get_k8s_service()
     metrics = k8s.get_pod_metrics(namespace, pod_name)
     return metrics
+
+
+@router.post("/pods/{pod_name}/exec", response_model=PodExecResponse, summary="执行Pod命令")
+async def exec_pod_command(
+    pod_name: str,
+    request: PodExecRequest,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """执行一次非交互式 Pod 命令。"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+
+    k8s = get_k8s_service()
+    result = k8s.exec_pod_command(
+        namespace=namespace,
+        pod_name=pod_name,
+        command=request.command,
+        container=request.container,
+        stdin_data=request.stdin,
+        timeout=request.timeout,
+        tty=request.tty,
+    )
+    return PodExecResponse(**result)
 
 
 # ==================== Service 管理 ====================
@@ -2060,4 +2086,3 @@ async def websocket_attach_pod(
 
         ws_manager.disconnect(client_id)
         logger.info(f"Attach连接关闭: {client_id}")
-

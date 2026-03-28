@@ -3,12 +3,13 @@
 import os
 import uuid
 import asyncio
+import base64
 import aiofiles
 import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, UploadFile, File, Form, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.models.database import (
@@ -21,11 +22,14 @@ from app.schemas import (
     TaskResponse, TaskListResponse, TaskLogResponse,
     PVCListResponse, PVCInfoResponse,
     OutputPVCCreateRequest, OutputPVCCreateResponse, OutputPVCDeleteResponse,
+    PvcBrowserRootResponse, PvcBrowserChildrenResponse, PvcBrowserFileResponse, PvcBrowserUploadResponse,
+    OutputPVCBrowserCreateDirectoryRequest, OutputPVCBrowserRenameRequest, OutputPVCBrowserMoveRequest,
     TokenPayload
 )
 from app.services.auth import get_auth_service
 from app.services.project import get_project_service
 from app.services.k8s import get_k8s_service
+from app.services.pvc_browser import get_pvc_browser_service
 from app.tasks.manager import get_task_manager
 from app.tasks.worker import create_upload_extract_task, create_delete_resource_task
 from app.main import get_config
@@ -105,6 +109,25 @@ def get_upload_dir() -> str:
     config = get_config()
     app_config = config.get("app", {})
     return app_config.get("upload_dir", "/data/uploads")
+
+
+def _resolve_output_pvc_resource(db: Session, resource_id: int) -> Resource:
+    resource = db.query(Resource).filter(
+        Resource.id == resource_id,
+        Resource.resource_type == ResourceType.OUTPUT_PVC
+    ).first()
+    if not resource:
+        raise HTTPException(status_code=404, detail="Output PVC resource not found")
+    return resource
+
+
+def _resolve_resource_project_id(resource: Resource) -> str:
+    pvc_namespace = resource.pvc_namespace
+    if pvc_namespace and pvc_namespace.startswith("secflow-"):
+        return pvc_namespace.replace("secflow-", "", 1)
+    if resource.projects:
+        return resource.projects[0].id
+    raise HTTPException(status_code=500, detail="Cannot determine project for PVC")
 
 
 # ============ 资源上传接口（文件上传模式） ============
@@ -791,13 +814,7 @@ async def delete_output_pvc(
     - 如果未被使用，创建异步删除任务在后台执行
     - 通过任务API查询删除进度
     """
-    resource = db.query(Resource).filter(
-        Resource.id == resource_id,
-        Resource.resource_type == ResourceType.OUTPUT_PVC
-    ).first()
-
-    if not resource:
-        raise HTTPException(status_code=404, detail="Output PVC resource not found")
+    resource = _resolve_output_pvc_resource(db, resource_id)
 
     current_user, token = user_and_token
 
@@ -809,14 +826,10 @@ async def delete_output_pvc(
 
     # 确定项目ID
     pvc_namespace = resource.pvc_namespace
-    if pvc_namespace and pvc_namespace.startswith("secflow-"):
-        project_id = pvc_namespace.replace("secflow-", "", 1)
-    elif resource.projects:
-        project_id = resource.projects[0].id
-    else:
-        raise HTTPException(status_code=500, detail="Cannot determine project for PVC")
+    project_id = _resolve_resource_project_id(resource)
 
     k8s_service = get_k8s_service()
+    get_pvc_browser_service().cleanup_browser_pod(project_id)
 
     # 检查PVC是否被使用
     if resource.pvc_name:
@@ -872,13 +885,7 @@ async def get_output_pvc(
     - 返回PVC详细信息
     - 包含PVC使用状态
     """
-    resource = db.query(Resource).filter(
-        Resource.id == resource_id,
-        Resource.resource_type == ResourceType.OUTPUT_PVC
-    ).first()
-
-    if not resource:
-        raise HTTPException(status_code=404, detail="Output PVC resource not found")
+    resource = _resolve_output_pvc_resource(db, resource_id)
 
     current_user, token = user_and_token
 
@@ -892,12 +899,7 @@ async def get_output_pvc(
 
     # 确定项目ID
     pvc_namespace = resource.pvc_namespace
-    if pvc_namespace and pvc_namespace.startswith("secflow-"):
-        project_id = pvc_namespace.replace("secflow-", "", 1)
-    elif resource.projects:
-        project_id = resource.projects[0].id
-    else:
-        project_id = None
+    project_id = _resolve_resource_project_id(resource)
 
     # 获取PVC状态
     pvc_status = None
@@ -924,3 +926,153 @@ async def get_output_pvc(
         "created_at": resource.created_at,
         "updated_at": resource.updated_at
     }
+
+
+async def _load_output_pvc_with_access(
+    resource_id: int,
+    user_and_token: tuple[TokenPayload, str],
+    db: Session,
+) -> tuple[Resource, str, str]:
+    resource = _resolve_output_pvc_resource(db, resource_id)
+    current_user, token = user_and_token
+    if resource.projects:
+        has_access, _ = await validate_project_access(resource.projects[0].id, token)
+        if not has_access:
+            raise HTTPException(status_code=403, detail="No permission to access this project")
+    project_id = _resolve_resource_project_id(resource)
+    if not resource.pvc_name:
+        raise HTTPException(status_code=409, detail="Output PVC is missing pvc_name")
+    return resource, project_id, token
+
+
+@router.get("/output-pvc/{resource_id}/browser/root", response_model=PvcBrowserRootResponse)
+async def get_output_pvc_browser_root(
+    resource_id: int,
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    payload = browser.list_root(project_id, resource.pvc_name, resource.id)
+    payload["pvc_name"] = resource.pvc_name
+    return PvcBrowserRootResponse(**payload)
+
+
+@router.get("/output-pvc/{resource_id}/browser/tree", response_model=PvcBrowserRootResponse)
+async def get_output_pvc_browser_tree(
+    resource_id: int,
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    payload = browser.list_tree(project_id, resource.pvc_name, resource.id)
+    payload["pvc_name"] = resource.pvc_name
+    return PvcBrowserRootResponse(**payload)
+
+
+@router.get("/output-pvc/{resource_id}/browser/children", response_model=PvcBrowserChildrenResponse)
+async def get_output_pvc_browser_children(
+    resource_id: int,
+    path: str = Query("/", description="目录路径"),
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    payload = browser.list_children(project_id, resource.pvc_name, resource.id, path)
+    payload["pvc_name"] = resource.pvc_name
+    return PvcBrowserChildrenResponse(**payload)
+
+
+@router.get("/output-pvc/{resource_id}/browser/file", response_model=PvcBrowserFileResponse)
+async def get_output_pvc_browser_file(
+    resource_id: int,
+    path: str = Query(..., description="文件路径"),
+    max_bytes: int = Query(1048576, ge=0, le=10485760, description="预览最大字节数"),
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    payload = browser.read_file(project_id, resource.pvc_name, path, max_bytes=max_bytes)
+    return PvcBrowserFileResponse(**payload)
+
+
+@router.get("/output-pvc/{resource_id}/browser/download")
+async def download_output_pvc_browser_file(
+    resource_id: int,
+    path: str = Query(..., description="文件路径"),
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    payload = browser.read_file(project_id, resource.pvc_name, path, max_bytes=0)
+    raw = base64.b64decode(payload.get("base64") or "")
+    media_type = payload.get("content_type") or "application/octet-stream"
+    filename = payload.get("filename") or "download.bin"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(iter([raw]), media_type=media_type, headers=headers)
+
+
+@router.post("/output-pvc/{resource_id}/browser/upload", response_model=PvcBrowserUploadResponse)
+async def upload_output_pvc_browser_file(
+    resource_id: int,
+    path: str = Form("/", description="目标目录路径"),
+    file: UploadFile = File(...),
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    payload = await browser.upload_file(project_id, resource.pvc_name, path, file)
+    return PvcBrowserUploadResponse(**payload)
+
+
+@router.post("/output-pvc/{resource_id}/browser/directories")
+async def create_output_pvc_browser_directory(
+    resource_id: int,
+    request: OutputPVCBrowserCreateDirectoryRequest,
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    return browser.create_directory(project_id, resource.pvc_name, request.path, request.name)
+
+
+@router.post("/output-pvc/{resource_id}/browser/rename")
+async def rename_output_pvc_browser_node(
+    resource_id: int,
+    request: OutputPVCBrowserRenameRequest,
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    return browser.rename_node(project_id, resource.pvc_name, request.path, request.target_name)
+
+
+@router.post("/output-pvc/{resource_id}/browser/move")
+async def move_output_pvc_browser_node(
+    resource_id: int,
+    request: OutputPVCBrowserMoveRequest,
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    return browser.move_node(project_id, resource.pvc_name, request.path, request.target_path)
+
+
+@router.delete("/output-pvc/{resource_id}/browser/node")
+async def delete_output_pvc_browser_node(
+    resource_id: int,
+    path: str = Query(..., description="要删除的节点路径"),
+    user_and_token: tuple[TokenPayload, str] = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
+    browser = get_pvc_browser_service()
+    return browser.delete_node(project_id, resource.pvc_name, path)

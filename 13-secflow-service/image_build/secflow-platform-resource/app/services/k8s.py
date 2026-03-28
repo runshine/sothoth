@@ -139,6 +139,79 @@ class KubernetesService:
             logger.error(f"Failed to create PVC {pvc_name}: {e}")
             return None
 
+    def get_pod(self, project_id: str, pod_name: str) -> Optional[Dict[str, Any]]:
+        """Get Pod details."""
+        try:
+            resp = self._request("GET", f"/pods/{pod_name}", project_id=project_id)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to get Pod {pod_name}: {e}")
+            return None
+
+    def create_pod(self, project_id: str, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Create a Pod in the project namespace."""
+        try:
+            resp = self._request("POST", "/pods", project_id=project_id, json=manifest)
+            if resp.status_code in (200, 201):
+                return resp.json()
+            logger.error(f"Failed to create Pod: {resp.status_code} {resp.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create Pod: {e}")
+            return None
+
+    def delete_pod(self, project_id: str, pod_name: str) -> bool:
+        """Delete a Pod in the project namespace."""
+        try:
+            resp = self._request("DELETE", f"/pods/{pod_name}", project_id=project_id)
+            return resp.status_code in (200, 404)
+        except Exception as e:
+            logger.error(f"Failed to delete Pod {pod_name}: {e}")
+            return False
+
+    def wait_for_pod_running(self, project_id: str, pod_name: str, timeout: int = 60) -> bool:
+        """Wait for a Pod to become Running."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            pod = self.get_pod(project_id, pod_name)
+            if pod and pod.get("status") == "Running":
+                return True
+            time.sleep(1)
+        return False
+
+    def exec_pod_command(
+        self,
+        project_id: str,
+        pod_name: str,
+        command: List[str],
+        container: Optional[str] = None,
+        stdin: Optional[str] = None,
+        timeout: int = 30,
+        tty: bool = False,
+    ) -> Dict[str, Any]:
+        """Execute a non-interactive command inside a Pod."""
+        try:
+            resp = self._request(
+                "POST",
+                f"/pods/{pod_name}/exec",
+                project_id=project_id,
+                json={
+                    "command": command,
+                    "container": container,
+                    "stdin": stdin,
+                    "timeout": timeout,
+                    "tty": tty,
+                },
+            )
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+            return resp.json() or {"stdout": "", "stderr": "", "exit_code": 0}
+        except Exception as e:
+            logger.error(f"Failed to exec Pod command {command} on {pod_name}: {e}")
+            raise
+
     def wait_for_pvc_bound(self, project_id: str, pvc_name: str, timeout: int = 60) -> bool:
         """Wait for PVC to reach Bound state."""
         start_time = time.time()

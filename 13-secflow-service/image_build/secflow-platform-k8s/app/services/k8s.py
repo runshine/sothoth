@@ -3,7 +3,9 @@ K8S资源管理服务模块
 提供对Kubernetes资源的增删查改操作
 """
 
+import json
 import logging
+import time
 from typing import Optional, List, Dict, Any
 
 import kubernetes
@@ -15,6 +17,8 @@ from kubernetes.client import (
     CustomObjectsApi,
 )
 from kubernetes.client.exceptions import ApiException
+from kubernetes.stream import stream
+from kubernetes.stream.ws_client import ERROR_CHANNEL
 
 from app.config import get_config
 from app.exception import InternalError, NotFoundError, ValidationError
@@ -2271,6 +2275,97 @@ class KubernetesService:
         except Exception as e:
             logger.error(f"[EXEC] 执行失败: {type(e).__name__}: {e}")
             raise
+
+    def exec_pod_command(
+        self,
+        namespace: str,
+        pod_name: str,
+        command: List[str],
+        container: str = None,
+        stdin_data: Optional[str] = None,
+        timeout: int = 30,
+        tty: bool = False,
+    ) -> Dict[str, Any]:
+        """执行一次非交互式 Pod 命令，返回 stdout/stderr/exit_code。"""
+        stdout_chunks: List[str] = []
+        stderr_chunks: List[str] = []
+        exit_code = 0
+        error_channel_payload = ""
+        response = None
+
+        try:
+            response = stream(
+                self.core_v1.connect_get_namespaced_pod_exec,
+                pod_name,
+                namespace,
+                command=command,
+                container=container,
+                stdin=stdin_data is not None,
+                stdout=True,
+                stderr=True,
+                tty=tty,
+                _preload_content=False,
+            )
+
+            if stdin_data:
+                response.write_stdin(stdin_data)
+                try:
+                    response.close_stdin()
+                except Exception:
+                    pass
+
+            deadline = time.time() + max(1, timeout)
+            while response.is_open():
+                response.update(timeout=1)
+                if response.peek_stdout():
+                    stdout_chunks.append(response.read_stdout())
+                if response.peek_stderr():
+                    stderr_chunks.append(response.read_stderr())
+                if response.peek_channel(ERROR_CHANNEL):
+                    error_channel_payload += response.read_channel(ERROR_CHANNEL) or ""
+                if time.time() > deadline:
+                    raise TimeoutError(f"Pod exec timed out after {timeout}s")
+
+            if error_channel_payload:
+                try:
+                    payload = json.loads(error_channel_payload)
+                    status = payload.get("status")
+                    if status == "Success":
+                        exit_code = 0
+                    else:
+                        details = payload.get("details") or {}
+                        causes = details.get("causes") or []
+                        for cause in causes:
+                            if cause.get("reason") == "ExitCode":
+                                exit_code = int(cause.get("message", "1"))
+                                break
+                        else:
+                            exit_code = 1
+                        message = payload.get("message")
+                        if message:
+                            stderr_chunks.append(message)
+                except Exception:
+                    if error_channel_payload.strip():
+                        stderr_chunks.append(error_channel_payload.strip())
+                        exit_code = 1
+
+            return {
+                "stdout": "".join(stdout_chunks),
+                "stderr": "".join(stderr_chunks),
+                "exit_code": exit_code,
+            }
+        except ApiException as e:
+            self._handle_api_exception(e, "Pod", "执行命令")
+            raise
+        except Exception as e:
+            logger.error(f"执行Pod命令失败: namespace={namespace}, pod={pod_name}, command={command}, error={e}")
+            raise InternalError(f"Pod执行命令失败: {e}")
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
     def resize_pod_exec(
         self,
