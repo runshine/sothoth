@@ -11,5 +11,21 @@ heartbeat_timeout: 120.0
 # 清理过期服务间隔（秒）
 cleanup_interval: 30
 
+# Redis 共享状态配置。多副本部署时建议开启。
+redis_enabled: true
+redis_url: "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
+redis_strict_mode: true
+redis_key_prefix: "secflow:menu"
+
+# 主动健康检查配置
+health_scheduler_interval: 5
+health_check_interval: 30
+health_check_timeout: 2.0
+health_failure_threshold: 2
+
+# 统一网关地址。已注册服务若上报了 0.0.0.0 / 127.0.0.1，
+# menu 将优先通过该地址 + api_prefix 生成健康检查 URL。
+service_gateway_url: "http://secflow.sothothv2.com"
+
 # 日志配置
 log_level: "INFO"

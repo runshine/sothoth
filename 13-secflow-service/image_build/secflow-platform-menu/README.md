@@ -8,10 +8,11 @@ SecFlow Menu Service 是一个动态菜单注册管理微服务，用于提供�
 
 - **服务注册管理**：支持动态注册、注销服务
 - **心跳检测**：自动检测服务存活状态
+- **聚合健康检查**：由 menu 主动探测后端微服务健康状态
 - **动态菜单**：根据注册信息动态生成菜单
 - **成熟度分类**：支持已上线、开发中、规划中三种成熟度
 - **多级菜单**：支持多级菜单结构
-- **无数据库设计**：基于内存存储，配置驱动
+- **多副本共享状态**：通过 Redis 共享注册信息与健康缓存
 
 ## 项目结构
 
@@ -48,6 +49,15 @@ port: 5000
 debug: false
 heartbeat_timeout: 30.0
 cleanup_interval: 10
+redis_enabled: true
+redis_url: "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
+redis_strict_mode: true
+redis_key_prefix: "secflow:menu"
+health_scheduler_interval: 5
+health_check_interval: 30
+health_check_timeout: 2.0
+health_failure_threshold: 2
+service_gateway_url: "http://secflow.sothothv2.com"
 log_level: "INFO"
 ```
 
@@ -95,7 +105,13 @@ def register():
         "service_name": "您的服务",
         "host": "your-service-host",
         "port": 8080,
+        "api_prefix": "/api/your-service",
         "maturity": "已上线",
+        "health_check": {
+            "path": "/api/your-service/health",
+            "interval_seconds": 30,
+            "timeout_seconds": 2
+        },
         "menu_item": {
             "id": "menu-id",
             "name": "菜单名称",
@@ -116,3 +132,10 @@ while True:
     heartbeat()
     time.sleep(10)
 ```
+
+## 多副本机制
+
+- `register / heartbeat / unregister` 统一写入 Redis，共享注册状态
+- `GET /api/menu/services/health*` 从 Redis 读取共享健康缓存
+- 多个 menu Pod 通过 Redis 锁选主，只有一个实例负责主动健康探测和过期清理
+- 如果服务注册时上报了 `0.0.0.0 / 127.0.0.1`，menu 会优先使用 `service_gateway_url + api_prefix + /health` 进行探测

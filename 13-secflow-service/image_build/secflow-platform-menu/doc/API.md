@@ -17,10 +17,13 @@ SecFlow Menu Service 是一个动态菜单注册管理微服务，提供服务�
 | 1 | GET | `/api/menu/health` | 健康检查 |
 | 2 | GET | `/api/menu/menu` | 获取动态菜单 |
 | 3 | GET | `/api/menu/services` | 获取所有服务信息 |
-| 4 | POST | `/api/menu/register` | 注册/更新服务 |
-| 5 | DELETE | `/api/menu/unregister/{service_id}` | 注销服务 |
-| 6 | POST | `/api/menu/heartbeat/{service_id}` | 心跳检测 |
-| 7 | GET | `/api/menu/maturity/list` | 获取成熟度列表 |
+| 4 | GET | `/api/menu/services/health` | 获取所有服务聚合健康状态 |
+| 5 | GET | `/api/menu/services/health/summary` | 获取前端菜单健康汇总 |
+| 6 | POST | `/api/menu/services/health/check/{service_id}` | 手动触发单服务健康检查 |
+| 7 | POST | `/api/menu/register` | 注册/更新服务 |
+| 8 | DELETE | `/api/menu/unregister/{service_id}` | 注销服务 |
+| 9 | POST | `/api/menu/heartbeat/{service_id}` | 心跳检测 |
+| 10 | GET | `/api/menu/maturity/list` | 获取成熟度列表 |
 
 ---
 
@@ -132,6 +135,91 @@ SecFlow Menu Service 是一个动态菜单注册管理微服务，提供服务�
 
 ### 4. 注册服务
 
+### 4. 获取所有服务聚合健康状态
+
+**GET** `/api/menu/services/health`
+
+返回所有已注册服务的聚合健康状态明细。
+
+**响应示例**:
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": [
+    {
+      "service_id": "secflow-platform-vuln",
+      "service_name": "漏洞生命周期引擎",
+      "api_prefix": "/api/vuln",
+      "menu_item_id": "vuln-root",
+      "menu_path": "/vuln-overview",
+      "health_url": "http://secflow.sothothv2.com/api/vuln/health",
+      "health": {
+        "status": "healthy",
+        "last_check": 1700000000.123,
+        "last_ok": 1700000000.123,
+        "http_status": 200,
+        "latency_ms": 12,
+        "error": null,
+        "consecutive_failures": 0,
+        "heartbeat_age_seconds": 5.2
+      }
+    }
+  ]
+}
+```
+
+---
+
+### 5. 获取前端菜单健康汇总
+
+**GET** `/api/menu/services/health/summary`
+
+返回适合前端菜单图标染色的轻量健康汇总。
+
+**响应示例**:
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "generated_at": 1700000000.123,
+    "totals": {
+      "healthy": 5,
+      "unhealthy": 1,
+      "degraded": 0,
+      "unknown": 2,
+      "stale": 0
+    },
+    "services": {
+      "secflow-platform-vuln": {
+        "service_id": "secflow-platform-vuln",
+        "service_name": "漏洞生命周期引擎",
+        "api_prefix": "/api/vuln",
+        "menu_item_id": "vuln-root",
+        "menu_path": "/vuln-overview",
+        "health": "healthy",
+        "latency_ms": 12,
+        "last_check_at": 1700000000.123,
+        "error": null
+      }
+    }
+  }
+}
+```
+
+---
+
+### 6. 手动触发单服务健康检查
+
+**POST** `/api/menu/services/health/check/{service_id}`
+
+立即执行一次指定服务的主动健康检查。
+
+---
+
+### 7. 注册服务
+
 **POST** `/api/menu/register`
 
 注册或更新服务。
@@ -148,7 +236,13 @@ Content-Type: application/json
     "service_name": "用户服务",
     "host": "192.168.1.100",
     "port": 8080,
+    "api_prefix": "/api/auth",
     "maturity": "已上线",
+    "health_check": {
+        "path": "/api/auth/health",
+        "interval_seconds": 30,
+        "timeout_seconds": 2
+    },
     "menu_item": {
         "id": "user-manage",
         "name": "用户管理",
@@ -169,8 +263,20 @@ Content-Type: application/json
 | service_name | string | 是 | 服务名称 |
 | host | string | 是 | 服务主机地址 |
 | port | int | 是 | 服务端口 |
+| api_prefix | string | 否 | 服务 API 前缀，用于自动推导健康检查地址 |
 | maturity | string | 否 | 成熟度，默认"开发中" |
+| health_check | object | 否 | 主动健康检查配置 |
 | menu_item | object | 否 | 菜单配置 |
+
+**health_check 参数说明**:
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| path | string | 否 | 健康检查路径，默认 `${api_prefix}/health` |
+| url | string | 否 | 显式健康检查 URL，优先级最高 |
+| method | string | 否 | 探测方法，默认 `GET` |
+| interval_seconds | number | 否 | menu 端主动探测周期 |
+| timeout_seconds | number | 否 | 单次探测超时时间 |
 
 **menu_item 参数说明**:
 
@@ -195,7 +301,7 @@ Content-Type: application/json
 
 ---
 
-### 5. 注销服务
+### 8. 注销服务
 
 **DELETE** `/api/menu/unregister/{service_id}`
 
@@ -214,7 +320,7 @@ Content-Type: application/json
 
 ---
 
-### 6. 心跳检测
+### 9. 心跳检测
 
 **POST** `/api/menu/heartbeat/{service_id}`
 
