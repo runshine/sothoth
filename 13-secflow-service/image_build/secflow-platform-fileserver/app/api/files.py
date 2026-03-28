@@ -348,6 +348,29 @@ def remove_empty_parents(path: str, stop_path: str):
         current = os.path.dirname(current)
 
 
+def delete_subproject_contents(db: Session, project_id: str, subproject_id: int):
+    directories = db.query(FileDirectory).filter(
+        FileDirectory.project_id == project_id,
+        FileDirectory.subproject_id == subproject_id,
+    ).all()
+    directory_ids = [item.id for item in directories]
+    if directory_ids:
+        db.query(ManagedFile).filter(
+            ManagedFile.project_id == project_id,
+            ManagedFile.subproject_id == subproject_id,
+            ManagedFile.directory_id.in_(directory_ids),
+        ).delete(synchronize_session=False)
+        db.query(FileDirectory).filter(
+            FileDirectory.id.in_(directory_ids),
+        ).delete(synchronize_session=False)
+
+    db.query(ManagedFile).filter(
+        ManagedFile.project_id == project_id,
+        ManagedFile.subproject_id == subproject_id,
+        ManagedFile.directory_id.is_(None),
+    ).delete(synchronize_session=False)
+
+
 def preview_mode_for_file(file_record: ManagedFile) -> str:
     content_type = guess_content_type(file_record.filename, file_record.content_type)
     if content_type.startswith("text/"):
@@ -728,6 +751,8 @@ async def delete_subproject(
     if (file_count > 0 or dir_count > 0) and not recursive:
         raise ConflictError("子项目下仍存在目录或文件，无法删除")
     subproject_root = sync_subproject_root(project_id, subproject_id)
+    if recursive:
+        delete_subproject_contents(db, project_id, subproject_id)
     db.delete(subproject)
     db.commit()
     if recursive and os.path.isdir(subproject_root):
