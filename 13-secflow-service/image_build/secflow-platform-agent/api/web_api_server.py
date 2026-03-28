@@ -3301,6 +3301,143 @@ class WebAPIServer:
                 self.logger.error(f"查询AI helper列表失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/agent/ai-agents', methods=['GET'])
+        def list_project_ai_agents():
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+
+                target_agent_key = str(request.args.get('agent_key') or '').strip()
+                target_helper_health = str(request.args.get('health_status') or '').strip().lower()
+                target_backend_type = str(request.args.get('backend_type') or '').strip().lower()
+                installed_filter_raw = str(request.args.get('installed') or '').strip().lower()
+                installed_filter: Optional[bool] = None
+                if installed_filter_raw in ('true', '1', 'yes'):
+                    installed_filter = True
+                elif installed_filter_raw in ('false', '0', 'no'):
+                    installed_filter = False
+
+                table_name = self.db_manager.get_table_name('agent_services')
+                rows = self.db_manager.fetch_all(
+                    f"""
+                    SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                           service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                           first_seen_at, last_seen_at, updated_at
+                    FROM {table_name}
+                    WHERE project_id = %s AND is_stale = 0
+                    ORDER BY last_seen_at DESC
+                    """ if self.db_manager.db_type == 'mysql' else
+                    f"""
+                    SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                           service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                           first_seen_at, last_seen_at, updated_at
+                    FROM {table_name}
+                    WHERE project_id = ? AND is_stale = 0
+                    ORDER BY last_seen_at DESC
+                    """,
+                    (project_id,)
+                ) or []
+
+                items = []
+                for row in rows:
+                    helper_agent_key = str(row.get('agent_key') or '').strip()
+                    helper_service_name = str(row.get('service_name') or '').strip()
+                    helper_tags = self._normalize_service_tags(row.get('tags_json'))
+
+                    if target_agent_key and helper_agent_key != target_agent_key:
+                        continue
+                    if not self._has_ai_helper_tag(helper_tags):
+                        continue
+
+                    helper_health_payload: Dict[str, Any] = {}
+                    helper_health_status = 'unknown'
+                    try:
+                        helper_health_payload, health_code = self._call_ai_helper_api(
+                            project_id,
+                            helper_agent_key,
+                            helper_service_name,
+                            'GET',
+                            '/api/ai-agents/health',
+                            None,
+                            timeout=(5, 20),
+                        )
+                        helper_health_status = 'healthy' if health_code < 300 else 'unhealthy'
+                    except Exception as exc:
+                        helper_health_payload = {'status': 'unreachable', 'error': str(exc)}
+                        helper_health_status = 'unhealthy'
+
+                    if target_helper_health and target_helper_health != helper_health_status:
+                        continue
+
+                    try:
+                        agents_payload, agents_code = self._call_ai_helper_api(
+                            project_id,
+                            helper_agent_key,
+                            helper_service_name,
+                            'GET',
+                            '/api/ai-agents',
+                            None,
+                            timeout=(5, 30),
+                        )
+                    except Exception as exc:
+                        self.logger.warning(
+                            f"查询AI Agent列表失败，helper={helper_agent_key}/{helper_service_name}: {exc}"
+                        )
+                        continue
+
+                    if agents_code >= 300 or not isinstance(agents_payload, dict):
+                        continue
+
+                    helper_agents = agents_payload.get('items') or []
+                    for agent in helper_agents:
+                        if not isinstance(agent, dict):
+                            continue
+                        backend_type = str(agent.get('backend_type') or '').strip().lower()
+                        installed = bool(agent.get('installed'))
+                        if target_backend_type and backend_type != target_backend_type:
+                            continue
+                        if installed_filter is not None and installed != installed_filter:
+                            continue
+
+                        items.append({
+                            'project_id': project_id,
+                            'agent_key': helper_agent_key,
+                            'agent_hostname': row.get('agent_hostname'),
+                            'agent_ip': row.get('agent_ip'),
+                            'service_name': helper_service_name,
+                            'image': row.get('image') or '',
+                            'status': row.get('status') or 'unknown',
+                            'health_status': helper_health_status,
+                            'helper_tags': helper_tags,
+                            'helper_health': helper_health_payload,
+                            'agent_id': agent.get('agent_id'),
+                            'name': agent.get('name'),
+                            'backend_type': agent.get('backend_type'),
+                            'command': agent.get('command'),
+                            'args': agent.get('args') if isinstance(agent.get('args'), list) else [],
+                            'env': agent.get('env') if isinstance(agent.get('env'), dict) else {},
+                            'enabled': bool(agent.get('enabled')),
+                            'running': bool(agent.get('running')),
+                            'active': bool(agent.get('active')),
+                            'installed': installed,
+                            'pid': agent.get('pid'),
+                            'description': agent.get('description'),
+                            'health': agent.get('health') if isinstance(agent.get('health'), dict) else agent.get('health'),
+                            'capabilities': agent.get('capabilities') if isinstance(agent.get('capabilities'), dict) else agent.get('capabilities'),
+                            'last_seen_at': row.get('last_seen_at'),
+                            'updated_at': row.get('updated_at'),
+                        })
+
+                return jsonify({
+                    'project_id': project_id,
+                    'items': items,
+                    'total': len(items),
+                })
+            except Exception as e:
+                self.logger.error(f"查询项目级AI Agent列表失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>', methods=['GET'])
         def get_ai_helper_detail(agent_key, service_name):
             try:

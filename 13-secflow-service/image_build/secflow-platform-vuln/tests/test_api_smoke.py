@@ -316,6 +316,8 @@ def test_dashboard_manual_task_and_decision_flow(client: TestClient):
     assert overview.status_code == 200
     assert overview.json()["metrics"]["total_cases"] == 1
     assert overview.json()["metrics"]["manual_tasks_open"] == 0
+    assert overview.json()["severity_counts"]["high"] == 1
+    assert len(overview.json()["recent_trend"]) == 7
 
 
 def test_failed_result_creates_automation_manual_task(client: TestClient):

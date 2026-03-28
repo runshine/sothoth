@@ -69,6 +69,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/fileserver
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-fileserver
+            port:
+              number: 80
+
       - path: /api/packages
         pathType: Prefix
         backend:

@@ -94,6 +94,14 @@ class DirectoryTreeResponse(BaseModel):
     items: List[DirectoryTreeItem]
 
 
+class DirectoryRenameRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+
+
+class DirectoryMoveRequest(BaseModel):
+    target_parent_id: Optional[int] = None
+
+
 class FileResponse(BaseModel):
     id: int
     project_id: str
@@ -124,3 +132,62 @@ class FileRenameRequest(BaseModel):
 
 class FileMoveRequest(BaseModel):
     target_directory_id: Optional[int] = None
+
+
+class ExplorerBreadcrumbItem(BaseModel):
+    node_type: str
+    id: str
+    name: str
+    subproject_id: Optional[int] = None
+    directory_id: Optional[int] = None
+
+
+class ExplorerNode(BaseModel):
+    node_type: str
+    id: str
+    name: str
+    project_id: str
+    subproject_id: Optional[int] = None
+    directory_id: Optional[int] = None
+    file_id: Optional[int] = None
+    parent_directory_id: Optional[int] = None
+    path_key: Optional[str] = None
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    special_badge: Optional[str] = None
+    has_children: bool = False
+    children: List["ExplorerNode"] = Field(default_factory=list)
+
+
+if hasattr(ExplorerNode, "model_rebuild"):
+    ExplorerNode.model_rebuild()
+else:
+    ExplorerNode.update_forward_refs()
+
+
+class ExplorerRootResponse(BaseModel):
+    project_id: str
+    root_name: str
+    total: int
+    items: List[ExplorerNode]
+
+
+class DirectoryChildrenResponse(BaseModel):
+    project_id: str
+    subproject_id: int
+    directory_id: Optional[int] = None
+    current_name: str
+    current_path: str
+    breadcrumbs: List[ExplorerBreadcrumbItem]
+    directories: List[DirectoryResponse]
+    files: List[FileResponse]
+
+
+class FilePreviewResponse(BaseModel):
+    file_id: int
+    filename: str
+    content_type: Optional[str]
+    preview_mode: str
+    preview_url: str
+    download_url: str

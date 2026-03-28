@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+import mimetypes
 import os
 import posixpath
 import tempfile
@@ -16,8 +17,15 @@ from app.config import get_config, get_data_pvc_name
 from app.exception import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
 from app.model import FileDirectory, FileSubproject, ManagedFile, get_db
 from app.schemas import (
+    DirectoryChildrenResponse,
     DirectoryCreate,
+    DirectoryMoveRequest,
+    DirectoryRenameRequest,
     DirectoryResponse,
+    ExplorerBreadcrumbItem,
+    ExplorerNode,
+    ExplorerRootResponse,
+    FilePreviewResponse,
     DirectoryTreeItem,
     DirectoryTreeResponse,
     FileListResponse,
@@ -85,6 +93,35 @@ async def get_storage_pvc(
     return StoragePVCResponse(
         mount_path=get_config().storage.root_dir,
         pvc_name=get_data_pvc_name(),
+    )
+
+
+@router.get("/explorer/root", response_model=ExplorerRootResponse)
+async def get_explorer_root(
+    project_id: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    subprojects = db.query(FileSubproject).filter(
+        FileSubproject.project_id == project_id,
+    ).order_by(FileSubproject.id.asc()).all()
+    items: List[ExplorerNode] = []
+    for subproject in subprojects:
+        directories = db.query(FileDirectory).filter(
+            FileDirectory.project_id == project_id,
+            FileDirectory.subproject_id == subproject.id,
+        ).order_by(FileDirectory.path_key.asc()).all()
+        files = db.query(ManagedFile).filter(
+            ManagedFile.project_id == project_id,
+            ManagedFile.subproject_id == subproject.id,
+        ).order_by(ManagedFile.filename.asc()).all()
+        items.append(build_subproject_root_node(subproject, directories, files))
+    return ExplorerRootResponse(
+        project_id=project_id,
+        root_name=project_id,
+        total=len(items),
+        items=items,
     )
 
 
@@ -163,6 +200,172 @@ def build_directory_tree(directories: List[FileDirectory]) -> List[DirectoryTree
         else:
             roots.append(node)
     return roots
+
+
+def guess_content_type(filename: str, current_type: Optional[str]) -> str:
+    if current_type:
+        return current_type
+    guessed, _ = mimetypes.guess_type(filename)
+    return guessed or "application/octet-stream"
+
+
+def get_directory_storage_path(project_id: str, subproject_id: int, directory: Optional[FileDirectory]) -> str:
+    base = sync_subproject_root(project_id, subproject_id)
+    relative = normalize_directory_path(directory)
+    return os.path.join(base, relative) if relative else base
+
+
+def build_breadcrumbs(
+    project_id: str,
+    subproject: FileSubproject,
+    directory: Optional[FileDirectory],
+) -> List[ExplorerBreadcrumbItem]:
+    breadcrumbs = [
+        ExplorerBreadcrumbItem(node_type="project", id=f"project:{project_id}", name=project_id),
+        ExplorerBreadcrumbItem(
+            node_type="subproject",
+            id=f"subproject:{subproject.id}",
+            name=subproject.name,
+            subproject_id=subproject.id,
+        ),
+    ]
+    if directory is None:
+        return breadcrumbs
+
+    chain: List[FileDirectory] = []
+    current = directory
+    while current is not None:
+        chain.append(current)
+        current = current.parent
+    for item in reversed(chain):
+        breadcrumbs.append(
+            ExplorerBreadcrumbItem(
+                node_type="directory",
+                id=f"directory:{item.id}",
+                name=item.name,
+                subproject_id=item.subproject_id,
+                directory_id=item.id,
+            )
+        )
+    return breadcrumbs
+
+
+def directory_to_explorer_node(directory: FileDirectory) -> ExplorerNode:
+    return ExplorerNode(
+        node_type="directory",
+        id=f"directory:{directory.id}",
+        name=directory.name,
+        project_id=directory.project_id,
+        subproject_id=directory.subproject_id,
+        directory_id=directory.id,
+        parent_directory_id=directory.parent_id,
+        path_key=directory.path_key,
+        updated_at=directory.updated_at,
+        has_children=True,
+    )
+
+
+def file_to_explorer_node(file_record: ManagedFile) -> ExplorerNode:
+    return ExplorerNode(
+        node_type="file",
+        id=f"file:{file_record.id}",
+        name=file_record.filename,
+        project_id=file_record.project_id,
+        subproject_id=file_record.subproject_id,
+        directory_id=file_record.directory_id,
+        file_id=file_record.id,
+        parent_directory_id=file_record.directory_id,
+        path_key=file_record.storage_key,
+        content_type=file_record.content_type,
+        size=file_record.size,
+        updated_at=file_record.updated_at,
+        has_children=False,
+    )
+
+
+def build_subproject_root_node(
+    subproject: FileSubproject,
+    directories: List[FileDirectory],
+    files: List[ManagedFile],
+) -> ExplorerNode:
+    child_nodes = [directory_to_explorer_node(item) for item in directories if item.parent_id is None]
+    child_nodes.extend(file_to_explorer_node(item) for item in files if item.directory_id is None)
+    child_nodes.sort(key=lambda item: (0 if item.node_type != "file" else 1, item.name.lower()))
+    return ExplorerNode(
+        node_type="subproject",
+        id=f"subproject:{subproject.id}",
+        name=subproject.name,
+        project_id=subproject.project_id,
+        subproject_id=subproject.id,
+        path_key=f"/{subproject.id}",
+        updated_at=subproject.updated_at,
+        special_badge="SUBPROJECT",
+        has_children=bool(child_nodes),
+        children=child_nodes,
+    )
+
+
+def ensure_no_descendant_move(directory: FileDirectory, target_parent: Optional[FileDirectory]):
+    if target_parent is None:
+        return
+    if target_parent.id == directory.id:
+        raise ConflictError("目录不能移动到自身下")
+    source_prefix = f"{directory.path_key.rstrip('/')}/"
+    if (target_parent.path_key or "").startswith(source_prefix):
+        raise ConflictError("目录不能移动到自己的子目录下")
+
+
+def update_directory_subtree_paths(db: Session, root_directory: FileDirectory):
+    directories = db.query(FileDirectory).filter(
+        FileDirectory.subproject_id == root_directory.subproject_id,
+    ).all()
+    by_parent: Dict[Optional[int], List[FileDirectory]] = {}
+    for item in directories:
+        by_parent.setdefault(item.parent_id, []).append(item)
+
+    def walk(node: FileDirectory, parent_path: Optional[str]):
+        node.path_key = f"/{node.name}" if not parent_path else f"{parent_path.rstrip('/')}/{node.name}"
+        for child in by_parent.get(node.id, []):
+            walk(child, node.path_key)
+
+    walk(root_directory, root_directory.parent.path_key if root_directory.parent else None)
+
+
+def refresh_file_storage_keys(db: Session, subproject_id: int):
+    files = db.query(ManagedFile).filter(ManagedFile.subproject_id == subproject_id).all()
+    for item in files:
+        item.storage_key = storage_relative_path(item.project_id, item.subproject_id, item.directory, item.filename)
+
+
+def remove_empty_parents(path: str, stop_path: str):
+    current = os.path.dirname(path)
+    stop = os.path.abspath(stop_path)
+    while os.path.abspath(current).startswith(stop) and os.path.abspath(current) != stop:
+        try:
+            os.rmdir(current)
+        except OSError:
+            break
+        current = os.path.dirname(current)
+
+
+def preview_mode_for_file(file_record: ManagedFile) -> str:
+    content_type = guess_content_type(file_record.filename, file_record.content_type)
+    if content_type.startswith("text/"):
+        return "text"
+    if content_type in {"application/json", "application/xml", "application/javascript"}:
+        return "text"
+    if content_type.startswith("image/"):
+        return "image"
+    if content_type == "application/pdf":
+        return "pdf"
+    if content_type.startswith("audio/"):
+        return "audio"
+    if content_type.startswith("video/"):
+        return "video"
+    extension = file_record.filename.rsplit(".", 1)[-1].lower() if "." in file_record.filename else ""
+    if extension in {"yml", "yaml", "md", "log", "csv", "sql", "sh", "py", "java", "go", "ts", "js", "tsx", "jsx", "xml"}:
+        return "text"
+    return "binary"
 
 
 def normalize_directory_path(directory: Optional[FileDirectory]) -> str:
@@ -455,6 +658,37 @@ async def get_subproject(
     return require_subproject(db, project_id, subproject_id)
 
 
+@router.get("/subprojects/{subproject_id}/children", response_model=DirectoryChildrenResponse)
+async def get_subproject_children(
+    subproject_id: int,
+    project_id: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    subproject = require_subproject(db, project_id, subproject_id)
+    directories = db.query(FileDirectory).filter(
+        FileDirectory.project_id == project_id,
+        FileDirectory.subproject_id == subproject_id,
+        FileDirectory.parent_id.is_(None),
+    ).order_by(FileDirectory.name.asc()).all()
+    files = db.query(ManagedFile).filter(
+        ManagedFile.project_id == project_id,
+        ManagedFile.subproject_id == subproject_id,
+        ManagedFile.directory_id.is_(None),
+    ).order_by(ManagedFile.filename.asc()).all()
+    return DirectoryChildrenResponse(
+        project_id=project_id,
+        subproject_id=subproject_id,
+        directory_id=None,
+        current_name=subproject.name,
+        current_path="/",
+        breadcrumbs=build_breadcrumbs(project_id, subproject, None),
+        directories=directories,
+        files=files,
+    )
+
+
 @router.put("/subprojects/{subproject_id}", response_model=SubprojectResponse)
 async def update_subproject(
     subproject_id: int,
@@ -483,6 +717,7 @@ async def update_subproject(
 async def delete_subproject(
     subproject_id: int,
     project_id: str = Query(...),
+    recursive: bool = Query(False),
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
@@ -490,10 +725,15 @@ async def delete_subproject(
     subproject = require_subproject(db, project_id, subproject_id)
     file_count = db.query(ManagedFile).filter(ManagedFile.subproject_id == subproject_id).count()
     dir_count = db.query(FileDirectory).filter(FileDirectory.subproject_id == subproject_id).count()
-    if file_count > 0 or dir_count > 0:
+    if (file_count > 0 or dir_count > 0) and not recursive:
         raise ConflictError("子项目下仍存在目录或文件，无法删除")
+    subproject_root = sync_subproject_root(project_id, subproject_id)
     db.delete(subproject)
     db.commit()
+    if recursive and os.path.isdir(subproject_root):
+        import shutil
+
+        shutil.rmtree(subproject_root, ignore_errors=True)
     return SuccessResponse(message="子项目删除成功")
 
 
@@ -543,6 +783,162 @@ async def get_directory_tree(
     return DirectoryTreeResponse(total=len(directories), items=items)
 
 
+@router.get("/directories/{directory_id}/children", response_model=DirectoryChildrenResponse)
+async def get_directory_children(
+    directory_id: int,
+    project_id: str = Query(...),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    directory = db.query(FileDirectory).filter(
+        FileDirectory.id == directory_id,
+        FileDirectory.project_id == project_id,
+    ).first()
+    if not directory:
+        raise NotFoundError("目录", str(directory_id))
+    subproject = require_subproject(db, project_id, directory.subproject_id)
+    directories = db.query(FileDirectory).filter(
+        FileDirectory.project_id == project_id,
+        FileDirectory.subproject_id == directory.subproject_id,
+        FileDirectory.parent_id == directory.id,
+    ).order_by(FileDirectory.name.asc()).all()
+    files = db.query(ManagedFile).filter(
+        ManagedFile.project_id == project_id,
+        ManagedFile.subproject_id == directory.subproject_id,
+        ManagedFile.directory_id == directory.id,
+    ).order_by(ManagedFile.filename.asc()).all()
+    return DirectoryChildrenResponse(
+        project_id=project_id,
+        subproject_id=subproject.id,
+        directory_id=directory.id,
+        current_name=directory.name,
+        current_path=directory.path_key,
+        breadcrumbs=build_breadcrumbs(project_id, subproject, directory),
+        directories=directories,
+        files=files,
+    )
+
+
+@router.post("/directories/{directory_id}/rename", response_model=DirectoryResponse)
+async def rename_directory(
+    directory_id: int,
+    payload: DirectoryRenameRequest,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    directory = db.query(FileDirectory).filter(FileDirectory.id == directory_id).first()
+    if not directory:
+        raise NotFoundError("目录", str(directory_id))
+    await verify_project_access(directory.project_id, authorization)
+    new_name = sanitize_name(payload.name)
+    existing = db.query(FileDirectory).filter(
+        FileDirectory.subproject_id == directory.subproject_id,
+        FileDirectory.parent_id == directory.parent_id,
+        FileDirectory.name == new_name,
+        FileDirectory.id != directory.id,
+    ).first()
+    if existing:
+        raise ConflictError(f"同级目录下名称已存在: {new_name}")
+
+    old_path = get_directory_storage_path(directory.project_id, directory.subproject_id, directory)
+    directory.name = new_name
+    update_directory_subtree_paths(db, directory)
+    refresh_file_storage_keys(db, directory.subproject_id)
+    new_path = get_directory_storage_path(directory.project_id, directory.subproject_id, directory)
+    if old_path != new_path and os.path.exists(old_path):
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+        os.replace(old_path, new_path)
+        remove_empty_parents(old_path, sync_subproject_root(directory.project_id, directory.subproject_id))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ConflictError(f"同级目录下名称已存在: {new_name}")
+    db.refresh(directory)
+    return directory
+
+
+@router.post("/directories/{directory_id}/move", response_model=DirectoryResponse)
+async def move_directory(
+    directory_id: int,
+    payload: DirectoryMoveRequest,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    directory = db.query(FileDirectory).filter(FileDirectory.id == directory_id).first()
+    if not directory:
+        raise NotFoundError("目录", str(directory_id))
+    await verify_project_access(directory.project_id, authorization)
+    target_parent = require_directory(db, directory.project_id, directory.subproject_id, payload.target_parent_id)
+    ensure_no_descendant_move(directory, target_parent)
+    existing = db.query(FileDirectory).filter(
+        FileDirectory.subproject_id == directory.subproject_id,
+        FileDirectory.parent_id == payload.target_parent_id,
+        FileDirectory.name == directory.name,
+        FileDirectory.id != directory.id,
+    ).first()
+    if existing:
+        raise ConflictError(f"目标目录下已存在同名目录: {directory.name}")
+
+    old_path = get_directory_storage_path(directory.project_id, directory.subproject_id, directory)
+    directory.parent_id = target_parent.id if target_parent else None
+    directory.parent = target_parent
+    update_directory_subtree_paths(db, directory)
+    refresh_file_storage_keys(db, directory.subproject_id)
+    new_path = get_directory_storage_path(directory.project_id, directory.subproject_id, directory)
+    if old_path != new_path and os.path.exists(old_path):
+        os.makedirs(os.path.dirname(new_path), exist_ok=True)
+        os.replace(old_path, new_path)
+        remove_empty_parents(old_path, sync_subproject_root(directory.project_id, directory.subproject_id))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise ConflictError(f"目标目录下已存在同名目录: {directory.name}")
+    db.refresh(directory)
+    return directory
+
+
+@router.delete("/directories/{directory_id}", response_model=SuccessResponse)
+async def delete_directory(
+    directory_id: int,
+    project_id: str = Query(...),
+    recursive: bool = Query(False),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    directory = db.query(FileDirectory).filter(
+        FileDirectory.id == directory_id,
+        FileDirectory.project_id == project_id,
+    ).first()
+    if not directory:
+        raise NotFoundError("目录", str(directory_id))
+    descendant_dirs = db.query(FileDirectory).filter(
+        FileDirectory.project_id == project_id,
+        FileDirectory.subproject_id == directory.subproject_id,
+        FileDirectory.path_key.startswith(directory.path_key.rstrip("/") + "/"),
+    ).all()
+    descendant_ids = [directory.id] + [item.id for item in descendant_dirs]
+    child_dir_count = len(descendant_dirs)
+    file_count = db.query(ManagedFile).filter(ManagedFile.directory_id.in_(descendant_ids)).count()
+    if (child_dir_count > 0 or file_count > 0) and not recursive:
+        raise ConflictError("目录下仍存在子目录或文件，无法删除")
+    target_path = get_directory_storage_path(project_id, directory.subproject_id, directory)
+    if descendant_ids:
+        db.query(ManagedFile).filter(ManagedFile.directory_id.in_(descendant_ids)).delete(synchronize_session=False)
+        db.query(FileDirectory).filter(FileDirectory.id.in_(descendant_ids[1:])).delete(synchronize_session=False)
+    db.delete(directory)
+    db.commit()
+    if recursive and os.path.isdir(target_path):
+        import shutil
+
+        shutil.rmtree(target_path, ignore_errors=True)
+        remove_empty_parents(target_path, sync_subproject_root(project_id, directory.subproject_id))
+    return SuccessResponse(message="目录删除成功")
+
+
 @router.post("/files/upload", response_model=ManagedFileResponse)
 async def upload_file(
     project_id: str = Form(...),
@@ -578,7 +974,7 @@ async def upload_file(
         directory_id=directory_id,
         filename=filename,
         original_filename=file.filename or filename,
-        content_type=file.content_type,
+        content_type=guess_content_type(filename, file.content_type),
         size=total_size,
         sha256=sha256,
         storage_key="pending",
@@ -638,6 +1034,29 @@ async def get_file_detail(
     return file_record
 
 
+@router.get("/files/{file_id}/preview")
+async def preview_file(
+    file_id: int,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    file_record = require_file(db, file_id)
+    await verify_project_access(file_record.project_id, authorization)
+    file_path = absolute_storage_path(file_record.storage_key)
+    if not os.path.exists(file_path):
+        raise NotFoundError("物理文件", file_record.storage_key)
+    media_type = guess_content_type(file_record.filename, file_record.content_type)
+    return FileResponse(
+        path=file_path,
+        filename=file_record.filename,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{file_record.filename}"',
+            "X-Preview-Mode": preview_mode_for_file(file_record),
+        },
+    )
+
+
 @router.get("/files/{file_id}/download")
 async def download_file(
     file_id: int,
@@ -679,6 +1098,7 @@ async def rename_file(
     if os.path.exists(old_path):
         os.replace(old_path, new_path)
     file_record.filename = new_name
+    file_record.content_type = guess_content_type(new_name, file_record.content_type)
     file_record.storage_key = new_storage_key
     db.commit()
     db.refresh(file_record)

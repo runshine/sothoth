@@ -3,7 +3,7 @@
 import json
 from uuid import uuid4
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -242,15 +242,31 @@ async def get_dashboard_overview(
 
     stage_counts: dict[str, int] = {}
     decision_counts: dict[str, int] = {}
+    severity_counts: dict[str, int] = {}
     action_status_counts: dict[str, int] = {}
     result_type_counts: dict[str, int] = {}
     for item in cases:
         stage_counts[item.current_stage] = stage_counts.get(item.current_stage, 0) + 1
         decision_counts[item.decision_status] = decision_counts.get(item.decision_status, 0) + 1
+        severity_counts[item.severity] = severity_counts.get(item.severity, 0) + 1
     for item in actions:
         action_status_counts[item.execution_status] = action_status_counts.get(item.execution_status, 0) + 1
     for item in results:
         result_type_counts[item.result_type] = result_type_counts.get(item.result_type, 0) + 1
+
+    recent_trend: list[dict[str, int | str]] = []
+    trend_window = 7
+    today = datetime.utcnow().date()
+    for offset in range(trend_window - 1, -1, -1):
+        day = today - timedelta(days=offset)
+        count = len([
+            item for item in cases
+            if item.created_at and item.created_at.date() == day
+        ])
+        recent_trend.append({
+            "date": day.isoformat(),
+            "count": count,
+        })
 
     recent_cases = sorted(cases, key=lambda item: item.updated_at or datetime.utcnow(), reverse=True)[:5]
     return {
@@ -266,8 +282,10 @@ async def get_dashboard_overview(
         },
         "stage_counts": stage_counts,
         "decision_counts": decision_counts,
+        "severity_counts": severity_counts,
         "action_status_counts": action_status_counts,
         "result_type_counts": result_type_counts,
+        "recent_trend": recent_trend,
         "recent_cases": [_case_payload(item) for item in recent_cases],
     }
 
