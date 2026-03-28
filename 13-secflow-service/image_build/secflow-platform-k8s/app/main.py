@@ -17,6 +17,7 @@ from app.exception import setup_exception_handlers
 from app.models.database import init_database
 from app.services.auth import get_auth_service
 from app.services.k8s import get_k8s_service
+from app.services.registry import get_registry_service
 from app.api.k8s_resources import router
 
 
@@ -107,12 +108,25 @@ async def lifespan(app: FastAPI):
     verify_auth_service_or_exit()
     logger.info("Auth服务连通性与机机Token校验通过")
 
+    try:
+        registry_service = get_registry_service()
+        await registry_service.start()
+        logger.info("Menu注册服务启动成功")
+    except Exception as e:
+        logger.warning(f"Menu注册服务启动失败: {e}，服务将继续运行")
+
     logger.info("K8S资源管理服务启动完成")
 
     yield
 
     # 关闭时清理
     logger.info("关闭K8S资源管理服务...")
+    try:
+        registry_service = get_registry_service()
+        await registry_service.stop()
+        logger.info("Menu注册服务已停止")
+    except Exception as e:
+        logger.warning(f"Menu注册服务停止失败: {e}")
 
 
 # 创建FastAPI应用

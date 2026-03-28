@@ -114,6 +114,8 @@ _package_locks: Dict[str, threading.RLock] = {}
 # 定时校验线程控制
 _auto_verify_stop_event = threading.Event()
 _auto_verify_thread: Optional[threading.Thread] = None
+_registry_thread: Optional[threading.Thread] = None
+_registry_loop: Optional[asyncio.AbstractEventLoop] = None
 
 # ==================== 数据库模型 ====================
 
@@ -1968,17 +1970,62 @@ async def shutdown_registry():
         logger.warning(f"Menu注册服务停止失败: {e}")
 
 
+def start_registry_background():
+    """在独立事件循环中启动Menu注册心跳，避免主线程关闭loop后任务丢失。"""
+    global _registry_thread, _registry_loop
+
+    if _registry_thread and _registry_thread.is_alive():
+        return
+
+    def _worker():
+        global _registry_loop
+        loop = asyncio.new_event_loop()
+        _registry_loop = loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(setup_registry())
+            loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+
+    _registry_thread = threading.Thread(target=_worker, name="menu-registry-loop", daemon=True)
+    _registry_thread.start()
+
+
+def stop_registry_background():
+    """停止后台Menu注册心跳循环。"""
+    global _registry_thread, _registry_loop
+
+    if _registry_loop is None:
+        return
+
+    try:
+        future = asyncio.run_coroutine_threadsafe(shutdown_registry(), _registry_loop)
+        future.result(timeout=10)
+    except Exception as e:
+        logger.warning(f"停止Menu注册后台线程失败: {e}")
+    finally:
+        _registry_loop.call_soon_threadsafe(_registry_loop.stop)
+
+    if _registry_thread and _registry_thread.is_alive():
+        _registry_thread.join(timeout=5)
+
+    _registry_thread = None
+    _registry_loop = None
+
+
 # 注册程序退出时的清理操作
 def cleanup(signum=None, frame=None):
     """清理操作"""
     logger.info("正在执行清理操作...")
     try:
         stop_auto_verify_worker()
-        # 使用事件循环执行异步清理
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(shutdown_registry())
-        loop.close()
+        stop_registry_background()
     except Exception as e:
         logger.error(f"清理操作失败: {e}")
     sys.exit(0)
@@ -1987,7 +2034,7 @@ def cleanup(signum=None, frame=None):
 # 注册信号处理
 signal.signal(signal.SIGTERM, cleanup)
 signal.signal(signal.SIGINT, cleanup)
-atexit.register(lambda: asyncio.run(shutdown_registry()) if get_registry_service() else None)
+atexit.register(lambda: stop_registry_background())
 atexit.register(lambda: stop_auto_verify_worker())
 
 
@@ -2003,10 +2050,7 @@ if __name__ == '__main__':
 
     # 启动Menu注册服务
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(setup_registry())
-        loop.close()
+        start_registry_background()
     except Exception as e:
         logger.warning(f"注册服务启动失败: {e}，服务将继续运行")
 
