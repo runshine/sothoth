@@ -36,9 +36,15 @@ class RegistryService:
             return {}
 
         menu = self.config.menu
+        display_name = (
+            (menu.level3.name if menu.level3 and menu.level3.name else None)
+            or (menu.level2.name if menu.level2 and menu.level2.name else None)
+            or (menu.level1.name if menu.level1 and menu.level1.name else None)
+            or self.config.service_name
+        )
         menu_item = {
             "id": menu.id,
-            "name": menu.level3.name if menu.level3 else (menu.level2.name if menu.level2 else menu.level1.name),
+            "name": display_name,
             "path": menu.path,
             "icon": menu.icon,
             "order": menu.order,
