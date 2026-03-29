@@ -223,6 +223,25 @@ async def readiness_check():
     return {"status": "ready"}
 
 
+@router.get("/platform/deployments", summary="获取平台微服务 Deployment 概览")
+async def list_platform_deployments(
+    namespace: str = Query("secflow-ns", description="K8S命名空间"),
+    name_prefix: str = Query("secflow-", description="Deployment名称前缀"),
+    current_user: dict = Depends(get_current_user),
+):
+    """获取平台微服务 Deployment 列表，用于平台级监控聚合。"""
+    k8s = get_k8s_service()
+    deployments = k8s.list_deployments(namespace)
+    items = [
+        dep for dep in deployments
+        if not name_prefix or dep.get("name", "").startswith(name_prefix)
+    ]
+    return {
+        "total": len(items),
+        "items": items,
+    }
+
+
 # ==================== Namespace 管理 ====================
 
 

@@ -8,6 +8,7 @@ import os
 import json
 import time
 import threading
+from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from flask import Flask, jsonify, request, Blueprint
@@ -100,6 +101,10 @@ class MenuManager:
         redis_strict_mode: bool = False,
         redis_key_prefix: str = "secflow:menu",
         pod_id: str = "menu-unknown",
+        k8s_service_url: str = "",
+        k8s_service_machine_token: str = "",
+        k8s_service_namespace: str = "secflow-ns",
+        k8s_service_name_prefix: str = "secflow-",
     ):
         self.services: Dict[str, ServiceInfo] = {}
         self.heartbeat_timeout = heartbeat_timeout
@@ -113,6 +118,10 @@ class MenuManager:
         self.redis_strict_mode = redis_strict_mode
         self.redis_key_prefix = redis_key_prefix.rstrip(":")
         self.pod_id = pod_id
+        self.k8s_service_url = k8s_service_url.rstrip("?")
+        self.k8s_service_machine_token = k8s_service_machine_token
+        self.k8s_service_namespace = k8s_service_namespace
+        self.k8s_service_name_prefix = k8s_service_name_prefix
         self.redis_client = None
         self.lock = threading.Lock()
         self._init_redis()
@@ -597,21 +606,37 @@ class MenuManager:
     def get_services_health_summary(self) -> Dict[str, Any]:
         """获取前端友好的健康汇总"""
         services = self.get_services_health()
+        deployment_summary = self.get_platform_deployment_summary()
         summary: Dict[str, Any] = {
             "generated_at": time.time(),
+            "summary": {
+                "total_services": 0,
+                "registered_services": 0,
+                "unregistered_services": 0,
+                "total_replicas": 0,
+                "ready_replicas": 0,
+                "available_replicas": 0,
+            },
             "totals": {
                 "healthy": 0,
                 "unhealthy": 0,
                 "degraded": 0,
                 "unknown": 0,
                 "stale": 0,
+                "unregistered": 0,
             },
             "services": {},
+            "deployments": deployment_summary["items"],
         }
+        deployment_lookup = {item["name"]: item for item in deployment_summary["items"]}
+        matched_deployments = set()
         for service in services:
             health_status = service["health"]["status"]
             summary["totals"][health_status] = summary["totals"].get(health_status, 0) + 1
-            summary["services"][service["service_id"]] = {
+            deployment_info = self._match_service_deployment(service["service_id"], deployment_lookup)
+            if deployment_info:
+                matched_deployments.add(deployment_info["name"])
+            service_payload = {
                 "service_id": service["service_id"],
                 "service_name": service["service_name"],
                 "api_prefix": service["api_prefix"],
@@ -621,8 +646,114 @@ class MenuManager:
                 "latency_ms": service["health"]["latency_ms"],
                 "last_check_at": service["health"]["last_check"],
                 "error": service["health"]["error"],
+                "registered": True,
+                "replicas": deployment_info.get("replicas") if deployment_info else None,
+                "ready_replicas": deployment_info.get("ready_replicas") if deployment_info else None,
+                "available_replicas": deployment_info.get("available_replicas") if deployment_info else None,
+                "deployment_name": deployment_info.get("name") if deployment_info else None,
+                "runtime_status": self._derive_runtime_status(deployment_info) if deployment_info else "unknown",
             }
+            summary["services"][service["service_id"]] = service_payload
+
+        for deployment in deployment_summary["items"]:
+            if deployment["name"] in matched_deployments:
+                continue
+            summary["totals"]["unregistered"] += 1
+            summary["services"][deployment["name"]] = {
+                "service_id": deployment["name"],
+                "service_name": deployment["name"],
+                "api_prefix": None,
+                "menu_item_id": None,
+                "menu_path": None,
+                "health": "unregistered",
+                "latency_ms": None,
+                "last_check_at": None,
+                "error": None,
+                "registered": False,
+                "replicas": deployment.get("replicas"),
+                "ready_replicas": deployment.get("ready_replicas"),
+                "available_replicas": deployment.get("available_replicas"),
+                "deployment_name": deployment.get("name"),
+                "runtime_status": self._derive_runtime_status(deployment),
+            }
+
+        summary["summary"]["total_services"] = len(summary["services"])
+        summary["summary"]["registered_services"] = len([item for item in summary["services"].values() if item["registered"]])
+        summary["summary"]["unregistered_services"] = summary["summary"]["total_services"] - summary["summary"]["registered_services"]
+        summary["summary"]["total_replicas"] = deployment_summary["total_replicas"]
+        summary["summary"]["ready_replicas"] = deployment_summary["ready_replicas"]
+        summary["summary"]["available_replicas"] = deployment_summary["available_replicas"]
         return summary
+
+    def _service_deployment_candidates(self, service_id: str) -> List[str]:
+        candidates = [service_id]
+        if service_id.startswith("secflow-") and not service_id.startswith("secflow-platform-"):
+            candidates.append(service_id.replace("secflow-", "secflow-platform-", 1))
+        if service_id.startswith("secflow-platform-"):
+            candidates.append(service_id.replace("secflow-platform-", "secflow-", 1))
+        return list(dict.fromkeys(candidates))
+
+    def _match_service_deployment(self, service_id: str, deployment_lookup: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        for candidate in self._service_deployment_candidates(service_id):
+            if candidate in deployment_lookup:
+                return deployment_lookup[candidate]
+        return None
+
+    def _derive_runtime_status(self, deployment: Optional[Dict[str, Any]]) -> str:
+        if not deployment:
+            return "unknown"
+        replicas = int(deployment.get("replicas") or 0)
+        ready_replicas = int(deployment.get("ready_replicas") or 0)
+        available_replicas = int(deployment.get("available_replicas") or 0)
+        if replicas == 0:
+            return "scaled-to-zero"
+        if ready_replicas >= replicas and available_replicas >= replicas:
+            return "running"
+        if ready_replicas > 0 or available_replicas > 0:
+            return "degraded"
+        return "unavailable"
+
+    def get_platform_deployment_summary(self) -> Dict[str, Any]:
+        if not self.k8s_service_url:
+            return {
+                "items": [],
+                "total_replicas": 0,
+                "ready_replicas": 0,
+                "available_replicas": 0,
+            }
+
+        query = urlencode({
+            "namespace": self.k8s_service_namespace,
+            "name_prefix": self.k8s_service_name_prefix,
+        })
+        request_url = f"{self.k8s_service_url}?{query}"
+        headers = {"Accept": "application/json"}
+        if self.k8s_service_machine_token:
+            headers["Authorization"] = f"Bearer {self.k8s_service_machine_token}"
+
+        req = Request(request_url, headers=headers, method="GET")
+        try:
+            with urlopen(req, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to load deployment summary from k8s service: %s", exc)
+            return {
+                "items": [],
+                "total_replicas": 0,
+                "ready_replicas": 0,
+                "available_replicas": 0,
+            }
+
+        items = payload.get("items") or payload.get("data", {}).get("items") or []
+        total_replicas = sum(int(item.get("replicas") or 0) for item in items)
+        ready_replicas = sum(int(item.get("ready_replicas") or 0) for item in items)
+        available_replicas = sum(int(item.get("available_replicas") or 0) for item in items)
+        return {
+            "items": items,
+            "total_replicas": total_replicas,
+            "ready_replicas": ready_replicas,
+            "available_replicas": available_replicas,
+        }
 
     def get_dynamic_menu(self) -> List[Dict]:
         """获取动态菜单"""
@@ -945,6 +1076,10 @@ def create_app(config: Dict = None) -> Flask:
             redis_strict_mode=config.get('redis_strict_mode', False),
             redis_key_prefix=config.get('redis_key_prefix', 'secflow:menu'),
             pod_id=os.environ.get('POD_NAME', 'menu-local'),
+            k8s_service_url=config.get('k8s_service_url', ''),
+            k8s_service_machine_token=config.get('k8s_service_machine_token', ''),
+            k8s_service_namespace=config.get('k8s_service_namespace', 'secflow-ns'),
+            k8s_service_name_prefix=config.get('k8s_service_name_prefix', 'secflow-'),
         )
 
     app.register_blueprint(menu_bp)
@@ -1007,6 +1142,10 @@ if __name__ == '__main__':
         redis_strict_mode=config.get('redis_strict_mode', False),
         redis_key_prefix=config.get('redis_key_prefix', 'secflow:menu'),
         pod_id=os.environ.get('POD_NAME', 'menu-local'),
+        k8s_service_url=config.get('k8s_service_url', ''),
+        k8s_service_machine_token=config.get('k8s_service_machine_token', ''),
+        k8s_service_namespace=config.get('k8s_service_namespace', 'secflow-ns'),
+        k8s_service_name_prefix=config.get('k8s_service_name_prefix', 'secflow-'),
     )
 
     # 注册蓝图
