@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-agent
-        image: ghcr.io/runshine/secflow-platform-agent:latest  # 包含kubectl命令
+        image: runshine0819/secflow-platform-agent:amd64-20260329  # 当前开发环境实际运行镜像
         imagePullPolicy: Always
         env:
         - name: POD_NAME

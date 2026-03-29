@@ -168,55 +168,6 @@
 #      - port: 10007
 #        protocol: TCP
 #---
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: secflow-platform-agent-debug
-  namespace: secflow-ns
-spec:
-  type: ClusterIP
-  ports:
-  - port: 80
-    targetPort: 10008
-    protocol: TCP
----
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: secflow-platform-agent-debug
-  namespace: secflow-ns
-subsets:
-  - addresses:
-      - ip: 192.168.12.44
-    ports:
-      - port: 10008
-        protocol: TCP
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: secflow-platform-workflow
-  namespace: secflow-ns
-spec:
-  type: ClusterIP
-  ports:
-  - port: 80
-    targetPort: 10009
-    protocol: TCP
----
-apiVersion: v1
-kind: Endpoints
-metadata:
-  name: secflow-platform-workflow
-  namespace: secflow-ns
-subsets:
-  - addresses:
-      - ip: 192.168.12.44
-    ports:
-      - port: 10009
-        protocol: TCP
----
 #
 #
 #
@@ -338,9 +289,16 @@ metadata:
     # 支持最大10G文件上传
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
     nginx.ingress.kubernetes.io/proxy-body-size: "10240m"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "8k"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-set-headers: |
+      Upgrade $http_upgrade;
+      Connection "upgrade";
+    nginx.ingress.kubernetes.io/websocket-services: "secflow-platform-agent"
 spec:
   ingressClassName: nginx
   tls:
@@ -378,7 +336,7 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: secflow-platform-agent-debug
+            name: secflow-platform-agent
             port:
               number: 80
 
@@ -406,6 +364,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/fileserver
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-fileserver
+            port:
+              number: 80
+
       - path: /api/packages
         pathType: Prefix
         backend:
@@ -422,11 +388,11 @@ spec:
             port:
               number: 80
 
-      - path: /api/app/code-server
+      - path: /api/k8s
         pathType: Prefix
         backend:
           service:
-            name: secflow-app-code-server
+            name: secflow-platform-k8s
             port:
               number: 80
 
@@ -435,5 +401,21 @@ spec:
         backend:
           service:
             name: secflow-platform-workflow
+            port:
+              number: 80
+
+      - path: /api/vuln
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-vuln
+            port:
+              number: 80
+
+      - path: /api/app/code-server
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-code-server
             port:
               number: 80

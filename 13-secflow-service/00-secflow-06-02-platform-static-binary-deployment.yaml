@@ -52,7 +52,7 @@ spec:
           periodSeconds: 5
 
       - name: nginx
-        image: nginx:alpine
+        image: nginx:latest
         imagePullPolicy: Always
         ports:
           - containerPort: 80

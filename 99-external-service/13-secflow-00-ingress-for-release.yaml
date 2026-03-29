@@ -8,9 +8,15 @@ metadata:
     # 支持最大10G文件上传
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
     nginx.ingress.kubernetes.io/proxy-body-size: "10240m"
+    nginx.ingress.kubernetes.io/proxy-buffer-size: "8k"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
     nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-set-headers: |
+      Upgrade $http_upgrade;
+      Connection "upgrade";
     nginx.ingress.kubernetes.io/websocket-services: "secflow-platform-agent"
 spec:
   ingressClassName: nginx
@@ -114,6 +120,14 @@ spec:
         backend:
           service:
             name: secflow-platform-workflow
+            port:
+              number: 80
+
+      - path: /api/vuln
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-vuln
             port:
               number: 80
 
