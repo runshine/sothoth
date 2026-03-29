@@ -65,6 +65,7 @@ class RegistryConfig(BaseModel):
     maturity: str = "开发中"
     description: str = "统一管理平台级动态系统配置项"
     api_prefix: str = "/api/configcenter"
+    unregister_on_shutdown: bool = False
     menu: MenuConfig = Field(default_factory=MenuConfig)
 
 

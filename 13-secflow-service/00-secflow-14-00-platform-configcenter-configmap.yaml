@@ -32,6 +32,7 @@ data:
       maturity: "开发中"
       description: "统一管理平台级动态系统配置项"
       api_prefix: "/api/configcenter"
+      unregister_on_shutdown: false
       menu:
         id: "config-center-llm"
         path: "/config-center/llm"

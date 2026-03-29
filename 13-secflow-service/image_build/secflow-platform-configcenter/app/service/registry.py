@@ -95,6 +95,9 @@ class RegistryService:
     async def unregister(self) -> bool:
         if not self.config.enabled:
             return True
+        if not getattr(self.config, "unregister_on_shutdown", False):
+            logger.info("跳过主动注销，由心跳超时机制回收服务注册: service_id=%s", self.config.service_id)
+            return True
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.delete(self._unregister_url())

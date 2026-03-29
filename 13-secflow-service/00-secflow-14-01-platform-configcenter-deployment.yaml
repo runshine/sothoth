@@ -4,7 +4,7 @@ metadata:
   name: secflow-platform-configcenter
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       name: secflow-platform-configcenter
