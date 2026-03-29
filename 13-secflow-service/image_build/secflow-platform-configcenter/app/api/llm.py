@@ -1,5 +1,6 @@
 """LLM provider management APIs."""
 
+import asyncio
 import re
 
 from fastapi import APIRouter, Depends
@@ -8,10 +9,16 @@ from sqlalchemy.orm import Session
 from app.exception import ConflictError, NotFoundError, ValidationError
 from app.model import LlmProvider, get_db
 from app.schemas import (
+    LlmProviderChatRequest,
+    LlmProviderChatResponse,
     LlmProviderCreateRequest,
     LlmProviderDetail,
     LlmProviderListResponse,
+    LlmProviderModelsRequest,
+    LlmProviderModelsResponse,
     LlmProviderServiceListResponse,
+    LlmProviderTestRequest,
+    LlmProviderTestResponse,
     LlmProviderUpdateRequest,
     MessageResponse,
     build_detail_payload,
@@ -19,6 +26,8 @@ from app.schemas import (
     build_summary_payload,
 )
 from app.service.auth import get_current_super_admin, get_machine_client
+from app.service.llm_runtime import chat_with_provider, list_provider_models
+from app.service.llm_tester import test_llm_provider
 
 
 router = APIRouter(prefix="/api/configcenter", tags=["Config Center"])
@@ -236,6 +245,46 @@ async def delete_llm_provider(
             replacement.is_default = True
     db.commit()
     return MessageResponse(message="Provider 已删除", provider_key=deleted_key)
+
+
+@router.post("/admin/llm/providers/test", response_model=LlmProviderTestResponse)
+async def test_admin_llm_provider(
+    request: LlmProviderTestRequest,
+    current_user: dict = Depends(get_current_super_admin),
+):
+    return await test_llm_provider(request)
+
+
+@router.post("/admin/llm/providers/models", response_model=LlmProviderModelsResponse)
+async def list_admin_llm_provider_models(
+    request: LlmProviderModelsRequest,
+    current_user: dict = Depends(get_current_super_admin),
+    db: Session = Depends(get_db),
+):
+    provider = get_provider_or_404(db, normalize_provider_key(request.provider_key))
+    return await list_provider_models(provider)
+
+
+@router.post("/admin/llm/providers/chat", response_model=LlmProviderChatResponse)
+async def chat_admin_llm_providers(
+    request: LlmProviderChatRequest,
+    current_user: dict = Depends(get_current_super_admin),
+    db: Session = Depends(get_db),
+):
+    provider_map = {
+        item.provider_key: item
+        for item in db.query(LlmProvider).filter(
+            LlmProvider.provider_key.in_([normalize_provider_key(target.provider_key) for target in request.targets])
+        ).all()
+    }
+    tasks = []
+    for target in request.targets:
+        provider_key = normalize_provider_key(target.provider_key)
+        provider = provider_map.get(provider_key)
+        if provider is None:
+            raise NotFoundError("LLM Provider", provider_key)
+        tasks.append(chat_with_provider(provider, target.model, target.messages))
+    return LlmProviderChatResponse(results=list(await asyncio.gather(*tasks)))
 
 
 @router.get("/service/llm/providers", response_model=LlmProviderServiceListResponse)

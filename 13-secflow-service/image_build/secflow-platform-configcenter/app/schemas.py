@@ -1,7 +1,7 @@
 """Pydantic schemas for config center."""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -58,6 +58,91 @@ class LlmProviderCreateRequest(LlmProviderBase):
 
 class LlmProviderUpdateRequest(LlmProviderBase):
     pass
+
+
+class LlmProviderTestRequest(LlmProviderBase):
+    pass
+
+
+class LlmProviderModelsRequest(BaseModel):
+    provider_key: str
+
+    @field_validator("provider_key")
+    @classmethod
+    def validate_provider_key(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("provider_key 不能为空")
+        return value
+
+
+class LlmProviderModelOption(BaseModel):
+    value: str
+    label: str
+    source: Literal["remote", "configured", "manual"] = "remote"
+
+
+class LlmProviderModelsResponse(BaseModel):
+    provider_key: str
+    provider_type: str
+    request_target: Optional[str] = None
+    status_code: Optional[int] = None
+    error_message: Optional[str] = None
+    items: List[LlmProviderModelOption]
+
+
+class LlmProviderChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("消息内容不能为空")
+        return value
+
+
+class LlmProviderChatTarget(BaseModel):
+    provider_key: str
+    model: str
+    messages: List[LlmProviderChatMessage] = Field(default_factory=list)
+
+    @field_validator("provider_key", "model")
+    @classmethod
+    def validate_target_fields(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+
+class LlmProviderChatRequest(BaseModel):
+    targets: List[LlmProviderChatTarget] = Field(default_factory=list)
+
+    @field_validator("targets")
+    @classmethod
+    def validate_targets(cls, value: List[LlmProviderChatTarget]) -> List[LlmProviderChatTarget]:
+        if not value:
+            raise ValueError("至少需要选择一个 Provider")
+        return value
+
+
+class LlmProviderChatResult(BaseModel):
+    provider_key: str
+    provider_type: str
+    model: str
+    ok: bool
+    assistant_message: Optional[str] = None
+    latency_ms: int
+    status_code: Optional[int] = None
+    request_target: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class LlmProviderChatResponse(BaseModel):
+    results: List[LlmProviderChatResult]
 
 
 class LlmProviderSummary(BaseModel):
@@ -135,6 +220,16 @@ class LlmProviderServiceListResponse(BaseModel):
 class MessageResponse(BaseModel):
     message: str
     provider_key: Optional[str] = None
+
+
+class LlmProviderTestResponse(BaseModel):
+    ok: bool
+    provider_type: str
+    request_target: str
+    latency_ms: int
+    status_code: Optional[int] = None
+    response_preview: Optional[str] = None
+    error_message: Optional[str] = None
 
 
 def build_summary_payload(item, api_key_masked: str) -> LlmProviderSummary:

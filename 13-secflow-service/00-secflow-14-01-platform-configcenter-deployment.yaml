@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-configcenter
-        image: ghcr.io/runshine/secflow-platform-configcenter:latest
+        image: runshine0819/secflow-platform-configcenter:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
