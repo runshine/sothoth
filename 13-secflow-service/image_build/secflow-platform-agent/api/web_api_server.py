@@ -32,6 +32,7 @@ from model.agent_manager import AgentManager
 from model.task_manager import TaskManager
 from model.enhanced_proxy_manager import EnhancedProxyManager
 from model.model import AgentInfo
+from model.menu_registry import MenuRegistryService
 
 from flask import send_file, redirect, Response
 # ===================== Flask应用 =====================
@@ -146,6 +147,7 @@ class WebAPIServer:
         self.k8s_service_url = (config.get('k8s_service_url') or '').rstrip('/')
         self.k8s_service_timeout_sec = int(config.get('k8s_service_timeout_sec', 15))
         self.service_machine_token = config.get('service_machine_token')
+        self.menu_registry = MenuRegistryService(config, self.logger)
 
         # 11. 注册路由
         self._register_routes()
@@ -6831,6 +6833,7 @@ class WebAPIServer:
 
     def shutdown(self):
         """停止后台组件。"""
+        self.menu_registry.stop()
         self.stop_refresh_thread()
         self.task_manager.stop_workers()
 
@@ -6839,6 +6842,7 @@ class WebAPIServer:
         # 启动后台刷新线程
         self.start_refresh_thread()
         self.task_manager.start_workers()
+        self.menu_registry.start()
 
         # 运行Flask应用
         self.logger.info(f"启动WEB API服务器，监听 {self.config['host']}:{self.config['port']}")
