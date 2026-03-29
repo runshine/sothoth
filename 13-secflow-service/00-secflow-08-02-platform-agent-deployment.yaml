@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-agent
-        image: runshine0819/secflow-platform-agent:amd64-20260329  # 当前开发环境实际运行镜像
+        image: runshine0819/secflow-platform-agent:latest
         imagePullPolicy: Always
         env:
         - name: POD_NAME

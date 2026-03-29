@@ -17,7 +17,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-k8s
-        image: runshine0819/secflow-platform-k8s:20260329  # 当前开发环境实际运行镜像
+        image: runshine0819/secflow-platform-k8s:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080

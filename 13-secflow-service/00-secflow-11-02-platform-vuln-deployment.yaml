@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-vuln
-        image: runshine0819/secflow-platform-vuln:amd64-20260329
+        image: runshine0819/secflow-platform-vuln:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
