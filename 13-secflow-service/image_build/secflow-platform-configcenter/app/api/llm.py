@@ -3,7 +3,8 @@
 import asyncio
 import re
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.exception import ConflictError, NotFoundError, ValidationError
@@ -26,7 +27,7 @@ from app.schemas import (
     build_summary_payload,
 )
 from app.service.auth import get_current_super_admin, get_machine_client
-from app.service.llm_runtime import chat_with_provider, list_provider_models
+from app.service.llm_runtime import chat_with_provider, list_provider_models, stream_chat_targets
 from app.service.llm_tester import test_llm_provider
 
 
@@ -265,9 +266,10 @@ async def list_admin_llm_provider_models(
     return await list_provider_models(provider)
 
 
-@router.post("/admin/llm/providers/chat", response_model=LlmProviderChatResponse)
+@router.post("/admin/llm/providers/chat")
 async def chat_admin_llm_providers(
     request: LlmProviderChatRequest,
+    stream: bool = Query(True),
     current_user: dict = Depends(get_current_super_admin),
     db: Session = Depends(get_db),
 ):
@@ -277,13 +279,25 @@ async def chat_admin_llm_providers(
             LlmProvider.provider_key.in_([normalize_provider_key(target.provider_key) for target in request.targets])
         ).all()
     }
+    resolved_targets = []
     tasks = []
     for target in request.targets:
         provider_key = normalize_provider_key(target.provider_key)
         provider = provider_map.get(provider_key)
         if provider is None:
             raise NotFoundError("LLM Provider", provider_key)
+        resolved_targets.append((provider, target.model, target.messages))
         tasks.append(chat_with_provider(provider, target.model, target.messages))
+    if stream:
+        return StreamingResponse(
+            stream_chat_targets(resolved_targets),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
     return LlmProviderChatResponse(results=list(await asyncio.gather(*tasks)))
 
 

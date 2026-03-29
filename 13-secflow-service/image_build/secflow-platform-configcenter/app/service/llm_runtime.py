@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import urlencode
 
 import httpx
@@ -137,6 +139,10 @@ def _extract_ollama_reply(payload: dict[str, Any]) -> str | None:
     return _extract_text_content(message.get("content"))
 
 
+def _sse_encode(payload: dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 def _to_openai_messages(messages: list[LlmProviderChatMessage]) -> list[dict[str, str]]:
     return [{"role": item.role, "content": item.content} for item in messages]
 
@@ -159,6 +165,28 @@ def _azure_base_root(api_base: str) -> str:
         if marker in base:
             base = base.split(marker)[0]
     return base
+
+
+async def _iter_sse_events(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
+    event_name = "message"
+    data_lines: list[str] = []
+    async for raw_line in response.aiter_lines():
+        line = raw_line.rstrip("\r")
+        if not line:
+            if data_lines:
+                yield event_name, "\n".join(data_lines)
+                event_name = "message"
+                data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            event_name = line[6:].strip() or "message"
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[5:].strip())
+    if data_lines:
+        yield event_name, "\n".join(data_lines)
 
 
 async def list_provider_models(provider: LlmProvider) -> LlmProviderModelsResponse:
@@ -333,6 +361,138 @@ async def _chat_with_ollama(provider: LlmProvider, model: str, messages: list[Ll
     return _extract_ollama_reply(payload) or "", response.status_code, target
 
 
+async def _stream_openai_like(provider: LlmProvider, model: str, messages: list[LlmProviderChatMessage]) -> AsyncIterator[tuple[str, int, str]]:
+    target = _join_url(provider.api_base, "/chat/completions")
+    headers = {
+        "Authorization": f"Bearer {_trimmed(provider.api_key)}",
+        "Content-Type": "application/json",
+    }
+    if _trimmed(provider.organization):
+        headers["OpenAI-Organization"] = _trimmed(provider.organization)
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": _to_openai_messages(messages),
+        "stream": True,
+    }
+    if provider.max_tokens is not None:
+        body["max_tokens"] = provider.max_tokens
+    if provider.temperature is not None:
+        body["temperature"] = provider.temperature
+    async with httpx.AsyncClient(timeout=provider.timeout_seconds) as client:
+        async with client.stream("POST", target, headers=headers, json=body) as response:
+            response.raise_for_status()
+            async for _event_name, data in _iter_sse_events(response):
+                if data == "[DONE]":
+                    break
+                payload = json.loads(data)
+                choices = payload.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                chunk = _extract_text_content(delta.get("content"))
+                if chunk:
+                    yield chunk, response.status_code, target
+
+
+async def _stream_azure(provider: LlmProvider, model: str, messages: list[LlmProviderChatMessage]) -> AsyncIterator[tuple[str, int, str]]:
+    base = _trimmed(provider.api_base)
+    if "openai/deployments" in base and "chat/completions" in base:
+        target = base
+    else:
+        target = _join_url(base, f"/openai/deployments/{model}/chat/completions")
+    target = _append_query(target, {"api-version": _trimmed(provider.api_version)})
+    headers = {"api-key": _trimmed(provider.api_key), "Content-Type": "application/json"}
+    body: dict[str, Any] = {
+        "messages": _to_openai_messages(messages),
+        "stream": True,
+    }
+    if provider.max_tokens is not None:
+        body["max_tokens"] = provider.max_tokens
+    if provider.temperature is not None:
+        body["temperature"] = provider.temperature
+    async with httpx.AsyncClient(timeout=provider.timeout_seconds) as client:
+        async with client.stream("POST", target, headers=headers, json=body) as response:
+            response.raise_for_status()
+            async for _event_name, data in _iter_sse_events(response):
+                if data == "[DONE]":
+                    break
+                payload = json.loads(data)
+                choices = payload.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                chunk = _extract_text_content(delta.get("content"))
+                if chunk:
+                    yield chunk, response.status_code, target
+
+
+async def _stream_anthropic(provider: LlmProvider, model: str, messages: list[LlmProviderChatMessage]) -> AsyncIterator[tuple[str, int, str]]:
+    system_message, anthropic_messages = _to_anthropic_messages(messages)
+    target = _join_url(provider.api_base, "/messages")
+    headers = {
+        "x-api-key": _trimmed(provider.api_key),
+        "anthropic-version": _trimmed(provider.api_version) or DEFAULT_ANTHROPIC_VERSION,
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": provider.max_tokens or DEFAULT_CHAT_MAX_TOKENS,
+        "messages": anthropic_messages,
+        "stream": True,
+    }
+    if provider.temperature is not None:
+        body["temperature"] = provider.temperature
+    if system_message:
+        body["system"] = system_message
+    async with httpx.AsyncClient(timeout=provider.timeout_seconds) as client:
+        async with client.stream("POST", target, headers=headers, json=body) as response:
+            response.raise_for_status()
+            async for event_name, data in _iter_sse_events(response):
+                if event_name not in {"content_block_delta", "content_block_start"}:
+                    continue
+                payload = json.loads(data)
+                chunk = None
+                if event_name == "content_block_delta":
+                    delta = payload.get("delta") or {}
+                    chunk = _extract_text_content(delta.get("text"))
+                else:
+                    content_block = payload.get("content_block") or {}
+                    chunk = _extract_text_content(content_block.get("text"))
+                if chunk:
+                    yield chunk, response.status_code, target
+
+
+async def _stream_ollama(provider: LlmProvider, model: str, messages: list[LlmProviderChatMessage]) -> AsyncIterator[tuple[str, int, str]]:
+    target = _join_url(provider.api_base, "/api/chat")
+    headers = {"Content-Type": "application/json"}
+    if _trimmed(provider.api_key):
+        headers["Authorization"] = f"Bearer {_trimmed(provider.api_key)}"
+    options: dict[str, Any] = {}
+    if provider.max_tokens is not None:
+        options["num_predict"] = provider.max_tokens
+    if provider.temperature is not None:
+        options["temperature"] = provider.temperature
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": _to_openai_messages(messages),
+        "stream": True,
+    }
+    if options:
+        body["options"] = options
+    async with httpx.AsyncClient(timeout=provider.timeout_seconds) as client:
+        async with client.stream("POST", target, headers=headers, json=body) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if payload.get("done"):
+                    break
+                chunk = _extract_text_content((payload.get("message") or {}).get("content"))
+                if chunk:
+                    yield chunk, response.status_code, target
+
+
 async def chat_with_provider(
     provider: LlmProvider,
     model: str,
@@ -378,3 +538,93 @@ async def chat_with_provider(
             request_target=request_target,
             error_message=_normalize_error_message(exc),
         )
+
+
+async def stream_chat_with_provider(
+    provider: LlmProvider,
+    model: str,
+    messages: list[LlmProviderChatMessage],
+) -> AsyncIterator[dict[str, Any]]:
+    normalized_type = _normalize_provider_type(provider.provider_type)
+    resolved_model = _ensure_provider_ready(provider, model)
+    start = time.perf_counter()
+    chunks: list[str] = []
+    request_target: str | None = None
+    status_code: int | None = None
+    yield {
+        "type": "start",
+        "provider_key": provider.provider_key,
+        "provider_type": normalized_type,
+        "model": resolved_model,
+    }
+    try:
+        if normalized_type == "openai-compatible":
+            stream = _stream_openai_like(provider, resolved_model, messages)
+        elif normalized_type == "azure-openai":
+            stream = _stream_azure(provider, resolved_model, messages)
+        elif normalized_type == "anthropic":
+            stream = _stream_anthropic(provider, resolved_model, messages)
+        elif normalized_type == "ollama":
+            stream = _stream_ollama(provider, resolved_model, messages)
+        else:
+            raise ValidationError(f"暂不支持该 Provider 类型: {provider.provider_type}")
+        async for chunk, response_status, target in stream:
+            status_code = response_status
+            request_target = target
+            chunks.append(chunk)
+            yield {
+                "type": "delta",
+                "provider_key": provider.provider_key,
+                "delta": chunk,
+            }
+        yield {
+            "type": "done",
+            "provider_key": provider.provider_key,
+            "provider_type": normalized_type,
+            "model": resolved_model,
+            "ok": True,
+            "assistant_message": "".join(chunks) or "(模型返回了空内容)",
+            "latency_ms": int((time.perf_counter() - start) * 1000),
+            "status_code": status_code,
+            "request_target": request_target,
+            "error_message": None,
+        }
+    except Exception as exc:
+        yield {
+            "type": "error",
+            "provider_key": provider.provider_key,
+            "provider_type": normalized_type,
+            "model": resolved_model,
+            "ok": False,
+            "assistant_message": None,
+            "latency_ms": int((time.perf_counter() - start) * 1000),
+            "status_code": exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None,
+            "request_target": request_target,
+            "error_message": _normalize_error_message(exc),
+        }
+
+
+async def stream_chat_targets(
+    targets: list[tuple[LlmProvider, str, list[LlmProviderChatMessage]]],
+) -> AsyncIterator[str]:
+    queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    async def _worker(provider: LlmProvider, model: str, messages: list[LlmProviderChatMessage]):
+        async for event in stream_chat_with_provider(provider, model, messages):
+            await queue.put(event)
+        await queue.put(None)
+
+    tasks = [asyncio.create_task(_worker(provider, model, messages)) for provider, model, messages in targets]
+    remaining = len(tasks)
+    try:
+        while remaining > 0:
+            event = await queue.get()
+            if event is None:
+                remaining -= 1
+                continue
+            yield _sse_encode(event)
+        yield _sse_encode({"type": "all_done"})
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
