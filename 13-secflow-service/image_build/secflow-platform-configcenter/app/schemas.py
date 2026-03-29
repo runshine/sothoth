@@ -24,13 +24,18 @@ class LlmProviderBase(BaseModel):
     extra_config: Dict[str, Any] = Field(default_factory=dict)
     description: Optional[str] = None
 
-    @field_validator("provider_key", "display_name", "provider_type", "api_base", "model", "api_key")
+    @field_validator("provider_key", "display_name", "provider_type", "api_base", "api_key")
     @classmethod
     def validate_required_str(cls, value: str) -> str:
         value = (value or "").strip()
         if not value:
             raise ValueError("字段不能为空")
         return value
+
+    @field_validator("model")
+    @classmethod
+    def normalize_model(cls, value: str) -> str:
+        return (value or "").strip()
 
     @field_validator("timeout_seconds")
     @classmethod

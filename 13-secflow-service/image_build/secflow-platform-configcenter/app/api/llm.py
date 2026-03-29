@@ -58,6 +58,12 @@ def validate_env_bindings(env_bindings: dict):
             raise ValidationError(f"环境变量名不合法: {key}")
 
 
+def normalize_env_bindings(env_bindings: dict) -> dict:
+    normalized = dict(env_bindings or {})
+    normalized.pop("OPENAI_API_KEY", None)
+    return normalized
+
+
 def apply_payload(provider: LlmProvider, payload: LlmProviderCreateRequest | LlmProviderUpdateRequest):
     provider.provider_key = normalize_provider_key(payload.provider_key)
     provider.display_name = payload.display_name.strip()
@@ -72,7 +78,7 @@ def apply_payload(provider: LlmProvider, payload: LlmProviderCreateRequest | Llm
     provider.timeout_seconds = payload.timeout_seconds
     provider.max_tokens = payload.max_tokens
     provider.temperature = payload.temperature
-    provider.env_bindings = payload.env_bindings or {}
+    provider.env_bindings = normalize_env_bindings(payload.env_bindings)
     provider.extra_config = payload.extra_config or {}
     provider.description = payload.description.strip() if payload.description else None
     validate_env_bindings(provider.env_bindings)
