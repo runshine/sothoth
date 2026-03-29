@@ -33,17 +33,6 @@ from app.service.llm_tester import test_llm_provider
 
 router = APIRouter(prefix="/api/configcenter", tags=["Config Center"])
 
-
-def mask_secret(value: str) -> str:
-    if not value:
-        return ""
-    if len(value) <= 4:
-        return "*" * len(value)
-    if len(value) <= 8:
-        return f"{value[0]}{'*' * (len(value) - 2)}{value[-1]}"
-    return f"{value[:3]}{'*' * (len(value) - 6)}{value[-3:]}"
-
-
 def normalize_provider_key(value: str) -> str:
     normalized = re.sub(r"[^a-z0-9-_]+", "-", (value or "").strip().lower()).strip("-")
     if not normalized:
@@ -69,9 +58,7 @@ def validate_env_bindings(env_bindings: dict):
 
 
 def normalize_env_bindings(env_bindings: dict) -> dict:
-    normalized = dict(env_bindings or {})
-    normalized.pop("OPENAI_API_KEY", None)
-    return normalized
+    return dict(env_bindings or {})
 
 
 def apply_payload(provider: LlmProvider, payload: LlmProviderCreateRequest | LlmProviderUpdateRequest):
@@ -109,7 +96,7 @@ async def list_admin_llm_providers(
     return LlmProviderListResponse(
         total=len(items),
         default_provider_key=default_provider,
-        items=[build_summary_payload(item, mask_secret(item.api_key)) for item in items],
+        items=[build_summary_payload(item) for item in items],
     )
 
 

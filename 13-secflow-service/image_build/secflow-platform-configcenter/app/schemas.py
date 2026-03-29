@@ -153,7 +153,7 @@ class LlmProviderSummary(BaseModel):
     is_default: bool
     api_base: str
     model: str
-    api_key_masked: str
+    api_key: str
     organization: Optional[str] = None
     api_version: Optional[str] = None
     timeout_seconds: int
@@ -201,6 +201,7 @@ class LlmProviderServiceListItem(BaseModel):
     is_default: bool
     api_base: str
     model: str
+    api_key: str
     organization: Optional[str] = None
     api_version: Optional[str] = None
     timeout_seconds: int
@@ -232,7 +233,7 @@ class LlmProviderTestResponse(BaseModel):
     error_message: Optional[str] = None
 
 
-def build_summary_payload(item, api_key_masked: str) -> LlmProviderSummary:
+def build_summary_payload(item) -> LlmProviderSummary:
     return LlmProviderSummary(
         provider_key=item.provider_key,
         display_name=item.display_name,
@@ -241,7 +242,7 @@ def build_summary_payload(item, api_key_masked: str) -> LlmProviderSummary:
         is_default=item.is_default,
         api_base=item.api_base,
         model=item.model,
-        api_key_masked=api_key_masked,
+        api_key=item.api_key,
         organization=item.organization,
         api_version=item.api_version,
         timeout_seconds=item.timeout_seconds,
@@ -287,6 +288,7 @@ def build_service_payload(item) -> LlmProviderServiceListItem:
         is_default=item.is_default,
         api_base=item.api_base,
         model=item.model,
+        api_key=item.api_key,
         organization=item.organization,
         api_version=item.api_version,
         timeout_seconds=item.timeout_seconds,

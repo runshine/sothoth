@@ -121,6 +121,32 @@ def _extract_text_content(value: Any) -> str | None:
     return str(value).strip() or None
 
 
+def _extract_stream_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value if value != "" else None
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(item, str):
+                parts.append(item)
+        joined = "".join(parts)
+        return joined if joined != "" else None
+    if isinstance(value, dict):
+        for key in ("text", "content"):
+            extracted = _extract_stream_text(value.get(key))
+            if extracted is not None:
+                return extracted
+        return None
+    text = str(value)
+    return text if text != "" else None
+
+
 def _extract_openai_reply(payload: dict[str, Any]) -> str | None:
     choices = payload.get("choices") or []
     if not choices:
@@ -389,8 +415,8 @@ async def _stream_openai_like(provider: LlmProvider, model: str, messages: list[
                 if not choices:
                     continue
                 delta = choices[0].get("delta") or {}
-                chunk = _extract_text_content(delta.get("content"))
-                if chunk:
+                chunk = _extract_stream_text(delta.get("content"))
+                if chunk is not None:
                     yield chunk, response.status_code, target
 
 
@@ -421,8 +447,8 @@ async def _stream_azure(provider: LlmProvider, model: str, messages: list[LlmPro
                 if not choices:
                     continue
                 delta = choices[0].get("delta") or {}
-                chunk = _extract_text_content(delta.get("content"))
-                if chunk:
+                chunk = _extract_stream_text(delta.get("content"))
+                if chunk is not None:
                     yield chunk, response.status_code, target
 
 
@@ -454,11 +480,13 @@ async def _stream_anthropic(provider: LlmProvider, model: str, messages: list[Ll
                 chunk = None
                 if event_name == "content_block_delta":
                     delta = payload.get("delta") or {}
-                    chunk = _extract_text_content(delta.get("text"))
+                    if delta.get("type") == "text_delta":
+                        chunk = _extract_stream_text(delta.get("text"))
                 else:
                     content_block = payload.get("content_block") or {}
-                    chunk = _extract_text_content(content_block.get("text"))
-                if chunk:
+                    if content_block.get("type") == "text":
+                        chunk = _extract_stream_text(content_block.get("text"))
+                if chunk is not None:
                     yield chunk, response.status_code, target
 
 
@@ -488,8 +516,8 @@ async def _stream_ollama(provider: LlmProvider, model: str, messages: list[LlmPr
                 payload = json.loads(line)
                 if payload.get("done"):
                     break
-                chunk = _extract_text_content((payload.get("message") or {}).get("content"))
-                if chunk:
+                chunk = _extract_stream_text((payload.get("message") or {}).get("content"))
+                if chunk is not None:
                     yield chunk, response.status_code, target
 
 
