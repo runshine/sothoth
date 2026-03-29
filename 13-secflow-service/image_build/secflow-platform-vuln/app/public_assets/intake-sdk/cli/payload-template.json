@@ -1,0 +1,24 @@
+{
+  "project_id": "44f9029d00650a10",
+  "title": "Anonymous CLI vulnerability submission",
+  "summary": "Discovered by CLI automation pipeline",
+  "severity": "high",
+  "confidence": 82,
+  "reporter_type": "cli",
+  "reporter_name": "daily-pipeline",
+  "source_meta": {
+    "source_service": "cli-demo",
+    "source_kind": "script"
+  },
+  "target_meta": {
+    "asset_type": "http",
+    "asset_locator": "https://demo.example/api/login"
+  },
+  "display_meta": {
+    "preferred_render_type": "generic"
+  },
+  "raw_payload": {
+    "finding_id": "demo-cli-001"
+  },
+  "attachments": []
+}

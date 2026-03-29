@@ -1,7 +1,7 @@
 """Pydantic schemas."""
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -52,6 +52,46 @@ class CaseCreateRequest(BaseModel):
     display_meta: dict[str, Any] = Field(default_factory=dict)
     created_by_type: str = "human"
     created_by: Optional[str] = None
+
+
+class PublicIntakeSubmissionRequest(BaseModel):
+    project_id: str
+    title: str
+    summary: Optional[str] = None
+    severity: str = "medium"
+    confidence: int = 0
+    source_meta: dict[str, Any] = Field(default_factory=dict)
+    target_meta: dict[str, Any] = Field(default_factory=dict)
+    display_meta: dict[str, Any] = Field(default_factory=dict)
+    reporter_type: Literal["cli", "plugin", "skill", "api", "other"] = "other"
+    reporter_name: Optional[str] = None
+    raw_payload: dict[str, Any] = Field(default_factory=dict)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+
+    def to_case_create_request(self) -> CaseCreateRequest:
+        source_meta = dict(self.source_meta)
+        source_meta.setdefault("reporter_type", self.reporter_type)
+        source_meta.setdefault("reporter_name", self.reporter_name)
+        source_meta.setdefault("raw_payload", self.raw_payload)
+        source_meta.setdefault("attachments", self.attachments)
+        source_meta.setdefault("anonymous_submission", True)
+
+        display_meta = dict(self.display_meta)
+        display_meta.setdefault("preferred_render_type", "generic")
+
+        created_by = self.reporter_name or f"anonymous:{self.reporter_type}"
+        return CaseCreateRequest(
+            project_id=self.project_id,
+            title=self.title,
+            summary=self.summary,
+            severity=self.severity,
+            confidence=self.confidence,
+            source_meta=source_meta,
+            target_meta=self.target_meta,
+            display_meta=display_meta,
+            created_by_type="anonymous",
+            created_by=created_by,
+        )
 
 
 class CaseResponse(BaseModel):

@@ -1,0 +1,29 @@
+{
+  "kind": "plugin",
+  "payload": {
+    "project_id": "44f9029d00650a10",
+    "title": "Plugin submission example",
+    "summary": "Detected by external analyzer plugin",
+    "severity": "medium",
+    "confidence": 74,
+    "reporter_type": "plugin",
+    "reporter_name": "secflow-snmp-plugin",
+    "source_meta": {
+      "source_service": "snmp-plugin",
+      "source_kind": "plugin"
+    },
+    "target_meta": {
+      "asset_type": "network_device",
+      "asset_locator": "10.10.10.1:161"
+    },
+    "raw_payload": {
+      "rule_id": "SNMP-EXTERNAL-HIGH-RISK"
+    },
+    "attachments": [
+      {
+        "type": "report",
+        "name": "snmp-findings.json"
+      }
+    ]
+  }
+}

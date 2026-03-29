@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.actions import router as actions_router
 from app.api.cases import router as cases_router
 from app.api.health import router as health_router
+from app.api.public import router as public_router
 from app.api.services import router as services_router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
@@ -87,6 +88,7 @@ app.add_middleware(
 setup_exception_handlers(app)
 
 app.include_router(health_router)
+app.include_router(public_router)
 app.include_router(services_router)
 app.include_router(cases_router)
 app.include_router(actions_router)

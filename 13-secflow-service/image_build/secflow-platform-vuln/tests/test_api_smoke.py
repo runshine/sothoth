@@ -72,6 +72,76 @@ def test_health(client: TestClient):
     assert response.json()["service"] == "secflow-platform-vuln"
 
 
+def test_public_intake_catalog_downloads_and_examples(client: TestClient):
+    catalog = client.get("/api/vuln/public/intake/catalog")
+    assert catalog.status_code == 200
+    payload = catalog.json()
+    assert payload["version"] == "1.0.0"
+    assert len(payload["items"]) == 4
+
+    cli_download = client.get("/api/vuln/public/intake/sdk/cli")
+    assert cli_download.status_code == 200
+    assert cli_download.headers["content-type"].startswith("application/zip")
+
+    plugin_download = client.get("/api/vuln/public/intake/sdk/plugin")
+    assert plugin_download.status_code == 200
+    assert plugin_download.headers["content-type"].startswith("application/zip")
+
+    skill_download = client.get("/api/vuln/public/intake/sdk/skill")
+    assert skill_download.status_code == 200
+    assert skill_download.headers["content-type"].startswith("application/zip")
+
+    openapi_spec = client.get("/api/vuln/public/intake/spec/openapi")
+    assert openapi_spec.status_code == 200
+    assert openapi_spec.headers["content-type"].startswith("application/json")
+
+    for kind in ("cli", "plugin", "skill", "openapi"):
+        example = client.get(f"/api/vuln/public/intake/examples/{kind}")
+        assert example.status_code == 200
+
+
+def test_public_anonymous_submission_creates_case(client: TestClient):
+    response = client.post(
+        "/api/vuln/public/intake/submissions",
+        json={
+            "project_id": "demo-project",
+            "title": "Anonymous submission",
+            "summary": "created through public intake",
+            "severity": "high",
+            "confidence": 77,
+            "reporter_type": "cli",
+            "reporter_name": "public-ci",
+            "source_meta": {"source_service": "public-cli"},
+            "target_meta": {"asset_type": "web", "asset_locator": "/auth/login"},
+            "display_meta": {},
+            "raw_payload": {"trace_id": "anon-001"},
+            "attachments": [],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created_by_type"] == "anonymous"
+    assert payload["created_by"] == "public-ci"
+    assert payload["project_id"] == "demo-project"
+
+    detail = client.get(f"/api/vuln/cases/{payload['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["created_by_type"] == "anonymous"
+    assert detail.json()["source_meta"]["anonymous_submission"] is True
+
+
+def test_public_routes_remain_anonymous_but_private_routes_require_auth(client: TestClient):
+    public_response = client.get("/api/vuln/public/intake/catalog")
+    assert public_response.status_code == 200
+
+    override = app.dependency_overrides.pop(get_current_subject)
+    try:
+        private_response = client.get("/api/vuln/cases")
+        assert private_response.status_code == 401
+    finally:
+        app.dependency_overrides[get_current_subject] = override
+
+
 def test_register_service_and_list(client: TestClient):
     payload = {
         "service_id": "svc-analyzer-01",

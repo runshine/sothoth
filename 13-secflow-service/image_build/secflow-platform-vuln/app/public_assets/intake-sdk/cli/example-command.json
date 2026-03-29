@@ -1,0 +1,11 @@
+{
+  "kind": "cli",
+  "description": "匿名 CLI 上报示例",
+  "command": "curl -X POST \"$SECFLOW_VULN_BASE/api/vuln/public/intake/submissions\" -H 'Content-Type: application/json' --data @payload.json",
+  "payload_file": "payload-template.json",
+  "notes": [
+    "必须携带 project_id",
+    "不需要 Authorization header",
+    "created_by_type 会自动写为 anonymous"
+  ]
+}
