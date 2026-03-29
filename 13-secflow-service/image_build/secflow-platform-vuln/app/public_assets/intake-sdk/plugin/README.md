@@ -4,9 +4,11 @@
 
 ## 集成建议
 
-- 在插件完成一次漏洞识别后调用匿名上报接口
-- 将原始扫描结果放进 `raw_payload`
-- 将插件自身标识写入 `reporter_name` 和 `source_meta`
+- 在插件完成一次疑点识别后调用匿名上报接口
+- 将插件自身标识写入 `reporter.name`、`reporter.version`、`reporter.type`
+- 将目标对象统一写入 `subject`
+- 将原始扫描结果、运行上下文、自定义字段放进 `metadata`
+- 将文件、目录树、报告、截图等原始产物放进 `artifacts`
 
 ## 文件说明
 

@@ -48,6 +48,7 @@ def ensure_default_workflow(db: Session) -> WorkflowDefinition:
 
 def create_case_with_runtime(db: Session, request: CaseCreateRequest) -> Case:
     workflow = ensure_default_workflow(db)
+    source_meta, target_meta, display_meta = request.build_storage_payloads()
     case = Case(
         id=uuid4().hex,
         project_id=request.project_id,
@@ -59,9 +60,9 @@ def create_case_with_runtime(db: Session, request: CaseCreateRequest) -> Case:
         current_status="running",
         decision_status="unknown",
         workflow_definition_id=workflow.id,
-        source_meta_json=json.dumps(request.source_meta, ensure_ascii=False),
-        target_meta_json=json.dumps(request.target_meta, ensure_ascii=False),
-        display_meta_json=json.dumps(request.display_meta, ensure_ascii=False),
+        source_meta_json=json.dumps(source_meta, ensure_ascii=False),
+        target_meta_json=json.dumps(target_meta, ensure_ascii=False),
+        display_meta_json=json.dumps(display_meta, ensure_ascii=False),
         created_by_type=request.created_by_type,
         created_by=request.created_by,
     )
@@ -84,7 +85,7 @@ def create_case_with_runtime(db: Session, request: CaseCreateRequest) -> Case:
         case_id=case.id,
         event_type="created",
         summary=request.summary or request.title,
-        payload_json=json.dumps(request.model_dump(), ensure_ascii=False),
+        payload_json=json.dumps(request.model_dump(mode="json"), ensure_ascii=False),
     ))
 
     db.add(StageHistory(

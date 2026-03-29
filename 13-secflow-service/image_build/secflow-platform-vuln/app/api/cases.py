@@ -16,6 +16,7 @@ from app.schemas import (
     ManualTaskCreateRequest,
     ManualTaskStatusUpdateRequest,
     RoutedActionDispatchRequest,
+    SuspicionSubmissionRequest,
     StageTransitionRequest,
 )
 from app.services.lifecycle_engine import (
@@ -32,21 +33,35 @@ router = APIRouter(prefix="/api/vuln/cases", tags=["cases"])
 
 
 def _case_payload(item: Case) -> dict:
+    source_meta = json.loads(item.source_meta_json or "{}")
+    subject = json.loads(item.target_meta_json or "{}")
+    display_meta = json.loads(item.display_meta_json or "{}")
+    metadata = display_meta.get("metadata") or {}
     return {
         "id": item.id,
         "project_id": item.project_id,
         "title": item.title,
         "summary": item.summary,
         "severity": item.severity,
+        "cvss_score": source_meta.get("cvss_score", 0.0),
         "confidence": item.confidence,
+        "report_id": source_meta.get("report_id"),
+        "state": source_meta.get("state", "suspected"),
+        "category": source_meta.get("category"),
+        "rule_id": source_meta.get("rule_id"),
+        "rule_name": source_meta.get("rule_name"),
+        "fingerprint": source_meta.get("fingerprint"),
+        "reported_at": source_meta.get("reported_at"),
+        "reporter": source_meta.get("reporter") or {},
+        "subject": subject,
+        "evidence": display_meta.get("evidence") or {},
+        "artifacts": display_meta.get("artifacts") or [],
+        "metadata": metadata,
         "current_stage": item.current_stage,
         "current_status": item.current_status,
         "decision_status": item.decision_status,
         "created_by_type": item.created_by_type,
         "created_by": item.created_by,
-        "source_meta": json.loads(item.source_meta_json or "{}"),
-        "target_meta": json.loads(item.target_meta_json or "{}"),
-        "display_meta": json.loads(item.display_meta_json or "{}"),
         "created_at": item.created_at,
         "updated_at": item.updated_at,
     }
@@ -70,13 +85,17 @@ def _manual_task_payload(item: ManualTask) -> dict:
 
 @router.post("")
 async def create_case(
-    request: CaseCreateRequest,
+    request: SuspicionSubmissionRequest,
     user_and_token: tuple[dict, str] = Depends(get_current_subject),
     db: Session = Depends(get_db),
 ):
-    _, token = user_and_token
+    subject, token = user_and_token
     await ensure_project_access(request.project_id, token)
-    item = create_case_with_runtime(db, request)
+    creator = subject.get("username") or str(subject.get("id"))
+    item = create_case_with_runtime(
+        db,
+        request.to_case_create_request(created_by_type="human", created_by=creator),
+    )
     return _case_payload(item)
 
 
@@ -157,6 +176,35 @@ async def get_case(case_id: str, user_and_token: tuple[dict, str] = Depends(get_
             for result in results
         ],
         "manual_tasks": [_manual_task_payload(item) for item in manual_tasks],
+    }
+
+
+@router.delete("/{case_id}")
+async def delete_case(
+    case_id: str,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    item = db.query(Case).filter(Case.id == case_id).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="case not found")
+
+    user, token = user_and_token
+    await ensure_project_access(item.project_id, token)
+
+    db.query(Result).filter(Result.case_id == case_id).delete()
+    db.query(ActionExecution).filter(ActionExecution.case_id == case_id).delete()
+    db.query(ManualTask).filter(ManualTask.case_id == case_id).delete()
+    db.query(StageHistory).filter(StageHistory.case_id == case_id).delete()
+    db.query(CaseEvent).filter(CaseEvent.case_id == case_id).delete()
+    db.query(WorkflowRun).filter(WorkflowRun.case_id == case_id).delete()
+    db.delete(item)
+    db.commit()
+
+    return {
+        "status": "ok",
+        "deleted_case_id": case_id,
+        "deleted_by": user.get("username") or str(user.get("id")),
     }
 
 

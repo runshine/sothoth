@@ -2,28 +2,60 @@
   "kind": "plugin",
   "payload": {
     "project_id": "44f9029d00650a10",
-    "title": "Plugin submission example",
+    "report_id": "plugin-demo-001",
+    "title": "Plugin suspicion submission example",
     "summary": "Detected by external analyzer plugin",
     "severity": "medium",
+    "cvss_score": 6.8,
     "confidence": 74,
-    "reporter_type": "plugin",
-    "reporter_name": "secflow-snmp-plugin",
-    "source_meta": {
-      "source_service": "snmp-plugin",
-      "source_kind": "plugin"
+    "state": "suspected",
+    "category": "network_misconfiguration",
+    "rule_id": "SNMP-EXTERNAL-HIGH-RISK",
+    "rule_name": "SNMP External High Risk",
+    "fingerprint": "snmp-plugin-fp-001",
+    "reporter": {
+      "name": "secflow-snmp-plugin",
+      "version": "1.4.2",
+      "type": "plugin",
+      "vendor": "secflow",
+      "endpoint": "http://snmp-plugin/api/report"
     },
-    "target_meta": {
-      "asset_type": "network_device",
-      "asset_locator": "10.10.10.1:161"
+    "subject": {
+      "type": "service",
+      "locator": "10.10.10.1:161",
+      "name": "SNMP service"
     },
-    "raw_payload": {
-      "rule_id": "SNMP-EXTERNAL-HIGH-RISK"
+    "evidence": {
+      "summary": "Plugin identified a suspicious SNMP response pattern",
+      "references": []
     },
-    "attachments": [
+    "artifacts": [
       {
-        "type": "report",
-        "name": "snmp-findings.json"
+        "kind": "report",
+        "name": "snmp-findings.json",
+        "content_ref": "artifact://snmp-findings.json"
+      },
+      {
+        "kind": "tree",
+        "name": "input-structure",
+        "children": [
+          {
+            "kind": "file",
+            "name": "capture.pcap",
+            "path": "captures/capture.pcap",
+            "content_ref": "artifact://captures/capture.pcap"
+          }
+        ]
       }
-    ]
+    ],
+    "metadata": {
+      "source": {
+        "source_service": "snmp-plugin",
+        "source_kind": "plugin"
+      },
+      "tool_output": {
+        "raw_rule_id": "SNMP-EXTERNAL-HIGH-RISK"
+      }
+    }
   }
 }

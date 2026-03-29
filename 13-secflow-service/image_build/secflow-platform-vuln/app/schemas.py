@@ -1,5 +1,7 @@
 """Pydantic schemas."""
 
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any, Literal, Optional
 
@@ -41,57 +43,141 @@ class ServiceResponse(BaseModel):
     capabilities: list[dict[str, Any]]
 
 
-class CaseCreateRequest(BaseModel):
+class ReporterInfo(BaseModel):
+    name: str
+    version: str
+    type: Literal["plugin", "service", "cli", "skill", "api", "human", "other"] = "other"
+    vendor: Optional[str] = None
+    endpoint: Optional[str] = None
+    instance_id: Optional[str] = None
+
+
+class SubjectInfo(BaseModel):
+    type: str
+    locator: str
+    name: Optional[str] = None
+    version: Optional[str] = None
+
+
+class EvidenceInfo(BaseModel):
+    summary: Optional[str] = None
+    reproduction_hint: Optional[str] = None
+    references: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ArtifactItem(BaseModel):
+    artifact_id: Optional[str] = None
+    kind: Literal[
+        "file",
+        "directory",
+        "tree",
+        "json",
+        "text",
+        "binary",
+        "archive",
+        "screenshot",
+        "pcap",
+        "request_response",
+        "report",
+        "script",
+        "other",
+    ] = "other"
+    name: str
+    path: Optional[str] = None
+    media_type: Optional[str] = None
+    sha256: Optional[str] = None
+    size: int = 0
+    encoding: Optional[Literal["plain", "base64", "utf-8"]] = None
+    content: Optional[str] = None
+    content_ref: Optional[str] = None
+    children: list["ArtifactItem"] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SuspicionSubmissionRequest(BaseModel):
     project_id: str
+    report_id: Optional[str] = None
     title: str
     summary: Optional[str] = None
-    severity: str = "medium"
+    severity: Literal["critical", "high", "medium", "low"] = "medium"
+    cvss_score: float = 0.0
     confidence: int = 0
-    source_meta: dict[str, Any] = Field(default_factory=dict)
-    target_meta: dict[str, Any] = Field(default_factory=dict)
-    display_meta: dict[str, Any] = Field(default_factory=dict)
-    created_by_type: str = "human"
-    created_by: Optional[str] = None
+    state: Literal["suspected", "confirmed", "rejected"] = "suspected"
+    category: Optional[str] = None
+    rule_id: Optional[str] = None
+    rule_name: Optional[str] = None
+    fingerprint: Optional[str] = None
+    reported_at: Optional[datetime] = None
+    reporter: ReporterInfo
+    subject: SubjectInfo
+    evidence: EvidenceInfo = Field(default_factory=EvidenceInfo)
+    artifacts: list[ArtifactItem] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
-
-class PublicIntakeSubmissionRequest(BaseModel):
-    project_id: str
-    title: str
-    summary: Optional[str] = None
-    severity: str = "medium"
-    confidence: int = 0
-    source_meta: dict[str, Any] = Field(default_factory=dict)
-    target_meta: dict[str, Any] = Field(default_factory=dict)
-    display_meta: dict[str, Any] = Field(default_factory=dict)
-    reporter_type: Literal["cli", "plugin", "skill", "api", "other"] = "other"
-    reporter_name: Optional[str] = None
-    raw_payload: dict[str, Any] = Field(default_factory=dict)
-    attachments: list[dict[str, Any]] = Field(default_factory=list)
-
-    def to_case_create_request(self) -> CaseCreateRequest:
-        source_meta = dict(self.source_meta)
-        source_meta.setdefault("reporter_type", self.reporter_type)
-        source_meta.setdefault("reporter_name", self.reporter_name)
-        source_meta.setdefault("raw_payload", self.raw_payload)
-        source_meta.setdefault("attachments", self.attachments)
-        source_meta.setdefault("anonymous_submission", True)
-
-        display_meta = dict(self.display_meta)
-        display_meta.setdefault("preferred_render_type", "generic")
-
-        created_by = self.reporter_name or f"anonymous:{self.reporter_type}"
+    def to_case_create_request(
+        self,
+        *,
+        created_by_type: str,
+        created_by: Optional[str],
+        anonymous_submission: bool = False,
+    ) -> "CaseCreateRequest":
+        metadata = dict(self.metadata)
+        source_meta = dict(metadata.get("source") or {})
+        source_meta.setdefault("anonymous_submission", anonymous_submission)
+        metadata["source"] = source_meta
         return CaseCreateRequest(
             project_id=self.project_id,
+            report_id=self.report_id,
             title=self.title,
             summary=self.summary,
             severity=self.severity,
+            cvss_score=self.cvss_score,
             confidence=self.confidence,
-            source_meta=source_meta,
-            target_meta=self.target_meta,
-            display_meta=display_meta,
-            created_by_type="anonymous",
-            created_by=created_by,
+            state=self.state,
+            category=self.category,
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            fingerprint=self.fingerprint,
+            reported_at=self.reported_at,
+            reporter=self.reporter,
+            subject=self.subject,
+            evidence=self.evidence,
+            artifacts=self.artifacts,
+            metadata=metadata,
+            created_by_type=created_by_type,
+            created_by=created_by or self.reporter.name,
         )
+
+
+class CaseCreateRequest(SuspicionSubmissionRequest):
+    created_by_type: str = "human"
+    created_by: Optional[str] = None
+
+    def build_storage_payloads(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        source_meta = {
+            "report_id": self.report_id,
+            "state": self.state,
+            "category": self.category,
+            "rule_id": self.rule_id,
+            "rule_name": self.rule_name,
+            "fingerprint": self.fingerprint,
+            "reported_at": self.reported_at.isoformat() if self.reported_at else None,
+            "cvss_score": self.cvss_score,
+            "reporter": self.reporter.model_dump(mode="json"),
+        }
+        target_meta = self.subject.model_dump(mode="json")
+        display_meta = {
+            "entity_label": "疑点",
+            "preferred_render_type": "generic",
+            "evidence": self.evidence.model_dump(mode="json"),
+            "artifacts": [artifact.model_dump(mode="json") for artifact in self.artifacts],
+            "metadata": self.metadata,
+        }
+        return source_meta, target_meta, display_meta
+
+
+class PublicIntakeSubmissionRequest(SuspicionSubmissionRequest):
+    pass
 
 
 class CaseResponse(BaseModel):

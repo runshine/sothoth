@@ -28,5 +28,10 @@ data:
     # 统一网关地址。注册服务若上报 0.0.0.0 / 127.0.0.1，
     # menu 将优先通过该地址 + api_prefix 生成健康检查 URL。
     service_gateway_url: "http://secflow.sothothv2.com"
+    # K8S deployment 聚合来源。优先使用集群内 service，避免依赖 ingress。
+    k8s_service_url: "http://secflow-platform-k8s/api/k8s/platform/deployments"
+    k8s_service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+    k8s_service_namespace: "secflow-ns"
+    k8s_service_name_prefix: "secflow-"
     # 日志配置
     log_level: "INFO"

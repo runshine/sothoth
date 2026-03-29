@@ -20,6 +20,42 @@ from app.api import actions as actions_api  # noqa: E402
 from app.models.database import Base, get_db  # noqa: E402
 
 
+def make_suspicion_payload(**overrides):
+    payload = {
+        "project_id": "demo-project",
+        "report_id": "demo-report-001",
+        "title": "Demo suspicion",
+        "summary": "summary",
+        "severity": "medium",
+        "cvss_score": 5.0,
+        "confidence": 60,
+        "state": "suspected",
+        "category": "generic_issue",
+        "rule_id": "RULE-001",
+        "rule_name": "Generic Rule",
+        "fingerprint": "fp-demo-001",
+        "reporter": {
+            "name": "manual-console",
+            "version": "1.0.0",
+            "type": "human",
+        },
+        "subject": {
+            "type": "service",
+            "locator": "svc://demo",
+            "name": "demo-service",
+        },
+        "evidence": {
+            "summary": "summary",
+            "reproduction_hint": "check manually",
+            "references": [],
+        },
+        "artifacts": [],
+        "metadata": {},
+    }
+    payload.update(overrides)
+    return payload
+
+
 @pytest.fixture()
 def client():
     engine = create_engine(
@@ -76,7 +112,7 @@ def test_public_intake_catalog_downloads_and_examples(client: TestClient):
     catalog = client.get("/api/vuln/public/intake/catalog")
     assert catalog.status_code == 200
     payload = catalog.json()
-    assert payload["version"] == "1.0.0"
+    assert payload["version"] == "2.0.0"
     assert len(payload["items"]) == 4
 
     cli_download = client.get("/api/vuln/public/intake/sdk/cli")
@@ -103,20 +139,24 @@ def test_public_intake_catalog_downloads_and_examples(client: TestClient):
 def test_public_anonymous_submission_creates_case(client: TestClient):
     response = client.post(
         "/api/vuln/public/intake/submissions",
-        json={
-            "project_id": "demo-project",
-            "title": "Anonymous submission",
-            "summary": "created through public intake",
-            "severity": "high",
-            "confidence": 77,
-            "reporter_type": "cli",
-            "reporter_name": "public-ci",
-            "source_meta": {"source_service": "public-cli"},
-            "target_meta": {"asset_type": "web", "asset_locator": "/auth/login"},
-            "display_meta": {},
-            "raw_payload": {"trace_id": "anon-001"},
-            "attachments": [],
-        },
+        json=make_suspicion_payload(
+            title="Anonymous submission",
+            summary="created through public intake",
+            severity="high",
+            cvss_score=8.1,
+            confidence=77,
+            reporter={"name": "public-ci", "version": "2.3.0", "type": "cli"},
+            subject={"type": "http_endpoint", "locator": "/auth/login", "name": "login"},
+            metadata={"source": {"source_service": "public-cli"}, "tool_output": {"trace_id": "anon-001"}},
+            artifacts=[
+                {
+                    "kind": "text",
+                    "name": "stdout.txt",
+                    "content": "anonymous result",
+                    "encoding": "utf-8",
+                }
+            ],
+        ),
     )
     assert response.status_code == 200
     payload = response.json()
@@ -127,7 +167,10 @@ def test_public_anonymous_submission_creates_case(client: TestClient):
     detail = client.get(f"/api/vuln/cases/{payload['id']}")
     assert detail.status_code == 200
     assert detail.json()["created_by_type"] == "anonymous"
-    assert detail.json()["source_meta"]["anonymous_submission"] is True
+    assert detail.json()["reporter"]["name"] == "public-ci"
+    assert detail.json()["subject"]["locator"] == "/auth/login"
+    assert detail.json()["cvss_score"] == 8.1
+    assert detail.json()["metadata"]["source"]["anonymous_submission"] is True
 
 
 def test_public_routes_remain_anonymous_but_private_routes_require_auth(client: TestClient):
@@ -140,6 +183,59 @@ def test_public_routes_remain_anonymous_but_private_routes_require_auth(client: 
         assert private_response.status_code == 401
     finally:
         app.dependency_overrides[get_current_subject] = override
+
+
+def test_suspicion_submission_requires_reporter_and_subject(client: TestClient):
+    response = client.post(
+        "/api/vuln/public/intake/submissions",
+        json={
+            "project_id": "demo-project",
+            "title": "invalid submission",
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_artifacts_and_metadata_round_trip(client: TestClient):
+    response = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Artifact round trip case",
+            reporter={"name": "artifact-tester", "version": "1.1.0", "type": "human"},
+            subject={"type": "repo", "locator": "repo://demo/service", "name": "service"},
+            artifacts=[
+                {
+                    "kind": "directory",
+                    "name": "workspace",
+                    "children": [
+                        {
+                            "kind": "file",
+                            "name": "report.txt",
+                            "path": "workspace/report.txt",
+                            "content": "hello",
+                            "encoding": "utf-8",
+                        }
+                    ],
+                },
+                {
+                    "kind": "binary",
+                    "name": "sample.bin",
+                    "encoding": "base64",
+                    "content": "AAEC",
+                },
+            ],
+            metadata={
+                "source": {"source_service": "artifact-suite"},
+                "custom": {"note": "round-trip"},
+            },
+        ),
+    )
+    assert response.status_code == 200
+    detail = client.get(f"/api/vuln/cases/{response.json()['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["artifacts"][0]["children"][0]["path"] == "workspace/report.txt"
+    assert detail.json()["artifacts"][1]["encoding"] == "base64"
+    assert detail.json()["metadata"]["custom"]["note"] == "round-trip"
 
 
 def test_register_service_and_list(client: TestClient):
@@ -188,18 +284,15 @@ def test_register_service_and_list(client: TestClient):
 
 
 def test_create_case_and_timeline(client: TestClient):
-    payload = {
-        "project_id": "demo-project",
-        "title": "Demo vuln case",
-        "summary": "summary",
-        "severity": "high",
-        "confidence": 80,
-        "source_meta": {"source_service": "manual"},
-        "target_meta": {"asset_type": "web", "asset_locator": "/login"},
-        "display_meta": {"preferred_render_type": "generic"},
-        "created_by_type": "human",
-        "created_by": "tester",
-    }
+    payload = make_suspicion_payload(
+        title="Demo suspicion case",
+        severity="high",
+        cvss_score=7.5,
+        confidence=80,
+        reporter={"name": "manual-reviewer", "version": "1.0.0", "type": "human"},
+        subject={"type": "http_endpoint", "locator": "/login", "name": "login"},
+        metadata={"source": {"source_service": "manual"}},
+    )
     response = client.post("/api/vuln/cases", json=payload)
     assert response.status_code == 200
     case_id = response.json()["id"]
@@ -207,27 +300,39 @@ def test_create_case_and_timeline(client: TestClient):
     detail = client.get(f"/api/vuln/cases/{case_id}")
     assert detail.status_code == 200
     assert detail.json()["current_stage"] == "normalize"
+    assert detail.json()["reporter"]["name"] == "manual-reviewer"
+    assert detail.json()["subject"]["locator"] == "/login"
+    assert detail.json()["cvss_score"] == 7.5
 
     timeline = client.get(f"/api/vuln/cases/{case_id}/timeline")
     assert timeline.status_code == 200
     assert timeline.json()["total"] >= 2
 
 
+def test_delete_case_removes_suspicion(client: TestClient):
+    create_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Delete me",
+            reporter={"name": "deleter", "version": "1.0.0", "type": "human"},
+            subject={"type": "service", "locator": "svc://delete-me", "name": "delete-me"},
+        ),
+    )
+    assert create_resp.status_code == 200
+    case_id = create_resp.json()["id"]
+
+    delete_resp = client.delete(f"/api/vuln/cases/{case_id}")
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted_case_id"] == case_id
+
+    detail_resp = client.get(f"/api/vuln/cases/{case_id}")
+    assert detail_resp.status_code == 404
+
+
 def test_mock_dispatch_and_callback(client: TestClient):
     case_resp = client.post(
         "/api/vuln/cases",
-        json={
-            "project_id": "demo-project",
-            "title": "Callback case",
-            "summary": "summary",
-            "severity": "medium",
-            "confidence": 60,
-            "source_meta": {},
-            "target_meta": {},
-            "display_meta": {},
-            "created_by_type": "human",
-            "created_by": "tester",
-        },
+        json=make_suspicion_payload(title="Callback case"),
     )
     case_id = case_resp.json()["id"]
 
@@ -303,18 +408,15 @@ def test_dashboard_manual_task_and_decision_flow(client: TestClient):
 
     case_resp = client.post(
         "/api/vuln/cases",
-        json={
-            "project_id": "demo-project",
-            "title": "Ops case",
-            "summary": "ops summary",
-            "severity": "high",
-            "confidence": 90,
-            "source_meta": {"source_service": "manual"},
-            "target_meta": {"asset_type": "service", "asset_locator": "svc://demo"},
-            "display_meta": {},
-            "created_by_type": "human",
-            "created_by": "tester",
-        },
+        json=make_suspicion_payload(
+            title="Ops case",
+            summary="ops summary",
+            severity="high",
+            confidence=90,
+            reporter={"name": "ops-console", "version": "1.0.0", "type": "human"},
+            subject={"type": "service", "locator": "svc://demo", "name": "demo"},
+            metadata={"source": {"source_service": "manual"}},
+        ),
     )
     assert case_resp.status_code == 200
     case_id = case_resp.json()["id"]
@@ -393,18 +495,7 @@ def test_dashboard_manual_task_and_decision_flow(client: TestClient):
 def test_failed_result_creates_automation_manual_task(client: TestClient):
     case_resp = client.post(
         "/api/vuln/cases",
-        json={
-            "project_id": "demo-project",
-            "title": "Automation follow-up case",
-            "summary": "summary",
-            "severity": "medium",
-            "confidence": 60,
-            "source_meta": {},
-            "target_meta": {},
-            "display_meta": {},
-            "created_by_type": "human",
-            "created_by": "tester",
-        },
+        json=make_suspicion_payload(title="Automation follow-up case"),
     )
     case_id = case_resp.json()["id"]
 
@@ -445,18 +536,7 @@ def test_failed_result_creates_automation_manual_task(client: TestClient):
 def test_low_confidence_success_creates_manual_review_task(client: TestClient):
     case_resp = client.post(
         "/api/vuln/cases",
-        json={
-            "project_id": "demo-project",
-            "title": "Low confidence follow-up case",
-            "summary": "summary",
-            "severity": "medium",
-            "confidence": 60,
-            "source_meta": {},
-            "target_meta": {},
-            "display_meta": {},
-            "created_by_type": "human",
-            "created_by": "tester",
-        },
+        json=make_suspicion_payload(title="Low confidence follow-up case"),
     )
     case_id = case_resp.json()["id"]
 
@@ -517,18 +597,11 @@ def test_recommended_actions_marks_active_service_action_pair(client: TestClient
 
     case_resp = client.post(
         "/api/vuln/cases",
-        json={
-            "project_id": "demo-project",
-            "title": "Recommendation case",
-            "summary": "summary",
-            "severity": "high",
-            "confidence": 80,
-            "source_meta": {},
-            "target_meta": {},
-            "display_meta": {},
-            "created_by_type": "human",
-            "created_by": "tester",
-        },
+        json=make_suspicion_payload(
+            title="Recommendation case",
+            severity="high",
+            confidence=80,
+        ),
     )
     case_id = case_resp.json()["id"]
 

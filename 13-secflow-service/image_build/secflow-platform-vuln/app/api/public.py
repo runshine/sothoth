@@ -68,7 +68,7 @@ def _catalog_payload(request: Request) -> dict:
     openapi_path = SDK_DIRS["openapi"] / "anonymous-intake-openapi.json"
 
     return {
-        "version": "1.0.0",
+        "version": "2.0.0",
         "anonymous_submission_endpoint": str(request.url_for("submit_anonymous_submission")),
         "items": [
             {
@@ -178,7 +178,14 @@ async def get_public_example(kind: str):
 
 @router.post("/intake/submissions", name="submit_anonymous_submission")
 async def submit_anonymous_submission(request: PublicIntakeSubmissionRequest, db: Session = Depends(get_db)):
-    item = create_case_with_runtime(db, request.to_case_create_request())
+    item = create_case_with_runtime(
+        db,
+        request.to_case_create_request(
+            created_by_type="anonymous",
+            created_by=request.reporter.name,
+            anonymous_submission=True,
+        ),
+    )
     return {
         "id": item.id,
         "project_id": item.project_id,

@@ -1,24 +1,48 @@
 {
   "project_id": "44f9029d00650a10",
-  "title": "Anonymous CLI vulnerability submission",
+  "report_id": "cli-demo-001",
+  "title": "Anonymous CLI suspicion submission",
   "summary": "Discovered by CLI automation pipeline",
   "severity": "high",
+  "cvss_score": 8.2,
   "confidence": 82,
-  "reporter_type": "cli",
-  "reporter_name": "daily-pipeline",
-  "source_meta": {
-    "source_service": "cli-demo",
-    "source_kind": "script"
+  "state": "suspected",
+  "category": "http_security_issue",
+  "rule_id": "CLI-DEMO-001",
+  "rule_name": "CLI Demo Rule",
+  "fingerprint": "cli-demo-fp-001",
+  "reporter": {
+    "name": "daily-pipeline",
+    "version": "1.0.0",
+    "type": "cli",
+    "vendor": "secflow"
   },
-  "target_meta": {
-    "asset_type": "http",
-    "asset_locator": "https://demo.example/api/login"
+  "subject": {
+    "type": "http_endpoint",
+    "locator": "https://demo.example/api/login",
+    "name": "login api"
   },
-  "display_meta": {
-    "preferred_render_type": "generic"
+  "evidence": {
+    "summary": "CLI pipeline observed a suspicious login flow",
+    "reproduction_hint": "Replay the request in the same environment",
+    "references": []
   },
-  "raw_payload": {
-    "finding_id": "demo-cli-001"
-  },
-  "attachments": []
+  "artifacts": [
+    {
+      "kind": "json",
+      "name": "scanner-output.json",
+      "media_type": "application/json",
+      "encoding": "utf-8",
+      "content": "{\"finding_id\":\"demo-cli-001\"}"
+    }
+  ],
+  "metadata": {
+    "source": {
+      "source_service": "cli-demo",
+      "source_kind": "script"
+    },
+    "runtime": {
+      "pipeline": "daily-security-job"
+    }
+  }
 }

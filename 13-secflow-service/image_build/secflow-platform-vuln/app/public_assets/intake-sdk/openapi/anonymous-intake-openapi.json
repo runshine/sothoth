@@ -1,19 +1,19 @@
 {
   "openapi": "3.0.3",
   "info": {
-    "title": "SecFlow Vulnerability Anonymous Intake API",
-    "version": "1.0.0"
+    "title": "SecFlow Suspicion Anonymous Intake API",
+    "version": "2.0.0"
   },
   "paths": {
     "/api/vuln/public/intake/submissions": {
       "post": {
-        "summary": "Anonymous vulnerability submission",
+        "summary": "Anonymous suspicion submission",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PublicIntakeSubmissionRequest"
+                "$ref": "#/components/schemas/SuspicionSubmissionRequest"
               }
             }
           }
@@ -35,29 +35,103 @@
   },
   "components": {
     "schemas": {
-      "PublicIntakeSubmissionRequest": {
+      "ReporterInfo": {
         "type": "object",
-        "required": ["project_id", "title"],
+        "required": ["name", "version", "type"],
         "properties": {
-          "project_id": { "type": "string" },
-          "title": { "type": "string" },
-          "summary": { "type": "string" },
-          "severity": { "type": "string", "default": "medium" },
-          "confidence": { "type": "integer", "default": 0 },
-          "reporter_type": {
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "type": {
             "type": "string",
-            "enum": ["cli", "plugin", "skill", "api", "other"],
-            "default": "other"
+            "enum": ["plugin", "service", "cli", "skill", "api", "human", "other"]
           },
-          "reporter_name": { "type": "string" },
-          "source_meta": { "type": "object" },
-          "target_meta": { "type": "object" },
-          "display_meta": { "type": "object" },
-          "raw_payload": { "type": "object" },
-          "attachments": {
+          "vendor": { "type": "string" },
+          "endpoint": { "type": "string" },
+          "instance_id": { "type": "string" }
+        }
+      },
+      "SubjectInfo": {
+        "type": "object",
+        "required": ["type", "locator"],
+        "properties": {
+          "type": { "type": "string" },
+          "locator": { "type": "string" },
+          "name": { "type": "string" },
+          "version": { "type": "string" }
+        }
+      },
+      "EvidenceInfo": {
+        "type": "object",
+        "properties": {
+          "summary": { "type": "string" },
+          "reproduction_hint": { "type": "string" },
+          "references": {
             "type": "array",
             "items": { "type": "object" }
           }
+        }
+      },
+      "ArtifactItem": {
+        "type": "object",
+        "required": ["kind", "name"],
+        "properties": {
+          "artifact_id": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["file", "directory", "tree", "json", "text", "binary", "archive", "screenshot", "pcap", "request_response", "report", "script", "other"]
+          },
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "media_type": { "type": "string" },
+          "sha256": { "type": "string" },
+          "size": { "type": "integer", "default": 0 },
+          "encoding": { "type": "string", "enum": ["plain", "base64", "utf-8"] },
+          "content": { "type": "string" },
+          "content_ref": { "type": "string" },
+          "children": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ArtifactItem" }
+          },
+          "metadata": { "type": "object" }
+        }
+      },
+      "SuspicionSubmissionRequest": {
+        "type": "object",
+        "required": ["project_id", "title", "reporter", "subject"],
+        "properties": {
+          "project_id": { "type": "string" },
+          "report_id": { "type": "string" },
+          "title": { "type": "string" },
+          "summary": { "type": "string" },
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "high", "medium", "low"],
+            "default": "medium"
+          },
+          "cvss_score": {
+            "type": "number",
+            "format": "float",
+            "default": 0
+          },
+          "confidence": { "type": "integer", "default": 0 },
+          "state": {
+            "type": "string",
+            "enum": ["suspected", "confirmed", "rejected"],
+            "default": "suspected"
+          },
+          "category": { "type": "string" },
+          "rule_id": { "type": "string" },
+          "rule_name": { "type": "string" },
+          "fingerprint": { "type": "string" },
+          "reported_at": { "type": "string", "format": "date-time" },
+          "reporter": { "$ref": "#/components/schemas/ReporterInfo" },
+          "subject": { "$ref": "#/components/schemas/SubjectInfo" },
+          "evidence": { "$ref": "#/components/schemas/EvidenceInfo" },
+          "artifacts": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ArtifactItem" }
+          },
+          "metadata": { "type": "object" }
         }
       }
     }
