@@ -809,9 +809,19 @@ class AppWorkflowCreate(BaseModel):
     timeout_seconds: Optional[int] = Field(None, ge=1, description="超时时间（秒）")
 
     # Ingress配置（可选）
+    create_ingress: bool = Field(default=False, description="是否自动创建 Ingress")
     ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
     ingress_host: Optional[str] = Field(None, description="Ingress域名 (例如: myapp.example.com)")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller外部IP地址")
+
+    @model_validator(mode='after')
+    def validate_ingress_config(self):
+        if self.create_ingress:
+            if not self.ingress_type:
+                self.ingress_type = "nginx"
+            if self.ingress_type != "nginx":
+                raise ValueError("ingress_type must be nginx when create_ingress is True")
+        return self
 
 
 class AppWorkflowUpdate(BaseModel):
@@ -830,9 +840,19 @@ class AppWorkflowUpdate(BaseModel):
     timeout_seconds: Optional[int] = Field(None, ge=1)
 
     # Ingress配置（可选）
+    create_ingress: Optional[bool] = Field(None, description="是否自动创建 Ingress")
     ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
     ingress_host: Optional[str] = Field(None, description="Ingress域名")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller外部IP地址")
+
+    @model_validator(mode='after')
+    def validate_ingress_config(self):
+        if self.create_ingress is True:
+            if not self.ingress_type:
+                self.ingress_type = "nginx"
+            if self.ingress_type != "nginx":
+                raise ValueError("ingress_type must be nginx when create_ingress is True")
+        return self
 
 
 class AppWorkflowNodeResponse(BaseModel):

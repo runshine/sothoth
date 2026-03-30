@@ -267,8 +267,8 @@ async def create_app_workflow(
         "resources": workflow_data.resources.model_dump() if workflow_data.resources and hasattr(workflow_data.resources, 'model_dump') else (workflow_data.resources.dict() if workflow_data.resources else None),
         "replicas": workflow_data.replicas,
         "timeout_seconds": workflow_data.timeout_seconds,
-        "create_ingress": bool(workflow_data.ingress_type and workflow_data.ingress_host),
-        "ingress_type": workflow_data.ingress_type,
+        "create_ingress": workflow_data.create_ingress,
+        "ingress_type": workflow_data.ingress_type if workflow_data.create_ingress else None,
         "ingress_host": workflow_data.ingress_host,
         "ingress_ip": workflow_data.ingress_ip,
     }
@@ -305,9 +305,9 @@ async def create_app_workflow(
         volume_mounts=[v.model_dump() if hasattr(v, 'model_dump') else v.dict() for v in workflow_data.volume_mounts] if workflow_data.volume_mounts else [],
         resources=workflow_data.resources.model_dump() if workflow_data.resources and hasattr(workflow_data.resources, 'model_dump') else (workflow_data.resources.dict() if workflow_data.resources else None),
         timeout_seconds=workflow_data.timeout_seconds,
-        ingress_type=workflow_data.ingress_type,
-        ingress_host=workflow_data.ingress_host,
-        ingress_ip=workflow_data.ingress_ip,
+        ingress_type=workflow_data.ingress_type if workflow_data.create_ingress else None,
+        ingress_host=workflow_data.ingress_host if workflow_data.create_ingress else None,
+        ingress_ip=workflow_data.ingress_ip if workflow_data.create_ingress else None,
     )
     db.add(node_instance)
     db.commit()
@@ -664,6 +664,15 @@ async def update_app_workflow(
     if workflow_data.timeout_seconds is not None:
         node.timeout_seconds = workflow_data.timeout_seconds
         node_config["timeout_seconds"] = workflow_data.timeout_seconds
+    if workflow_data.create_ingress is not None:
+        node_config["create_ingress"] = workflow_data.create_ingress
+        if workflow_data.create_ingress is False:
+            node.ingress_type = None
+            node.ingress_host = None
+            node.ingress_ip = None
+            node_config["ingress_type"] = None
+            node_config["ingress_host"] = None
+            node_config["ingress_ip"] = None
     if workflow_data.ingress_type is not None:
         node.ingress_type = workflow_data.ingress_type
         node_config["ingress_type"] = workflow_data.ingress_type
@@ -674,7 +683,8 @@ async def update_app_workflow(
         node.ingress_ip = workflow_data.ingress_ip
         node_config["ingress_ip"] = workflow_data.ingress_ip
     if any(value is not None for value in (workflow_data.ingress_type, workflow_data.ingress_host, workflow_data.ingress_ip)):
-        node_config["create_ingress"] = bool(node_config.get("ingress_type") and node_config.get("ingress_host"))
+        if node_config.get("create_ingress") is not False:
+            node_config["create_ingress"] = bool(node_config.get("ingress_type"))
 
     latest_create_ingress = node_config.get(
         "create_ingress",
