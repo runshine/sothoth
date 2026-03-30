@@ -46,6 +46,10 @@ class BackendRuntimeService:
                 'env_keys': self.registry.env_keys(name),
                 'env': cfg.get('env', {}),
                 'capabilities': adapter.capabilities(),
+                'llm_provider_key': cfg.get('llm_provider_key'),
+                'llm_provider_snapshot': cfg.get('llm_provider_snapshot') if isinstance(cfg.get('llm_provider_snapshot'), dict) else None,
+                'llm_provider_applied_at': cfg.get('llm_provider_applied_at'),
+                'llm_provider_mapped_env_keys': list(cfg.get('llm_provider_mapped_env_keys', []) or []),
             })
         return {
             'default_backend': data.get('default_backend'),
@@ -71,6 +75,10 @@ class BackendRuntimeService:
             'env_keys': self.registry.env_keys(name),
             'env': cfg.get('env', {}),
             'capabilities': adapter.capabilities(),
+            'llm_provider_key': cfg.get('llm_provider_key'),
+            'llm_provider_snapshot': cfg.get('llm_provider_snapshot') if isinstance(cfg.get('llm_provider_snapshot'), dict) else None,
+            'llm_provider_applied_at': cfg.get('llm_provider_applied_at'),
+            'llm_provider_mapped_env_keys': list(cfg.get('llm_provider_mapped_env_keys', []) or []),
         }
 
     def upsert_backend(self, name: str, payload: Dict[str, Any]) -> Dict[str, Any]:

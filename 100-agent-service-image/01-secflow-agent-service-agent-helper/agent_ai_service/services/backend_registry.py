@@ -82,6 +82,7 @@ class BackendRegistry:
         backends = data.setdefault('backends', {})
         existing = backends.get(name, {})
         merged = {
+            **existing,
             'name': name,
             'backend_type': payload.get('backend_type', existing.get('backend_type', existing.get('name', name))),
             'command': payload.get(
@@ -93,6 +94,10 @@ class BackendRegistry:
             'enabled': bool(payload.get('enabled', existing.get('enabled', True))),
             'cwd': payload.get('cwd', existing.get('cwd')),
             'description': payload.get('description', existing.get('description', '')),
+            'llm_provider_key': payload.get('llm_provider_key', existing.get('llm_provider_key')),
+            'llm_provider_snapshot': payload.get('llm_provider_snapshot', existing.get('llm_provider_snapshot')),
+            'llm_provider_applied_at': payload.get('llm_provider_applied_at', existing.get('llm_provider_applied_at')),
+            'llm_provider_mapped_env_keys': payload.get('llm_provider_mapped_env_keys', existing.get('llm_provider_mapped_env_keys', [])),
         }
         backends[name] = merged
         self.store.write(data)
@@ -135,12 +140,16 @@ class BackendRegistry:
         cfg = self.get(name)
         if not cfg:
             raise KeyError(name)
-        if 'backend_type' not in cfg:
-            cfg = {
-                **cfg,
-                'backend_type': cfg.get('name', name),
-            }
-        return BackendConfig(**cfg)
+        return BackendConfig(
+            name=name,
+            backend_type=cfg.get('backend_type', cfg.get('name', name)),
+            command=cfg.get('command', cfg.get('backend_type', name)),
+            args=list(cfg.get('args', []) or []),
+            env=dict(cfg.get('env', {}) or {}),
+            enabled=bool(cfg.get('enabled', True)),
+            cwd=cfg.get('cwd'),
+            description=cfg.get('description', ''),
+        )
 
     def env_keys(self, name: str) -> List[str]:
         cfg = self.get(name) or {}

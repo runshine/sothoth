@@ -22,6 +22,10 @@ def _to_agent(detail):
         'installed': bool(detail.get('installed', False)),
         'pid': detail.get('pid'),
         'description': detail.get('description', ''),
+        'llm_provider_key': detail.get('llm_provider_key'),
+        'llm_provider_snapshot': detail.get('llm_provider_snapshot') if isinstance(detail.get('llm_provider_snapshot'), dict) else None,
+        'llm_provider_applied_at': detail.get('llm_provider_applied_at'),
+        'llm_provider_mapped_env_keys': list(detail.get('llm_provider_mapped_env_keys', []) or []),
         'health': {
             'status': 'healthy' if detail.get('installed') else 'unavailable',
             'running': bool(detail.get('running', False)),
