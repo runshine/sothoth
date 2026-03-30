@@ -21,6 +21,8 @@
   "nacos_namespace": "public",
   "nacos_username": "nacos",
   "nacos_password": "nacos",
+  "configcenter_service_url": "http://secflow-platform-configcenter",
+  "configcenter_service_timeout_sec": 15,
   "auth_service_url": "http://secflow-platform-auth",
   "service_machine_token": "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8",
   "registry": {

@@ -247,6 +247,44 @@ class EnhancedTemplateManager:
         if not isinstance(presets, list):
             return normalized
 
+    def _normalize_default_llm_provider_binding(self, binding: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(binding, dict):
+            return None
+        raw_provider_keys = binding.get('provider_keys')
+        if not isinstance(raw_provider_keys, list):
+            raw_provider_keys = []
+        provider_keys: List[str] = []
+        seen = set()
+        for item in raw_provider_keys:
+            text = str(item or '').strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            provider_keys.append(text)
+
+        raw_targets = binding.get('target_services', '*')
+        if raw_targets == '*' or raw_targets is None:
+            target_services: Union[str, List[str]] = '*'
+        elif isinstance(raw_targets, list):
+            target_seen = set()
+            target_services = []
+            for item in raw_targets:
+                text = str(item or '').strip()
+                if not text or text in target_seen:
+                    continue
+                target_seen.add(text)
+                target_services.append(text)
+        else:
+            target_services = '*'
+
+        if not provider_keys:
+            return None
+        return {
+            'provider_keys': provider_keys,
+            'target_services': target_services,
+            'updated_at': datetime.now().isoformat(),
+        }
+
         for item in presets:
             if not isinstance(item, dict):
                 continue
@@ -1516,7 +1554,8 @@ class EnhancedTemplateManager:
                         file_content: bytes, filename: str, created_by: str,
                         visibility: str = 'shared', owner_id: str = '', owner_name: str = '',
                         web_port_presets: Optional[List[Dict[str, Any]]] = None,
-                        tags: Optional[List[str]] = None) -> Tuple[bool, str]:
+                        tags: Optional[List[str]] = None,
+                        default_llm_provider_binding: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """创建模板（增强版，支持多种压缩格式）"""
         template_dir = None
         file_path = None
@@ -1666,6 +1705,9 @@ class EnhancedTemplateManager:
             if web_port_presets is not None:
                 metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
             metadata['tags'] = self._normalize_template_tags(tags)
+            normalized_llm_binding = self._normalize_default_llm_provider_binding(default_llm_provider_binding)
+            if normalized_llm_binding is not None:
+                metadata['default_llm_provider_binding'] = normalized_llm_binding
 
             if template_type == 'archive' and found_yaml:
                 metadata['main_yaml_file'] = str(found_yaml.relative_to(template_dir))
@@ -2599,6 +2641,7 @@ class EnhancedTemplateManager:
                               visibility: Optional[str] = None,
                               web_port_presets: Optional[List[Dict[str, Any]]] = None,
                               tags: Optional[List[str]] = None,
+                              default_llm_provider_binding: Optional[Dict[str, Any]] = None,
                               updated_by: str = '') -> Tuple[bool, str, Optional[Dict]]:
         """更新模板基础信息（支持重命名）"""
         try:
@@ -2650,6 +2693,12 @@ class EnhancedTemplateManager:
                 metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
             if tags is not None:
                 metadata['tags'] = self._normalize_template_tags(tags)
+            if default_llm_provider_binding is not None:
+                normalized_llm_binding = self._normalize_default_llm_provider_binding(default_llm_provider_binding)
+                if normalized_llm_binding is None:
+                    metadata.pop('default_llm_provider_binding', None)
+                else:
+                    metadata['default_llm_provider_binding'] = normalized_llm_binding
 
             table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':
@@ -2708,7 +2757,8 @@ class EnhancedTemplateManager:
                 owner_id=owner_id,
                 owner_name=owner_name,
                 web_port_presets=source_meta.get('web_port_presets'),
-                tags=self._normalize_template_tags(source_meta.get('tags'))
+                tags=self._normalize_template_tags(source_meta.get('tags')),
+                default_llm_provider_binding=source_meta.get('default_llm_provider_binding'),
             )
         except Exception as e:
             self.logger.error(f"复制模板失败: {str(e)}", exc_info=True)

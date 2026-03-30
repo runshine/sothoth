@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
     'redis_strict_mode': False,  # 多副本场景下要求Redis可用，否则分布式锁直接失败
     'nacos_url': 'http://localhost:8848',
     'nacos_namespace': 'public',
+    'configcenter_service_url': 'http://secflow-platform-configcenter',
+    'configcenter_service_timeout_sec': 15,
     'k8s_service_url': 'http://secflow-platform-k8s:10010',
     'k8s_service_timeout_sec': 15,
     'registry': {

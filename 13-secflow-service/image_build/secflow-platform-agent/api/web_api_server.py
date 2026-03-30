@@ -144,6 +144,8 @@ class WebAPIServer:
         self.daemon_read_timeout_sec = int(config.get('daemon_read_timeout_sec', 8))
         self.agent_ttyd_port = int(config.get('agent_ttyd_port', 11198))
         self.ttyd_probe_timeout_sec = int(config.get('ttyd_probe_timeout_sec', 3))
+        self.configcenter_service_url = (config.get('configcenter_service_url') or 'http://secflow-platform-configcenter').rstrip('/')
+        self.configcenter_service_timeout_sec = int(config.get('configcenter_service_timeout_sec', 15))
         self.k8s_service_url = (config.get('k8s_service_url') or '').rstrip('/')
         self.k8s_service_timeout_sec = int(config.get('k8s_service_timeout_sec', 15))
         self.service_machine_token = config.get('service_machine_token')
@@ -164,6 +166,7 @@ class WebAPIServer:
         self.logger.info(f"Agent API超时配置: {agent_api_timeouts}")
         self.logger.info(f"Daemon API快速失败超时: {self.daemon_read_timeout_sec}s")
         self.logger.info(f"Agent TTYD端口: {self.agent_ttyd_port}, 探测超时: {self.ttyd_probe_timeout_sec}s")
+        self.logger.info(f"ConfigCenter服务地址: {self.configcenter_service_url}, 超时: {self.configcenter_service_timeout_sec}s")
         self.logger.info(f"K8S服务地址: {self.k8s_service_url}, 超时: {self.k8s_service_timeout_sec}s")
         self.logger.info(f"代理功能: 已启用")
 
@@ -291,6 +294,30 @@ class WebAPIServer:
             json=payload,
             headers=req_headers,
             timeout=(5, self.k8s_service_timeout_sec)
+        )
+
+    def _call_configcenter_service(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> requests.Response:
+        if not self.configcenter_service_url:
+            raise ValueError("configcenter_service_url未配置")
+        url = f"{self.configcenter_service_url}{path}"
+        headers: Dict[str, str] = {}
+        if self.service_machine_token:
+            headers['Authorization'] = f"Bearer {self.service_machine_token}"
+        if payload is not None:
+            headers['Content-Type'] = 'application/json'
+        return requests.request(
+            method=method.upper(),
+            url=url,
+            params=params or None,
+            json=payload,
+            headers=headers,
+            timeout=(5, self.configcenter_service_timeout_sec),
         )
 
     def _resolve_request_ws_scheme(self) -> str:
@@ -873,6 +900,338 @@ class WebAPIServer:
 
     def _has_ai_helper_tag(self, tags: Any) -> bool:
         return 'AI_AGENT_HELPER' in self._normalize_service_tags(tags)
+
+    def _load_configcenter_payload(self, response: requests.Response) -> Dict[str, Any]:
+        try:
+            payload = response.json() if response.content else {}
+        except Exception:
+            payload = {'raw': response.text}
+        if response.status_code >= 300:
+            message = payload.get('detail') or payload.get('error') or payload.get('message') or payload.get('raw') or response.text
+            raise ValueError(f'ConfigCenter请求失败: {response.status_code} {message}')
+        return payload if isinstance(payload, dict) else {}
+
+    def _list_service_llm_providers(self) -> Dict[str, Any]:
+        response = self._call_configcenter_service('GET', '/api/configcenter/service/llm/providers')
+        return self._load_configcenter_payload(response)
+
+    def _get_service_llm_provider(self, provider_key: str) -> Dict[str, Any]:
+        response = self._call_configcenter_service(
+            'GET',
+            f"/api/configcenter/service/llm/providers/{quote(provider_key, safe='')}",
+        )
+        return self._load_configcenter_payload(response)
+
+    def _stringify_env_value(self, value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+
+    def _build_llm_provider_snapshot(self, provider: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'provider_key': provider.get('provider_key'),
+            'display_name': provider.get('display_name'),
+            'provider_type': provider.get('provider_type'),
+            'model': provider.get('model'),
+            'api_base': provider.get('api_base'),
+            'updated_at': provider.get('updated_at'),
+            'description': provider.get('description'),
+        }
+
+    def _build_llm_provider_env(self, provider: Dict[str, Any], backend_type: str) -> Dict[str, str]:
+        provider_type = str(provider.get('provider_type') or '').strip().lower()
+        backend_type = str(backend_type or '').strip().lower()
+        env: Dict[str, str] = {}
+
+        def put(key: str, value: Any):
+            text = self._stringify_env_value(value)
+            if text is not None and str(key or '').strip():
+                env[str(key).strip()] = text
+
+        if provider_type in ('openai-compatible', 'deepseek', 'qwen', 'moonshot', 'custom'):
+            put('OPENAI_API_KEY', provider.get('api_key'))
+            put('OPENAI_BASE_URL', provider.get('api_base'))
+            put('OPENAI_MODEL', provider.get('model'))
+            put('OPENAI_ORG_ID', provider.get('organization'))
+            put('OPENAI_API_VERSION', provider.get('api_version'))
+            put('OPENAI_TIMEOUT_SECONDS', provider.get('timeout_seconds'))
+            put('OPENAI_MAX_TOKENS', provider.get('max_tokens'))
+            put('OPENAI_TEMPERATURE', provider.get('temperature'))
+        elif provider_type == 'azure-openai':
+            put('AZURE_OPENAI_API_KEY', provider.get('api_key'))
+            put('AZURE_OPENAI_ENDPOINT', provider.get('api_base'))
+            put('AZURE_OPENAI_API_VERSION', provider.get('api_version'))
+            put('AZURE_OPENAI_MODEL', provider.get('model'))
+            put('AZURE_OPENAI_TIMEOUT_SECONDS', provider.get('timeout_seconds'))
+            put('AZURE_OPENAI_MAX_TOKENS', provider.get('max_tokens'))
+            put('AZURE_OPENAI_TEMPERATURE', provider.get('temperature'))
+        elif provider_type == 'anthropic':
+            put('ANTHROPIC_API_KEY', provider.get('api_key'))
+            put('ANTHROPIC_BASE_URL', provider.get('api_base'))
+            put('ANTHROPIC_MODEL', provider.get('model'))
+            put('ANTHROPIC_TIMEOUT_SECONDS', provider.get('timeout_seconds'))
+            put('ANTHROPIC_MAX_TOKENS', provider.get('max_tokens'))
+            put('ANTHROPIC_TEMPERATURE', provider.get('temperature'))
+        elif provider_type == 'ollama':
+            put('OLLAMA_BASE_URL', provider.get('api_base'))
+            put('OLLAMA_MODEL', provider.get('model'))
+            put('OLLAMA_TIMEOUT_SECONDS', provider.get('timeout_seconds'))
+        else:
+            put('OPENAI_API_KEY', provider.get('api_key'))
+            put('OPENAI_BASE_URL', provider.get('api_base'))
+            put('OPENAI_MODEL', provider.get('model'))
+
+        env_bindings = provider.get('env_bindings') if isinstance(provider.get('env_bindings'), dict) else {}
+        for key, value in env_bindings.items():
+            put(str(key), value)
+
+        if backend_type in ('claude', 'claude-a2a') and provider_type == 'anthropic':
+            put('ANTHROPIC_AUTH_TOKEN', provider.get('api_key'))
+        if backend_type in ('codex', 'opencode') and provider_type == 'azure-openai':
+            put('OPENAI_API_KEY', provider.get('api_key'))
+            put('OPENAI_BASE_URL', provider.get('api_base'))
+            put('OPENAI_API_VERSION', provider.get('api_version'))
+            put('OPENAI_MODEL', provider.get('model'))
+
+        return env
+
+    def _merge_llm_provider_binding(
+        self,
+        provider_keys: List[str],
+        target_services: Any = '*',
+        source: str = 'deployment_override',
+    ) -> Dict[str, Any]:
+        normalized_provider_keys: List[str] = []
+        seen = set()
+        provider_snapshots: List[Dict[str, Any]] = []
+        merged_env: Dict[str, str] = {}
+
+        for item in provider_keys or []:
+            provider_key = str(item or '').strip()
+            if not provider_key or provider_key in seen:
+                continue
+            seen.add(provider_key)
+            provider = self._get_service_llm_provider(provider_key)
+            normalized_provider_keys.append(provider_key)
+            provider_snapshots.append(self._build_llm_provider_snapshot(provider))
+            merged_env.update(self._build_llm_provider_env(provider, ''))
+
+        if target_services == '*' or target_services is None:
+            normalized_targets: Union[str, List[str]] = '*'
+        else:
+            target_seen = set()
+            normalized_targets = []
+            for item in target_services or []:
+                text = str(item or '').strip()
+                if not text or text in target_seen:
+                    continue
+                target_seen.add(text)
+                normalized_targets.append(text)
+
+        return {
+            'provider_keys': normalized_provider_keys,
+            'target_services': normalized_targets,
+            'source': source,
+            'provider_snapshots': provider_snapshots,
+            'merged_env': merged_env,
+            'mapped_env_keys': sorted(merged_env.keys()),
+            'updated_at': datetime.utcnow().isoformat(),
+        }
+
+    def _extract_template_service_names(self, template: Dict[str, Any]) -> List[str]:
+        metadata = template.get('metadata') or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        parsed_compose = metadata.get('parsed_compose') if isinstance(metadata, dict) else None
+        services = parsed_compose.get('services') if isinstance(parsed_compose, dict) else None
+        if isinstance(services, dict) and services:
+            return [str(name) for name in services.keys()]
+        return []
+
+    def _normalize_template_llm_binding(
+        self,
+        raw_binding: Any,
+        allowed_services: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw_binding, dict):
+            return None
+        provider_keys_raw = raw_binding.get('provider_keys')
+        if not isinstance(provider_keys_raw, list):
+            provider_keys_raw = []
+        provider_keys: List[str] = []
+        seen = set()
+        for item in provider_keys_raw:
+            text = str(item or '').strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            provider_keys.append(text)
+        if not provider_keys:
+            return None
+
+        target_services_raw = raw_binding.get('target_services', '*')
+        if target_services_raw == '*' or target_services_raw is None:
+            target_services: Union[str, List[str]] = '*'
+        elif isinstance(target_services_raw, list):
+            target_seen = set()
+            target_services = []
+            for item in target_services_raw:
+                text = str(item or '').strip()
+                if not text or text in target_seen:
+                    continue
+                target_seen.add(text)
+                target_services.append(text)
+        else:
+            target_services = '*'
+
+        if allowed_services is not None and target_services != '*':
+            missing = [name for name in target_services if name not in allowed_services]
+            if missing:
+                raise ValueError(f"目标服务不存在: {', '.join(missing)}")
+
+        return {
+            'provider_keys': provider_keys,
+            'target_services': target_services,
+            'updated_at': datetime.utcnow().isoformat(),
+        }
+
+    def _resolve_template_default_llm_binding(self, template: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        metadata = template.get('metadata') or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        return self._normalize_template_llm_binding(
+            metadata.get('default_llm_provider_binding') if isinstance(metadata, dict) else None,
+            allowed_services=self._extract_template_service_names(template),
+        )
+
+    def _prepare_deploy_extra_params(
+        self,
+        project_id: str,
+        template_name: str,
+        extra_params: Any,
+    ) -> Dict[str, Any]:
+        prepared = dict(extra_params or {}) if isinstance(extra_params, dict) else {}
+        template = self.template_manager.get_template(template_name)
+        if not template:
+            return prepared
+
+        default_binding = self._resolve_template_default_llm_binding(template)
+        override_binding = self._normalize_template_llm_binding(
+            prepared.get('llm_provider_binding'),
+            allowed_services=self._extract_template_service_names(template),
+        )
+        effective_binding = override_binding or default_binding
+        if effective_binding:
+            source = 'deployment_override' if override_binding else 'template_default'
+            prepared['llm_provider_binding'] = {
+                'provider_keys': effective_binding.get('provider_keys', []),
+                'target_services': effective_binding.get('target_services', '*'),
+                'source': source,
+            }
+            prepared['resolved_llm_provider_binding'] = self._merge_llm_provider_binding(
+                effective_binding.get('provider_keys', []),
+                effective_binding.get('target_services', '*'),
+                source=source,
+            )
+        return prepared
+
+    def _get_ai_helper_agent_detail(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        agent_id: str,
+    ) -> Dict[str, Any]:
+        data, status_code = self._call_ai_helper_api(
+            project_id,
+            agent_key,
+            service_name,
+            'GET',
+            f"/api/ai-agents/{quote(agent_id, safe='')}",
+            None,
+            timeout=(5, 30),
+        )
+        if status_code >= 300 or not isinstance(data, dict):
+            raise ValueError(f'AI Agent读取失败: {data}')
+        return data
+
+    def _apply_llm_provider_to_ai_agent(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        agent_id: str,
+        provider_key: str,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
+        current_agent = self._get_ai_helper_agent_detail(project_id, agent_key, service_name, agent_id)
+        provider_key = str(provider_key or current_agent.get('llm_provider_key') or '').strip()
+        if not provider_key:
+            raise ValueError('provider_key is required')
+
+        provider = self._get_service_llm_provider(provider_key)
+        backend_type = str(current_agent.get('backend_type') or '').strip()
+        mapped_env = self._build_llm_provider_env(provider, backend_type)
+        previous_env = current_agent.get('env') if isinstance(current_agent.get('env'), dict) else {}
+        previous_mapped_keys = [str(item) for item in (current_agent.get('llm_provider_mapped_env_keys') or []) if str(item).strip()]
+
+        merged_env = {
+            str(key): self._stringify_env_value(value) or ''
+            for key, value in previous_env.items()
+            if str(key) not in previous_mapped_keys
+        }
+        merged_env.update(mapped_env)
+
+        payload = {
+            'name': agent_id,
+            'backend_type': current_agent.get('backend_type'),
+            'command': current_agent.get('command'),
+            'args': current_agent.get('args') if isinstance(current_agent.get('args'), list) else [],
+            'env': merged_env,
+            'enabled': bool(current_agent.get('enabled', True)),
+            'description': current_agent.get('description', ''),
+            'llm_provider_key': provider_key,
+            'llm_provider_snapshot': self._build_llm_provider_snapshot(provider),
+            'llm_provider_applied_at': datetime.utcnow().isoformat(),
+            'llm_provider_mapped_env_keys': sorted(mapped_env.keys()),
+        }
+        updated, status_code = self._call_ai_helper_api(
+            project_id,
+            agent_key,
+            service_name,
+            'PUT',
+            f"/api/ai-agents/{quote(agent_id, safe='')}",
+            payload,
+            timeout=(5, 30),
+        )
+        if status_code >= 300 or not isinstance(updated, dict):
+            raise ValueError(f'AI Agent应用LLM Provider失败: {updated}')
+        return {
+            'project_id': project_id,
+            'agent_key': agent_key,
+            'service_name': service_name,
+            'agent_id': agent_id,
+            'provider_key': provider_key,
+            'refresh': bool(refresh),
+            'mapped_env_preview': mapped_env,
+            'mapped_env_keys': sorted(mapped_env.keys()),
+            'updated_agent': updated,
+        }
 
     def _resolve_helper_rest_port(self, service_row: Dict[str, Any]) -> int:
         ports = self._parse_ports_json(service_row.get('ports_json'))
@@ -2159,9 +2518,14 @@ class WebAPIServer:
                         'details': duplicate
                     }), 409
 
+                prepared_extra_params = self._prepare_deploy_extra_params(
+                    project_id,
+                    data['template_name'],
+                    data.get('extra_params'),
+                )
                 task_id = self.task_manager.create_task(
                     'deploy', data['service_name'], data['agent_key'],
-                    data['template_name'], data.get('extra_params'), project_id
+                    data['template_name'], prepared_extra_params, project_id
                 )
 
             return jsonify({
@@ -2272,8 +2636,13 @@ class WebAPIServer:
                             })
                             continue
 
+                        prepared_extra_params = self._prepare_deploy_extra_params(
+                            project_id,
+                            template_name,
+                            extra_params,
+                        )
                         task_id = self.task_manager.create_task(
-                            'deploy', service_name, agent_key, template_name, extra_params, project_id
+                            'deploy', service_name, agent_key, template_name, prepared_extra_params, project_id
                         )
                     results.append({
                         'index': idx,
@@ -3427,6 +3796,10 @@ class WebAPIServer:
                             'description': agent.get('description'),
                             'health': agent.get('health') if isinstance(agent.get('health'), dict) else agent.get('health'),
                             'capabilities': agent.get('capabilities') if isinstance(agent.get('capabilities'), dict) else agent.get('capabilities'),
+                            'llm_provider_key': agent.get('llm_provider_key'),
+                            'llm_provider_snapshot': agent.get('llm_provider_snapshot') if isinstance(agent.get('llm_provider_snapshot'), dict) else None,
+                            'llm_provider_applied_at': agent.get('llm_provider_applied_at'),
+                            'llm_provider_mapped_env_keys': agent.get('llm_provider_mapped_env_keys') if isinstance(agent.get('llm_provider_mapped_env_keys'), list) else [],
                             'last_seen_at': row.get('last_seen_at'),
                             'updated_at': row.get('updated_at'),
                         })
@@ -3438,6 +3811,121 @@ class WebAPIServer:
                 })
             except Exception as e:
                 self.logger.error(f"查询项目级AI Agent列表失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-agents/llm-providers', methods=['GET'])
+        def list_ai_agent_llm_providers():
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                payload = self._list_service_llm_providers()
+                return jsonify({
+                    'project_id': project_id,
+                    'default_provider_key': payload.get('default_provider_key'),
+                    'items': payload.get('items') if isinstance(payload.get('items'), list) else [],
+                    'total': int(payload.get('total') or 0),
+                })
+            except Exception as e:
+                self.logger.error(f"查询AI Agent LLM Provider列表失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-agents/llm-providers/<provider_key>', methods=['GET'])
+        def get_ai_agent_llm_provider(provider_key):
+            try:
+                detail = self._get_service_llm_provider(provider_key)
+                backend_type = str(request.args.get('backend_type') or '').strip()
+                if backend_type:
+                    detail['mapped_env_preview'] = self._build_llm_provider_env(detail, backend_type)
+                return jsonify(detail)
+            except Exception as e:
+                self.logger.error(f"查询AI Agent LLM Provider详情失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-agents/<agent_key>/<service_name>/<agent_id>/apply-llm-provider', methods=['POST'])
+        def apply_llm_provider_to_ai_agent(agent_key, service_name, agent_id):
+            try:
+                payload = request.get_json(silent=True) or {}
+                project_id = str(payload.get('project_id') or request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                provider_key = str(payload.get('provider_key') or '').strip()
+                refresh = bool(payload.get('refresh', False))
+                if not provider_key:
+                    return jsonify({'error': 'provider_key is required'}), 400
+                result = self._apply_llm_provider_to_ai_agent(project_id, agent_key, service_name, agent_id, provider_key, refresh)
+                return jsonify(result)
+            except Exception as e:
+                self.logger.error(f"单个AI Agent应用LLM Provider失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-agents/apply-llm-provider/batch', methods=['POST'])
+        def batch_apply_llm_provider_to_ai_agents():
+            try:
+                payload = request.get_json(silent=True) or {}
+                project_id = str(payload.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                provider_key = str(payload.get('provider_key') or '').strip()
+                if not provider_key:
+                    return jsonify({'error': 'provider_key is required'}), 400
+                refresh = bool(payload.get('refresh', False))
+                targets = payload.get('targets') if isinstance(payload.get('targets'), list) else []
+                if not targets:
+                    return jsonify({'error': 'targets is required'}), 400
+
+                results = []
+                success_count = 0
+                for target in targets:
+                    if not isinstance(target, dict):
+                        continue
+                    target_agent_key = str(target.get('agent_key') or '').strip()
+                    target_service_name = str(target.get('service_name') or '').strip()
+                    target_agent_id = str(target.get('agent_id') or '').strip()
+                    if not target_agent_key or not target_service_name or not target_agent_id:
+                        results.append({
+                            'agent_key': target_agent_key,
+                            'service_name': target_service_name,
+                            'agent_id': target_agent_id,
+                            'success': False,
+                            'error': 'invalid target',
+                        })
+                        continue
+                    try:
+                        result = self._apply_llm_provider_to_ai_agent(
+                            project_id,
+                            target_agent_key,
+                            target_service_name,
+                            target_agent_id,
+                            provider_key,
+                            refresh,
+                        )
+                        success_count += 1
+                        results.append({
+                            'agent_key': target_agent_key,
+                            'service_name': target_service_name,
+                            'agent_id': target_agent_id,
+                            'success': True,
+                            **result,
+                        })
+                    except Exception as exc:
+                        results.append({
+                            'agent_key': target_agent_key,
+                            'service_name': target_service_name,
+                            'agent_id': target_agent_id,
+                            'success': False,
+                            'error': str(exc),
+                        })
+                status = 'success' if results and success_count == len(results) else ('partial_success' if success_count > 0 else 'failed')
+                return jsonify({
+                    'project_id': project_id,
+                    'provider_key': provider_key,
+                    'refresh': refresh,
+                    'status': status,
+                    'results': results,
+                    'total': len(results),
+                    'success_count': success_count,
+                })
+            except Exception as e:
+                self.logger.error(f"批量应用LLM Provider失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>', methods=['GET'])
@@ -5466,8 +5954,10 @@ class WebAPIServer:
             visibility = (request.form.get('visibility', 'shared') or 'shared').strip().lower()
             web_port_presets_raw = request.form.get('web_port_presets')
             tags_raw = request.form.get('tags')
+            llm_binding_raw = request.form.get('default_llm_provider_binding')
             web_port_presets = None
             tags = None
+            default_llm_provider_binding = None
             if visibility not in ('shared', 'private'):
                 return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
             if web_port_presets_raw:
@@ -5484,6 +5974,13 @@ class WebAPIServer:
                         return jsonify({'error': 'tags 必须是JSON数组'}), 400
                 except Exception:
                     return jsonify({'error': 'tags JSON格式错误'}), 400
+            if llm_binding_raw:
+                try:
+                    default_llm_provider_binding = json.loads(llm_binding_raw)
+                    if not isinstance(default_llm_provider_binding, dict):
+                        return jsonify({'error': 'default_llm_provider_binding 必须是JSON对象'}), 400
+                except Exception:
+                    return jsonify({'error': 'default_llm_provider_binding JSON格式错误'}), 400
 
             if not name:
                 return jsonify({'error': '模板名称不能为空'}), 400
@@ -5532,7 +6029,8 @@ class WebAPIServer:
                     owner_id=user_ctx.get('user_id', ''),
                     owner_name=user_ctx.get('username', ''),
                     web_port_presets=web_port_presets,
-                    tags=tags
+                    tags=tags,
+                    default_llm_provider_binding=default_llm_provider_binding,
                 )
 
             try:
@@ -5638,12 +6136,15 @@ class WebAPIServer:
             visibility = data.get('visibility') if 'visibility' in data else None
             web_port_presets = data.get('web_port_presets') if 'web_port_presets' in data else None
             tags = data.get('tags') if 'tags' in data else None
+            default_llm_provider_binding = data.get('default_llm_provider_binding') if 'default_llm_provider_binding' in data else None
             if visibility is not None and str(visibility).strip().lower() not in ('shared', 'private'):
                 return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
             if web_port_presets is not None and not isinstance(web_port_presets, list):
                 return jsonify({'error': 'web_port_presets 必须是数组'}), 400
             if tags is not None and not isinstance(tags, list):
                 return jsonify({'error': 'tags 必须是数组'}), 400
+            if default_llm_provider_binding is not None and not isinstance(default_llm_provider_binding, dict):
+                return jsonify({'error': 'default_llm_provider_binding 必须是对象'}), 400
 
             def _update_template_basic():
                 return self.template_manager.update_template_basic(
@@ -5653,6 +6154,7 @@ class WebAPIServer:
                     visibility=visibility,
                     web_port_presets=web_port_presets,
                     tags=tags,
+                    default_llm_provider_binding=default_llm_provider_binding,
                     updated_by=user_ctx.get('username', 'system')
                 )
 
@@ -5748,6 +6250,102 @@ class WebAPIServer:
                 'template': updated,
                 'web_port_presets': normalized
             })
+
+        @self.app.route('/api/agent/templates/llm-providers', methods=['GET'])
+        def list_template_llm_providers():
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                payload = self._list_service_llm_providers()
+                return jsonify({
+                    'project_id': project_id,
+                    'default_provider_key': payload.get('default_provider_key'),
+                    'items': payload.get('items') if isinstance(payload.get('items'), list) else [],
+                    'total': int(payload.get('total') or 0),
+                })
+            except Exception as e:
+                self.logger.error(f"查询模板LLM Provider列表失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/templates/llm-providers/<provider_key>', methods=['GET'])
+        def get_template_llm_provider(provider_key):
+            try:
+                return jsonify(self._get_service_llm_provider(provider_key))
+            except Exception as e:
+                self.logger.error(f"查询模板LLM Provider详情失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/templates/llm-providers/preview', methods=['POST'])
+        def preview_template_llm_binding():
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+
+                provider_keys = data.get('provider_keys')
+                if not isinstance(provider_keys, list):
+                    return jsonify({'error': 'provider_keys must be a list'}), 400
+
+                target_services = data.get('target_services', '*')
+                if target_services != '*' and not isinstance(target_services, list):
+                    target_services = '*'
+
+                merged = self._merge_llm_provider_binding(
+                    provider_keys,
+                    target_services=target_services,
+                    source='preview',
+                )
+                return jsonify({
+                    'project_id': project_id,
+                    **merged,
+                })
+            except Exception as e:
+                self.logger.error(f"预览模板LLM Provider绑定失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/llm-binding', methods=['POST'])
+        def update_template_llm_binding(template_id):
+            user_ctx = self._get_request_user_context()
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
+
+            data = request.get_json(silent=True) or {}
+            raw_binding = data.get('default_llm_provider_binding')
+            if raw_binding is None:
+                return jsonify({'error': 'default_llm_provider_binding is required'}), 400
+
+            try:
+                normalized_binding = self._normalize_template_llm_binding(
+                    raw_binding,
+                    allowed_services=self._extract_template_service_names(template) or None,
+                )
+            except Exception as e:
+                return jsonify({'error': str(e)}), 400
+
+            def _update_template_binding():
+                return self.template_manager.update_template_basic(
+                    template_id=template_id,
+                    default_llm_provider_binding=normalized_binding or {},
+                    updated_by=user_ctx.get('username', 'system')
+                )
+
+            try:
+                success, message, updated = self._with_template_write_lock(
+                    [template.get('name')],
+                    _update_template_binding
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
+
+            if not success:
+                return jsonify({'error': message}), 400
+            updated = self.template_manager.decorate_template_permissions(
+                updated,
+                user_ctx.get('user_id', ''),
+                user_ctx.get('username', '')
+            )
+            return jsonify({'message': message, 'template': updated, 'status': 'success'})
 
         @self.app.route('/api/agent/templates/<name>/yaml', methods=['GET'])
         def get_template_yaml(name):

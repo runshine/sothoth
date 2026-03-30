@@ -744,6 +744,7 @@ class DatabaseManager:
             self._ensure_agent_services_columns(db, table_agent_services)
             self._ensure_template_columns(db, table_templates)
             self._ensure_task_columns(db, table_tasks)
+            self._ensure_service_template_binding_columns(db, table_service_bindings)
 
             self.logger.info(f"数据库初始化完成（使用{self.db_type.upper()}, 表前缀: {prefix}）")
         finally:
@@ -912,6 +913,31 @@ class DatabaseManager:
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_tasks_lease ON {table_name}(lease_until)')
         except Exception as e:
             self.logger.error(f"检查/迁移 {table_name} 任务字段失败: {str(e)}")
+
+    def _ensure_service_template_binding_columns(self, db: DatabaseConnection, table_name: str):
+        """确保 service_template_bindings 表包含部署快照字段。"""
+        try:
+            if self.db_type == 'mysql':
+                columns = db.fetch_all(
+                    """
+                    SELECT COLUMN_NAME
+                    FROM information_schema.columns
+                    WHERE table_schema = DATABASE() AND table_name = %s
+                    """,
+                    (table_name,)
+                )
+                existing = {item['COLUMN_NAME'] for item in columns}
+                if 'llm_provider_binding_json' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN llm_provider_binding_json JSON NULL")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 llm_provider_binding_json 列")
+            else:
+                columns = db.fetch_all(f"PRAGMA table_info({table_name})")
+                existing = {item['name'] for item in columns}
+                if 'llm_provider_binding_json' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN llm_provider_binding_json TEXT")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 llm_provider_binding_json 列")
+        except Exception as e:
+            self.logger.error(f"检查/迁移 {table_name} 服务绑定字段失败: {str(e)}")
 
     def execute_query(self, query: str, params: tuple = ()):
         """执行查询 - 使用持久化连接"""

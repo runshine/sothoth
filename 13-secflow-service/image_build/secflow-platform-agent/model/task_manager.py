@@ -265,7 +265,8 @@ class TaskManager:
         service_name: str,
         template_name: str,
         template_id: Optional[int] = None,
-        source_task_id: str = ''
+        source_task_id: str = '',
+        llm_provider_binding: Optional[Dict[str, Any]] = None,
     ):
         project_id = str(project_id or '').strip()
         agent_key = str(agent_key or '').strip()
@@ -275,37 +276,143 @@ class TaskManager:
             return
 
         table_name = self.db.get_table_name('service_template_bindings')
+        llm_binding_json = json.dumps(llm_provider_binding, ensure_ascii=False) if llm_provider_binding else None
         if self.db.db_type == 'mysql':
             self.db.execute_query(
                 f"""
                 INSERT INTO {table_name}
-                (project_id, agent_key, service_name, template_id, template_name, source_task_id, source)
-                VALUES (%s, %s, %s, %s, %s, %s, 'deploy')
+                (project_id, agent_key, service_name, template_id, template_name, source_task_id, source, llm_provider_binding_json)
+                VALUES (%s, %s, %s, %s, %s, %s, 'deploy', %s)
                 ON DUPLICATE KEY UPDATE
                     template_id = VALUES(template_id),
                     template_name = VALUES(template_name),
                     source_task_id = VALUES(source_task_id),
+                    llm_provider_binding_json = VALUES(llm_provider_binding_json),
                     source = VALUES(source),
                     updated_at = NOW()
                 """,
-                (project_id, agent_key, service_name, template_id, template_name, source_task_id)
+                (project_id, agent_key, service_name, template_id, template_name, source_task_id, llm_binding_json)
             )
         else:
             now_ts = datetime.now().isoformat()
             self.db.execute_query(
                 f"""
                 INSERT INTO {table_name}
-                (project_id, agent_key, service_name, template_id, template_name, source_task_id, source, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'deploy', ?, ?)
+                (project_id, agent_key, service_name, template_id, template_name, source_task_id, source, llm_provider_binding_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'deploy', ?, ?, ?)
                 ON CONFLICT(project_id, agent_key, service_name) DO UPDATE SET
                     template_id=excluded.template_id,
                     template_name=excluded.template_name,
                     source_task_id=excluded.source_task_id,
+                    llm_provider_binding_json=excluded.llm_provider_binding_json,
                     source=excluded.source,
                     updated_at=excluded.updated_at
                 """,
-                (project_id, agent_key, service_name, template_id, template_name, source_task_id, now_ts, now_ts)
+                (project_id, agent_key, service_name, template_id, template_name, source_task_id, llm_binding_json, now_ts, now_ts)
             )
+
+    @staticmethod
+    def _normalize_compose_environment(environment: Any) -> Dict[str, str]:
+        if isinstance(environment, dict):
+            return {str(k): '' if v is None else str(v) for k, v in environment.items()}
+        if isinstance(environment, list):
+            result: Dict[str, str] = {}
+            for item in environment:
+                if not isinstance(item, str) or '=' not in item:
+                    continue
+                key, value = item.split('=', 1)
+                result[str(key)] = value
+            return result
+        return {}
+
+    def _apply_llm_provider_binding_to_yaml(self, yaml_content: str, binding: Optional[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+        if not binding or not isinstance(binding, dict):
+            return yaml_content, {'applied': False, 'provider_keys': [], 'target_services': [], 'mapped_env_keys': []}
+
+        merged_env = binding.get('merged_env') if isinstance(binding.get('merged_env'), dict) else {}
+        provider_keys = [str(item) for item in (binding.get('provider_keys') or []) if str(item).strip()]
+        target_services = binding.get('target_services', '*')
+        if not merged_env or not provider_keys:
+            return yaml_content, {'applied': False, 'provider_keys': provider_keys, 'target_services': [], 'mapped_env_keys': sorted(merged_env.keys())}
+
+        compose_data = yaml.safe_load(yaml_content) or {}
+        if not isinstance(compose_data, dict):
+            raise ValueError('compose YAML 解析结果不是对象')
+        services = compose_data.get('services')
+        if not isinstance(services, dict) or not services:
+            raise ValueError('compose YAML 缺少 services 定义')
+
+        available_services = [str(name) for name in services.keys()]
+        if target_services == '*' or target_services is None:
+            selected_services = available_services
+        else:
+            selected_services = [str(item) for item in (target_services or []) if str(item).strip()]
+            missing = [name for name in selected_services if name not in services]
+            if missing:
+                raise ValueError(f"LLM Provider 目标服务不存在: {', '.join(missing)}")
+
+        for service_name in selected_services:
+            service_cfg = services.get(service_name)
+            if not isinstance(service_cfg, dict):
+                continue
+            env_map = self._normalize_compose_environment(service_cfg.get('environment'))
+            env_map.update({str(k): '' if v is None else str(v) for k, v in merged_env.items()})
+            service_cfg['environment'] = env_map
+
+        updated_yaml = yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
+        return updated_yaml, {
+            'applied': True,
+            'provider_keys': provider_keys,
+            'target_services': selected_services,
+            'mapped_env_keys': sorted(merged_env.keys()),
+        }
+
+    def _build_archive_bytes_with_llm_binding(self, template_name: str, binding: Optional[Dict[str, Any]]) -> Tuple[bytes, str, Dict[str, Any]]:
+        template = self.template_manager.get_template(template_name)
+        if not template:
+            raise ValueError(f'模板不存在: {template_name}')
+
+        template_dir = self.template_manager.templates_root / template_name
+        if not template_dir.exists():
+            raise ValueError(f'模板目录不存在: {template_dir}')
+
+        metadata = template.get('metadata') or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+
+        main_yaml = str(metadata.get('main_yaml_file') or '').strip()
+        if not main_yaml:
+            raise ValueError('archive 模板未记录 main_yaml_file，无法注入 LLM Provider')
+
+        original_archive_path = Path(template.get('file_path') or '')
+        with tempfile.TemporaryDirectory(prefix=f"tmpl-{template_name}-") as temp_dir:
+            temp_root = Path(temp_dir)
+            for item in template_dir.iterdir():
+                if original_archive_path and item.resolve() == original_archive_path.resolve():
+                    continue
+                dest = temp_root / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest)
+                else:
+                    shutil.copy2(item, dest)
+
+            compose_path = temp_root / main_yaml
+            if not compose_path.exists():
+                raise ValueError(f'archive 模板主 compose 不存在: {main_yaml}')
+
+            original_yaml = compose_path.read_text(encoding='utf-8')
+            updated_yaml, injection = self._apply_llm_provider_binding_to_yaml(original_yaml, binding)
+            compose_path.write_text(updated_yaml, encoding='utf-8')
+
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for file_path in temp_root.rglob('*'):
+                    if file_path.is_file():
+                        zipf.write(file_path, file_path.relative_to(temp_root))
+            return buffer.getvalue(), f"{template_name}.zip", injection
 
     def _delete_service_template_binding(self, project_id: str, agent_key: str, service_name: str):
         project_id = str(project_id or '').strip()
@@ -806,6 +913,13 @@ class TaskManager:
                 self._update_task_status(task_id, 'failed', 30, f'获取YAML内容失败: {yaml_content}')
                 return
 
+            llm_binding = extra_params.get('resolved_llm_provider_binding') if isinstance(extra_params, dict) else None
+            yaml_content, injection = self._apply_llm_provider_binding_to_yaml(yaml_content, llm_binding)
+            if injection.get('applied'):
+                self._add_task_log(task_id, 'INFO', f"注入LLM Provider: {', '.join(injection['provider_keys'])}")
+                self._add_task_log(task_id, 'INFO', f"注入目标服务: {', '.join(injection['target_services'])}")
+                self._add_task_log(task_id, 'INFO', f"注入环境变量键: {', '.join(injection['mapped_env_keys'])}")
+
             self._add_task_log(task_id, 'INFO', f"YAML内容大小: {len(yaml_content)} 字符")
 
             # 准备部署数据
@@ -818,7 +932,7 @@ class TaskManager:
 
             # 添加额外参数（如果有）
             if extra_params:
-                data.update(extra_params)
+                data.update({k: v for k, v in extra_params.items() if k not in {'llm_provider_binding', 'resolved_llm_provider_binding'}})
 
             self._add_task_log(task_id, 'INFO', f"调用Agent API创建服务: {service_name}")
 
@@ -851,7 +965,8 @@ class TaskManager:
                         service_name,
                         template_name,
                         template_id=template_id,
-                        source_task_id=task_id
+                        source_task_id=task_id,
+                        llm_provider_binding=llm_binding
                     )
                     self._update_task_status(task_id, 'success', 100, '服务部署成功')
                     self._add_task_log(task_id, 'INFO', '服务部署完成')
@@ -865,7 +980,8 @@ class TaskManager:
                             service_name,
                             template_name,
                             template_id=template_id,
-                            source_task_id=task_id
+                            source_task_id=task_id,
+                            llm_provider_binding=llm_binding
                         )
                         self._update_task_status(task_id, 'success', 100, '服务部署成功（超时后状态确认）')
                     else:
@@ -911,21 +1027,26 @@ class TaskManager:
         """部署压缩模板（支持多种格式）"""
         try:
             self._update_task_status(task_id, 'running', 30, '处理压缩模板')
+            llm_binding = extra_params.get('resolved_llm_provider_binding') if isinstance(extra_params, dict) else None
+            if llm_binding:
+                file_content, filename, injection = self._build_archive_bytes_with_llm_binding(template_name, llm_binding)
+                self._add_task_log(task_id, 'INFO', f"已生成临时 archive 部署包: {filename}")
+                if injection.get('applied'):
+                    self._add_task_log(task_id, 'INFO', f"注入LLM Provider: {', '.join(injection['provider_keys'])}")
+                    self._add_task_log(task_id, 'INFO', f"注入目标服务: {', '.join(injection['target_services'])}")
+                    self._add_task_log(task_id, 'INFO', f"注入环境变量键: {', '.join(injection['mapped_env_keys'])}")
+            else:
+                template_file = self.template_manager.get_template_file(template_name)
+                if not template_file:
+                    self._update_task_status(task_id, 'failed', 30, '压缩模板文件不存在')
+                    return
 
-            # 获取模板文件路径
-            template_file = self.template_manager.get_template_file(template_name)
-            if not template_file:
-                self._update_task_status(task_id, 'failed', 30, '压缩模板文件不存在')
-                return
+                self._add_task_log(task_id, 'INFO', f"压缩文件: {template_file}")
 
-            self._add_task_log(task_id, 'INFO', f"压缩文件: {template_file}")
+                with open(template_file, 'rb') as f:
+                    file_content = f.read()
 
-            # 读取压缩文件内容
-            with open(template_file, 'rb') as f:
-                file_content = f.read()
-
-            # 获取文件扩展名
-            filename = Path(template_file).name
+                filename = Path(template_file).name
 
             # 创建文件字典（符合call_agent_api的文件格式）
             files = {
@@ -940,7 +1061,7 @@ class TaskManager:
 
             # 添加额外参数
             if extra_params:
-                data.update(extra_params)
+                data.update({k: v for k, v in extra_params.items() if k not in {'llm_provider_binding', 'resolved_llm_provider_binding'}})
 
             self._add_task_log(task_id, 'INFO', f"上传压缩文件到Agent: {filename}")
 
@@ -976,7 +1097,8 @@ class TaskManager:
                         service_name,
                         template_name,
                         template_id=template_id,
-                        source_task_id=task_id
+                        source_task_id=task_id,
+                        llm_provider_binding=llm_binding
                     )
                     self._update_task_status(task_id, 'success', 100, '压缩服务部署成功')
                     self._add_task_log(task_id, 'INFO', '压缩服务部署完成')
@@ -989,7 +1111,8 @@ class TaskManager:
                             service_name,
                             template_name,
                             template_id=template_id,
-                            source_task_id=task_id
+                            source_task_id=task_id,
+                            llm_provider_binding=llm_binding
                         )
                         self._update_task_status(task_id, 'success', 100, '压缩服务部署成功（超时后状态确认）')
                     else:
