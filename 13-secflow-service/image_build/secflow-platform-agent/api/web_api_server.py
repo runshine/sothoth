@@ -6055,6 +6055,9 @@ class WebAPIServer:
         @self.app.route('/api/agent/templates/<name>', methods=['GET'])
         def get_template_detail(name):
             """获取模板详细信息（包含解析数据和文件大小）"""
+            if name == 'llm-providers':
+                return list_template_llm_providers()
+
             user_ctx = self._get_request_user_context()
             template = self.template_manager.get_template(name)
 
