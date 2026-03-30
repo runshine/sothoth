@@ -50,6 +50,8 @@ from app.schemas import (
     IngressSimpleCreateRequest,
     IngressDomainBindingRequest,
     IngressExternalCreateRequest,
+    WorkflowAppIngressCreateRequest,
+    WorkflowAppIngressInfo,
     AgentIngressRouteCreateRequest,
     AgentIngressRouteListResponse,
     AgentIngressRouteInfo,
@@ -138,6 +140,58 @@ def _build_resource_names(project_id: str, agent_key: str, target_port: int, hos
     ingress_name = f"agrt-{_sanitize_name_fragment(agent_key)[:12]}-{target_port}-{uniq}"[:63]
     service_name = f"{ingress_name}-external-svc"
     return ingress_name, service_name
+
+
+def _build_workflow_ingress_name(service_name: str, service_port: int, host: str, path: str) -> str:
+    uniq = hashlib.sha1(f"{service_name}|{service_port}|{host}|{path}".encode("utf-8")).hexdigest()[:8]
+    prefix = _sanitize_name_fragment(service_name)[:18]
+    return f"work-{prefix}-{service_port}-{uniq}"[:63]
+
+
+def _resolve_dynamic_ingress_options(request, namespace: str) -> dict:
+    conf = get_config().dynamic_ingress
+    ingress_type = request.ingress_type or conf.default_ingress_type
+    path_type = request.path_type or conf.default_path_type
+    tls_enabled = bool(conf.default_tls_enabled if request.tls_enabled is None else request.tls_enabled)
+    tls_secret_name = request.tls_secret_name if request.tls_secret_name is not None else conf.default_tls_secret_name
+    if tls_secret_name == "wildcard-code-server.sothothv2.com-tls":
+        tls_secret_name = "wildcard-sothothv2.com-tls"
+    if tls_enabled and (not tls_secret_name or not str(tls_secret_name).strip()):
+        raise ValidationError("已启用TLS但未配置tls_secret_name，请配置公共TLS Secret名称")
+    if tls_enabled:
+        try:
+            get_k8s_service().get_secret(namespace, tls_secret_name)
+        except Exception:
+            raise ValidationError(
+                f"目标命名空间缺少TLS Secret: {tls_secret_name}，请先在 {namespace} 中创建该公共Secret"
+            )
+    websocket_enabled = bool(conf.default_websocket_enabled if request.websocket_enabled is None else request.websocket_enabled)
+    proxy_body_size = request.proxy_body_size if request.proxy_body_size is not None else conf.default_proxy_body_size
+    proxy_connect_timeout = int(request.proxy_connect_timeout if request.proxy_connect_timeout is not None else conf.default_proxy_connect_timeout)
+    proxy_send_timeout = int(request.proxy_send_timeout if request.proxy_send_timeout is not None else conf.default_proxy_send_timeout)
+    proxy_read_timeout = int(request.proxy_read_timeout if request.proxy_read_timeout is not None else conf.default_proxy_read_timeout)
+    if websocket_enabled:
+        if request.proxy_send_timeout is None:
+            proxy_send_timeout = max(proxy_send_timeout, 3600)
+        if request.proxy_read_timeout is None:
+            proxy_read_timeout = max(proxy_read_timeout, 3600)
+    ssl_redirect = bool(conf.default_ssl_redirect if request.ssl_redirect is None else request.ssl_redirect)
+    backend_protocol = str(request.backend_protocol or "http").strip().lower()
+    if backend_protocol not in {"http", "https"}:
+        backend_protocol = "http"
+    return {
+        "ingress_type": ingress_type,
+        "path_type": path_type,
+        "tls_enabled": tls_enabled,
+        "tls_secret_name": tls_secret_name,
+        "websocket_enabled": websocket_enabled,
+        "proxy_body_size": proxy_body_size,
+        "proxy_connect_timeout": proxy_connect_timeout,
+        "proxy_send_timeout": proxy_send_timeout,
+        "proxy_read_timeout": proxy_read_timeout,
+        "ssl_redirect": ssl_redirect,
+        "backend_protocol": backend_protocol,
+    }
 
 
 async def get_current_user(
@@ -760,6 +814,78 @@ async def create_simple_ingress(
         path=request.path,
         path_type=request.path_type
     )
+
+
+@router.post(
+    "/ingresses/workflow-app",
+    response_model=WorkflowAppIngressInfo,
+    status_code=status.HTTP_201_CREATED,
+    summary="创建工作流应用实例Ingress",
+)
+async def create_workflow_app_ingress(
+    request: WorkflowAppIngressCreateRequest,
+    project_id: str = Query(..., description="项目ID"),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """创建供 workflow -> workflow-status -> k8s 链路使用的 Service-backed Ingress。"""
+    project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
+    _ensure_namespace_exists(namespace)
+
+    conf = get_config().dynamic_ingress
+    if not conf.enabled:
+        raise ValidationError("动态Ingress功能已关闭")
+
+    default_prefix = _sanitize_name_fragment(f"work-{request.service_name}")
+    resolved_host = _resolve_ingress_host(
+        project_id=project_id,
+        explicit_host=request.host,
+        host_prefix=request.host_prefix,
+        default_prefix=default_prefix,
+    )
+    if not resolved_host:
+        raise ValidationError("host 或 host_prefix 必须至少提供一个，且需配置 dynamic_ingress.common_domain_suffix")
+
+    path = _normalize_path(request.path or conf.default_path)
+    ingress_options = _resolve_dynamic_ingress_options(request, namespace)
+    ingress_name = _build_workflow_ingress_name(request.service_name, int(request.service_port), resolved_host, path)
+
+    result = get_k8s_service().create_workflow_app_ingress(
+        namespace=namespace,
+        name=ingress_name,
+        service_name=request.service_name,
+        service_port=int(request.service_port),
+        host=resolved_host,
+        path=path,
+        path_type=ingress_options["path_type"],
+        ingress_type=ingress_options["ingress_type"],
+        ingress_ip=request.ingress_ip,
+        tls_enabled=ingress_options["tls_enabled"],
+        tls_secret_name=ingress_options["tls_secret_name"],
+        backend_protocol=ingress_options["backend_protocol"],
+        websocket_enabled=ingress_options["websocket_enabled"],
+        proxy_body_size=ingress_options["proxy_body_size"],
+        proxy_connect_timeout=ingress_options["proxy_connect_timeout"],
+        proxy_send_timeout=ingress_options["proxy_send_timeout"],
+        proxy_read_timeout=ingress_options["proxy_read_timeout"],
+        ssl_redirect=ingress_options["ssl_redirect"],
+    )
+    return {
+        "ingress_name": ingress_name,
+        "service_name": request.service_name,
+        "service_port": int(request.service_port),
+        "host": resolved_host,
+        "path": path,
+        "path_type": ingress_options["path_type"],
+        "ingress_type": ingress_options["ingress_type"],
+        "ingress_ip": request.ingress_ip,
+        "tls_enabled": ingress_options["tls_enabled"],
+        "tls_secret_name": ingress_options["tls_secret_name"],
+        "backend_protocol": ingress_options["backend_protocol"],
+        "websocket_enabled": ingress_options["websocket_enabled"],
+        "access_url": result.get("access_url"),
+        "ingress": result.get("ingress", {}),
+    }
 
 
 @router.post("/ingresses/{ingress_name}/bind-domain", response_model=IngressInfo, summary="绑定Ingress域名")

@@ -359,6 +359,10 @@ class WorkflowLifecycleService:
                     message=task_record["message"],
                     k8s_resource_name=result.k8s_resource_name,
                     service_name=result.service_name,
+                    ingress_name=result.ingress_name,
+                    ingress_host=result.ingress_host,
+                    ingress_access_url=result.ingress_access_url,
+                    ingress_tls_enabled=result.ingress_tls_enabled,
                     error=result.error
                 )
 
@@ -500,6 +504,7 @@ class WorkflowLifecycleService:
             node_type = node_info.get("node_type", NodeType.APP)
             k8s_resource_name = node_info.get("k8s_resource_name")
             service_name = node_info.get("service_name") or node_info.get("metadata", {}).get("service_name")
+            ingress_name = node_info.get("ingress_name") or node_info.get("metadata", {}).get("ingress_name")
 
             # 检查是否有Ingress
             has_ingress = node_info.get("has_ingress", False)
@@ -534,7 +539,8 @@ class WorkflowLifecycleService:
                     node_type=node_type,
                     k8s_resource_name=k8s_resource_name,
                     service_name=service_name,
-                    has_ingress=has_ingress
+                    has_ingress=has_ingress,
+                    ingress_name=ingress_name,
                 )
 
                 if task_id:
@@ -577,6 +583,8 @@ class WorkflowLifecycleService:
                     status=task_record["status"],
                     message=task_record["message"],
                     k8s_resource_name=k8s_resource_name,
+                    service_name=service_name,
+                    ingress_name=ingress_name,
                     error=result.error
                 )
 
@@ -715,6 +723,7 @@ class WorkflowLifecycleService:
             node_type = node_info.get("node_type", NodeType.APP)
             k8s_resource_name = node_info.get("k8s_resource_name")
             service_name = node_info.get("service_name") or node_info.get("metadata", {}).get("service_name")
+            ingress_name = node_info.get("ingress_name") or node_info.get("metadata", {}).get("ingress_name")
 
             has_ingress = node_info.get("has_ingress", False)
             if not has_ingress:
@@ -748,7 +757,8 @@ class WorkflowLifecycleService:
                     node_type=node_type,
                     k8s_resource_name=k8s_resource_name,
                     service_name=service_name,
-                    has_ingress=has_ingress
+                    has_ingress=has_ingress,
+                    ingress_name=ingress_name,
                 )
 
                 if task_id:
@@ -791,6 +801,8 @@ class WorkflowLifecycleService:
                     status=task_record["status"],
                     message=task_record["message"],
                     k8s_resource_name=k8s_resource_name,
+                    service_name=service_name,
+                    ingress_name=ingress_name,
                     error=result.error
                 )
 

@@ -267,6 +267,45 @@ class IngressExternalCreateRequest(BaseModel):
     ssl_redirect: bool = Field(default=True, description="是否强制HTTPS重定向")
 
 
+class WorkflowAppIngressCreateRequest(BaseModel):
+    """工作流应用实例Ingress创建请求（路由到K8S Service）"""
+    service_name: str = Field(..., description="后端Service名称")
+    service_port: int = Field(..., description="后端Service端口")
+    host: Optional[str] = Field(default=None, description="完整域名，传入则优先使用")
+    host_prefix: Optional[str] = Field(default=None, description="域名前缀，平台将按统一规则生成host")
+    path: str = Field(default="/", description="路由路径")
+    path_type: str = Field(default="Prefix", description="路径类型")
+    ingress_type: Optional[str] = Field(default=None, description="IngressClass，不传则使用平台默认")
+    ingress_ip: Optional[str] = Field(default=None, description="Ingress Controller外部IP(仅记录用途)")
+    tls_enabled: Optional[bool] = Field(default=None, description="是否启用TLS")
+    tls_secret_name: Optional[str] = Field(default=None, description="TLS Secret名")
+    backend_protocol: Optional[str] = Field(default=None, description="后端服务协议: http 或 https")
+    websocket_enabled: Optional[bool] = Field(default=None, description="是否开启WebSocket转发")
+    proxy_body_size: Optional[str] = Field(default=None, description="Nginx代理body大小")
+    proxy_connect_timeout: Optional[int] = Field(default=None, description="Nginx连接超时")
+    proxy_send_timeout: Optional[int] = Field(default=None, description="Nginx发送超时")
+    proxy_read_timeout: Optional[int] = Field(default=None, description="Nginx读取超时")
+    ssl_redirect: Optional[bool] = Field(default=None, description="是否强制HTTPS重定向")
+
+
+class WorkflowAppIngressInfo(BaseModel):
+    """工作流应用实例Ingress信息"""
+    ingress_name: str
+    service_name: str
+    service_port: int
+    host: str
+    path: str
+    path_type: str
+    ingress_type: str
+    ingress_ip: Optional[str] = None
+    tls_enabled: bool
+    tls_secret_name: Optional[str] = None
+    backend_protocol: Optional[str] = None
+    websocket_enabled: bool
+    access_url: Optional[str] = None
+    ingress: Dict[str, Any] = Field(default_factory=dict)
+
+
 class AgentIngressRouteCreateRequest(BaseModel):
     """Agent动态Ingress路由创建请求"""
     agent_key: str = Field(..., description="Agent唯一标识")

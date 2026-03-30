@@ -606,6 +606,9 @@ class WorkflowNodeInstanceResponse(BaseModel):
     ingress_type: Optional[str] = None
     ingress_host: Optional[str] = None
     ingress_ip: Optional[str] = None
+    ingress_name: Optional[str] = None
+    ingress_access_url: Optional[str] = None
+    ingress_tls_enabled: Optional[bool] = None
     created_at: Optional[datetime] = None
 
     class Config:
@@ -883,6 +886,9 @@ class AppWorkflowNodeResponse(BaseModel):
     ingress_type: Optional[str] = None
     ingress_host: Optional[str] = None
     ingress_ip: Optional[str] = None
+    ingress_name: Optional[str] = None
+    ingress_access_url: Optional[str] = None
+    ingress_tls_enabled: Optional[bool] = None
 
 
 class AppWorkflowResponse(BaseModel):
@@ -910,6 +916,9 @@ class AppWorkflowResponse(BaseModel):
     ingress_type: Optional[str] = None
     ingress_host: Optional[str] = None
     ingress_ip: Optional[str] = None
+    ingress_name: Optional[str] = None
+    ingress_access_url: Optional[str] = None
+    ingress_tls_enabled: Optional[bool] = None
 
     # 模板信息
     template_id: str

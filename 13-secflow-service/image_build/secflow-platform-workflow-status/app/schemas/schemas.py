@@ -506,6 +506,15 @@ class IngressConfig(BaseModel):
     ingress_ip: Optional[str] = None
     path: str = "/"
     path_type: str = "Prefix"
+    tls_enabled: Optional[bool] = None
+    tls_secret_name: Optional[str] = None
+    backend_protocol: Optional[str] = None
+    websocket_enabled: Optional[bool] = None
+    proxy_body_size: Optional[str] = None
+    proxy_connect_timeout: Optional[int] = None
+    proxy_send_timeout: Optional[int] = None
+    proxy_read_timeout: Optional[int] = None
+    ssl_redirect: Optional[bool] = None
 
 
 class NodeInitializeRequest(BaseModel):
@@ -532,6 +541,10 @@ class NodeInitializeResponse(BaseModel):
     message: Optional[str] = None
     k8s_resource_name: Optional[str] = None
     service_name: Optional[str] = None
+    ingress_name: Optional[str] = None
+    ingress_host: Optional[str] = None
+    ingress_access_url: Optional[str] = None
+    ingress_tls_enabled: Optional[bool] = None
     error: Optional[str] = None
 
 
@@ -543,6 +556,7 @@ class NodeUninitializeRequest(BaseModel):
     k8s_resource_name: str
     service_name: Optional[str] = None
     has_ingress: bool = False
+    ingress_name: Optional[str] = None
 
 
 class NodeUninitializeResponse(BaseModel):
@@ -588,6 +602,7 @@ class NodeStopRequest(BaseModel):
     k8s_resource_name: str
     service_name: Optional[str] = None
     has_ingress: bool = False
+    ingress_name: Optional[str] = None
 
 
 class NodeStopResponse(BaseModel):
@@ -606,6 +621,10 @@ class NodeOperationResult(BaseModel):
     message: Optional[str] = None
     k8s_resource_name: Optional[str] = None
     service_name: Optional[str] = None
+    ingress_name: Optional[str] = None
+    ingress_host: Optional[str] = None
+    ingress_access_url: Optional[str] = None
+    ingress_tls_enabled: Optional[bool] = None
     error: Optional[str] = None
 
 
@@ -644,6 +663,10 @@ class WorkflowNodeResult(BaseModel):
     message: Optional[str] = None
     k8s_resource_name: Optional[str] = None
     service_name: Optional[str] = None
+    ingress_name: Optional[str] = None
+    ingress_host: Optional[str] = None
+    ingress_access_url: Optional[str] = None
+    ingress_tls_enabled: Optional[bool] = None
     error: Optional[str] = None
 
 
@@ -718,4 +741,3 @@ class NodeStartResponse(BaseModel):
     message: Optional[str] = None
     k8s_resource_name: Optional[str] = None
     error: Optional[str] = None
-

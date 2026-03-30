@@ -52,12 +52,13 @@ async def ensure_project_namespace(project_id: str):
         raise InternalError(f"Namespace verification failed: {result.get('message', 'unknown error')}")
 
 
-def build_lifecycle_nodes(nodes: List[WorkflowNodeInstance]) -> List[Dict[str, Any]]:
+def build_lifecycle_nodes(nodes: List[WorkflowNodeInstance], instance: Optional[WorkflowInstance] = None) -> List[Dict[str, Any]]:
     """Build nodes payload for workflow lifecycle APIs."""
     payload: List[Dict[str, Any]] = []
     for node in nodes:
         if not node.k8s_resource_name:
             continue
+        node_config = get_instance_node_config(instance, node.id) if instance else {}
         payload.append({
             "node_id": node.node_id,
             "node_type": node.node_type.value if hasattr(node.node_type, "value") else str(node.node_type),
@@ -65,6 +66,7 @@ def build_lifecycle_nodes(nodes: List[WorkflowNodeInstance]) -> List[Dict[str, A
             "k8s_resource_type": node.k8s_resource_type,
             "service_name": node.service_name,
             "has_ingress": bool(node.ingress_type),
+            "ingress_name": resolve_node_ingress_name(node, node_config),
         })
     return payload
 
@@ -89,6 +91,7 @@ def build_node_response(node: WorkflowNodeInstance, instance: WorkflowInstance) 
     ingress_type = node_config.get("ingress_type") or node.ingress_type
     ingress_host = node_config.get("ingress_host") or node.ingress_host
     ingress_ip = node_config.get("ingress_ip") or node.ingress_ip
+    ingress_name = resolve_node_ingress_name(node, node_config)
     create_ingress = node_config.get("create_ingress")
     if create_ingress is None:
         create_ingress = bool(ingress_type or ingress_host or ingress_ip)
@@ -123,6 +126,9 @@ def build_node_response(node: WorkflowNodeInstance, instance: WorkflowInstance) 
         "ingress_type": ingress_type,
         "ingress_host": ingress_host,
         "ingress_ip": ingress_ip,
+        "ingress_name": ingress_name,
+        "ingress_access_url": node_config.get("ingress_access_url"),
+        "ingress_tls_enabled": node_config.get("ingress_tls_enabled"),
         "created_at": node.created_at.isoformat() if node.created_at else None,
     }
 
@@ -139,6 +145,38 @@ def get_primary_service_ports(node_config: Dict[str, Any]) -> tuple[Optional[int
     return service_port, target_port
 
 
+def build_workflow_ingress_host_prefix(node_config: Dict[str, Any], service_name: Optional[str]) -> Optional[str]:
+    """Build the default workflow ingress host prefix."""
+    if node_config.get("ingress_host_prefix"):
+        return node_config.get("ingress_host_prefix")
+    if not service_name:
+        return None
+    return f"work-{service_name}"
+
+
+def resolve_node_ingress_name(node: WorkflowNodeInstance, node_config: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve the stored ingress name with backward-compatible fallback."""
+    node_config = node_config or {}
+    ingress_name = node_config.get("ingress_name")
+    if ingress_name:
+        return ingress_name
+    service_name = node_config.get("service_name") or node.service_name
+    if service_name and node.k8s_resource_name and bool(node_config.get("create_ingress", bool(node.ingress_type))):
+        return f"ing-{service_name}"
+    return None
+
+
+def resolve_ingress_access_url(node_config: Dict[str, Any], host: Optional[str], path: str = "/") -> Optional[str]:
+    """Build a fallback ingress access URL from stored config."""
+    if node_config.get("ingress_access_url"):
+        return node_config.get("ingress_access_url")
+    if not host:
+        return None
+    scheme = "https" if node_config.get("ingress_tls_enabled") else "http"
+    normalized_path = path if str(path).startswith("/") else f"/{path}"
+    return f"{scheme}://{host}{normalized_path}"
+
+
 def upsert_node_domain_binding(
     db: Session,
     instance: WorkflowInstance,
@@ -151,6 +189,7 @@ def upsert_node_domain_binding(
     service_port: Optional[int],
     target_port: Optional[int],
     binding_status: str,
+    ingress_name: Optional[str] = None,
     message: Optional[str] = None,
 ):
     """Create or update one node domain binding record."""
@@ -175,7 +214,7 @@ def upsert_node_domain_binding(
         db.add(binding)
 
     binding.service_name = service_name
-    binding.ingress_name = f"ing-{service_name}" if service_name else None
+    binding.ingress_name = ingress_name or (f"ing-{service_name}" if service_name else None)
     binding.ingress_type = ingress_type
     binding.ingress_ip = ingress_ip
     binding.service_port = service_port
@@ -378,7 +417,7 @@ async def initialize_workflow_instance(
     if force and instance.status in [WorkflowStatus.UNREADY, WorkflowStatus.READY]:
         init_logs.append(f"[{datetime.utcnow().isoformat()}] 强制初始化: 删除已存在的K8S资源")
         logger.info(f"Force initialization cleanup via workflow-status: instance={instance_id}")
-        existing_nodes = build_lifecycle_nodes(nodes)
+        existing_nodes = build_lifecycle_nodes(nodes, instance)
         if existing_nodes:
             cleanup_result = await status_client.deinitialize_workflow(
                 instance_id=instance_id,
@@ -505,7 +544,7 @@ async def initialize_workflow_instance(
             create_ingress = node_config.get("create_ingress")
             ingress_type = node_config.get("ingress_type")
             ingress_host = node_config.get("ingress_host")
-            ingress_host_prefix = node_config.get("ingress_host_prefix") or service_name
+            ingress_host_prefix = build_workflow_ingress_host_prefix(node_config, service_name)
             ingress_ip = node_config.get("ingress_ip")
 
             ingress_config = None
@@ -516,7 +555,18 @@ async def initialize_workflow_instance(
                     "host": ingress_host,
                     "host_prefix": ingress_host_prefix,
                     "ingress_type": ingress_type,
-                    "ingress_ip": ingress_ip
+                    "ingress_ip": ingress_ip,
+                    "path": node_config.get("ingress_path", "/"),
+                    "path_type": node_config.get("ingress_path_type", "Prefix"),
+                    "tls_enabled": node_config.get("ingress_tls_enabled"),
+                    "tls_secret_name": node_config.get("ingress_tls_secret_name"),
+                    "backend_protocol": node_config.get("ingress_backend_protocol"),
+                    "websocket_enabled": node_config.get("ingress_websocket_enabled"),
+                    "proxy_body_size": node_config.get("ingress_proxy_body_size"),
+                    "proxy_connect_timeout": node_config.get("ingress_proxy_connect_timeout"),
+                    "proxy_send_timeout": node_config.get("ingress_proxy_send_timeout"),
+                    "proxy_read_timeout": node_config.get("ingress_proxy_read_timeout"),
+                    "ssl_redirect": node_config.get("ingress_ssl_redirect"),
                 }
 
             node_info = {
@@ -569,13 +619,23 @@ async def initialize_workflow_instance(
                     node.k8s_resource_type = "Deployment" if node.node_type == NodeType.APP else "Job"
                     node.service_name = node_result.get("service_name")
                     node_config = get_instance_node_config(instance, node.id)
+                    node_config["ingress_name"] = node_result.get("ingress_name") or node_config.get("ingress_name")
+                    if node_result.get("ingress_host"):
+                        node_config["ingress_host"] = node_result.get("ingress_host")
+                    if "ingress_tls_enabled" in node_result:
+                        node_config["ingress_tls_enabled"] = node_result.get("ingress_tls_enabled")
+                    if node_result.get("ingress_access_url"):
+                        node_config["ingress_access_url"] = node_result.get("ingress_access_url")
+                    from sqlalchemy.orm.attributes import flag_modified
+                    flag_modified(instance, "nodes")
                     configured_create_ingress = node_config.get(
                         "create_ingress",
                         bool(node.ingress_type or node.ingress_host or node.ingress_ip),
                     )
-                    configured_host = node_config.get("ingress_host") or node.ingress_host
+                    configured_host = node_result.get("ingress_host") or node_config.get("ingress_host") or node.ingress_host
                     configured_ip = node_config.get("ingress_ip") or node.ingress_ip
                     configured_type = node_config.get("ingress_type") or node.ingress_type
+                    node.ingress_host = configured_host
                     service_port, target_port = get_primary_service_ports(node_config)
 
                     result_status = str(node_result.get("status", "Pending")).lower()
@@ -603,6 +663,7 @@ async def initialize_workflow_instance(
                             service_name=node.service_name,
                             service_port=service_port,
                             target_port=target_port,
+                            ingress_name=node_result.get("ingress_name") or resolve_node_ingress_name(node, node_config),
                             binding_status="configured",
                             message="Node initialized with ingress configuration",
                         )
@@ -1428,7 +1489,7 @@ async def stop_workflow_instance(
     nodes = db.query(WorkflowNodeInstance).filter(
         WorkflowNodeInstance.instance_id == instance_id
     ).all()
-    nodes_info = build_lifecycle_nodes(nodes)
+    nodes_info = build_lifecycle_nodes(nodes, instance)
 
     result = await get_status_client().stop_workflow(
         instance_id=instance_id,
@@ -1510,7 +1571,7 @@ async def uninitialize_workflow_instance(
 
     deleted_count = 0
     errors = []
-    nodes_info = build_lifecycle_nodes(nodes)
+    nodes_info = build_lifecycle_nodes(nodes, instance)
     result = await get_status_client().deinitialize_workflow(
         instance_id=instance_id,
         project_id=instance.project_id,
@@ -1580,7 +1641,7 @@ async def delete_workflow_instance(
             WorkflowNodeInstance.instance_id == instance_id
         ).all()
 
-        nodes_info = build_lifecycle_nodes(nodes)
+        nodes_info = build_lifecycle_nodes(nodes, instance)
         result = await get_status_client().deinitialize_workflow(
             instance_id=instance_id,
             project_id=instance.project_id,
@@ -2282,8 +2343,13 @@ async def get_workflow_node_access_info(
     # or node config so the UI can still show the expected domain-based access info.
     if configured_ingress.get("create_ingress") and fallback_host and not access_info["ingress_accesses"]:
         host = fallback_host
+        ingress_name = (
+            (fallback_binding.ingress_name if fallback_binding else None)
+            or resolve_node_ingress_name(node, node_config)
+        )
+        access_url = resolve_ingress_access_url(node_config, host, "/")
         ingress_item = {
-            "ingress_name": f"ing-{node.service_name}",
+            "ingress_name": ingress_name,
             "ingress_class_name": fallback_type,
             "host": host,
             "path": "/",
@@ -2291,7 +2357,7 @@ async def get_workflow_node_access_info(
             "service_name": node.service_name,
             "service_port": fallback_binding.service_port if fallback_binding else None,
             "selected_ip": fallback_ip,
-            "url": f"http://{host}/",
+            "url": access_url,
             "source": "binding_record" if fallback_binding else "configured",
         }
         access_info["ingress_accesses"].append(ingress_item)
@@ -2304,11 +2370,11 @@ async def get_workflow_node_access_info(
                 {
                     "type": "Ingress",
                     "port_name": node.service_name,
-                    "url": f"http://{host}/",
+                    "url": access_url,
                     "host": host,
                     "path": "/",
                     "selected_ip": fallback_ip,
-                    "ingress_name": f"ing-{node.service_name}",
+                    "ingress_name": ingress_name,
                     "source": "binding_record" if fallback_binding else "configured",
                 }
             )
@@ -2388,6 +2454,10 @@ async def bind_workflow_node_ingress(
     node_config["ingress_type"] = request.ingress_type
     node_config["ingress_host"] = request.ingress_host
     node_config["ingress_ip"] = request.ingress_ip
+    if not request.create_ingress:
+        node_config["ingress_name"] = None
+        node_config["ingress_access_url"] = None
+        node_config["ingress_tls_enabled"] = None
     node.ingress_type = request.ingress_type
     node.ingress_host = request.ingress_host
     node.ingress_ip = request.ingress_ip
@@ -2397,7 +2467,9 @@ async def bind_workflow_node_ingress(
         if not service_ports:
             raise ValidationError("service_ports cannot be empty when binding ingress")
         service_port = service_ports[0].get("port") or service_ports[0].get("target_port")
-        ingress_name = f"ing-{node.service_name}"
+        ingress_name = resolve_node_ingress_name(node, node_config)
+        if not ingress_name:
+            raise ValidationError("ingress_name is missing for this initialized node")
         await get_status_client().bind_ingress_domain(
             project_id=instance.project_id,
             ingress_name=ingress_name,
@@ -2420,6 +2492,7 @@ async def bind_workflow_node_ingress(
             service_name=node.service_name,
             service_port=service_port,
             target_port=target_port,
+            ingress_name=ingress_name,
             binding_status="active",
             message="Ingress domain bound successfully",
         )
@@ -2435,6 +2508,7 @@ async def bind_workflow_node_ingress(
             service_name=node.service_name,
             service_port=service_port,
             target_port=target_port,
+            ingress_name=node_config.get("ingress_name"),
             binding_status="configured",
             message="Ingress config saved, waiting for node initialization",
         )

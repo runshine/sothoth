@@ -139,6 +139,7 @@ class NodeLifecycleService:
         包含事务回滚机制
         """
         created_resources = []  # 记录已创建的资源，用于回滚
+        ingress_result: Optional[Dict[str, Any]] = None
 
         try:
             # 1. 创建 Deployment
@@ -173,12 +174,10 @@ class NodeLifecycleService:
 
             # 3. 创建 Ingress（可选）
             if ingress_config and service_name and service_ports:
-                ingress_name = f"ing-{service_name}"
                 service_port = service_ports[0].get("port", 80) if service_ports else 80
-                logger.info(f"[NodeLifecycle] 创建Ingress: {ingress_name}")
-                success, error = self.k8s_client.create_ingress(
+                logger.info(f"[NodeLifecycle] 为Service创建workflow ingress: service_name={service_name}")
+                success, error, ingress_result = self.k8s_client.create_workflow_app_ingress(
                     project_id=project_id,
-                    name=ingress_name,
                     service_name=service_name,
                     service_port=service_port,
                     host=ingress_config.get("host"),
@@ -186,13 +185,24 @@ class NodeLifecycleService:
                     ingress_type=ingress_config.get("ingress_type", "nginx"),
                     ingress_ip=ingress_config.get("ingress_ip"),
                     path=ingress_config.get("path", "/"),
-                    path_type=ingress_config.get("path_type", "Prefix")
+                    path_type=ingress_config.get("path_type", "Prefix"),
+                    tls_enabled=ingress_config.get("tls_enabled"),
+                    tls_secret_name=ingress_config.get("tls_secret_name"),
+                    backend_protocol=ingress_config.get("backend_protocol"),
+                    websocket_enabled=ingress_config.get("websocket_enabled"),
+                    proxy_body_size=ingress_config.get("proxy_body_size"),
+                    proxy_connect_timeout=ingress_config.get("proxy_connect_timeout"),
+                    proxy_send_timeout=ingress_config.get("proxy_send_timeout"),
+                    proxy_read_timeout=ingress_config.get("proxy_read_timeout"),
+                    ssl_redirect=ingress_config.get("ssl_redirect"),
                 )
                 if not success:
                     # Ingress 创建失败视为警告而非错误
                     logger.warning(f"[NodeLifecycle] Ingress创建失败(非致命): {error}")
                 else:
-                    created_resources.append(("ingress", ingress_name))
+                    ingress_name = (ingress_result or {}).get("ingress_name")
+                    if ingress_name:
+                        created_resources.append(("ingress", ingress_name))
 
             logger.info(f"[NodeLifecycle] APP节点初始化成功: node_id={node_id}, resources={created_resources}")
             return NodeOperationResult(
@@ -201,6 +211,10 @@ class NodeLifecycleService:
                 status=AppNodeStatus.PENDING,
                 k8s_resource_name=deployment_name,
                 service_name=service_name if service_ports else None,
+                ingress_name=(ingress_result or {}).get("ingress_name"),
+                ingress_host=(ingress_result or {}).get("host"),
+                ingress_access_url=(ingress_result or {}).get("access_url"),
+                ingress_tls_enabled=(ingress_result or {}).get("tls_enabled"),
                 message=f"APP node initialized with {len(created_resources)} resources"
             )
 
@@ -245,7 +259,8 @@ class NodeLifecycleService:
         node_type: str,
         k8s_resource_name: str,
         service_name: Optional[str] = None,
-        has_ingress: bool = False
+        has_ingress: bool = False,
+        ingress_name: Optional[str] = None,
     ) -> NodeOperationResult:
         """
         反初始化节点：删除所有关联的 K8S 资源
@@ -271,10 +286,10 @@ class NodeLifecycleService:
                 # APP 节点：删除 Ingress -> Service -> Deployment
 
                 # 1. 删除 Ingress
-                if has_ingress and service_name:
-                    ingress_name = f"ing-{service_name}"
+                if has_ingress and (ingress_name or service_name):
+                    ingress_name = ingress_name or (f"ing-{service_name}" if service_name else None)
                     logger.info(f"[NodeLifecycle] 删除Ingress: {ingress_name}")
-                    if not self.k8s_client.delete_ingress(project_id, ingress_name):
+                    if ingress_name and not self.k8s_client.delete_ingress(project_id, ingress_name):
                         errors.append(f"Ingress {ingress_name} 删除失败")
 
                 # 2. 删除 Service
@@ -455,7 +470,8 @@ class NodeLifecycleService:
         node_type: str,
         k8s_resource_name: str,
         service_name: Optional[str] = None,
-        has_ingress: bool = False
+        has_ingress: bool = False,
+        ingress_name: Optional[str] = None,
     ) -> NodeOperationResult:
         """
         停止节点
@@ -488,7 +504,8 @@ class NodeLifecycleService:
             node_type=node_type,
             k8s_resource_name=k8s_resource_name,
             service_name=service_name,
-            has_ingress=has_ingress
+            has_ingress=has_ingress,
+            ingress_name=ingress_name,
         )
 
 

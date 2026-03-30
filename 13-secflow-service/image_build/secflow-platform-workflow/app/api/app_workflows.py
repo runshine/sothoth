@@ -15,6 +15,9 @@ from app.api.dependencies import get_current_user, generate_id
 from app.api.workflow_instances import (
     get_instance_node_config,
     get_primary_service_ports,
+    build_workflow_ingress_host_prefix,
+    resolve_ingress_access_url,
+    resolve_node_ingress_name,
     upsert_node_domain_binding,
     delete_node_domain_bindings,
 )
@@ -71,6 +74,7 @@ def build_app_workflow_response(
     ingress_type = node_config.get("ingress_type") or node.ingress_type
     ingress_host = node_config.get("ingress_host") or node.ingress_host
     ingress_ip = node_config.get("ingress_ip") or node.ingress_ip
+    ingress_name = node_config.get("ingress_name")
     create_ingress = node_config.get("create_ingress")
     if create_ingress is None:
         create_ingress = bool(ingress_type or ingress_host or ingress_ip)
@@ -109,6 +113,9 @@ def build_app_workflow_response(
             "ingress_type": ingress_type,
             "ingress_host": ingress_host,
             "ingress_ip": ingress_ip,
+            "ingress_name": ingress_name,
+            "ingress_access_url": node_config.get("ingress_access_url"),
+            "ingress_tls_enabled": node_config.get("ingress_tls_enabled"),
             "init_logs": node.init_logs,
         },
         "service_name": service_name,
@@ -123,6 +130,9 @@ def build_app_workflow_response(
         "ingress_type": ingress_type,
         "ingress_host": ingress_host,
         "ingress_ip": ingress_ip,
+        "ingress_name": ingress_name,
+        "ingress_access_url": node_config.get("ingress_access_url"),
+        "ingress_tls_enabled": node_config.get("ingress_tls_enabled"),
         "template_id": node.template_id,
         "template_name": template.name if template else None,
         "created_by": instance.created_by,
@@ -439,6 +449,9 @@ async def get_app_workflow_access_info(
         "ingress_type": node_config.get("ingress_type") or node.ingress_type,
         "ingress_host": node_config.get("ingress_host") or node.ingress_host,
         "ingress_ip": node_config.get("ingress_ip") or node.ingress_ip,
+        "ingress_name": node_config.get("ingress_name"),
+        "ingress_access_url": node_config.get("ingress_access_url"),
+        "ingress_tls_enabled": node_config.get("ingress_tls_enabled"),
     }
 
     fallback_binding = domain_bindings[0] if domain_bindings else None
@@ -451,7 +464,12 @@ async def get_app_workflow_access_info(
     )
 
     if configured_ingress.get("create_ingress") and fallback_host and not access_info["ingress_accesses"]:
-        ingress_name = f"ing-{service_name}"
+        ingress_name = (
+            (fallback_binding.ingress_name if fallback_binding else None)
+            or configured_ingress.get("ingress_name")
+            or (f"ing-{service_name}" if service_name else None)
+        )
+        access_url = resolve_ingress_access_url(node_config, fallback_host, "/")
         ingress_item = {
             "ingress_name": ingress_name,
             "ingress_class_name": fallback_type,
@@ -461,7 +479,7 @@ async def get_app_workflow_access_info(
             "service_name": service_name,
             "service_port": fallback_binding.service_port if fallback_binding else None,
             "selected_ip": fallback_ip,
-            "url": f"http://{fallback_host}/",
+            "url": access_url,
             "source": "binding_record" if fallback_binding else "configured",
         }
         access_info["ingress_accesses"].append(ingress_item)
@@ -473,7 +491,7 @@ async def get_app_workflow_access_info(
                 {
                     "type": "Ingress",
                     "port_name": service_name,
-                    "url": f"http://{fallback_host}/",
+                    "url": access_url,
                     "host": fallback_host,
                     "path": "/",
                     "selected_ip": fallback_ip,
@@ -544,6 +562,9 @@ async def bind_app_workflow_ingress(
         node_config["ingress_type"] = None
         node_config["ingress_host"] = None
         node_config["ingress_ip"] = None
+        node_config["ingress_name"] = None
+        node_config["ingress_access_url"] = None
+        node_config["ingress_tls_enabled"] = None
         delete_node_domain_bindings(db, instance_id, node.id)
         flag_modified(instance, "nodes")
         db.commit()
@@ -555,7 +576,9 @@ async def bind_app_workflow_ingress(
         service_port, target_port = get_primary_service_ports(node_config)
         if not service_port:
             raise ValidationError("service_ports cannot be empty when binding ingress")
-        ingress_name = f"ing-{node.service_name}"
+        ingress_name = resolve_node_ingress_name(node, node_config)
+        if not ingress_name:
+            raise ValidationError("ingress_name is missing for this initialized app workflow")
         await get_status_client().bind_ingress_domain(
             project_id=instance.project_id,
             ingress_name=ingress_name,
@@ -577,6 +600,7 @@ async def bind_app_workflow_ingress(
             service_name=node.service_name,
             service_port=service_port,
             target_port=target_port,
+            ingress_name=ingress_name,
             binding_status="active",
             message="Ingress domain bound successfully",
         )
@@ -592,6 +616,7 @@ async def bind_app_workflow_ingress(
             service_name=node.service_name or node_config.get("service_name"),
             service_port=service_port,
             target_port=target_port,
+            ingress_name=node_config.get("ingress_name"),
             binding_status="configured",
             message="Ingress config saved, waiting for node initialization",
         )
@@ -673,6 +698,9 @@ async def update_app_workflow(
             node_config["ingress_type"] = None
             node_config["ingress_host"] = None
             node_config["ingress_ip"] = None
+            node_config["ingress_name"] = None
+            node_config["ingress_access_url"] = None
+            node_config["ingress_tls_enabled"] = None
     if workflow_data.ingress_type is not None:
         node.ingress_type = workflow_data.ingress_type
         node_config["ingress_type"] = workflow_data.ingress_type
@@ -705,6 +733,7 @@ async def update_app_workflow(
             service_name=node_config.get("service_name") or node.service_name,
             service_port=service_port,
             target_port=target_port,
+            ingress_name=node_config.get("ingress_name"),
             binding_status="active" if node.k8s_resource_name else "configured",
             message="Ingress config updated on app workflow",
         )
@@ -753,6 +782,7 @@ async def delete_app_workflow(
                     "k8s_resource_type": node.k8s_resource_type,
                     "service_name": node.service_name,
                     "has_ingress": bool(node.ingress_type),
+                    "ingress_name": resolve_node_ingress_name(node, get_instance_node_config(instance, node.id)),
                 }],
             )
             logger.info(f"delete app workflow deinitialize result: {result}")
@@ -843,6 +873,7 @@ async def initialize_app_workflow(
                 "k8s_resource_type": node.k8s_resource_type,
                 "service_name": node.service_name,
                 "has_ingress": bool(node.ingress_type),
+                "ingress_name": resolve_node_ingress_name(node, get_instance_node_config(instance, node.id)),
             }],
         )
         if not cleanup_result.get("success", False):
@@ -874,7 +905,7 @@ async def initialize_app_workflow(
         deployment_name = f"wf-{instance_id[:8]}-{node.id[:8]}"
         ingress_type = node_config.get("ingress_type")
         ingress_host = node_config.get("ingress_host")
-        ingress_host_prefix = node_config.get("ingress_host_prefix") or service_name
+        ingress_host_prefix = build_workflow_ingress_host_prefix(node_config, service_name)
         ingress_ip = node_config.get("ingress_ip")
 
         lifecycle_nodes = [{
@@ -888,6 +919,17 @@ async def initialize_app_workflow(
                 "host_prefix": ingress_host_prefix,
                 "ingress_type": ingress_type,
                 "ingress_ip": ingress_ip,
+                "path": node_config.get("ingress_path", "/"),
+                "path_type": node_config.get("ingress_path_type", "Prefix"),
+                "tls_enabled": node_config.get("ingress_tls_enabled"),
+                "tls_secret_name": node_config.get("ingress_tls_secret_name"),
+                "backend_protocol": node_config.get("ingress_backend_protocol"),
+                "websocket_enabled": node_config.get("ingress_websocket_enabled"),
+                "proxy_body_size": node_config.get("ingress_proxy_body_size"),
+                "proxy_connect_timeout": node_config.get("ingress_proxy_connect_timeout"),
+                "proxy_send_timeout": node_config.get("ingress_proxy_send_timeout"),
+                "proxy_read_timeout": node_config.get("ingress_proxy_read_timeout"),
+                "ssl_redirect": node_config.get("ingress_ssl_redirect"),
             } if ingress_type else None,
             "containers": containers,
             "volume_mounts": template.volume_mounts if hasattr(template, "volume_mounts") else None,
@@ -921,24 +963,34 @@ async def initialize_app_workflow(
         node.k8s_resource_name = node_result.get("k8s_resource_name")
         node.k8s_resource_type = "Deployment"
         node.service_name = node_result.get("service_name")
+        node_config["ingress_name"] = node_result.get("ingress_name") or node_config.get("ingress_name")
+        if node_result.get("ingress_host"):
+            node_config["ingress_host"] = node_result.get("ingress_host")
+        if "ingress_tls_enabled" in node_result:
+            node_config["ingress_tls_enabled"] = node_result.get("ingress_tls_enabled")
+        if node_result.get("ingress_access_url"):
+            node_config["ingress_access_url"] = node_result.get("ingress_access_url")
+        flag_modified(instance, "nodes")
         node.ingress_type = ingress_type
-        node.ingress_host = ingress_host
+        node.ingress_host = node_result.get("ingress_host") or ingress_host
         node.ingress_ip = ingress_ip
-        if ingress_type and ingress_host:
+        if ingress_type and (node_result.get("ingress_host") or ingress_host):
             service_port, target_port = get_primary_service_ports(node_config)
             upsert_node_domain_binding(
                 db,
                 instance,
                 node,
-                domain=ingress_host,
+                domain=node_result.get("ingress_host") or ingress_host,
                 ingress_ip=ingress_ip,
                 ingress_type=ingress_type,
                 service_name=node.service_name,
                 service_port=service_port,
                 target_port=target_port,
+                ingress_name=node_result.get("ingress_name") or node_config.get("ingress_name"),
                 binding_status="active",
                 message="Ingress bound during initialization",
             )
+            flag_modified(instance, "nodes")
 
         result_status = str(node_result.get("status", "Pending")).lower()
         if result_status == "ready":
@@ -1007,6 +1059,7 @@ async def uninitialize_app_workflow(
                 "k8s_resource_type": node.k8s_resource_type,
                 "service_name": node.service_name,
                 "has_ingress": bool(node.ingress_type),
+                "ingress_name": resolve_node_ingress_name(node, get_instance_node_config(instance, node.id)),
             }],
         )
         deleted_count = result.get("succeeded_nodes", 0)
@@ -1020,8 +1073,12 @@ async def uninitialize_app_workflow(
     node.started_at = None
     node.finished_at = None
     node.message = None
+    node_config = get_instance_node_config(instance, node.id)
+    node_config["ingress_name"] = None
+    node_config["ingress_access_url"] = None
 
     delete_node_domain_bindings(db, instance_id, node.id)
+    flag_modified(instance, "nodes")
 
     instance.status = WorkflowStatus.PENDING
     instance.started_at = None
@@ -1223,6 +1280,7 @@ async def stop_app_workflow(
                 "k8s_resource_type": node.k8s_resource_type,
                 "service_name": node.service_name,
                 "has_ingress": bool(node.ingress_type),
+                "ingress_name": resolve_node_ingress_name(node, node_config),
             }],
         )
         logger.info(f"stop app workflow result: {result}")
@@ -1254,6 +1312,7 @@ async def stop_app_workflow(
             service_name=node_config.get("service_name") or node.service_name,
             service_port=service_port,
             target_port=target_port,
+            ingress_name=node_config.get("ingress_name"),
             binding_status="configured",
             message="Ingress config preserved after workflow stop",
         )

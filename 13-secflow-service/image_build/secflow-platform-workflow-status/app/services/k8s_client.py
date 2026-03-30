@@ -699,6 +699,65 @@ class K8SClient:
             logger.error(error_msg)
             return False, error_msg
 
+    def create_workflow_app_ingress(
+        self,
+        project_id: str,
+        service_name: str,
+        service_port: int,
+        host: Optional[str] = None,
+        host_prefix: Optional[str] = None,
+        ingress_type: str = "nginx",
+        ingress_ip: Optional[str] = None,
+        path: str = "/",
+        path_type: str = "Prefix",
+        tls_enabled: Optional[bool] = None,
+        tls_secret_name: Optional[str] = None,
+        backend_protocol: Optional[str] = None,
+        websocket_enabled: Optional[bool] = None,
+        proxy_body_size: Optional[str] = None,
+        proxy_connect_timeout: Optional[int] = None,
+        proxy_send_timeout: Optional[int] = None,
+        proxy_read_timeout: Optional[int] = None,
+        ssl_redirect: Optional[bool] = None,
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """创建 workflow 应用实例专用 Ingress。"""
+        try:
+            url = f"{self._get_base_url()}/ingresses/workflow-app?project_id={project_id}"
+            payload = {
+                "service_name": service_name,
+                "service_port": service_port,
+                "host": host,
+                "host_prefix": host_prefix,
+                "ingress_type": ingress_type,
+                "ingress_ip": ingress_ip,
+                "path": path,
+                "path_type": path_type,
+                "tls_enabled": tls_enabled,
+                "tls_secret_name": tls_secret_name,
+                "backend_protocol": backend_protocol,
+                "websocket_enabled": websocket_enabled,
+                "proxy_body_size": proxy_body_size,
+                "proxy_connect_timeout": proxy_connect_timeout,
+                "proxy_send_timeout": proxy_send_timeout,
+                "proxy_read_timeout": proxy_read_timeout,
+                "ssl_redirect": ssl_redirect,
+            }
+            response = self.client.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"Workflow app ingress for service {service_name} 创建成功")
+            return True, None, data
+        except httpx.HTTPError as e:
+            error_msg = f"创建 workflow app ingress 失败: {e}"
+            if hasattr(e, "response") and e.response is not None:
+                error_msg = f"创建 workflow app ingress 失败: {e.response.text}"
+            logger.error(error_msg)
+            return False, error_msg, None
+        except Exception as e:
+            error_msg = f"创建 workflow app ingress 异常: {str(e)}"
+            logger.error(error_msg)
+            return False, error_msg, None
+
     def bind_ingress_domain(
         self,
         project_id: str,

@@ -625,6 +625,86 @@ class KubernetesService:
 
         return self.create_ingress(namespace, manifest)
 
+    def _build_managed_service_ingress_manifest(
+        self,
+        namespace: str,
+        name: str,
+        service_name: str,
+        service_port: int,
+        host: str,
+        path: str = "/",
+        path_type: str = "Prefix",
+        ingress_type: str = "nginx",
+        ingress_ip: Optional[str] = None,
+        tls_enabled: bool = False,
+        tls_secret_name: Optional[str] = None,
+        backend_protocol: str = "HTTP",
+        websocket_enabled: bool = False,
+        proxy_body_size: str = "10m",
+        proxy_connect_timeout: int = 60,
+        proxy_send_timeout: int = 60,
+        proxy_read_timeout: int = 60,
+        ssl_redirect: bool = True,
+        managed_by: str = "secflow-workflow",
+    ) -> Dict:
+        """构建带 NGINX 增强能力的 Service-backed Ingress manifest。"""
+        annotations = {
+            "nginx.ingress.kubernetes.io/ssl-redirect": str(ssl_redirect).lower(),
+            "nginx.ingress.kubernetes.io/proxy-body-size": proxy_body_size,
+            "nginx.ingress.kubernetes.io/proxy-connect-timeout": str(proxy_connect_timeout),
+            "nginx.ingress.kubernetes.io/proxy-send-timeout": str(proxy_send_timeout),
+            "nginx.ingress.kubernetes.io/proxy-read-timeout": str(proxy_read_timeout),
+        }
+        if ingress_ip:
+            annotations[INGRESS_IP_ANNOTATION] = ingress_ip
+
+        backend_protocol_normalized = str(backend_protocol or "HTTP").strip().upper()
+        if backend_protocol_normalized not in {"HTTP", "HTTPS"}:
+            backend_protocol_normalized = "HTTP"
+        if backend_protocol_normalized == "HTTPS":
+            annotations["nginx.ingress.kubernetes.io/backend-protocol"] = "HTTPS"
+
+        if websocket_enabled:
+            annotations["nginx.ingress.kubernetes.io/proxy-http-version"] = "1.1"
+            annotations["nginx.ingress.kubernetes.io/proxy-buffering"] = "off"
+            annotations["nginx.ingress.kubernetes.io/enable-websocket"] = "true"
+
+        manifest = {
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "annotations": annotations,
+                "labels": {
+                    "app": name,
+                    "managed-by": managed_by,
+                }
+            },
+            "spec": {
+                "ingressClassName": ingress_type,
+                "rules": [{
+                    "host": host,
+                    "http": {
+                        "paths": [{
+                            "path": path,
+                            "path_type": path_type,
+                            "backend": {
+                                "service": {
+                                    "name": service_name,
+                                    "port": {"number": service_port}
+                                }
+                            }
+                        }]
+                    }
+                }]
+            }
+        }
+        if tls_enabled and tls_secret_name:
+            manifest["spec"]["tls"] = [{
+                "hosts": [host],
+                "secret_name": tls_secret_name,
+            }]
+        return manifest
+
     def replace_ingress(self, namespace: str, name: str, manifest: Dict) -> Dict:
         """更新已存在的 Ingress。"""
         try:
@@ -693,6 +773,68 @@ class KubernetesService:
             self._handle_api_exception(e, "Ingress", "查询")
 
         return self.replace_ingress(namespace, ingress_name, manifest)
+
+    def create_workflow_app_ingress(
+        self,
+        namespace: str,
+        name: str,
+        service_name: str,
+        service_port: int,
+        host: str,
+        path: str = "/",
+        path_type: str = "Prefix",
+        ingress_type: str = "nginx",
+        ingress_ip: Optional[str] = None,
+        tls_enabled: bool = False,
+        tls_secret_name: Optional[str] = None,
+        backend_protocol: str = "HTTP",
+        websocket_enabled: bool = False,
+        proxy_body_size: str = "10m",
+        proxy_connect_timeout: int = 60,
+        proxy_send_timeout: int = 60,
+        proxy_read_timeout: int = 60,
+        ssl_redirect: bool = True,
+    ) -> Dict:
+        """为 workflow 应用实例创建或更新 Service-backed Ingress。"""
+        ingress_manifest = self._build_managed_service_ingress_manifest(
+            namespace=namespace,
+            name=name,
+            service_name=service_name,
+            service_port=service_port,
+            host=host,
+            path=path,
+            path_type=path_type,
+            ingress_type=ingress_type,
+            ingress_ip=ingress_ip,
+            tls_enabled=tls_enabled,
+            tls_secret_name=tls_secret_name,
+            backend_protocol=backend_protocol,
+            websocket_enabled=websocket_enabled,
+            proxy_body_size=proxy_body_size,
+            proxy_connect_timeout=proxy_connect_timeout,
+            proxy_send_timeout=proxy_send_timeout,
+            proxy_read_timeout=proxy_read_timeout,
+            ssl_redirect=ssl_redirect,
+            managed_by="secflow-workflow-ingress",
+        )
+        try:
+            self.networking_v1.read_namespaced_ingress(name=name, namespace=namespace)
+        except ApiException as e:
+            if e.status == 404:
+                ingress_result = self.create_ingress(namespace, ingress_manifest)
+                return {
+                    "ingress": ingress_result,
+                    "access_url": f"{'https' if tls_enabled else 'http'}://{host}{path}",
+                    "backend_protocol": str(backend_protocol or "HTTP").strip().upper(),
+                }
+            self._handle_api_exception(e, "Ingress", "查询")
+
+        ingress_result = self.replace_ingress(namespace, name, ingress_manifest)
+        return {
+            "ingress": ingress_result,
+            "access_url": f"{'https' if tls_enabled else 'http'}://{host}{path}",
+            "backend_protocol": str(backend_protocol or "HTTP").strip().upper(),
+        }
 
     def create_external_ingress(
         self,
@@ -2866,10 +3008,16 @@ class KubernetesService:
             for ing in ingresses:
                 annotations = ing.get("annotations") or ing.get("annotation") or {}
                 ingress_ip = annotations.get(INGRESS_IP_ANNOTATION)
+                tls_hosts = {
+                    tls_host
+                    for tls_item in (ing.get("tls") or [])
+                    for tls_host in (tls_item.get("hosts") or [])
+                }
                 rules = ing.get("rules") or ing.get("rule") or []
 
                 for rule in rules:
                     host = rule.get("host")
+                    scheme = "https" if host and host in tls_hosts else "http"
                     for path_info in rule.get("paths", []):
                         backend_service = ((path_info.get("backend") or {}).get("service") or {})
                         if backend_service.get("name") != service_name:
@@ -2885,18 +3033,20 @@ class KubernetesService:
                             "service_name": service_name,
                             "service_port": ((backend_service.get("port") or {}).get("number")),
                             "selected_ip": ingress_ip,
-                            "url": f"http://{host}{path}" if host else None,
+                            "tls_enabled": scheme == "https",
+                            "url": f"{scheme}://{host}{path}" if host else None,
                         }
                         access_info["ingress_accesses"].append(ingress_access)
                         if host:
                             access_info["access_urls"].append({
                                 "type": "Ingress",
                                 "port_name": backend_service.get("name"),
-                                "url": f"http://{host}{path}",
+                                "url": f"{scheme}://{host}{path}",
                                 "host": host,
                                 "path": path,
                                 "selected_ip": ingress_ip,
                                 "ingress_name": ing.get("name"),
+                                "tls_enabled": scheme == "https",
                             })
 
             return access_info
