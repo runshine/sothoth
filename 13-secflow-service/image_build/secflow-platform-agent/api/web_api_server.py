@@ -1107,18 +1107,6 @@ class WebAPIServer:
             'updated_at': datetime.utcnow().isoformat(),
         }
 
-    def _resolve_template_default_llm_binding(self, template: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        metadata = template.get('metadata') or {}
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except Exception:
-                metadata = {}
-        return self._normalize_template_llm_binding(
-            metadata.get('default_llm_provider_binding') if isinstance(metadata, dict) else None,
-            allowed_services=self._extract_template_service_names(template),
-        )
-
     def _prepare_deploy_extra_params(
         self,
         project_id: str,
@@ -1130,23 +1118,20 @@ class WebAPIServer:
         if not template:
             return prepared
 
-        default_binding = self._resolve_template_default_llm_binding(template)
         override_binding = self._normalize_template_llm_binding(
             prepared.get('llm_provider_binding'),
             allowed_services=self._extract_template_service_names(template),
         )
-        effective_binding = override_binding or default_binding
-        if effective_binding:
-            source = 'deployment_override' if override_binding else 'template_default'
+        if override_binding:
             prepared['llm_provider_binding'] = {
-                'provider_keys': effective_binding.get('provider_keys', []),
-                'target_services': effective_binding.get('target_services', '*'),
-                'source': source,
+                'provider_keys': override_binding.get('provider_keys', []),
+                'target_services': override_binding.get('target_services', '*'),
+                'source': 'deployment_override',
             }
             prepared['resolved_llm_provider_binding'] = self._merge_llm_provider_binding(
-                effective_binding.get('provider_keys', []),
-                effective_binding.get('target_services', '*'),
-                source=source,
+                override_binding.get('provider_keys', []),
+                override_binding.get('target_services', '*'),
+                source='deployment_override',
             )
         return prepared
 
@@ -5954,10 +5939,8 @@ class WebAPIServer:
             visibility = (request.form.get('visibility', 'shared') or 'shared').strip().lower()
             web_port_presets_raw = request.form.get('web_port_presets')
             tags_raw = request.form.get('tags')
-            llm_binding_raw = request.form.get('default_llm_provider_binding')
             web_port_presets = None
             tags = None
-            default_llm_provider_binding = None
             if visibility not in ('shared', 'private'):
                 return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
             if web_port_presets_raw:
@@ -5974,13 +5957,6 @@ class WebAPIServer:
                         return jsonify({'error': 'tags 必须是JSON数组'}), 400
                 except Exception:
                     return jsonify({'error': 'tags JSON格式错误'}), 400
-            if llm_binding_raw:
-                try:
-                    default_llm_provider_binding = json.loads(llm_binding_raw)
-                    if not isinstance(default_llm_provider_binding, dict):
-                        return jsonify({'error': 'default_llm_provider_binding 必须是JSON对象'}), 400
-                except Exception:
-                    return jsonify({'error': 'default_llm_provider_binding JSON格式错误'}), 400
 
             if not name:
                 return jsonify({'error': '模板名称不能为空'}), 400
@@ -6030,7 +6006,6 @@ class WebAPIServer:
                     owner_name=user_ctx.get('username', ''),
                     web_port_presets=web_port_presets,
                     tags=tags,
-                    default_llm_provider_binding=default_llm_provider_binding,
                 )
 
             try:
@@ -6076,10 +6051,13 @@ class WebAPIServer:
                     files = []
                     for file_path in template_dir.rglob('*'):
                         if file_path.is_file():
+                            rel_path = file_path.relative_to(template_dir)
+                            if self.template_manager._is_internal_template_path(rel_path):
+                                continue
                             file_stat = file_path.stat()
                             files.append({
                                 'name': file_path.name,
-                                'path': str(file_path.relative_to(template_dir)),
+                                'path': str(rel_path),
                                 'size': file_stat.st_size,
                                 'modified': datetime.fromtimestamp(file_stat.st_mtime).isoformat()
                             })
@@ -6139,15 +6117,12 @@ class WebAPIServer:
             visibility = data.get('visibility') if 'visibility' in data else None
             web_port_presets = data.get('web_port_presets') if 'web_port_presets' in data else None
             tags = data.get('tags') if 'tags' in data else None
-            default_llm_provider_binding = data.get('default_llm_provider_binding') if 'default_llm_provider_binding' in data else None
             if visibility is not None and str(visibility).strip().lower() not in ('shared', 'private'):
                 return jsonify({'error': 'visibility 仅支持 shared 或 private'}), 400
             if web_port_presets is not None and not isinstance(web_port_presets, list):
                 return jsonify({'error': 'web_port_presets 必须是数组'}), 400
             if tags is not None and not isinstance(tags, list):
                 return jsonify({'error': 'tags 必须是数组'}), 400
-            if default_llm_provider_binding is not None and not isinstance(default_llm_provider_binding, dict):
-                return jsonify({'error': 'default_llm_provider_binding 必须是对象'}), 400
 
             def _update_template_basic():
                 return self.template_manager.update_template_basic(
@@ -6157,7 +6132,6 @@ class WebAPIServer:
                     visibility=visibility,
                     web_port_presets=web_port_presets,
                     tags=tags,
-                    default_llm_provider_binding=default_llm_provider_binding,
                     updated_by=user_ctx.get('username', 'system')
                 )
 
@@ -6304,19 +6278,20 @@ class WebAPIServer:
                 self.logger.error(f"预览模板LLM Provider绑定失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/templates/id/<int:template_id>/llm-binding', methods=['POST'])
-        def update_template_llm_binding(template_id):
+        @self.app.route('/api/agent/templates/id/<int:template_id>/regenerate-with-llm-providers', methods=['POST'])
+        def regenerate_template_with_llm_providers(template_id):
             user_ctx = self._get_request_user_context()
             template = _resolve_template_by_id(template_id)
             if not template:
                 return jsonify({'error': '模板不存在'}), 404
             if not self._check_template_manageable(template, user_ctx):
-                return jsonify({'error': '无权限更新该模板，仅拥有者可更新'}), 403
+                return jsonify({'error': '无权限重新生成该模板，仅拥有者可更新'}), 403
 
             data = request.get_json(silent=True) or {}
-            raw_binding = data.get('default_llm_provider_binding')
-            if raw_binding is None:
-                return jsonify({'error': 'default_llm_provider_binding is required'}), 400
+            raw_binding = {
+                'provider_keys': data.get('provider_keys'),
+                'target_services': data.get('target_services', '*'),
+            }
 
             try:
                 normalized_binding = self._normalize_template_llm_binding(
@@ -6326,17 +6301,55 @@ class WebAPIServer:
             except Exception as e:
                 return jsonify({'error': str(e)}), 400
 
-            def _update_template_binding():
-                return self.template_manager.update_template_basic(
+            resolved_binding = self._merge_llm_provider_binding(
+                normalized_binding.get('provider_keys', []),
+                normalized_binding.get('target_services', '*'),
+                source='template_regeneration',
+            )
+
+            def _regenerate_template():
+                return self.template_manager.regenerate_template_with_llm_providers(
                     template_id=template_id,
-                    default_llm_provider_binding=normalized_binding or {},
-                    updated_by=user_ctx.get('username', 'system')
+                    binding=resolved_binding,
+                    generated_by=user_ctx.get('username', 'system')
                 )
 
             try:
                 success, message, updated = self._with_template_write_lock(
                     [template.get('name')],
-                    _update_template_binding
+                    _regenerate_template
+                )
+            except BlockingIOError as e:
+                return jsonify({'error': str(e)}), 409
+
+            if not success:
+                return jsonify({'error': message}), 400
+            updated = self.template_manager.decorate_template_permissions(
+                updated,
+                user_ctx.get('user_id', ''),
+                user_ctx.get('username', '')
+            )
+            return jsonify({'message': message, 'template': updated, 'resolved_binding': resolved_binding, 'status': 'success'})
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/restore-original-compose', methods=['POST'])
+        def restore_template_original_compose(template_id):
+            user_ctx = self._get_request_user_context()
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_manageable(template, user_ctx):
+                return jsonify({'error': '无权限恢复该模板，仅拥有者可更新'}), 403
+
+            def _restore_template():
+                return self.template_manager.restore_template_original_compose(
+                    template_id=template_id,
+                    restored_by=user_ctx.get('username', 'system')
+                )
+
+            try:
+                success, message, updated = self._with_template_write_lock(
+                    [template.get('name')],
+                    _restore_template
                 )
             except BlockingIOError as e:
                 return jsonify({'error': str(e)}), 409
@@ -6349,6 +6362,19 @@ class WebAPIServer:
                 user_ctx.get('username', '')
             )
             return jsonify({'message': message, 'template': updated, 'status': 'success'})
+
+        @self.app.route('/api/agent/templates/id/<int:template_id>/compose-source', methods=['GET'])
+        def get_template_compose_source(template_id):
+            user_ctx = self._get_request_user_context()
+            template = _resolve_template_by_id(template_id)
+            if not template:
+                return jsonify({'error': '模板不存在'}), 404
+            if not self._check_template_visible(template, user_ctx):
+                return jsonify({'error': '无权限访问该模板'}), 403
+            success, message, payload = self.template_manager.get_template_compose_source(template_id)
+            if not success:
+                return jsonify({'error': message}), 400
+            return jsonify(payload)
 
         @self.app.route('/api/agent/templates/<name>/yaml', methods=['GET'])
         def get_template_yaml(name):

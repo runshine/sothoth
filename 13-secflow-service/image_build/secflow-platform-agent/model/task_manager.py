@@ -411,7 +411,10 @@ class TaskManager:
             with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 for file_path in temp_root.rglob('*'):
                     if file_path.is_file():
-                        zipf.write(file_path, file_path.relative_to(temp_root))
+                        rel_path = file_path.relative_to(temp_root)
+                        if rel_path.parts and rel_path.parts[0] == '.template-meta':
+                            continue
+                        zipf.write(file_path, rel_path)
             return buffer.getvalue(), f"{template_name}.zip", injection
 
     def _delete_service_template_binding(self, project_id: str, agent_key: str, service_name: str):

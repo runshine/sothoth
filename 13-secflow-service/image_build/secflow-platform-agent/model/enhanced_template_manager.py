@@ -246,45 +246,6 @@ class EnhancedTemplateManager:
         normalized: List[Dict[str, Any]] = []
         if not isinstance(presets, list):
             return normalized
-
-    def _normalize_default_llm_provider_binding(self, binding: Any) -> Optional[Dict[str, Any]]:
-        if not isinstance(binding, dict):
-            return None
-        raw_provider_keys = binding.get('provider_keys')
-        if not isinstance(raw_provider_keys, list):
-            raw_provider_keys = []
-        provider_keys: List[str] = []
-        seen = set()
-        for item in raw_provider_keys:
-            text = str(item or '').strip()
-            if not text or text in seen:
-                continue
-            seen.add(text)
-            provider_keys.append(text)
-
-        raw_targets = binding.get('target_services', '*')
-        if raw_targets == '*' or raw_targets is None:
-            target_services: Union[str, List[str]] = '*'
-        elif isinstance(raw_targets, list):
-            target_seen = set()
-            target_services = []
-            for item in raw_targets:
-                text = str(item or '').strip()
-                if not text or text in target_seen:
-                    continue
-                target_seen.add(text)
-                target_services.append(text)
-        else:
-            target_services = '*'
-
-        if not provider_keys:
-            return None
-        return {
-            'provider_keys': provider_keys,
-            'target_services': target_services,
-            'updated_at': datetime.now().isoformat(),
-        }
-
         for item in presets:
             if not isinstance(item, dict):
                 continue
@@ -324,6 +285,44 @@ class EnhancedTemplateManager:
             dedup[f"{p['port']}:{p['backend_protocol']}:{int(bool(p['ingress_tls_enabled']))}:{p['path']}"] = p
         return list(dedup.values())[:32]
 
+    def _normalize_llm_provider_mix_request(self, binding: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(binding, dict):
+            return None
+        raw_provider_keys = binding.get('provider_keys')
+        if not isinstance(raw_provider_keys, list):
+            raw_provider_keys = []
+        provider_keys: List[str] = []
+        seen = set()
+        for item in raw_provider_keys:
+            text = str(item or '').strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            provider_keys.append(text)
+
+        raw_targets = binding.get('target_services', '*')
+        if raw_targets == '*' or raw_targets is None:
+            target_services: Union[str, List[str]] = '*'
+        elif isinstance(raw_targets, list):
+            target_seen = set()
+            target_services = []
+            for item in raw_targets:
+                text = str(item or '').strip()
+                if not text or text in target_seen:
+                    continue
+                target_seen.add(text)
+                target_services.append(text)
+        else:
+            target_services = '*'
+
+        if not provider_keys:
+            return None
+        return {
+            'provider_keys': provider_keys,
+            'target_services': target_services,
+            'updated_at': datetime.now().isoformat(),
+        }
+
     @staticmethod
     def _normalize_template_tags(tags: Any) -> List[str]:
         if isinstance(tags, str):
@@ -344,6 +343,290 @@ class EnhancedTemplateManager:
             if value and value not in normalized:
                 normalized.append(value)
         return normalized[:64]
+
+    @staticmethod
+    def _internal_meta_dir_name() -> str:
+        return '.template-meta'
+
+    def _internal_meta_dir(self, template_dir: Path) -> Path:
+        return template_dir / self._internal_meta_dir_name()
+
+    def _original_compose_backup_relative_path(self) -> str:
+        return f"{self._internal_meta_dir_name()}/original-compose.yaml"
+
+    def _is_internal_template_path(self, relative_path: Path) -> bool:
+        return bool(relative_path.parts) and relative_path.parts[0] == self._internal_meta_dir_name()
+
+    def _load_template_metadata_dict(self, template: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = template.get('metadata') or {}
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return metadata
+
+    def _update_template_metadata(self, template_id: int, metadata: Dict[str, Any]):
+        table_name = self.db.get_table_name('service_templates')
+        metadata_json = json.dumps(metadata, ensure_ascii=False)
+        if self.db.db_type == 'mysql':
+            self.db.execute_query(
+                f"UPDATE {table_name} SET updated_at = NOW(), metadata = %s WHERE id = %s",
+                (metadata_json, template_id)
+            )
+        else:
+            self.db.execute_query(
+                f"UPDATE {table_name} SET updated_at = datetime('now'), metadata = ? WHERE id = ?",
+                (metadata_json, template_id)
+            )
+
+    def _write_original_compose_backup(
+        self,
+        template_dir: Path,
+        compose_content: str,
+        source_type: str,
+        main_compose_path: str,
+    ) -> Dict[str, Any]:
+        meta_dir = self._internal_meta_dir(template_dir)
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        backup_relative_path = self._original_compose_backup_relative_path()
+        backup_path = template_dir / backup_relative_path
+        backup_path.write_text(compose_content, encoding='utf-8')
+        return {
+            'file_path': backup_relative_path,
+            'source_type': source_type,
+            'main_compose_path': main_compose_path,
+            'created_at': datetime.now().isoformat(),
+        }
+
+    def _get_main_compose_relative_path(self, template: Dict[str, Any], metadata: Dict[str, Any]) -> str:
+        main_yaml = str(metadata.get('main_yaml_file') or '').strip()
+        if main_yaml:
+            return main_yaml
+        file_path = Path(str(template.get('file_path') or ''))
+        return file_path.name
+
+    def _ensure_original_compose_backup(
+        self,
+        template_id: int,
+        template: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], str]:
+        backup_info = metadata.get('original_compose_backup') if isinstance(metadata.get('original_compose_backup'), dict) else None
+        template_dir = self.templates_root / str(template.get('name') or '')
+        if not template_dir.exists():
+            raise ValueError(f"模板目录不存在: {template_dir}")
+
+        if backup_info:
+            backup_path = template_dir / str(backup_info.get('file_path') or '')
+            if backup_path.exists():
+                return backup_info, backup_path.read_text(encoding='utf-8')
+
+        main_compose_path = self._get_main_compose_relative_path(template, metadata)
+        current_compose_path = template_dir / main_compose_path
+        if not current_compose_path.exists():
+            raise ValueError(f"模板主 compose 不存在: {main_compose_path}")
+        compose_content = current_compose_path.read_text(encoding='utf-8')
+        backup_info = self._write_original_compose_backup(
+            template_dir=template_dir,
+            compose_content=compose_content,
+            source_type=str(template.get('type') or 'yaml'),
+            main_compose_path=main_compose_path,
+        )
+        metadata['original_compose_backup'] = backup_info
+        self._update_template_metadata(int(template_id), metadata)
+        return backup_info, compose_content
+
+    @staticmethod
+    def _normalize_compose_environment(environment: Any) -> Dict[str, str]:
+        if isinstance(environment, dict):
+            return {str(k): '' if v is None else str(v) for k, v in environment.items()}
+        if isinstance(environment, list):
+            result: Dict[str, str] = {}
+            for item in environment:
+                if not isinstance(item, str) or '=' not in item:
+                    continue
+                key, value = item.split('=', 1)
+                result[str(key)] = value
+            return result
+        return {}
+
+    def _apply_llm_provider_binding_to_yaml(
+        self,
+        yaml_content: str,
+        binding: Optional[Dict[str, Any]],
+    ) -> Tuple[str, Dict[str, Any]]:
+        if not binding or not isinstance(binding, dict):
+            return yaml_content, {'applied': False, 'provider_keys': [], 'target_services': [], 'mapped_env_keys': []}
+
+        merged_env = binding.get('merged_env') if isinstance(binding.get('merged_env'), dict) else {}
+        provider_keys = [str(item) for item in (binding.get('provider_keys') or []) if str(item).strip()]
+        target_services = binding.get('target_services', '*')
+        if not merged_env or not provider_keys:
+            return yaml_content, {'applied': False, 'provider_keys': provider_keys, 'target_services': [], 'mapped_env_keys': sorted(merged_env.keys())}
+
+        compose_data = yaml.safe_load(yaml_content) or {}
+        if not isinstance(compose_data, dict):
+            raise ValueError('compose YAML 解析结果不是对象')
+        services = compose_data.get('services')
+        if not isinstance(services, dict) or not services:
+            raise ValueError('compose YAML 缺少 services 定义')
+
+        available_services = [str(name) for name in services.keys()]
+        if target_services == '*' or target_services is None:
+            selected_services = available_services
+        else:
+            selected_services = [str(item) for item in (target_services or []) if str(item).strip()]
+            missing = [name for name in selected_services if name not in services]
+            if missing:
+                raise ValueError(f"LLM Provider 目标服务不存在: {', '.join(missing)}")
+
+        for service_name in selected_services:
+            service_cfg = services.get(service_name)
+            if not isinstance(service_cfg, dict):
+                continue
+            env_map = self._normalize_compose_environment(service_cfg.get('environment'))
+            env_map.update({str(k): '' if v is None else str(v) for k, v in merged_env.items()})
+            service_cfg['environment'] = env_map
+
+        updated_yaml = yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
+        return updated_yaml, {
+            'applied': True,
+            'provider_keys': provider_keys,
+            'target_services': selected_services,
+            'mapped_env_keys': sorted(merged_env.keys()),
+        }
+
+    def _rebuild_template_archive(self, template: Dict[str, Any], template_dir: Path):
+        archive_path = Path(str(template.get('file_path') or ''))
+        if not archive_path.exists():
+            raise ValueError(f"原始压缩文件不存在: {archive_path}")
+
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file_path in template_dir.rglob('*'):
+                if not file_path.is_file():
+                    continue
+                rel_path = file_path.relative_to(template_dir)
+                if self._is_internal_template_path(rel_path):
+                    continue
+                if archive_path.resolve() == file_path.resolve():
+                    continue
+                zipf.write(file_path, rel_path)
+        archive_path.write_bytes(buffer.getvalue())
+
+    def _append_llm_mix_history(self, metadata: Dict[str, Any], entry: Dict[str, Any]):
+        history = metadata.get('llm_mix_history')
+        if not isinstance(history, list):
+            history = []
+        history.append(entry)
+        metadata['llm_mix_history'] = history[-20:]
+
+    def regenerate_template_with_llm_providers(
+        self,
+        template_id: int,
+        binding: Dict[str, Any],
+        generated_by: str = 'system',
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        template = self.get_template_by_id(template_id)
+        if not template:
+            return False, '模板不存在', None
+
+        metadata = self._load_template_metadata_dict(template)
+        normalized = self._normalize_llm_provider_mix_request(binding)
+        if not normalized:
+            return False, 'provider_keys 不能为空', None
+
+        try:
+            backup_info, original_compose = self._ensure_original_compose_backup(template_id, template, metadata)
+            resolved_binding = {
+                'provider_keys': list(binding.get('provider_keys') or []),
+                'target_services': normalized.get('target_services', '*'),
+                'merged_env': dict(binding.get('merged_env') or {}),
+                'provider_snapshots': list(binding.get('provider_snapshots') or []),
+                'mapped_env_keys': list(binding.get('mapped_env_keys') or []),
+            }
+            updated_yaml, injection = self._apply_llm_provider_binding_to_yaml(original_compose, resolved_binding)
+
+            template_dir = self.templates_root / str(template.get('name') or '')
+            main_compose_path = str((backup_info or {}).get('main_compose_path') or self._get_main_compose_relative_path(template, metadata))
+            compose_path = template_dir / main_compose_path
+            compose_path.parent.mkdir(parents=True, exist_ok=True)
+            compose_path.write_text(updated_yaml, encoding='utf-8')
+
+            if str(template.get('type') or '') == 'archive':
+                self._rebuild_template_archive(template, template_dir)
+
+            mix_state = {
+                'provider_keys': list(resolved_binding.get('provider_keys') or []),
+                'provider_snapshots': list(resolved_binding.get('provider_snapshots') or []),
+                'mapped_env_keys': list(injection.get('mapped_env_keys') or []),
+                'target_services': resolved_binding.get('target_services', '*'),
+                'generated_at': datetime.now().isoformat(),
+                'generated_by': generated_by,
+            }
+            metadata['llm_mix_state'] = mix_state
+            self._append_llm_mix_history(metadata, dict(mix_state))
+            self._update_template_metadata(template_id, metadata)
+            if template.get('name'):
+                self.parse_template_compose(str(template.get('name')))
+            return True, '模板已重新生成', self.get_template_by_id(template_id)
+        except Exception as e:
+            self.logger.error(f"重新生成模板失败: {str(e)}", exc_info=True)
+            return False, f"重新生成模板失败: {str(e)}", None
+
+    def restore_template_original_compose(
+        self,
+        template_id: int,
+        restored_by: str = 'system',
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        template = self.get_template_by_id(template_id)
+        if not template:
+            return False, '模板不存在', None
+
+        metadata = self._load_template_metadata_dict(template)
+        try:
+            backup_info, original_compose = self._ensure_original_compose_backup(template_id, template, metadata)
+            template_dir = self.templates_root / str(template.get('name') or '')
+            main_compose_path = str((backup_info or {}).get('main_compose_path') or self._get_main_compose_relative_path(template, metadata))
+            compose_path = template_dir / main_compose_path
+            compose_path.parent.mkdir(parents=True, exist_ok=True)
+            compose_path.write_text(original_compose, encoding='utf-8')
+            if str(template.get('type') or '') == 'archive':
+                self._rebuild_template_archive(template, template_dir)
+            metadata.pop('llm_mix_state', None)
+            metadata['llm_mix_restored_at'] = datetime.now().isoformat()
+            metadata['llm_mix_restored_by'] = restored_by
+            self._update_template_metadata(template_id, metadata)
+            if template.get('name'):
+                self.parse_template_compose(str(template.get('name')))
+            return True, '模板已恢复为原始内容', self.get_template_by_id(template_id)
+        except Exception as e:
+            self.logger.error(f"恢复原始模板失败: {str(e)}", exc_info=True)
+            return False, f"恢复原始模板失败: {str(e)}", None
+
+    def get_template_compose_source(self, template_id: int) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        template = self.get_template_by_id(template_id)
+        if not template:
+            return False, '模板不存在', None
+        metadata = self._load_template_metadata_dict(template)
+        backup_info = metadata.get('original_compose_backup') if isinstance(metadata.get('original_compose_backup'), dict) else None
+        llm_mix_state = metadata.get('llm_mix_state') if isinstance(metadata.get('llm_mix_state'), dict) else None
+        llm_mix_history = metadata.get('llm_mix_history') if isinstance(metadata.get('llm_mix_history'), list) else []
+        return True, 'ok', {
+            'template_id': template_id,
+            'template_name': template.get('name'),
+            'original_compose_backup': backup_info,
+            'llm_mix_state': llm_mix_state,
+            'llm_mix_history': llm_mix_history[-20:],
+            'current_source': (
+                'original'
+                if not llm_mix_state
+                else f"original + {' + '.join([str(item) for item in (llm_mix_state.get('provider_keys') or []) if str(item).strip()])}"
+            ),
+        }
 
     @staticmethod
     def _normalize_template_owner(template: Dict[str, Any]) -> Dict[str, Any]:
@@ -1554,8 +1837,7 @@ class EnhancedTemplateManager:
                         file_content: bytes, filename: str, created_by: str,
                         visibility: str = 'shared', owner_id: str = '', owner_name: str = '',
                         web_port_presets: Optional[List[Dict[str, Any]]] = None,
-                        tags: Optional[List[str]] = None,
-                        default_llm_provider_binding: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+                        tags: Optional[List[str]] = None) -> Tuple[bool, str]:
         """创建模板（增强版，支持多种压缩格式）"""
         template_dir = None
         file_path = None
@@ -1705,12 +1987,22 @@ class EnhancedTemplateManager:
             if web_port_presets is not None:
                 metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
             metadata['tags'] = self._normalize_template_tags(tags)
-            normalized_llm_binding = self._normalize_default_llm_provider_binding(default_llm_provider_binding)
-            if normalized_llm_binding is not None:
-                metadata['default_llm_provider_binding'] = normalized_llm_binding
-
             if template_type == 'archive' and found_yaml:
                 metadata['main_yaml_file'] = str(found_yaml.relative_to(template_dir))
+                metadata['original_compose_backup'] = self._write_original_compose_backup(
+                    template_dir=template_dir,
+                    compose_content=yaml_content,
+                    source_type='archive',
+                    main_compose_path=metadata['main_yaml_file']
+                )
+            elif template_type == 'yaml':
+                metadata['main_yaml_file'] = filename
+                metadata['original_compose_backup'] = self._write_original_compose_backup(
+                    template_dir=template_dir,
+                    compose_content=yaml_content,
+                    source_type='yaml',
+                    main_compose_path=filename
+                )
 
             metadata_json = json.dumps(metadata)
 
@@ -2641,7 +2933,6 @@ class EnhancedTemplateManager:
                               visibility: Optional[str] = None,
                               web_port_presets: Optional[List[Dict[str, Any]]] = None,
                               tags: Optional[List[str]] = None,
-                              default_llm_provider_binding: Optional[Dict[str, Any]] = None,
                               updated_by: str = '') -> Tuple[bool, str, Optional[Dict]]:
         """更新模板基础信息（支持重命名）"""
         try:
@@ -2693,12 +2984,6 @@ class EnhancedTemplateManager:
                 metadata['web_port_presets'] = self._normalize_web_port_presets(web_port_presets)
             if tags is not None:
                 metadata['tags'] = self._normalize_template_tags(tags)
-            if default_llm_provider_binding is not None:
-                normalized_llm_binding = self._normalize_default_llm_provider_binding(default_llm_provider_binding)
-                if normalized_llm_binding is None:
-                    metadata.pop('default_llm_provider_binding', None)
-                else:
-                    metadata['default_llm_provider_binding'] = normalized_llm_binding
 
             table_name = self.db.get_table_name('service_templates')
             if self.db.db_type == 'mysql':
@@ -2758,7 +3043,6 @@ class EnhancedTemplateManager:
                 owner_name=owner_name,
                 web_port_presets=source_meta.get('web_port_presets'),
                 tags=self._normalize_template_tags(source_meta.get('tags')),
-                default_llm_provider_binding=source_meta.get('default_llm_provider_binding'),
             )
         except Exception as e:
             self.logger.error(f"复制模板失败: {str(e)}", exc_info=True)
