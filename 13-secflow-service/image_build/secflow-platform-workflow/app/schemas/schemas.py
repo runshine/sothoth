@@ -333,7 +333,7 @@ class WorkflowNodeConfig(BaseModel):
     # Service configuration (for app type nodes only)
     # These fields are only used when node_type is "app"
     create_service: bool = Field(default=True, description="Whether to create K8s Service")
-    service_name: Optional[str] = Field(None, description="K8s Service name (default: auto-generated)")
+    service_name: Optional[str] = Field(None, description="Service display name or label; actual K8s Service name is auto-generated")
     service_ports: List[ServicePort] = Field(default=[], description="Service ports exposed by the Deployment")
     service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="K8s Service type")
 
@@ -352,7 +352,7 @@ class WorkflowNodeConfig(BaseModel):
         if self.node_type == NodeType.APP and self.create_service:
             errors = []
             if not self.service_name or not self.service_name.strip():
-                errors.append("service_name is required when create_service is True")
+                errors.append("service_name is required as a display label when create_service is True")
             if not self.service_ports or len(self.service_ports) == 0:
                 errors.append("service_ports cannot be empty when create_service is True")
             if self.create_ingress:
@@ -458,7 +458,7 @@ class WorkflowNodeCreate(BaseModel):
     # Service configuration (for app type nodes only)
     # These fields are only used when node_type is "app"
     create_service: bool = Field(default=True, description="Whether to create K8s Service")
-    service_name: Optional[str] = Field(None, description="K8s Service name (default: auto-generated)")
+    service_name: Optional[str] = Field(None, description="Service display name or label; actual K8s Service name is auto-generated")
     service_ports: List[ServicePort] = Field(default=[], description="Service ports exposed by the Deployment")
     service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="K8s Service type")
 
@@ -477,7 +477,7 @@ class WorkflowNodeCreate(BaseModel):
         if self.node_type == NodeType.APP and self.create_service:
             errors = []
             if not self.service_name or not self.service_name.strip():
-                errors.append("service_name is required when create_service is True")
+                errors.append("service_name is required as a display label when create_service is True")
             if not self.service_ports or len(self.service_ports) == 0:
                 errors.append("service_ports cannot be empty when create_service is True")
             if self.create_ingress:
@@ -510,7 +510,7 @@ class WorkflowNodeUpdate(BaseModel):
     # Service configuration (for app type nodes only)
     # These fields are only used when node_type is "app"
     create_service: Optional[bool] = Field(None, description="Whether to create K8s Service")
-    service_name: Optional[str] = Field(None, description="K8s Service name")
+    service_name: Optional[str] = Field(None, description="Service display name or label; actual K8s Service name is auto-generated")
     service_ports: Optional[List[ServicePort]] = Field(None, description="Service ports exposed by the Deployment")
     service_type: Optional[ServiceType] = Field(None, description="K8s Service type")
 
@@ -528,7 +528,7 @@ class WorkflowNodeUpdate(BaseModel):
         if self.create_service is True:
             errors = []
             if not self.service_name or not self.service_name.strip():
-                errors.append("service_name is required when create_service is True")
+                errors.append("service_name is required as a display label when create_service is True")
             if not self.service_ports or len(self.service_ports) == 0:
                 errors.append("service_ports cannot be empty when create_service is True")
             if self.create_ingress is True:
@@ -800,7 +800,7 @@ class AppWorkflowCreate(BaseModel):
     template_id: str = Field(..., description="应用模板ID")
 
     # Service配置（APP节点需要暴露服务）
-    service_name: str = Field(..., min_length=1, description="K8s Service名称")
+    service_name: str = Field(..., min_length=1, description="Service展示名称；实际K8s Service名称由后端自动生成")
     service_ports: List[ServicePort] = Field(..., min_length=1, description="Service端口配置")
     service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="Service类型")
 
@@ -832,7 +832,7 @@ class AppWorkflowUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=128)
     description: Optional[str] = None
     # Service配置
-    service_name: Optional[str] = Field(None, min_length=1)
+    service_name: Optional[str] = Field(None, min_length=1, description="Service展示名称；实际K8s Service名称由后端自动生成")
     service_ports: Optional[List[ServicePort]] = None
     service_type: Optional[ServiceType] = None
     # 覆盖配置
