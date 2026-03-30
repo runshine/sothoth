@@ -947,9 +947,11 @@ class WebAPIServer:
             'description': provider.get('description'),
         }
 
-    def _build_llm_provider_env(self, provider: Dict[str, Any], backend_type: str) -> Dict[str, str]:
-        provider_type = str(provider.get('provider_type') or '').strip().lower()
-        backend_type = str(backend_type or '').strip().lower()
+    def _build_llm_provider_env(
+        self,
+        provider: Dict[str, Any],
+        backend_type: str,
+    ) -> Dict[str, str]:
         env: Dict[str, str] = {}
 
         def put(key: str, value: Any):
@@ -957,50 +959,9 @@ class WebAPIServer:
             if text is not None and str(key or '').strip():
                 env[str(key).strip()] = text
 
-        if provider_type in ('openai-compatible', 'deepseek', 'qwen', 'moonshot', 'custom'):
-            put('OPENAI_API_KEY', provider.get('api_key'))
-            put('OPENAI_BASE_URL', provider.get('api_base'))
-            put('OPENAI_MODEL', provider.get('model'))
-            put('OPENAI_ORG_ID', provider.get('organization'))
-            put('OPENAI_API_VERSION', provider.get('api_version'))
-            put('OPENAI_TIMEOUT_SECONDS', provider.get('timeout_seconds'))
-            put('OPENAI_MAX_TOKENS', provider.get('max_tokens'))
-            put('OPENAI_TEMPERATURE', provider.get('temperature'))
-        elif provider_type == 'azure-openai':
-            put('AZURE_OPENAI_API_KEY', provider.get('api_key'))
-            put('AZURE_OPENAI_ENDPOINT', provider.get('api_base'))
-            put('AZURE_OPENAI_API_VERSION', provider.get('api_version'))
-            put('AZURE_OPENAI_MODEL', provider.get('model'))
-            put('AZURE_OPENAI_TIMEOUT_SECONDS', provider.get('timeout_seconds'))
-            put('AZURE_OPENAI_MAX_TOKENS', provider.get('max_tokens'))
-            put('AZURE_OPENAI_TEMPERATURE', provider.get('temperature'))
-        elif provider_type == 'anthropic':
-            put('ANTHROPIC_API_KEY', provider.get('api_key'))
-            put('ANTHROPIC_BASE_URL', provider.get('api_base'))
-            put('ANTHROPIC_MODEL', provider.get('model'))
-            put('ANTHROPIC_TIMEOUT_SECONDS', provider.get('timeout_seconds'))
-            put('ANTHROPIC_MAX_TOKENS', provider.get('max_tokens'))
-            put('ANTHROPIC_TEMPERATURE', provider.get('temperature'))
-        elif provider_type == 'ollama':
-            put('OLLAMA_BASE_URL', provider.get('api_base'))
-            put('OLLAMA_MODEL', provider.get('model'))
-            put('OLLAMA_TIMEOUT_SECONDS', provider.get('timeout_seconds'))
-        else:
-            put('OPENAI_API_KEY', provider.get('api_key'))
-            put('OPENAI_BASE_URL', provider.get('api_base'))
-            put('OPENAI_MODEL', provider.get('model'))
-
         env_bindings = provider.get('env_bindings') if isinstance(provider.get('env_bindings'), dict) else {}
         for key, value in env_bindings.items():
             put(str(key), value)
-
-        if backend_type in ('claude', 'claude-a2a') and provider_type == 'anthropic':
-            put('ANTHROPIC_AUTH_TOKEN', provider.get('api_key'))
-        if backend_type in ('codex', 'opencode') and provider_type == 'azure-openai':
-            put('OPENAI_API_KEY', provider.get('api_key'))
-            put('OPENAI_BASE_URL', provider.get('api_base'))
-            put('OPENAI_API_VERSION', provider.get('api_version'))
-            put('OPENAI_MODEL', provider.get('model'))
 
         return env
 
