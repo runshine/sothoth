@@ -6,6 +6,7 @@ import signal
 import subprocess
 import threading
 import time
+import codecs
 from datetime import datetime, timezone
 from typing import Any, Dict, Generator
 
@@ -173,10 +174,10 @@ class AgentProcessManager:
                 args,
                 cwd=config.cwd or None,
                 env=env,
-                text=True,
+                text=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=1,
+                bufsize=0,
             )
         except FileNotFoundError:
             yield {
@@ -185,22 +186,27 @@ class AgentProcessManager:
             }
             return
 
-        q: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        q: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
         stdout_parts: list[str] = []
         stderr_parts: list[str] = []
+        decoders = {
+            'stdout': codecs.getincrementaldecoder('utf-8')(),
+            'stderr': codecs.getincrementaldecoder('utf-8')(),
+        }
+
         def _pump(pipe, source: str) -> None:
             try:
                 while True:
-                    line = pipe.readline()
-                    if line == '':
+                    chunk = os.read(pipe.fileno(), 64)
+                    if not chunk:
                         break
-                    q.put((source, line))
+                    q.put((source, chunk))
             finally:
                 try:
                     pipe.close()
                 except Exception:
                     pass
-                q.put(None)
+                q.put((source, None))
 
         stdout_thread = threading.Thread(target=_pump, args=(proc.stdout, 'stdout'), daemon=True)
         stderr_thread = threading.Thread(target=_pump, args=(proc.stderr, 'stderr'), daemon=True)
@@ -208,14 +214,14 @@ class AgentProcessManager:
         stderr_thread.start()
 
         stream_end = time.time() + settings.backend_invoke_timeout_sec
-        done_sentinels = 0
+        done_sources: set[str] = set()
         timed_out = False
 
         while True:
-            if done_sentinels >= 2 and q.empty():
+            if len(done_sources) >= 2 and q.empty():
                 break
 
-            timeout_left = max(0.1, min(0.5, stream_end - time.time()))
+            timeout_left = max(0.01, min(0.05, stream_end - time.time()))
             if stream_end - time.time() <= 0:
                 timed_out = True
                 try:
@@ -229,11 +235,25 @@ class AgentProcessManager:
             except queue.Empty:
                 continue
 
-            if item is None:
-                done_sentinels += 1
+            source, raw = item
+            if raw is None:
+                done_sources.add(source)
+                flush_text = decoders[source].decode(b'', final=True)
+                if flush_text:
+                    if source == 'stdout':
+                        stdout_parts.append(flush_text)
+                    else:
+                        stderr_parts.append(flush_text)
+                    yield {
+                        'type': 'chunk',
+                        'source': source,
+                        'text': flush_text,
+                    }
                 continue
 
-            source, text = item
+            text = decoders[source].decode(raw, final=False)
+            if not text:
+                continue
             if source == 'stdout':
                 stdout_parts.append(text)
             else:

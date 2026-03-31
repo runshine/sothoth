@@ -203,6 +203,19 @@ def get_ai_agent_session(session_id: str):
     return jsonify(session)
 
 
+@bp.delete('/api/ai-agents/sessions/<session_id>')
+def delete_ai_agent_session(session_id: str):
+    try:
+        deleted = a2a.session_store.delete(session_id)
+        return jsonify({
+            'session_id': session_id,
+            'deleted': True,
+            'session': deleted,
+        })
+    except KeyError:
+        return jsonify({'error': 'session not found'}), 404
+
+
 @bp.post('/api/ai-agents/sessions/<session_id>/messages')
 def send_ai_agent_session_message(session_id: str):
     payload = request.get_json(silent=True) or {}

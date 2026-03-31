@@ -4051,12 +4051,23 @@ class WebAPIServer:
                 self.logger.error(f"AI helper会话代理失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/sessions/<session_id>', methods=['GET'])
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/sessions/<session_id>', methods=['GET', 'DELETE'])
         def get_ai_helper_session(agent_key, service_name, session_id):
-            project_id = str(request.args.get('project_id') or '').strip()
+            payload = request.get_json(silent=True) or {}
+            project_id = str(request.args.get('project_id') or payload.get('project_id') or '').strip()
             if not project_id:
                 return jsonify({'error': 'project_id is required'}), 400
             try:
+                if request.method == 'DELETE':
+                    data, status_code = self._call_ai_helper_api(
+                        project_id,
+                        agent_key,
+                        service_name,
+                        'DELETE',
+                        f"/api/ai-agents/sessions/{quote(session_id, safe='')}",
+                        payload if isinstance(payload, dict) else None,
+                    )
+                    return jsonify(data), status_code
                 data, status_code = self._call_ai_helper_api(
                     project_id,
                     agent_key,
@@ -4099,7 +4110,7 @@ class WebAPIServer:
 
                     def _proxy_stream():
                         try:
-                            for chunk in upstream.iter_content(chunk_size=1024):
+                            for chunk in upstream.iter_content(chunk_size=64):
                                 if not chunk:
                                     continue
                                 yield chunk
@@ -4241,12 +4252,87 @@ class WebAPIServer:
                 self.logger.error(f"创建AI helper批量会话失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/ai-helpers/sessions/batch/<batch_id>', methods=['GET'])
+        @self.app.route('/api/agent/ai-helpers/sessions/batch/<batch_id>', methods=['GET', 'DELETE'])
         def get_ai_helper_batch(batch_id):
             try:
                 batch = self._load_ai_batch(batch_id)
                 if not batch:
                     return jsonify({'error': 'batch not found'}), 404
+                if request.method == 'DELETE':
+                    project_id = str(batch.get('project_id') or '')
+                    items_table = self.db_manager.get_table_name('ai_agent_session_batch_items')
+                    messages_table = self.db_manager.get_table_name('ai_agent_session_batch_messages')
+                    batch_table = self.db_manager.get_table_name('ai_agent_session_batches')
+                    items = self.db_manager.fetch_all(
+                        f"SELECT agent_key, service_name, helper_session_id FROM {items_table} WHERE batch_id = %s ORDER BY agent_key, service_name"
+                        if self.db_manager.db_type == 'mysql' else
+                        f"SELECT agent_key, service_name, helper_session_id FROM {items_table} WHERE batch_id = ? ORDER BY agent_key, service_name",
+                        (batch_id,)
+                    ) or []
+                    helper_cleanup = []
+                    for item in items:
+                        helper_session_id = str(item.get('helper_session_id') or '').strip()
+                        if not helper_session_id:
+                            helper_cleanup.append({
+                                'agent_key': item.get('agent_key'),
+                                'service_name': item.get('service_name'),
+                                'session_id': helper_session_id,
+                                'deleted': False,
+                                'status_code': 0,
+                                'error': 'missing helper_session_id',
+                            })
+                            continue
+                        try:
+                            cleanup_data, cleanup_code = self._call_ai_helper_api(
+                                project_id,
+                                str(item.get('agent_key') or ''),
+                                str(item.get('service_name') or ''),
+                                'DELETE',
+                                f"/api/ai-agents/sessions/{quote(helper_session_id, safe='')}",
+                                None,
+                                timeout=(5, 30),
+                            )
+                            helper_cleanup.append({
+                                'agent_key': item.get('agent_key'),
+                                'service_name': item.get('service_name'),
+                                'session_id': helper_session_id,
+                                'deleted': cleanup_code < 300,
+                                'status_code': cleanup_code,
+                                'response': cleanup_data,
+                            })
+                        except Exception as cleanup_exc:
+                            helper_cleanup.append({
+                                'agent_key': item.get('agent_key'),
+                                'service_name': item.get('service_name'),
+                                'session_id': helper_session_id,
+                                'deleted': False,
+                                'status_code': 500,
+                                'error': str(cleanup_exc),
+                            })
+
+                    self.db_manager.execute_query(
+                        f"DELETE FROM {messages_table} WHERE batch_id = %s"
+                        if self.db_manager.db_type == 'mysql' else
+                        f"DELETE FROM {messages_table} WHERE batch_id = ?",
+                        (batch_id,)
+                    )
+                    self.db_manager.execute_query(
+                        f"DELETE FROM {items_table} WHERE batch_id = %s"
+                        if self.db_manager.db_type == 'mysql' else
+                        f"DELETE FROM {items_table} WHERE batch_id = ?",
+                        (batch_id,)
+                    )
+                    self.db_manager.execute_query(
+                        f"DELETE FROM {batch_table} WHERE batch_id = %s"
+                        if self.db_manager.db_type == 'mysql' else
+                        f"DELETE FROM {batch_table} WHERE batch_id = ?",
+                        (batch_id,)
+                    )
+                    return jsonify({
+                        'batch_id': batch_id,
+                        'deleted': True,
+                        'helper_cleanup': helper_cleanup,
+                    })
                 items_table = self.db_manager.get_table_name('ai_agent_session_batch_items')
                 items = self.db_manager.fetch_all(
                     f"SELECT * FROM {items_table} WHERE batch_id = %s ORDER BY agent_key, service_name"

@@ -62,3 +62,12 @@ class SessionStore:
     def list(self) -> List[Dict[str, Any]]:
         sessions = self.store.read().get('sessions', {})
         return list(sessions.values())
+
+    def delete(self, session_id: str) -> Dict[str, Any]:
+        data = self.store.read()
+        session = data.get('sessions', {}).get(session_id)
+        if not session:
+            raise KeyError(session_id)
+        data['sessions'].pop(session_id, None)
+        self.store.write(data)
+        return session
