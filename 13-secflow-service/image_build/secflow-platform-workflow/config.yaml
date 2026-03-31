@@ -69,6 +69,13 @@ fileserver_service:
   port: 80
   timeout: 30
 
+# Config Center Service Configuration
+configcenter_service:
+  enabled: true
+  host: "secflow-platform-configcenter"
+  port: 80
+  timeout: 30
+
 # Application Configuration
 app:
   host: "0.0.0.0"
