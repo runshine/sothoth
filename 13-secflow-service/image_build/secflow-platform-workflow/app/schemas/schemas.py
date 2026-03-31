@@ -5,6 +5,7 @@ Pydantic schemas for workflow service
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from enum import Enum
+import re
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -799,6 +800,92 @@ class WorkflowSyncRecordListResponse(BaseModel):
     items: List[WorkflowSyncRecordResponse]
 
 
+# ============ LLM Binding Schemas ============
+
+class AppWorkflowLlmBindingSource(str, Enum):
+    CONFIG_CENTER = "config_center"
+    CUSTOM = "custom"
+
+
+class LlmProviderConfigPayload(BaseModel):
+    provider_key: str
+    display_name: str
+    provider_type: str
+    enabled: bool = True
+    is_default: bool = False
+    api_base: str
+    model: str
+    api_key: str
+    organization: Optional[str] = None
+    api_version: Optional[str] = None
+    timeout_seconds: int = 60
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    env_bindings: Dict[str, Any] = Field(default_factory=dict)
+    extra_config: Dict[str, Any] = Field(default_factory=dict)
+    description: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    @field_validator("provider_key", "display_name", "provider_type", "api_base", "api_key")
+    @classmethod
+    def validate_required_str(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+    @field_validator("model")
+    @classmethod
+    def normalize_model(cls, value: str) -> str:
+        return (value or "").strip()
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def validate_timeout(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("timeout_seconds 必须大于 0")
+        return value
+
+    @field_validator("temperature")
+    @classmethod
+    def validate_temperature(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and (value < 0 or value > 2):
+            raise ValueError("temperature 需介于 0 到 2 之间")
+        return value
+
+    @field_validator("env_bindings")
+    @classmethod
+    def validate_env_bindings(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(value or {})
+        for key in normalized.keys():
+            if not re.match(r"^[A-Z][A-Z0-9_]*$", str(key)):
+                raise ValueError(f"环境变量名不合法: {key}")
+        return normalized
+
+
+class AppWorkflowLlmBindingRequest(BaseModel):
+    source: AppWorkflowLlmBindingSource
+    provider_key: Optional[str] = None
+    config: Optional[LlmProviderConfigPayload] = None
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if self.source == AppWorkflowLlmBindingSource.CONFIG_CENTER:
+            if not (self.provider_key or "").strip():
+                raise ValueError("provider_key is required when source=config_center")
+        if self.source == AppWorkflowLlmBindingSource.CUSTOM and self.config is None:
+            raise ValueError("config is required when source=custom")
+        return self
+
+
+class AppWorkflowLlmBindingResponse(BaseModel):
+    source: AppWorkflowLlmBindingSource
+    provider_key: str
+    config: LlmProviderConfigPayload
+    bound_at: Optional[datetime] = None
+
+
 # ============ App Workflow Schemas (Single Application Workflow) ============
 
 class AppWorkflowCreate(BaseModel):
@@ -832,6 +919,7 @@ class AppWorkflowCreate(BaseModel):
     ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
     ingress_host: Optional[str] = Field(None, description="Ingress域名 (例如: myapp.example.com)")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller外部IP地址")
+    llm_binding: Optional[AppWorkflowLlmBindingRequest] = Field(None, description="LLM配置绑定")
 
     @model_validator(mode='after')
     def validate_ingress_config(self):
@@ -864,6 +952,7 @@ class AppWorkflowUpdate(BaseModel):
     ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
     ingress_host: Optional[str] = Field(None, description="Ingress域名")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller外部IP地址")
+    llm_binding: Optional[AppWorkflowLlmBindingRequest] = Field(None, description="LLM配置绑定")
 
     @model_validator(mode='after')
     def validate_ingress_config(self):
@@ -907,6 +996,7 @@ class AppWorkflowNodeResponse(BaseModel):
     ingress_name: Optional[str] = None
     ingress_access_url: Optional[str] = None
     ingress_tls_enabled: Optional[bool] = None
+    llm_binding: Optional[AppWorkflowLlmBindingResponse] = None
 
 
 class AppWorkflowResponse(BaseModel):
@@ -938,6 +1028,7 @@ class AppWorkflowResponse(BaseModel):
     ingress_name: Optional[str] = None
     ingress_access_url: Optional[str] = None
     ingress_tls_enabled: Optional[bool] = None
+    llm_binding: Optional[AppWorkflowLlmBindingResponse] = None
 
     # 模板信息
     template_id: str

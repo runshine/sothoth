@@ -47,6 +47,8 @@ from app.schemas.schemas import (
     WorkflowInstanceResponse,
     WorkflowInstanceListResponse,
     # App Workflow
+    AppWorkflowLlmBindingRequest,
+    AppWorkflowLlmBindingResponse,
     AppWorkflowCreate,
     AppWorkflowUpdate,
     AppWorkflowNodeResponse,
@@ -103,6 +105,8 @@ __all__ = [
     "WorkflowInstanceListResponse",
     "AppWorkflowCreate",
     "AppWorkflowUpdate",
+    "AppWorkflowLlmBindingRequest",
+    "AppWorkflowLlmBindingResponse",
     "AppWorkflowNodeResponse",
     "AppWorkflowResponse",
     "AppWorkflowListResponse",

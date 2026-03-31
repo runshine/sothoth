@@ -124,6 +124,19 @@ class FileserverServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}/api/fileserver"
 
 
+class ConfigCenterServiceConfig(BaseModel):
+    """Config Center微服务配置"""
+    enabled: bool = True
+    host: str = "secflow-platform-configcenter"
+    port: int = 80
+    timeout: int = 30
+
+    @property
+    def base_url(self) -> str:
+        """Generate config center service base URL"""
+        return f"http://{self.host}:{self.port}/api/configcenter"
+
+
 class AppConfig(BaseModel):
     """Application configuration"""
     host: str = "0.0.0.0"
@@ -145,6 +158,7 @@ class Config(BaseModel):
     k8s_service: K8SServiceConfig = K8SServiceConfig()  # K8S微服务配置
     workflow_status_service: WorkflowStatusServiceConfig = WorkflowStatusServiceConfig()  # Workflow Status微服务配置
     fileserver_service: FileserverServiceConfig = FileserverServiceConfig()
+    configcenter_service: ConfigCenterServiceConfig = ConfigCenterServiceConfig()
     app: AppConfig
     logging: LoggingConfig = LoggingConfig()
 

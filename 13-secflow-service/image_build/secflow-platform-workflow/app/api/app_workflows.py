@@ -34,11 +34,13 @@ from app.schemas import (
     AppWorkflowCreate, AppWorkflowUpdate,
     AppWorkflowResponse, AppWorkflowListResponse,
     AppWorkflowNodeResponse,
+    AppWorkflowLlmBindingRequest,
     SuccessResponse,
     WorkflowNodeIngressBindingRequest,
     WorkflowNodeDomainBindingResponse,
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
+from app.services.configcenter_client import get_configcenter_client
 from app.services.workflow_status_client import get_workflow_status_client
 from app.config import get_config
 
@@ -67,6 +69,43 @@ def check_instance_permission(instance: WorkflowInstance, user_id: str) -> bool:
     return False
 
 
+def get_configcenter_client_or_fail():
+    """Get config center client, fail fast when disabled."""
+    config = get_config()
+    if not config.configcenter_service or not config.configcenter_service.enabled:
+        raise InternalError("config center service is required but disabled")
+    return get_configcenter_client()
+
+
+async def resolve_llm_binding(
+    binding: Optional[AppWorkflowLlmBindingRequest],
+) -> Optional[Dict[str, Any]]:
+    """Resolve and validate llm binding payload into a persisted snapshot."""
+    if binding is None:
+        return None
+
+    if binding.source.value == "config_center":
+        provider_key = (binding.provider_key or "").strip()
+        provider_detail = await get_configcenter_client_or_fail().get_llm_provider(provider_key)
+        return {
+            "source": "config_center",
+            "provider_key": provider_detail["provider_key"],
+            "config": provider_detail,
+            "bound_at": datetime.utcnow().isoformat(),
+        }
+
+    if binding.config is None:
+        raise ValidationError("custom llm config is required")
+
+    config_payload = binding.config.model_dump(mode="json")
+    return {
+        "source": "custom",
+        "provider_key": config_payload["provider_key"],
+        "config": config_payload,
+        "bound_at": datetime.utcnow().isoformat(),
+    }
+
+
 def build_app_workflow_response(
     instance: WorkflowInstance,
     node: WorkflowNodeInstance,
@@ -85,6 +124,7 @@ def build_app_workflow_response(
     create_service = node_config.get("create_service")
     if create_service is None:
         create_service = True
+    llm_binding = node_config.get("llm_binding")
 
     return {
         "id": instance.id,
@@ -121,6 +161,7 @@ def build_app_workflow_response(
             "ingress_name": ingress_name,
             "ingress_access_url": node_config.get("ingress_access_url"),
             "ingress_tls_enabled": node_config.get("ingress_tls_enabled"),
+            "llm_binding": llm_binding,
             "init_logs": node.init_logs,
         },
         "service_name": display_service_name,
@@ -139,6 +180,7 @@ def build_app_workflow_response(
         "ingress_name": ingress_name,
         "ingress_access_url": node_config.get("ingress_access_url"),
         "ingress_tls_enabled": node_config.get("ingress_tls_enabled"),
+        "llm_binding": llm_binding,
         "template_id": node.template_id,
         "template_name": template.name if template else None,
         "created_by": instance.created_by,
@@ -259,6 +301,7 @@ async def create_app_workflow(
     # 3. 生成工作流ID和节点ID
     instance_id = generate_id(workflow_data.name)
     node_id = generate_id(f"{instance_id}_node")
+    llm_binding = await resolve_llm_binding(workflow_data.llm_binding)
     resolved_volume_mounts, raw_volume_mounts, normalized_project_mounts = await resolve_requested_volume_mounts(
         workflow_data.project_id,
         workflow_data.volume_mounts,
@@ -294,6 +337,7 @@ async def create_app_workflow(
         "ingress_type": workflow_data.ingress_type if workflow_data.create_ingress else None,
         "ingress_host": workflow_data.ingress_host,
         "ingress_ip": workflow_data.ingress_ip,
+        "llm_binding": llm_binding,
     }
 
     # 5. 创建 WorkflowInstance
@@ -382,6 +426,27 @@ async def list_app_workflows(
             items.append(build_app_workflow_response(inst, node, template))
 
     return AppWorkflowListResponse(total=len(items), items=items)
+
+
+# ============ LLM Providers ============
+
+@router.get("/llm-providers", summary="获取可绑定的LLM配置列表")
+async def list_app_workflow_llm_providers(
+    current_user: dict = Depends(get_current_user),
+):
+    """代理配置中心的已启用 LLM Provider 列表，供应用实例创建时选择。"""
+    _ = current_user
+    return await get_configcenter_client_or_fail().list_llm_providers()
+
+
+@router.get("/llm-providers/{provider_key}", summary="获取可绑定的LLM配置详情")
+async def get_app_workflow_llm_provider(
+    provider_key: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """代理配置中心的单个 LLM Provider 详情。"""
+    _ = current_user
+    return await get_configcenter_client_or_fail().get_llm_provider(provider_key)
 
 
 # ============ Ingress Controllers ============
@@ -711,6 +776,8 @@ async def update_app_workflow(
     if workflow_data.timeout_seconds is not None:
         node.timeout_seconds = workflow_data.timeout_seconds
         node_config["timeout_seconds"] = workflow_data.timeout_seconds
+    if workflow_data.llm_binding is not None:
+        node_config["llm_binding"] = await resolve_llm_binding(workflow_data.llm_binding)
     if workflow_data.create_ingress is not None:
         node_config["create_ingress"] = workflow_data.create_ingress
         if workflow_data.create_ingress is False:
