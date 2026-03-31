@@ -4110,7 +4110,7 @@ class WebAPIServer:
 
                     def _proxy_stream():
                         try:
-                            for chunk in upstream.iter_content(chunk_size=64):
+                            for chunk in upstream.iter_content(chunk_size=1):
                                 if not chunk:
                                     continue
                                 yield chunk

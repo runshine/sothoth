@@ -28,7 +28,7 @@ class A2AService:
         if isinstance(agent_ids, list):
             values = [str(item).strip() for item in agent_ids if str(item).strip()]
             if values:
-                return values
+                return [values[0]]
         agent_id = str(payload.get('agent_id') or payload.get('backend') or '').strip()
         if agent_id:
             return [agent_id]
@@ -70,7 +70,7 @@ class A2AService:
         return self.session_store.create(
             backend=backend,
             metadata=payload.get('metadata') or {},
-            agent_ids=agent_ids,
+            agent_ids=agent_ids[:1],
         )
 
     def send_session_message(self, session_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -78,11 +78,10 @@ class A2AService:
         content = payload.get('content', '')
         session = self.session_store.append_message(session_id, role, content)
         agent_ids = session.get('agent_ids') or ([session.get('backend')] if session.get('backend') else [])
+        agent_ids = agent_ids[:1]
         result = self._invoke_for_agents(agent_ids, content, session.get('messages', []))
-        assistant_content = '\n'.join(
-            f"[{item.get('agent_id')}] {item.get('output') or item.get('error') or ''}".strip()
-            for item in result.get('results', [])
-        ).strip()
+        first_result = (result.get('results') or [{}])[0] or {}
+        assistant_content = str(first_result.get('output') or first_result.get('error') or '').strip()
         self.session_store.append_message(session_id, 'assistant', assistant_content)
         return {
             'session': self.session_store.get(session_id),
@@ -94,6 +93,7 @@ class A2AService:
         content = str(payload.get('content') or '')
         session = self.session_store.append_message(session_id, role, content)
         agent_ids = session.get('agent_ids') or ([session.get('backend')] if session.get('backend') else [])
+        agent_ids = agent_ids[:1]
         if not agent_ids:
             error_payload = {
                 'type': 'error',
@@ -111,7 +111,6 @@ class A2AService:
         yield f"data: {json.dumps(start_payload, ensure_ascii=False)}\n\n"
 
         results = []
-        aggregated_lines = []
         success_count = 0
         history_messages = session.get('messages', [])
 
@@ -156,9 +155,10 @@ class A2AService:
                 'error': '' if success else str((last_done or {}).get('error') or (last_done or {}).get('stderr') or ''),
                 'raw': last_done or {},
             })
-            aggregated_lines.append(f"[{agent_id}] {output or ((last_done or {}).get('error') or '')}".strip())
+            break
 
-        assistant_content = '\n'.join([line for line in aggregated_lines if line]).strip()
+        first_result = (results or [{}])[0] or {}
+        assistant_content = str(first_result.get('output') or first_result.get('error') or '').strip()
         self.session_store.append_message(session_id, 'assistant', assistant_content)
         final_result = {
             'success': success_count == len(agent_ids) and len(agent_ids) > 0,
