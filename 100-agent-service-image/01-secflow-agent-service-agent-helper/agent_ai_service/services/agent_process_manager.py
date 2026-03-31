@@ -197,7 +197,7 @@ class AgentProcessManager:
         def _pump(pipe, source: str) -> None:
             try:
                 while True:
-                    chunk = os.read(pipe.fileno(), 64)
+                    chunk = os.read(pipe.fileno(), 1)
                     if not chunk:
                         break
                     q.put((source, chunk))
