@@ -1145,7 +1145,10 @@ async def list_workflow_instances(
     if not project_id:
         return WorkflowInstanceListResponse(total=0, items=[])
 
-    query = query.filter(WorkflowInstance.project_id == project_id)
+    query = query.filter(
+        WorkflowInstance.project_id == project_id,
+        WorkflowInstance.run_mode != "simple_app",
+    )
     if status:
         query = query.filter(WorkflowInstance.status == status)
 
@@ -1166,6 +1169,8 @@ async def get_workflow_instance(
     instance = db.query(WorkflowInstance).filter(WorkflowInstance.id == instance_id).first()
 
     if not instance:
+        raise NotFoundError("Workflow instance", instance_id)
+    if instance.run_mode == "simple_app":
         raise NotFoundError("Workflow instance", instance_id)
 
     user_id = str(current_user.get("id", ""))
