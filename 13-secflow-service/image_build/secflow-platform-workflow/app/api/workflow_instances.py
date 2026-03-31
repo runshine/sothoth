@@ -187,9 +187,7 @@ def build_workflow_ingress_host_prefix(node_config: Dict[str, Any], service_name
     """Build the default workflow ingress host prefix."""
     if node_config.get("ingress_host_prefix"):
         return node_config.get("ingress_host_prefix")
-    if not service_name:
-        return None
-    return f"work-{service_name}"
+    return None
 
 
 def resolve_node_ingress_name(node: WorkflowNodeInstance, node_config: Optional[Dict[str, Any]] = None) -> Optional[str]:

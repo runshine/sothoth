@@ -142,10 +142,24 @@ def _build_resource_names(project_id: str, agent_key: str, target_port: int, hos
     return ingress_name, service_name
 
 
+def _build_workflow_host_seed(service_name: str) -> str:
+    sanitized = _sanitize_name_fragment(service_name)
+    if sanitized.startswith("wf-"):
+        sanitized = sanitized[3:]
+    if sanitized.endswith("-svc"):
+        sanitized = sanitized[:-4]
+    return sanitized.strip("-")
+
+
+def _build_workflow_default_host_prefix(service_name: str, service_port: int) -> str:
+    seed = _build_workflow_host_seed(service_name) or _sanitize_name_fragment(service_name)
+    return f"{seed}-{int(service_port)}-{_random_suffix(6)}"[:63]
+
+
 def _build_workflow_ingress_name(service_name: str, service_port: int, host: str, path: str) -> str:
     uniq = hashlib.sha1(f"{service_name}|{service_port}|{host}|{path}".encode("utf-8")).hexdigest()[:8]
     prefix = _sanitize_name_fragment(service_name)[:18]
-    return f"work-{prefix}-{service_port}-{uniq}"[:63]
+    return f"{prefix}-{service_port}-{uniq}"[:63]
 
 
 def _resolve_dynamic_ingress_options(request, namespace: str) -> dict:
@@ -836,7 +850,7 @@ async def create_workflow_app_ingress(
     if not conf.enabled:
         raise ValidationError("动态Ingress功能已关闭")
 
-    default_prefix = _sanitize_name_fragment(f"work-{request.service_name}")
+    default_prefix = _build_workflow_default_host_prefix(request.service_name, int(request.service_port))
     resolved_host = _resolve_ingress_host(
         project_id=project_id,
         explicit_host=request.host,
