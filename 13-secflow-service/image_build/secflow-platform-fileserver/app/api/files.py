@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import posixpath
+import shutil
 import tempfile
 from typing import Any, Dict, List, Optional
 
@@ -32,6 +33,12 @@ from app.schemas import (
     FileMoveRequest,
     FileRenameRequest,
     FileResponse as ManagedFileResponse,
+    ProjectPathChildrenResponse,
+    ProjectPathDirectoryCreate,
+    ProjectPathDirectoryEntry,
+    ProjectPathFileEntry,
+    ProjectPathMkdirsRequest,
+    ProjectPathOperationResponse,
     StoragePVCResponse,
     SubprojectCreate,
     SubprojectListResponse,
@@ -46,6 +53,7 @@ from app.service.project import ProjectServiceError, get_project_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/fileserver", tags=["fileserver"])
+SPECIAL_VULN_SUBPROJECT_NAME = "__vuln_cases__"
 
 
 @router.get("/health")
@@ -149,6 +157,175 @@ def require_subproject(db: Session, project_id: str, subproject_id: int) -> File
     if not subproject:
         raise NotFoundError("子项目", str(subproject_id))
     return subproject
+
+
+def ensure_special_subproject(
+    db: Session,
+    project_id: str,
+    *,
+    name: str = SPECIAL_VULN_SUBPROJECT_NAME,
+    created_by: str = "system",
+) -> FileSubproject:
+    subproject = db.query(FileSubproject).filter(
+        FileSubproject.project_id == project_id,
+        FileSubproject.name == name,
+    ).first()
+    if subproject:
+        return subproject
+
+    subproject = FileSubproject(
+        project_id=project_id,
+        name=name,
+        description="漏洞疑点专用文件区",
+        created_by=created_by,
+    )
+    db.add(subproject)
+    db.flush()
+    return subproject
+
+
+def normalize_special_project_path(path: str) -> tuple[str, str, str]:
+    relative_no_lead, normalized = normalize_sync_path(path)
+    prefix = f"/{SPECIAL_VULN_SUBPROJECT_NAME}"
+    if normalized != prefix and not normalized.startswith(prefix + "/"):
+        raise ValidationError(f"路径必须位于 {prefix} 之下")
+    special_relative = normalized[len(prefix):] or "/"
+    return relative_no_lead, normalized, special_relative
+
+
+def build_project_relative_directory_path(directory: Optional[FileDirectory]) -> str:
+    if directory is None:
+        return f"/{SPECIAL_VULN_SUBPROJECT_NAME}"
+    return f"/{SPECIAL_VULN_SUBPROJECT_NAME}{directory.path_key}"
+
+
+def build_project_relative_file_path(file_record: ManagedFile, directory: Optional[FileDirectory]) -> str:
+    base = build_project_relative_directory_path(directory)
+    if base == f"/{SPECIAL_VULN_SUBPROJECT_NAME}":
+        return f"{base}/{file_record.filename}"
+    return f"{base.rstrip('/')}/{file_record.filename}"
+
+
+def split_special_relative_path(special_relative: str) -> list[str]:
+    if special_relative in {"", "/"}:
+        return []
+    return [part for part in special_relative.strip("/").split("/") if part]
+
+
+def ensure_directory_chain_by_parts(
+    db: Session,
+    project_id: str,
+    subproject: FileSubproject,
+    parts: list[str],
+    *,
+    created_by: str,
+) -> Optional[FileDirectory]:
+    parent: Optional[FileDirectory] = None
+    current_path = ""
+    for name in parts:
+        current_path = f"{current_path}/{name}" if current_path else f"/{name}"
+        directory = db.query(FileDirectory).filter(
+            FileDirectory.project_id == project_id,
+            FileDirectory.subproject_id == subproject.id,
+            FileDirectory.path_key == current_path,
+        ).first()
+        if directory is None:
+            directory = FileDirectory(
+                project_id=project_id,
+                subproject_id=subproject.id,
+                parent_id=parent.id if parent else None,
+                name=name,
+                path_key=current_path,
+                created_by=created_by,
+            )
+            db.add(directory)
+            db.flush()
+        parent = directory
+    return parent
+
+
+def lookup_directory_by_special_path(
+    db: Session,
+    project_id: str,
+    subproject: FileSubproject,
+    special_relative: str,
+) -> Optional[FileDirectory]:
+    parts = split_special_relative_path(special_relative)
+    if not parts:
+        return None
+    return db.query(FileDirectory).filter(
+        FileDirectory.project_id == project_id,
+        FileDirectory.subproject_id == subproject.id,
+        FileDirectory.path_key == f"/{'/'.join(parts)}",
+    ).first()
+
+
+def resolve_special_parent_and_filename(
+    db: Session,
+    project_id: str,
+    subproject: FileSubproject,
+    normalized_path: str,
+    *,
+    create_dirs: bool,
+    created_by: str,
+) -> tuple[Optional[FileDirectory], str]:
+    _, _, special_relative = normalize_special_project_path(normalized_path)
+    parts = split_special_relative_path(special_relative)
+    if len(parts) < 2:
+        raise ValidationError("文件路径至少需要包含 case_uuid 和文件名")
+    parent_parts = parts[:-1]
+    filename = sanitize_name(parts[-1])
+    parent_dir = (
+        ensure_directory_chain_by_parts(db, project_id, subproject, parent_parts, created_by=created_by)
+        if create_dirs
+        else lookup_directory_by_special_path(db, project_id, subproject, "/" + "/".join(parent_parts))
+    )
+    if parent_dir is None:
+        raise NotFoundError("目录", "/" + "/".join(parent_parts))
+    return parent_dir, filename
+
+
+def remove_empty_special_parents(project_id: str, subproject_id: int, directory: Optional[FileDirectory]) -> None:
+    current = directory
+    root = sync_subproject_root(project_id, subproject_id)
+    while current is not None:
+        if (current.path_key or "").count("/") <= 1:
+            break
+        has_dirs = len(current.children)
+        has_files = len(current.files)
+        if has_dirs or has_files:
+            break
+        current_path = get_directory_storage_path(project_id, subproject_id, current)
+        parent = current.parent
+        if os.path.isdir(current_path):
+            shutil.rmtree(current_path, ignore_errors=True)
+            remove_empty_parents(current_path, root)
+        current = parent
+
+
+def to_project_path_directory_entry(directory: FileDirectory) -> ProjectPathDirectoryEntry:
+    return ProjectPathDirectoryEntry(
+        id=directory.id,
+        name=directory.name,
+        path=build_project_relative_directory_path(directory),
+        created_at=directory.created_at,
+        updated_at=directory.updated_at,
+    )
+
+
+def to_project_path_file_entry(file_record: ManagedFile, directory: Optional[FileDirectory]) -> ProjectPathFileEntry:
+    return ProjectPathFileEntry(
+        id=file_record.id,
+        filename=file_record.filename,
+        original_filename=file_record.original_filename,
+        path=build_project_relative_file_path(file_record, directory),
+        content_type=file_record.content_type,
+        size=file_record.size,
+        sha256=file_record.sha256,
+        storage_key=file_record.storage_key,
+        created_at=file_record.created_at,
+        updated_at=file_record.updated_at,
+    )
 
 
 def require_directory(
@@ -633,6 +810,243 @@ async def sync_put_object(
         "size": computed_size,
         "sha256": computed_sha256,
     }
+
+
+@router.get("/vuln/project-path/children", response_model=ProjectPathChildrenResponse)
+async def get_vuln_project_path_children(
+    project_id: str = Query(...),
+    path: str = Query(...),
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    subproject = ensure_special_subproject(db, project_id, created_by=str(current_user.id))
+    _, normalized, special_relative = normalize_special_project_path(path)
+    parts = split_special_relative_path(special_relative)
+    current_directory = ensure_directory_chain_by_parts(
+        db,
+        project_id,
+        subproject,
+        parts,
+        created_by=str(current_user.id),
+    ) if parts else None
+    db.commit()
+
+    if current_directory is None:
+        directories = db.query(FileDirectory).filter(
+            FileDirectory.project_id == project_id,
+            FileDirectory.subproject_id == subproject.id,
+            FileDirectory.parent_id.is_(None),
+        ).order_by(FileDirectory.name.asc()).all()
+        files = db.query(ManagedFile).filter(
+            ManagedFile.project_id == project_id,
+            ManagedFile.subproject_id == subproject.id,
+            ManagedFile.directory_id.is_(None),
+        ).order_by(ManagedFile.filename.asc()).all()
+    else:
+        directories = db.query(FileDirectory).filter(
+            FileDirectory.project_id == project_id,
+            FileDirectory.subproject_id == subproject.id,
+            FileDirectory.parent_id == current_directory.id,
+        ).order_by(FileDirectory.name.asc()).all()
+        files = db.query(ManagedFile).filter(
+            ManagedFile.project_id == project_id,
+            ManagedFile.subproject_id == subproject.id,
+            ManagedFile.directory_id == current_directory.id,
+        ).order_by(ManagedFile.filename.asc()).all()
+
+    case_uuid = parts[0] if parts else None
+    root_path = f"/{SPECIAL_VULN_SUBPROJECT_NAME}/{case_uuid}" if case_uuid else f"/{SPECIAL_VULN_SUBPROJECT_NAME}"
+    root_name = case_uuid or SPECIAL_VULN_SUBPROJECT_NAME
+    return ProjectPathChildrenResponse(
+        project_id=project_id,
+        current_path=normalized,
+        current_name=parts[-1] if parts else SPECIAL_VULN_SUBPROJECT_NAME,
+        root_path=root_path,
+        root_name=root_name,
+        special_subproject_name=SPECIAL_VULN_SUBPROJECT_NAME,
+        special_subproject_id=subproject.id,
+        case_uuid=case_uuid,
+        directories=[to_project_path_directory_entry(item) for item in directories],
+        files=[to_project_path_file_entry(item, item.directory) for item in files],
+    )
+
+
+@router.post("/vuln/project-path/directories", response_model=ProjectPathDirectoryEntry)
+async def create_vuln_project_path_directory(
+    payload: ProjectPathDirectoryCreate,
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(payload.project_id, authorization)
+    subproject = ensure_special_subproject(db, payload.project_id, created_by=str(current_user.id))
+    _, _, special_relative = normalize_special_project_path(payload.path)
+    parts = split_special_relative_path(special_relative)
+    if not parts:
+        raise ValidationError("不能直接创建特殊子项目根目录")
+    directory = ensure_directory_chain_by_parts(
+        db,
+        payload.project_id,
+        subproject,
+        parts,
+        created_by=str(current_user.id),
+    )
+    db.commit()
+    assert directory is not None
+    db.refresh(directory)
+    return to_project_path_directory_entry(directory)
+
+
+@router.post("/vuln/project-path/mkdirs", response_model=ProjectPathOperationResponse)
+async def create_vuln_project_path_directories(
+    payload: ProjectPathMkdirsRequest,
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(payload.project_id, authorization)
+    subproject = ensure_special_subproject(db, payload.project_id, created_by=str(current_user.id))
+    last_path = f"/{SPECIAL_VULN_SUBPROJECT_NAME}"
+    for item in payload.paths:
+        _, normalized, special_relative = normalize_special_project_path(item)
+        parts = split_special_relative_path(special_relative)
+        if not parts:
+            continue
+        ensure_directory_chain_by_parts(
+            db,
+            payload.project_id,
+            subproject,
+            parts,
+            created_by=str(current_user.id),
+        )
+        last_path = normalized
+    db.commit()
+    return ProjectPathOperationResponse(path=last_path, entry_type="directory", message="目录创建成功")
+
+
+@router.post("/vuln/project-path/files/upload", response_model=ProjectPathFileEntry)
+async def upload_vuln_project_path_file(
+    project_id: str = Form(...),
+    path: str = Form(...),
+    file: UploadFile = File(...),
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    subproject = ensure_special_subproject(db, project_id, created_by=str(current_user.id))
+    normalized_relative_path = normalize_sync_path(path)[1]
+    parent_dir, filename = resolve_special_parent_and_filename(
+        db,
+        project_id,
+        subproject,
+        normalized_relative_path,
+        create_dirs=True,
+        created_by=str(current_user.id),
+    )
+
+    config = get_config()
+    temp_path, sha256, total_size = await persist_upload(file, config.storage.temp_dir)
+    existing = db.query(ManagedFile).filter(
+        ManagedFile.project_id == project_id,
+        ManagedFile.subproject_id == subproject.id,
+        ManagedFile.directory_id == (parent_dir.id if parent_dir else None),
+        ManagedFile.filename == filename,
+    ).first()
+    if existing:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise ConflictError(f"目录下已存在同名文件: {filename}")
+
+    file_record = ManagedFile(
+        project_id=project_id,
+        subproject_id=subproject.id,
+        directory_id=parent_dir.id if parent_dir else None,
+        filename=filename,
+        original_filename=file.filename or filename,
+        content_type=guess_content_type(filename, file.content_type),
+        size=total_size,
+        sha256=sha256,
+        storage_key="pending",
+        created_by=str(current_user.id),
+    )
+    db.add(file_record)
+    db.flush()
+    storage_key = storage_relative_path(project_id, subproject.id, parent_dir, filename)
+    target_path = absolute_storage_path(storage_key)
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    os.replace(temp_path, target_path)
+    file_record.storage_key = storage_key
+    db.commit()
+    db.refresh(file_record)
+    return to_project_path_file_entry(file_record, parent_dir)
+
+
+@router.delete("/vuln/project-path/object", response_model=ProjectPathOperationResponse)
+async def delete_vuln_project_path_object(
+    project_id: str = Query(...),
+    path: str = Query(...),
+    recursive: bool = Query(True),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    await verify_project_access(project_id, authorization)
+    subproject = ensure_special_subproject(db, project_id)
+    _, normalized, special_relative = normalize_special_project_path(path)
+    parts = split_special_relative_path(special_relative)
+    if not parts:
+        raise ValidationError("不能删除特殊子项目根目录")
+
+    filename = parts[-1]
+    parent_dir = lookup_directory_by_special_path(
+        db,
+        project_id,
+        subproject,
+        "/" + "/".join(parts[:-1]),
+    ) if len(parts) > 1 else None
+    file_record = db.query(ManagedFile).filter(
+        ManagedFile.project_id == project_id,
+        ManagedFile.subproject_id == subproject.id,
+        ManagedFile.directory_id == (parent_dir.id if parent_dir else None),
+        ManagedFile.filename == filename,
+    ).first()
+    if file_record:
+        file_path = absolute_storage_path(file_record.storage_key)
+        db.delete(file_record)
+        db.commit()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        remove_empty_special_parents(project_id, subproject.id, parent_dir)
+        return ProjectPathOperationResponse(path=normalized, entry_type="file", message="文件删除成功")
+
+    directory = lookup_directory_by_special_path(db, project_id, subproject, special_relative)
+    if directory is None:
+        raise NotFoundError("对象", normalized)
+
+    descendant_dirs = db.query(FileDirectory).filter(
+        FileDirectory.project_id == project_id,
+        FileDirectory.subproject_id == subproject.id,
+        FileDirectory.path_key.startswith(directory.path_key.rstrip("/") + "/"),
+    ).all()
+    descendant_ids = [directory.id] + [item.id for item in descendant_dirs]
+    file_count = db.query(ManagedFile).filter(ManagedFile.directory_id.in_(descendant_ids)).count()
+    if (descendant_dirs or file_count > 0) and not recursive:
+        raise ConflictError("目录下仍存在子目录或文件，无法删除")
+
+    target_path = get_directory_storage_path(project_id, subproject.id, directory)
+    if descendant_ids:
+        db.query(ManagedFile).filter(ManagedFile.directory_id.in_(descendant_ids)).delete(synchronize_session=False)
+        db.query(FileDirectory).filter(FileDirectory.id.in_(descendant_ids[1:])).delete(synchronize_session=False)
+    parent = directory.parent
+    db.delete(directory)
+    db.commit()
+    if os.path.isdir(target_path):
+        shutil.rmtree(target_path, ignore_errors=True)
+        remove_empty_parents(target_path, sync_subproject_root(project_id, subproject.id))
+    remove_empty_special_parents(project_id, subproject.id, parent)
+    return ProjectPathOperationResponse(path=normalized, entry_type="directory", message="目录删除成功")
 
 
 @router.post("/subprojects", response_model=SubprojectResponse)

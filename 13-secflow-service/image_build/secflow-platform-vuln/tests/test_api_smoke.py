@@ -163,6 +163,7 @@ def test_public_anonymous_submission_creates_case(client: TestClient):
     assert payload["created_by_type"] == "anonymous"
     assert payload["created_by"] == "public-ci"
     assert payload["project_id"] == "demo-project"
+    assert payload["files_root_path"].startswith("/__vuln_cases__/")
 
     detail = client.get(f"/api/vuln/cases/{payload['id']}")
     assert detail.status_code == 200
@@ -171,6 +172,25 @@ def test_public_anonymous_submission_creates_case(client: TestClient):
     assert detail.json()["subject"]["locator"] == "/auth/login"
     assert detail.json()["cvss_score"] == 8.1
     assert detail.json()["metadata"]["source"]["anonymous_submission"] is True
+    assert detail.json()["files_root_path"] == f"/__vuln_cases__/{payload['id']}"
+    assert detail.json()["fileserver_root"]["special_subproject_name"] == "__vuln_cases__"
+
+
+def test_draft_case_creation_returns_fileserver_root(client: TestClient):
+    response = client.post(
+        "/api/vuln/cases/draft",
+        json={
+            "project_id": "demo-project",
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["project_id"] == "demo-project"
+    assert payload["current_status"] == "draft"
+    assert payload["files_root_path"] == f"/__vuln_cases__/{payload['id']}"
+    assert payload["fileserver_root"]["root_name"] == payload["id"]
+    assert payload["reporter"]["name"] == "tester"
+    assert payload["subject"]["locator"] == "draft://demo-project"
 
 
 def test_public_routes_remain_anonymous_but_private_routes_require_auth(client: TestClient):

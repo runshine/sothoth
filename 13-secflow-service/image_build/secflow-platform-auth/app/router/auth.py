@@ -67,7 +67,12 @@ def _build_human_user_payload(user: User, db: Optional[Session] = None) -> Dict[
     }
 
 
-def _build_machine_user_payload(machine_code: str, machine_token_id: Optional[int] = None) -> Dict[str, Any]:
+def _build_machine_user_payload(
+    machine_code: str,
+    machine_token_id: Optional[int] = None,
+    project_id: Optional[str] = None,
+    token_scope: str = "global"
+) -> Dict[str, Any]:
     """构建统一的机机主体响应结构，兼容既有依赖中的用户字段。"""
     return {
         "id": -1,
@@ -79,6 +84,8 @@ def _build_machine_user_payload(machine_code: str, machine_token_id: Optional[in
         "token_type": "machine",
         "machine_code": machine_code,
         "machine_token_id": machine_token_id,
+        "project_id": project_id,
+        "token_scope": token_scope,
     }
 
 
@@ -318,6 +325,7 @@ def validate_machine_token(
 @router.post("/validate-token")
 def validate_token(
     authorization: Optional[str] = Header(None),
+    project_id: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """
@@ -353,9 +361,16 @@ def validate_token(
     # 2) 机机Token（数据库）
     db_token = verify_machine_token(db, token)
     if db_token is not None:
+        if project_id and db_token.token_scope == "project" and db_token.project_id != project_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="机机Token未绑定当前项目",
+            )
         return _build_machine_user_payload(
             machine_code=db_token.machine_code,
             machine_token_id=db_token.id,
+            project_id=db_token.project_id,
+            token_scope=db_token.token_scope or "global",
         )
 
     # 3) 统一机机Token（配置）

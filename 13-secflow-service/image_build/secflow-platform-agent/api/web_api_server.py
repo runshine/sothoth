@@ -150,6 +150,8 @@ class WebAPIServer:
         self.k8s_service_timeout_sec = int(config.get('k8s_service_timeout_sec', 15))
         self.service_machine_token = config.get('service_machine_token')
         self.menu_registry = MenuRegistryService(config, self.logger)
+        self.ingress_rebind_lock = threading.Lock()
+        self.ingress_rebind_events: List[Dict[str, Any]] = []
 
         # 11. 注册路由
         self._register_routes()
@@ -695,6 +697,140 @@ class WebAPIServer:
             return payload
         return []
 
+    def _record_ingress_rebind_event(self, event: Dict[str, Any]):
+        timestamp = datetime.now().isoformat()
+        payload = {
+            **(event or {}),
+            'timestamp': timestamp,
+        }
+        with self.ingress_rebind_lock:
+            self.ingress_rebind_events.append(payload)
+            if len(self.ingress_rebind_events) > 200:
+                self.ingress_rebind_events = self.ingress_rebind_events[-200:]
+
+    def _get_recent_ingress_rebind_events(self, project_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        with self.ingress_rebind_lock:
+            events = [item for item in self.ingress_rebind_events if str(item.get('project_id') or '') == str(project_id or '')]
+            return events[-max(1, int(limit)):]
+
+    def _get_latest_ingress_rebind_by_agent(self, project_id: str) -> Dict[str, Dict[str, Any]]:
+        latest: Dict[str, Dict[str, Any]] = {}
+        for event in self._get_recent_ingress_rebind_events(project_id=project_id, limit=200):
+            agent_key = str(event.get('agent_key') or '').strip()
+            if not agent_key:
+                continue
+            latest[agent_key] = event
+        return latest
+
+    def _rebind_agent_ingress_external_ip(
+        self,
+        project_id: str,
+        agent_key: str,
+        new_ip: str,
+        auth_header: Optional[str] = None
+    ) -> Dict[str, Any]:
+        new_ip = str(new_ip or '').strip()
+        agent_key = str(agent_key or '').strip()
+        if not project_id or not agent_key or not new_ip:
+            return {
+                'project_id': project_id,
+                'agent_key': agent_key,
+                'new_ip': new_ip,
+                'target_count': 0,
+                'success_count': 0,
+                'fail_count': 0,
+                'details': [],
+                'skipped': True,
+                'reason': 'project_id/agent_key/new_ip is required',
+            }
+
+        routes = self._list_project_ingress_routes(
+            project_id=project_id,
+            include_deleted=False,
+            auth_header=auth_header,
+        )
+        target_routes = []
+        for route in routes:
+            if str(route.get('agent_key') or '').strip() != agent_key:
+                continue
+            if str(route.get('status') or '').strip().lower() == 'deleted':
+                continue
+            if route.get('deleted_at'):
+                continue
+            target_routes.append(route)
+
+        details: List[Dict[str, Any]] = []
+        success_count = 0
+        for route in target_routes:
+            route_id = str(route.get('route_id') or '').strip()
+            route_metadata = self._extract_route_metadata(route)
+            payload = {
+                'agent_key': agent_key,
+                'external_ips': [new_ip],
+                'target_port': int(route.get('target_port') or 0),
+                'host': route.get('host'),
+                'path': route.get('path') or '/',
+                'path_type': route.get('path_type') or 'Prefix',
+                'ingress_type': route.get('ingress_type'),
+                'service_port': int(route.get('service_port') or route.get('target_port') or 0),
+                'tls_enabled': route.get('tls_enabled'),
+                'tls_secret_name': route.get('tls_secret_name'),
+                'backend_protocol': route.get('backend_protocol') or route_metadata.get('backend_protocol'),
+                'websocket_enabled': route.get('websocket_enabled', True),
+                'owner_service': route.get('owner_service') or 'platform-agent',
+                'created_by': route.get('created_by'),
+                'metadata': route_metadata,
+                'force_recreate': True,
+            }
+            try:
+                resp = self._call_k8s_service(
+                    method='POST',
+                    path='/api/k8s/agent-ingress-routes',
+                    project_id=project_id,
+                    payload=payload,
+                    headers={'Authorization': auth_header} if auth_header else None
+                )
+                if resp.status_code < 300:
+                    success_count += 1
+                    details.append({
+                        'route_id': route_id,
+                        'host': route.get('host'),
+                        'path': route.get('path'),
+                        'target_port': route.get('target_port'),
+                        'status': 'ok',
+                    })
+                else:
+                    details.append({
+                        'route_id': route_id,
+                        'host': route.get('host'),
+                        'path': route.get('path'),
+                        'target_port': route.get('target_port'),
+                        'status': 'failed',
+                        'status_code': resp.status_code,
+                        'error': (resp.text or '')[:200],
+                    })
+            except Exception as inner:
+                details.append({
+                    'route_id': route_id,
+                    'host': route.get('host'),
+                    'path': route.get('path'),
+                    'target_port': route.get('target_port'),
+                    'status': 'failed',
+                    'error': str(inner),
+                })
+
+        summary = {
+            'project_id': project_id,
+            'agent_key': agent_key,
+            'new_ip': new_ip,
+            'target_count': len(target_routes),
+            'success_count': success_count,
+            'fail_count': max(0, len(target_routes) - success_count),
+            'details': details,
+        }
+        self._record_ingress_rebind_event(summary)
+        return summary
+
     def _extract_route_metadata(self, route: Dict[str, Any]) -> Dict[str, Any]:
         metadata = route.get('metadata') or {}
         if isinstance(metadata, dict):
@@ -1188,6 +1324,7 @@ class WebAPIServer:
             'backend_type': current_agent.get('backend_type'),
             'command': current_agent.get('command'),
             'args': current_agent.get('args') if isinstance(current_agent.get('args'), list) else [],
+            'cwd': current_agent.get('cwd'),
             'env': merged_env,
             'enabled': bool(current_agent.get('enabled', True)),
             'description': current_agent.get('description', ''),
@@ -2320,6 +2457,46 @@ class WebAPIServer:
 
             except Exception as e:
                 self.logger.error(f"更新agent状态失败: {str(e)}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/<agent_key>/ingress/rebind', methods=['POST'])
+        def rebind_agent_ingress_external_ip(agent_key):
+            """手动触发指定Agent的Ingress外部IP重绑。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                agent_key = str(agent_key or '').strip()
+                if not agent_key:
+                    return jsonify({'error': 'agent_key is required'}), 400
+
+                agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
+                if not agent:
+                    return jsonify({'error': f'Agent {agent_key} not found'}), 404
+
+                project_id = str(data.get('project_id') or getattr(agent, 'project_id', '') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                target_ip = str(data.get('ip') or getattr(agent, 'ip_address', '') or '').strip()
+                if not target_ip:
+                    return jsonify({'error': 'target ip is required'}), 400
+
+                summary = self._rebind_agent_ingress_external_ip(
+                    project_id=project_id,
+                    agent_key=agent_key,
+                    new_ip=target_ip,
+                    auth_header=request.headers.get('Authorization'),
+                )
+                self.logger.info(
+                    f"manual_ingress_rebind agent={agent_key} project={project_id} "
+                    f"new_ip={target_ip} target={summary.get('target_count')} "
+                    f"success={summary.get('success_count')} fail={summary.get('fail_count')}"
+                )
+                return jsonify({
+                    'message': 'ingress rebind completed',
+                    **summary,
+                }), 200 if int(summary.get('fail_count') or 0) == 0 else 207
+            except Exception as e:
+                self.logger.error(f"手动重绑Agent Ingress失败: {str(e)}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         def _normalize_task_payload(task: Dict) -> Dict:
@@ -3773,6 +3950,7 @@ class WebAPIServer:
                             'backend_type': agent.get('backend_type'),
                             'command': agent.get('command'),
                             'args': agent.get('args') if isinstance(agent.get('args'), list) else [],
+                            'cwd': agent.get('cwd'),
                             'env': agent.get('env') if isinstance(agent.get('env'), dict) else {},
                             'enabled': bool(agent.get('enabled')),
                             'running': bool(agent.get('running')),
@@ -4660,6 +4838,7 @@ class WebAPIServer:
                 )
                 items = [item for item in all_items if self._is_service_bound_ingress_route(item)]
                 active_service_keys = self._get_project_active_service_keys(project_id)
+                latest_rebind_by_agent = self._get_latest_ingress_rebind_by_agent(project_id)
 
                 enhanced_items: List[Dict[str, Any]] = []
                 stale_count = 0
@@ -4689,11 +4868,13 @@ class WebAPIServer:
                         'associated_service_name': assoc_service,
                         'service_exists': service_exists,
                         'is_stale_service_ingress': is_stale,
+                        'last_rebind_summary': latest_rebind_by_agent.get(str(item.get('agent_key') or '').strip()),
                     })
 
                 return jsonify({
                     'project_id': project_id,
                     'items': enhanced_items,
+                    'recent_rebind_events': self._get_recent_ingress_rebind_events(project_id, limit=20),
                     'stats': {
                         'total': len(enhanced_items),
                         'ready': ready_count,
@@ -4877,6 +5058,7 @@ class WebAPIServer:
                     auth_header=auth_header
                 )
                 items = [item for item in all_items if self._is_agent_console_ingress_route(item)]
+                latest_rebind_by_agent = self._get_latest_ingress_rebind_by_agent(project_id)
 
                 agents, _ = self.agent_manager.list_agents(page=1, per_page=5000, project_id=project_id)
                 online_keys = {str(a.get('key') or '').strip() for a in agents if str(a.get('status') or '').lower() == 'online'}
@@ -4913,11 +5095,13 @@ class WebAPIServer:
                         **item,
                         'agent_online': is_online,
                         'is_stale_agent_ingress': is_stale,
+                        'last_rebind_summary': latest_rebind_by_agent.get(agent_key),
                     })
 
                 return jsonify({
                     'project_id': project_id,
                     'items': enhanced_items,
+                    'recent_rebind_events': self._get_recent_ingress_rebind_events(project_id, limit=20),
                     'stats': {
                         'total': len(enhanced_items),
                         'ready': ready_count,
@@ -5370,16 +5554,43 @@ class WebAPIServer:
                 if not isinstance(services, list):
                     return jsonify({'error': 'services must be an array'}), 400
 
+                existing_agent = self.agent_manager.get_agent(agent_key)
+                old_ip = str(getattr(existing_agent, 'ip_address', '') or '').strip()
                 agent = self._upsert_agent_from_report(agent_key, data) or self._resolve_or_auto_create_agent_for_report(agent_key)
                 if not agent:
                     return jsonify({'error': f'Agent {agent_key} not found'}), 404
+                new_ip = str(getattr(agent, 'ip_address', '') or '').strip()
+
+                rebind_summary = None
+                if old_ip and new_ip and old_ip != new_ip:
+                    try:
+                        rebind_summary = self._rebind_agent_ingress_external_ip(
+                            project_id=str(getattr(agent, 'project_id', '') or '').strip(),
+                            agent_key=agent_key,
+                            new_ip=new_ip,
+                            auth_header=request.headers.get('Authorization')
+                        )
+                        self.logger.info(
+                            f"ingress_rebind_on_ip_change agent={agent_key} project={getattr(agent, 'project_id', '')} "
+                            f"old_ip={old_ip} new_ip={new_ip} target={rebind_summary.get('target_count')} "
+                            f"success={rebind_summary.get('success_count')} fail={rebind_summary.get('fail_count')}"
+                        )
+                    except Exception as rebind_err:
+                        self.logger.error(
+                            f"ingress_rebind_on_ip_change_failed agent={agent_key} old_ip={old_ip} new_ip={new_ip}: {rebind_err}",
+                            exc_info=True
+                        )
 
                 seen, upserted = self._upsert_agent_services_snapshot(agent, services, source='report_full')
                 return jsonify({
                     'message': 'service snapshot accepted',
                     'agent_key': agent_key,
                     'seen': seen,
-                    'upserted': upserted
+                    'upserted': upserted,
+                    'ip_changed': bool(old_ip and new_ip and old_ip != new_ip),
+                    'old_ip': old_ip,
+                    'new_ip': new_ip,
+                    'ingress_rebind': rebind_summary,
                 }), 202
             except Exception as e:
                 self.logger.error(f"处理Agent全量上报失败: {e}", exc_info=True)
@@ -5401,9 +5612,32 @@ class WebAPIServer:
                 if not isinstance(services, list):
                     return jsonify({'error': 'services must be an array'}), 400
 
+                existing_agent = self.agent_manager.get_agent(agent_key)
+                old_ip = str(getattr(existing_agent, 'ip_address', '') or '').strip()
                 agent = self._upsert_agent_from_report(agent_key, data) or self._resolve_or_auto_create_agent_for_report(agent_key)
                 if not agent:
                     return jsonify({'error': f'Agent {agent_key} not found'}), 404
+                new_ip = str(getattr(agent, 'ip_address', '') or '').strip()
+
+                rebind_summary = None
+                if old_ip and new_ip and old_ip != new_ip:
+                    try:
+                        rebind_summary = self._rebind_agent_ingress_external_ip(
+                            project_id=str(getattr(agent, 'project_id', '') or '').strip(),
+                            agent_key=agent_key,
+                            new_ip=new_ip,
+                            auth_header=request.headers.get('Authorization')
+                        )
+                        self.logger.info(
+                            f"ingress_rebind_on_ip_change agent={agent_key} project={getattr(agent, 'project_id', '')} "
+                            f"old_ip={old_ip} new_ip={new_ip} target={rebind_summary.get('target_count')} "
+                            f"success={rebind_summary.get('success_count')} fail={rebind_summary.get('fail_count')}"
+                        )
+                    except Exception as rebind_err:
+                        self.logger.error(
+                            f"ingress_rebind_on_ip_change_failed agent={agent_key} old_ip={old_ip} new_ip={new_ip}: {rebind_err}",
+                            exc_info=True
+                        )
 
                 upserted = 0
                 for service in services:
@@ -5417,7 +5651,11 @@ class WebAPIServer:
                 return jsonify({
                     'message': 'service delta accepted',
                     'agent_key': agent_key,
-                    'upserted': upserted
+                    'upserted': upserted,
+                    'ip_changed': bool(old_ip and new_ip and old_ip != new_ip),
+                    'old_ip': old_ip,
+                    'new_ip': new_ip,
+                    'ingress_rebind': rebind_summary,
                 }), 202
             except Exception as e:
                 self.logger.error(f"处理Agent增量上报失败: {e}", exc_info=True)

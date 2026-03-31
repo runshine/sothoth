@@ -2,6 +2,7 @@
 数据库模型模块
 """
 
+import logging
 from datetime import datetime
 from typing import List, Optional
 
@@ -15,13 +16,16 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 from app.config import get_config
 
 Base = declarative_base()
+logger = logging.getLogger(__name__)
 
 
 secflow_user_user_role = Table(
@@ -168,6 +172,24 @@ def init_database():
     """初始化数据库"""
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
+    run_auto_migrations()
+
+
+def run_auto_migrations():
+    """启动时执行轻量级幂等迁移。"""
+    engine = get_engine()
+    inspector = inspect(engine)
+
+    migrations = []
+
+    with engine.begin() as connection:
+        for migration in migrations:
+            inspector = inspect(connection)
+            if migration["check"](inspector):
+                continue
+            logger.info("[Database] Applying migration: %s", migration["name"])
+            connection.execute(text(migration["sql"]))
+            logger.info("[Database] Migration applied: %s", migration["name"])
 
 
 def get_db():

@@ -16,6 +16,7 @@ def _to_agent(detail):
         'backend_type': detail.get('backend_type') or detail.get('name'),
         'command': detail.get('command'),
         'args': detail.get('args', []),
+        'cwd': detail.get('cwd'),
         'env': detail.get('env', {}),
         'enabled': bool(detail.get('enabled', True)),
         'running': bool(detail.get('running', False)),

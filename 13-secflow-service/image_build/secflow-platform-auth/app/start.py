@@ -183,8 +183,8 @@ def create_app():
     from app.config import config
     from app.rbac import ensure_platform_roles_seeded
 
-    logger.info(f"[Database] Initializing database...")
-    # 初始化数据库，创建所有表
+    logger.info(f"[Database] Initializing database and running startup migrations...")
+    # 初始化数据库，创建所有表并自动执行幂等迁移
     init_db()
 
     # 验证数据库表是否真正存在
@@ -195,7 +195,7 @@ def create_app():
         logger.error(str(e))
         raise
 
-    logger.info(f"[Database] Database initialization completed")
+    logger.info(f"[Database] Database initialization and startup migrations completed")
 
     def ensure_platform_roles_ready():
         db = SessionLocal()

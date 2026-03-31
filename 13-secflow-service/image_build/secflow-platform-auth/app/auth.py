@@ -51,7 +51,9 @@ def decode_access_token(token: str) -> Optional[dict]:
 
 
 def create_machine_token(db: Session, machine_code: str, description: Optional[str] = None,
-                         expires_at: Optional[datetime] = None) -> MachineToken:
+                         expires_at: Optional[datetime] = None,
+                         token_scope: str = "global",
+                         project_id: Optional[str] = None) -> MachineToken:
     """创建机机Token"""
     # 生成随机token
     token = secrets.token_urlsafe(64)
@@ -59,6 +61,8 @@ def create_machine_token(db: Session, machine_code: str, description: Optional[s
         token=token,
         machine_code=machine_code,
         description=description,
+        token_scope=token_scope,
+        project_id=project_id,
         expires_at=expires_at
     )
     db.add(db_token)

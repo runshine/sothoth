@@ -180,6 +180,64 @@ class PublicIntakeSubmissionRequest(SuspicionSubmissionRequest):
     pass
 
 
+class DraftCaseCreateRequest(BaseModel):
+    project_id: str
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    severity: Literal["critical", "high", "medium", "low"] = "medium"
+    cvss_score: float = 0.0
+    confidence: int = 0
+    state: Literal["suspected", "confirmed", "rejected"] = "suspected"
+    category: Optional[str] = None
+    rule_id: Optional[str] = None
+    rule_name: Optional[str] = None
+    fingerprint: Optional[str] = None
+    reported_at: Optional[datetime] = None
+    reporter: Optional[ReporterInfo] = None
+    subject: Optional[SubjectInfo] = None
+    evidence: EvidenceInfo = Field(default_factory=EvidenceInfo)
+    artifacts: list[ArtifactItem] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def to_case_create_request(self, *, created_by_type: str, created_by: Optional[str]) -> "CaseCreateRequest":
+        reporter = self.reporter or ReporterInfo(
+            name=created_by or "draft-intake",
+            version="0.0.0",
+            type="human",
+        )
+        subject = self.subject or SubjectInfo(
+            type="unknown",
+            locator=f"draft://{self.project_id}",
+            name="待补充",
+        )
+        metadata = dict(self.metadata)
+        draft_meta = dict(metadata.get("draft") or {})
+        draft_meta.setdefault("is_draft", True)
+        metadata["draft"] = draft_meta
+        return CaseCreateRequest(
+            project_id=self.project_id,
+            report_id=None,
+            title=self.title or "未命名疑点草稿",
+            summary=self.summary or "草稿疑点，等待补充详情与文件。",
+            severity=self.severity,
+            cvss_score=self.cvss_score,
+            confidence=self.confidence,
+            state=self.state,
+            category=self.category,
+            rule_id=self.rule_id,
+            rule_name=self.rule_name,
+            fingerprint=self.fingerprint,
+            reported_at=self.reported_at,
+            reporter=reporter,
+            subject=subject,
+            evidence=self.evidence,
+            artifacts=self.artifacts,
+            metadata=metadata,
+            created_by_type=created_by_type,
+            created_by=created_by,
+        )
+
+
 class CaseResponse(BaseModel):
     id: str
     project_id: str

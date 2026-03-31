@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.models.database import get_db
 from app.schemas import PublicIntakeSubmissionRequest
+from app.services.lifecycle_engine import build_case_fileserver_root
 from app.services.lifecycle_engine import create_case_with_runtime
 
 
@@ -189,6 +190,8 @@ async def submit_anonymous_submission(request: PublicIntakeSubmissionRequest, db
     return {
         "id": item.id,
         "project_id": item.project_id,
+        "files_root_path": build_case_fileserver_root(item.id)["root_path"],
+        "fileserver_root": build_case_fileserver_root(item.id),
         "title": item.title,
         "current_stage": item.current_stage,
         "current_status": item.current_status,

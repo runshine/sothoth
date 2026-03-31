@@ -191,3 +191,54 @@ class FilePreviewResponse(BaseModel):
     preview_mode: str
     preview_url: str
     download_url: str
+
+
+class ProjectPathDirectoryCreate(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=32)
+    path: str = Field(..., min_length=1, max_length=1024)
+
+
+class ProjectPathMkdirsRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=32)
+    paths: List[str] = Field(default_factory=list)
+
+
+class ProjectPathDirectoryEntry(BaseModel):
+    id: int
+    name: str
+    path: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectPathFileEntry(BaseModel):
+    id: int
+    filename: str
+    original_filename: str
+    path: str
+    content_type: Optional[str]
+    size: int
+    sha256: str
+    storage_key: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ProjectPathChildrenResponse(BaseModel):
+    project_id: str
+    current_path: str
+    current_name: str
+    root_path: str
+    root_name: str
+    special_subproject_name: str
+    special_subproject_id: int
+    case_uuid: Optional[str] = None
+    directories: List[ProjectPathDirectoryEntry]
+    files: List[ProjectPathFileEntry]
+
+
+class ProjectPathOperationResponse(BaseModel):
+    ok: bool = True
+    path: str
+    entry_type: str
+    message: Optional[str] = None

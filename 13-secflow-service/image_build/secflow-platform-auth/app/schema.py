@@ -104,6 +104,8 @@ class MachineTokenCreate(BaseModel):
     """创建机机Token模式"""
     machine_code: str
     description: Optional[str] = None
+    token_scope: str = "global"
+    project_id: Optional[str] = None
     expires_at: Optional[datetime] = None  # null表示永不过期
 
 
@@ -118,6 +120,8 @@ class MachineTokenResponse(BaseModel):
     id: int
     machine_code: str
     description: Optional[str]
+    token_scope: str = "global"
+    project_id: Optional[str] = None
     is_active: bool
     created_at: datetime
     expires_at: Optional[datetime]
@@ -132,6 +136,20 @@ class MachineTokenDetailResponse(MachineTokenResponse):
 
     class Config:
         from_attributes = True
+
+
+class ProjectMachineTokenResponse(MachineTokenDetailResponse):
+    """项目级机机Token响应"""
+    project_id: str
+    token_scope: str = "project"
+
+
+class ProjectMachineTokenEnsureRequest(BaseModel):
+    """项目级机机Token自动创建请求"""
+    project_id: str
+    project_name: Optional[str] = None
+    description: Optional[str] = None
+    expires_at: Optional[datetime] = None
 
 
 # ============ 用户角色绑定模式 ============

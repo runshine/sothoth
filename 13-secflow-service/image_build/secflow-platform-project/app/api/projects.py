@@ -118,6 +118,51 @@ def verify_project_permission(
     return False
 
 
+def is_machine_token_user(current_user: dict) -> bool:
+    return current_user.get("token_type") == "machine"
+
+
+def is_project_machine_token(current_user: dict, project_id: str) -> bool:
+    return (
+        is_machine_token_user(current_user)
+        and current_user.get("token_scope") == "project"
+        and current_user.get("project_id") == project_id
+    )
+
+
+def get_human_user_id(current_user: dict) -> int:
+    if is_machine_token_user(current_user):
+        raise ForbiddenError("项目级机机Token不允许执行当前用户操作")
+    return int(current_user["id"])
+
+
+def get_project_with_permission(
+    db: Session,
+    project_id: str,
+    current_user: dict,
+    require_manage: bool = False,
+) -> Project:
+    project = db.query(Project).options(joinedload(Project.role_binds), joinedload(Project.department)).filter(
+        Project.id == project_id,
+        Project.status == "active"
+    ).first()
+
+    if not project:
+        raise NotFoundError("项目", project_id)
+
+    if is_project_machine_token(current_user, project_id):
+        return project
+
+    user_id = get_human_user_id(current_user)
+    allowed = can_manage_project(db, project, user_id) if require_manage else can_view_project(db, project, user_id)
+    if not allowed:
+        if require_manage:
+            raise ForbiddenError("只有归属部门管理员或其上级部门管理员可以执行此操作")
+        raise ForbiddenError("无权访问此项目")
+
+    return project
+
+
 def get_user_department_ids(db: Session, user_id: int) -> List[int]:
     """获取用户所属部门。"""
     rows = db.query(DepartmentMember.department_id).filter(
@@ -258,7 +303,8 @@ def can_manage_project(db: Session, project: Project, user_id: int) -> bool:
 
 
 async def get_current_user(
-    authorization: Optional[str] = Header(None)
+    authorization: Optional[str] = Header(None),
+    project_id: Optional[str] = None
 ) -> dict:
     """
     获取当前用户（认证）
@@ -280,14 +326,15 @@ async def get_current_user(
 
     try:
         auth_service = get_auth_service()
-        user = await auth_service.validate_token_async(token)
+        user = await auth_service.validate_token_async(token, project_id=project_id)
         return user
     except TokenInvalidError:
         raise UnauthorizedError("Token无效或已过期")
 
 
 async def get_current_user_sync(
-    authorization: Optional[str] = Header(None)
+    authorization: Optional[str] = Header(None),
+    project_id: Optional[str] = None
 ) -> dict:
     """
     获取当前用户（同步版本，用于非async函数）
@@ -303,7 +350,7 @@ async def get_current_user_sync(
 
     try:
         auth_service = get_auth_service()
-        user = auth_service.validate_token(token)
+        user = auth_service.validate_token(token, project_id=project_id)
         return user
     except TokenInvalidError:
         raise UnauthorizedError("Token无效或已过期")
@@ -351,7 +398,7 @@ async def create_project(
     - 自动将创建者设为项目所有者
     - 项目权限以归属部门为主，公开项目对所有人可见
     """
-    user_id = int(current_user["id"])
+    user_id = get_human_user_id(current_user)
 
     # 检查项目名是否重复
     existing = db.query(Project).filter(
@@ -419,6 +466,20 @@ async def create_project(
             db.rollback()
             logger.error(f"创建TLS Secret失败后的数据库补偿清理失败: {project_id}, 错误: {cleanup_error}")
         raise HTTPException(status_code=500, detail=f"创建TLS Secret失败: {tls_error}")
+
+    try:
+        get_auth_service().ensure_project_token(project_id=project_id, project_name=project.name)
+    except Exception as exc:
+        logger.error(f"自动创建项目级机机Token失败: {project_id}, 错误: {exc}")
+        k8s_client.delete_namespace(project_id, force=True)
+        try:
+            db.query(ProjectRoleBind).filter(ProjectRoleBind.project_id == project_id).delete(synchronize_session=False)
+            db.query(Project).filter(Project.id == project_id).delete(synchronize_session=False)
+            db.commit()
+        except Exception as cleanup_error:
+            db.rollback()
+            logger.error(f"项目级机机Token创建失败后的数据库补偿清理失败: {project_id}, 错误: {cleanup_error}")
+        raise HTTPException(status_code=500, detail="创建项目级SDK Token失败")
 
     return make_project_response(project, [ProjectRoleBindResponse(
         user_id=role_bind.user_id,
@@ -499,19 +560,7 @@ async def get_project(
 
     - 需要对项目有访问权限
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).options(joinedload(Project.role_binds), joinedload(Project.department)).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    # 检查权限
-    if not can_view_project(db, project, user_id):
-        raise ForbiddenError("无权访问此项目")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=False)
 
     roles = [ProjectRoleBindResponse(
         user_id=bind.user_id,
@@ -519,7 +568,11 @@ async def get_project(
         created_at=bind.created_at
     ) for bind in project.role_binds]
 
-    return make_project_response(project, roles, can_manage=can_manage_project(db, project, user_id))
+    can_manage = is_project_machine_token(current_user, project_id)
+    if not can_manage and not is_machine_token_user(current_user):
+        can_manage = can_manage_project(db, project, int(current_user["id"]))
+
+    return make_project_response(project, roles, can_manage=can_manage)
 
 
 @router.put("/{project_id}", response_model=ProjectResponse)
@@ -534,18 +587,8 @@ async def update_project(
 
     - 仅归属部门管理员或其上级部门管理员可修改
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).options(joinedload(Project.role_binds), joinedload(Project.department)).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    if not can_manage_project(db, project, user_id):
-        raise ForbiddenError("只有归属部门管理员或其上级部门管理员可以修改项目")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=True)
+    user_id = None if is_machine_token_user(current_user) else int(current_user["id"])
 
     # 更新字段
     if project_data.name is not None:
@@ -569,6 +612,8 @@ async def update_project(
         project.is_public = project_data.is_public
 
     if project_data.department_id is not None:
+        if user_id is None:
+            raise ForbiddenError("项目级机机Token不允许修改项目归属部门")
         project.department_id = validate_project_department_scope(db, user_id, project_data.department_id)
 
     db.commit()
@@ -580,7 +625,7 @@ async def update_project(
         created_at=bind.created_at
     ) for bind in project.role_binds]
 
-    return make_project_response(project, roles_list, can_manage=can_manage_project(db, project, user_id))
+    return make_project_response(project, roles_list, can_manage=True)
 
 
 @router.delete("/{project_id}", response_model=SuccessResponse)
@@ -595,18 +640,7 @@ async def delete_project(
     - 仅归属部门管理员或其上级部门管理员可删除
     - 同时删除K8S Namespace及所有资源
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    if not can_manage_project(db, project, user_id):
-        raise ForbiddenError("只有归属部门管理员或其上级部门管理员可以删除项目")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=True)
 
     # 软删除项目
     project.status = "deleted"
@@ -632,19 +666,7 @@ async def bind_role(
 
     - 需要项目管理权限
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    # 检查权限
-    if not can_manage_project(db, project, user_id):
-        raise ForbiddenError("只有归属部门管理员或其上级部门管理员可以绑定角色")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=True)
 
     # 检查是否已存在绑定
     existing = db.query(ProjectRoleBind).filter(
@@ -692,19 +714,7 @@ async def unbind_role(
     - 需要项目管理权限
     - 不能解除所有者自己的角色
     """
-    current_user_id = int(current_user["id"])
-
-    project = db.query(Project).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    # 检查权限
-    if not can_manage_project(db, project, current_user_id):
-        raise ForbiddenError("只有归属部门管理员或其上级部门管理员可以解除角色绑定")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=True)
 
     # 不能解除所有者
     if user_id == project.owner_id:
@@ -733,19 +743,7 @@ async def get_project_namespace(
     """
     获取项目关联的K8S Namespace状态
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    # 检查权限
-    if not can_view_project(db, project, user_id):
-        raise ForbiddenError("无权访问此项目")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=False)
 
     k8s_client = get_k8s_client()
     status = k8s_client.get_namespace_status(project_id)
@@ -770,19 +768,7 @@ async def get_project_resources(
 
     包括：Pod、Service、ConfigMap、Secret、Deployment、StatefulSet、PVC、Ingress等
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    # 检查权限
-    if not can_view_project(db, project, user_id):
-        raise ForbiddenError("无权访问此项目")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=False)
 
     k8s_client = get_k8s_client()
 
@@ -818,19 +804,7 @@ async def get_pod_logs(
     - 支持设置返回行数tail_lines，默认100行
     - 多容器Pod可通过container参数指定容器
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    # 检查权限
-    if not can_view_project(db, project, user_id):
-        raise ForbiddenError("无权访问此项目")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=False)
 
     k8s_client = get_k8s_client()
     k8s_namespace = project.k8s_namespace or k8s_client.generate_namespace_name(project_id)
@@ -861,19 +835,7 @@ async def delete_pod(
 
     - 删除项目关联Namespace下的指定Pod
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    # 检查权限
-    if not can_manage_project(db, project, user_id):
-        raise ForbiddenError("只有归属部门管理员或其上级部门管理员可以删除Pod")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=True)
 
     k8s_client = get_k8s_client()
 
@@ -897,19 +859,7 @@ async def delete_pvc(
     - 删除前会检查PVC是否被任何Pod使用
     - 如PVC正在被使用，将返回409错误
     """
-    user_id = int(current_user["id"])
-
-    project = db.query(Project).filter(
-        Project.id == project_id,
-        Project.status == "active"
-    ).first()
-
-    if not project:
-        raise NotFoundError("项目", project_id)
-
-    # 检查权限
-    if not can_manage_project(db, project, user_id):
-        raise ForbiddenError("只有归属部门管理员或其上级部门管理员可以删除PVC")
+    project = get_project_with_permission(db, project_id, current_user, require_manage=True)
 
     k8s_client = get_k8s_client()
 

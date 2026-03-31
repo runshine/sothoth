@@ -1,19 +1,146 @@
 """机机Token管理路由"""
 
-from typing import List, Optional
+import secrets
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.config import config
 from app.database import get_db
-from app.dependencies import get_current_super_admin
+from app.dependencies import get_current_super_admin, get_current_user
 from app.schema import (
     MachineTokenCreate, MachineTokenResponse, MachineTokenUpdate,
-    MachineTokenDetailResponse, Message
+    MachineTokenDetailResponse, Message, ProjectMachineTokenEnsureRequest,
+    ProjectMachineTokenResponse
 )
 from app.model import MachineToken, User
+from app.service.project import ProjectServiceError, get_project_service
 
 router = APIRouter(tags=["机机Token管理"], prefix="/machine-tokens")
+
+
+def _build_project_machine_code(project_id: str) -> str:
+    return f"project-sdk:{project_id}"
+
+
+def _refresh_token_if_expired(db: Session, token: MachineToken) -> bool:
+    now = datetime.utcnow()
+    token_expired = token.expires_at and token.expires_at < now
+    if token_expired and token.is_active:
+        token.is_active = False
+        token.updated_at = now
+        db.commit()
+    return bool(token_expired)
+
+
+def _mask_expired_token(token: MachineToken) -> MachineTokenDetailResponse:
+    return MachineTokenDetailResponse(
+        id=token.id,
+        machine_code=token.machine_code,
+        description=token.description,
+        token_scope=token.token_scope or "global",
+        project_id=token.project_id,
+        is_active=token.is_active,
+        created_at=token.created_at,
+        expires_at=token.expires_at,
+        token=""
+    )
+
+
+def _get_internal_service_token() -> str:
+    return (
+        config.get("service_auth", {}).get("machine_token")
+        or config.get("service_auth", {}).get("service_machine_token")
+        or ""
+    )
+
+
+def _require_internal_service_token(authorization: Optional[str]) -> None:
+    if not authorization:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="缺少Authorization头")
+
+    try:
+        scheme, token = authorization.split()
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization格式错误")
+
+    if scheme.lower() != "bearer":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization格式错误")
+
+    shared_token = _get_internal_service_token()
+    if not shared_token or not secrets.compare_digest(token, shared_token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权调用内部项目Token接口")
+
+
+def _assert_project_manage_permission(project_id: str, authorization: Optional[str]) -> dict:
+    if not authorization:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="缺少Authorization头")
+
+    try:
+        token = authorization.split()[1]
+    except (IndexError, ValueError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization格式错误")
+
+    project_service = get_project_service()
+    try:
+        project = project_service.get_project(token, project_id)
+    except ProjectServiceError as exc:
+        message = str(exc)
+        if "资源不存在" in message:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目不存在")
+        if "无权限" in message or "Token无效" in message:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问当前项目")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"校验项目权限失败: {message}")
+
+    if not project.get("can_manage"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅项目管理员可查看或刷新项目级Token")
+
+    return project
+
+
+def _ensure_project_machine_token(
+    db: Session,
+    project_id: str,
+    project_name: Optional[str] = None,
+    description: Optional[str] = None,
+    expires_at: Optional[datetime] = None,
+    regenerate: bool = False,
+) -> MachineToken:
+    machine_code = _build_project_machine_code(project_id)
+    token = db.query(MachineToken).filter(MachineToken.machine_code == machine_code).first()
+
+    default_description = description or f"项目 {project_name or project_id} 的 SDK 访问凭证"
+    now = datetime.utcnow()
+
+    if token:
+        token.description = default_description
+        token.token_scope = "project"
+        token.project_id = project_id
+        if expires_at is not None:
+            token.expires_at = expires_at
+        if regenerate or not token.is_active:
+            token.token = secrets.token_urlsafe(64)
+            token.is_active = True
+        token.updated_at = now
+        db.commit()
+        db.refresh(token)
+        return token
+
+    token = MachineToken(
+        token=secrets.token_urlsafe(64),
+        machine_code=machine_code,
+        description=default_description,
+        token_scope="project",
+        project_id=project_id,
+        expires_at=expires_at,
+        is_active=True,
+    )
+    db.add(token)
+    db.commit()
+    db.refresh(token)
+    return token
 
 
 @router.get("", response_model=List[MachineTokenResponse])
@@ -32,7 +159,6 @@ def list_machine_tokens(
     now = datetime.utcnow()
     for token in tokens:
         if token.expires_at and token.expires_at < now and token.is_active:
-            # 如果Token已过期且状态仍为激活，更新状态为禁用
             token.is_active = False
             token.updated_at = now
     
@@ -61,28 +187,9 @@ def get_machine_token(
             detail="Token不存在"
         )
     
-    # 检查Token是否过期
-    now = datetime.utcnow()
-    token_expired = token.expires_at and token.expires_at < now
-    
-    if token_expired and token.is_active:
-        # 如果Token已过期且状态仍为激活，更新状态为禁用
-        token.is_active = False
-        token.updated_at = now
-        db.commit()
-    
-    # 如果Token已过期，创建一个不包含token字段的响应对象
+    token_expired = _refresh_token_if_expired(db, token)
     if token_expired:
-        response_data = {
-            "id": token.id,
-            "machine_code": token.machine_code,
-            "description": token.description,
-            "is_active": token.is_active,
-            "created_at": token.created_at,
-            "expires_at": token.expires_at,
-            "token": ""  # 设置为空字符串
-        }
-        return MachineTokenDetailResponse(**response_data)
+        return _mask_expired_token(token)
     
     return token
 
@@ -119,6 +226,8 @@ def create_machine_token(
         token=token_value,
         machine_code=token_data.machine_code,
         description=token_data.description,
+        token_scope=token_data.token_scope or "global",
+        project_id=token_data.project_id,
         expires_at=token_data.expires_at
     )
 
@@ -127,6 +236,84 @@ def create_machine_token(
     db.refresh(db_token)
 
     return db_token
+
+
+@router.get("/projects/{project_id}", response_model=ProjectMachineTokenResponse)
+def get_project_machine_token(
+    project_id: str,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    获取项目级机机Token详情。
+
+    仅具备项目管理权限的用户可查看。
+    """
+    _assert_project_manage_permission(project_id, authorization)
+
+    machine_code = _build_project_machine_code(project_id)
+    token = db.query(MachineToken).filter(MachineToken.machine_code == machine_code).first()
+    if not token or token.token_scope != "project" or token.project_id != project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="项目级Token不存在")
+
+    token_expired = _refresh_token_if_expired(db, token)
+    if token_expired:
+        masked = _mask_expired_token(token)
+        return ProjectMachineTokenResponse(
+            id=masked.id,
+            machine_code=masked.machine_code,
+            description=masked.description,
+            token_scope="project",
+            project_id=project_id,
+            is_active=masked.is_active,
+            created_at=masked.created_at,
+            expires_at=masked.expires_at,
+            token=masked.token,
+        )
+
+    return token
+
+
+@router.post("/projects/{project_id}/refresh", response_model=ProjectMachineTokenResponse)
+def refresh_project_machine_token(
+    project_id: str,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    手动刷新项目级机机Token。
+    """
+    project = _assert_project_manage_permission(project_id, authorization)
+    token = _ensure_project_machine_token(
+        db=db,
+        project_id=project_id,
+        project_name=project.get("name"),
+        regenerate=True,
+    )
+    return token
+
+
+@router.post("/projects/ensure", response_model=ProjectMachineTokenResponse, status_code=status.HTTP_201_CREATED)
+def ensure_project_machine_token(
+    request: ProjectMachineTokenEnsureRequest,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """
+    由项目微服务内部调用，自动创建项目级机机Token。
+    """
+    _require_internal_service_token(authorization)
+    token = _ensure_project_machine_token(
+        db=db,
+        project_id=request.project_id,
+        project_name=request.project_name,
+        description=request.description,
+        expires_at=request.expires_at,
+        regenerate=False,
+    )
+    return token
 
 
 @router.put("/{token_id}", response_model=MachineTokenDetailResponse)
@@ -259,8 +446,6 @@ def regenerate_machine_token(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Token不存在"
         )
-
-    import secrets
 
     # 生成新的token值
     token.token = secrets.token_urlsafe(64)

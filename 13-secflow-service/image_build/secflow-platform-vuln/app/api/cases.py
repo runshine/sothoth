@@ -13,6 +13,7 @@ from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Re
 from app.schemas import (
     CaseCreateRequest,
     DecisionRequest,
+    DraftCaseCreateRequest,
     ManualTaskCreateRequest,
     ManualTaskStatusUpdateRequest,
     RoutedActionDispatchRequest,
@@ -37,6 +38,7 @@ def _case_payload(item: Case) -> dict:
     subject = json.loads(item.target_meta_json or "{}")
     display_meta = json.loads(item.display_meta_json or "{}")
     metadata = display_meta.get("metadata") or {}
+    fileserver_root = display_meta.get("fileserver_root") or {}
     return {
         "id": item.id,
         "project_id": item.project_id,
@@ -57,6 +59,8 @@ def _case_payload(item: Case) -> dict:
         "evidence": display_meta.get("evidence") or {},
         "artifacts": display_meta.get("artifacts") or [],
         "metadata": metadata,
+        "files_root_path": fileserver_root.get("root_path"),
+        "fileserver_root": fileserver_root,
         "current_stage": item.current_stage,
         "current_status": item.current_status,
         "decision_status": item.decision_status,
@@ -95,6 +99,23 @@ async def create_case(
     item = create_case_with_runtime(
         db,
         request.to_case_create_request(created_by_type="human", created_by=creator),
+    )
+    return _case_payload(item)
+
+
+@router.post("/draft")
+async def create_draft_case(
+    request: DraftCaseCreateRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    subject, token = user_and_token
+    await ensure_project_access(request.project_id, token)
+    creator = subject.get("username") or str(subject.get("id"))
+    item = create_case_with_runtime(
+        db,
+        request.to_case_create_request(created_by_type="human", created_by=creator),
+        initial_status="draft",
     )
     return _case_payload(item)
 

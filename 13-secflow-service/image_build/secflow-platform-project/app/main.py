@@ -87,12 +87,12 @@ async def lifespan(app: FastAPI):
         logger.error(f"加载配置失败: {e}")
         sys.exit(1)
 
-    # 初始化数据库
+    # 初始化数据库并执行启动迁移
     try:
         init_database()
-        logger.info("数据库初始化成功")
+        logger.info("数据库初始化及启动迁移成功")
     except Exception as e:
-        logger.error(f"数据库初始化失败: {e}")
+        logger.error(f"数据库初始化或启动迁移失败: {e}")
         sys.exit(1)
 
     # 校验Auth服务与机机Token

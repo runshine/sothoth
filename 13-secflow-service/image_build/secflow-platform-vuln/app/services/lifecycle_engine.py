@@ -22,6 +22,18 @@ STAGE_ACTION_CANDIDATES: dict[str, list[str]] = {
     "track": ["feedback", "tool_feedback"],
 }
 
+SPECIAL_FILESERVER_SUBPROJECT_NAME = "__vuln_cases__"
+
+
+def build_case_fileserver_root(case_id: str) -> dict[str, str | None]:
+    root_path = f"/{SPECIAL_FILESERVER_SUBPROJECT_NAME}/{case_id}"
+    return {
+        "root_path": root_path,
+        "root_name": case_id,
+        "special_subproject_name": SPECIAL_FILESERVER_SUBPROJECT_NAME,
+        "special_subproject_id": None,
+    }
+
 
 def ensure_default_workflow(db: Session) -> WorkflowDefinition:
     cfg = get_config()
@@ -46,18 +58,21 @@ def ensure_default_workflow(db: Session) -> WorkflowDefinition:
     return workflow
 
 
-def create_case_with_runtime(db: Session, request: CaseCreateRequest) -> Case:
+def create_case_with_runtime(db: Session, request: CaseCreateRequest, *, initial_status: str = "running") -> Case:
     workflow = ensure_default_workflow(db)
     source_meta, target_meta, display_meta = request.build_storage_payloads()
+    case_id = uuid4().hex
+    fileserver_root = build_case_fileserver_root(case_id)
+    display_meta["fileserver_root"] = fileserver_root
     case = Case(
-        id=uuid4().hex,
+        id=case_id,
         project_id=request.project_id,
         title=request.title,
         summary=request.summary,
         severity=request.severity,
         confidence=request.confidence,
         current_stage="ingest",
-        current_status="running",
+        current_status=initial_status,
         decision_status="unknown",
         workflow_definition_id=workflow.id,
         source_meta_json=json.dumps(source_meta, ensure_ascii=False),

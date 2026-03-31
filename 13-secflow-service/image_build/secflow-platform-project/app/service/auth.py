@@ -43,12 +43,15 @@ class AuthService:
         self._cache_enabled = self.config.token_cache_enabled
         self._cache_ttl_seconds = self.config.token_cache_ttl_minutes * 60
 
-    def _get_cached_user(self, token: str) -> Optional[dict]:
+    def _get_cache_key(self, token: str, project_id: Optional[str] = None) -> str:
+        return f"{token}::{project_id or ''}"
+
+    def _get_cached_user(self, token: str, project_id: Optional[str] = None) -> Optional[dict]:
         """从缓存获取用户信息"""
         if not self._cache_enabled:
             return None
 
-        cache_entry = self._token_cache.get(token)
+        cache_entry = self._token_cache.get(self._get_cache_key(token, project_id))
         if cache_entry is None:
             return None
 
@@ -60,15 +63,19 @@ class AuthService:
         logger.debug("Token缓存命中，直接返回缓存的用户信息")
         return cache_entry.user_info
 
-    def _set_cached_user(self, token: str, user_info: dict):
+    def _set_cached_user(self, token: str, user_info: dict, project_id: Optional[str] = None):
         """将用户信息缓存"""
         if not self._cache_enabled:
             return
 
-        self._token_cache[token] = TokenCacheEntry(user_info, self._cache_ttl_seconds)
+        if user_info.get("token_type") == "machine":
+            logger.debug("机机Token不进入缓存，确保刷新/禁用即时生效")
+            return
+
+        self._token_cache[self._get_cache_key(token, project_id)] = TokenCacheEntry(user_info, self._cache_ttl_seconds)
         logger.debug(f"Token已缓存，TTL={self._cache_ttl_seconds}秒")
 
-    def validate_token(self, token: str) -> dict:
+    def validate_token(self, token: str, project_id: Optional[str] = None) -> dict:
         """
         验证用户Token（带缓存）
 
@@ -83,7 +90,7 @@ class AuthService:
             AuthServiceError: 认证服务异常
         """
         # 先检查缓存
-        cached_user = self._get_cached_user(token)
+        cached_user = self._get_cached_user(token, project_id)
         if cached_user is not None:
             return cached_user
 
@@ -92,7 +99,8 @@ class AuthService:
             headers = {"Authorization": f"Bearer {token}"}
             response = self.client.post(
                 self.config.validate_url,
-                headers=headers
+                headers=headers,
+                params={"project_id": project_id} if project_id else None
             )
 
             if response.status_code == 401:
@@ -106,7 +114,7 @@ class AuthService:
             data = response.json()
 
             # 缓存验证结果
-            self._set_cached_user(token, data)
+            self._set_cached_user(token, data, project_id)
 
             return data
 
@@ -115,7 +123,7 @@ class AuthService:
         except httpx.ConnectError as e:
             raise AuthServiceError(f"无法连接到认证服务: {e}")
 
-    async def validate_token_async(self, token: str) -> dict:
+    async def validate_token_async(self, token: str, project_id: Optional[str] = None) -> dict:
         """
         异步验证用户Token（带缓存）
 
@@ -126,7 +134,7 @@ class AuthService:
             用户信息字典
         """
         # 先检查缓存
-        cached_user = self._get_cached_user(token)
+        cached_user = self._get_cached_user(token, project_id)
         if cached_user is not None:
             return cached_user
 
@@ -136,7 +144,8 @@ class AuthService:
                 headers = {"Authorization": f"Bearer {token}"}
                 response = await client.post(
                     self.config.validate_url,
-                    headers=headers
+                    headers=headers,
+                    params={"project_id": project_id} if project_id else None
                 )
 
                 if response.status_code == 401:
@@ -150,7 +159,7 @@ class AuthService:
                 data = response.json()
 
                 # 缓存验证结果
-                self._set_cached_user(token, data)
+                self._set_cached_user(token, data, project_id)
 
                 return data
 
@@ -158,6 +167,29 @@ class AuthService:
                 raise AuthServiceError("认证服务请求超时")
             except httpx.ConnectError as e:
                 raise AuthServiceError(f"无法连接到认证服务: {e}")
+
+    def ensure_project_token(self, project_id: str, project_name: Optional[str] = None) -> dict:
+        """通知认证服务为项目创建项目级Token。"""
+        machine_token = getattr(self.config, "service_machine_token", None)
+        if not machine_token:
+            raise AuthServiceError("未配置auth_service.service_machine_token")
+
+        url = f"http://{self.config.host}:{self.config.port}/api/auth/machine-tokens/projects/ensure"
+        headers = {"Authorization": f"Bearer {machine_token}"}
+        payload = {
+            "project_id": project_id,
+            "project_name": project_name,
+        }
+
+        try:
+            response = self.client.post(url, headers=headers, json=payload)
+            if response.status_code not in (200, 201):
+                raise AuthServiceError(f"认证服务创建项目级Token失败: {response.text}")
+            return response.json()
+        except httpx.TimeoutException:
+            raise AuthServiceError("认证服务请求超时")
+        except httpx.ConnectError as e:
+            raise AuthServiceError(f"无法连接到认证服务: {e}")
 
 
 # 单例实例
