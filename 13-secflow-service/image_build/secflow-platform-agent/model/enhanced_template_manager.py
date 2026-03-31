@@ -453,19 +453,57 @@ class EnhancedTemplateManager:
             return result
         return {}
 
+    @staticmethod
+    def _normalize_service_configs(configs: Any) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        if isinstance(configs, list):
+            for item in configs:
+                if isinstance(item, str):
+                    source = item.strip()
+                    if source:
+                        normalized.append({'source': source})
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                source = str(item.get('source') or item.get('config') or '').strip()
+                if not source:
+                    continue
+                record: Dict[str, Any] = {'source': source}
+                target = str(item.get('target') or '').strip()
+                if target:
+                    record['target'] = target
+                if 'mode' in item:
+                    record['mode'] = item.get('mode')
+                if 'uid' in item:
+                    record['uid'] = item.get('uid')
+                if 'gid' in item:
+                    record['gid'] = item.get('gid')
+                normalized.append(record)
+        return normalized
+
+    @staticmethod
+    def _sanitize_config_name(value: str) -> str:
+        normalized = ''.join(ch if str(ch).isalnum() else '_' for ch in str(value or '').strip().lower())
+        normalized = normalized.strip('_')
+        if not normalized:
+            normalized = 'llm_file'
+        return normalized[:48]
+
     def _apply_llm_provider_binding_to_yaml(
         self,
         yaml_content: str,
         binding: Optional[Dict[str, Any]],
+        template_dir: Optional[Path] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         if not binding or not isinstance(binding, dict):
-            return yaml_content, {'applied': False, 'provider_keys': [], 'target_services': [], 'mapped_env_keys': []}
+            return yaml_content, {'applied': False, 'provider_keys': [], 'target_services': [], 'mapped_env_keys': [], 'mapped_file_paths': []}
 
         merged_env = binding.get('merged_env') if isinstance(binding.get('merged_env'), dict) else {}
+        merged_files = binding.get('merged_files') if isinstance(binding.get('merged_files'), list) else []
         provider_keys = [str(item) for item in (binding.get('provider_keys') or []) if str(item).strip()]
         target_services = binding.get('target_services', '*')
-        if not merged_env or not provider_keys:
-            return yaml_content, {'applied': False, 'provider_keys': provider_keys, 'target_services': [], 'mapped_env_keys': sorted(merged_env.keys())}
+        if (not merged_env and not merged_files) or not provider_keys:
+            return yaml_content, {'applied': False, 'provider_keys': provider_keys, 'target_services': [], 'mapped_env_keys': sorted(merged_env.keys()), 'mapped_file_paths': []}
 
         compose_data = yaml.safe_load(yaml_content) or {}
         if not isinstance(compose_data, dict):
@@ -483,6 +521,42 @@ class EnhancedTemplateManager:
             if missing:
                 raise ValueError(f"LLM Provider 目标服务不存在: {', '.join(missing)}")
 
+        mapped_file_paths: List[str] = []
+        llm_service_configs: Dict[str, Dict[str, Any]] = {}
+        if merged_files:
+            if template_dir is None:
+                raise ValueError('模板目录不存在，无法写入 LLM Provider 文件')
+            llm_files_dir = template_dir / '.llm-provider-files'
+            if llm_files_dir.exists():
+                shutil.rmtree(llm_files_dir, ignore_errors=True)
+            llm_files_dir.mkdir(parents=True, exist_ok=True)
+            compose_configs = compose_data.get('configs')
+            if not isinstance(compose_configs, dict):
+                compose_configs = {}
+                compose_data['configs'] = compose_configs
+
+            for idx, raw_item in enumerate(merged_files):
+                if not isinstance(raw_item, dict):
+                    continue
+                file_path = str(raw_item.get('path') or '').strip()
+                content = raw_item.get('content')
+                if not file_path or not isinstance(content, str):
+                    continue
+                file_name_token = hashlib.sha1(file_path.encode('utf-8')).hexdigest()[:12]
+                file_ext = Path(file_path).suffix or '.txt'
+                relative_file_path = Path('.llm-provider-files') / f"{idx + 1:02d}_{file_name_token}{file_ext}"
+                absolute_file_path = template_dir / relative_file_path
+                absolute_file_path.parent.mkdir(parents=True, exist_ok=True)
+                absolute_file_path.write_text(content, encoding='utf-8')
+
+                config_name = f"llm_file_{self._sanitize_config_name(file_name_token)}"
+                compose_configs[config_name] = {'file': relative_file_path.as_posix()}
+                llm_service_configs[file_path] = {
+                    'source': config_name,
+                    'target': file_path,
+                }
+                mapped_file_paths.append(file_path)
+
         for service_name in selected_services:
             service_cfg = services.get(service_name)
             if not isinstance(service_cfg, dict):
@@ -490,6 +564,15 @@ class EnhancedTemplateManager:
             env_map = self._normalize_compose_environment(service_cfg.get('environment'))
             env_map.update({str(k): '' if v is None else str(v) for k, v in merged_env.items()})
             service_cfg['environment'] = env_map
+            if llm_service_configs:
+                existing_configs = self._normalize_service_configs(service_cfg.get('configs'))
+                target_path_set = set(llm_service_configs.keys())
+                cleaned_configs = [
+                    item for item in existing_configs
+                    if str(item.get('target') or '').strip() not in target_path_set
+                ]
+                cleaned_configs.extend(llm_service_configs.values())
+                service_cfg['configs'] = cleaned_configs
 
         updated_yaml = yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
         return updated_yaml, {
@@ -497,6 +580,7 @@ class EnhancedTemplateManager:
             'provider_keys': provider_keys,
             'target_services': selected_services,
             'mapped_env_keys': sorted(merged_env.keys()),
+            'mapped_file_paths': sorted(set(mapped_file_paths)),
         }
 
     def _rebuild_template_archive(self, template: Dict[str, Any], template_dir: Path):
@@ -545,12 +629,18 @@ class EnhancedTemplateManager:
                 'provider_keys': list(binding.get('provider_keys') or []),
                 'target_services': normalized.get('target_services', '*'),
                 'merged_env': dict(binding.get('merged_env') or {}),
+                'merged_files': list(binding.get('merged_files') or []),
                 'provider_snapshots': list(binding.get('provider_snapshots') or []),
                 'mapped_env_keys': list(binding.get('mapped_env_keys') or []),
+                'mapped_file_paths': list(binding.get('mapped_file_paths') or []),
             }
-            updated_yaml, injection = self._apply_llm_provider_binding_to_yaml(original_compose, resolved_binding)
-
             template_dir = self.templates_root / str(template.get('name') or '')
+            updated_yaml, injection = self._apply_llm_provider_binding_to_yaml(
+                original_compose,
+                resolved_binding,
+                template_dir=template_dir,
+            )
+
             main_compose_path = str((backup_info or {}).get('main_compose_path') or self._get_main_compose_relative_path(template, metadata))
             compose_path = template_dir / main_compose_path
             compose_path.parent.mkdir(parents=True, exist_ok=True)
@@ -563,6 +653,7 @@ class EnhancedTemplateManager:
                 'provider_keys': list(resolved_binding.get('provider_keys') or []),
                 'provider_snapshots': list(resolved_binding.get('provider_snapshots') or []),
                 'mapped_env_keys': list(injection.get('mapped_env_keys') or []),
+                'mapped_file_paths': list(injection.get('mapped_file_paths') or []),
                 'target_services': resolved_binding.get('target_services', '*'),
                 'generated_at': datetime.now().isoformat(),
                 'generated_by': generated_by,
@@ -590,6 +681,9 @@ class EnhancedTemplateManager:
         try:
             backup_info, original_compose = self._ensure_original_compose_backup(template_id, template, metadata)
             template_dir = self.templates_root / str(template.get('name') or '')
+            llm_files_dir = template_dir / '.llm-provider-files'
+            if llm_files_dir.exists():
+                shutil.rmtree(llm_files_dir, ignore_errors=True)
             main_compose_path = str((backup_info or {}).get('main_compose_path') or self._get_main_compose_relative_path(template, metadata))
             compose_path = template_dir / main_compose_path
             compose_path.parent.mkdir(parents=True, exist_ok=True)

@@ -8,6 +8,7 @@ from agent_ai_service.api.ai_agents import bp as ai_agents_bp
 from agent_ai_service.api.backends import bp as backends_bp
 from agent_ai_service.api.commands import bp as commands_bp
 from agent_ai_service.api.health import bp as health_bp
+from agent_ai_service.api.openai_compat import bp as openai_compat_bp
 from agent_ai_service.api.system import bp as system_bp
 from agent_ai_service.logging_setup import configure_logging
 from agent_ai_service.api.backends import process_manager
@@ -24,6 +25,7 @@ app.register_blueprint(system_bp)
 app.register_blueprint(backends_bp)
 app.register_blueprint(ai_agents_bp)
 app.register_blueprint(a2a_bp)
+app.register_blueprint(openai_compat_bp)
 register_ws_routes(sock)
 
 

@@ -36,15 +36,6 @@ DEFAULT_BACKENDS = {
         'enabled': False,
         'description': 'OpenCode CLI backend',
     },
-    'claude-a2a': {
-        'name': 'claude-a2a',
-        'backend_type': 'claude-a2a',
-        'command': 'claude-a2a',
-        'args': [],
-        'env': {},
-        'enabled': False,
-        'description': 'Claude A2A bridge backend',
-    },
 }
 
 
@@ -64,10 +55,17 @@ class BackendRegistry:
         changed = False
         data.setdefault('backends', {})
         data.setdefault('default_backend', settings.agent_default_backend)
+        # 清理已下线的历史默认后端，避免在 AI Agent 管理页继续出现
+        removed_legacy = data['backends'].pop('claude-a2a', None)
+        if removed_legacy is not None:
+            changed = True
         for name, cfg in DEFAULT_BACKENDS.items():
             if name not in data['backends']:
                 data['backends'][name] = deepcopy(cfg)
                 changed = True
+        if data.get('default_backend') == 'claude-a2a':
+            data['default_backend'] = settings.agent_default_backend if settings.agent_default_backend in data['backends'] else 'claude'
+            changed = True
         if changed:
             self.store.write(data)
 

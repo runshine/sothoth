@@ -947,6 +947,32 @@ class WebAPIServer:
             'description': provider.get('description'),
         }
 
+    def _build_llm_provider_files(self, provider: Dict[str, Any]) -> List[Dict[str, Any]]:
+        provider_key = str(provider.get('provider_key') or '').strip()
+        raw_items = provider.get('file_bindings') if isinstance(provider.get('file_bindings'), list) else []
+        files: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                continue
+            enabled = bool(item.get('enabled', True))
+            if not enabled:
+                continue
+            path = str(item.get('path') or '').strip()
+            content = item.get('content')
+            if not path or not isinstance(content, str):
+                continue
+            name = str(item.get('name') or '').strip() or f"{provider_key or 'provider'}-file-{index + 1}"
+            fmt = str(item.get('format') or 'other').strip().lower() or 'other'
+            files.append({
+                'name': name,
+                'path': path,
+                'content': content,
+                'format': fmt,
+                'enabled': True,
+                'provider_key': provider_key,
+            })
+        return files
+
     def _build_llm_provider_env(
         self,
         provider: Dict[str, Any],
@@ -975,6 +1001,7 @@ class WebAPIServer:
         seen = set()
         provider_snapshots: List[Dict[str, Any]] = []
         merged_env: Dict[str, str] = {}
+        merged_files_by_path: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
         for item in provider_keys or []:
             provider_key = str(item or '').strip()
@@ -983,8 +1010,18 @@ class WebAPIServer:
             seen.add(provider_key)
             provider = self._get_service_llm_provider(provider_key)
             normalized_provider_keys.append(provider_key)
-            provider_snapshots.append(self._build_llm_provider_snapshot(provider))
+            provider_files = self._build_llm_provider_files(provider)
+            snapshot = self._build_llm_provider_snapshot(provider)
+            snapshot['file_binding_count'] = len(provider_files)
+            provider_snapshots.append(snapshot)
             merged_env.update(self._build_llm_provider_env(provider, ''))
+            for file_item in provider_files:
+                file_path = str(file_item.get('path') or '').strip()
+                if not file_path:
+                    continue
+                if file_path in merged_files_by_path:
+                    del merged_files_by_path[file_path]
+                merged_files_by_path[file_path] = file_item
 
         if target_services == '*' or target_services is None:
             normalized_targets: Union[str, List[str]] = '*'
@@ -998,6 +1035,7 @@ class WebAPIServer:
                 target_seen.add(text)
                 normalized_targets.append(text)
 
+        merged_files = list(merged_files_by_path.values())
         return {
             'provider_keys': normalized_provider_keys,
             'target_services': normalized_targets,
@@ -1005,6 +1043,8 @@ class WebAPIServer:
             'provider_snapshots': provider_snapshots,
             'merged_env': merged_env,
             'mapped_env_keys': sorted(merged_env.keys()),
+            'merged_files': merged_files,
+            'mapped_file_paths': sorted([str(item.get('path') or '').strip() for item in merged_files if str(item.get('path') or '').strip()]),
             'updated_at': datetime.utcnow().isoformat(),
         }
 
@@ -4036,7 +4076,47 @@ class WebAPIServer:
             project_id = str(payload.get('project_id') or request.args.get('project_id') or '').strip()
             if not project_id:
                 return jsonify({'error': 'project_id is required'}), 400
+            stream = str(request.args.get('stream') or '').lower() == 'true'
             try:
+                if stream:
+                    row = self._get_ai_helper_service_row(project_id, agent_key, service_name)
+                    if not row:
+                        return jsonify({'error': f'AI helper service not found: {agent_key}/{service_name}'}), 404
+                    agent_ip = str(row.get('agent_ip') or '').strip()
+                    if not agent_ip:
+                        return jsonify({'error': f'AI helper service has no agent IP: {agent_key}/{service_name}'}), 400
+                    rest_port = self._resolve_helper_rest_port(row)
+                    target = f"http://{agent_ip}:{rest_port}/api/ai-agents/sessions/{quote(session_id, safe='')}/messages/stream"
+
+                    upstream = requests.request('POST', target, json=payload, timeout=(10, 300), stream=True)
+                    if upstream.status_code >= 400:
+                        try:
+                            err_payload = upstream.json()
+                        except Exception:
+                            err_payload = {'error': upstream.text or f'upstream status {upstream.status_code}'}
+                        upstream.close()
+                        return jsonify(err_payload), upstream.status_code
+
+                    def _proxy_stream():
+                        try:
+                            for chunk in upstream.iter_content(chunk_size=1024):
+                                if not chunk:
+                                    continue
+                                yield chunk
+                        finally:
+                            upstream.close()
+
+                    return Response(
+                        _proxy_stream(),
+                        status=upstream.status_code,
+                        mimetype='text/event-stream',
+                        headers={
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive',
+                            'X-Accel-Buffering': 'no',
+                        },
+                    )
+
                 data, status_code = self._call_ai_helper_api(
                     project_id,
                     agent_key,
@@ -4245,6 +4325,7 @@ class WebAPIServer:
                 role = str(payload.get('role') or 'user').strip() or 'user'
                 if not content:
                     return jsonify({'error': 'content is required'}), 400
+                stream = str(request.args.get('stream') or '').lower() == 'true'
 
                 item_rows = self.db_manager.fetch_all(
                     f"SELECT * FROM {items_table} WHERE batch_id = %s ORDER BY agent_key, service_name"
@@ -4259,6 +4340,132 @@ class WebAPIServer:
                     (batch_id,)
                 ) or []
                 next_round = int((round_rows[0].get('max_round') if round_rows else 0) or 0) + 1
+
+                if stream:
+                    def _batch_stream():
+                        try:
+                            start_payload = {
+                                'type': 'start',
+                                'batch_id': batch_id,
+                                'round_no': next_round,
+                                'total_items': len(item_rows),
+                                'role': role,
+                            }
+                            yield f"data: {json.dumps(start_payload, ensure_ascii=False)}\n\n"
+
+                            results = []
+                            success_count = 0
+                            for item in item_rows:
+                                helper_session_id = str(item.get('helper_session_id') or '').strip()
+                                item_key = {
+                                    'agent_key': item.get('agent_key'),
+                                    'service_name': item.get('service_name'),
+                                }
+                                if not helper_session_id:
+                                    item_result = {
+                                        **item_key,
+                                        'success': False,
+                                        'error': item.get('last_error') or 'missing helper_session_id',
+                                    }
+                                    results.append(item_result)
+                                    yield f"data: {json.dumps({'type': 'item', 'batch_id': batch_id, **item_result}, ensure_ascii=False)}\n\n"
+                                    continue
+                                try:
+                                    helper_agent_ids = []
+                                    raw_helper_agent_ids = item.get('helper_agent_ids_json')
+                                    if raw_helper_agent_ids:
+                                        try:
+                                            helper_agent_ids = json.loads(raw_helper_agent_ids) if isinstance(raw_helper_agent_ids, str) else list(raw_helper_agent_ids or [])
+                                        except Exception:
+                                            helper_agent_ids = []
+                                    data, status_code = self._call_ai_helper_api(
+                                        str(batch.get('project_id') or ''),
+                                        str(item.get('agent_key') or ''),
+                                        str(item.get('service_name') or ''),
+                                        'POST',
+                                        f"/api/ai-agents/sessions/{quote(helper_session_id, safe='')}/messages",
+                                        {'role': role, 'content': content},
+                                    )
+                                    ok = status_code < 300
+                                    success_count += 1 if ok else 0
+                                    self._upsert_ai_batch_item(
+                                        batch_id,
+                                        str(batch.get('project_id') or ''),
+                                        str(item.get('agent_key') or ''),
+                                        str(item.get('service_name') or ''),
+                                        helper_session_id,
+                                        helper_agent_ids,
+                                        'success' if ok else 'failed',
+                                        '' if ok else str(data),
+                                    )
+                                    item_result = {
+                                        **item_key,
+                                        'success': ok,
+                                        'status_code': status_code,
+                                        'response': data,
+                                    }
+                                    results.append(item_result)
+                                    yield f"data: {json.dumps({'type': 'item', 'batch_id': batch_id, **item_result}, ensure_ascii=False)}\n\n"
+                                except Exception as exc:
+                                    self._upsert_ai_batch_item(
+                                        batch_id,
+                                        str(batch.get('project_id') or ''),
+                                        str(item.get('agent_key') or ''),
+                                        str(item.get('service_name') or ''),
+                                        helper_session_id,
+                                        [],
+                                        'failed',
+                                        str(exc),
+                                    )
+                                    item_result = {
+                                        **item_key,
+                                        'success': False,
+                                        'error': str(exc),
+                                    }
+                                    results.append(item_result)
+                                    yield f"data: {json.dumps({'type': 'item', 'batch_id': batch_id, **item_result}, ensure_ascii=False)}\n\n"
+
+                            aggregate = {
+                                'batch_id': batch_id,
+                                'round_no': next_round,
+                                'role': role,
+                                'content': content,
+                                'results': results,
+                                'partial_success': 0 < success_count < len(results),
+                                'success': bool(results) and success_count == len(results),
+                            }
+                            self._append_ai_batch_round(batch_id, next_round, role, content, aggregate)
+                            batch_table = self.db_manager.get_table_name('ai_agent_session_batches')
+                            new_status = 'success' if results and success_count == len(results) else ('partial_success' if success_count > 0 else 'failed')
+                            self.db_manager.execute_query(
+                                f"UPDATE {batch_table} SET status = %s WHERE batch_id = %s"
+                                if self.db_manager.db_type == 'mysql' else
+                                f"UPDATE {batch_table} SET status = ?, updated_at = ? WHERE batch_id = ?",
+                                (new_status, batch_id)
+                                if self.db_manager.db_type == 'mysql' else
+                                (new_status, datetime.now().isoformat(), batch_id)
+                            )
+                            done_payload = {
+                                'type': 'done',
+                                **aggregate,
+                                'status': new_status,
+                            }
+                            yield f"data: {json.dumps(done_payload, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+                        except Exception as stream_exc:
+                            err_payload = {'type': 'error', 'batch_id': batch_id, 'error_message': str(stream_exc)}
+                            yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+                            yield "data: [DONE]\n\n"
+
+                    return Response(
+                        _batch_stream(),
+                        mimetype='text/event-stream',
+                        headers={
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive',
+                            'X-Accel-Buffering': 'no',
+                        },
+                    )
 
                 results = []
                 success_count = 0

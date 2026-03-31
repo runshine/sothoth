@@ -6,6 +6,17 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 
+LlmProviderFileFormat = Literal["json", "yaml", "yml", "toml", "env", "conf", "txt", "md", "xml", "ini", "other"]
+
+
+class LlmProviderFileBinding(BaseModel):
+    name: str
+    path: str
+    content: str
+    format: LlmProviderFileFormat = "other"
+    enabled: bool = True
+
+
 class LlmProviderBase(BaseModel):
     provider_key: str
     display_name: str
@@ -21,6 +32,7 @@ class LlmProviderBase(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     env_bindings: Dict[str, Any] = Field(default_factory=dict)
+    file_bindings: List[LlmProviderFileBinding] = Field(default_factory=list)
     extra_config: Dict[str, Any] = Field(default_factory=dict)
     description: Optional[str] = None
 
@@ -160,6 +172,7 @@ class LlmProviderSummary(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     env_bindings: Dict[str, Any]
+    file_bindings: List[LlmProviderFileBinding]
     extra_config: Dict[str, Any]
     description: Optional[str] = None
     created_at: Optional[str] = None
@@ -181,6 +194,7 @@ class LlmProviderDetail(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     env_bindings: Dict[str, Any]
+    file_bindings: List[LlmProviderFileBinding]
     extra_config: Dict[str, Any]
     description: Optional[str] = None
     created_at: Optional[str] = None
@@ -208,6 +222,7 @@ class LlmProviderServiceListItem(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     env_bindings: Dict[str, Any]
+    file_bindings: List[LlmProviderFileBinding]
     extra_config: Dict[str, Any]
     description: Optional[str] = None
 
@@ -249,6 +264,7 @@ def build_summary_payload(item) -> LlmProviderSummary:
         max_tokens=item.max_tokens,
         temperature=item.temperature,
         env_bindings=item.env_bindings or {},
+        file_bindings=item.file_bindings or [],
         extra_config=item.extra_config or {},
         description=item.description,
         created_at=item.created_at.isoformat() if isinstance(item.created_at, datetime) else None,
@@ -272,6 +288,7 @@ def build_detail_payload(item) -> LlmProviderDetail:
         max_tokens=item.max_tokens,
         temperature=item.temperature,
         env_bindings=item.env_bindings or {},
+        file_bindings=item.file_bindings or [],
         extra_config=item.extra_config or {},
         description=item.description,
         created_at=item.created_at.isoformat() if isinstance(item.created_at, datetime) else None,
@@ -295,6 +312,7 @@ def build_service_payload(item) -> LlmProviderServiceListItem:
         max_tokens=item.max_tokens,
         temperature=item.temperature,
         env_bindings=item.env_bindings or {},
+        file_bindings=item.file_bindings or [],
         extra_config=item.extra_config or {},
         description=item.description,
     )

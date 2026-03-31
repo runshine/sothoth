@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, inspect
 from sqlalchemy.dialects.mysql import JSON as MySQLJSON
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.types import JSON
@@ -34,6 +34,7 @@ class LlmProvider(Base):
     max_tokens = Column(Integer, nullable=True)
     temperature = Column(Float, nullable=True)
     env_bindings = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=dict)
+    file_bindings = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=list)
     extra_config = Column(JSON().with_variant(MySQLJSON, "mysql"), nullable=False, default=dict)
     description = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -65,7 +66,29 @@ def get_session_factory():
 
 
 def init_database():
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _ensure_file_bindings_column(engine)
+
+
+def _ensure_file_bindings_column(engine):
+    inspector = inspect(engine)
+    table_name = LlmProvider.__tablename__
+    try:
+        columns = {col.get("name") for col in inspector.get_columns(table_name)}
+    except Exception:
+        return
+    if "file_bindings" in columns:
+        return
+
+    dialect = engine.dialect.name
+    if dialect == "mysql":
+        alter_sql = f"ALTER TABLE {table_name} ADD COLUMN file_bindings JSON NULL"
+    else:
+        alter_sql = f"ALTER TABLE {table_name} ADD COLUMN file_bindings JSON"
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(alter_sql)
 
 
 def get_db():

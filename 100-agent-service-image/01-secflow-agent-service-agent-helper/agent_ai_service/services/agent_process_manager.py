@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
+import queue
 import signal
 import subprocess
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Generator
 
 import psutil
 
@@ -159,6 +160,114 @@ class AgentProcessManager:
             return {'success': False, 'error': f'backend command not found: {config.command}'}
         except subprocess.TimeoutExpired:
             return {'success': False, 'error': 'backend invoke timeout'}
+
+    def invoke_once_stream(self, config: BackendConfig, prompt: str, messages: list[dict[str, Any]] | None = None) -> Generator[Dict[str, Any], None, None]:
+        env = os.environ.copy()
+        env.update(config.env or {})
+        args = [config.command, *(config.args or [])]
+        if prompt:
+            args.append(prompt)
+
+        try:
+            proc = subprocess.Popen(
+                args,
+                cwd=config.cwd or None,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            yield {
+                'type': 'error',
+                'error': f'backend command not found: {config.command}',
+            }
+            return
+
+        q: queue.Queue[tuple[str, str] | None] = queue.Queue()
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        def _pump(pipe, source: str) -> None:
+            try:
+                while True:
+                    line = pipe.readline()
+                    if line == '':
+                        break
+                    q.put((source, line))
+            finally:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+                q.put(None)
+
+        stdout_thread = threading.Thread(target=_pump, args=(proc.stdout, 'stdout'), daemon=True)
+        stderr_thread = threading.Thread(target=_pump, args=(proc.stderr, 'stderr'), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+
+        stream_end = time.time() + settings.backend_invoke_timeout_sec
+        done_sentinels = 0
+        timed_out = False
+
+        while True:
+            if done_sentinels >= 2 and q.empty():
+                break
+
+            timeout_left = max(0.1, min(0.5, stream_end - time.time()))
+            if stream_end - time.time() <= 0:
+                timed_out = True
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                break
+
+            try:
+                item = q.get(timeout=timeout_left)
+            except queue.Empty:
+                continue
+
+            if item is None:
+                done_sentinels += 1
+                continue
+
+            source, text = item
+            if source == 'stdout':
+                stdout_parts.append(text)
+            else:
+                stderr_parts.append(text)
+            yield {
+                'type': 'chunk',
+                'source': source,
+                'text': text,
+            }
+
+        try:
+            returncode = proc.wait(timeout=1)
+        except Exception:
+            returncode = -1
+
+        stdout = ''.join(stdout_parts)
+        stderr = ''.join(stderr_parts)
+        if timed_out:
+            yield {
+                'type': 'error',
+                'error': 'backend invoke timeout',
+                'returncode': returncode,
+                'stdout': stdout,
+                'stderr': stderr,
+            }
+            return
+
+        yield {
+            'type': 'done',
+            'success': returncode == 0,
+            'returncode': returncode,
+            'stdout': stdout,
+            'stderr': stderr,
+        }
 
     def health(self, pid: int | None) -> Dict[str, Any]:
         if not pid:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Generator
 
 from agent_ai_service.adapters.claude_a2a_adapter import ClaudeA2AAdapter
 from agent_ai_service.adapters.claude_adapter import ClaudeAdapter
@@ -139,6 +139,28 @@ class BackendRuntimeService:
             'timestamp': datetime.now(timezone.utc).isoformat(),
             **response,
         }
+
+    def invoke_backend_stream(self, name: str | None, prompt: str, messages: list[dict[str, Any]] | None = None) -> Generator[Dict[str, Any], None, None]:
+        data = self.registry.list()
+        chosen = name or data.get('default_backend')
+        if not chosen:
+            raise ValueError('no backend configured')
+        model = self.registry.to_model(chosen)
+        self.process_manager.touch(chosen)
+
+        for event in self.process_manager.invoke_once_stream(model, prompt=prompt, messages=messages):
+            if event.get('type') == 'done':
+                self.process_manager.touch(chosen)
+                yield {
+                    'backend': chosen,
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    **event,
+                }
+                continue
+            yield {
+                'backend': chosen,
+                **event,
+            }
 
     def service_health(self) -> Dict[str, Any]:
         backends = self.list_backends()

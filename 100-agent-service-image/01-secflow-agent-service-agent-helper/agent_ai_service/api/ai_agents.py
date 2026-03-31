@@ -1,9 +1,10 @@
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 
 from agent_ai_service.api.backends import runtime
 from agent_ai_service.api.a2a_api import a2a
 
 bp = Blueprint('ai_agents', __name__)
+DISABLED_BACKEND_TYPES = {'claude-a2a'}
 
 
 def _to_agent(detail):
@@ -75,6 +76,8 @@ def create_ai_agent():
     backend_type = str(payload.get('backend_type') or '').strip()
     if not backend_type:
         return jsonify({'error': 'backend_type is required'}), 400
+    if backend_type in DISABLED_BACKEND_TYPES:
+        return jsonify({'error': f'backend_type not allowed: {backend_type}'}), 400
     payload['name'] = agent_id
     payload['backend_type'] = backend_type
     return jsonify(_decorate_active(runtime.upsert_backend(agent_id, payload))), 201
@@ -83,6 +86,9 @@ def create_ai_agent():
 @bp.put('/api/ai-agents/<agent_id>')
 def update_ai_agent(agent_id: str):
     payload = request.get_json(silent=True) or {}
+    backend_type = str(payload.get('backend_type') or '').strip()
+    if backend_type in DISABLED_BACKEND_TYPES:
+        return jsonify({'error': f'backend_type not allowed: {backend_type}'}), 400
     payload['name'] = agent_id
     return jsonify(_decorate_active(runtime.upsert_backend(agent_id, payload)))
 
@@ -202,5 +208,22 @@ def send_ai_agent_session_message(session_id: str):
     payload = request.get_json(silent=True) or {}
     try:
         return jsonify(a2a.send_session_message(session_id, payload))
+    except KeyError:
+        return jsonify({'error': 'session not found'}), 404
+
+
+@bp.post('/api/ai-agents/sessions/<session_id>/messages/stream')
+def send_ai_agent_session_message_stream(session_id: str):
+    payload = request.get_json(silent=True) or {}
+    try:
+        return Response(
+            a2a.send_session_message_sse(session_id, payload),
+            mimetype='text/event-stream',
+            headers={
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
+            },
+        )
     except KeyError:
         return jsonify({'error': 'session not found'}), 404

@@ -61,6 +61,38 @@ def normalize_env_bindings(env_bindings: dict) -> dict:
     return dict(env_bindings or {})
 
 
+def normalize_file_bindings(file_bindings) -> list[dict]:
+    if not isinstance(file_bindings, list):
+        return []
+    normalized = []
+    for item in file_bindings:
+        if not isinstance(item, dict):
+            raise ValidationError("file_bindings 每一项都必须是对象")
+        normalized.append(
+            {
+                "name": str(item.get("name") or "").strip(),
+                "path": str(item.get("path") or "").strip(),
+                "content": item.get("content"),
+                "format": str(item.get("format") or "other").strip().lower() or "other",
+                "enabled": bool(item.get("enabled", True)),
+            }
+        )
+    return normalized
+
+
+def validate_file_bindings(file_bindings: list[dict]):
+    for idx, item in enumerate(file_bindings):
+        name = item.get("name")
+        path = item.get("path")
+        content = item.get("content")
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError(f"file_bindings[{idx}].name 不能为空")
+        if not isinstance(path, str) or not path.strip():
+            raise ValidationError(f"file_bindings[{idx}].path 不能为空")
+        if not isinstance(content, str):
+            raise ValidationError(f"file_bindings[{idx}].content 必须是字符串")
+
+
 def apply_payload(provider: LlmProvider, payload: LlmProviderCreateRequest | LlmProviderUpdateRequest):
     provider.provider_key = normalize_provider_key(payload.provider_key)
     provider.display_name = payload.display_name.strip()
@@ -76,9 +108,11 @@ def apply_payload(provider: LlmProvider, payload: LlmProviderCreateRequest | Llm
     provider.max_tokens = payload.max_tokens
     provider.temperature = payload.temperature
     provider.env_bindings = normalize_env_bindings(payload.env_bindings)
+    provider.file_bindings = normalize_file_bindings(payload.file_bindings)
     provider.extra_config = payload.extra_config or {}
     provider.description = payload.description.strip() if payload.description else None
     validate_env_bindings(provider.env_bindings)
+    validate_file_bindings(provider.file_bindings)
 
 
 @router.get("/health")
