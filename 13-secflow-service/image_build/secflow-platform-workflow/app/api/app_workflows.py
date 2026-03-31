@@ -252,8 +252,8 @@ async def create_app_workflow(
     if not template:
         raise NotFoundError("App template", workflow_data.template_id)
 
-    # 2. 验证模板权限（global模板所有人可用，project模板仅创建者可用）
-    if template.scope != "global" and template.created_by != user_id:
+    # 2. 验证模板权限（global模板所有人可用，project模板同项目或创建者可用）
+    if template.scope != "global" and template.created_by != user_id and template.project_id != workflow_data.project_id:
         raise ForbiddenError(f"No permission to use app template {workflow_data.template_id}")
 
     # 3. 生成工作流ID和节点ID

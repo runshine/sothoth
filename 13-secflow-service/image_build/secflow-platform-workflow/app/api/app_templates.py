@@ -23,13 +23,20 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/app-templates", tags=["App Templates"])
 
 
-def check_template_permission(template: AppTemplate, user_id: str, user_roles: List[str]) -> bool:
+def check_template_permission(
+    template: AppTemplate,
+    user_id: str,
+    user_roles: List[str],
+    project_id: Optional[str] = None,
+) -> bool:
     """Check if user has permission to access template"""
     # Global templates are accessible to all
     if template.scope == "global":
         return True
     # Project templates require project access
     if template.created_by == user_id:
+        return True
+    if project_id and template.project_id == project_id:
         return True
     return False
 
@@ -144,6 +151,7 @@ async def list_app_templates(
 @router.get("/{template_id}", response_model=AppTemplateResponse)
 async def get_app_template(
     template_id: str,
+    project_id: Optional[str] = Query(None, description="Project ID for project-scoped template access"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -158,7 +166,7 @@ async def get_app_template(
     # Check permission
     user_id = str(current_user.get("id", ""))
     user_roles = current_user.get("role", [])
-    if not check_template_permission(template, user_id, user_roles):
+    if not check_template_permission(template, user_id, user_roles, project_id):
         raise ForbiddenError("No permission to access this template")
 
     return template

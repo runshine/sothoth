@@ -1141,13 +1141,13 @@ async def create_workflow_instance(
             template = db.query(AppTemplate).filter(AppTemplate.id == template_id).first()
             if not template:
                 raise NotFoundError("App template", template_id)
-            if template.scope != "global" and template.created_by != user_id:
+            if template.scope != "global" and template.created_by != user_id and template.project_id != instance_data.project_id:
                 raise ForbiddenError(f"No permission to use app template {template_id}")
         else:  # job
             template = db.query(JobTemplate).filter(JobTemplate.id == template_id).first()
             if not template:
                 raise NotFoundError("Job template", template_id)
-            if template.scope != "global" and template.created_by != user_id:
+            if template.scope != "global" and template.created_by != user_id and template.project_id != instance_data.project_id:
                 raise ForbiddenError(f"No permission to use job template {template_id}")
 
         # Validate template dependencies (env_vars and volume_mounts must satisfy template's requirements)
@@ -2309,13 +2309,13 @@ async def create_workflow_node(
         template = db.query(AppTemplate).filter(AppTemplate.id == template_id).first()
         if not template:
             raise NotFoundError("App template", template_id)
-        if template.scope != "global" and template.created_by != user_id:
+        if template.scope != "global" and template.created_by != user_id and template.project_id != instance.project_id:
             raise ForbiddenError(f"No permission to use app template {template_id}")
     else:  # job
         template = db.query(JobTemplate).filter(JobTemplate.id == template_id).first()
         if not template:
             raise NotFoundError("Job template", template_id)
-        if template.scope != "global" and template.created_by != user_id:
+        if template.scope != "global" and template.created_by != user_id and template.project_id != instance.project_id:
             raise ForbiddenError(f"No permission to use job template {template_id}")
 
     # Validate template dependencies (env_vars and volume_mounts must satisfy template's requirements)
