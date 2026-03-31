@@ -111,6 +111,19 @@ class WorkflowStatusServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}/api/workflow-status"
 
 
+class FileserverServiceConfig(BaseModel):
+    """Fileserver微服务配置"""
+    enabled: bool = True
+    host: str = "secflow-platform-fileserver"
+    port: int = 80
+    timeout: int = 30
+
+    @property
+    def base_url(self) -> str:
+        """Generate fileserver service base URL"""
+        return f"http://{self.host}:{self.port}/api/fileserver"
+
+
 class AppConfig(BaseModel):
     """Application configuration"""
     host: str = "0.0.0.0"
@@ -131,6 +144,7 @@ class Config(BaseModel):
     registry: RegistryConfig
     k8s_service: K8SServiceConfig = K8SServiceConfig()  # K8S微服务配置
     workflow_status_service: WorkflowStatusServiceConfig = WorkflowStatusServiceConfig()  # Workflow Status微服务配置
+    fileserver_service: FileserverServiceConfig = FileserverServiceConfig()
     app: AppConfig
     logging: LoggingConfig = LoggingConfig()
 

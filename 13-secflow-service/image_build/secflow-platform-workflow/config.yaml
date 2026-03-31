@@ -62,6 +62,13 @@ workflow_status_service:
   port: 80
   timeout: 30
 
+# Fileserver Service Configuration
+fileserver_service:
+  enabled: true
+  host: "secflow-platform-fileserver"
+  port: 80
+  timeout: 30
+
 # Application Configuration
 app:
   host: "0.0.0.0"

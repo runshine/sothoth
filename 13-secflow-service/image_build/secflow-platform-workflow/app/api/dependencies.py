@@ -36,6 +36,7 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict:
     try:
         auth_service = get_auth_service()
         user = await auth_service.validate_token_async(token)
+        user["token"] = token
         return user
     except TokenInvalidError:
         raise UnauthorizedError("Token is invalid or expired")

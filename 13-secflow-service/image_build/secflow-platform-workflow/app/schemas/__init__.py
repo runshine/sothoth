@@ -19,6 +19,7 @@ from app.schemas.schemas import (
     EnvVar,
     ServicePort,
     VolumeMount,
+    ProjectFileMount,
     # App Template
     AppTemplateCreate,
     AppTemplateUpdate,
@@ -77,6 +78,7 @@ __all__ = [
     "EnvVar",
     "ServicePort",
     "VolumeMount",
+    "ProjectFileMount",
     "AppTemplateCreate",
     "AppTemplateUpdate",
     "AppTemplateResponse",

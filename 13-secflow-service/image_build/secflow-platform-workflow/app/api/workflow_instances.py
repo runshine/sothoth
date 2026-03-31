@@ -29,6 +29,7 @@ from app.schemas import (
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError, InternalError
 from app.services import WorkflowEngine
+from app.services.fileserver_client import FileserverClientError, get_fileserver_client
 from app.services.workflow_status_client import get_workflow_status_client
 from app.config import get_config
 
@@ -43,6 +44,136 @@ def get_status_client():
     if not config.workflow_status_service or not config.workflow_status_service.enabled:
         raise InternalError("workflow-status service is required but disabled")
     return get_workflow_status_client()
+
+
+def _dump_items(items: Optional[List[Any]]) -> List[Dict[str, Any]]:
+    dumped: List[Dict[str, Any]] = []
+    for item in items or []:
+        if hasattr(item, "model_dump"):
+            dumped.append(item.model_dump())
+        elif hasattr(item, "dict"):
+            dumped.append(item.dict())
+        else:
+            dumped.append(dict(item))
+    return dumped
+
+
+async def resolve_project_file_mounts(
+    project_id: str,
+    project_file_mounts: Optional[List[Any]],
+    token: Optional[str],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    if not project_file_mounts:
+        return [], []
+
+    config = get_config()
+    if not config.fileserver_service.enabled:
+        raise InternalError("fileserver service is required but disabled")
+    if not token:
+        raise ValidationError("Missing user token for project file mount resolution")
+
+    fileserver_client = get_fileserver_client()
+    try:
+        storage_info = await fileserver_client.get_storage_pvc(token)
+    except FileserverClientError as exc:
+        raise ValidationError(f"无法获取项目文件存储PVC: {exc}") from exc
+
+    pvc_name = storage_info.get("pvc_name")
+    if not pvc_name:
+        raise InternalError("fileserver storage pvc_name is empty")
+
+    resolved_mounts: List[Dict[str, Any]] = []
+    normalized_mounts: List[Dict[str, Any]] = []
+
+    for raw_mount in project_file_mounts:
+        mount = raw_mount.model_dump() if hasattr(raw_mount, "model_dump") else (
+            raw_mount.dict() if hasattr(raw_mount, "dict") else dict(raw_mount)
+        )
+        subproject_id = mount.get("subproject_id")
+        directory_id = mount.get("directory_id")
+        mount_path = (mount.get("mount_path") or "").strip()
+        read_only = bool(mount.get("read_only", True))
+
+        if not subproject_id:
+            raise ValidationError("project_file_mounts.subproject_id is required")
+        if not mount_path:
+            raise ValidationError("project_file_mounts.mount_path is required")
+
+        try:
+            if directory_id is not None:
+                current = await fileserver_client.get_directory_children(project_id, int(directory_id), token)
+                if int(current.get("subproject_id")) != int(subproject_id):
+                    raise ValidationError(f"目录 {directory_id} 不属于子项目 {subproject_id}")
+                relative_path = (current.get("current_path") or "/").strip("/")
+                subproject_name = None
+                for crumb in current.get("breadcrumbs") or []:
+                    if crumb.get("node_type") == "subproject":
+                        subproject_name = crumb.get("name")
+                        break
+                normalized_mounts.append({
+                    "subproject_id": int(subproject_id),
+                    "directory_id": int(directory_id),
+                    "mount_path": mount_path,
+                    "read_only": read_only,
+                    "display_path": current.get("current_path") or "/",
+                    "subproject_name": subproject_name,
+                    "directory_name": current.get("current_name"),
+                })
+            else:
+                current = await fileserver_client.get_subproject_children(project_id, int(subproject_id), token)
+                relative_path = ""
+                normalized_mounts.append({
+                    "subproject_id": int(subproject_id),
+                    "directory_id": None,
+                    "mount_path": mount_path,
+                    "read_only": read_only,
+                    "display_path": "/",
+                    "subproject_name": current.get("current_name"),
+                    "directory_name": None,
+                })
+        except FileserverClientError as exc:
+            raise ValidationError(f"项目文件目录校验失败: {exc}") from exc
+
+        sub_path = f"files/{project_id}/{int(subproject_id)}"
+        if relative_path:
+            sub_path = f"{sub_path}/{relative_path}"
+
+        resolved_mounts.append({
+            "pvc_name": pvc_name,
+            "mount_path": mount_path,
+            "sub_path": sub_path,
+            "read_only": read_only,
+        })
+
+    return resolved_mounts, normalized_mounts
+
+
+async def resolve_requested_volume_mounts(
+    project_id: str,
+    volume_mounts: Optional[List[Any]],
+    project_file_mounts: Optional[List[Any]],
+    token: Optional[str],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    raw_volume_mounts = _dump_items(volume_mounts)
+    resolved_project_mounts, normalized_project_mounts = await resolve_project_file_mounts(
+        project_id,
+        project_file_mounts,
+        token,
+    )
+
+    combined_mounts = list(raw_volume_mounts)
+    combined_mounts.extend(resolved_project_mounts)
+
+    seen_mount_paths: set[str] = set()
+    for mount in combined_mounts:
+        mount_path = (mount.get("mount_path") or "").strip()
+        if not mount_path:
+            raise ValidationError("volume mount mount_path cannot be empty")
+        if mount_path in seen_mount_paths:
+            raise ValidationError(f"Duplicate mount_path detected: {mount_path}")
+        seen_mount_paths.add(mount_path)
+
+    return combined_mounts, raw_volume_mounts, normalized_project_mounts
 
 
 async def ensure_project_namespace(project_id: str):
@@ -115,7 +246,8 @@ def build_node_response(node: WorkflowNodeInstance, instance: WorkflowInstance) 
         "init_logs": node.init_logs,
         "position": node.position or {"x": 0.0, "y": 0.0},
         "env_vars": node.env_vars or [],
-        "volume_mounts": node.volume_mounts or [],
+        "volume_mounts": node_config.get("volume_mounts", node.volume_mounts or []),
+        "project_file_mounts": node_config.get("project_file_mounts", []),
         "resources": node.resources,
         "input_env_vars": node.input_env_vars or [],
         "input_volume_mounts": node.input_volume_mounts or [],
@@ -1039,11 +1171,22 @@ async def create_workflow_instance(
 
     # Convert nodes and edges to dict for storage
     nodes_dict = []
+    resolved_node_mounts: List[List[Dict[str, Any]]] = []
     for n in nodes:
         if hasattr(n, 'model_dump'):
-            nodes_dict.append(n.model_dump())
+            node_config = n.model_dump()
         else:
-            nodes_dict.append(n.dict())
+            node_config = n.dict()
+        combined_mounts, raw_volume_mounts, normalized_project_mounts = await resolve_requested_volume_mounts(
+            instance_data.project_id,
+            node_config.get("volume_mounts"),
+            node_config.get("project_file_mounts"),
+            current_user.get("token"),
+        )
+        node_config["volume_mounts"] = raw_volume_mounts
+        node_config["project_file_mounts"] = normalized_project_mounts
+        nodes_dict.append(node_config)
+        resolved_node_mounts.append(combined_mounts)
 
     edges_dict = []
     for e in (instance_data.edges or []):
@@ -1074,7 +1217,7 @@ async def create_workflow_instance(
     db.flush()  # Get instance ID
 
     # Create node instances from provided nodes
-    for node_config in nodes_dict:
+    for index, node_config in enumerate(nodes_dict):
         # Generate node ID - this will be both id and node_id
         node_id = generate_id(f"{instance_id}_{node_config.get('name', 'node')}")
 
@@ -1091,7 +1234,7 @@ async def create_workflow_instance(
             status=NodeStatus.PENDING,
             position=node_config.get("position", {"x": 0.0, "y": 0.0}),
             env_vars=node_config.get("env_vars", []),
-            volume_mounts=node_config.get("volume_mounts", []),
+            volume_mounts=resolved_node_mounts[index],
             resources=node_config.get("resources"),
             depends_on=depends_on,
             downstream_node_ids=[],  # Initialize empty, will be built after all nodes created
@@ -2192,10 +2335,14 @@ async def create_workflow_node(
     else:
         node_config = node_data.dict()
 
-    # For app type nodes, ensure service configuration is included
-    if node_type_val == "app":
-        # These fields are already in the node_config from the Pydantic model
-        pass
+    resolved_volume_mounts, raw_volume_mounts, normalized_project_mounts = await resolve_requested_volume_mounts(
+        instance.project_id,
+        node_config.get("volume_mounts"),
+        node_config.get("project_file_mounts"),
+        current_user.get("token"),
+    )
+    node_config["volume_mounts"] = raw_volume_mounts
+    node_config["project_file_mounts"] = normalized_project_mounts
 
     # Note: Different nodes have no dependency relationship, depends_on is always empty
     depends_on = []
@@ -2211,7 +2358,7 @@ async def create_workflow_node(
         status=NodeStatus.PENDING,
         position=node_data.position,
         env_vars=[e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in (node_data.env_vars or [])],
-        volume_mounts=[vm.model_dump() if hasattr(vm, 'model_dump') else vm.dict() for vm in (node_data.volume_mounts or [])],
+        volume_mounts=resolved_volume_mounts,
         resources=node_data.resources.model_dump() if node_data.resources and hasattr(node_data.resources, 'model_dump') else (node_data.resources.dict() if node_data.resources else None),
         depends_on=depends_on,
         downstream_node_ids=[],  # Will be rebuilt from edges
@@ -2271,7 +2418,9 @@ def validate_template_dependencies(template, node_data: WorkflowNodeCreate) -> L
 
     # Get node's env_vars and volume_mounts
     node_env_vars = node_data.env_vars or []
-    node_volume_mounts = node_data.volume_mounts or []
+    node_volume_mounts = list(node_data.volume_mounts or [])
+    for project_mount in getattr(node_data, "project_file_mounts", []) or []:
+        node_volume_mounts.append(project_mount)
 
     # Convert to dict for easier lookup
     node_env_vars_dict = {e.name: e.value for e in node_env_vars}
@@ -2627,6 +2776,21 @@ async def update_workflow_node(
     if not node:
         raise NotFoundError("Workflow node", node_instance_id)
 
+    current_node_config = get_instance_node_config(instance, node_instance_id)
+    effective_volume_mounts = node_data.volume_mounts if node_data.volume_mounts is not None else current_node_config.get("volume_mounts", node.volume_mounts or [])
+    effective_project_file_mounts = node_data.project_file_mounts if node_data.project_file_mounts is not None else current_node_config.get("project_file_mounts", [])
+
+    resolved_volume_mounts: Optional[List[Dict[str, Any]]] = None
+    raw_volume_mounts: Optional[List[Dict[str, Any]]] = None
+    normalized_project_mounts: Optional[List[Dict[str, Any]]] = None
+    if node_data.volume_mounts is not None or node_data.project_file_mounts is not None:
+        resolved_volume_mounts, raw_volume_mounts, normalized_project_mounts = await resolve_requested_volume_mounts(
+            instance.project_id,
+            effective_volume_mounts,
+            effective_project_file_mounts,
+            current_user.get("token"),
+        )
+
     # Update node instance fields
     if node_data.name is not None:
         node.name = node_data.name
@@ -2634,8 +2798,8 @@ async def update_workflow_node(
         node.position = node_data.position
     if node_data.env_vars is not None:
         node.env_vars = [e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in node_data.env_vars]
-    if node_data.volume_mounts is not None:
-        node.volume_mounts = [vm.model_dump() if hasattr(vm, 'model_dump') else vm.dict() for vm in node_data.volume_mounts]
+    if resolved_volume_mounts is not None:
+        node.volume_mounts = resolved_volume_mounts
     if node_data.resources is not None:
         node.resources = node_data.resources.model_dump() if hasattr(node_data.resources, 'model_dump') else node_data.resources.dict()
     if node_data.input_env_vars is not None:
@@ -2666,8 +2830,10 @@ async def update_workflow_node(
                 existing_node["position"] = node_data.position
             if node_data.env_vars is not None:
                 existing_node["env_vars"] = [e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in node_data.env_vars]
-            if node_data.volume_mounts is not None:
-                existing_node["volume_mounts"] = [vm.model_dump() if hasattr(vm, 'model_dump') else vm.dict() for vm in node_data.volume_mounts]
+            if raw_volume_mounts is not None:
+                existing_node["volume_mounts"] = raw_volume_mounts
+            if normalized_project_mounts is not None:
+                existing_node["project_file_mounts"] = normalized_project_mounts
             if node_data.resources is not None:
                 existing_node["resources"] = node_data.resources.model_dump() if hasattr(node_data.resources, 'model_dump') else node_data.resources.dict()
             if node_data.input_env_vars is not None:

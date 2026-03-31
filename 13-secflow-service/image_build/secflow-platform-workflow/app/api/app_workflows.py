@@ -21,6 +21,7 @@ from app.api.workflow_instances import (
     resolve_ingress_access_url,
     resolve_node_ingress_name,
     resolve_runtime_service_name,
+    resolve_requested_volume_mounts,
     upsert_node_domain_binding,
     delete_node_domain_bindings,
 )
@@ -106,7 +107,8 @@ def build_app_workflow_response(
             "finished_at": node.finished_at.isoformat() if node.finished_at else None,
             "created_at": node.created_at.isoformat() if node.created_at else None,
             "env_vars": node.env_vars or [],
-            "volume_mounts": node.volume_mounts or [],
+            "volume_mounts": node_config.get("volume_mounts", node.volume_mounts or []),
+            "project_file_mounts": node_config.get("project_file_mounts", []),
             "resources": node.resources,
             "timeout_seconds": node.timeout_seconds,
             "create_service": create_service,
@@ -126,7 +128,8 @@ def build_app_workflow_response(
         "service_type": node_config.get("service_type"),
         "replicas": node_config.get("replicas"),
         "env_vars": node.env_vars or [],
-        "volume_mounts": node.volume_mounts or [],
+        "volume_mounts": node_config.get("volume_mounts", node.volume_mounts or []),
+        "project_file_mounts": node_config.get("project_file_mounts", []),
         "resources": node.resources,
         "create_service": create_service,
         "create_ingress": create_ingress,
@@ -256,6 +259,12 @@ async def create_app_workflow(
     # 3. 生成工作流ID和节点ID
     instance_id = generate_id(workflow_data.name)
     node_id = generate_id(f"{instance_id}_node")
+    resolved_volume_mounts, raw_volume_mounts, normalized_project_mounts = await resolve_requested_volume_mounts(
+        workflow_data.project_id,
+        workflow_data.volume_mounts,
+        workflow_data.project_file_mounts,
+        current_user.get("token"),
+    )
 
     # 4. 构建节点配置
     service_ports_dict = []
@@ -276,7 +285,8 @@ async def create_app_workflow(
         "service_ports": service_ports_dict,
         "service_type": workflow_data.service_type.value if hasattr(workflow_data.service_type, 'value') else workflow_data.service_type,
         "env_vars": [e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in workflow_data.env_vars] if workflow_data.env_vars else [],
-        "volume_mounts": [v.model_dump() if hasattr(v, 'model_dump') else v.dict() for v in workflow_data.volume_mounts] if workflow_data.volume_mounts else [],
+        "volume_mounts": raw_volume_mounts,
+        "project_file_mounts": normalized_project_mounts,
         "resources": workflow_data.resources.model_dump() if workflow_data.resources and hasattr(workflow_data.resources, 'model_dump') else (workflow_data.resources.dict() if workflow_data.resources else None),
         "replicas": workflow_data.replicas,
         "timeout_seconds": workflow_data.timeout_seconds,
@@ -315,7 +325,7 @@ async def create_app_workflow(
         position={"x": 0.0, "y": 0.0},
         service_name=None,
         env_vars=[e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in workflow_data.env_vars] if workflow_data.env_vars else [],
-        volume_mounts=[v.model_dump() if hasattr(v, 'model_dump') else v.dict() for v in workflow_data.volume_mounts] if workflow_data.volume_mounts else [],
+        volume_mounts=resolved_volume_mounts,
         resources=workflow_data.resources.model_dump() if workflow_data.resources and hasattr(workflow_data.resources, 'model_dump') else (workflow_data.resources.dict() if workflow_data.resources else None),
         timeout_seconds=workflow_data.timeout_seconds,
         ingress_type=workflow_data.ingress_type if workflow_data.create_ingress else None,
@@ -681,9 +691,18 @@ async def update_app_workflow(
     if workflow_data.env_vars is not None:
         node.env_vars = [e.model_dump() if hasattr(e, 'model_dump') else e.dict() for e in workflow_data.env_vars]
         node_config["env_vars"] = node.env_vars
-    if workflow_data.volume_mounts is not None:
-        node.volume_mounts = [v.model_dump() if hasattr(v, 'model_dump') else v.dict() for v in workflow_data.volume_mounts]
-        node_config["volume_mounts"] = node.volume_mounts
+    effective_volume_mounts = workflow_data.volume_mounts if workflow_data.volume_mounts is not None else node_config.get("volume_mounts", node.volume_mounts or [])
+    effective_project_file_mounts = workflow_data.project_file_mounts if workflow_data.project_file_mounts is not None else node_config.get("project_file_mounts", [])
+    if workflow_data.volume_mounts is not None or workflow_data.project_file_mounts is not None:
+        resolved_volume_mounts, raw_volume_mounts, normalized_project_mounts = await resolve_requested_volume_mounts(
+            instance.project_id,
+            effective_volume_mounts,
+            effective_project_file_mounts,
+            current_user.get("token"),
+        )
+        node.volume_mounts = resolved_volume_mounts
+        node_config["volume_mounts"] = raw_volume_mounts
+        node_config["project_file_mounts"] = normalized_project_mounts
     if workflow_data.resources is not None:
         node.resources = workflow_data.resources.model_dump() if hasattr(workflow_data.resources, 'model_dump') else workflow_data.resources.dict()
         node_config["resources"] = node.resources

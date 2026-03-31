@@ -138,6 +138,17 @@ class VolumeMount(BaseModel):
     read_only: bool = Field(default=False, description="Read only")
 
 
+class ProjectFileMount(BaseModel):
+    """Project file directory mount resolved from fileserver storage."""
+    subproject_id: int = Field(..., description="Fileserver subproject ID")
+    directory_id: Optional[int] = Field(None, description="Fileserver directory ID; omit to mount subproject root")
+    mount_path: str = Field(..., description="Mount path in container")
+    read_only: bool = Field(default=True, description="Project file mounts are usually read-only")
+    display_path: Optional[str] = Field(None, description="Selected directory path for display")
+    subproject_name: Optional[str] = Field(None, description="Subproject display name")
+    directory_name: Optional[str] = Field(None, description="Directory display name")
+
+
 class VolumeMountInput(BaseModel):
     """
     Volume mount input dependency - declare need from upstream PVC, source determined at workflow instance.
@@ -321,6 +332,7 @@ class WorkflowNodeConfig(BaseModel):
     # Fixed (override template)
     env_vars: Optional[List[EnvVar]] = Field(None, description="Override/add fixed environment variables")
     volume_mounts: Optional[List[VolumeMount]] = Field(None, description="Override/add fixed volume mounts")
+    project_file_mounts: Optional[List[ProjectFileMount]] = Field(None, description="Project file directory mounts")
 
     # Resource Requirements
     resources: Optional[ResourceRequirements] = Field(None, description="Override resource requirements")
@@ -446,6 +458,7 @@ class WorkflowNodeCreate(BaseModel):
     # These are used to satisfy template dependencies when instantiating
     env_vars: Optional[List[EnvVar]] = Field(None, description="Override/add fixed environment variables")
     volume_mounts: Optional[List[VolumeMount]] = Field(None, description="Override/add fixed volume mounts")
+    project_file_mounts: Optional[List[ProjectFileMount]] = Field(None, description="Project file directory mounts")
 
     # Resource Requirements
     resources: Optional[ResourceRequirements] = Field(None, description="Override resource requirements")
@@ -502,6 +515,7 @@ class WorkflowNodeUpdate(BaseModel):
     # Fixed (override template)
     env_vars: Optional[List[EnvVar]] = Field(None, description="Override/add fixed environment variables")
     volume_mounts: Optional[List[VolumeMount]] = Field(None, description="Override/add fixed volume mounts")
+    project_file_mounts: Optional[List[ProjectFileMount]] = Field(None, description="Project file directory mounts")
     # Resource Requirements
     resources: Optional[ResourceRequirements] = Field(None, description="Override resource requirements")
     # Input Dependencies (specify source_node_id at instance level)
@@ -593,6 +607,7 @@ class WorkflowNodeInstanceResponse(BaseModel):
     position: Dict[str, float] = {"x": 0.0, "y": 0.0}
     env_vars: List[EnvVar] = []
     volume_mounts: List[VolumeMount] = []
+    project_file_mounts: List[ProjectFileMount] = []
     resources: Optional[ResourceRequirements] = None
     # Input dependencies (specify sources)
     input_env_vars: List[DependencyEnvVar] = []
@@ -807,6 +822,7 @@ class AppWorkflowCreate(BaseModel):
     # 可选的覆盖配置
     env_vars: Optional[List[EnvVar]] = Field(None, description="覆盖/添加环境变量")
     volume_mounts: Optional[List[VolumeMount]] = Field(None, description="覆盖/添加卷挂载")
+    project_file_mounts: Optional[List[ProjectFileMount]] = Field(None, description="项目文件目录挂载")
     resources: Optional[ResourceRequirements] = Field(None, description="覆盖资源需求")
     replicas: Optional[int] = Field(None, ge=1, description="覆盖副本数")
     timeout_seconds: Optional[int] = Field(None, ge=1, description="超时时间（秒）")
@@ -838,6 +854,7 @@ class AppWorkflowUpdate(BaseModel):
     # 覆盖配置
     env_vars: Optional[List[EnvVar]] = None
     volume_mounts: Optional[List[VolumeMount]] = None
+    project_file_mounts: Optional[List[ProjectFileMount]] = None
     resources: Optional[ResourceRequirements] = None
     replicas: Optional[int] = Field(None, ge=1)
     timeout_seconds: Optional[int] = Field(None, ge=1)
@@ -877,6 +894,7 @@ class AppWorkflowNodeResponse(BaseModel):
     # 节点配置
     env_vars: List[EnvVar] = []
     volume_mounts: List[VolumeMount] = []
+    project_file_mounts: List[ProjectFileMount] = []
     resources: Optional[ResourceRequirements] = None
     timeout_seconds: Optional[int] = None
     create_service: bool = True
@@ -910,6 +928,7 @@ class AppWorkflowResponse(BaseModel):
     replicas: Optional[int] = None
     env_vars: List[EnvVar] = []
     volume_mounts: List[VolumeMount] = []
+    project_file_mounts: List[ProjectFileMount] = []
     resources: Optional[ResourceRequirements] = None
     create_service: bool = True
     create_ingress: bool = False
