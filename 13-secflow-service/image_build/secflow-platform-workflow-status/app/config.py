@@ -74,6 +74,13 @@ class WorkflowServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}"
 
 
+class FileserverMountConfig(BaseModel):
+    """Fileserver 项目文件挂载配置"""
+    strategy: str = "pvc"
+    nfs_server: Optional[str] = None
+    nfs_base_path: Optional[str] = None
+
+
 class RegistryMenuLevelConfig(BaseModel):
     """菜单层级配置"""
     name: Optional[str] = None
@@ -131,6 +138,7 @@ class Config(BaseModel):
     auth_service: AuthServiceConfig
     k8s_service: K8SServiceConfig = K8SServiceConfig()
     workflow_service: WorkflowServiceConfig
+    fileserver_mount: FileserverMountConfig = FileserverMountConfig()
     registry: RegistryConfig
     status_sync: StatusSyncConfig = StatusSyncConfig()
     app: AppConfig
