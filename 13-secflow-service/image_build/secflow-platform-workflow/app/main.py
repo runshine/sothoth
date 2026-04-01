@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.app_templates import router as app_template_router
 from app.api.job_templates import router as job_template_router
+from app.api.template_tags import router as template_tag_router
 from app.api.workflow_instances import router as workflow_instance_router
 from app.api.app_workflows import router as app_workflow_router
 from app.api.terminal_proxy import router as terminal_proxy_router
@@ -174,6 +175,7 @@ async def ready_check():
 # Register routers
 app.include_router(app_template_router, prefix="/api/workflow")
 app.include_router(job_template_router, prefix="/api/workflow")
+app.include_router(template_tag_router, prefix="/api/workflow")
 app.include_router(workflow_instance_router, prefix="/api/workflow")
 app.include_router(app_workflow_router, prefix="/api/workflow")
 app.include_router(terminal_proxy_router)

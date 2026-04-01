@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user, generate_id
-from app.models import get_db, JobTemplate
+from app.models import get_db, JobTemplate, TemplateTagBinding
 from app.schemas import (
     JobTemplateCreate,
     JobTemplateUpdate,
@@ -17,10 +17,18 @@ from app.schemas import (
     SuccessResponse,
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError
+from app.services.template_tags import filter_template_ids_by_tag_keys, get_template_tags, sync_template_tags
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/job-templates", tags=["Job Templates"])
+
+
+def _attach_job_template_tags(db: Session, templates: List[JobTemplate]) -> List[JobTemplate]:
+    tag_map = get_template_tags(db, template_type="job", template_ids=[template.id for template in templates])
+    for template in templates:
+        template.tags = tag_map.get(template.id, [])
+    return templates
 
 
 def check_job_template_permission(
@@ -101,8 +109,11 @@ async def create_job_template(
     )
 
     db.add(template)
+    db.flush()
+    sync_template_tags(db, template_type="job", template_id=template_id, tags=template_data.tags, created_by=user_id)
     db.commit()
     db.refresh(template)
+    _attach_job_template_tags(db, [template])
 
     logger.info(f"Created job template {template_id} by user {user_id}")
     return template
@@ -112,6 +123,7 @@ async def create_job_template(
 async def list_job_templates(
     scope: Optional[str] = Query(None, description="Filter by scope: global/project"),
     project_id: Optional[str] = Query(None, description="Filter by project ID"),
+    tag_keys: Optional[str] = Query(None, description="Comma separated tag keys"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -136,7 +148,19 @@ async def list_job_templates(
             (JobTemplate.scope == "global") | (JobTemplate.created_by == user_id)
         )
 
+    if tag_keys:
+        matched_ids = filter_template_ids_by_tag_keys(
+            db,
+            template_type="job",
+            tag_keys=[item.strip() for item in tag_keys.split(",") if item.strip()],
+        )
+        if matched_ids is not None:
+            if not matched_ids:
+                return JobTemplateListResponse(total=0, items=[])
+            query = query.filter(JobTemplate.id.in_(matched_ids))
+
     templates = query.all()
+    _attach_job_template_tags(db, templates)
 
     return JobTemplateListResponse(total=len(templates), items=templates)
 
@@ -159,6 +183,7 @@ async def get_job_template(
     if not check_job_template_permission(template, user_id, user_roles, project_id):
         raise ForbiddenError("No permission to access this template")
 
+    _attach_job_template_tags(db, [template])
     return template
 
 
@@ -212,8 +237,11 @@ async def update_job_template(
     if template_data.backoff_limit is not None:
         template.backoff_limit = template_data.backoff_limit
 
+    sync_template_tags(db, template_type="job", template_id=template.id, tags=template_data.tags, created_by=user_id)
+
     db.commit()
     db.refresh(template)
+    _attach_job_template_tags(db, [template])
 
     logger.info(f"Updated job template {template_id} by user {user_id}")
     return template
@@ -237,6 +265,10 @@ async def delete_job_template(
     if template.created_by != user_id and "admin" not in user_roles:
         raise ForbiddenError("Only template creator or admin can delete")
 
+    db.query(TemplateTagBinding).filter(
+        TemplateTagBinding.template_type == "job",
+        TemplateTagBinding.template_id == template.id,
+    ).delete(synchronize_session=False)
     db.delete(template)
     db.commit()
 

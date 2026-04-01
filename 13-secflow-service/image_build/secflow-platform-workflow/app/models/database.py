@@ -19,6 +19,7 @@ from sqlalchemy import (
     JSON,
     create_engine,
     Index,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -90,6 +91,14 @@ class NodeType:
     """Workflow node type"""
     APP = "app"
     JOB = "job"
+
+
+class TemplateTagCategory:
+    TARGET = "target"
+    CAPABILITY = "capability"
+    REQUIREMENT = "requirement"
+    EXECUTION = "execution"
+    OUTPUT = "output"
 
 
 # ============ App Template Model ============
@@ -178,6 +187,41 @@ class JobTemplate(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class TemplateTag(Base):
+    __tablename__ = f"{TABLE_PREFIX}template_tag"
+
+    id = Column(String(64), primary_key=True)
+    tag_key = Column(String(128), nullable=False, unique=True, index=True)
+    tag_label = Column(String(128), nullable=False)
+    category = Column(String(32), nullable=False, default=TemplateTagCategory.CAPABILITY, index=True)
+    description = Column(Text)
+    color = Column(String(32), default="slate")
+    is_system = Column(Boolean, default=False)
+    enabled = Column(Boolean, default=True, index=True)
+    sort_order = Column(Integer, default=0)
+    created_by = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TemplateTagBinding(Base):
+    __tablename__ = f"{TABLE_PREFIX}template_tag_binding"
+    __table_args__ = (
+        UniqueConstraint("template_type", "template_id", "tag_id", name=f"uk_{TABLE_PREFIX}template_tag_binding_rel"),
+        Index(f"idx_{TABLE_PREFIX}template_tag_binding_template", "template_type", "template_id"),
+    )
+
+    id = Column(String(64), primary_key=True)
+    template_type = Column(String(32), nullable=False)
+    template_id = Column(String(64), nullable=False)
+    tag_id = Column(String(64), ForeignKey(f"{TABLE_PREFIX}template_tag.id", ondelete="CASCADE"), nullable=False)
+    source = Column(String(32), default="manual")
+    created_by = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    tag = relationship("TemplateTag")
 
 
 

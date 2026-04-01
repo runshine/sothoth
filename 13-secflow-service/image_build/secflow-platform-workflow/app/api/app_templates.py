@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user, generate_id
-from app.models import get_db, AppTemplate
+from app.models import get_db, AppTemplate, TemplateTagBinding
 from app.schemas import (
     AppTemplateCreate,
     AppTemplateUpdate,
@@ -17,10 +17,18 @@ from app.schemas import (
     SuccessResponse,
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError
+from app.services.template_tags import filter_template_ids_by_tag_keys, get_template_tags, sync_template_tags
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/app-templates", tags=["App Templates"])
+
+
+def _attach_app_template_tags(db: Session, templates: List[AppTemplate]) -> List[AppTemplate]:
+    tag_map = get_template_tags(db, template_type="app", template_ids=[template.id for template in templates])
+    for template in templates:
+        template.tags = tag_map.get(template.id, [])
+    return templates
 
 
 def check_template_permission(
@@ -104,8 +112,11 @@ async def create_app_template(
     )
 
     db.add(template)
+    db.flush()
+    sync_template_tags(db, template_type="app", template_id=template_id, tags=template_data.tags, created_by=user_id)
     db.commit()
     db.refresh(template)
+    _attach_app_template_tags(db, [template])
 
     logger.info(f"Created app template {template_id} by user {user_id}")
     return template
@@ -115,6 +126,7 @@ async def create_app_template(
 async def list_app_templates(
     scope: Optional[str] = Query(None, description="Filter by scope: global/project"),
     project_id: Optional[str] = Query(None, description="Filter by project ID"),
+    tag_keys: Optional[str] = Query(None, description="Comma separated tag keys"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -143,7 +155,19 @@ async def list_app_templates(
             (AppTemplate.scope == "global") | (AppTemplate.created_by == user_id)
         )
 
+    if tag_keys:
+        matched_ids = filter_template_ids_by_tag_keys(
+            db,
+            template_type="app",
+            tag_keys=[item.strip() for item in tag_keys.split(",") if item.strip()],
+        )
+        if matched_ids is not None:
+            if not matched_ids:
+                return AppTemplateListResponse(total=0, items=[])
+            query = query.filter(AppTemplate.id.in_(matched_ids))
+
     templates = query.all()
+    _attach_app_template_tags(db, templates)
 
     return AppTemplateListResponse(total=len(templates), items=templates)
 
@@ -169,6 +193,7 @@ async def get_app_template(
     if not check_template_permission(template, user_id, user_roles, project_id):
         raise ForbiddenError("No permission to access this template")
 
+    _attach_app_template_tags(db, [template])
     return template
 
 
@@ -227,8 +252,11 @@ async def update_app_template(
     if template_data.replicas is not None:
         template.replicas = template_data.replicas
 
+    sync_template_tags(db, template_type="app", template_id=template.id, tags=template_data.tags, created_by=user_id)
+
     db.commit()
     db.refresh(template)
+    _attach_app_template_tags(db, [template])
 
     logger.info(f"Updated app template {template_id} by user {user_id}")
     return template
@@ -257,6 +285,10 @@ async def delete_app_template(
     if template.created_by != user_id and "admin" not in user_roles:
         raise ForbiddenError("Only template creator or admin can delete")
 
+    db.query(TemplateTagBinding).filter(
+        TemplateTagBinding.template_type == "app",
+        TemplateTagBinding.template_id == template.id,
+    ).delete(synchronize_session=False)
     db.delete(template)
     db.commit()
 
