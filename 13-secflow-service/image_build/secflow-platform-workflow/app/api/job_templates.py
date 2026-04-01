@@ -17,11 +17,39 @@ from app.schemas import (
     SuccessResponse,
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError
+from app.services import AuthServiceError, get_auth_service
 from app.services.template_tags import filter_template_ids_by_tag_keys, get_template_tags, sync_template_tags
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/job-templates", tags=["Job Templates"])
+
+
+def _has_template_admin_permission(current_user: dict) -> bool:
+    user_roles = current_user.get("role", []) or []
+    platform_role = current_user.get("platform_role")
+    return "admin" in user_roles or platform_role == "super_admin"
+
+
+async def _can_manage_project_template(current_user: dict, project_id: Optional[str]) -> bool:
+    if not project_id:
+        return False
+    if _has_template_admin_permission(current_user):
+        return True
+    if current_user.get("platform_role") != "ordinary_admin":
+        return False
+
+    token = current_user.get("token")
+    if not token:
+        return False
+
+    try:
+        projects = await get_auth_service().get_user_department_projects_async(token)
+    except AuthServiceError as exc:
+        logger.warning("Failed to query user manageable projects for template permission: %s", exc)
+        return False
+
+    return any(str(project.get("id")) == str(project_id) and bool(project.get("can_manage")) for project in projects)
 
 
 def _attach_job_template_tags(db: Session, templates: List[JobTemplate]) -> List[JobTemplate]:
@@ -64,8 +92,7 @@ async def create_job_template(
 
     # Validate permission for global templates
     if template_data.scope == "global":
-        user_roles = current_user.get("role", [])
-        if "admin" not in user_roles:
+        if not _has_template_admin_permission(current_user):
             raise ForbiddenError("Only admins can create global templates")
 
     # Validate project_id for project scope
@@ -201,9 +228,8 @@ async def update_job_template(
         raise NotFoundError("Job template", template_id)
 
     user_id = str(current_user.get("id", ""))
-    user_roles = current_user.get("role", [])
-
-    if template.created_by != user_id and "admin" not in user_roles:
+    can_manage_project_template = await _can_manage_project_template(current_user, template.project_id)
+    if template.created_by != user_id and not can_manage_project_template:
         raise ForbiddenError("Only template creator or admin can update")
 
     # Update fields
@@ -260,9 +286,8 @@ async def delete_job_template(
         raise NotFoundError("Job template", template_id)
 
     user_id = str(current_user.get("id", ""))
-    user_roles = current_user.get("role", [])
-
-    if template.created_by != user_id and "admin" not in user_roles:
+    can_manage_project_template = await _can_manage_project_template(current_user, template.project_id)
+    if template.created_by != user_id and not can_manage_project_template:
         raise ForbiddenError("Only template creator or admin can delete")
 
     db.query(TemplateTagBinding).filter(
