@@ -2,7 +2,8 @@
   "openapi": "3.0.3",
   "info": {
     "title": "SecFlow Suspicion Authenticated Intake API",
-    "version": "2.0.0"
+    "version": "2.1.0",
+    "description": "Only authenticated submissions are supported. Anonymous submission is not supported."
   },
   "paths": {
     "/api/vuln/public/intake/submissions": {
@@ -19,6 +20,87 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/SuspicionSubmissionRequest"
+              },
+              "examples": {
+                "simple_without_files": {
+                  "summary": "Simple mode (without files)",
+                  "value": {
+                    "project_id": "44f9029d00650a10",
+                    "report_id": "simple-demo-001",
+                    "title": "Simple authenticated suspicion",
+                    "summary": "Quick report without file artifacts",
+                    "severity": "medium",
+                    "cvss_score": 6.1,
+                    "confidence": 68,
+                    "state": "suspected",
+                    "reporter": {
+                      "name": "manual-intake",
+                      "version": "1.0.0",
+                      "type": "api"
+                    },
+                    "subject": {
+                      "type": "http_endpoint",
+                      "locator": "https://demo.example/api/login",
+                      "name": "login api"
+                    },
+                    "evidence": {
+                      "summary": "Suspicious status code and response pattern"
+                    }
+                  }
+                },
+                "normal_with_files": {
+                  "summary": "Normal mode (with files and folder tree)",
+                  "value": {
+                    "project_id": "44f9029d00650a10",
+                    "report_id": "normal-demo-001",
+                    "title": "Normal authenticated suspicion with artifacts",
+                    "summary": "Report with structured file artifacts",
+                    "severity": "high",
+                    "cvss_score": 8.0,
+                    "confidence": 82,
+                    "state": "suspected",
+                    "reporter": {
+                      "name": "pipeline-intake",
+                      "version": "2.0.0",
+                      "type": "cli"
+                    },
+                    "subject": {
+                      "type": "service",
+                      "locator": "10.10.10.10:443",
+                      "name": "target service"
+                    },
+                    "evidence": {
+                      "summary": "Captured error traces and suspicious payload"
+                    },
+                    "artifacts": [
+                      {
+                        "kind": "json",
+                        "name": "finding.json",
+                        "media_type": "application/json",
+                        "encoding": "utf-8",
+                        "content": "{\"finding_id\":\"normal-demo-001\"}"
+                      },
+                      {
+                        "kind": "tree",
+                        "name": "evidence",
+                        "children": [
+                          {
+                            "kind": "file",
+                            "name": "request.txt",
+                            "path": "evidence/http/request.txt",
+                            "content_ref": "artifact://evidence/http/request.txt"
+                          },
+                          {
+                            "kind": "file",
+                            "name": "response.txt",
+                            "path": "evidence/http/response.txt",
+                            "content_ref": "artifact://evidence/http/response.txt"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
               }
             }
           }

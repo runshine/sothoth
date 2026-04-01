@@ -22,6 +22,14 @@
 `POST /api/vuln/public/intake/submissions`
 
 请求必须携带 Bearer Token，并按 `project_id` 通过项目级权限校验。
+匿名上报不支持。
+
+## 推荐工作模式
+
+1. 简易上报（不带文件）  
+只提交疑点核心字段（title/subject/evidence），快速创建疑点。
+2. 正常上报（带文件）  
+在 `artifacts` 携带文件或目录树（`children` 递归），用于后续研判和验证。
 
 ## 输出要求
 

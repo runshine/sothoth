@@ -37,7 +37,7 @@ EXAMPLE_FILES = {
     "cli": SDK_DIRS["cli"] / "example-command.json",
     "plugin": SDK_DIRS["plugin"] / "example-payload.json",
     "skill": SDK_DIRS["skill"] / "example-skill-call.json",
-    "openapi": SDK_DIRS["openapi"] / "anonymous-intake-openapi.json",
+    "openapi": SDK_DIRS["openapi"] / "authenticated-intake-openapi.json",
 }
 
 
@@ -67,10 +67,10 @@ def _catalog_payload(request: Request) -> dict:
     cli_zip = _build_zip_bytes(SDK_DIRS["cli"])
     plugin_zip = _build_zip_bytes(SDK_DIRS["plugin"])
     skill_zip = _build_zip_bytes(SDK_DIRS["skill"])
-    openapi_path = SDK_DIRS["openapi"] / "anonymous-intake-openapi.json"
+    openapi_path = SDK_DIRS["openapi"] / "authenticated-intake-openapi.json"
 
     return {
-        "version": "2.0.0",
+        "version": "2.1.0",
         "authenticated_submission_endpoint": str(request.url_for("submit_authenticated_submission")),
         "items": [
             {
@@ -164,7 +164,7 @@ async def download_skill_sdk():
 
 @router.get("/intake/spec/openapi", name="get_public_openapi_spec")
 async def get_public_openapi_spec():
-    path = SDK_DIRS["openapi"] / "anonymous-intake-openapi.json"
+    path = SDK_DIRS["openapi"] / "authenticated-intake-openapi.json"
     if not path.exists():
         raise HTTPException(status_code=404, detail="OpenAPI spec not found")
     return FileResponse(path, media_type="application/json", filename=path.name)

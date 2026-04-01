@@ -1,0 +1,39 @@
+{
+  "project_id": "44f9029d00650a10",
+  "report_id": "cli-simple-001",
+  "title": "Authenticated simple suspicion report",
+  "summary": "Quick intake without file artifacts",
+  "severity": "medium",
+  "cvss_score": 6.0,
+  "confidence": 70,
+  "state": "suspected",
+  "category": "generic_issue",
+  "rule_id": "CLI-SIMPLE-001",
+  "rule_name": "CLI Simple Rule",
+  "fingerprint": "cli-simple-fp-001",
+  "reporter": {
+    "name": "daily-pipeline",
+    "version": "1.0.0",
+    "type": "cli",
+    "vendor": "secflow"
+  },
+  "subject": {
+    "type": "http_endpoint",
+    "locator": "https://demo.example/api/login",
+    "name": "login api"
+  },
+  "evidence": {
+    "summary": "Detected suspicious behavior in login endpoint",
+    "reproduction_hint": "Replay with same request headers",
+    "references": []
+  },
+  "metadata": {
+    "source": {
+      "source_service": "cli-demo",
+      "source_kind": "script"
+    },
+    "runtime": {
+      "pipeline": "daily-security-job"
+    }
+  }
+}
