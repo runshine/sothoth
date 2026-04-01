@@ -14,20 +14,44 @@ from app.schemas import (
     CaseCreateRequest,
     DecisionRequest,
     DraftCaseCreateRequest,
+    FinishCaseRequest,
     ManualTaskCreateRequest,
     ManualTaskStatusUpdateRequest,
     RoutedActionDispatchRequest,
     SuspicionSubmissionRequest,
     StageTransitionRequest,
+    TriageDecisionRequest,
+    TriageGateRequest,
+    TriageRoundStartRequest,
+    ValidationResultRequest,
 )
 from app.services.lifecycle_engine import (
+    FINISHED_REASONS,
+    FINISHED_STATUS_DONE,
+    MAIN_STAGE_FINISHED,
+    MAIN_STAGE_RECEIVE,
+    MAIN_STAGE_TRIAGE,
+    MAIN_STAGE_VALIDATION,
+    TRIAGE_DECISIONS,
+    TRIAGE_GATES,
+    TRIAGE_STATUS_AWAITING_MANUAL_GATE,
+    TRIAGE_STATUS_COMPLETED,
+    TRIAGE_STATUS_WAITING,
+    VALIDATION_RESULTS,
+    VALIDATION_STATUS_COMPLETED,
+    VALIDATION_STATUS_QUEUED,
     advance_case_stage,
     auto_orchestrate_case,
     create_case_with_runtime,
     create_manual_task,
     dispatch_routed_actions,
+    get_lifecycle_state,
     recommend_actions,
     record_case_decision,
+    set_lifecycle_state,
+    start_next_triage_round,
+    update_triage_gate,
+    update_validation_result,
 )
 
 router = APIRouter(prefix="/api/vuln/cases", tags=["cases"])
@@ -37,6 +61,7 @@ def _case_payload(item: Case) -> dict:
     source_meta = json.loads(item.source_meta_json or "{}")
     subject = json.loads(item.target_meta_json or "{}")
     display_meta = json.loads(item.display_meta_json or "{}")
+    lifecycle = get_lifecycle_state(item)
     metadata = display_meta.get("metadata") or {}
     fileserver_root = display_meta.get("fileserver_root") or {}
     return {
@@ -62,8 +87,14 @@ def _case_payload(item: Case) -> dict:
         "files_root_path": fileserver_root.get("root_path"),
         "fileserver_root": fileserver_root,
         "current_stage": item.current_stage,
-        "current_status": item.current_status,
+        "current_status": lifecycle.get("stage_status", item.current_status),
         "decision_status": item.decision_status,
+        "triage_decision": lifecycle.get("triage_decision"),
+        "triage_gate": lifecycle.get("triage_gate"),
+        "triage_round": lifecycle.get("triage_round"),
+        "triage_history": lifecycle.get("triage_history") or [],
+        "validation_result": lifecycle.get("validation_result"),
+        "finished_reason": lifecycle.get("finished_reason"),
         "created_by_type": item.created_by_type,
         "created_by": item.created_by,
         "created_at": item.created_at,
@@ -85,6 +116,88 @@ def _manual_task_payload(item: ManualTask) -> dict:
         "completed_at": item.completed_at,
         "created_at": item.created_at,
     }
+
+
+def _validate_stage_transition(
+    case: Case,
+    to_stage: str,
+    *,
+    finished_reason: str | None = None,
+    summary: str | None = None,
+) -> None:
+    lifecycle = get_lifecycle_state(case)
+    if to_stage not in {MAIN_STAGE_RECEIVE, MAIN_STAGE_TRIAGE, MAIN_STAGE_VALIDATION, MAIN_STAGE_FINISHED}:
+        raise HTTPException(status_code=400, detail=f"unsupported stage: {to_stage}")
+    if case.current_stage == MAIN_STAGE_FINISHED:
+        raise HTTPException(status_code=400, detail="finished stage is terminal and cannot transition")
+    if to_stage == case.current_stage:
+        raise HTTPException(status_code=400, detail="target stage must be different from current stage")
+
+    if case.current_stage == MAIN_STAGE_RECEIVE and to_stage != MAIN_STAGE_TRIAGE:
+        raise HTTPException(status_code=400, detail="receive stage can only transition to triage")
+    if case.current_stage == MAIN_STAGE_TRIAGE and to_stage not in {MAIN_STAGE_VALIDATION, MAIN_STAGE_FINISHED}:
+        raise HTTPException(status_code=400, detail="triage stage can only transition to validation or finished")
+    if case.current_stage == MAIN_STAGE_VALIDATION and to_stage != MAIN_STAGE_FINISHED:
+        raise HTTPException(status_code=400, detail="validation stage can only transition to finished")
+
+    if case.current_stage == MAIN_STAGE_TRIAGE and to_stage == MAIN_STAGE_VALIDATION:
+        if lifecycle.get("triage_decision") != "issue":
+            raise HTTPException(status_code=400, detail="triage_decision must be issue before validation")
+        if lifecycle.get("triage_gate") != "approved_to_validation":
+            raise HTTPException(status_code=400, detail="triage_gate must be approved_to_validation before validation")
+
+    if to_stage == MAIN_STAGE_FINISHED:
+        if case.current_stage not in {MAIN_STAGE_TRIAGE, MAIN_STAGE_VALIDATION}:
+            raise HTTPException(status_code=400, detail="only triage or validation stage can be finished manually")
+        if finished_reason not in FINISHED_REASONS:
+            raise HTTPException(status_code=400, detail="finished_reason is required when transitioning to finished")
+        if not (summary or "").strip():
+            raise HTTPException(status_code=400, detail="summary is required when transitioning to finished")
+
+
+def _finish_case(
+    db: Session,
+    case: Case,
+    *,
+    finished_reason: str,
+    summary: str,
+    operator: str | None,
+    transition_reason: str,
+) -> None:
+    _validate_stage_transition(case, MAIN_STAGE_FINISHED, finished_reason=finished_reason, summary=summary)
+    advance_case_stage(db, case, MAIN_STAGE_FINISHED, transition_reason, "human")
+    lifecycle = get_lifecycle_state(case)
+    lifecycle["stage_status"] = FINISHED_STATUS_DONE
+    lifecycle["finished_reason"] = finished_reason
+    set_lifecycle_state(case, lifecycle)
+    case.current_status = lifecycle["stage_status"]
+    if finished_reason == "vulnerable":
+        case.decision_status = "issue"
+    elif finished_reason == "non_vulnerable":
+        case.decision_status = "non_issue"
+    elif finished_reason in TRIAGE_DECISIONS:
+        case.decision_status = finished_reason
+
+    if case.active_workflow_run_id:
+        workflow_run = db.query(WorkflowRun).filter(WorkflowRun.id == case.active_workflow_run_id).first()
+        if workflow_run:
+            workflow_run.run_status = "completed"
+            workflow_run.completed_at = datetime.utcnow()
+
+    db.add(CaseEvent(
+        id=uuid4().hex,
+        case_id=case.id,
+        event_type="case_finished",
+        summary=summary,
+        payload_json=json.dumps(
+            {
+                "finished_reason": finished_reason,
+                "operator": operator,
+                "transition_reason": transition_reason,
+            },
+            ensure_ascii=False,
+        ),
+    ))
 
 
 @router.post("")
@@ -115,7 +228,7 @@ async def create_draft_case(
     item = create_case_with_runtime(
         db,
         request.to_case_create_request(created_by_type="human", created_by=creator),
-        initial_status="draft",
+        initial_status="intake_created",
     )
     return _case_payload(item)
 
@@ -311,6 +424,7 @@ async def get_dashboard_overview(
 
     stage_counts: dict[str, int] = {}
     decision_counts: dict[str, int] = {}
+    finished_reason_counts: dict[str, int] = {}
     severity_counts: dict[str, int] = {}
     action_status_counts: dict[str, int] = {}
     result_type_counts: dict[str, int] = {}
@@ -318,6 +432,9 @@ async def get_dashboard_overview(
         stage_counts[item.current_stage] = stage_counts.get(item.current_stage, 0) + 1
         decision_counts[item.decision_status] = decision_counts.get(item.decision_status, 0) + 1
         severity_counts[item.severity] = severity_counts.get(item.severity, 0) + 1
+        finished_reason = get_lifecycle_state(item).get("finished_reason")
+        if item.current_stage == MAIN_STAGE_FINISHED and finished_reason:
+            finished_reason_counts[finished_reason] = finished_reason_counts.get(finished_reason, 0) + 1
     for item in actions:
         action_status_counts[item.execution_status] = action_status_counts.get(item.execution_status, 0) + 1
     for item in results:
@@ -342,8 +459,13 @@ async def get_dashboard_overview(
         "project_id": project_id,
         "metrics": {
             "total_cases": len(cases),
-            "running_cases": len([item for item in cases if item.current_status == "running"]),
-            "waiting_external": len([item for item in cases if item.current_status == "waiting_external"]),
+            "running_cases": len([item for item in cases if item.current_stage in {MAIN_STAGE_RECEIVE, MAIN_STAGE_TRIAGE, MAIN_STAGE_VALIDATION}]),
+            "finished_cases": len([item for item in cases if item.current_stage == MAIN_STAGE_FINISHED]),
+            "finished_rate": round(
+                (len([item for item in cases if item.current_stage == MAIN_STAGE_FINISHED]) / len(cases)) * 100,
+                2,
+            ) if cases else 0.0,
+            "waiting_external": len([item for item in actions if item.execution_status in {"queued", "running"}]),
             "manual_tasks_open": len([item for item in tasks if item.status == "open"]),
             "registered_services": len(services),
             "active_services": len([item for item in services if item.status == "active"]),
@@ -351,6 +473,7 @@ async def get_dashboard_overview(
         },
         "stage_counts": stage_counts,
         "decision_counts": decision_counts,
+        "finished_reason_counts": finished_reason_counts,
         "severity_counts": severity_counts,
         "action_status_counts": action_status_counts,
         "result_type_counts": result_type_counts,
@@ -392,7 +515,8 @@ async def create_case_manual_task(
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
     item = create_manual_task(db, case, request)
-    case.current_status = "waiting_manual"
+    lifecycle = get_lifecycle_state(case)
+    case.current_status = lifecycle.get("stage_status", case.current_status)
     db.commit()
     return {
         "status": "ok",
@@ -433,8 +557,11 @@ async def update_case_manual_task_status(
             ensure_ascii=False,
         ),
     ))
-    if request.status in {"done", "completed", "closed"}:
-        case.current_status = "running"
+    if request.status in {"done", "completed", "closed"} and case.current_stage == MAIN_STAGE_TRIAGE:
+        lifecycle = get_lifecycle_state(case)
+        lifecycle["stage_status"] = TRIAGE_STATUS_AWAITING_MANUAL_GATE
+        set_lifecycle_state(case, lifecycle)
+        case.current_status = lifecycle["stage_status"]
     db.commit()
     return {"status": "ok", "task": _manual_task_payload(task)}
 
@@ -451,8 +578,32 @@ async def transition_case_stage(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
+    _validate_stage_transition(
+        case,
+        request.to_stage,
+        finished_reason=request.finished_reason,
+        summary=request.summary,
+    )
+    if request.to_stage == MAIN_STAGE_FINISHED:
+        _finish_case(
+            db,
+            case,
+            finished_reason=request.finished_reason or "manual_terminated",
+            summary=(request.summary or "").strip(),
+            operator=user.get("username"),
+            transition_reason=request.reason or "manual_transition",
+        )
+        db.commit()
+        return {"status": "ok", "case": _case_payload(case)}
+
     advance_case_stage(db, case, request.to_stage, request.reason or "manual_transition", "human")
-    case.current_status = "running"
+    lifecycle = get_lifecycle_state(case)
+    if request.to_stage == MAIN_STAGE_TRIAGE:
+        lifecycle["stage_status"] = TRIAGE_STATUS_WAITING
+    elif request.to_stage == MAIN_STAGE_VALIDATION:
+        lifecycle["stage_status"] = VALIDATION_STATUS_QUEUED
+    set_lifecycle_state(case, lifecycle)
+    case.current_status = lifecycle["stage_status"]
     db.add(CaseEvent(
         id=uuid4().hex,
         case_id=case.id,
@@ -471,6 +622,30 @@ async def transition_case_stage(
     return {"status": "ok", "case": _case_payload(case)}
 
 
+@router.post("/{case_id}/finish")
+async def finish_case(
+    case_id: str,
+    request: FinishCaseRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    user, token = user_and_token
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if case is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    await ensure_project_access(case.project_id, token)
+    _finish_case(
+        db,
+        case,
+        finished_reason=request.finished_reason,
+        summary=request.summary.strip(),
+        operator=user.get("username"),
+        transition_reason="manual_finish",
+    )
+    db.commit()
+    return {"status": "ok", "case": _case_payload(case)}
+
+
 @router.post("/{case_id}/decisions")
 async def create_case_decision(
     case_id: str,
@@ -483,7 +658,140 @@ async def create_case_decision(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
+    if case.current_stage != MAIN_STAGE_TRIAGE:
+        raise HTTPException(status_code=400, detail="decision is only allowed in triage stage")
     record_case_decision(db, case, request.decision_status, request.summary, user.get("username"))
+    db.commit()
+    return {"status": "ok", "case": _case_payload(case)}
+
+
+@router.post("/{case_id}/triage/decision")
+async def update_case_triage_decision(
+    case_id: str,
+    request: TriageDecisionRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    user, token = user_and_token
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if case is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    await ensure_project_access(case.project_id, token)
+    if case.current_stage != MAIN_STAGE_TRIAGE:
+        raise HTTPException(status_code=400, detail="triage decision is only allowed in triage stage")
+    if request.triage_decision not in TRIAGE_DECISIONS:
+        raise HTTPException(status_code=400, detail=f"unsupported triage_decision: {request.triage_decision}")
+
+    record_case_decision(db, case, request.triage_decision, request.summary, user.get("username"))
+    db.commit()
+    return {"status": "ok", "case": _case_payload(case)}
+
+
+@router.post("/{case_id}/triage/gate")
+async def update_case_triage_gate(
+    case_id: str,
+    request: TriageGateRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    user, token = user_and_token
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if case is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    await ensure_project_access(case.project_id, token)
+    if case.current_stage != MAIN_STAGE_TRIAGE:
+        raise HTTPException(status_code=400, detail="triage gate is only allowed in triage stage")
+    if request.triage_gate not in TRIAGE_GATES:
+        raise HTTPException(status_code=400, detail=f"unsupported triage_gate: {request.triage_gate}")
+
+    update_triage_gate(
+        case,
+        request.triage_gate,
+        summary=request.summary or f"triage gate -> {request.triage_gate}",
+        source_id=user.get("username"),
+    )
+    db.add(CaseEvent(
+        id=uuid4().hex,
+        case_id=case.id,
+        event_type="triage_gate_updated",
+        summary=request.summary or request.triage_gate,
+        payload_json=json.dumps(
+            {
+                "triage_gate": request.triage_gate,
+                "operator": user.get("username"),
+            },
+            ensure_ascii=False,
+        ),
+    ))
+    db.commit()
+    return {"status": "ok", "case": _case_payload(case)}
+
+
+@router.post("/{case_id}/triage/rounds")
+async def start_case_next_triage_round(
+    case_id: str,
+    request: TriageRoundStartRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    user, token = user_and_token
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if case is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    await ensure_project_access(case.project_id, token)
+    if case.current_stage != MAIN_STAGE_TRIAGE:
+        raise HTTPException(status_code=400, detail="triage rounds are only allowed in triage stage")
+
+    next_round = start_next_triage_round(case, summary=request.summary)
+    db.add(CaseEvent(
+        id=uuid4().hex,
+        case_id=case.id,
+        event_type="triage_round_started",
+        summary=request.summary or f"round {next_round}",
+        payload_json=json.dumps(
+            {
+                "triage_round": next_round,
+                "operator": user.get("username"),
+                "reason": request.summary,
+            },
+            ensure_ascii=False,
+        ),
+    ))
+    db.commit()
+    return {"status": "ok", "case": _case_payload(case)}
+
+
+@router.post("/{case_id}/validation/result")
+async def update_case_validation_result(
+    case_id: str,
+    request: ValidationResultRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    user, token = user_and_token
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if case is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    await ensure_project_access(case.project_id, token)
+    if case.current_stage != MAIN_STAGE_VALIDATION:
+        raise HTTPException(status_code=400, detail="validation result is only allowed in validation stage")
+    if request.validation_result not in VALIDATION_RESULTS:
+        raise HTTPException(status_code=400, detail=f"unsupported validation_result: {request.validation_result}")
+
+    update_validation_result(case, request.validation_result, stage_status=VALIDATION_STATUS_COMPLETED)
+    db.add(CaseEvent(
+        id=uuid4().hex,
+        case_id=case.id,
+        event_type="validation_result_updated",
+        summary=request.summary or request.validation_result,
+        payload_json=json.dumps(
+            {
+                "validation_result": request.validation_result,
+                "operator": user.get("username"),
+            },
+            ensure_ascii=False,
+        ),
+    ))
     db.commit()
     return {"status": "ok", "case": _case_payload(case)}
 
@@ -500,6 +808,10 @@ async def dispatch_case_actions(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
+    if case.current_stage == MAIN_STAGE_FINISHED:
+        raise HTTPException(status_code=400, detail="finished stage does not allow dispatch")
+    if request.stage and request.stage != case.current_stage:
+        raise HTTPException(status_code=400, detail="stage override is not allowed; use stage-transition first")
     actions = dispatch_routed_actions(db, case, request)
     db.commit()
     return {
@@ -530,6 +842,8 @@ async def get_case_recommended_actions(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
+    if case.current_stage == MAIN_STAGE_FINISHED:
+        return {"items": [], "total": 0}
     items = recommend_actions(db, case)
     return {"items": items, "total": len(items)}
 
@@ -545,6 +859,8 @@ async def auto_orchestrate_case_actions(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
+    if case.current_stage == MAIN_STAGE_FINISHED:
+        raise HTTPException(status_code=400, detail="finished stage does not allow auto orchestration")
     actions = auto_orchestrate_case(db, case)
     db.commit()
     return {

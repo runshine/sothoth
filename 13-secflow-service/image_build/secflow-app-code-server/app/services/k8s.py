@@ -3,7 +3,9 @@ Code Server Manager - K8S API 客户端服务（统一通过 secflow-platform-k8
 """
 
 import logging
-from typing import Optional, List, Dict, Any, Tuple
+import os
+import shlex
+from typing import Optional, List, Dict, Any
 
 import httpx
 
@@ -126,11 +128,44 @@ class K8SService:
             logger.error(f"删除PVC失败: {e}")
             return False
 
+    def create_configmap(self, namespace: str, name: str, data: Dict[str, str], labels: Optional[Dict[str, str]] = None) -> bool:
+        try:
+            project_id = self._project_id_from_namespace(namespace)
+            payload = {
+                "name": name,
+                "data": data or {},
+                "label": labels or {},
+                "annotation": {},
+                "binary_data": {},
+            }
+            resp = self._request("POST", "/configmaps", project_id=project_id, json=payload)
+            if resp.status_code in (200, 201):
+                return True
+            if resp.status_code == 409:
+                return True
+            logger.error(f"创建ConfigMap失败: {resp.status_code} {resp.text}")
+            return False
+        except Exception as e:
+            logger.error(f"创建ConfigMap失败: {e}")
+            return False
+
+    def delete_configmap(self, namespace: str, name: str) -> bool:
+        try:
+            project_id = self._project_id_from_namespace(namespace)
+            resp = self._request("DELETE", f"/configmaps/{name}", project_id=project_id)
+            return resp.status_code in (200, 404)
+        except Exception as e:
+            logger.error(f"删除ConfigMap失败: {e}")
+            return False
+
     def create_deployment(self, namespace: str, name: str, code_server_id: str,
                          source_pvcs: List[Dict], output_pvcs: List[Dict],
                          custom_env: Dict[str, str] = None,
                          code_server_env: Dict[str, Any] = None,
-                         image: str = None) -> tuple[bool, Optional[Dict[str, Any]]]:
+                         image: str = None,
+                         extra_env: Optional[Dict[str, str]] = None,
+                         extra_file_mounts: Optional[List[Dict[str, Any]]] = None,
+                         llm_configmap_name: Optional[str] = None) -> tuple[bool, Optional[Dict[str, Any]]]:
         """创建Deployment"""
         try:
             project_id = self._project_id_from_namespace(namespace)
@@ -208,11 +243,57 @@ class K8SService:
                 env.append({"name": key, "value": value})
             for key, value in config.env.items():
                 if key not in final_code_server_env:
-                    env.append({"name": key, "value": value})
+                    env.append({"name": key, "value": str(value)})
             if custom_env:
                 for key, value in custom_env.items():
                     if key not in final_code_server_env:
-                        env.append({"name": key, "value": value})
+                        env.append({"name": key, "value": str(value)})
+            if extra_env:
+                seen_env = {item["name"] for item in env if item.get("name")}
+                for key, value in extra_env.items():
+                    key_text = str(key or "").strip()
+                    if not key_text:
+                        continue
+                    value_text = str(value) if value is not None else ""
+                    if key_text in seen_env:
+                        for env_item in env:
+                            if env_item.get("name") == key_text:
+                                env_item["value"] = value_text
+                                break
+                    else:
+                        env.append({"name": key_text, "value": value_text})
+                        seen_env.add(key_text)
+
+            init_containers: List[Dict[str, Any]] = []
+            if llm_configmap_name:
+                volumes.append({
+                    "name": "llm-provider-files",
+                    "configMap": {"name": llm_configmap_name},
+                })
+            file_mount_parent_dirs: List[str] = []
+            for item in extra_file_mounts or []:
+                mount_path = str(item.get("path") or "").strip()
+                sub_path = str(item.get("sub_path") or "").strip()
+                if not mount_path or not sub_path:
+                    continue
+                volume_mounts.append({
+                    "name": "llm-provider-files",
+                    "mountPath": mount_path,
+                    "subPath": sub_path,
+                    "readOnly": True,
+                })
+                parent_dir = os.path.dirname(mount_path)
+                if parent_dir and parent_dir not in file_mount_parent_dirs:
+                    file_mount_parent_dirs.append(parent_dir)
+
+            if file_mount_parent_dirs:
+                mkdir_cmd = "mkdir -p " + " ".join(shlex.quote(path) for path in file_mount_parent_dirs)
+                init_containers.append({
+                    "name": "llm-file-init",
+                    "image": image if image else config.image,
+                    "imagePullPolicy": config.image_pull_policy,
+                    "command": ["sh", "-c", mkdir_cmd],
+                })
 
             container_image = image if image else config.image
             deployment_manifest = {
@@ -233,6 +314,7 @@ class K8SService:
                     "template": {
                         "metadata": {"labels": {"app": "code-server", "code-server-id": code_server_id}},
                         "spec": {
+                            "initContainers": init_containers,
                             "containers": [{
                                 "name": "code-server",
                                 "image": container_image,

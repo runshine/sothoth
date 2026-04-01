@@ -1,4 +1,4 @@
-"""Public anonymous intake and SDK endpoints."""
+"""Public authenticated intake and SDK endpoints."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.api.dependencies import ensure_project_access, get_current_subject
 from app.models.database import get_db
 from app.schemas import PublicIntakeSubmissionRequest
 from app.services.lifecycle_engine import build_case_fileserver_root
@@ -70,13 +71,13 @@ def _catalog_payload(request: Request) -> dict:
 
     return {
         "version": "2.0.0",
-        "anonymous_submission_endpoint": str(request.url_for("submit_anonymous_submission")),
+        "authenticated_submission_endpoint": str(request.url_for("submit_authenticated_submission")),
         "items": [
             {
                 "kind": "cli",
                 "title": "CLI 命令行上报",
                 "description": "适合 Shell、CI/CD、批处理脚本和运维自动化场景。",
-                "anonymous_access": True,
+                "anonymous_access": False,
                 "download_url": str(request.url_for("download_cli_sdk")),
                 "example_url": str(request.url_for("get_public_example", kind="cli")),
                 "filename": SDK_FILENAMES["cli"],
@@ -87,7 +88,7 @@ def _catalog_payload(request: Request) -> dict:
                 "kind": "plugin",
                 "title": "插件开发上报",
                 "description": "适合扫描器插件、分析器插件和其他微服务直接集成。",
-                "anonymous_access": True,
+                "anonymous_access": False,
                 "download_url": str(request.url_for("download_plugin_sdk")),
                 "example_url": str(request.url_for("get_public_example", kind="plugin")),
                 "filename": SDK_FILENAMES["plugin"],
@@ -98,7 +99,7 @@ def _catalog_payload(request: Request) -> dict:
                 "kind": "skill",
                 "title": "AI Agent Skill 上报",
                 "description": "同时提供 Markdown Skill 包与 JSON/OpenAPI 模板，适合 AI Agent 与 Skill 调用。",
-                "anonymous_access": True,
+                "anonymous_access": False,
                 "download_url": str(request.url_for("download_skill_sdk")),
                 "example_url": str(request.url_for("get_public_example", kind="skill")),
                 "filename": SDK_FILENAMES["skill"],
@@ -109,7 +110,7 @@ def _catalog_payload(request: Request) -> dict:
                 "kind": "openapi",
                 "title": "JSON/OpenAPI 结构化接入",
                 "description": "适合程序化调用、API 生成器与接口联调。",
-                "anonymous_access": True,
+                "anonymous_access": False,
                 "download_url": str(request.url_for("get_public_openapi_spec")),
                 "example_url": str(request.url_for("get_public_example", kind="openapi")),
                 "filename": openapi_path.name,
@@ -177,14 +178,21 @@ async def get_public_example(kind: str):
     return JSONResponse(_read_json_file(example_path))
 
 
-@router.post("/intake/submissions", name="submit_anonymous_submission")
-async def submit_anonymous_submission(request: PublicIntakeSubmissionRequest, db: Session = Depends(get_db)):
+@router.post("/intake/submissions", name="submit_authenticated_submission")
+async def submit_authenticated_submission(
+    request: PublicIntakeSubmissionRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    subject, token = user_and_token
+    await ensure_project_access(request.project_id, token)
+    creator = subject.get("username") or str(subject.get("id"))
     item = create_case_with_runtime(
         db,
         request.to_case_create_request(
-            created_by_type="anonymous",
-            created_by=request.reporter.name,
-            anonymous_submission=True,
+            created_by_type="human",
+            created_by=creator,
+            anonymous_submission=False,
         ),
     )
     return {

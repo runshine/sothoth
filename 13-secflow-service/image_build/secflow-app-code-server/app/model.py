@@ -17,6 +17,8 @@ from sqlalchemy import (
     Enum as SQLEnum,
     JSON,
     create_engine,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
@@ -78,6 +80,11 @@ class CodeServer(Base):
     # 环境变量配置
     custom_env = Column(JSON, default=dict)          # 自定义环境变量
     code_server_env = Column(JSON, default=dict)     # Code Server镜像环境变量配置
+    llm_provider_key = Column(String(128))
+    llm_provider_snapshot = Column(JSON, default=dict)
+    llm_provider_mapped_env_keys = Column(JSON, default=list)
+    llm_file_bindings = Column(JSON, default=list)
+    llm_configmap_name = Column(String(128))
 
     # 元数据
     description = Column(Text)
@@ -102,6 +109,11 @@ class CodeServer(Base):
             "access_url": self.access_url,
             "custom_env": self.custom_env or {},
             "code_server_env": self.code_server_env or {},
+            "llm_provider_key": self.llm_provider_key,
+            "llm_provider_snapshot": self.llm_provider_snapshot or {},
+            "llm_provider_mapped_env_keys": self.llm_provider_mapped_env_keys or [],
+            "llm_file_bindings": self.llm_file_bindings or [],
+            "llm_configmap_name": self.llm_configmap_name,
             "description": self.description,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -197,6 +209,32 @@ def init_database():
     """初始化数据库"""
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
+    _ensure_code_server_columns(engine)
+
+
+def _ensure_code_server_columns(engine):
+    """兼容历史库：补齐新增列。"""
+    inspector = inspect(engine)
+    columns = {item["name"] for item in inspector.get_columns("code_servers")}
+
+    to_add = []
+    if "llm_provider_key" not in columns:
+        to_add.append("llm_provider_key VARCHAR(128)")
+    if "llm_provider_snapshot" not in columns:
+        to_add.append("llm_provider_snapshot JSON")
+    if "llm_provider_mapped_env_keys" not in columns:
+        to_add.append("llm_provider_mapped_env_keys JSON")
+    if "llm_file_bindings" not in columns:
+        to_add.append("llm_file_bindings JSON")
+    if "llm_configmap_name" not in columns:
+        to_add.append("llm_configmap_name VARCHAR(128)")
+
+    if not to_add:
+        return
+
+    with engine.begin() as conn:
+        for ddl in to_add:
+            conn.execute(text(f"ALTER TABLE code_servers ADD COLUMN {ddl}"))
 
 
 def get_db():

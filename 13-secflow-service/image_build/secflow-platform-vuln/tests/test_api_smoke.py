@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from app.main import app  # noqa: E402
 from app.api.dependencies import get_current_subject  # noqa: E402
 from app.api import cases as cases_api  # noqa: E402
 from app.api import actions as actions_api  # noqa: E402
+from app.api import public as public_api  # noqa: E402
 from app.models.database import Base, get_db  # noqa: E402
 
 
@@ -91,8 +93,10 @@ def client():
     app.dependency_overrides[get_current_subject] = override_subject
     original_ensure_project_access = cases_api.ensure_project_access
     original_actions_project_access = actions_api.ensure_project_access
+    original_public_project_access = public_api.ensure_project_access
     cases_api.ensure_project_access = override_project_access
     actions_api.ensure_project_access = override_project_access
+    public_api.ensure_project_access = override_project_access
 
     with TestClient(app) as test_client:
         yield test_client
@@ -100,6 +104,7 @@ def client():
     app.dependency_overrides.clear()
     cases_api.ensure_project_access = original_ensure_project_access
     actions_api.ensure_project_access = original_actions_project_access
+    public_api.ensure_project_access = original_public_project_access
 
 
 def test_health(client: TestClient):
@@ -136,11 +141,11 @@ def test_public_intake_catalog_downloads_and_examples(client: TestClient):
         assert example.status_code == 200
 
 
-def test_public_anonymous_submission_creates_case(client: TestClient):
+def test_public_authenticated_submission_creates_case(client: TestClient):
     response = client.post(
         "/api/vuln/public/intake/submissions",
         json=make_suspicion_payload(
-            title="Anonymous submission",
+            title="Authenticated submission",
             summary="created through public intake",
             severity="high",
             cvss_score=8.1,
@@ -152,7 +157,7 @@ def test_public_anonymous_submission_creates_case(client: TestClient):
                 {
                     "kind": "text",
                     "name": "stdout.txt",
-                    "content": "anonymous result",
+                    "content": "authenticated result",
                     "encoding": "utf-8",
                 }
             ],
@@ -160,18 +165,19 @@ def test_public_anonymous_submission_creates_case(client: TestClient):
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["created_by_type"] == "anonymous"
-    assert payload["created_by"] == "public-ci"
+    assert re.match(r"^case-\d{8}-\d{6}-[0-9a-f]{10}$", payload["id"])
+    assert payload["created_by_type"] == "human"
+    assert payload["created_by"] == "tester"
     assert payload["project_id"] == "demo-project"
     assert payload["files_root_path"].startswith("/__vuln_cases__/")
 
     detail = client.get(f"/api/vuln/cases/{payload['id']}")
     assert detail.status_code == 200
-    assert detail.json()["created_by_type"] == "anonymous"
+    assert detail.json()["created_by_type"] == "human"
     assert detail.json()["reporter"]["name"] == "public-ci"
     assert detail.json()["subject"]["locator"] == "/auth/login"
     assert detail.json()["cvss_score"] == 8.1
-    assert detail.json()["metadata"]["source"]["anonymous_submission"] is True
+    assert detail.json()["metadata"]["source"]["anonymous_submission"] is False
     assert detail.json()["files_root_path"] == f"/__vuln_cases__/{payload['id']}"
     assert detail.json()["fileserver_root"]["special_subproject_name"] == "__vuln_cases__"
 
@@ -185,20 +191,26 @@ def test_draft_case_creation_returns_fileserver_root(client: TestClient):
     )
     assert response.status_code == 200
     payload = response.json()
+    assert re.match(r"^case-\d{8}-\d{6}-[0-9a-f]{10}$", payload["id"])
     assert payload["project_id"] == "demo-project"
-    assert payload["current_status"] == "draft"
+    assert payload["current_status"] == "intake_created"
     assert payload["files_root_path"] == f"/__vuln_cases__/{payload['id']}"
     assert payload["fileserver_root"]["root_name"] == payload["id"]
     assert payload["reporter"]["name"] == "tester"
     assert payload["subject"]["locator"] == "draft://demo-project"
 
 
-def test_public_routes_remain_anonymous_but_private_routes_require_auth(client: TestClient):
+def test_public_submission_and_private_routes_require_auth(client: TestClient):
     public_response = client.get("/api/vuln/public/intake/catalog")
     assert public_response.status_code == 200
 
     override = app.dependency_overrides.pop(get_current_subject)
     try:
+        submission_response = client.post(
+            "/api/vuln/public/intake/submissions",
+            json=make_suspicion_payload(),
+        )
+        assert submission_response.status_code == 401
         private_response = client.get("/api/vuln/cases")
         assert private_response.status_code == 401
     finally:
@@ -319,7 +331,7 @@ def test_create_case_and_timeline(client: TestClient):
 
     detail = client.get(f"/api/vuln/cases/{case_id}")
     assert detail.status_code == 200
-    assert detail.json()["current_stage"] == "normalize"
+    assert detail.json()["current_stage"] == "receive"
     assert detail.json()["reporter"]["name"] == "manual-reviewer"
     assert detail.json()["subject"]["locator"] == "/login"
     assert detail.json()["cvss_score"] == 7.5
@@ -355,6 +367,11 @@ def test_mock_dispatch_and_callback(client: TestClient):
         json=make_suspicion_payload(title="Callback case"),
     )
     case_id = case_resp.json()["id"]
+    transition_resp = client.post(
+        f"/api/vuln/cases/{case_id}/stage-transition",
+        json={"to_stage": "triage", "reason": "manual_enter_triage"},
+    )
+    assert transition_resp.status_code == 200
 
     action_resp = client.post(f"/api/vuln/actions/mock-dispatch/{case_id}")
     assert action_resp.status_code == 200
@@ -368,8 +385,8 @@ def test_mock_dispatch_and_callback(client: TestClient):
             "status": "succeeded",
             "summary": "analysis completed",
             "confidence": 70,
-            "suggested_stage": "verify",
-            "suggested_decision": "suspected",
+            "suggested_stage": "validation",
+            "suggested_decision": "issue",
             "result_meta": {"ok": True},
             "raw_payload": {"trace": "demo"},
             "artifact_refs": [],
@@ -379,8 +396,9 @@ def test_mock_dispatch_and_callback(client: TestClient):
 
     detail = client.get(f"/api/vuln/cases/{case_id}")
     assert detail.status_code == 200
-    assert detail.json()["decision_status"] == "suspected"
-    assert detail.json()["current_stage"] == "verify"
+    assert detail.json()["decision_status"] == "issue"
+    assert detail.json()["current_stage"] == "triage"
+    assert detail.json()["current_status"] == "awaiting_manual_gate"
 
     control_resp = client.post(
         f"/api/vuln/actions/{action_id}/control",
@@ -402,18 +420,18 @@ def test_dashboard_manual_task_and_decision_flow(client: TestClient):
         "/api/vuln/services/register",
         json={
             "service_id": "svc-validator-01",
-            "service_name": "Validator",
-            "service_type": "validator",
-            "endpoint": "http://validator",
-            "healthcheck_url": "http://validator/health",
+            "service_name": "Analyzer",
+            "service_type": "analyzer",
+            "endpoint": "http://analyzer",
+            "healthcheck_url": "http://analyzer/health",
             "callback_mode": "push",
             "auth_mode": "machine_token",
             "version": "1.0.0",
             "meta": {},
             "capabilities": [
                 {
-                    "capability_code": "validation-default",
-                    "action_type": "validation",
+                    "capability_code": "analysis-default",
+                    "action_type": "analysis",
                     "priority": 100,
                     "timeout_seconds": 300,
                     "concurrency_limit": 2,
@@ -440,10 +458,15 @@ def test_dashboard_manual_task_and_decision_flow(client: TestClient):
     )
     assert case_resp.status_code == 200
     case_id = case_resp.json()["id"]
+    transition_to_triage = client.post(
+        f"/api/vuln/cases/{case_id}/stage-transition",
+        json={"to_stage": "triage", "reason": "manual_enter_triage"},
+    )
+    assert transition_to_triage.status_code == 200
 
     dispatch_resp = client.post(
         f"/api/vuln/cases/{case_id}/actions/dispatch",
-        json={"action_type": "validation"},
+        json={"action_type": "analysis"},
     )
     assert dispatch_resp.status_code == 200
     assert dispatch_resp.json()["count"] == 1
@@ -486,19 +509,25 @@ def test_dashboard_manual_task_and_decision_flow(client: TestClient):
     decision_resp = client.post(
         f"/api/vuln/cases/{case_id}/decisions",
         json={
-            "decision_status": "confirmed",
+            "decision_status": "issue",
             "summary": "Human analyst confirmed",
         },
     )
     assert decision_resp.status_code == 200
-    assert decision_resp.json()["case"]["decision_status"] == "confirmed"
+    assert decision_resp.json()["case"]["decision_status"] == "issue"
+
+    gate_resp = client.post(
+        f"/api/vuln/cases/{case_id}/triage/gate",
+        json={"triage_gate": "approved_to_validation", "summary": "manual gate approved"},
+    )
+    assert gate_resp.status_code == 200
 
     stage_resp = client.post(
         f"/api/vuln/cases/{case_id}/stage-transition",
-        json={"to_stage": "track", "reason": "manual_promote"},
+        json={"to_stage": "validation", "reason": "manual_promote"},
     )
     assert stage_resp.status_code == 200
-    assert stage_resp.json()["case"]["current_stage"] == "track"
+    assert stage_resp.json()["case"]["current_stage"] == "validation"
 
     task_list = client.get("/api/vuln/cases/ops/manual-tasks", params={"project_id": "demo-project"})
     assert task_list.status_code == 200
@@ -540,7 +569,7 @@ def test_failed_result_creates_automation_manual_task(client: TestClient):
 
     detail = client.get(f"/api/vuln/cases/{case_id}")
     assert detail.status_code == 200
-    assert detail.json()["current_status"] == "waiting_manual"
+    assert detail.json()["current_status"] == "files_collecting"
     assert len(detail.json()["manual_tasks"]) == 1
     assert detail.json()["manual_tasks"][0]["task_type"] == "manual_validation"
 
@@ -581,7 +610,7 @@ def test_low_confidence_success_creates_manual_review_task(client: TestClient):
 
     detail = client.get(f"/api/vuln/cases/{case_id}")
     assert detail.status_code == 200
-    assert detail.json()["current_status"] == "waiting_manual"
+    assert detail.json()["current_status"] == "files_collecting"
     assert len(detail.json()["manual_tasks"]) == 1
     assert detail.json()["manual_tasks"][0]["task_type"] == "manual_review"
 
@@ -624,6 +653,11 @@ def test_recommended_actions_marks_active_service_action_pair(client: TestClient
         ),
     )
     case_id = case_resp.json()["id"]
+    transition_to_triage = client.post(
+        f"/api/vuln/cases/{case_id}/stage-transition",
+        json={"to_stage": "triage", "reason": "manual_enter_triage"},
+    )
+    assert transition_to_triage.status_code == 200
 
     dispatch_resp = client.post(
         f"/api/vuln/cases/{case_id}/actions/dispatch",
@@ -640,3 +674,57 @@ def test_recommended_actions_marks_active_service_action_pair(client: TestClient
     ]
     assert len(pairs) == 1
     assert pairs[0]["already_active"] is True
+
+
+def test_finish_stage_requires_reason_and_blocks_orchestration(client: TestClient):
+    case_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(title="Finish lifecycle case"),
+    )
+    assert case_resp.status_code == 200
+    case_id = case_resp.json()["id"]
+
+    transition_to_triage = client.post(
+        f"/api/vuln/cases/{case_id}/stage-transition",
+        json={"to_stage": "triage", "reason": "manual_enter_triage"},
+    )
+    assert transition_to_triage.status_code == 200
+
+    missing_summary = client.post(
+        f"/api/vuln/cases/{case_id}/finish",
+        json={"finished_reason": "manual_terminated", "summary": ""},
+    )
+    assert missing_summary.status_code == 400
+
+    finish_resp = client.post(
+        f"/api/vuln/cases/{case_id}/finish",
+        json={"finished_reason": "non_issue", "summary": "manual close in triage"},
+    )
+    assert finish_resp.status_code == 200
+    assert finish_resp.json()["case"]["current_stage"] == "finished"
+    assert finish_resp.json()["case"]["current_status"] == "finished"
+    assert finish_resp.json()["case"]["finished_reason"] == "non_issue"
+
+    detail_resp = client.get(f"/api/vuln/cases/{case_id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["current_stage"] == "finished"
+    assert detail_resp.json()["finished_reason"] == "non_issue"
+
+    recommend_resp = client.get(f"/api/vuln/cases/{case_id}/recommended-actions")
+    assert recommend_resp.status_code == 200
+    assert recommend_resp.json()["total"] == 0
+
+    dispatch_resp = client.post(
+        f"/api/vuln/cases/{case_id}/actions/dispatch",
+        json={"action_type": "analysis"},
+    )
+    assert dispatch_resp.status_code == 400
+
+    orchestrate_resp = client.post(f"/api/vuln/cases/{case_id}/orchestrate/auto")
+    assert orchestrate_resp.status_code == 400
+
+    illegal_transition = client.post(
+        f"/api/vuln/cases/{case_id}/stage-transition",
+        json={"to_stage": "validation", "reason": "should_fail"},
+    )
+    assert illegal_transition.status_code == 400

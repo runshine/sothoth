@@ -21,6 +21,8 @@
 
 `POST /api/vuln/public/intake/submissions`
 
+请求必须携带 Bearer Token，并按 `project_id` 通过项目级权限校验。
+
 ## 输出要求
 
 返回接口创建的疑点 ID，并记录摘要。

@@ -11,18 +11,107 @@ from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Re
 from app.schemas import ActionCallbackRequest, CaseCreateRequest, ManualTaskCreateRequest, RoutedActionDispatchRequest
 
 
+MAIN_STAGE_RECEIVE = "receive"
+MAIN_STAGE_TRIAGE = "triage"
+MAIN_STAGE_VALIDATION = "validation"
+MAIN_STAGE_FINISHED = "finished"
+
+MAIN_STAGES = {MAIN_STAGE_RECEIVE, MAIN_STAGE_TRIAGE, MAIN_STAGE_VALIDATION, MAIN_STAGE_FINISHED}
+
+TRIAGE_DECISIONS = {"issue", "non_issue", "observe"}
+TRIAGE_GATES = {"pending", "approved_to_validation", "rejected_to_validation"}
+VALIDATION_RESULTS = {"vulnerable", "not_vulnerable", "inconclusive"}
+FINISHED_REASONS = {"vulnerable", "non_vulnerable", "inconclusive", "non_issue", "observe", "manual_terminated"}
+
+RECEIVE_STATUS_INTAKE_CREATED = "intake_created"
+RECEIVE_STATUS_FILES_COLLECTING = "files_collecting"
+RECEIVE_STATUS_READY_FOR_TRIAGE = "ready_for_triage"
+
+TRIAGE_STATUS_WAITING = "waiting"
+TRIAGE_STATUS_AI_ASSESSING = "ai_assessing"
+TRIAGE_STATUS_MANUAL_ASSESSING = "manual_assessing"
+TRIAGE_STATUS_AWAITING_MANUAL_GATE = "awaiting_manual_gate"
+TRIAGE_STATUS_COMPLETED = "triage_completed"
+
+VALIDATION_STATUS_QUEUED = "queued"
+VALIDATION_STATUS_POC_GENERATING = "poc_generating"
+VALIDATION_STATUS_EXP_GENERATING = "exp_generating"
+VALIDATION_STATUS_REPRODUCING = "reproducing"
+VALIDATION_STATUS_EVIDENCE_COLLECTING = "evidence_collecting"
+VALIDATION_STATUS_COMPLETED = "validation_completed"
+FINISHED_STATUS_DONE = "finished"
+
 STAGE_ACTION_CANDIDATES: dict[str, list[str]] = {
-    "ingest": ["analysis"],
-    "normalize": ["analysis", "ai_analysis", "static_analysis"],
-    "route": ["analysis", "ai_analysis", "static_analysis", "reverse_analysis"],
-    "analyze": ["analysis", "ai_analysis", "static_analysis", "reverse_analysis"],
-    "verify": ["validation", "blackbox_validation", "runtime_validation", "simulation_validation"],
-    "prove": ["poc_generation", "exp_generation", "proof_verification"],
-    "decide": ["manual_review", "manual_decision"],
-    "track": ["feedback", "tool_feedback"],
+    MAIN_STAGE_RECEIVE: [],
+    MAIN_STAGE_TRIAGE: ["analysis", "ai_analysis", "static_analysis", "reverse_analysis", "manual_review", "manual_decision"],
+    MAIN_STAGE_VALIDATION: [
+        "validation",
+        "blackbox_validation",
+        "runtime_validation",
+        "simulation_validation",
+        "poc_generation",
+        "exp_generation",
+        "proof_verification",
+    ],
+    MAIN_STAGE_FINISHED: [],
 }
 
 SPECIAL_FILESERVER_SUBPROJECT_NAME = "__vuln_cases__"
+
+
+def _load_display_meta(case: Case) -> dict:
+    return json.loads(case.display_meta_json or "{}")
+
+
+def _write_display_meta(case: Case, display_meta: dict) -> None:
+    case.display_meta_json = json.dumps(display_meta, ensure_ascii=False)
+
+
+def get_lifecycle_state(case: Case) -> dict:
+    display_meta = _load_display_meta(case)
+    lifecycle = dict(display_meta.get("lifecycle") or {})
+    lifecycle.setdefault("stage_status", case.current_status or RECEIVE_STATUS_INTAKE_CREATED)
+    lifecycle.setdefault("triage_decision", case.decision_status if case.decision_status in TRIAGE_DECISIONS else "observe")
+    lifecycle.setdefault("triage_gate", "pending")
+    lifecycle.setdefault("triage_round", 1)
+    lifecycle.setdefault("triage_history", [])
+    lifecycle.setdefault("validation_result", "inconclusive")
+    lifecycle.setdefault("finished_reason", None)
+    return lifecycle
+
+
+def set_lifecycle_state(case: Case, lifecycle: dict) -> None:
+    display_meta = _load_display_meta(case)
+    display_meta["lifecycle"] = lifecycle
+    _write_display_meta(case, display_meta)
+
+
+def append_triage_history(
+    case: Case,
+    *,
+    actor_type: str,
+    summary: str | None,
+    suggested_decision: str | None,
+) -> None:
+    lifecycle = get_lifecycle_state(case)
+    history = list(lifecycle.get("triage_history") or [])
+    history.append(
+        {
+            "round_no": int(lifecycle.get("triage_round") or 1),
+            "actor_type": actor_type,
+            "summary": summary,
+            "suggested_decision": suggested_decision,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+    )
+    lifecycle["triage_history"] = history
+    set_lifecycle_state(case, lifecycle)
+
+
+def generate_case_id() -> str:
+    """Generate a sortable case id with report timestamp embedded."""
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    return f"case-{ts}-{uuid4().hex[:10]}"
 
 
 def build_case_fileserver_root(case_id: str) -> dict[str, str | None]:
@@ -58,10 +147,10 @@ def ensure_default_workflow(db: Session) -> WorkflowDefinition:
     return workflow
 
 
-def create_case_with_runtime(db: Session, request: CaseCreateRequest, *, initial_status: str = "running") -> Case:
+def create_case_with_runtime(db: Session, request: CaseCreateRequest, *, initial_status: str = RECEIVE_STATUS_INTAKE_CREATED) -> Case:
     workflow = ensure_default_workflow(db)
     source_meta, target_meta, display_meta = request.build_storage_payloads()
-    case_id = uuid4().hex
+    case_id = generate_case_id()
     fileserver_root = build_case_fileserver_root(case_id)
     display_meta["fileserver_root"] = fileserver_root
     case = Case(
@@ -71,9 +160,9 @@ def create_case_with_runtime(db: Session, request: CaseCreateRequest, *, initial
         summary=request.summary,
         severity=request.severity,
         confidence=request.confidence,
-        current_stage="ingest",
+        current_stage=MAIN_STAGE_RECEIVE,
         current_status=initial_status,
-        decision_status="unknown",
+        decision_status="observe",
         workflow_definition_id=workflow.id,
         source_meta_json=json.dumps(source_meta, ensure_ascii=False),
         target_meta_json=json.dumps(target_meta, ensure_ascii=False),
@@ -88,7 +177,7 @@ def create_case_with_runtime(db: Session, request: CaseCreateRequest, *, initial
         id=uuid4().hex,
         case_id=case.id,
         workflow_definition_id=workflow.id,
-        current_stage="ingest",
+        current_stage=MAIN_STAGE_RECEIVE,
         run_status="running",
         context_json=json.dumps({}, ensure_ascii=False),
     )
@@ -107,13 +196,23 @@ def create_case_with_runtime(db: Session, request: CaseCreateRequest, *, initial
         id=uuid4().hex,
         case_id=case.id,
         from_stage=None,
-        to_stage="ingest",
+        to_stage=MAIN_STAGE_RECEIVE,
         reason="case_created",
         source_type=request.created_by_type,
         source_id=request.created_by,
     ))
-
-    advance_case_stage(db, case, "normalize", "auto_after_ingest")
+    set_lifecycle_state(
+        case,
+        {
+            "stage_status": initial_status,
+            "triage_decision": "observe",
+            "triage_gate": "pending",
+            "triage_round": 1,
+            "triage_history": [],
+            "validation_result": "inconclusive",
+            "finished_reason": None,
+        },
+    )
     db.commit()
     db.refresh(case)
     return case
@@ -138,26 +237,49 @@ def advance_case_stage(db: Session, case: Case, to_stage: str, reason: str, sour
 
 
 def apply_action_result(db: Session, case: Case, payload: ActionCallbackRequest) -> None:
-    automation_notes: list[str] = []
+    if case.current_stage == MAIN_STAGE_FINISHED:
+        return
 
-    if payload.suggested_decision:
-        case.decision_status = payload.suggested_decision
-        automation_notes.append(f"decision={payload.suggested_decision}")
-    if payload.suggested_stage and payload.suggested_stage != case.current_stage:
-        advance_case_stage(db, case, payload.suggested_stage, "external_result_suggestion", "service")
-        automation_notes.append(f"stage={payload.suggested_stage}")
-    elif case.current_stage in {"normalize", "route"}:
-        advance_case_stage(db, case, "analyze", "result_received_default", "service")
-        automation_notes.append("stage=analyze")
-    elif case.current_stage == "analyze":
-        advance_case_stage(db, case, "verify", "analysis_completed_default", "service")
-        automation_notes.append("stage=verify")
-    elif case.current_stage == "verify" and payload.result_type in {"poc", "exp"}:
-        advance_case_stage(db, case, "prove", "proof_received", "service")
-        automation_notes.append("stage=prove")
+    automation_notes: list[str] = []
+    lifecycle = get_lifecycle_state(case)
+
+    if case.current_stage == MAIN_STAGE_TRIAGE:
+        suggested = payload.suggested_decision if payload.suggested_decision in TRIAGE_DECISIONS else None
+        append_triage_history(
+            case,
+            actor_type="ai",
+            summary=payload.summary,
+            suggested_decision=suggested,
+        )
+        lifecycle = get_lifecycle_state(case)
+        lifecycle["stage_status"] = TRIAGE_STATUS_AWAITING_MANUAL_GATE
+        if suggested:
+            lifecycle["triage_decision"] = suggested
+            case.decision_status = suggested
+            automation_notes.append(f"triage_decision={suggested}")
+        set_lifecycle_state(case, lifecycle)
+
+    if case.current_stage == MAIN_STAGE_VALIDATION:
+        lifecycle["stage_status"] = VALIDATION_STATUS_EVIDENCE_COLLECTING
+        suggested = payload.suggested_decision if payload.suggested_decision in TRIAGE_DECISIONS else None
+        if suggested == "issue":
+            lifecycle["validation_result"] = "vulnerable"
+        elif suggested == "non_issue":
+            lifecycle["validation_result"] = "not_vulnerable"
+        elif payload.status in {"failed", "partial"}:
+            lifecycle["validation_result"] = "inconclusive"
+        set_lifecycle_state(case, lifecycle)
+        automation_notes.append(f"validation_result={lifecycle['validation_result']}")
 
     if payload.status == "failed":
-        case.current_status = "waiting_manual"
+        if case.current_stage == MAIN_STAGE_TRIAGE:
+            lifecycle["stage_status"] = TRIAGE_STATUS_MANUAL_ASSESSING
+        elif case.current_stage == MAIN_STAGE_VALIDATION:
+            lifecycle["stage_status"] = VALIDATION_STATUS_EVIDENCE_COLLECTING
+        else:
+            lifecycle["stage_status"] = RECEIVE_STATUS_FILES_COLLECTING
+        set_lifecycle_state(case, lifecycle)
+        case.current_status = lifecycle["stage_status"]
         _ensure_manual_task(
             db,
             case,
@@ -172,7 +294,14 @@ def apply_action_result(db: Session, case: Case, payload: ActionCallbackRequest)
         )
         automation_notes.append("manual_task=failed_result_followup")
     elif payload.confidence < 50 and payload.status in {"succeeded", "partial"}:
-        case.current_status = "waiting_manual"
+        if case.current_stage == MAIN_STAGE_TRIAGE:
+            lifecycle["stage_status"] = TRIAGE_STATUS_MANUAL_ASSESSING
+        elif case.current_stage == MAIN_STAGE_VALIDATION:
+            lifecycle["stage_status"] = VALIDATION_STATUS_EVIDENCE_COLLECTING
+        else:
+            lifecycle["stage_status"] = RECEIVE_STATUS_FILES_COLLECTING
+        set_lifecycle_state(case, lifecycle)
+        case.current_status = lifecycle["stage_status"]
         _ensure_manual_task(
             db,
             case,
@@ -186,25 +315,9 @@ def apply_action_result(db: Session, case: Case, payload: ActionCallbackRequest)
             },
         )
         automation_notes.append("manual_task=low_confidence_review")
-    elif payload.result_type in {"poc", "exp"} and payload.status == "succeeded":
-        if case.current_stage != "decide":
-            advance_case_stage(db, case, "decide", "proof_ready_auto_decide", "system")
-            automation_notes.append("stage=decide")
-        if case.decision_status == "unknown":
-            case.decision_status = "suspected"
-            automation_notes.append("decision=suspected")
-    elif payload.result_type in {"feedback"} and payload.status == "succeeded":
-        if case.current_stage != "track":
-            advance_case_stage(db, case, "track", "feedback_completed", "system")
-            automation_notes.append("stage=track")
-
-    if payload.suggested_decision in {"confirmed", "false_positive", "accepted_risk"}:
-        if case.current_stage != "track":
-            advance_case_stage(db, case, "track", "decision_converged_auto_track", "system")
-            automation_notes.append("stage=track")
-        case.current_status = "running"
-    elif case.current_status != "waiting_manual":
-        case.current_status = "running"
+    else:
+        lifecycle = get_lifecycle_state(case)
+        case.current_status = lifecycle.get("stage_status", case.current_status)
 
     if automation_notes:
         db.add(CaseEvent(
@@ -244,6 +357,15 @@ def create_manual_task(db: Session, case: Case, request: ManualTaskCreateRequest
         summary=request.title,
         payload_json=json.dumps(request.model_dump(mode="json"), ensure_ascii=False),
     ))
+    lifecycle = get_lifecycle_state(case)
+    if case.current_stage == MAIN_STAGE_TRIAGE:
+        lifecycle["stage_status"] = TRIAGE_STATUS_MANUAL_ASSESSING
+        set_lifecycle_state(case, lifecycle)
+        case.current_status = TRIAGE_STATUS_MANUAL_ASSESSING
+    elif case.current_stage == MAIN_STAGE_VALIDATION:
+        lifecycle["stage_status"] = VALIDATION_STATUS_EVIDENCE_COLLECTING
+        set_lifecycle_state(case, lifecycle)
+        case.current_status = VALIDATION_STATUS_EVIDENCE_COLLECTING
     return task
 
 
@@ -276,16 +398,36 @@ def _ensure_manual_task(
 
 
 def record_case_decision(db: Session, case: Case, decision_status: str, summary: str | None, source_id: str | None) -> None:
-    case.decision_status = decision_status
-    case.current_status = "waiting_manual" if decision_status == "needs_more_evidence" else "running"
+    lifecycle = get_lifecycle_state(case)
+    mapped = decision_status
+    if decision_status in {"confirmed", "suspected"}:
+        mapped = "issue"
+    elif decision_status in {"false_positive", "accepted_risk"}:
+        mapped = "non_issue"
+    elif decision_status == "needs_more_evidence":
+        mapped = "observe"
+    if mapped not in TRIAGE_DECISIONS:
+        mapped = "observe"
+
+    lifecycle["triage_decision"] = mapped
+    lifecycle["stage_status"] = TRIAGE_STATUS_AWAITING_MANUAL_GATE if mapped == "issue" else TRIAGE_STATUS_COMPLETED
+    case.decision_status = mapped
+    case.current_status = lifecycle["stage_status"]
+    set_lifecycle_state(case, lifecycle)
+    append_triage_history(
+        case,
+        actor_type="human",
+        summary=summary,
+        suggested_decision=mapped,
+    )
     db.add(CaseEvent(
         id=uuid4().hex,
         case_id=case.id,
-        event_type="decision_recorded",
-        summary=summary or decision_status,
+        event_type="triage_decision_recorded",
+        summary=summary or mapped,
         payload_json=json.dumps(
             {
-                "decision_status": decision_status,
+                "triage_decision": mapped,
                 "summary": summary,
             },
             ensure_ascii=False,
@@ -302,23 +444,65 @@ def record_case_decision(db: Session, case: Case, decision_status: str, summary:
     ))
 
 
+def update_triage_gate(case: Case, triage_gate: str, *, summary: str | None = None, source_id: str | None = None) -> None:
+    lifecycle = get_lifecycle_state(case)
+    lifecycle["triage_gate"] = triage_gate if triage_gate in TRIAGE_GATES else "pending"
+    if lifecycle["triage_gate"] == "approved_to_validation":
+        lifecycle["stage_status"] = TRIAGE_STATUS_AWAITING_MANUAL_GATE
+    elif lifecycle["triage_gate"] == "rejected_to_validation":
+        lifecycle["stage_status"] = TRIAGE_STATUS_COMPLETED
+    set_lifecycle_state(case, lifecycle)
+    case.current_status = lifecycle["stage_status"]
+    if summary or source_id:
+        append_triage_history(
+            case,
+            actor_type="human",
+            summary=summary,
+            suggested_decision=lifecycle.get("triage_decision"),
+        )
+
+
+def start_next_triage_round(case: Case, *, summary: str | None = None) -> int:
+    lifecycle = get_lifecycle_state(case)
+    lifecycle["triage_round"] = int(lifecycle.get("triage_round") or 1) + 1
+    lifecycle["triage_gate"] = "pending"
+    lifecycle["stage_status"] = TRIAGE_STATUS_WAITING
+    set_lifecycle_state(case, lifecycle)
+    case.current_status = lifecycle["stage_status"]
+    if summary:
+        append_triage_history(
+            case,
+            actor_type="human",
+            summary=summary,
+            suggested_decision=lifecycle.get("triage_decision"),
+        )
+    return lifecycle["triage_round"]
+
+
+def update_validation_result(case: Case, validation_result: str, *, stage_status: str | None = None) -> None:
+    lifecycle = get_lifecycle_state(case)
+    lifecycle["validation_result"] = validation_result if validation_result in VALIDATION_RESULTS else "inconclusive"
+    if stage_status:
+        lifecycle["stage_status"] = stage_status
+    set_lifecycle_state(case, lifecycle)
+    case.current_status = lifecycle["stage_status"]
+
+
 def _stage_from_action(action_type: str, current_stage: str) -> str:
     mapping = {
-        "analysis": "analyze",
-        "ai_analysis": "analyze",
-        "static_analysis": "analyze",
-        "reverse_analysis": "analyze",
-        "validation": "verify",
-        "blackbox_validation": "verify",
-        "runtime_validation": "verify",
-        "simulation_validation": "verify",
-        "poc_generation": "prove",
-        "exp_generation": "prove",
-        "proof_verification": "prove",
-        "manual_review": "decide",
-        "manual_decision": "decide",
-        "feedback": "track",
-        "tool_feedback": "track",
+        "analysis": MAIN_STAGE_TRIAGE,
+        "ai_analysis": MAIN_STAGE_TRIAGE,
+        "static_analysis": MAIN_STAGE_TRIAGE,
+        "reverse_analysis": MAIN_STAGE_TRIAGE,
+        "manual_review": MAIN_STAGE_TRIAGE,
+        "manual_decision": MAIN_STAGE_TRIAGE,
+        "validation": MAIN_STAGE_VALIDATION,
+        "blackbox_validation": MAIN_STAGE_VALIDATION,
+        "runtime_validation": MAIN_STAGE_VALIDATION,
+        "simulation_validation": MAIN_STAGE_VALIDATION,
+        "poc_generation": MAIN_STAGE_VALIDATION,
+        "exp_generation": MAIN_STAGE_VALIDATION,
+        "proof_verification": MAIN_STAGE_VALIDATION,
     }
     return mapping.get(action_type, current_stage)
 
@@ -337,8 +521,13 @@ def dispatch_routed_actions(
 
     actions: list[ActionExecution] = []
     stage = route_request.stage or case.current_stage
+    if stage == MAIN_STAGE_FINISHED:
+        return []
+    allowed_types = STAGE_ACTION_CANDIDATES.get(stage, [])
     for service in services:
         for capability in service.capabilities:
+            if capability.action_type not in allowed_types:
+                continue
             if route_request.action_type and capability.action_type != route_request.action_type:
                 continue
             action_stage = _stage_from_action(capability.action_type, stage)
@@ -365,7 +554,23 @@ def dispatch_routed_actions(
         next_stage = _stage_from_action(actions[0].action_type, case.current_stage)
         if next_stage != case.current_stage:
             advance_case_stage(db, case, next_stage, "action_dispatched", "system")
-        case.current_status = "waiting_external"
+        lifecycle = get_lifecycle_state(case)
+        if next_stage == MAIN_STAGE_TRIAGE:
+            if actions[0].action_type == "manual_review":
+                lifecycle["stage_status"] = TRIAGE_STATUS_MANUAL_ASSESSING
+            else:
+                lifecycle["stage_status"] = TRIAGE_STATUS_AI_ASSESSING
+        elif next_stage == MAIN_STAGE_VALIDATION:
+            if actions[0].action_type == "poc_generation":
+                lifecycle["stage_status"] = VALIDATION_STATUS_POC_GENERATING
+            elif actions[0].action_type == "exp_generation":
+                lifecycle["stage_status"] = VALIDATION_STATUS_EXP_GENERATING
+            elif actions[0].action_type == "proof_verification":
+                lifecycle["stage_status"] = VALIDATION_STATUS_REPRODUCING
+            else:
+                lifecycle["stage_status"] = VALIDATION_STATUS_QUEUED
+        set_lifecycle_state(case, lifecycle)
+        case.current_status = lifecycle.get("stage_status", case.current_status)
         db.add(CaseEvent(
             id=uuid4().hex,
             case_id=case.id,

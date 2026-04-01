@@ -4319,6 +4319,334 @@ class WebAPIServer:
                 self.logger.error(f"发送AI helper会话消息失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/agent/ai-helpers/sessions/global', methods=['GET'])
+        def list_project_ai_agent_sessions_global():
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+                try:
+                    page = max(1, int(request.args.get('page', 1)))
+                except Exception:
+                    page = 1
+                try:
+                    per_page = max(1, min(200, int(request.args.get('per_page', 100))))
+                except Exception:
+                    per_page = 100
+                q = str(request.args.get('q') or '').strip().lower()
+                node_filter = str(request.args.get('node') or '').strip()
+                service_name_filter = str(request.args.get('service_name') or '').strip()
+                status_filter = str(request.args.get('status') or '').strip().lower()
+                invalid_filter = str(request.args.get('invalid_filter') or 'all').strip().lower()
+                invalid_reason_filter = str(request.args.get('invalid_reason') or '').strip()
+
+                table_name = self.db_manager.get_table_name('agent_services')
+                rows = self.db_manager.fetch_all(
+                    f"""
+                    SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                           service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                           first_seen_at, last_seen_at, updated_at
+                    FROM {table_name}
+                    WHERE project_id = %s AND is_stale = 0
+                    ORDER BY last_seen_at DESC
+                    """ if self.db_manager.db_type == 'mysql' else
+                    f"""
+                    SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                           service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                           first_seen_at, last_seen_at, updated_at
+                    FROM {table_name}
+                    WHERE project_id = ? AND is_stale = 0
+                    ORDER BY last_seen_at DESC
+                    """,
+                    (project_id,)
+                ) or []
+
+                helper_rows = [row for row in rows if self._has_ai_helper_tag(row.get('tags_json'))]
+
+                items: List[Dict[str, Any]] = []
+                helper_unreachable: List[Dict[str, Any]] = []
+
+                def _normalize_session_agent_ids(session_payload: Dict[str, Any]) -> List[str]:
+                    values: List[str] = []
+                    raw_agent_ids = session_payload.get('agent_ids')
+                    if isinstance(raw_agent_ids, list):
+                        values = [str(item).strip() for item in raw_agent_ids if str(item).strip()]
+                    elif isinstance(raw_agent_ids, str):
+                        raw_text = raw_agent_ids.strip()
+                        if raw_text:
+                            try:
+                                parsed = json.loads(raw_text)
+                                if isinstance(parsed, list):
+                                    values = [str(item).strip() for item in parsed if str(item).strip()]
+                                else:
+                                    values = [raw_text]
+                            except Exception:
+                                values = [raw_text]
+                    backend_text = str(session_payload.get('backend') or '').strip()
+                    if backend_text and backend_text not in values:
+                        values.append(backend_text)
+                    return values
+
+                for row in helper_rows:
+                    helper_agent_key = str(row.get('agent_key') or '').strip()
+                    helper_service_name = str(row.get('service_name') or '').strip()
+                    helper_context = {
+                        'agent_key': helper_agent_key,
+                        'service_name': helper_service_name,
+                        'agent_hostname': row.get('agent_hostname') or helper_agent_key,
+                        'agent_ip': row.get('agent_ip') or '',
+                    }
+
+                    try:
+                        sessions_data, sessions_code = self._call_ai_helper_api(
+                            project_id,
+                            helper_agent_key,
+                            helper_service_name,
+                            'GET',
+                            '/api/ai-agents/sessions',
+                            None,
+                            timeout=(5, 30),
+                        )
+                        agents_data, agents_code = self._call_ai_helper_api(
+                            project_id,
+                            helper_agent_key,
+                            helper_service_name,
+                            'GET',
+                            '/api/ai-agents',
+                            None,
+                            timeout=(5, 30),
+                        )
+                        if sessions_code >= 300:
+                            raise ValueError(f'sessions status {sessions_code}: {sessions_data}')
+                        if agents_code >= 300:
+                            raise ValueError(f'ai-agents status {agents_code}: {agents_data}')
+                    except Exception as helper_exc:
+                        helper_unreachable.append({
+                            **helper_context,
+                            'health_status': 'unreachable',
+                            'error': str(helper_exc),
+                        })
+                        continue
+
+                    session_list = sessions_data.get('items') if isinstance(sessions_data, dict) else []
+                    if not isinstance(session_list, list):
+                        session_list = []
+                    helper_agents = agents_data.get('items') if isinstance(agents_data, dict) else []
+                    if not isinstance(helper_agents, list):
+                        helper_agents = []
+                    helper_agent_id_set = {
+                        str(item.get('agent_id') or item.get('name') or '').strip()
+                        for item in helper_agents if isinstance(item, dict)
+                    }
+                    helper_agent_id_set = {item for item in helper_agent_id_set if item}
+
+                    for session in session_list:
+                        if not isinstance(session, dict):
+                            continue
+                        status = str(session.get('status') or 'unknown').strip().lower()
+                        backend = str(session.get('backend') or '').strip()
+                        agent_ids = _normalize_session_agent_ids(session)
+
+                        invalid_reasons: List[str] = []
+                        if status != 'ready':
+                            invalid_reasons.append(f'status_not_ready:{status or "unknown"}')
+                        pty_pid = session.get('pty_pid')
+                        backend_pid = session.get('backend_pid')
+                        if backend_pid is None:
+                            backend_pid = pty_pid
+                        if status == 'ready':
+                            has_pty_pid = isinstance(pty_pid, int) and pty_pid > 0
+                            if not has_pty_pid:
+                                invalid_reasons.append('pty_missing')
+
+                        if backend and backend not in helper_agent_id_set:
+                            invalid_reasons.append('backend_not_found_in_helper_agents')
+                        missing_agent_ids = [agent_id for agent_id in agent_ids if agent_id not in helper_agent_id_set]
+                        if missing_agent_ids:
+                            invalid_reasons.append(f'agent_ids_not_found:{",".join(missing_agent_ids)}')
+
+                        items.append({
+                            'project_id': project_id,
+                            **helper_context,
+                            'health_status': 'healthy',
+                            'session_id': session.get('session_id'),
+                            'backend': backend or None,
+                            'agent_ids': agent_ids,
+                            'status': session.get('status'),
+                            'pty_pid': pty_pid,
+                            'backend_pid': backend_pid,
+                            'pty_started_at': session.get('pty_started_at'),
+                            'last_error': session.get('last_error'),
+                            'metadata': session.get('metadata') if isinstance(session.get('metadata'), dict) else {},
+                            'created_at': session.get('created_at'),
+                            'updated_at': session.get('updated_at'),
+                            'is_invalid': len(invalid_reasons) > 0,
+                            'invalid_reasons': invalid_reasons,
+                        })
+
+                overall_total = len(items)
+                invalid_count = len([item for item in items if item.get('is_invalid')])
+                normal_count = overall_total - invalid_count
+
+                filtered_items = []
+                for item in items:
+                    node_text = str(item.get('agent_hostname') or item.get('agent_key') or '')
+                    service_name_text = str(item.get('service_name') or '')
+                    status_text = str(item.get('status') or 'unknown').strip().lower()
+                    is_invalid = bool(item.get('is_invalid'))
+                    invalid_reasons = item.get('invalid_reasons') if isinstance(item.get('invalid_reasons'), list) else []
+                    invalid_reasons = [str(reason) for reason in invalid_reasons]
+                    search_text = ' '.join([
+                        str(item.get('session_id') or ''),
+                        str(item.get('backend') or ''),
+                        str(item.get('agent_key') or ''),
+                        node_text,
+                        service_name_text,
+                        ','.join(item.get('agent_ids') or []),
+                    ]).lower()
+
+                    if q and q not in search_text:
+                        continue
+                    if node_filter and node_text != node_filter:
+                        continue
+                    if service_name_filter and service_name_text != service_name_filter:
+                        continue
+                    if status_filter and status_text != status_filter:
+                        continue
+                    if invalid_filter == 'invalid' and not is_invalid:
+                        continue
+                    if invalid_filter == 'normal' and is_invalid:
+                        continue
+                    if invalid_reason_filter and invalid_reason_filter not in invalid_reasons:
+                        continue
+                    filtered_items.append(item)
+
+                filtered_total = len(filtered_items)
+                node_options = sorted({
+                    str(item.get('agent_hostname') or item.get('agent_key') or '').strip()
+                    for item in items
+                    if str(item.get('agent_hostname') or item.get('agent_key') or '').strip()
+                })
+                service_name_options = sorted({
+                    str(item.get('service_name') or '').strip()
+                    for item in items
+                    if str(item.get('service_name') or '').strip()
+                })
+                status_options = sorted({
+                    str(item.get('status') or 'unknown').strip()
+                    for item in items
+                })
+                invalid_reason_options = sorted({
+                    str(reason).strip()
+                    for item in items
+                    for reason in (item.get('invalid_reasons') if isinstance(item.get('invalid_reasons'), list) else [])
+                    if str(reason).strip()
+                })
+                start = (page - 1) * per_page
+                end = start + per_page
+                paginated_items = filtered_items[start:end]
+                return jsonify({
+                    'project_id': project_id,
+                    'items': paginated_items,
+                    'total': filtered_total,
+                    'filtered_total': filtered_total,
+                    'page': page,
+                    'per_page': per_page,
+                    'stats': {
+                        'total_sessions': overall_total,
+                        'normal_count': normal_count,
+                        'invalid_count': invalid_count,
+                        'helper_total': len(helper_rows),
+                        'helper_reachable_count': len(helper_rows) - len(helper_unreachable),
+                        'helper_unreachable_count': len(helper_unreachable),
+                    },
+                    'filters': {
+                        'nodes': node_options,
+                        'service_names': service_name_options,
+                        'statuses': status_options,
+                        'invalid_reasons': invalid_reason_options,
+                    },
+                    'helper_unreachable': helper_unreachable,
+                })
+            except Exception as e:
+                self.logger.error(f"查询AI helper全局会话失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-helpers/sessions/global/delete-batch', methods=['POST'])
+        def batch_delete_project_ai_agent_sessions_global():
+            try:
+                payload = request.get_json(silent=True) or {}
+                project_id = str(payload.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                targets = payload.get('targets') or []
+                if not isinstance(targets, list) or len(targets) == 0:
+                    return jsonify({'error': 'targets is required'}), 400
+
+                results = []
+                success_count = 0
+                for item in targets:
+                    target = item if isinstance(item, dict) else {}
+                    agent_key = str(target.get('agent_key') or '').strip()
+                    service_name = str(target.get('service_name') or '').strip()
+                    session_id = str(target.get('session_id') or '').strip()
+                    if not agent_key or not service_name or not session_id:
+                        results.append({
+                            'agent_key': agent_key,
+                            'service_name': service_name,
+                            'session_id': session_id,
+                            'success': False,
+                            'status_code': 400,
+                            'error': 'agent_key/service_name/session_id are required',
+                        })
+                        continue
+                    try:
+                        response_payload, status_code = self._call_ai_helper_api(
+                            project_id,
+                            agent_key,
+                            service_name,
+                            'DELETE',
+                            f"/api/ai-agents/sessions/{quote(session_id, safe='')}",
+                            {'project_id': project_id},
+                            timeout=(5, 30),
+                        )
+                        success = status_code < 300
+                        if success:
+                            success_count += 1
+                        results.append({
+                            'agent_key': agent_key,
+                            'service_name': service_name,
+                            'session_id': session_id,
+                            'success': success,
+                            'status_code': status_code,
+                            'response': response_payload,
+                            'error': '' if success else str(response_payload),
+                        })
+                    except Exception as item_exc:
+                        results.append({
+                            'agent_key': agent_key,
+                            'service_name': service_name,
+                            'session_id': session_id,
+                            'success': False,
+                            'status_code': 500,
+                            'error': str(item_exc),
+                        })
+
+                total = len(results)
+                failed_count = total - success_count
+                status_text = 'success' if failed_count == 0 else ('failed' if success_count == 0 else 'partial_success')
+                return jsonify({
+                    'project_id': project_id,
+                    'status': status_text,
+                    'total': total,
+                    'success_count': success_count,
+                    'failed_count': failed_count,
+                    'results': results,
+                })
+            except Exception as e:
+                self.logger.error(f"批量终止AI helper全局会话失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/agent/ai-helpers/sessions/batch', methods=['POST'])
         def create_ai_helper_batch_session():
             try:

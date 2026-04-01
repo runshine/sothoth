@@ -44,6 +44,13 @@ auth_service:
   service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
   timeout: 10
 
+# 配置中心服务配置
+configcenter_service:
+  enabled: true
+  host: "secflow-platform-configcenter"
+  port: 80
+  timeout: 30
+
 # Code Server配置
 code_server:
   # 默认镜像

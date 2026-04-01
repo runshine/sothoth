@@ -1,6 +1,6 @@
 {
   "kind": "skill",
-  "prompt": "请将下面的疑点作为匿名疑点上报到 SecFlow 漏洞生命周期引擎。",
+  "prompt": "请将下面的疑点作为认证疑点上报到 SecFlow 漏洞生命周期引擎。",
   "request": {
     "project_id": "44f9029d00650a10",
     "report_id": "skill-demo-001",

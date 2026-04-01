@@ -17,6 +17,8 @@ class Settings:
     backend_invoke_timeout_sec: int = int(os.getenv('AGENT_BACKEND_INVOKE_TIMEOUT_SEC', 300))
     backend_idle_timeout_sec: int = int(os.getenv('AGENT_BACKEND_IDLE_TIMEOUT_SEC', 1800))
     housekeeping_interval_sec: int = int(os.getenv('AGENT_HOUSEKEEPING_INTERVAL_SEC', 30))
+    session_pty_quiet_window_ms: int = int(os.getenv('AGENT_SESSION_PTY_QUIET_WINDOW_MS', 450))
+    session_pty_max_window_ms: int = int(os.getenv('AGENT_SESSION_PTY_MAX_WINDOW_MS', 10000))
 
     @property
     def allowed_commands(self) -> List[str]:

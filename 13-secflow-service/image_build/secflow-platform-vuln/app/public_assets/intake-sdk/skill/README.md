@@ -1,6 +1,6 @@
 # SecFlow Vuln Skill Package
 
-本包用于 AI Agent / Skill 方式接入匿名漏洞上报。
+本包用于 AI Agent / Skill 方式接入认证漏洞上报。
 
 包含：
 

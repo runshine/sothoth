@@ -3,11 +3,12 @@ Code Server Manager - 任务管理服务
 """
 
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, List
 
 from sqlalchemy.orm import Session
 
@@ -17,6 +18,7 @@ from app.model import (
     CodeServerStatus, TaskStatus, TaskType
 )
 from app.services.k8s import get_k8s_service
+from app.services.configcenter import get_configcenter_client
 
 logger = logging.getLogger(__name__)
 
@@ -180,28 +182,143 @@ class TaskManager:
                     del self.running_tasks[task_id]
             db.close()
 
+    @staticmethod
+    def _stringify_env_value(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float, str)):
+            return str(value)
+        return str(value)
+
+    @staticmethod
+    def _build_provider_snapshot(provider: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "provider_key": provider.get("provider_key"),
+            "display_name": provider.get("display_name"),
+            "provider_type": provider.get("provider_type"),
+            "model": provider.get("model"),
+            "api_base": provider.get("api_base"),
+            "updated_at": provider.get("updated_at"),
+            "description": provider.get("description"),
+        }
+
+    def _normalize_provider_env_bindings(self, provider: Dict[str, Any]) -> Dict[str, str]:
+        env_bindings = provider.get("env_bindings") if isinstance(provider.get("env_bindings"), dict) else {}
+        normalized: Dict[str, str] = {}
+        for key, value in env_bindings.items():
+            key_text = str(key or "").strip()
+            if not key_text or not re.match(r"^[A-Z][A-Z0-9_]*$", key_text):
+                continue
+            value_text = self._stringify_env_value(value)
+            if value_text is None:
+                continue
+            normalized[key_text] = value_text
+        return normalized
+
+    def _normalize_provider_file_bindings(self, provider: Dict[str, Any]) -> List[Dict[str, Any]]:
+        raw_items = provider.get("file_bindings") if isinstance(provider.get("file_bindings"), list) else []
+        normalized: List[Dict[str, Any]] = []
+        for index, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                continue
+            if not bool(item.get("enabled", True)):
+                continue
+            path = str(item.get("path") or "").strip()
+            content = item.get("content")
+            if not path or not path.startswith("/") or not isinstance(content, str):
+                continue
+            normalized.append({
+                "name": str(item.get("name") or f"llm-file-{index + 1}").strip() or f"llm-file-{index + 1}",
+                "path": path,
+                "content": content,
+                "format": str(item.get("format") or "other").strip().lower() or "other",
+                "enabled": True,
+            })
+        return normalized
+
     def _handle_create_task(self, task: Task, db: Session) -> str:
         """处理创建任务"""
         params = task.params or {}
         code_server_id = params.get("code_server_id")
         namespace = params.get("namespace")
         name = params.get("name")
-        custom_env = params.get("custom_env") or {}
+        custom_env = dict(params.get("custom_env") or {})
         # 注入PROJECT_ID环境变量
         custom_env["PROJECT_ID"] = task.project_id
         code_server_env = params.get("code_server_env") or {}
         image = params.get("image")  # 获取自定义镜像参数
+        llm_provider_key = str(params.get("llm_provider_key") or "").strip()
 
         k8s_service = get_k8s_service()
+        configcenter_client = get_configcenter_client()
 
         # 获取Code Server记录
         code_server = db.query(CodeServer).filter(CodeServer.id == code_server_id).first()
         if not code_server:
             raise ValueError(f"Code Server {code_server_id} 不存在")
 
+        llm_configmap_created = False
+        llm_configmap_name: Optional[str] = None
         try:
             # 更新状态
             code_server.status = CodeServerStatus.CREATING.value
+            db.commit()
+
+            deployment_custom_env: Dict[str, str] = dict(custom_env)
+            deployment_extra_env: Optional[Dict[str, str]] = None
+            llm_provider_snapshot: Dict[str, Any] = {}
+            llm_provider_mapped_env_keys: List[str] = []
+            llm_file_bindings: List[Dict[str, Any]] = []
+            llm_file_mounts: List[Dict[str, Any]] = []
+
+            if llm_provider_key:
+                provider = configcenter_client.get_llm_provider(llm_provider_key)
+                provider_env = self._normalize_provider_env_bindings(provider)
+                deployment_custom_env = dict(provider_env)
+                deployment_custom_env["PROJECT_ID"] = task.project_id
+                deployment_extra_env = dict(custom_env)
+
+                llm_provider_snapshot = self._build_provider_snapshot(provider)
+                llm_provider_mapped_env_keys = sorted(provider_env.keys())
+                llm_file_bindings = self._normalize_provider_file_bindings(provider)
+
+                if llm_file_bindings:
+                    llm_configmap_name = f"code-server-llm-{code_server_id}"[:63].rstrip("-")
+                    configmap_data: Dict[str, str] = {}
+                    for index, file_item in enumerate(llm_file_bindings):
+                        sub_path = f"file-{index + 1}"
+                        configmap_data[sub_path] = file_item["content"]
+                        llm_file_mounts.append({
+                            "path": file_item["path"],
+                            "sub_path": sub_path,
+                        })
+
+                    if not k8s_service.create_configmap(
+                        namespace=namespace,
+                        name=llm_configmap_name,
+                        data=configmap_data,
+                        labels={
+                            "app": "code-server",
+                            "code-server-id": code_server_id,
+                            "managed-by": "vscode-web-manager",
+                        },
+                    ):
+                        raise RuntimeError(f"创建LLM ConfigMap失败: {llm_configmap_name}")
+                    llm_configmap_created = True
+
+                code_server.llm_provider_key = llm_provider_key
+                code_server.llm_provider_snapshot = llm_provider_snapshot
+                code_server.llm_provider_mapped_env_keys = llm_provider_mapped_env_keys
+                code_server.llm_file_bindings = llm_file_bindings
+                code_server.llm_configmap_name = llm_configmap_name
+            else:
+                code_server.llm_provider_key = None
+                code_server.llm_provider_snapshot = {}
+                code_server.llm_provider_mapped_env_keys = []
+                code_server.llm_file_bindings = []
+                code_server.llm_configmap_name = None
             db.commit()
 
             # 1. 创建输出PVC（如果不存在）
@@ -237,9 +354,12 @@ class TaskManager:
                 code_server_id=code_server_id,
                 source_pvcs=code_server.source_pvcs or [],
                 output_pvcs=output_pvcs_config,
-                custom_env=custom_env,
+                custom_env=deployment_custom_env,
                 code_server_env=code_server_env,
-                image=image  # 传递自定义镜像参数
+                image=image,  # 传递自定义镜像参数
+                extra_env=deployment_extra_env,
+                extra_file_mounts=llm_file_mounts,
+                llm_configmap_name=llm_configmap_name
             )
             if not success:
                 raise RuntimeError(f"创建Deployment {deployment_name} 失败")
@@ -279,6 +399,8 @@ class TaskManager:
             return f"Code Server {name} 创建成功，访问地址: {code_server.access_url}"
 
         except Exception as e:
+            if llm_configmap_created and llm_configmap_name:
+                k8s_service.delete_configmap(namespace, llm_configmap_name)
             code_server.status = CodeServerStatus.ERROR.value
             db.commit()
             raise
@@ -311,6 +433,10 @@ class TaskManager:
             if code_server.deployment_name:
                 k8s_service.delete_deployment(namespace, code_server.deployment_name)
 
+            # 3.1 删除LLM ConfigMap
+            if code_server.llm_configmap_name:
+                k8s_service.delete_configmap(namespace, code_server.llm_configmap_name)
+
             # 4. 删除PVC（如果需要）
             if delete_output_pvcs:
                 for pvc_info in code_server.output_pvcs or []:
@@ -322,6 +448,7 @@ class TaskManager:
             code_server.status = CodeServerStatus.DELETED.value
             code_server.access_url = None
             code_server.pod_name = None
+            code_server.llm_configmap_name = None
             code_server.deleted_at = datetime.utcnow()
             db.commit()
 

@@ -7,6 +7,8 @@ from agent_ai_service.config import settings
 from agent_ai_service.models.agent_backend import BackendConfig
 from agent_ai_service.persistence.file_store import JsonFileStore
 
+DEFAULT_WORKDIR = '/host'
+
 
 DEFAULT_BACKENDS = {
     'claude': {
@@ -14,6 +16,7 @@ DEFAULT_BACKENDS = {
         'backend_type': 'claude',
         'command': 'claude',
         'args': [],
+        'cwd': DEFAULT_WORKDIR,
         'env': {},
         'enabled': True,
         'description': 'Claude Code CLI backend',
@@ -22,7 +25,8 @@ DEFAULT_BACKENDS = {
         'name': 'codex',
         'backend_type': 'codex',
         'command': 'codex',
-        'args': [],
+        'args': ['exec'],
+        'cwd': DEFAULT_WORKDIR,
         'env': {},
         'enabled': False,
         'description': 'OpenAI Codex CLI backend',
@@ -32,11 +36,20 @@ DEFAULT_BACKENDS = {
         'backend_type': 'opencode',
         'command': 'opencode',
         'args': [],
+        'cwd': DEFAULT_WORKDIR,
         'env': {},
         'enabled': False,
         'description': 'OpenCode CLI backend',
     },
 }
+
+def _normalize_backend_args(backend_type: Any, args: Any) -> List[str]:
+    normalized = [str(item) for item in (args or []) if str(item).strip()]
+    backend = str(backend_type or '').strip().lower()
+    # Codex CLI 在 helper 的非 TTY 调用场景下应走 `codex exec <prompt>`
+    if backend == 'codex' and not normalized:
+        return ['exec']
+    return normalized
 
 
 class BackendRegistry:
@@ -63,6 +76,19 @@ class BackendRegistry:
             if name not in data['backends']:
                 data['backends'][name] = deepcopy(cfg)
                 changed = True
+        # 所有 AI Agent 默认工作目录统一为 /host；保留已有显式配置
+        for name, cfg in list(data.get('backends', {}).items()):
+            if not isinstance(cfg, dict):
+                continue
+            if not str(cfg.get('cwd') or '').strip():
+                cfg['cwd'] = DEFAULT_WORKDIR
+                data['backends'][name] = cfg
+                changed = True
+            normalized_args = _normalize_backend_args(cfg.get('backend_type', name), cfg.get('args', []))
+            if normalized_args != list(cfg.get('args', []) or []):
+                cfg['args'] = normalized_args
+                data['backends'][name] = cfg
+                changed = True
         if data.get('default_backend') == 'claude-a2a':
             data['default_backend'] = settings.agent_default_backend if settings.agent_default_backend in data['backends'] else 'claude'
             changed = True
@@ -79,18 +105,22 @@ class BackendRegistry:
         data = self.store.read()
         backends = data.setdefault('backends', {})
         existing = backends.get(name, {})
+        requested_cwd = payload.get('cwd', existing.get('cwd', DEFAULT_WORKDIR))
+        normalized_cwd = str(requested_cwd or '').strip() or DEFAULT_WORKDIR
+        normalized_backend_type = payload.get('backend_type', existing.get('backend_type', existing.get('name', name)))
+        normalized_args = _normalize_backend_args(normalized_backend_type, payload.get('args', existing.get('args', [])))
         merged = {
             **existing,
             'name': name,
-            'backend_type': payload.get('backend_type', existing.get('backend_type', existing.get('name', name))),
+            'backend_type': normalized_backend_type,
             'command': payload.get(
                 'command',
-                existing.get('command', payload.get('backend_type', existing.get('backend_type', name)))
+                existing.get('command', normalized_backend_type)
             ),
-            'args': payload.get('args', existing.get('args', [])),
+            'args': normalized_args,
             'env': payload.get('env', existing.get('env', {})),
             'enabled': bool(payload.get('enabled', existing.get('enabled', True))),
-            'cwd': payload.get('cwd', existing.get('cwd')),
+            'cwd': normalized_cwd,
             'description': payload.get('description', existing.get('description', '')),
             'llm_provider_key': payload.get('llm_provider_key', existing.get('llm_provider_key')),
             'llm_provider_snapshot': payload.get('llm_provider_snapshot', existing.get('llm_provider_snapshot')),
@@ -145,7 +175,7 @@ class BackendRegistry:
             args=list(cfg.get('args', []) or []),
             env=dict(cfg.get('env', {}) or {}),
             enabled=bool(cfg.get('enabled', True)),
-            cwd=cfg.get('cwd'),
+            cwd=str(cfg.get('cwd') or '').strip() or DEFAULT_WORKDIR,
             description=cfg.get('description', ''),
         )
 

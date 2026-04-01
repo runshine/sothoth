@@ -7,6 +7,14 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 
+class LlmProviderFileBinding(BaseModel):
+    name: str
+    path: str
+    content: str
+    format: str = "other"
+    enabled: bool = True
+
+
 # ============ PVC相关Schema ============
 
 class PVCMount(BaseModel):
@@ -52,6 +60,7 @@ class CodeServerCreateRequest(BaseModel):
     code_server_env: Optional[Dict[str, Any]] = Field(None, description="Code Server镜像环境变量配置（PUID, PGID, TZ, PASSWORD, SUDO_PASSWORD等）")
     # 自定义镜像
     image: Optional[str] = Field(None, description="自定义镜像地址，使用特定镜像创建Code Server")
+    llm_provider_key: Optional[str] = Field(None, description="可选，配置中心 LLM Provider Key")
 
 
 class CodeServerDeleteRequest(BaseModel):
@@ -80,6 +89,11 @@ class CodeServerResponse(BaseModel):
     pod_name: Optional[str]
     access_url: Optional[str]
     code_server_env: Optional[Dict[str, Any]] = None  # Code Server环境变量
+    llm_provider_key: Optional[str] = None
+    llm_provider_snapshot: Optional[Dict[str, Any]] = None
+    llm_provider_mapped_env_keys: List[str] = Field(default_factory=list)
+    llm_file_bindings: List[LlmProviderFileBinding] = Field(default_factory=list)
+    llm_configmap_name: Optional[str] = None
     description: Optional[str]
     created_at: Optional[str]
     updated_at: Optional[str]

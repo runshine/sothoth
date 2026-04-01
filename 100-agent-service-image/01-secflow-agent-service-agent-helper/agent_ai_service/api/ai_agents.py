@@ -190,9 +190,18 @@ def create_ai_agent_session():
 
 @bp.get('/api/ai-agents/sessions')
 def list_ai_agent_sessions():
+    sessions = a2a.session_store.list()
+    normalized = []
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        payload = dict(session)
+        if payload.get('backend_pid') is None:
+            payload['backend_pid'] = payload.get('pty_pid')
+        normalized.append(payload)
     return jsonify({
-        'items': a2a.session_store.list(),
-        'total': len(a2a.session_store.list()),
+        'items': normalized,
+        'total': len(normalized),
     })
 
 
@@ -201,13 +210,18 @@ def get_ai_agent_session(session_id: str):
     session = a2a.session_store.get(session_id)
     if not session:
         return jsonify({'error': 'session not found'}), 404
+    if isinstance(session, dict) and session.get('backend_pid') is None:
+        session = {
+            **session,
+            'backend_pid': session.get('pty_pid'),
+        }
     return jsonify(session)
 
 
 @bp.delete('/api/ai-agents/sessions/<session_id>')
 def delete_ai_agent_session(session_id: str):
     try:
-        deleted = a2a.session_store.delete(session_id)
+        deleted = a2a.delete_session(session_id)
         return jsonify({
             'session_id': session_id,
             'deleted': True,

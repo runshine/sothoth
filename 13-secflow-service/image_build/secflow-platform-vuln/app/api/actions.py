@@ -11,7 +11,15 @@ from app.api.dependencies import ensure_project_access, get_current_subject
 from app.config import get_config
 from app.models.database import ActionExecution, Case, CaseEvent, Result, get_db
 from app.schemas import ActionCallbackRequest, ActionControlRequest
-from app.services.lifecycle_engine import apply_action_result
+from app.services.lifecycle_engine import (
+    MAIN_STAGE_TRIAGE,
+    MAIN_STAGE_VALIDATION,
+    TRIAGE_STATUS_AI_ASSESSING,
+    VALIDATION_STATUS_QUEUED,
+    get_lifecycle_state,
+    set_lifecycle_state,
+    apply_action_result,
+)
 
 router = APIRouter(prefix="/api/vuln/actions", tags=["actions"])
 
@@ -125,7 +133,13 @@ async def control_action(
         action.started_at = datetime.utcnow()
         action.retry_count = (action.retry_count or 0) + 1
         action.timeout_at = datetime.utcnow() + timedelta(seconds=get_config().engine.action_timeout_default)
-        case.current_status = "waiting_external"
+        lifecycle = get_lifecycle_state(case)
+        if case.current_stage == MAIN_STAGE_TRIAGE:
+            lifecycle["stage_status"] = TRIAGE_STATUS_AI_ASSESSING
+        elif case.current_stage == MAIN_STAGE_VALIDATION:
+            lifecycle["stage_status"] = VALIDATION_STATUS_QUEUED
+        set_lifecycle_state(case, lifecycle)
+        case.current_status = lifecycle.get("stage_status", case.current_status)
     elif operation == "cancel":
         action.execution_status = "cancelled"
         action.dispatch_status = "acknowledged"

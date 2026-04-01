@@ -12,4 +12,5 @@ kubectl rollout restart deployment/secflow-platform-fileserver -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-project -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-resource -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-static-binary -n secflow-ns
+kubectl rollout restart deployment/secflow-platform-system-analysis -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-workflow -n secflow-ns

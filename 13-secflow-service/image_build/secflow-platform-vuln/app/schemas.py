@@ -248,6 +248,12 @@ class CaseResponse(BaseModel):
     current_stage: str
     current_status: str
     decision_status: str
+    triage_decision: Optional[str] = None
+    triage_gate: Optional[str] = None
+    triage_round: Optional[int] = None
+    triage_history: list[dict[str, Any]] = Field(default_factory=list)
+    validation_result: Optional[str] = None
+    finished_reason: Optional[str] = None
     created_by_type: str
     created_by: Optional[str]
     created_at: datetime
@@ -257,11 +263,37 @@ class CaseResponse(BaseModel):
 class StageTransitionRequest(BaseModel):
     to_stage: str
     reason: Optional[str] = None
+    finished_reason: Optional[Literal["vulnerable", "non_vulnerable", "inconclusive", "non_issue", "observe", "manual_terminated"]] = None
+    summary: Optional[str] = None
 
 
 class DecisionRequest(BaseModel):
     decision_status: str
     summary: Optional[str] = None
+
+
+class TriageDecisionRequest(BaseModel):
+    triage_decision: Literal["issue", "non_issue", "observe"]
+    summary: Optional[str] = None
+
+
+class TriageGateRequest(BaseModel):
+    triage_gate: Literal["pending", "approved_to_validation", "rejected_to_validation"]
+    summary: Optional[str] = None
+
+
+class TriageRoundStartRequest(BaseModel):
+    summary: Optional[str] = None
+
+
+class ValidationResultRequest(BaseModel):
+    validation_result: Literal["vulnerable", "not_vulnerable", "inconclusive"]
+    summary: Optional[str] = None
+
+
+class FinishCaseRequest(BaseModel):
+    finished_reason: Literal["vulnerable", "non_vulnerable", "inconclusive", "non_issue", "observe", "manual_terminated"]
+    summary: str
 
 
 class ManualTaskCreateRequest(BaseModel):

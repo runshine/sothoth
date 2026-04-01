@@ -62,6 +62,18 @@ class AuthServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}{self.validate_token_path}"
 
 
+class ConfigCenterServiceConfig(BaseModel):
+    """配置中心服务配置"""
+    enabled: bool = True
+    host: str = "secflow-platform-configcenter"
+    port: int = 80
+    timeout: int = 30
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}/api/configcenter"
+
+
 class CodeServerResources(BaseModel):
     """Code Server资源限制"""
     cpu: str = "100m"
@@ -167,6 +179,7 @@ class Config(BaseModel):
     kubernetes: KubernetesConfig = Field(default_factory=KubernetesConfig)
     k8s_service: K8sServiceConfig = Field(default_factory=K8sServiceConfig)
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
+    configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
     code_server: CodeServerConfig = Field(default_factory=CodeServerConfig)
     pvc: PVCConfig = Field(default_factory=PVCConfig)
     ingress: IngressConfig = Field(default_factory=IngressConfig)

@@ -1,7 +1,7 @@
 {
   "project_id": "44f9029d00650a10",
   "report_id": "cli-demo-001",
-  "title": "Anonymous CLI suspicion submission",
+  "title": "Authenticated CLI suspicion submission",
   "summary": "Discovered by CLI automation pipeline",
   "severity": "high",
   "cvss_score": 8.2,

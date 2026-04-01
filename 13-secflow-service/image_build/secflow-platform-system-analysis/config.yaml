@@ -1,0 +1,68 @@
+# SecFlow System Analysis Service Configuration
+
+database:
+  host: "172.31.30.100"
+  port: 3306
+  username: "secflow"
+  password: "Huawei12#$"
+  name: "secflow"
+  table_prefix: "secflow_"
+  pool_size: 10
+  max_overflow: 20
+
+auth_service:
+  host: "192.168.12.44"
+  port: 10000
+  validate_token_path: "/api/auth/validate-token"
+  service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+  timeout: 10
+  token_cache_enabled: true
+  token_cache_ttl_minutes: 15
+
+agent_service:
+  base_url: "http://secflow-platform-agent:80"
+  timeout: 30
+
+registry:
+  enabled: true
+  menu_service_url: "http://secflow-platform-menu:80"
+  service_id: "secflow-platform-system-analysis"
+  service_name: "系统分析服务"
+  host: "0.0.0.0"
+  port: 10011
+  maturity: "开发中"
+  description: "提供测试环境自动化分析能力"
+  api_prefix: "/api/system-analysis"
+  unregister_on_shutdown: false
+  heartbeat_interval_seconds: 30
+  menu:
+    id: "system-analysis"
+    path: "/system-analysis"
+    icon: "activity"
+    order: 7
+    level1:
+      name: "环境服务"
+      name_en: "Environment"
+    level2:
+      name: "系统分析"
+      name_en: "System Analysis"
+    level3:
+      name: ""
+      name_en: ""
+
+service:
+  worker_poll_interval_seconds: 1
+  default_timeout_seconds: 600
+  default_max_concurrency: 5
+  max_timeout_seconds: 7200
+  max_concurrency_limit: 50
+
+app:
+  host: "0.0.0.0"
+  port: 10011
+  debug: false
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+

@@ -133,6 +133,11 @@ def make_code_server_response(server: CodeServer, realtime_status: str = None) -
         pod_name=server.pod_name,
         access_url=server.access_url,
         code_server_env=server.code_server_env or {},
+        llm_provider_key=server.llm_provider_key,
+        llm_provider_snapshot=server.llm_provider_snapshot or {},
+        llm_provider_mapped_env_keys=server.llm_provider_mapped_env_keys or [],
+        llm_file_bindings=server.llm_file_bindings or [],
+        llm_configmap_name=server.llm_configmap_name,
         description=server.description,
         created_at=server.created_at.isoformat() if server.created_at else None,
         updated_at=server.updated_at.isoformat() if server.updated_at else None
@@ -220,7 +225,8 @@ async def create_code_server(
             "storage_size": p.storage_size
         } for p in request.output_pvcs],
         custom_env=request.custom_env or {},
-        code_server_env=request.code_server_env or {}
+        code_server_env=request.code_server_env or {},
+        llm_provider_key=(request.llm_provider_key or "").strip() or None
     )
     db.add(code_server)
     db.commit()
@@ -233,7 +239,8 @@ async def create_code_server(
         "name": request.name,
         "custom_env": request.custom_env,
         "code_server_env": request.code_server_env,
-        "image": request.image  # 传递自定义镜像参数
+        "image": request.image,  # 传递自定义镜像参数
+        "llm_provider_key": (request.llm_provider_key or "").strip() or None
     }
     task = task_manager.create_task(
         project_id=project_id,

@@ -17,6 +17,11 @@ class SessionStore:
         backend: str,
         metadata: Optional[Dict[str, Any]] = None,
         agent_ids: Optional[List[str]] = None,
+        status: str = 'ready',
+        pty_pid: Optional[int] = None,
+        backend_pid: Optional[int] = None,
+        pty_started_at: Optional[str] = None,
+        last_error: Optional[str] = None,
     ) -> Dict[str, Any]:
         data = self.store.read()
         session_id = uuid.uuid4().hex
@@ -28,12 +33,27 @@ class SessionStore:
             'session_id': session_id,
             'backend': backend,
             'agent_ids': normalized_agent_ids,
+            'status': status,
+            'pty_pid': pty_pid,
+            'backend_pid': backend_pid if backend_pid is not None else pty_pid,
+            'pty_started_at': pty_started_at,
+            'last_error': last_error,
             'messages': [],
             'metadata': metadata or {},
             'created_at': now,
             'updated_at': now,
         }
         data['sessions'][session_id] = session
+        self.store.write(data)
+        return session
+
+    def patch(self, session_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+        data = self.store.read()
+        session = data.get('sessions', {}).get(session_id)
+        if not session:
+            raise KeyError(session_id)
+        session.update(updates or {})
+        session['updated_at'] = datetime.now(timezone.utc).isoformat()
         self.store.write(data)
         return session
 
