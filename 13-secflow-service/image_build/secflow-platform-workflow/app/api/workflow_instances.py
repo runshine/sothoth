@@ -80,8 +80,8 @@ async def resolve_project_file_mounts(
 
     pvc_name = storage_info.get("pvc_name")
     mount_strategy = (config.fileserver_service.project_mount_strategy or "pvc").strip().lower()
-    nfs_server = (config.fileserver_service.project_mount_nfs_server or "").strip()
-    nfs_base_path = (config.fileserver_service.project_mount_nfs_base_path or "").rstrip("/")
+    nfs_server = (storage_info.get("nfs_server") or config.fileserver_service.project_mount_nfs_server or "").strip()
+    nfs_base_path = (storage_info.get("nfs_base_path") or config.fileserver_service.project_mount_nfs_base_path or "").rstrip("/")
 
     if mount_strategy == "pvc":
         if not pvc_name:

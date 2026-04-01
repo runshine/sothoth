@@ -13,6 +13,8 @@ class SuccessResponse(BaseModel):
 class StoragePVCResponse(BaseModel):
     mount_path: str
     pvc_name: Optional[str]
+    nfs_server: Optional[str] = None
+    nfs_base_path: Optional[str] = None
 
 
 class TokenUser(BaseModel):
