@@ -6,10 +6,16 @@ from agent_ai_service.a2a.router import A2AService
 from agent_ai_service.a2a.session_store import SessionStore
 from agent_ai_service.config import settings
 from agent_ai_service.api.backends import runtime
+from agent_ai_service.services.session_pipe_manager import SessionPipeManager
 from agent_ai_service.services.session_pty_manager import SessionPtyManager
 
 bp = Blueprint('a2a', __name__)
-a2a = A2AService(runtime, SessionStore(), SessionPtyManager(settings.state_dir))
+a2a = A2AService(
+    runtime,
+    SessionStore(),
+    SessionPtyManager(settings.state_dir),
+    SessionPipeManager(settings.state_dir),
+)
 
 
 @bp.get('/api/a2a/discovery')

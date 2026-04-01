@@ -1,3 +1,6 @@
+import os
+from datetime import datetime, timezone
+
 from flask import Blueprint, Response, jsonify, request
 
 from agent_ai_service.api.backends import runtime
@@ -181,6 +184,17 @@ def get_ai_agent_capabilities(agent_id: str):
         return jsonify({'error': 'ai agent not found'}), 404
 
 
+@bp.get('/api/ai-agents/helper-env')
+def get_helper_runtime_env():
+    env_payload = {str(key): str(value) for key, value in os.environ.items()}
+    return jsonify({
+        'pid': os.getpid(),
+        'count': len(env_payload),
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+        'env': env_payload,
+    })
+
+
 @bp.post('/api/ai-agents/sessions')
 def create_ai_agent_session():
     payload = request.get_json(silent=True) or {}
@@ -196,6 +210,10 @@ def list_ai_agent_sessions():
         if not isinstance(session, dict):
             continue
         payload = dict(session)
+        session_mode = str(payload.get('session_mode') or '').strip().lower()
+        if session_mode not in ('pipe', 'pty', 'invoke'):
+            session_mode = 'pty'
+        payload['session_mode'] = session_mode
         if payload.get('backend_pid') is None:
             payload['backend_pid'] = payload.get('pty_pid')
         normalized.append(payload)
@@ -210,11 +228,16 @@ def get_ai_agent_session(session_id: str):
     session = a2a.session_store.get(session_id)
     if not session:
         return jsonify({'error': 'session not found'}), 404
-    if isinstance(session, dict) and session.get('backend_pid') is None:
+    if isinstance(session, dict):
+        session_mode = str(session.get('session_mode') or '').strip().lower()
+        if session_mode not in ('pipe', 'pty', 'invoke'):
+            session_mode = 'pty'
         session = {
             **session,
-            'backend_pid': session.get('pty_pid'),
+            'session_mode': session_mode,
         }
+        if session.get('backend_pid') is None:
+            session['backend_pid'] = session.get('pty_pid')
     return jsonify(session)
 
 

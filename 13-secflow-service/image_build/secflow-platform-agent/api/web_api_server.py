@@ -4199,6 +4199,28 @@ class WebAPIServer:
                 self.logger.error(f"AI helper Agent env代理失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/helper-env', methods=['GET'])
+        def ai_helper_runtime_env(agent_key, service_name):
+            project_id = str(request.args.get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            try:
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'GET',
+                    '/api/ai-agents/helper-env',
+                    None,
+                    timeout=(5, 20),
+                )
+                return jsonify(data), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"AI helper运行环境变量代理失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/sessions', methods=['GET', 'POST'])
         def ai_helper_sessions(agent_key, service_name):
             payload = request.get_json(silent=True) or {}
@@ -4443,6 +4465,9 @@ class WebAPIServer:
                     for session in session_list:
                         if not isinstance(session, dict):
                             continue
+                        session_mode = str(session.get('session_mode') or '').strip().lower()
+                        if session_mode not in ('pipe', 'pty', 'invoke'):
+                            session_mode = 'pty'
                         status = str(session.get('status') or 'unknown').strip().lower()
                         backend = str(session.get('backend') or '').strip()
                         agent_ids = _normalize_session_agent_ids(session)
@@ -4455,9 +4480,14 @@ class WebAPIServer:
                         if backend_pid is None:
                             backend_pid = pty_pid
                         if status == 'ready':
-                            has_pty_pid = isinstance(pty_pid, int) and pty_pid > 0
-                            if not has_pty_pid:
-                                invalid_reasons.append('pty_missing')
+                            if session_mode == 'pipe':
+                                has_backend_pid = isinstance(backend_pid, int) and backend_pid > 0
+                                if not has_backend_pid:
+                                    invalid_reasons.append('backend_pid_missing')
+                            elif session_mode == 'pty':
+                                has_pty_pid = isinstance(pty_pid, int) and pty_pid > 0
+                                if not has_pty_pid:
+                                    invalid_reasons.append('pty_missing')
 
                         if backend and backend not in helper_agent_id_set:
                             invalid_reasons.append('backend_not_found_in_helper_agents')
@@ -4473,6 +4503,7 @@ class WebAPIServer:
                             'backend': backend or None,
                             'agent_ids': agent_ids,
                             'status': session.get('status'),
+                            'session_mode': session_mode,
                             'pty_pid': pty_pid,
                             'backend_pid': backend_pid,
                             'pty_started_at': session.get('pty_started_at'),
@@ -4686,6 +4717,7 @@ class WebAPIServer:
                     helper_payload = {
                         'agent_id': helper_request.get('agent_id'),
                         'agent_ids': helper_request.get('agent_ids') or payload.get('agent_ids'),
+                        'session_mode': helper_request.get('session_mode') or payload.get('session_mode'),
                         'metadata': payload.get('metadata') or {},
                     }
                     try:

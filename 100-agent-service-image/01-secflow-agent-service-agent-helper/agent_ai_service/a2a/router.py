@@ -7,14 +7,22 @@ from typing import Any, Dict
 from agent_ai_service.config import settings
 from agent_ai_service.a2a.session_store import SessionStore
 from agent_ai_service.services.backend_runtime import BackendRuntimeService
+from agent_ai_service.services.session_pipe_manager import SessionPipeManager
 from agent_ai_service.services.session_pty_manager import SessionPtyManager
 
 
 class A2AService:
-    def __init__(self, backend_runtime: BackendRuntimeService, session_store: SessionStore, session_pty_manager: SessionPtyManager):
+    def __init__(
+        self,
+        backend_runtime: BackendRuntimeService,
+        session_store: SessionStore,
+        session_pty_manager: SessionPtyManager,
+        session_pipe_manager: SessionPipeManager,
+    ):
         self.backend_runtime = backend_runtime
         self.session_store = session_store
         self.session_pty_manager = session_pty_manager
+        self.session_pipe_manager = session_pipe_manager
 
     def discovery(self) -> Dict[str, Any]:
         backends = self.backend_runtime.list_backends()
@@ -37,6 +45,18 @@ class A2AService:
             return [agent_id]
         default_backend = self.backend_runtime.list_backends().get('default_backend')
         return [str(default_backend).strip()] if default_backend else []
+
+    def _resolve_session_mode(self, value: Any, default: str = 'pipe') -> str:
+        text = str(value or '').strip().lower()
+        if text == 'once':
+            return 'invoke'
+        if text in ('pipe', 'pty', 'invoke'):
+            return text
+        return default
+
+    def _session_mode(self, session: Dict[str, Any]) -> str:
+        # Backward compatibility: old sessions without session_mode are treated as PTY sessions.
+        return self._resolve_session_mode(session.get('session_mode'), default='pty')
 
     def _invoke_for_agents(self, agent_ids: list[str], prompt: str, messages: list[dict[str, Any]] | None = None) -> Dict[str, Any]:
         results = []
@@ -70,10 +90,12 @@ class A2AService:
     def create_session(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         agent_ids = self._resolve_agent_ids(payload)
         backend = agent_ids[0] if agent_ids else self.backend_runtime.list_backends().get('default_backend')
+        session_mode = self._resolve_session_mode(payload.get('session_mode'), default='pipe')
         session = self.session_store.create(
             backend=backend,
             metadata=payload.get('metadata') or {},
             agent_ids=agent_ids[:1],
+            session_mode=session_mode,
         )
         if not backend:
             return self.session_store.patch(session['session_id'], {
@@ -82,12 +104,32 @@ class A2AService:
             })
         try:
             model = self.backend_runtime.registry.to_model(str(backend))
-            pty_state = self.session_pty_manager.create_session_pty(session['session_id'], model)
+            if session_mode == 'pty':
+                pty_state = self.session_pty_manager.create_session_pty(session['session_id'], model)
+                return self.session_store.patch(session['session_id'], {
+                    'session_mode': 'pty',
+                    'status': 'ready',
+                    'pty_pid': pty_state.get('pid'),
+                    'backend_pid': pty_state.get('pid'),
+                    'pty_started_at': pty_state.get('started_at'),
+                    'last_error': None,
+                })
+            if session_mode == 'pipe':
+                pipe_state = self.session_pipe_manager.create_session_pipe(session['session_id'], model)
+                return self.session_store.patch(session['session_id'], {
+                    'session_mode': 'pipe',
+                    'status': 'ready',
+                    'pty_pid': None,
+                    'backend_pid': pipe_state.get('pid'),
+                    'pty_started_at': pipe_state.get('started_at'),
+                    'last_error': None,
+                })
             return self.session_store.patch(session['session_id'], {
+                'session_mode': 'invoke',
                 'status': 'ready',
-                'pty_pid': pty_state.get('pid'),
-                'backend_pid': pty_state.get('pid'),
-                'pty_started_at': pty_state.get('started_at'),
+                'pty_pid': None,
+                'backend_pid': None,
+                'pty_started_at': None,
                 'last_error': None,
             })
         except Exception as exc:
@@ -99,34 +141,74 @@ class A2AService:
                 'pty_started_at': None,
             })
 
-    def _ensure_session_pty(self, session: Dict[str, Any], allow_recreate: bool = True) -> Dict[str, Any]:
+    def _ensure_session_runtime(self, session: Dict[str, Any], allow_recreate: bool = True) -> Dict[str, Any]:
         session_id = str(session.get('session_id') or '')
         backend = str(session.get('backend') or '')
+        mode = self._session_mode(session)
         if not session_id:
             raise RuntimeError('session_id missing')
         if not backend:
             raise RuntimeError('no backend configured')
-        if self.session_pty_manager.is_alive(session_id):
-            pid = self.session_pty_manager.get_pid(session_id)
+
+        if mode == 'pty':
+            if self.session_pty_manager.is_alive(session_id):
+                pid = self.session_pty_manager.get_pid(session_id)
+                return self.session_store.patch(session_id, {
+                    'session_mode': 'pty',
+                    'status': 'ready',
+                    'pty_pid': pid,
+                    'backend_pid': pid,
+                    'last_error': None,
+                })
+            if not allow_recreate:
+                raise RuntimeError('session PTY is not running')
+            model = self.backend_runtime.registry.to_model(backend)
+            pty_state = self.session_pty_manager.create_session_pty(session_id, model)
             return self.session_store.patch(session_id, {
+                'session_mode': 'pty',
                 'status': 'ready',
-                'pty_pid': pid,
-                'backend_pid': pid,
+                'pty_pid': pty_state.get('pid'),
+                'backend_pid': pty_state.get('pid'),
+                'pty_started_at': pty_state.get('started_at'),
                 'last_error': None,
             })
-        if not allow_recreate:
-            raise RuntimeError('session PTY is not running')
-        model = self.backend_runtime.registry.to_model(backend)
-        pty_state = self.session_pty_manager.create_session_pty(session_id, model)
+
+        if mode == 'pipe':
+            if self.session_pipe_manager.is_alive(session_id):
+                pid = self.session_pipe_manager.get_pid(session_id)
+                return self.session_store.patch(session_id, {
+                    'session_mode': 'pipe',
+                    'status': 'ready',
+                    'pty_pid': None,
+                    'backend_pid': pid,
+                    'last_error': None,
+                })
+            if not allow_recreate:
+                raise RuntimeError('session PIPE is not running')
+            model = self.backend_runtime.registry.to_model(backend)
+            pipe_state = self.session_pipe_manager.create_session_pipe(session_id, model)
+            return self.session_store.patch(session_id, {
+                'session_mode': 'pipe',
+                'status': 'ready',
+                'pty_pid': None,
+                'backend_pid': pipe_state.get('pid'),
+                'pty_started_at': pipe_state.get('started_at'),
+                'last_error': None,
+            })
+
         return self.session_store.patch(session_id, {
+            'session_mode': 'invoke',
             'status': 'ready',
-            'pty_pid': pty_state.get('pid'),
-            'pty_started_at': pty_state.get('started_at'),
+            'pty_pid': None,
+            'backend_pid': None,
             'last_error': None,
         })
 
-    def _mark_session_broken(self, session_id: str, error_message: str) -> Dict[str, Any]:
-        self.session_pty_manager.mark_broken(session_id, error_message)
+    def _mark_session_broken(self, session_id: str, error_message: str, mode: str = 'pty') -> Dict[str, Any]:
+        if mode == 'pipe':
+            self.session_pipe_manager.mark_broken(session_id, error_message)
+        elif mode == 'pty':
+            self.session_pty_manager.mark_broken(session_id, error_message)
         return self.session_store.patch(session_id, {
             'status': 'broken',
             'last_error': str(error_message or ''),
@@ -134,7 +216,16 @@ class A2AService:
         })
 
     def delete_session(self, session_id: str) -> Dict[str, Any]:
+        session = self.session_store.get(session_id)
+        mode = self._session_mode(session or {}) if isinstance(session, dict) else 'pty'
+        if mode == 'pipe':
+            self.session_pipe_manager.close_session_pipe(session_id)
+        elif mode == 'pty':
+            self.session_pty_manager.close_session_pty(session_id)
+        # Best effort cleanup of the other runtime store in case of historical mismatch.
         self.session_pty_manager.close_session_pty(session_id)
+        self.session_pipe_manager.close_session_pipe(session_id)
+
         deleted = self.session_store.delete(session_id)
         deleted['status'] = 'closed'
         deleted['pty_pid'] = None
@@ -146,22 +237,41 @@ class A2AService:
         content = payload.get('content', '')
         session = self.session_store.append_message(session_id, role, content)
         backend = str(session.get('backend') or '')
+        mode = self._session_mode(session)
         agent_ids = session.get('agent_ids') or ([backend] if backend else [])
         agent_ids = agent_ids[:1]
         try:
-            session = self._ensure_session_pty(session, allow_recreate=True)
-            self.session_pty_manager.write_stdin(session_id, str(content), append_newline=True)
-            round_result = self.session_pty_manager.read_until_idle(
-                session_id,
-                quiet_window_ms=settings.session_pty_quiet_window_ms,
-                max_window_ms=settings.session_pty_max_window_ms,
-            )
+            session = self._ensure_session_runtime(session, allow_recreate=True)
+            if mode == 'pipe':
+                self.session_pipe_manager.write_stdin(session_id, str(content), append_newline=True)
+                round_result = self.session_pipe_manager.read_until_idle(
+                    session_id,
+                    quiet_window_ms=settings.session_pty_quiet_window_ms,
+                    max_window_ms=settings.session_pty_max_window_ms,
+                )
+            elif mode == 'pty':
+                self.session_pty_manager.write_stdin(session_id, str(content), append_newline=True)
+                round_result = self.session_pty_manager.read_until_idle(
+                    session_id,
+                    quiet_window_ms=settings.session_pty_quiet_window_ms,
+                    max_window_ms=settings.session_pty_max_window_ms,
+                )
+            else:
+                invoke_result = self.backend_runtime.invoke_backend(backend, prompt=str(content), messages=session.get('messages') or [])
+                round_result = {
+                    'output': invoke_result.get('stdout') or invoke_result.get('error') or invoke_result.get('stderr') or '',
+                    'pid': None,
+                    'alive': False,
+                    'timed_out': False,
+                    'raw': invoke_result,
+                }
             assistant_content = str(round_result.get('output') or '').strip()
             self.session_store.append_message(session_id, 'assistant', assistant_content)
             session = self.session_store.patch(session_id, {
                 'status': 'ready',
-                'pty_pid': round_result.get('pid'),
-                'backend_pid': round_result.get('pid'),
+                'session_mode': mode,
+                'pty_pid': round_result.get('pid') if mode == 'pty' else None,
+                'backend_pid': round_result.get('pid') if mode in ('pty', 'pipe') else None,
                 'last_error': None,
             })
             result = {
@@ -179,7 +289,7 @@ class A2AService:
                 }],
             }
         except Exception as exc:
-            session = self._mark_session_broken(session_id, str(exc))
+            session = self._mark_session_broken(session_id, str(exc), mode=mode)
             error_text = str(exc)
             self.session_store.append_message(session_id, 'assistant', error_text)
             result = {
@@ -206,6 +316,7 @@ class A2AService:
         content = str(payload.get('content') or '')
         session = self.session_store.append_message(session_id, role, content)
         backend = str(session.get('backend') or '')
+        mode = self._session_mode(session)
         agent_ids = session.get('agent_ids') or ([backend] if backend else [])
         agent_ids = agent_ids[:1]
         if not agent_ids:
@@ -227,14 +338,39 @@ class A2AService:
         assistant_text_parts = []
         final_result = None
         try:
-            session = self._ensure_session_pty(session, allow_recreate=True)
-            self.session_pty_manager.write_stdin(session_id, content, append_newline=True)
+            session = self._ensure_session_runtime(session, allow_recreate=True)
+            if mode == 'pipe':
+                self.session_pipe_manager.write_stdin(session_id, content, append_newline=True)
+                stream_iter = self.session_pipe_manager.stream_round(
+                    session_id,
+                    quiet_window_ms=settings.session_pty_quiet_window_ms,
+                    max_window_ms=settings.session_pty_max_window_ms,
+                )
+            elif mode == 'pty':
+                self.session_pty_manager.write_stdin(session_id, content, append_newline=True)
+                stream_iter = self.session_pty_manager.stream_round(
+                    session_id,
+                    quiet_window_ms=settings.session_pty_quiet_window_ms,
+                    max_window_ms=settings.session_pty_max_window_ms,
+                )
+            else:
+                def _invoke_stream():
+                    for event in self.backend_runtime.invoke_backend_stream(backend, prompt=content, messages=session.get('messages') or []):
+                        event_type = str(event.get('type') or '')
+                        if event_type == 'chunk':
+                            yield {
+                                'type': 'chunk',
+                                'text': str(event.get('text') or ''),
+                                'source': event.get('source') or 'stdout',
+                            }
+                        elif event_type == 'done':
+                            yield {'type': 'done', 'pid': None, 'timed_out': False, 'raw': event}
+                        elif event_type == 'error':
+                            raise RuntimeError(str(event.get('error') or 'backend invoke stream failed'))
+                stream_iter = _invoke_stream()
+
             stream_done = {'timed_out': False, 'pid': None}
-            for event in self.session_pty_manager.stream_round(
-                session_id,
-                quiet_window_ms=settings.session_pty_quiet_window_ms,
-                max_window_ms=settings.session_pty_max_window_ms,
-            ):
+            for event in stream_iter:
                 event_type = str(event.get('type') or '')
                 if event_type == 'chunk':
                     text = str(event.get('text') or '')
@@ -256,8 +392,9 @@ class A2AService:
             self.session_store.append_message(session_id, 'assistant', assistant_content)
             session = self.session_store.patch(session_id, {
                 'status': 'ready',
-                'pty_pid': stream_done.get('pid'),
-                'backend_pid': stream_done.get('pid'),
+                'session_mode': mode,
+                'pty_pid': stream_done.get('pid') if mode == 'pty' else None,
+                'backend_pid': stream_done.get('pid') if mode in ('pty', 'pipe') else None,
                 'last_error': None,
             })
             final_result = {
@@ -276,7 +413,7 @@ class A2AService:
             }
         except Exception as exc:
             error_message = str(exc)
-            session = self._mark_session_broken(session_id, error_message)
+            session = self._mark_session_broken(session_id, error_message, mode=mode)
             self.session_store.append_message(session_id, 'assistant', error_message)
             err_payload = {
                 'type': 'error',
