@@ -178,7 +178,7 @@ class K8SServiceClient:
         # 构建容器列表
         k8s_containers = []
         volumes = []
-        pvc_volumes = {}
+        attached_volumes = {}
         volume_index = 0
 
         for idx, container in enumerate(containers):
@@ -203,22 +203,36 @@ class K8SServiceClient:
             # 构建卷挂载
             container_mounts = []
             for vm in container.get("volume_mounts", []):
-                pvc_name = vm.get("pvc_name")
                 mount_path = vm.get("mount_path")
-                if not pvc_name or not mount_path:
+                volume_type = vm.get("volume_type", "pvc")
+                if not mount_path:
                     continue
 
-                if pvc_name not in pvc_volumes:
+                if volume_type == "nfs":
+                    nfs_server = vm.get("nfs_server")
+                    nfs_path = vm.get("nfs_path")
+                    if not nfs_server or not nfs_path:
+                        continue
+                    volume_key = f"nfs::{nfs_server}::{nfs_path}"
+                    volume_spec = {"nfs": {"server": nfs_server, "path": nfs_path}}
+                else:
+                    pvc_name = vm.get("pvc_name")
+                    if not pvc_name:
+                        continue
+                    volume_key = f"pvc::{pvc_name}"
+                    volume_spec = {"persistentVolumeClaim": {"claimName": pvc_name}}
+
+                if volume_key not in attached_volumes:
                     volume_name = f"volume-{volume_index}"
-                    pvc_volumes[pvc_name] = volume_name
+                    attached_volumes[volume_key] = volume_name
                     volumes.append({
                         "name": volume_name,
-                        "persistentVolumeClaim": {"claimName": pvc_name}
+                        **volume_spec,
                     })
                     volume_index += 1
 
                 container_mounts.append({
-                    "name": pvc_volumes[pvc_name],
+                    "name": attached_volumes[volume_key],
                     "mountPath": mount_path,
                     "subPath": vm.get("sub_path"),
                     "readOnly": vm.get("read_only", False)
@@ -531,7 +545,7 @@ class K8SServiceClient:
 
         k8s_containers = []
         volumes = []
-        pvc_volumes = {}
+        attached_volumes = {}
         volume_index = 0
 
         for idx, container in enumerate(containers):
@@ -546,22 +560,36 @@ class K8SServiceClient:
             # 构建卷挂载
             container_mounts = []
             for vm in container.get("volume_mounts", []):
-                pvc_name = vm.get("pvc_name")
                 mount_path = vm.get("mount_path")
-                if not pvc_name or not mount_path:
+                volume_type = vm.get("volume_type", "pvc")
+                if not mount_path:
                     continue
 
-                if pvc_name not in pvc_volumes:
+                if volume_type == "nfs":
+                    nfs_server = vm.get("nfs_server")
+                    nfs_path = vm.get("nfs_path")
+                    if not nfs_server or not nfs_path:
+                        continue
+                    volume_key = f"nfs::{nfs_server}::{nfs_path}"
+                    volume_spec = {"nfs": {"server": nfs_server, "path": nfs_path}}
+                else:
+                    pvc_name = vm.get("pvc_name")
+                    if not pvc_name:
+                        continue
+                    volume_key = f"pvc::{pvc_name}"
+                    volume_spec = {"persistentVolumeClaim": {"claimName": pvc_name}}
+
+                if volume_key not in attached_volumes:
                     volume_name = f"volume-{volume_index}"
-                    pvc_volumes[pvc_name] = volume_name
+                    attached_volumes[volume_key] = volume_name
                     volumes.append({
                         "name": volume_name,
-                        "persistentVolumeClaim": {"claimName": pvc_name}
+                        **volume_spec,
                     })
                     volume_index += 1
 
                 container_mounts.append({
-                    "name": pvc_volumes[pvc_name],
+                    "name": attached_volumes[volume_key],
                     "mountPath": mount_path,
                     "subPath": vm.get("sub_path"),
                     "readOnly": vm.get("read_only", False)

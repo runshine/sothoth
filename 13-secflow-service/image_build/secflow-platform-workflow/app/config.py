@@ -117,6 +117,9 @@ class FileserverServiceConfig(BaseModel):
     host: str = "secflow-platform-fileserver"
     port: int = 80
     timeout: int = 30
+    project_mount_strategy: str = "pvc"
+    project_mount_nfs_server: Optional[str] = None
+    project_mount_nfs_base_path: Optional[str] = None
 
     @property
     def base_url(self) -> str:

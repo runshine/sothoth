@@ -566,12 +566,19 @@ class WorkflowEngine:
         # 1. Container fixed volume_mounts (from template) - known PVC at template definition
         container_mounts = container.get("volume_mounts", [])
         for vm in container_mounts:
-            if vm.get("pvc_name") and vm.get("mount_path"):
+            if vm.get("mount_path") and (
+                vm.get("pvc_name") or (
+                    vm.get("volume_type") == "nfs" and vm.get("nfs_server") and vm.get("nfs_path")
+                )
+            ):
                 mounts.append({
-                    "pvc_name": vm["pvc_name"],
+                    "pvc_name": vm.get("pvc_name"),
                     "mount_path": vm["mount_path"],
                     "sub_path": vm.get("sub_path"),
-                    "read_only": vm.get("read_only", False)
+                    "read_only": vm.get("read_only", False),
+                    "volume_type": vm.get("volume_type", "pvc"),
+                    "nfs_server": vm.get("nfs_server"),
+                    "nfs_path": vm.get("nfs_path"),
                 })
 
         # 2. Container dependency volume_mounts (from template) - template only declares mount_path
@@ -583,12 +590,13 @@ class WorkflowEngine:
         for mount in global_mounts:
             # Convert format from K8S format to internal format
             if mount.get("pvcName") and mount.get("mountPath"):
-                if not any(m["mount_path"] == mount["mountPath"] for m in mount):
+                if not any(existing["mount_path"] == mount["mountPath"] for existing in mounts):
                     mounts.append({
                         "pvc_name": mount["pvcName"],
                         "mount_path": mount["mountPath"],
                         "sub_path": mount.get("subPath"),
-                        "read_only": mount.get("readOnly", False)
+                        "read_only": mount.get("readOnly", False),
+                        "volume_type": "pvc",
                     })
 
         return mounts

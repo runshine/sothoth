@@ -1246,7 +1246,10 @@ def _build_containers_from_template(template: AppTemplate, node: WorkflowNodeIns
                 "pvc_name": vm.get("pvc_name"),
                 "mount_path": vm.get("mount_path"),
                 "sub_path": vm.get("sub_path"),
-                "read_only": vm.get("read_only", False)
+                "read_only": vm.get("read_only", False),
+                "volume_type": vm.get("volume_type", "pvc"),
+                "nfs_server": vm.get("nfs_server"),
+                "nfs_path": vm.get("nfs_path"),
             })
 
         # 添加节点级别的卷挂载
@@ -1256,7 +1259,10 @@ def _build_containers_from_template(template: AppTemplate, node: WorkflowNodeIns
                 "pvc_name": vm.get("pvc_name"),
                 "mount_path": vm.get("mount_path"),
                 "sub_path": vm.get("sub_path"),
-                "read_only": vm.get("read_only", False)
+                "read_only": vm.get("read_only", False),
+                "volume_type": vm.get("volume_type", "pvc"),
+                "nfs_server": vm.get("nfs_server"),
+                "nfs_path": vm.get("nfs_path"),
             })
 
         # 节点级别的资源覆盖

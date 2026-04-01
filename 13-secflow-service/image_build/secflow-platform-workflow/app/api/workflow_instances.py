@@ -79,8 +79,18 @@ async def resolve_project_file_mounts(
         raise ValidationError(f"无法获取项目文件存储PVC: {exc}") from exc
 
     pvc_name = storage_info.get("pvc_name")
-    if not pvc_name:
-        raise InternalError("fileserver storage pvc_name is empty")
+    mount_strategy = (config.fileserver_service.project_mount_strategy or "pvc").strip().lower()
+    nfs_server = (config.fileserver_service.project_mount_nfs_server or "").strip()
+    nfs_base_path = (config.fileserver_service.project_mount_nfs_base_path or "").rstrip("/")
+
+    if mount_strategy == "pvc":
+        if not pvc_name:
+            raise InternalError("fileserver storage pvc_name is empty")
+    elif mount_strategy == "nfs":
+        if not nfs_server or not nfs_base_path:
+            raise InternalError("fileserver project mount strategy 'nfs' requires project_mount_nfs_server and project_mount_nfs_base_path")
+    else:
+        raise InternalError(f"unsupported fileserver project mount strategy: {mount_strategy}")
 
     resolved_mounts: List[Dict[str, Any]] = []
     normalized_mounts: List[Dict[str, Any]] = []
@@ -138,12 +148,24 @@ async def resolve_project_file_mounts(
         if relative_path:
             sub_path = f"{sub_path}/{relative_path}"
 
-        resolved_mounts.append({
-            "pvc_name": pvc_name,
+        resolved_mount: Dict[str, Any] = {
             "mount_path": mount_path,
-            "sub_path": sub_path,
             "read_only": read_only,
-        })
+        }
+        if mount_strategy == "nfs":
+            resolved_mount.update({
+                "volume_type": "nfs",
+                "nfs_server": nfs_server,
+                "nfs_path": f"{nfs_base_path}/{sub_path}".replace("//", "/"),
+            })
+        else:
+            resolved_mount.update({
+                "volume_type": "pvc",
+                "pvc_name": pvc_name,
+                "sub_path": sub_path,
+            })
+
+        resolved_mounts.append(resolved_mount)
 
     return resolved_mounts, normalized_mounts
 
@@ -997,7 +1019,10 @@ def _build_containers_from_template(template: AppTemplate, node: WorkflowNodeIns
                 "pvc_name": vm.get("pvc_name"),
                 "mount_path": vm.get("mount_path"),
                 "sub_path": vm.get("sub_path"),
-                "read_only": vm.get("read_only", False)
+                "read_only": vm.get("read_only", False),
+                "volume_type": vm.get("volume_type", "pvc"),
+                "nfs_server": vm.get("nfs_server"),
+                "nfs_path": vm.get("nfs_path"),
             })
 
         # 添加节点级别的卷挂载
@@ -1007,7 +1032,10 @@ def _build_containers_from_template(template: AppTemplate, node: WorkflowNodeIns
                 "pvc_name": vm.get("pvc_name"),
                 "mount_path": vm.get("mount_path"),
                 "sub_path": vm.get("sub_path"),
-                "read_only": vm.get("read_only", False)
+                "read_only": vm.get("read_only", False),
+                "volume_type": vm.get("volume_type", "pvc"),
+                "nfs_server": vm.get("nfs_server"),
+                "nfs_path": vm.get("nfs_path"),
             })
 
         # 节点级别的资源覆盖

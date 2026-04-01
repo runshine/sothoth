@@ -133,10 +133,13 @@ class ServicePort(BaseModel):
 
 class VolumeMount(BaseModel):
     """Fixed PVC volume mount - known PVC name at template definition time"""
-    pvc_name: str = Field(..., description="PVC name")
+    pvc_name: Optional[str] = Field(None, description="PVC name")
     mount_path: str = Field(..., description="Mount path in container")
     sub_path: Optional[str] = Field(None, description="Sub-path within the PVC to mount")
     read_only: bool = Field(default=False, description="Read only")
+    volume_type: str = Field(default="pvc", description="Volume source type: pvc or nfs")
+    nfs_server: Optional[str] = Field(None, description="NFS server when volume_type is nfs")
+    nfs_path: Optional[str] = Field(None, description="NFS export path when volume_type is nfs")
 
 
 class ProjectFileMount(BaseModel):
