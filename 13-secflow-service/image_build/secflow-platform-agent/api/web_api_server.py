@@ -4678,9 +4678,68 @@ class WebAPIServer:
                 self.logger.error(f"批量终止AI helper全局会话失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/ai-helpers/sessions/batch', methods=['POST'])
+        @self.app.route('/api/agent/ai-helpers/sessions/batch', methods=['GET', 'POST'])
         def create_ai_helper_batch_session():
             try:
+                if request.method == 'GET':
+                    project_id = str(request.args.get('project_id') or '').strip()
+                    if not project_id:
+                        return jsonify({'error': 'project_id is required'}), 400
+                    batches_table = self.db_manager.get_table_name('ai_agent_session_batches')
+                    items_table = self.db_manager.get_table_name('ai_agent_session_batch_items')
+                    rows = self.db_manager.fetch_all(
+                        f"SELECT batch_id, project_id, created_by, status, request_json, created_at, updated_at FROM {batches_table} WHERE project_id = %s ORDER BY updated_at DESC, created_at DESC"
+                        if self.db_manager.db_type == 'mysql' else
+                        f"SELECT batch_id, project_id, created_by, status, request_json, created_at, updated_at FROM {batches_table} WHERE project_id = ? ORDER BY updated_at DESC, created_at DESC",
+                        (project_id,)
+                    ) or []
+                    items = []
+                    for row in rows:
+                        batch_id = str(row.get('batch_id') or '')
+                        summary_rows = self.db_manager.fetch_all(
+                            f"""
+                            SELECT
+                              COUNT(*) AS helper_total,
+                              SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
+                              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+                              SUM(CASE WHEN status NOT IN ('success', 'failed') THEN 1 ELSE 0 END) AS pending_count
+                            FROM {items_table}
+                            WHERE batch_id = %s
+                            """ if self.db_manager.db_type == 'mysql' else
+                            f"""
+                            SELECT
+                              COUNT(*) AS helper_total,
+                              SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success_count,
+                              SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+                              SUM(CASE WHEN status NOT IN ('success', 'failed') THEN 1 ELSE 0 END) AS pending_count
+                            FROM {items_table}
+                            WHERE batch_id = ?
+                            """,
+                            (batch_id,)
+                        ) or []
+                        summary = summary_rows[0] if summary_rows else {}
+                        request_payload = {}
+                        raw_request = row.get('request_json')
+                        if raw_request:
+                            try:
+                                request_payload = json.loads(raw_request) if isinstance(raw_request, str) else (raw_request or {})
+                            except Exception:
+                                request_payload = {}
+                        items.append({
+                            'batch_id': batch_id,
+                            'project_id': row.get('project_id'),
+                            'created_by': row.get('created_by'),
+                            'status': row.get('status') or 'pending',
+                            'session_mode': (request_payload.get('session_mode') if isinstance(request_payload, dict) else None) or 'invoke',
+                            'created_at': row.get('created_at'),
+                            'updated_at': row.get('updated_at'),
+                            'helper_total': int(summary.get('helper_total') or 0),
+                            'success_count': int(summary.get('success_count') or 0),
+                            'failed_count': int(summary.get('failed_count') or 0),
+                            'pending_count': int(summary.get('pending_count') or 0),
+                        })
+                    return jsonify({'project_id': project_id, 'items': items, 'total': len(items)})
+
                 payload = request.get_json(silent=True) or {}
                 project_id = str(payload.get('project_id') or '').strip()
                 if not project_id:
@@ -4879,6 +4938,13 @@ class WebAPIServer:
                     (batch_id,)
                 ) or []
                 normalized_items = []
+                request_payload = {}
+                raw_request = batch.get('request_json')
+                if raw_request:
+                    try:
+                        request_payload = json.loads(raw_request) if isinstance(raw_request, str) else (raw_request or {})
+                    except Exception:
+                        request_payload = {}
                 for item in items:
                     agent_ids = []
                     raw = item.get('helper_agent_ids_json')
@@ -4900,6 +4966,7 @@ class WebAPIServer:
                     'batch_id': batch.get('batch_id'),
                     'project_id': batch.get('project_id'),
                     'status': batch.get('status'),
+                    'session_mode': (request_payload.get('session_mode') if isinstance(request_payload, dict) else None) or 'invoke',
                     'created_by': batch.get('created_by'),
                     'created_at': batch.get('created_at'),
                     'updated_at': batch.get('updated_at'),

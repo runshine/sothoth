@@ -61,9 +61,7 @@ data:
       host: "secflow-platform-fileserver"
       port: 80
       timeout: 30
-      project_mount_strategy: "nfs"
-      project_mount_nfs_server: "172.31.30.81"
-      project_mount_nfs_base_path: "/nvme/share_k8s/secflow-ns-secflow-platform-fileserver-data-nfs-pvc-pvc-64baa81c-80d0-4b69-91ca-a6a8d4f03292"
+      project_mount_strategy: "pvc"
 
     app:
       host: "0.0.0.0"

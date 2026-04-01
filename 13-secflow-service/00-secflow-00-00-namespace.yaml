@@ -5,3 +5,16 @@ metadata:
   labels:
     name: secflow-ns
     environment: production
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: secflow-platform-fileserver-data-nfs-pvc
+  namespace: secflow-ns
+spec:
+  storageClassName: nfs-storage-192.168.13.66
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi

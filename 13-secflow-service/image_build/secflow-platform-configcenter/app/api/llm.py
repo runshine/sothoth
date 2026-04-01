@@ -65,9 +65,16 @@ def normalize_file_bindings(file_bindings) -> list[dict]:
     if not isinstance(file_bindings, list):
         return []
     normalized = []
-    for item in file_bindings:
+    for idx, item in enumerate(file_bindings):
+        # pydantic v2 里嵌套模型可能是 BaseModel 实例，这里统一转换为字典
+        if hasattr(item, "model_dump") and callable(getattr(item, "model_dump")):
+            item = item.model_dump()
+        elif hasattr(item, "dict") and callable(getattr(item, "dict")):
+            item = item.dict()
         if not isinstance(item, dict):
-            raise ValidationError("file_bindings 每一项都必须是对象")
+            raise ValidationError(
+                f"file_bindings[{idx}] 必须是对象，当前类型: {type(item).__name__}"
+            )
         normalized.append(
             {
                 "name": str(item.get("name") or "").strip(),
@@ -86,11 +93,11 @@ def validate_file_bindings(file_bindings: list[dict]):
         path = item.get("path")
         content = item.get("content")
         if not isinstance(name, str) or not name.strip():
-            raise ValidationError(f"file_bindings[{idx}].name 不能为空")
+            raise ValidationError(f"file_bindings[{idx}] 缺少文件名(name)")
         if not isinstance(path, str) or not path.strip():
-            raise ValidationError(f"file_bindings[{idx}].path 不能为空")
+            raise ValidationError(f"file_bindings[{idx}] 缺少文件路径(path)")
         if not isinstance(content, str):
-            raise ValidationError(f"file_bindings[{idx}].content 必须是字符串")
+            raise ValidationError(f"file_bindings[{idx}] 文件内容(content)必须是字符串")
 
 
 def apply_payload(provider: LlmProvider, payload: LlmProviderCreateRequest | LlmProviderUpdateRequest):

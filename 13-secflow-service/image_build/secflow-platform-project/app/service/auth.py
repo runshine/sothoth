@@ -56,7 +56,8 @@ class AuthService:
             return None
 
         if cache_entry.is_expired():
-            del self._token_cache[token]
+            # cache key includes project_id; use safe pop to avoid KeyError on stale entries
+            self._token_cache.pop(self._get_cache_key(token, project_id), None)
             logger.debug("Token缓存已过期，从缓存移除")
             return None
 
