@@ -164,6 +164,38 @@ class VolumeMountInput(BaseModel):
     read_only: bool = Field(default=True, description="Read only mount (input is typically read-only)")
 
 
+class TemplateTagItem(BaseModel):
+    tag_key: str = Field(..., min_length=1, max_length=128)
+    tag_label: Optional[str] = None
+    category: str = Field(default="capability")
+    description: Optional[str] = None
+    color: Optional[str] = Field(default="slate")
+    is_system: bool = False
+
+
+class TemplateTagResponse(BaseModel):
+    id: str
+    tag_key: str
+    tag_label: str
+    category: str
+    description: Optional[str]
+    color: Optional[str]
+    is_system: bool
+    enabled: bool
+    sort_order: int
+    created_by: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TemplateTagListResponse(BaseModel):
+    total: int
+    items: List[TemplateTagResponse]
+
+
 
 
 # ============ Instance-level Dependency Schemas ============
@@ -236,6 +268,7 @@ class AppTemplateCreate(BaseModel):
     containers: List[ContainerConfig] = Field(..., min_length=1, description="Container configurations (at least one)")
     # Deployment-level configuration
     replicas: int = Field(default=1, ge=1, description="Number of replicas")
+    tags: Optional[List[TemplateTagItem]] = Field(default=None, description="Template tags")
 
 
 class AppTemplateUpdate(BaseModel):
@@ -244,6 +277,7 @@ class AppTemplateUpdate(BaseModel):
     description: Optional[str] = None
     containers: Optional[List[ContainerConfig]] = None
     replicas: Optional[int] = Field(None, ge=1, description="Number of replicas")
+    tags: Optional[List[TemplateTagItem]] = Field(default=None, description="Template tags")
 
 
 class AppTemplateResponse(BaseModel):
@@ -258,6 +292,7 @@ class AppTemplateResponse(BaseModel):
     created_by: str
     created_at: datetime
     updated_at: datetime
+    tags: List[TemplateTagResponse] = Field(default_factory=list)
 
     class Config:
         from_attributes = True
@@ -282,6 +317,7 @@ class JobTemplateCreate(BaseModel):
     # Job-level configuration
     ttl_seconds_after_finished: Optional[int] = Field(3600, ge=0, description="TTL after finished")
     backoff_limit: int = Field(3, ge=0, description="Backoff limit")
+    tags: Optional[List[TemplateTagItem]] = Field(default=None, description="Template tags")
 
 
 class JobTemplateUpdate(BaseModel):
@@ -291,6 +327,7 @@ class JobTemplateUpdate(BaseModel):
     containers: Optional[List[ContainerConfig]] = None
     ttl_seconds_after_finished: Optional[int] = None
     backoff_limit: Optional[int] = None
+    tags: Optional[List[TemplateTagItem]] = Field(default=None, description="Template tags")
 
 
 class JobTemplateResponse(BaseModel):
@@ -306,6 +343,7 @@ class JobTemplateResponse(BaseModel):
     created_by: str
     created_at: datetime
     updated_at: datetime
+    tags: List[TemplateTagResponse] = Field(default_factory=list)
 
     class Config:
         from_attributes = True

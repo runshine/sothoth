@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.config import get_config, get_data_pvc_name
+from app.config import get_config, get_data_nfs_base_path, get_data_nfs_server, get_data_pvc_name
 from app.exception import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
 from app.model import FileDirectory, FileSubproject, ManagedFile, get_db
 from app.schemas import (
@@ -101,6 +101,8 @@ async def get_storage_pvc(
     return StoragePVCResponse(
         mount_path=get_config().storage.root_dir,
         pvc_name=get_data_pvc_name(),
+        nfs_server=get_data_nfs_server(),
+        nfs_base_path=get_data_nfs_base_path(),
     )
 
 

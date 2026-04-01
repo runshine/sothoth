@@ -59,9 +59,16 @@ Authorization: Bearer <token>
 ```json
 {
   "mount_path": "/data",
-  "pvc_name": "secflow-platform-fileserver-data-nfs-pvc"
+  "pvc_name": "secflow-platform-fileserver-data-nfs-pvc",
+  "nfs_server": "172.31.30.81",
+  "nfs_base_path": "/nvme/share_k8s/secflow-ns-secflow-platform-fileserver-data-nfs-pvc-pvc-64baa81c-80d0-4b69-91ca-a6a8d4f03292"
 }
 ```
+
+说明：
+
+- `mount_path` 与 `pvc_name` 为兼容字段，保持原有行为不变
+- `nfs_server` 与 `nfs_base_path` 为新增可选字段，供 workflow 等服务自动解析项目文件目录挂载
 
 ## 1. 子项目管理
 

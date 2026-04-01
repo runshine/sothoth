@@ -83,6 +83,8 @@ class StorageConfig(BaseModel):
     root_dir: str = "/data"
     temp_dir: str = "/data/tmp"
     max_upload_size: int = 2147483648
+    nfs_server: Optional[str] = None
+    nfs_base_path: Optional[str] = None
 
 
 class AppConfig(BaseModel):
@@ -145,3 +147,11 @@ def get_config() -> Config:
 
 def get_data_pvc_name() -> Optional[str]:
     return os.environ.get("DATA_PVC_NAME")
+
+
+def get_data_nfs_server() -> Optional[str]:
+    return os.environ.get("DATA_NFS_SERVER") or get_config().storage.nfs_server
+
+
+def get_data_nfs_base_path() -> Optional[str]:
+    return os.environ.get("DATA_NFS_BASE_PATH") or get_config().storage.nfs_base_path

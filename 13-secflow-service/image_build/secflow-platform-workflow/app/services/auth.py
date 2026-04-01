@@ -4,7 +4,7 @@ Authentication service module
 
 import logging
 import time
-from typing import Optional, Dict
+from typing import Optional, Dict, Any, List
 
 import httpx
 
@@ -153,6 +153,30 @@ class AuthService:
                 self._set_cached_user(token, data)
 
                 return data
+
+            except httpx.TimeoutException:
+                raise AuthServiceError("Auth service request timeout")
+            except httpx.ConnectError as e:
+                raise AuthServiceError(f"Cannot connect to auth service: {e}")
+
+    async def get_user_department_projects_async(self, token: str) -> List[Dict[str, Any]]:
+        """Get projects visible to the current user along with can_manage flags."""
+        url = f"http://{self.config.host}:{self.config.port}/api/auth/org/user-department-projects"
+        async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+            try:
+                headers = {"Authorization": f"Bearer {token}"}
+                response = await client.get(url, headers=headers)
+
+                if response.status_code == 401:
+                    raise TokenInvalidError("Token expired or invalid")
+
+                if response.status_code != 200:
+                    raise AuthServiceError(
+                        f"Auth service returned abnormal status code: {response.status_code}"
+                    )
+
+                data = response.json()
+                return data.get("projects", []) if isinstance(data, dict) else []
 
             except httpx.TimeoutException:
                 raise AuthServiceError("Auth service request timeout")
