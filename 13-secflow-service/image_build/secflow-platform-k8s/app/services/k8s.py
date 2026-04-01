@@ -1598,7 +1598,7 @@ class KubernetesService:
         from kubernetes.client import (
             V1Deployment, V1ObjectMeta, V1DeploymentSpec,
             V1LabelSelector, V1PodTemplateSpec, V1PodSpec, V1Container,
-            V1EnvVar, V1VolumeMount, V1SecurityContext, V1Volume, V1PersistentVolumeClaimVolumeSource,
+            V1EnvVar, V1VolumeMount, V1SecurityContext, V1Volume, V1PersistentVolumeClaimVolumeSource, V1NFSVolumeSource,
             V1ContainerPort,
         )
 
@@ -1659,6 +1659,15 @@ class KubernetesService:
                         name=v.get("name"),
                         persistent_volume_claim=V1PersistentVolumeClaimVolumeSource(
                             claim_name=v["persistentVolumeClaim"].get("claimName")
+                        )
+                    ))
+                elif v.get("nfs"):
+                    volumes.append(V1Volume(
+                        name=v.get("name"),
+                        nfs=V1NFSVolumeSource(
+                            server=v["nfs"].get("server"),
+                            path=v["nfs"].get("path"),
+                            read_only=v["nfs"].get("readOnly", False)
                         )
                     ))
 
@@ -1952,7 +1961,7 @@ class KubernetesService:
         from kubernetes.client import (
             V1Job, V1ObjectMeta, V1JobSpec, V1LabelSelector,
             V1PodTemplateSpec, V1PodSpec, V1Container,
-            V1EnvVar, V1VolumeMount, V1SecurityContext, V1Volume, V1PersistentVolumeClaimVolumeSource,
+            V1EnvVar, V1VolumeMount, V1SecurityContext, V1Volume, V1PersistentVolumeClaimVolumeSource, V1NFSVolumeSource,
         )
 
         metadata = manifest.get("metadata", {})
@@ -2010,6 +2019,15 @@ class KubernetesService:
                         name=v.get("name"),
                         persistent_volume_claim=V1PersistentVolumeClaimVolumeSource(
                             claim_name=v["persistentVolumeClaim"].get("claimName")
+                        )
+                    ))
+                elif v.get("nfs"):
+                    volumes.append(V1Volume(
+                        name=v.get("name"),
+                        nfs=V1NFSVolumeSource(
+                            server=v["nfs"].get("server"),
+                            path=v["nfs"].get("path"),
+                            read_only=v["nfs"].get("readOnly", False)
                         )
                     ))
 
