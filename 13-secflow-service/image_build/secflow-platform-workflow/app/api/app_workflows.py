@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
@@ -47,6 +48,32 @@ from app.config import get_config
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/app-workflows", tags=["App Workflows"])
+
+
+def _resolve_runtime_ingress_host(
+    node_result: Dict[str, Any],
+    configured_host: Optional[str],
+    configured_access_url: Optional[str],
+) -> Optional[str]:
+    """Prefer explicit runtime host, then fallback to stored host/access URL."""
+    host = (
+        node_result.get("ingress_host")
+        or configured_host
+        or ""
+    ).strip()
+    if host:
+        return host
+
+    access_url = (
+        node_result.get("ingress_access_url")
+        or configured_access_url
+        or ""
+    ).strip()
+    if not access_url:
+        return None
+
+    parsed = urlparse(access_url)
+    return (parsed.hostname or "").strip() or None
 
 
 def get_status_client():
@@ -1058,23 +1085,34 @@ async def initialize_app_workflow(
         node.k8s_resource_type = "Deployment"
         node.service_name = node_result.get("service_name")
         node_config["ingress_name"] = node_result.get("ingress_name") or node_config.get("ingress_name")
-        if node_result.get("ingress_host"):
-            node_config["ingress_host"] = node_result.get("ingress_host")
+        resolved_ingress_host = _resolve_runtime_ingress_host(
+            node_result,
+            ingress_host,
+            node_config.get("ingress_access_url"),
+        )
+        if resolved_ingress_host:
+            node_config["ingress_host"] = resolved_ingress_host
         if "ingress_tls_enabled" in node_result:
             node_config["ingress_tls_enabled"] = node_result.get("ingress_tls_enabled")
         if node_result.get("ingress_access_url"):
             node_config["ingress_access_url"] = node_result.get("ingress_access_url")
+        elif resolved_ingress_host:
+            node_config["ingress_access_url"] = resolve_ingress_access_url(
+                node_config,
+                resolved_ingress_host,
+                node_config.get("ingress_path", "/"),
+            )
         flag_modified(instance, "nodes")
         node.ingress_type = ingress_type
-        node.ingress_host = node_result.get("ingress_host") or ingress_host
+        node.ingress_host = resolved_ingress_host
         node.ingress_ip = ingress_ip
-        if ingress_type and (node_result.get("ingress_host") or ingress_host):
+        if ingress_type and resolved_ingress_host:
             service_port, target_port = get_primary_service_ports(node_config)
             upsert_node_domain_binding(
                 db,
                 instance,
                 node,
-                domain=node_result.get("ingress_host") or ingress_host,
+                domain=resolved_ingress_host,
                 ingress_ip=ingress_ip,
                 ingress_type=ingress_type,
                 service_name=resolve_runtime_service_name(node, node_config),
