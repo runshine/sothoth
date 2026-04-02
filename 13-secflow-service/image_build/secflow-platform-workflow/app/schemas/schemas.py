@@ -268,6 +268,10 @@ class AppTemplateCreate(BaseModel):
     containers: List[ContainerConfig] = Field(..., min_length=1, description="Container configurations (at least one)")
     # Deployment-level configuration
     replicas: int = Field(default=1, ge=1, description="Number of replicas")
+    create_service: bool = Field(default=True, description="Whether the template exposes a Service by default")
+    service_name: Optional[str] = Field(None, description="Service display name")
+    service_ports: List[ServicePort] = Field(default=[], description="Default Service ports")
+    service_type: ServiceType = Field(default=ServiceType.CLUSTER_IP, description="Default K8s Service type")
     tags: Optional[List[TemplateTagItem]] = Field(default=None, description="Template tags")
 
 
@@ -277,6 +281,10 @@ class AppTemplateUpdate(BaseModel):
     description: Optional[str] = None
     containers: Optional[List[ContainerConfig]] = None
     replicas: Optional[int] = Field(None, ge=1, description="Number of replicas")
+    create_service: Optional[bool] = Field(None, description="Whether the template exposes a Service by default")
+    service_name: Optional[str] = Field(None, description="Service display name")
+    service_ports: Optional[List[ServicePort]] = Field(None, description="Default Service ports")
+    service_type: Optional[ServiceType] = Field(None, description="Default K8s Service type")
     tags: Optional[List[TemplateTagItem]] = Field(default=None, description="Template tags")
 
 
@@ -289,6 +297,10 @@ class AppTemplateResponse(BaseModel):
     project_id: Optional[str]
     containers: List[ContainerConfig]
     replicas: int
+    create_service: bool
+    service_name: Optional[str]
+    service_ports: List[ServicePort]
+    service_type: str
     created_by: str
     created_at: datetime
     updated_at: datetime

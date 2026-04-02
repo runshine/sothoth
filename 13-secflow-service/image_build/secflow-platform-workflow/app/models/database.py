@@ -20,6 +20,8 @@ from sqlalchemy import (
     create_engine,
     Index,
     UniqueConstraint,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -120,6 +122,10 @@ class AppTemplate(Base):
 
     # Deployment-level configuration
     replicas = Column(Integer, default=1)  # Number of replicas
+    create_service = Column(Boolean, default=True)
+    service_name = Column(String(128))
+    service_ports = Column(JSON, nullable=False, default=list)
+    service_type = Column(String(32), default="ClusterIP")
 
     # Audit fields
     created_by = Column(String(64), nullable=False)
@@ -138,6 +144,10 @@ class AppTemplate(Base):
             "project_id": self.project_id,
             "containers": self.containers,
             "replicas": self.replicas,
+            "create_service": self.create_service,
+            "service_name": self.service_name,
+            "service_ports": self.service_ports,
+            "service_type": self.service_type,
             "created_by": self.created_by,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
@@ -450,7 +460,35 @@ def create_tables():
     """Create all database tables"""
     engine = get_engine()
     Base.metadata.create_all(engine)
+    _ensure_app_template_columns(engine)
     return True
+
+
+def _ensure_app_template_columns(engine):
+    """Add newly introduced app template columns on existing deployments."""
+    inspector = inspect(engine)
+    table_name = AppTemplate.__tablename__
+    if not inspector.has_table(table_name):
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+    statements = []
+
+    if "create_service" not in existing_columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN create_service BOOLEAN DEFAULT 1")
+    if "service_name" not in existing_columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN service_name VARCHAR(128)")
+    if "service_ports" not in existing_columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN service_ports JSON")
+    if "service_type" not in existing_columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN service_type VARCHAR(32) DEFAULT 'ClusterIP'")
+
+    if not statements:
+        return
+
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def drop_tables():

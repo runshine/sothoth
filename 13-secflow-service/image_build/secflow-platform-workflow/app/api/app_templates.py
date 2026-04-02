@@ -32,9 +32,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/app-templates", tags=["App Templates"])
 
 
+def _normalize_app_template_service_fields(template: AppTemplate) -> AppTemplate:
+    template.create_service = True if template.create_service is None else bool(template.create_service)
+    template.service_name = template.service_name or ""
+    template.service_ports = template.service_ports or []
+    template.service_type = template.service_type or "ClusterIP"
+    return template
+
+
 def _attach_app_template_tags(db: Session, templates: List[AppTemplate]) -> List[AppTemplate]:
     tag_map = get_template_tags(db, template_type="app", template_ids=[template.id for template in templates])
     for template in templates:
+        _normalize_app_template_service_fields(template)
         template.tags = tag_map.get(template.id, [])
     return templates
 
@@ -104,6 +113,10 @@ async def create_app_template(
         project_id=template_data.project_id,
         containers=containers_json,
         replicas=template_data.replicas,
+        create_service=template_data.create_service,
+        service_name=template_data.service_name,
+        service_ports=[port.model_dump() for port in template_data.service_ports],
+        service_type=template_data.service_type.value if template_data.service_type else "ClusterIP",
         created_by=user_id,
     )
 
@@ -243,6 +256,17 @@ async def update_app_template(
         template.containers = containers_json
     if template_data.replicas is not None:
         template.replicas = template_data.replicas
+    if template_data.create_service is not None:
+        template.create_service = template_data.create_service
+        if template_data.create_service is False:
+            template.service_name = None
+            template.service_ports = []
+    if template_data.service_name is not None:
+        template.service_name = template_data.service_name
+    if template_data.service_ports is not None:
+        template.service_ports = [port.model_dump() for port in template_data.service_ports]
+    if template_data.service_type is not None:
+        template.service_type = template_data.service_type.value
 
     sync_template_tags(db, template_type="app", template_id=template.id, tags=template_data.tags, created_by=user_id)
 
