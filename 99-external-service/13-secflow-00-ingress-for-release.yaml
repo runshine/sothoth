@@ -131,10 +131,26 @@ spec:
             port:
               number: 80
 
+      - path: /api/system-analysis
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-system-analysis
+            port:
+              number: 80
+
       - path: /api/app/code-server
         pathType: Prefix
         backend:
           service:
             name: secflow-app-code-server
+            port:
+              number: 80
+
+      - path: /api/app/binary-to-source
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-binary-to-source-manager
             port:
               number: 80

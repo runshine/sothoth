@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-binary-to-source-manager
+  namespace: secflow-ns
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      name: secflow-app-binary-to-source-manager
+  template:
+    metadata:
+      labels:
+        name: secflow-app-binary-to-source-manager
+    spec:
+      serviceAccountName: secflow-app-binary-to-source-serviceaccount
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: secflow-app-binary-to-source-manager
+        image: ghcr.io/runshine/secflow-app-binary-to-source:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+        env:
+        - name: ROLE
+          value: "manager"
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        volumeMounts:
+        - name: secflow-app-binary-to-source-config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+        - name: secflow-app-binary-to-source-shared-pvc
+          mountPath: /data/binary-to-source
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/app/binary-to-source/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/app/binary-to-source/ready
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 15
+      volumes:
+      - name: secflow-app-binary-to-source-config
+        configMap:
+          name: secflow-app-binary-to-source-config
+          items:
+            - key: config.yaml
+              path: config.yaml
+      - name: secflow-app-binary-to-source-shared-pvc
+        persistentVolumeClaim:
+          claimName: secflow-app-binary-to-source-shared-pvc

@@ -113,6 +113,13 @@ spec:
                 name: secflow-platform-vuln
                 port:
                   number: 80
+          - path: /api/system-analysis
+            pathType: Prefix
+            backend:
+              service:
+                name: secflow-platform-system-analysis
+                port:
+                  number: 80
           - path: /api/app/code-server
             pathType: Prefix
             backend:

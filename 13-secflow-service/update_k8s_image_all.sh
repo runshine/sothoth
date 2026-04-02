@@ -2,6 +2,8 @@
 
 kubectl rollout restart deployment/secflow-app-code-server -n secflow-ns
 kubectl rollout restart deployment/secflow-app-secmate-ng -n secflow-ns
+kubectl rollout restart deployment/secflow-app-binary-to-source-manager -n secflow-ns
+kubectl rollout restart deployment/secflow-app-binary-to-source-worker -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-agent -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-auth -n secflow-ns
 kubectl rollout restart deployment/secflow-platform-deploy-script -n secflow-ns

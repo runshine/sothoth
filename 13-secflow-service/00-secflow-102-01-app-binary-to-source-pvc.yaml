@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: secflow-app-binary-to-source-shared-pvc
+  namespace: secflow-ns
+spec:
+  storageClassName: nfs-storage-192.168.13.66
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 20Gi
