@@ -339,6 +339,42 @@ class MenuManager:
 
         return f"http://{normalized_host}:{port}{health_path}"
 
+    def _build_direct_health_url(
+        self,
+        host: str,
+        port: int,
+        api_prefix: Optional[str],
+        explicit_path: Optional[str],
+    ) -> Optional[str]:
+        normalized_host = (host or "").strip()
+        if normalized_host in ("", "0.0.0.0"):
+            return None
+        health_path = self._resolve_health_path(api_prefix, explicit_path)
+        return f"http://{normalized_host}:{port}{health_path}"
+
+    def _build_gateway_health_url(
+        self,
+        api_prefix: Optional[str],
+        explicit_path: Optional[str],
+    ) -> Optional[str]:
+        if not self.service_gateway_url:
+            return None
+        health_path = self._resolve_health_path(api_prefix, explicit_path)
+        return f"{self.service_gateway_url}{health_path}"
+
+    def _get_health_probe_urls(self, service: ServiceInfo) -> List[str]:
+        urls: List[str] = []
+
+        def append_candidate(url: Optional[str]) -> None:
+            normalized = (url or "").strip()
+            if normalized and normalized not in urls:
+                urls.append(normalized)
+
+        append_candidate(service.health_url)
+        append_candidate(self._build_gateway_health_url(service.api_prefix, service.health_path))
+        append_candidate(self._build_direct_health_url(service.host, service.port, service.api_prefix, service.health_path))
+        return urls
+
     def register_service(self, service_id: str, service_name: str, host: str, port: int,
                          maturity: str = "开发中", menu_id: str = None, menu_name: str = None,
                          menu_path: str = None, parent_id: str = None, icon: str = None,
@@ -484,11 +520,11 @@ class MenuManager:
                 for s in self._get_all_services().values()
             ]
 
-    def _probe_service(self, service: ServiceInfo) -> Dict[str, Any]:
+    def _probe_url(self, health_url: str, method: str, timeout_seconds: float) -> Dict[str, Any]:
         started_at = time.time()
-        request_obj = Request(service.health_url, method=service.health_method)
+        request_obj = Request(health_url, method=method)
         try:
-            with urlopen(request_obj, timeout=service.health_timeout_seconds) as response:
+            with urlopen(request_obj, timeout=timeout_seconds) as response:
                 latency_ms = int((time.time() - started_at) * 1000)
                 return {
                     "ok": 200 <= response.status < 400,
@@ -518,6 +554,29 @@ class MenuManager:
                 "latency_ms": int((time.time() - started_at) * 1000),
                 "error": str(exc),
             }
+
+    def _probe_service(self, service: ServiceInfo) -> Dict[str, Any]:
+        probe_urls = self._get_health_probe_urls(service)
+        last_result: Dict[str, Any] = {
+            "ok": False,
+            "http_status": None,
+            "latency_ms": 0,
+            "error": "no health probe url",
+        }
+
+        for health_url in probe_urls:
+            probe_result = self._probe_url(
+                health_url=health_url,
+                method=service.health_method,
+                timeout_seconds=service.health_timeout_seconds,
+            )
+            if probe_result["ok"]:
+                probe_result["probe_url"] = health_url
+                return probe_result
+            last_result = probe_result
+
+        last_result["probe_url"] = probe_urls[-1] if probe_urls else None
+        return last_result
 
     def refresh_service_health(self, service_id: str) -> Dict[str, Any]:
         """立即刷新单个服务健康状态"""
