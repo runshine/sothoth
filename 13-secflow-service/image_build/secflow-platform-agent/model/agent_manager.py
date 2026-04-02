@@ -1375,7 +1375,8 @@ class AgentManager:
     def call_agent_api(self, agent_key: str, method: str, endpoint: str,
                        data: Any = None, params: Dict = None,
                        headers: Dict = None, files: Dict = None,
-                       stream: bool = False, timeout_type: str = 'default') -> Tuple[int, Any]:
+                       stream: bool = False, timeout_type: str = 'default',
+                       log_connection_error: bool = True) -> Tuple[int, Any]:
         """
         调用Agent API（增强版，支持文件上传和可配置超时）
 
@@ -1521,7 +1522,10 @@ class AgentManager:
             self.logger.error(f"请求Agent {agent_key} 超时 (超时设置: {timeout})")
             return 504, {'error': f'Request timeout to agent (timeout: {timeout})'}
         except requests.exceptions.ConnectionError:
-            self.logger.error(f"连接Agent {agent_key} 失败")
+            if log_connection_error:
+                self.logger.error(f"连接Agent {agent_key} 失败")
+            else:
+                self.logger.debug(f"连接Agent {agent_key} 失败 (method={method}, endpoint={endpoint})")
             return 503, {'error': 'Connection failed to agent'}
         except Exception as e:
             self.logger.error(f"调用Agent API失败: {str(e)}", exc_info=True)

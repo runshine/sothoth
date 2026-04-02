@@ -2052,7 +2052,7 @@ class WebAPIServer:
 
         begin = time.time()
         status_code, response = self.agent_manager.call_agent_api(
-            agent.key, 'GET', '/api/services', timeout_type='proxy'
+            agent.key, 'GET', '/api/services', timeout_type='proxy', log_connection_error=False
         )
         if status_code != 200:
             self._mark_agent_services_stale(agent.key)
