@@ -2054,6 +2054,15 @@ class WebAPIServer:
         status_code, response = self.agent_manager.call_agent_api(
             agent.key, 'GET', '/api/services', timeout_type='proxy', log_connection_error=False
         )
+        # 对节点 API 的瞬时连接抖动做一次轻量重试，避免前端在线状态频繁抖动。
+        if status_code in (503, 504):
+            time.sleep(0.2)
+            retry_status, retry_response = self.agent_manager.call_agent_api(
+                agent.key, 'GET', '/api/services', timeout_type='proxy', log_connection_error=False
+            )
+            if retry_status == 200:
+                status_code, response = retry_status, retry_response
+
         if status_code != 200:
             self._mark_agent_services_stale(agent.key)
             reason = ''
