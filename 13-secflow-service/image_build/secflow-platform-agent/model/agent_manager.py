@@ -1484,7 +1484,7 @@ class AgentManager:
 
             # 发送请求。对同步类GET请求做一次短重试，降低瞬时网络抖动导致的误失败。
             method_upper = method.upper()
-            max_attempts = 2 if method_upper == 'GET' and timeout_type in ('proxy', 'health_check') else 1
+            max_attempts = 4 if method_upper == 'GET' and timeout_type in ('proxy', 'health_check') else 1
             response = None
             last_request_exc = None
             for attempt in range(max_attempts):
@@ -1506,7 +1506,7 @@ class AgentManager:
                     last_request_exc = req_exc
                     if attempt >= max_attempts - 1:
                         raise
-                    time.sleep(0.2)
+                    time.sleep(0.2 * (2 ** attempt))
 
             # 处理响应
             content_type = response.headers.get('Content-Type', '').lower()
