@@ -190,6 +190,28 @@ def run_auto_migrations():
                 "AFTER status"
             ),
         },
+        {
+            "name": "add_department_id_to_secflow_project",
+            "check": lambda inspector: "department_id" in {
+                column["name"] for column in inspector.get_columns("secflow_project")
+            },
+            "sql": (
+                "ALTER TABLE secflow_project "
+                "ADD COLUMN department_id INT NULL "
+                "AFTER is_public"
+            ),
+        },
+        {
+            "name": "add_department_id_index_to_secflow_project",
+            "check": lambda inspector: any(
+                "department_id" in index.get("column_names", [])
+                for index in inspector.get_indexes("secflow_project")
+            ),
+            "sql": (
+                "CREATE INDEX idx_secflow_project_department_id "
+                "ON secflow_project (department_id)"
+            ),
+        },
     ]
 
     with engine.begin() as connection:
