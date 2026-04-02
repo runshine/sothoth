@@ -8,6 +8,14 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_current_user, generate_id
+from app.api.template_permissions import (
+    can_access_project,
+    can_manage_project,
+    can_modify_template,
+    can_read_template,
+    is_ordinary_admin,
+    is_super_admin,
+)
 from app.models import get_db, AppTemplate, TemplateTagBinding
 from app.schemas import (
     AppTemplateCreate,
@@ -17,7 +25,6 @@ from app.schemas import (
     SuccessResponse,
 )
 from app.exception import NotFoundError, ForbiddenError, ValidationError
-from app.services import AuthServiceError, get_auth_service
 from app.services.template_tags import filter_template_ids_by_tag_keys, get_template_tags, sync_template_tags
 
 logger = logging.getLogger(__name__)
@@ -25,56 +32,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/app-templates", tags=["App Templates"])
 
 
-def _has_template_admin_permission(current_user: dict) -> bool:
-    user_roles = current_user.get("role", []) or []
-    platform_role = current_user.get("platform_role")
-    return "admin" in user_roles or platform_role == "super_admin"
-
-
-async def _can_manage_project_template(current_user: dict, project_id: Optional[str]) -> bool:
-    if not project_id:
-        return False
-    if _has_template_admin_permission(current_user):
-        return True
-    if current_user.get("platform_role") != "ordinary_admin":
-        return False
-
-    token = current_user.get("token")
-    if not token:
-        return False
-
-    try:
-        projects = await get_auth_service().get_user_department_projects_async(token)
-    except AuthServiceError as exc:
-        logger.warning("Failed to query user manageable projects for template permission: %s", exc)
-        return False
-
-    return any(str(project.get("id")) == str(project_id) and bool(project.get("can_manage")) for project in projects)
-
-
 def _attach_app_template_tags(db: Session, templates: List[AppTemplate]) -> List[AppTemplate]:
     tag_map = get_template_tags(db, template_type="app", template_ids=[template.id for template in templates])
     for template in templates:
         template.tags = tag_map.get(template.id, [])
     return templates
-
-
-def check_template_permission(
-    template: AppTemplate,
-    user_id: str,
-    user_roles: List[str],
-    project_id: Optional[str] = None,
-) -> bool:
-    """Check if user has permission to access template"""
-    # Global templates are accessible to all
-    if template.scope == "global":
-        return True
-    # Project templates require project access
-    if template.created_by == user_id:
-        return True
-    if project_id and template.project_id == project_id:
-        return True
-    return False
 
 
 @router.post("", response_model=AppTemplateResponse, status_code=status.HTTP_201_CREATED)
@@ -95,12 +57,20 @@ async def create_app_template(
 
     # Validate permission for global templates
     if template_data.scope == "global":
-        if not _has_template_admin_permission(current_user):
-            raise ForbiddenError("Only admins can create global templates")
+        if not is_super_admin(current_user):
+            raise ForbiddenError("Only super admins can create global templates")
 
     # Validate project_id for project scope
     if template_data.scope == "project" and not template_data.project_id:
         raise ValidationError("project_id is required for project-scoped templates")
+    if template_data.scope == "project":
+        if is_super_admin(current_user):
+            pass
+        elif is_ordinary_admin(current_user):
+            if not await can_manage_project(current_user, template_data.project_id):
+                raise ForbiddenError("Ordinary admins can only create templates for manageable projects")
+        elif not await can_access_project(current_user, template_data.project_id):
+            raise ForbiddenError("No permission to create templates for this project")
 
     # Generate template ID
     template_id = generate_id(template_data.name)
@@ -214,9 +184,7 @@ async def get_app_template(
         raise NotFoundError("Application template", template_id)
 
     # Check permission
-    user_id = str(current_user.get("id", ""))
-    user_roles = current_user.get("role", [])
-    if not check_template_permission(template, user_id, user_roles, project_id):
+    if not await can_read_template(current_user, template):
         raise ForbiddenError("No permission to access this template")
 
     _attach_app_template_tags(db, [template])
@@ -243,9 +211,8 @@ async def update_app_template(
 
     # Check permission
     user_id = str(current_user.get("id", ""))
-    can_manage_project_template = await _can_manage_project_template(current_user, template.project_id)
-    if template.created_by != user_id and not can_manage_project_template:
-        raise ForbiddenError("Only template creator or admin can update")
+    if not await can_modify_template(current_user, template):
+        raise ForbiddenError("Only the template creator, scoped project admin, or super admin can update")
 
     # Update fields
     logger.info(f"Update request: template_id={template_id}, replicas={template_data.replicas}")
@@ -305,9 +272,8 @@ async def delete_app_template(
 
     # Check permission
     user_id = str(current_user.get("id", ""))
-    can_manage_project_template = await _can_manage_project_template(current_user, template.project_id)
-    if template.created_by != user_id and not can_manage_project_template:
-        raise ForbiddenError("Only template creator or admin can delete")
+    if not await can_modify_template(current_user, template):
+        raise ForbiddenError("Only the template creator, scoped project admin, or super admin can delete")
 
     db.query(TemplateTagBinding).filter(
         TemplateTagBinding.template_type == "app",
