@@ -24,7 +24,34 @@ logger = logging.getLogger(__name__)
 def process_single_elf(self, task_item_id: str):
     db = get_db_session()
     worker_id, _ = get_worker_id_and_queue()
+    claimed = False
     try:
+        now = datetime.utcnow()
+        # Atomic claim: prevents duplicate execution when duplicate messages are delivered.
+        updated = (
+            db.query(BinaryToSourceTaskItem)
+            .filter(
+                BinaryToSourceTaskItem.id == task_item_id,
+                BinaryToSourceTaskItem.status.in_([ItemTaskStatus.QUEUED, ItemTaskStatus.PENDING]),
+            )
+            .update(
+                {
+                    "status": ItemTaskStatus.RUNNING,
+                    "started_at": now,
+                    "worker_id": worker_id,
+                    "attempt_count": BinaryToSourceTaskItem.attempt_count + 1,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated == 0:
+            db.rollback()
+            return {"ok": False, "reason": "item_not_claimable"}
+
+        db.commit()
+        claimed = True
+        worker_start_task(current_task_item_id=task_item_id)
+
         item = db.query(BinaryToSourceTaskItem).filter(BinaryToSourceTaskItem.id == task_item_id).first()
         if not item:
             return {"ok": False, "reason": "item_not_found"}
@@ -42,16 +69,12 @@ def process_single_elf(self, task_item_id: str):
             db.commit()
             return {"ok": True, "status": item.status}
 
-        worker_start_task(current_task_item_id=item.id)
-        item.status = ItemTaskStatus.RUNNING
-        item.started_at = datetime.utcnow()
-        item.attempt_count = (item.attempt_count or 0) + 1
-        item.worker_id = worker_id
-        db.commit()
-
         adapter = get_decompiler_adapter()
         result = adapter.decompile_elf(item.elf_path, item.output_dir)
 
+        # Reload after third-party call to read latest cancel signal and avoid stale session state.
+        db.refresh(item)
+        db.refresh(parent)
         if parent.status == ParentTaskStatus.CANCELLING or item.cancel_requested:
             item.status = ItemTaskStatus.CANCELLED
             item.failure_type = FailureType.CANCELLED_BY_USER
@@ -83,8 +106,9 @@ def process_single_elf(self, task_item_id: str):
         return {"ok": True, "status": item.status, "failure_type": item.failure_type}
     except Exception as exc:
         logger.exception("worker task execution error: %s", exc)
+        db.rollback()
         item = db.query(BinaryToSourceTaskItem).filter(BinaryToSourceTaskItem.id == task_item_id).first()
-        if item:
+        if item and item.status in {ItemTaskStatus.QUEUED, ItemTaskStatus.RUNNING, ItemTaskStatus.PENDING}:
             item.status = ItemTaskStatus.FAILED
             item.failure_type = FailureType.TRANSIENT_SYSTEM_ERROR
             item.error_reason = str(exc)
@@ -97,5 +121,6 @@ def process_single_elf(self, task_item_id: str):
             db.commit()
         return {"ok": False, "reason": "internal_error"}
     finally:
-        worker_finish_task()
+        if claimed:
+            worker_finish_task()
         db.close()

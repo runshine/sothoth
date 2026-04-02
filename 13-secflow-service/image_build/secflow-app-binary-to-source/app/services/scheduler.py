@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 
 from app.celery_tasks import process_single_elf
-from app.model import BinaryToSourceTask, ItemTaskStatus, get_db_session
+from app.model import BinaryToSourceTask, BinaryToSourceTaskItem, ItemTaskStatus, ParentTaskStatus, get_db_session
 from app.services.leader import LeaderElector
 from app.services.task_service import auto_retry_transient_items, get_pending_items_for_dispatch, recover_timed_out_items, refresh_parent_status
 from app.services.worker_registry import list_available_workers
@@ -79,20 +79,39 @@ class SchedulerService:
                 parent = db.query(BinaryToSourceTask).filter(BinaryToSourceTask.id == item.parent_task_id).first()
                 if not parent:
                     continue
-                if parent.status == "cancelling":
+                if parent.status == ParentTaskStatus.CANCELLING:
                     item.status = ItemTaskStatus.CANCELLED
                     item.error_reason = "parent cancelling"
                     item.finished_at = datetime.utcnow()
                     refresh_parent_status(parent)
                     continue
 
-                item.status = ItemTaskStatus.QUEUED
-                item.queued_at = datetime.utcnow()
-                item.worker_id = worker.worker_id
-                item.worker_queue = worker.queue
+                # Atomic claim from pending -> queued, avoiding duplicate dispatch in race conditions.
+                queued_at = datetime.utcnow()
+                updated_rows = (
+                    db.query(BinaryToSourceTaskItem)
+                    .filter(
+                        BinaryToSourceTaskItem.id == item.id,
+                        BinaryToSourceTaskItem.status == ItemTaskStatus.PENDING,
+                    )
+                    .update(
+                        {
+                            "status": ItemTaskStatus.QUEUED,
+                            "queued_at": queued_at,
+                            "worker_id": worker.worker_id,
+                            "worker_queue": worker.queue,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                if updated_rows == 0:
+                    continue
 
                 async_result = process_single_elf.apply_async(args=[item.id], queue=worker.queue)
-                item.celery_task_id = async_result.id
+                db.query(BinaryToSourceTaskItem).filter(BinaryToSourceTaskItem.id == item.id).update(
+                    {"celery_task_id": async_result.id},
+                    synchronize_session=False,
+                )
                 refresh_parent_status(parent)
 
             db.commit()

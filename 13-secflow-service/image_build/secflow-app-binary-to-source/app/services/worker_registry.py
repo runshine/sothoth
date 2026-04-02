@@ -190,3 +190,23 @@ def list_available_workers(limit: int = 20) -> List[WorkerInfo]:
             )
     workers.sort(key=lambda x: x.last_seen, reverse=True)
     return workers[:limit]
+
+
+def list_alive_worker_ids() -> set[str]:
+    cfg = get_config().redis
+    now = int(time.time())
+    raw = get_redis_client().hgetall(_worker_hash_key())
+    alive: set[str] = set()
+    for _, value in raw.items():
+        try:
+            data = json.loads(value)
+        except Exception:
+            continue
+        if now - int(data.get("last_seen", 0)) > cfg.worker_ttl_seconds:
+            continue
+        if data.get("status") == "offline":
+            continue
+        worker_id = data.get("worker_id")
+        if worker_id:
+            alive.add(worker_id)
+    return alive

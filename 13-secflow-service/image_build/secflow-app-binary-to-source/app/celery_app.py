@@ -1,8 +1,10 @@
 """Celery app factory."""
 
 from celery import Celery
+from celery.signals import worker_process_init
 
 from app.config import get_config
+from app.model import reset_db_engine
 
 
 cfg = get_config().celery
@@ -14,3 +16,9 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_acks_late=True,
 )
+
+
+@worker_process_init.connect
+def _reset_db_for_forked_workers(**_kwargs):
+    # Celery prefork children must not reuse the parent's pooled DB connections.
+    reset_db_engine()

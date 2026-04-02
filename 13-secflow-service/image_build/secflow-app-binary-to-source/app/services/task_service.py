@@ -16,6 +16,7 @@ from app.model import (
     ParentTaskStatus,
     generate_id,
 )
+from app.services.worker_registry import list_alive_worker_ids
 
 
 _TERMINAL_ITEM_STATUSES = {
@@ -270,6 +271,7 @@ def recover_timed_out_items(db: Session) -> int:
     cfg = get_config().scheduler
     now = datetime.utcnow()
     changed = 0
+    alive_worker_ids = list_alive_worker_ids()
 
     queued_deadline = now - timedelta(seconds=cfg.queued_timeout_seconds)
     queued = db.query(BinaryToSourceTaskItem).filter(
@@ -278,6 +280,22 @@ def recover_timed_out_items(db: Session) -> int:
         BinaryToSourceTaskItem.queued_at < queued_deadline,
     ).all()
     for item in queued:
+        item.status = ItemTaskStatus.PENDING
+        item.worker_id = None
+        item.worker_queue = None
+        item.celery_task_id = None
+        item.queued_at = None
+        item.cancel_requested = False
+        changed += 1
+
+    # Fast recovery for orphaned queued items whose target worker is no longer alive.
+    orphaned_queued = db.query(BinaryToSourceTaskItem).filter(
+        BinaryToSourceTaskItem.status == ItemTaskStatus.QUEUED,
+        BinaryToSourceTaskItem.worker_id.isnot(None),
+    ).all()
+    for item in orphaned_queued:
+        if item.worker_id in alive_worker_ids:
+            continue
         item.status = ItemTaskStatus.PENDING
         item.worker_id = None
         item.worker_queue = None
@@ -302,7 +320,7 @@ def recover_timed_out_items(db: Session) -> int:
         changed += 1
 
     if changed:
-        _refresh_parent_for_items(db, queued + running)
+        _refresh_parent_for_items(db, queued + orphaned_queued + running)
         db.commit()
 
     return changed

@@ -192,6 +192,7 @@ def get_engine():
         cfg = get_config().database
         kwargs = {
             "pool_pre_ping": True,
+            "pool_recycle": 1800,
             "connect_args": {"check_same_thread": False} if cfg.type == "sqlite" else {},
         }
         if cfg.type != "sqlite":
@@ -204,7 +205,12 @@ def get_engine():
 def get_session_factory():
     global _SessionFactory
     if _SessionFactory is None:
-        _SessionFactory = sessionmaker(autocommit=False, autoflush=False, bind=get_engine())
+        _SessionFactory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            expire_on_commit=False,
+            bind=get_engine(),
+        )
     return _SessionFactory
 
 
@@ -223,6 +229,15 @@ def get_db():
 
 def get_db_session() -> Session:
     return get_session_factory()()
+
+
+def reset_db_engine():
+    """Dispose inherited connections in prefork workers and rebuild lazily."""
+    global _engine, _SessionFactory
+    if _engine is not None:
+        _engine.dispose()
+    _engine = None
+    _SessionFactory = None
 
 
 def generate_id() -> str:
