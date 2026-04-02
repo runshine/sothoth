@@ -1303,10 +1303,16 @@ class AgentManager:
                     agents_map[decoded['key']] = decoded
 
             for key, agent_data in memory_agents.items():
-                agents_map[key] = {
-                    **agents_map.get(key, {}),
-                    **agent_data
-                }
+                existing = agents_map.get(key)
+                if not existing:
+                    agents_map[key] = agent_data
+                    continue
+                # 多副本部署下以数据库快照为主，避免不同POD内存态覆盖导致前端状态横跳；
+                # 仅在数据库缺失时使用内存字段做补齐。
+                for field_name in ('system_info', 'daemon_info', 'services'):
+                    if not existing.get(field_name) and agent_data.get(field_name):
+                        existing[field_name] = agent_data.get(field_name)
+                agents_map[key] = existing
 
             agents_list = list(agents_map.values())
             for item in agents_list:
@@ -1350,10 +1356,15 @@ class AgentManager:
                 agents_map[decoded['key']] = decoded
 
         for key, agent_data in memory_agents.items():
-            agents_map[key] = {
-                **agents_map.get(key, {}),
-                **agent_data
-            }
+            existing = agents_map.get(key)
+            if not existing:
+                agents_map[key] = agent_data
+                continue
+            # 多副本部署下以数据库快照为主，避免不同POD内存态覆盖导致状态抖动。
+            for field_name in ('system_info', 'daemon_info', 'services'):
+                if not existing.get(field_name) and agent_data.get(field_name):
+                    existing[field_name] = agent_data.get(field_name)
+            agents_map[key] = existing
 
         agents_list = list(agents_map.values())
         total = len(agents_list)
