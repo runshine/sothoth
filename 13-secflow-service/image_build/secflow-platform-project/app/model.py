@@ -178,9 +178,19 @@ def init_database():
 def run_auto_migrations():
     """启动时执行轻量级幂等迁移。"""
     engine = get_engine()
-    inspector = inspect(engine)
-
-    migrations = []
+    migrations = [
+        {
+            "name": "add_is_public_to_secflow_project",
+            "check": lambda inspector: "is_public" in {
+                column["name"] for column in inspector.get_columns("secflow_project")
+            },
+            "sql": (
+                "ALTER TABLE secflow_project "
+                "ADD COLUMN is_public BOOLEAN NOT NULL DEFAULT FALSE "
+                "AFTER status"
+            ),
+        },
+    ]
 
     with engine.begin() as connection:
         for migration in migrations:
