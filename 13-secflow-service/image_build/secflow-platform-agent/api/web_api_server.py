@@ -2718,6 +2718,8 @@ class WebAPIServer:
                 if agent.get('project_id') != project_id:
                     return jsonify({'error': f'Agent {agent_key} does not belong to project {project_id}'}), 403
 
+                old_status = str(agent.get('status') or '')
+
                 # 更新agent状态
                 if self.db_manager.db_type == 'mysql':
                     self.db_manager.execute_query(f'''
@@ -2740,6 +2742,16 @@ class WebAPIServer:
                     agent_info.status = status
                     agent_info.last_seen = datetime.now()
 
+                self.agent_manager.record_manual_status_transition(
+                    project_id=project_id,
+                    agent_key=agent_key,
+                    hostname=str(agent.get('hostname') or ''),
+                    ip_address=str(agent.get('ip_address') or ''),
+                    from_status=old_status,
+                    to_status=status,
+                    reason_message=f'manual status update: {old_status or "unknown"} -> {status}'
+                )
+
                 self.logger.info(f"手动更新agent {agent_key} 状态为 {status}")
 
                 return jsonify({
@@ -2753,6 +2765,33 @@ class WebAPIServer:
 
             except Exception as e:
                 self.logger.error(f"更新agent状态失败: {str(e)}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/<agent_key>/status-history', methods=['GET'])
+        def get_agent_status_history(agent_key):
+            """查询指定Agent最近上下线事件历史"""
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+
+                limit_raw = request.args.get('limit', '100')
+                try:
+                    limit = int(limit_raw)
+                except Exception:
+                    limit = 100
+                limit = max(1, min(limit, 100))
+
+                items = self.agent_manager.list_agent_status_history(project_id, agent_key, limit=limit)
+                return jsonify({
+                    'project_id': project_id,
+                    'agent_key': agent_key,
+                    'limit': limit,
+                    'total': len(items),
+                    'items': items,
+                })
+            except Exception as e:
+                self.logger.error(f"获取Agent状态历史失败: {str(e)}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/agents/<agent_key>/ingress/rebind', methods=['POST'])

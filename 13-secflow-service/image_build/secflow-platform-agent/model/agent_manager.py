@@ -667,7 +667,20 @@ class AgentManager:
                 )
 
                 self._check_secflow_agent_agent_status(agent)
-                self._save_agent_to_db(agent)
+                reason_code = {
+                    'online': 'health_ok',
+                    'offline': 'health_connection_error',
+                    'timeout': 'health_timeout',
+                    'error': 'health_http_or_runtime_error',
+                    'unknown': 'health_unknown',
+                    'invalid': 'health_invalid_agent_key',
+                }.get(str(agent.status or '').lower(), 'health_unknown')
+                self._save_agent_to_db(
+                    agent,
+                    reason_code=reason_code,
+                    reason_message=f"refresh probe result: {agent.status}",
+                    source='refresh_probe'
+                )
                 new_agents[agent_key] = agent
 
         self._mark_missing_agents_offline(set(new_agents.keys()))
@@ -751,6 +764,21 @@ class AgentManager:
                     f"SET status = 'offline', pod_id = ?, updated_at = datetime('now') "
                     f"WHERE agent_key IN ({placeholders})",
                     (self.pod_id, *missing_online_keys)
+                )
+
+            for agent_key in missing_online_keys:
+                row = next((r for r in rows if r.get('agent_key') == agent_key), None) or {}
+                self._record_agent_status_transition(
+                    project_id=str(row.get('project_id') or ''),
+                    agent_key=agent_key,
+                    hostname='',
+                    ip_address='',
+                    from_status=str(row.get('status') or ''),
+                    to_status='offline',
+                    reason_code='nacos_missing_exceed_grace',
+                    reason_message=f'Agent not found in nacos and exceeded grace({self.agent_offline_grace_sec}s)',
+                    source='refresh_missing',
+                    observed_at=now,
                 )
 
             with self.lock:
@@ -982,14 +1010,158 @@ class AgentManager:
             except socket.error:
                 return False
 
+    @staticmethod
+    def _status_to_edge_state(status: Any) -> str:
+        return 'online' if str(status or '').lower() == 'online' else 'offline'
 
-    def _save_agent_to_db(self, agent: AgentInfo):
+    def _trim_agent_status_events(self, project_id: str, agent_key: str, keep: int = 100):
+        if not project_id or not agent_key:
+            return
+        table_name = self.db.get_table_name('agent_status_events')
+        keep = max(int(keep or 100), 1)
+        try:
+            if self.db.db_type == 'mysql':
+                self.db.execute_query(
+                    f'''
+                    DELETE FROM {table_name}
+                    WHERE project_id = %s
+                      AND agent_key = %s
+                      AND id NOT IN (
+                        SELECT id FROM (
+                          SELECT id FROM {table_name}
+                          WHERE project_id = %s AND agent_key = %s
+                          ORDER BY id DESC
+                          LIMIT %s
+                        ) AS keep_rows
+                      )
+                    ''',
+                    (project_id, agent_key, project_id, agent_key, keep)
+                )
+            else:
+                self.db.execute_query(
+                    f'''
+                    DELETE FROM {table_name}
+                    WHERE project_id = ?
+                      AND agent_key = ?
+                      AND id NOT IN (
+                        SELECT id FROM {table_name}
+                        WHERE project_id = ? AND agent_key = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                      )
+                    ''',
+                    (project_id, agent_key, project_id, agent_key, keep)
+                )
+        except Exception as e:
+            self.logger.warning(f"裁剪Agent状态事件失败: agent={agent_key}, err={e}")
+
+    def _record_agent_status_transition(
+        self,
+        *,
+        project_id: str,
+        agent_key: str,
+        hostname: str = '',
+        ip_address: str = '',
+        from_status: str,
+        to_status: str,
+        reason_code: str,
+        reason_message: str = '',
+        source: str = 'refresh',
+        observed_at: Optional[datetime] = None,
+    ) -> bool:
+        edge_from = self._status_to_edge_state(from_status)
+        edge_to = self._status_to_edge_state(to_status)
+        if edge_from == edge_to:
+            return False
+
+        table_name = self.db.get_table_name('agent_status_events')
+        observed = observed_at or datetime.now()
+        observed_text = observed.isoformat()
+        try:
+            if self.db.db_type == 'mysql':
+                self.db.execute_query(
+                    f'''
+                    INSERT INTO {table_name}
+                    (project_id, agent_key, hostname, ip_address, from_status, to_status,
+                     edge_state_from, edge_state_to, reason_code, reason_message, source, pod_id, observed_at, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ''',
+                    (
+                        project_id,
+                        agent_key,
+                        hostname or '',
+                        ip_address or '',
+                        str(from_status or ''),
+                        str(to_status or ''),
+                        edge_from,
+                        edge_to,
+                        str(reason_code or ''),
+                        str(reason_message or ''),
+                        str(source or 'refresh'),
+                        self.pod_id,
+                        observed_text,
+                    )
+                )
+            else:
+                self.db.execute_query(
+                    f'''
+                    INSERT INTO {table_name}
+                    (project_id, agent_key, hostname, ip_address, from_status, to_status,
+                     edge_state_from, edge_state_to, reason_code, reason_message, source, pod_id, observed_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    ''',
+                    (
+                        project_id,
+                        agent_key,
+                        hostname or '',
+                        ip_address or '',
+                        str(from_status or ''),
+                        str(to_status or ''),
+                        edge_from,
+                        edge_to,
+                        str(reason_code or ''),
+                        str(reason_message or ''),
+                        str(source or 'refresh'),
+                        self.pod_id,
+                        observed_text,
+                    )
+                )
+            self._trim_agent_status_events(project_id, agent_key, keep=100)
+            return True
+        except Exception as e:
+            self.logger.error(f"记录Agent状态切换失败: agent={agent_key}, err={e}")
+            return False
+
+
+    def _save_agent_to_db(
+        self,
+        agent: AgentInfo,
+        reason_code: str = 'refresh_probe',
+        reason_message: str = '',
+        source: str = 'refresh',
+    ):
+        prev_status = ''
+        table_name = self.db.get_table_name('agent_status')
+        try:
+            if self.db.db_type == 'mysql':
+                prev_row = self.db.fetch_one(
+                    f"SELECT status FROM {table_name} WHERE agent_key = %s LIMIT 1",
+                    (agent.key,)
+                )
+            else:
+                prev_row = self.db.fetch_one(
+                    f"SELECT status FROM {table_name} WHERE agent_key = ? LIMIT 1",
+                    (agent.key,)
+                )
+            prev_status = str((prev_row or {}).get('status') or '')
+        except Exception:
+            prev_status = ''
+
         try:
             system_info_json = json.dumps(agent.system_info) if agent.system_info else '{}'
             daemon_info_json = json.dumps(agent.daemon_info) if agent.daemon_info else '{}'
             services_json = json.dumps(agent.services) if agent.services else '[]'
             last_seen_str = agent.last_seen.isoformat() if agent.last_seen else None
-            table_name = self.db.get_table_name('agent_status')
 
             if self.db.db_type == 'mysql':
                 self.db.execute_query(f'''
@@ -1042,8 +1214,89 @@ class AgentManager:
                     self.pod_id
                 ))
 
+            self._record_agent_status_transition(
+                project_id=agent.project_id,
+                agent_key=agent.key,
+                hostname=agent.hostname,
+                ip_address=agent.ip_address,
+                from_status=prev_status,
+                to_status=agent.status,
+                reason_code=reason_code,
+                reason_message=reason_message,
+                source=source,
+                observed_at=agent.last_seen or datetime.now(),
+            )
         except Exception as e:
             self.logger.error(f"保存Agent状态到数据库失败: {str(e)}")
+
+    def record_manual_status_transition(
+        self,
+        *,
+        project_id: str,
+        agent_key: str,
+        hostname: str,
+        ip_address: str,
+        from_status: str,
+        to_status: str,
+        reason_message: str = '',
+    ) -> bool:
+        return self._record_agent_status_transition(
+            project_id=project_id,
+            agent_key=agent_key,
+            hostname=hostname,
+            ip_address=ip_address,
+            from_status=from_status,
+            to_status=to_status,
+            reason_code='manual_update',
+            reason_message=reason_message,
+            source='manual',
+            observed_at=datetime.now(),
+        )
+
+    def list_agent_status_history(self, project_id: str, agent_key: str, limit: int = 100) -> List[Dict]:
+        table_name = self.db.get_table_name('agent_status_events')
+        q_limit = max(1, min(int(limit or 100), 100))
+        try:
+            if self.db.db_type == 'mysql':
+                rows = self.db.fetch_all(
+                    f'''
+                    SELECT id, project_id, agent_key, hostname, ip_address,
+                           from_status, to_status, edge_state_from, edge_state_to,
+                           reason_code, reason_message, source, pod_id, observed_at, created_at
+                    FROM {table_name}
+                    WHERE project_id = %s AND agent_key = %s
+                    ORDER BY id DESC
+                    LIMIT %s
+                    ''',
+                    (project_id, agent_key, q_limit)
+                ) or []
+            else:
+                rows = self.db.fetch_all(
+                    f'''
+                    SELECT id, project_id, agent_key, hostname, ip_address,
+                           from_status, to_status, edge_state_from, edge_state_to,
+                           reason_code, reason_message, source, pod_id, observed_at, created_at
+                    FROM {table_name}
+                    WHERE project_id = ? AND agent_key = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    ''',
+                    (project_id, agent_key, q_limit)
+                ) or []
+
+            items: List[Dict] = []
+            for row in rows:
+                item = dict(row)
+                item['direction'] = '上线' if str(item.get('edge_state_to') or '').lower() == 'online' else '下线'
+                observed = item.get('observed_at')
+                created = item.get('created_at')
+                item['observed_at'] = str(observed) if observed is not None else None
+                item['created_at'] = str(created) if created is not None else None
+                items.append(item)
+            return items
+        except Exception as e:
+            self.logger.error(f"查询Agent状态历史失败: agent={agent_key}, err={e}")
+            return []
 
     def get_project(self, project_id: str) -> Optional[ProjectInfo]:
         with self.lock:
@@ -1197,7 +1450,12 @@ class AgentManager:
                 except Exception:
                     pass
 
-                self._save_agent_to_db(discovered)
+                self._save_agent_to_db(
+                    discovered,
+                    reason_code='auto_discover',
+                    reason_message='agent discovered from nacos by key lookup',
+                    source='auto_discover'
+                )
                 with self.lock:
                     self.agents[discovered.key] = discovered
                     self._update_project(discovered.project_id, discovered.key)
