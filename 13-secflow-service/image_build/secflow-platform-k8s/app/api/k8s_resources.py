@@ -1758,6 +1758,10 @@ async def create_pvc(
     """创建PVC"""
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
 
+    # 兼容历史调用：部分上游会传 {"manifest": {...}}。
+    if "manifest" in manifest and "metadata" not in manifest:
+        manifest = manifest["manifest"]
+
     if "metadata" not in manifest:
         manifest["metadata"] = {}
     manifest["metadata"]["namespace"] = namespace

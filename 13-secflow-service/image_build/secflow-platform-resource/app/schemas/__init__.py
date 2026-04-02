@@ -20,6 +20,8 @@ from app.schemas.schemas import (
     OutputPVCCreateRequest,
     OutputPVCCreateResponse,
     OutputPVCDeleteResponse,
+    ManualPVCCreateRequest,
+    ManualPVCCreateResponse,
     PvcBrowserBreadcrumbItem,
     PvcBrowserNode,
     PvcBrowserRootResponse,
@@ -67,4 +69,6 @@ __all__ = [
     "OutputPVCBrowserCreateDirectoryRequest",
     "OutputPVCBrowserRenameRequest",
     "OutputPVCBrowserMoveRequest",
+    "ManualPVCCreateRequest",
+    "ManualPVCCreateResponse",
 ]

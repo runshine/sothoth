@@ -240,6 +240,26 @@ class OutputPVCDeleteResponse(BaseModel):
     deleted_pvc: Optional[str] = None
 
 
+class ManualPVCCreateRequest(BaseModel):
+    """手动创建PVC资源请求（支持任意资源类型）。"""
+    name: str = Field(..., description="资源名称")
+    description: Optional[str] = Field(default=None, description="资源描述")
+    project_id: str = Field(..., description="关联项目ID")
+    resource_type: ResourceType = Field(..., description="资源类型: document/software/code/other/output_pvc")
+    pvc_size: int = Field(default=10, ge=1, le=500, description="PVC大小（Gi）")
+
+
+class ManualPVCCreateResponse(BaseModel):
+    """手动创建PVC资源响应。"""
+    resource_id: int
+    resource_uuid: str
+    resource_type: ResourceType
+    pvc_name: str
+    namespace: str
+    capacity: str
+    message: str
+
+
 class PvcBrowserBreadcrumbItem(BaseModel):
     """PVC 浏览器面包屑。"""
     path: str

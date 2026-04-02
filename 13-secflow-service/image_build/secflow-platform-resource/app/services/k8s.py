@@ -128,7 +128,8 @@ class KubernetesService:
                     "resources": {"requests": {"storage": f"{size or self.pvc_size}Gi"}},
                 },
             }
-            resp = self._request("POST", "/pvcs", project_id=project_id, json={"manifest": manifest})
+            # platform-k8s /pvcs endpoint expects raw manifest body (not wrapped by {"manifest": ...}).
+            resp = self._request("POST", "/pvcs", project_id=project_id, json=manifest)
             if resp.status_code in (200, 201):
                 return pvc_name
             if resp.status_code == 409:
@@ -519,14 +520,19 @@ ls -la {target_path}/"""
             items = (resp.json() or {}).get("items", [])
             result = []
             for pvc in items:
-                capacity = pvc.get("capacity") or {}
+                name = (pvc.get("name") or "").strip()
+                if not name:
+                    # Ignore malformed records to avoid breaking upper-layer response_model validation.
+                    continue
+                capacity = self._normalize_capacity(pvc.get("capacity"))
+                storage_class = self._normalize_storage_class(pvc.get("storage_class"))
                 result.append(
                     {
-                        "name": pvc.get("name"),
-                        "capacity": capacity.get("storage", "0Gi") if isinstance(capacity, dict) else "0Gi",
-                        "status": pvc.get("status", "Unknown"),
-                        "storage_class": pvc.get("storage_class"),
-                        "namespace": pvc.get("namespace", namespace),
+                        "name": name,
+                        "capacity": capacity,
+                        "status": pvc.get("status", "Unknown") or "Unknown",
+                        "storage_class": storage_class,
+                        "namespace": (pvc.get("namespace") or namespace).strip() or namespace,
                     }
                 )
             return result
@@ -596,17 +602,35 @@ ls -la {target_path}/"""
             if resp.status_code != 200:
                 return None
             pvc = resp.json() or {}
-            capacity = pvc.get("capacity") or {}
+            capacity = self._normalize_capacity(pvc.get("capacity"))
+            namespace = self.get_project_namespace(project_id)
             return {
-                "name": pvc.get("name"),
-                "capacity": capacity.get("storage", "0Gi") if isinstance(capacity, dict) else "0Gi",
-                "status": pvc.get("status", "Unknown"),
-                "storage_class": pvc.get("storage_class"),
-                "namespace": pvc.get("namespace", self.get_project_namespace(project_id)),
+                "name": (pvc.get("name") or pvc_name or "").strip(),
+                "capacity": capacity,
+                "status": pvc.get("status", "Unknown") or "Unknown",
+                "storage_class": self._normalize_storage_class(pvc.get("storage_class")),
+                "namespace": (pvc.get("namespace") or namespace).strip() or namespace,
             }
         except Exception as e:
             logger.error(f"Failed to get PVC {pvc_name}: {e}")
             return None
+
+    def _normalize_capacity(self, capacity: Any) -> str:
+        if isinstance(capacity, dict):
+            value = capacity.get("storage")
+            if value is None:
+                return "0Gi"
+            value_str = str(value).strip()
+            return value_str or "0Gi"
+        if capacity is None:
+            return "0Gi"
+        value_str = str(capacity).strip()
+        return value_str or "0Gi"
+
+    def _normalize_storage_class(self, storage_class: Any) -> str:
+        value = "" if storage_class is None else str(storage_class).strip()
+        # Hand-created PVCs may have no storageClassName (None/empty); keep response model stable.
+        return value or "n/a"
 
     def check_pvc_in_use(self, project_id: str, pvc_name: str) -> tuple[bool, str]:
         """Check if a PVC is currently in use by any pod/job."""
