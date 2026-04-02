@@ -220,6 +220,7 @@ class TaskManager:
     def _normalize_provider_file_bindings(self, provider: Dict[str, Any]) -> List[Dict[str, Any]]:
         raw_items = provider.get("file_bindings") if isinstance(provider.get("file_bindings"), list) else []
         normalized: List[Dict[str, Any]] = []
+        provider_key = str(provider.get("provider_key") or "").strip() or None
         for index, item in enumerate(raw_items):
             if not isinstance(item, dict):
                 continue
@@ -235,8 +236,48 @@ class TaskManager:
                 "content": content,
                 "format": str(item.get("format") or "other").strip().lower() or "other",
                 "enabled": True,
+                "provider_key": provider_key,
             })
         return normalized
+
+    @staticmethod
+    def _normalize_provider_keys(params: Dict[str, Any]) -> List[str]:
+        raw_items: List[str] = []
+        if isinstance(params.get("llm_provider_keys"), list):
+            raw_items.extend([str(item or "").strip() for item in params.get("llm_provider_keys") or []])
+        single = str(params.get("llm_provider_key") or "").strip()
+        if single:
+            raw_items.append(single)
+        normalized: List[str] = []
+        for item in raw_items:
+            if not item:
+                continue
+            if item not in normalized:
+                normalized.append(item)
+        return normalized
+
+    def _merge_provider_bindings(self, providers: List[Dict[str, Any]]) -> Dict[str, Any]:
+        merged_env: Dict[str, str] = {}
+        merged_files_by_path: Dict[str, Dict[str, Any]] = {}
+        snapshots: List[Dict[str, Any]] = []
+
+        for provider in providers:
+            merged_env.update(self._normalize_provider_env_bindings(provider))
+            for file_item in self._normalize_provider_file_bindings(provider):
+                merged_files_by_path[file_item["path"]] = file_item
+            snapshots.append(self._build_provider_snapshot(provider))
+
+        merged_files = list(merged_files_by_path.values())
+        effective_snapshot = snapshots[-1] if snapshots else {}
+        effective_key = str(effective_snapshot.get("provider_key") or "").strip() or None
+
+        return {
+            "env": merged_env,
+            "files": merged_files,
+            "snapshots": snapshots,
+            "effective_snapshot": effective_snapshot,
+            "effective_key": effective_key,
+        }
 
     def _handle_create_task(self, task: Task, db: Session) -> str:
         """处理创建任务"""
@@ -249,7 +290,7 @@ class TaskManager:
         custom_env["PROJECT_ID"] = task.project_id
         code_server_env = params.get("code_server_env") or {}
         image = params.get("image")  # 获取自定义镜像参数
-        llm_provider_key = str(params.get("llm_provider_key") or "").strip()
+        llm_provider_keys = self._normalize_provider_keys(params)
 
         k8s_service = get_k8s_service()
         configcenter_client = get_configcenter_client()
@@ -268,21 +309,28 @@ class TaskManager:
 
             deployment_custom_env: Dict[str, str] = dict(custom_env)
             deployment_extra_env: Optional[Dict[str, str]] = None
+            llm_provider_keys_to_save: List[str] = []
             llm_provider_snapshot: Dict[str, Any] = {}
+            llm_provider_snapshots: List[Dict[str, Any]] = []
             llm_provider_mapped_env_keys: List[str] = []
             llm_file_bindings: List[Dict[str, Any]] = []
             llm_file_mounts: List[Dict[str, Any]] = []
 
-            if llm_provider_key:
-                provider = configcenter_client.get_llm_provider(llm_provider_key)
-                provider_env = self._normalize_provider_env_bindings(provider)
+            if llm_provider_keys:
+                providers: List[Dict[str, Any]] = []
+                for provider_key in llm_provider_keys:
+                    providers.append(configcenter_client.get_llm_provider(provider_key))
+                merged_bindings = self._merge_provider_bindings(providers)
+                provider_env = merged_bindings["env"]
                 deployment_custom_env = dict(provider_env)
                 deployment_custom_env["PROJECT_ID"] = task.project_id
                 deployment_extra_env = dict(custom_env)
 
-                llm_provider_snapshot = self._build_provider_snapshot(provider)
+                llm_provider_keys_to_save = llm_provider_keys
+                llm_provider_snapshot = merged_bindings["effective_snapshot"]
+                llm_provider_snapshots = merged_bindings["snapshots"]
                 llm_provider_mapped_env_keys = sorted(provider_env.keys())
-                llm_file_bindings = self._normalize_provider_file_bindings(provider)
+                llm_file_bindings = merged_bindings["files"]
 
                 if llm_file_bindings:
                     llm_configmap_name = f"code-server-llm-{code_server_id}"[:63].rstrip("-")
@@ -308,14 +356,18 @@ class TaskManager:
                         raise RuntimeError(f"创建LLM ConfigMap失败: {llm_configmap_name}")
                     llm_configmap_created = True
 
-                code_server.llm_provider_key = llm_provider_key
+                code_server.llm_provider_key = merged_bindings["effective_key"]
+                code_server.llm_provider_keys = llm_provider_keys_to_save
                 code_server.llm_provider_snapshot = llm_provider_snapshot
+                code_server.llm_provider_snapshots = llm_provider_snapshots
                 code_server.llm_provider_mapped_env_keys = llm_provider_mapped_env_keys
                 code_server.llm_file_bindings = llm_file_bindings
                 code_server.llm_configmap_name = llm_configmap_name
             else:
                 code_server.llm_provider_key = None
+                code_server.llm_provider_keys = []
                 code_server.llm_provider_snapshot = {}
+                code_server.llm_provider_snapshots = []
                 code_server.llm_provider_mapped_env_keys = []
                 code_server.llm_file_bindings = []
                 code_server.llm_configmap_name = None

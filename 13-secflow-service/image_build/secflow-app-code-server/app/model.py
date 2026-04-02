@@ -81,7 +81,9 @@ class CodeServer(Base):
     custom_env = Column(JSON, default=dict)          # 自定义环境变量
     code_server_env = Column(JSON, default=dict)     # Code Server镜像环境变量配置
     llm_provider_key = Column(String(128))
+    llm_provider_keys = Column(JSON, default=list)
     llm_provider_snapshot = Column(JSON, default=dict)
+    llm_provider_snapshots = Column(JSON, default=list)
     llm_provider_mapped_env_keys = Column(JSON, default=list)
     llm_file_bindings = Column(JSON, default=list)
     llm_configmap_name = Column(String(128))
@@ -110,7 +112,9 @@ class CodeServer(Base):
             "custom_env": self.custom_env or {},
             "code_server_env": self.code_server_env or {},
             "llm_provider_key": self.llm_provider_key,
+            "llm_provider_keys": self.llm_provider_keys or [],
             "llm_provider_snapshot": self.llm_provider_snapshot or {},
+            "llm_provider_snapshots": self.llm_provider_snapshots or [],
             "llm_provider_mapped_env_keys": self.llm_provider_mapped_env_keys or [],
             "llm_file_bindings": self.llm_file_bindings or [],
             "llm_configmap_name": self.llm_configmap_name,
@@ -220,8 +224,12 @@ def _ensure_code_server_columns(engine):
     to_add = []
     if "llm_provider_key" not in columns:
         to_add.append("llm_provider_key VARCHAR(128)")
+    if "llm_provider_keys" not in columns:
+        to_add.append("llm_provider_keys JSON")
     if "llm_provider_snapshot" not in columns:
         to_add.append("llm_provider_snapshot JSON")
+    if "llm_provider_snapshots" not in columns:
+        to_add.append("llm_provider_snapshots JSON")
     if "llm_provider_mapped_env_keys" not in columns:
         to_add.append("llm_provider_mapped_env_keys JSON")
     if "llm_file_bindings" not in columns:

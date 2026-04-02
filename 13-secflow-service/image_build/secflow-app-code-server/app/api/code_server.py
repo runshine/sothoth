@@ -3,7 +3,7 @@ Code Server Manager - API路由
 """
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
 from sqlalchemy.orm import Session, joinedload
@@ -28,6 +28,41 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/app/code-server", tags=["Code Server Manager"])
 
 # ============ Helper Functions ============
+
+
+def normalize_llm_provider_keys(llm_provider_key: Optional[str], llm_provider_keys: Optional[List[str]]) -> List[str]:
+    raw_items: List[str] = []
+    if isinstance(llm_provider_keys, list):
+        raw_items.extend([str(item or "").strip() for item in llm_provider_keys])
+    single = str(llm_provider_key or "").strip()
+    if single:
+        raw_items.append(single)
+    normalized: List[str] = []
+    for item in raw_items:
+        if not item:
+            continue
+        if item not in normalized:
+            normalized.append(item)
+    return normalized
+
+
+def get_server_llm_provider_keys(server: CodeServer) -> List[str]:
+    provider_keys = server.llm_provider_keys if isinstance(server.llm_provider_keys, list) else []
+    if not provider_keys and server.llm_provider_key:
+        provider_keys = [server.llm_provider_key]
+    return provider_keys
+
+
+def matches_llm_filters(server: CodeServer, llm_binding: str, requested_provider_keys: Set[str]) -> bool:
+    server_provider_keys = get_server_llm_provider_keys(server)
+    has_binding = len(server_provider_keys) > 0
+    if llm_binding == "bound" and not has_binding:
+        return False
+    if llm_binding == "unbound" and has_binding:
+        return False
+    if requested_provider_keys and not any(key in requested_provider_keys for key in server_provider_keys):
+        return False
+    return True
 
 def get_code_server_by_name(db: Session, project_id: str, name: str) -> Optional[CodeServer]:
     """通过名称获取Code Server"""
@@ -119,6 +154,10 @@ def get_code_server_realtime_status(server: CodeServer, k8s_service) -> tuple[st
 
 def make_code_server_response(server: CodeServer, realtime_status: str = None) -> CodeServerResponse:
     """构建Code Server响应"""
+    provider_keys = get_server_llm_provider_keys(server)
+    provider_snapshots = server.llm_provider_snapshots if isinstance(server.llm_provider_snapshots, list) else []
+    if not provider_snapshots and server.llm_provider_snapshot:
+        provider_snapshots = [server.llm_provider_snapshot]
     return CodeServerResponse(
         id=server.id,
         project_id=server.project_id,
@@ -134,7 +173,9 @@ def make_code_server_response(server: CodeServer, realtime_status: str = None) -
         access_url=server.access_url,
         code_server_env=server.code_server_env or {},
         llm_provider_key=server.llm_provider_key,
+        llm_provider_keys=provider_keys,
         llm_provider_snapshot=server.llm_provider_snapshot or {},
+        llm_provider_snapshots=provider_snapshots,
         llm_provider_mapped_env_keys=server.llm_provider_mapped_env_keys or [],
         llm_file_bindings=server.llm_file_bindings or [],
         llm_configmap_name=server.llm_configmap_name,
@@ -210,6 +251,7 @@ async def create_code_server(
         raise ConflictError(f"Code Server名称已存在: {request.name}")
 
     # 创建Code Server记录
+    normalized_llm_provider_keys = normalize_llm_provider_keys(request.llm_provider_key, request.llm_provider_keys)
     code_server_id = generate_id()
     code_server = CodeServer(
         id=code_server_id,
@@ -226,7 +268,8 @@ async def create_code_server(
         } for p in request.output_pvcs],
         custom_env=request.custom_env or {},
         code_server_env=request.code_server_env or {},
-        llm_provider_key=(request.llm_provider_key or "").strip() or None
+        llm_provider_key=(normalized_llm_provider_keys[-1] if normalized_llm_provider_keys else None),
+        llm_provider_keys=normalized_llm_provider_keys
     )
     db.add(code_server)
     db.commit()
@@ -240,7 +283,8 @@ async def create_code_server(
         "custom_env": request.custom_env,
         "code_server_env": request.code_server_env,
         "image": request.image,  # 传递自定义镜像参数
-        "llm_provider_key": (request.llm_provider_key or "").strip() or None
+        "llm_provider_key": (normalized_llm_provider_keys[-1] if normalized_llm_provider_keys else None),
+        "llm_provider_keys": normalized_llm_provider_keys
     }
     task = task_manager.create_task(
         project_id=project_id,
@@ -348,6 +392,8 @@ async def restart_code_server(
 async def list_code_servers(
     project_id: str = Path(..., description="项目ID"),
     status: Optional[str] = Query(None, description="按状态过滤"),
+    llm_binding: str = Query("all", description="LLM 绑定状态过滤: all|bound|unbound"),
+    llm_provider_keys: Optional[str] = Query(None, description="按 Provider Key 过滤，逗号分隔，命中任一"),
     realtime: bool = Query(True, description="是否实时获取Kubernetes状态"),
     db: Session = Depends(get_db)
 ):
@@ -356,6 +402,10 @@ async def list_code_servers(
     - 默认实时从Kubernetes获取Pod状态
     - 设置 realtime=false 可只查询数据库状态（更快）
     """
+    llm_binding = str(llm_binding or "all").strip().lower()
+    if llm_binding not in {"all", "bound", "unbound"}:
+        raise ValidationError("llm_binding 仅支持 all|bound|unbound")
+
     query = db.query(CodeServer).filter(
         CodeServer.project_id == project_id,
         CodeServer.status != CodeServerStatus.DELETED.value
@@ -365,11 +415,16 @@ async def list_code_servers(
         query = query.filter(CodeServer.status == status)
 
     servers = query.all()
+    requested_provider_keys = {
+        item.strip() for item in str(llm_provider_keys or "").split(",") if item.strip()
+    }
 
     k8s_service = get_k8s_service() if realtime else None
 
     items = []
     for server in servers:
+        if not matches_llm_filters(server, llm_binding, requested_provider_keys):
+            continue
         realtime_status = None
         if realtime and k8s_service and server.deployment_name:
             try:

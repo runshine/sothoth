@@ -82,9 +82,13 @@ class FakeConfigCenter:
     def __init__(self, payload):
         self.payload = payload
         self.last_key = None
+        self.requested_keys = []
 
     def get_llm_provider(self, provider_key):
         self.last_key = provider_key
+        self.requested_keys.append(provider_key)
+        if isinstance(self.payload, dict) and provider_key in self.payload:
+            return self.payload[provider_key]
         return self.payload
 
 
@@ -105,7 +109,9 @@ def _make_code_server(llm_configmap_name=None):
         code_server_env={},
         custom_env={},
         llm_provider_key=None,
+        llm_provider_keys=[],
         llm_provider_snapshot={},
+        llm_provider_snapshots=[],
         llm_provider_mapped_env_keys=[],
         llm_file_bindings=[],
         llm_configmap_name=llm_configmap_name,
@@ -132,6 +138,7 @@ def test_create_without_llm_provider(monkeypatch):
             "code_server_env": {},
             "image": "",
             "llm_provider_key": "",
+            "llm_provider_keys": [],
         },
     )
 
@@ -140,6 +147,7 @@ def test_create_without_llm_provider(monkeypatch):
     assert "创建成功" in result
     assert code_server.status == CodeServerStatus.RUNNING.value
     assert code_server.llm_provider_key is None
+    assert code_server.llm_provider_keys == []
     assert fake_k8s.created_configmap is None
     assert fake_k8s.deployment_call["extra_env"] is None
     assert fake_k8s.deployment_call["llm_configmap_name"] is None
@@ -182,13 +190,16 @@ def test_create_with_llm_provider_env_override(monkeypatch):
             "code_server_env": {},
             "image": "",
             "llm_provider_key": "openai-prod",
+            "llm_provider_keys": ["openai-prod"],
         },
     )
 
     manager._handle_create_task(task, db)
 
     assert fake_cc.last_key == "openai-prod"
+    assert fake_cc.requested_keys == ["openai-prod"]
     assert code_server.llm_provider_key == "openai-prod"
+    assert code_server.llm_provider_keys == ["openai-prod"]
     assert code_server.llm_provider_snapshot["provider_key"] == "openai-prod"
     assert "COMMON" in code_server.llm_provider_mapped_env_keys
     assert fake_k8s.deployment_call["custom_env"]["COMMON"] == "from-provider"
@@ -243,6 +254,7 @@ def test_create_with_llm_file_bindings_and_delete_cleanup(monkeypatch):
             "code_server_env": {},
             "image": "",
             "llm_provider_key": "anthropic-prod",
+            "llm_provider_keys": ["anthropic-prod"],
         },
     )
     manager._handle_create_task(create_task, db)
@@ -264,5 +276,84 @@ def test_create_with_llm_file_bindings_and_delete_cleanup(monkeypatch):
 
     assert fake_k8s.deleted_configmap is not None
     assert fake_k8s.deleted_configmap["name"] == fake_k8s.created_configmap["name"]
+
+    manager.executor.shutdown(wait=False)
+
+
+def test_create_with_multiple_llm_providers_merge_rules(monkeypatch):
+    code_server = _make_code_server()
+    db = FakeDB(code_server)
+    fake_k8s = FakeK8s()
+    fake_cc = FakeConfigCenter(
+        {
+            "provider-a": {
+                "provider_key": "provider-a",
+                "display_name": "Provider A",
+                "provider_type": "openai-compatible",
+                "model": "a-model",
+                "api_base": "https://a.example.com",
+                "env_bindings": {
+                    "COMMON": "A",
+                    "A_ONLY": "A-ONLY",
+                },
+                "file_bindings": [
+                    {"name": "a.cfg", "path": "/etc/llm/agent.yaml", "content": "from: A", "enabled": True},
+                    {"name": "skip-a", "path": "/tmp/a.txt", "content": "skip", "enabled": False},
+                ],
+            },
+            "provider-b": {
+                "provider_key": "provider-b",
+                "display_name": "Provider B",
+                "provider_type": "anthropic",
+                "model": "b-model",
+                "api_base": "https://b.example.com",
+                "env_bindings": {
+                    "COMMON": "B",
+                    "B_ONLY": "B-ONLY",
+                },
+                "file_bindings": [
+                    {"name": "b.cfg", "path": "/etc/llm/agent.yaml", "content": "from: B", "enabled": True},
+                    {"name": "b2.cfg", "path": "/etc/llm/extra.json", "content": "{\"from\": \"B\"}", "enabled": True},
+                ],
+            },
+        }
+    )
+    monkeypatch.setattr("app.services.task_manager.get_k8s_service", lambda: fake_k8s)
+    monkeypatch.setattr("app.services.task_manager.get_configcenter_client", lambda: fake_cc)
+
+    manager = TaskManager()
+    task = SimpleNamespace(
+        project_id="p1",
+        params={
+            "code_server_id": "cs-1",
+            "namespace": "secflow-p1",
+            "name": "audit-env",
+            "custom_env": {"COMMON": "from-user", "USER_ONLY": "u-only"},
+            "code_server_env": {},
+            "image": "",
+            "llm_provider_keys": ["provider-a", "provider-b"],
+        },
+    )
+
+    manager._handle_create_task(task, db)
+
+    assert fake_cc.requested_keys == ["provider-a", "provider-b"]
+    assert code_server.llm_provider_keys == ["provider-a", "provider-b"]
+    assert code_server.llm_provider_key == "provider-b"
+    assert code_server.llm_provider_snapshot["provider_key"] == "provider-b"
+    assert [item["provider_key"] for item in code_server.llm_provider_snapshots] == ["provider-a", "provider-b"]
+    assert code_server.llm_provider_mapped_env_keys == ["A_ONLY", "B_ONLY", "COMMON"]
+    assert [item["path"] for item in code_server.llm_file_bindings] == ["/etc/llm/agent.yaml", "/etc/llm/extra.json"]
+    assert fake_k8s.deployment_call["custom_env"]["COMMON"] == "B"
+    assert fake_k8s.deployment_call["extra_env"]["COMMON"] == "from-user"
+    assert fake_k8s.deployment_call["extra_env"]["USER_ONLY"] == "u-only"
+    assert fake_k8s.created_configmap["data"] == {
+        "file-1": "from: B",
+        "file-2": "{\"from\": \"B\"}",
+    }
+    assert fake_k8s.deployment_call["extra_file_mounts"] == [
+        {"path": "/etc/llm/agent.yaml", "sub_path": "file-1"},
+        {"path": "/etc/llm/extra.json", "sub_path": "file-2"},
+    ]
 
     manager.executor.shutdown(wait=False)

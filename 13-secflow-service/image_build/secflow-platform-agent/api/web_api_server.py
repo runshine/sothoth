@@ -2767,13 +2767,24 @@ class WebAPIServer:
                 self.logger.error(f"更新agent状态失败: {str(e)}")
                 return jsonify({'error': str(e)}), 500
 
-        @self.app.route('/api/agent/agents/<agent_key>/status-history', methods=['GET'])
+        @self.app.route('/api/agent/agents/<agent_key>/status-history', methods=['GET', 'DELETE'])
         def get_agent_status_history(agent_key):
-            """查询指定Agent最近上下线事件历史"""
+            """查询或清空指定Agent上下线事件历史"""
             try:
                 project_id = str(request.args.get('project_id') or '').strip()
                 if not project_id:
                     return jsonify({'error': 'project_id parameter is required'}), 400
+
+                if request.method == 'DELETE':
+                    deleted = self.agent_manager.clear_agent_status_history(project_id, agent_key)
+                    if deleted < 0:
+                        return jsonify({'error': 'clear agent status history failed'}), 500
+                    return jsonify({
+                        'project_id': project_id,
+                        'agent_key': agent_key,
+                        'deleted': deleted,
+                        'message': f'已清空 {deleted} 条节点上下线记录'
+                    })
 
                 limit_raw = request.args.get('limit', '100')
                 try:

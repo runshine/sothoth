@@ -477,13 +477,24 @@ class AgentManager:
                 return False
 
             payload = response.json() if response.content else {}
+            healthy_hosts = []
             for host in payload.get('hosts') or []:
-                if expected_ip and str(host.get('ip') or '').strip() != expected_ip:
-                    continue
                 if host.get('healthy') is False:
                     continue
                 if host.get('enabled') is False:
                     continue
+                healthy_hosts.append(host)
+                if expected_ip and str(host.get('ip') or '').strip() != expected_ip:
+                    continue
+                return True
+            # 多网卡或注册地址切换场景：expected_ip 不匹配时，只要 nacos-client 集群存在健康实例也视为可用
+            if healthy_hosts:
+                if expected_ip:
+                    host_ips = [str(h.get('ip') or '').strip() for h in healthy_hosts]
+                    self.logger.debug(
+                        f"Nacos健康实例IP与服务名IP不一致，按健康实例保留可用: "
+                        f"service={service_name}, expected_ip={expected_ip}, host_ips={host_ips}"
+                    )
                 return True
             return False
         except Exception as e:
@@ -513,8 +524,7 @@ class AgentManager:
                 return False
             if str(row.get('status') or '').lower() != 'online':
                 return False
-            stale_ref = self._parse_stale_reference(row.get('last_seen')) or \
-                self._parse_stale_reference(row.get('updated_at'))
+            stale_ref = self._latest_stale_reference(row.get('last_seen'), row.get('updated_at'))
             if not stale_ref:
                 return False
             return (now - stale_ref).total_seconds() <= self.agent_offline_grace_sec
@@ -707,6 +717,16 @@ class AgentManager:
         except Exception:
             return None
 
+    def _latest_stale_reference(self, last_seen: Any, updated_at: Any) -> Optional[datetime]:
+        candidates = [
+            self._parse_stale_reference(last_seen),
+            self._parse_stale_reference(updated_at),
+        ]
+        candidates = [item for item in candidates if item is not None]
+        if not candidates:
+            return None
+        return max(candidates)
+
     def _mark_missing_agents_offline(self, active_keys: set):
         """将本轮Nacos未发现但数据库中仍标记在线的Agent收敛为离线。"""
         try:
@@ -725,8 +745,7 @@ class AgentManager:
                 if (row.get('status') or '').lower() != 'online':
                     continue
 
-                stale_ref = self._parse_stale_reference(row.get('last_seen')) or \
-                    self._parse_stale_reference(row.get('updated_at'))
+                stale_ref = self._latest_stale_reference(row.get('last_seen'), row.get('updated_at'))
                 if stale_ref is None:
                     missing_online_keys.append(agent_key)
                     continue
@@ -1298,6 +1317,36 @@ class AgentManager:
             self.logger.error(f"查询Agent状态历史失败: agent={agent_key}, err={e}")
             return []
 
+    def clear_agent_status_history(self, project_id: str, agent_key: str) -> int:
+        table_name = self.db.get_table_name('agent_status_events')
+        try:
+            if self.db.db_type == 'mysql':
+                count_row = self.db.fetch_one(
+                    f"SELECT COUNT(*) AS count FROM {table_name} WHERE project_id = %s AND agent_key = %s",
+                    (project_id, agent_key)
+                )
+            else:
+                count_row = self.db.fetch_one(
+                    f"SELECT COUNT(*) AS count FROM {table_name} WHERE project_id = ? AND agent_key = ?",
+                    (project_id, agent_key)
+                )
+            affected = int((count_row or {}).get('count') or 0)
+
+            if self.db.db_type == 'mysql':
+                self.db.execute_query(
+                    f"DELETE FROM {table_name} WHERE project_id = %s AND agent_key = %s",
+                    (project_id, agent_key)
+                )
+            else:
+                self.db.execute_query(
+                    f"DELETE FROM {table_name} WHERE project_id = ? AND agent_key = ?",
+                    (project_id, agent_key)
+                )
+            return affected
+        except Exception as e:
+            self.logger.error(f"清空Agent状态历史失败: agent={agent_key}, err={e}")
+            return -1
+
     def get_project(self, project_id: str) -> Optional[ProjectInfo]:
         with self.lock:
             return self.projects.get(project_id)
@@ -1575,14 +1624,10 @@ class AgentManager:
             agents_list = list(agents_map.values())
             for item in agents_list:
                 status = (item.get('status') or 'unknown').lower()
-                stale_ref_raw = item.get('last_seen') or item.get('updated_at')
-                if status == 'online' and stale_ref_raw:
+                stale_ref = self._latest_stale_reference(item.get('last_seen'), item.get('updated_at'))
+                if status == 'online' and stale_ref:
                     try:
-                        stale_ref = datetime.fromisoformat(str(stale_ref_raw).replace('Z', '+00:00'))
-                        # last_seen 由应用层写入，updated_at 可能来自数据库；二者都按本地朴素时间比较，
-                        # 避免 MySQL session 时区与应用时区不一致时把在线节点误判为离线。
-                        if stale_ref.tzinfo is not None:
-                            stale_ref = stale_ref.astimezone().replace(tzinfo=None)
+                        # 优先使用较新的时间基准，避免 last_seen 旧值覆盖 updated_at 新值导致误判离线。
                         if datetime.now() - stale_ref > timedelta(minutes=5):
                             status = 'offline'
                             item['status'] = 'offline'
