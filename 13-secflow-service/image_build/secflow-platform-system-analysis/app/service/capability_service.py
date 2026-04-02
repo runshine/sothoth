@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional
 
 from app.schemas import AnalysisCapabilityNodeItem, AnalysisCapabilitySummary, ProjectAnalysisCapabilitiesResponse
-from app.service.agent_gateway import AgentGateway, get_agent_gateway
+from app.service.agent_gateway import AgentGateway, AgentGatewayError, get_agent_gateway
+
+logger = logging.getLogger(__name__)
 
 
 class CapabilityService:
@@ -22,16 +25,33 @@ class CapabilityService:
             service_name = str(helper.get("service_name") or "").strip()
             if not agent_key or not service_name:
                 continue
-            helper_agents_payload = await self.agent_gateway.get_helper_agents(project_id, agent_key, service_name, token=token)
             helper_agents = []
-            for item in helper_agents_payload:
-                aid = str(item.get("agent_id") or "").strip()
-                aname = str(item.get("name") or aid).strip() or aid
-                if aid:
-                    helper_agents.append({"agent_id": aid, "agent_name": aname})
+            health_status = helper.get("health_status") or "unknown"
+            try:
+                helper_agents_payload = await self.agent_gateway.get_helper_agents(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    token=token,
+                )
+                for item in helper_agents_payload:
+                    aid = str(item.get("agent_id") or "").strip()
+                    aname = str(item.get("name") or aid).strip() or aid
+                    if aid:
+                        helper_agents.append({"agent_id": aid, "agent_name": aname})
+            except AgentGatewayError:
+                # Degrade single helper failure to node-level unavailable, but keep
+                # capability API responsive for other nodes.
+                logger.warning(
+                    "helper agent discovery failed, project_id=%s agent_key=%s service_name=%s",
+                    project_id,
+                    agent_key,
+                    service_name,
+                )
+                health_status = "error"
             candidate = {
                 "service_name": service_name,
-                "health_status": helper.get("health_status") or "unknown",
+                "health_status": health_status,
                 "ai_agents": helper_agents,
             }
             existing = helper_by_agent.get(agent_key)
@@ -95,4 +115,3 @@ def get_capability_service() -> CapabilityService:
     if _capability_service is None:
         _capability_service = CapabilityService()
     return _capability_service
-

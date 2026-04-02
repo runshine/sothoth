@@ -4,6 +4,8 @@ from fastapi import Request
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
+from app.service.agent_gateway import AgentGatewayError
+
 
 class AppException(HTTPException):
     def __init__(self, status_code: int, code: str, message: str, details: dict | None = None):
@@ -43,6 +45,17 @@ def handle_exception(request: Request, exc: AppException):
     return JSONResponse(status_code=exc.status_code, content=exc.detail)
 
 
+def handle_agent_gateway_exception(request: Request, exc: AgentGatewayError):
+    return JSONResponse(
+        status_code=502,
+        content={
+            "code": "AGENT_GATEWAY_ERROR",
+            "message": str(exc) or "调用Agent服务失败",
+            "details": None,
+        },
+    )
+
+
 def setup_exception_handlers(app):
     app.add_exception_handler(AppException, handle_exception)
-
+    app.add_exception_handler(AgentGatewayError, handle_agent_gateway_exception)

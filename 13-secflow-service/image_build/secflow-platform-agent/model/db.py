@@ -486,6 +486,59 @@ class DatabaseManager:
                 # 为SQLite创建索引
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_status_project ON {table_agent_status}(project_id)')
 
+            # 创建Agent上下线事件表（每节点保留最近100条由应用层裁剪）
+            table_agent_status_events = f"{prefix}agent_status_events"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_agent_status_events} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               hostname VARCHAR(100),
+                               ip_address VARCHAR(64),
+                               from_status VARCHAR(32),
+                               to_status VARCHAR(32),
+                               edge_state_from VARCHAR(16),
+                               edge_state_to VARCHAR(16),
+                               reason_code VARCHAR(64),
+                               reason_message TEXT,
+                               source VARCHAR(64),
+                               pod_id VARCHAR(100),
+                               observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               INDEX idx_agent_status_events_project_agent_id (project_id, agent_key, id),
+                               INDEX idx_agent_status_events_agent_observed (agent_key, observed_at)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_agent_status_events} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               hostname TEXT,
+                               ip_address TEXT,
+                               from_status TEXT,
+                               to_status TEXT,
+                               edge_state_from TEXT,
+                               edge_state_to TEXT,
+                               reason_code TEXT,
+                               reason_message TEXT,
+                               source TEXT,
+                               pod_id TEXT,
+                               observed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(
+                    f'CREATE INDEX IF NOT EXISTS idx_agent_status_events_project_agent_id '
+                    f'ON {table_agent_status_events}(project_id, agent_key, id)'
+                )
+                db.execute(
+                    f'CREATE INDEX IF NOT EXISTS idx_agent_status_events_agent_observed '
+                    f'ON {table_agent_status_events}(agent_key, observed_at)'
+                )
+
             # 创建Agent服务聚合表（用于全量服务发现）
             table_agent_services = f"{prefix}agent_services"
             if self.db_type == 'mysql':
