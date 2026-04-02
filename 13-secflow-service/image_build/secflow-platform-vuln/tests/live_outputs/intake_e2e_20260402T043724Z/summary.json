@@ -1,0 +1,816 @@
+{
+  "run_tag": "20260402T043724Z",
+  "base_url": "http://127.0.0.1:3000",
+  "project_input": "abbbb",
+  "project_id": "44f9029d00650a10",
+  "project_name": "abbbb",
+  "counts": {
+    "simple": 5,
+    "with_files": 5,
+    "nested_binary_min_required": 2,
+    "total_expected": 10,
+    "total_submitted": 10,
+    "unique_case_ids": 10
+  },
+  "security_negative_tests": {
+    "path_traversal": {
+      "status_code": 400,
+      "expected_rejected": true,
+      "rejected": true,
+      "body": "{\"code\":\"VALIDATION_ERROR\",\"message\":\"路径必须位于 /__vuln_cases__ 之下\",\"details\":null}"
+    },
+    "invalid_token": {
+      "status_code": 401,
+      "expected_rejected": true,
+      "rejected": true,
+      "body": "{\"detail\":\"Invalid or expired token\"}"
+    }
+  },
+  "runs": [
+    {
+      "mode": "simple",
+      "index": 1,
+      "case_id": "case-20260402-043724-8d3b8d4507",
+      "files_root_path": "/__vuln_cases__/case-20260402-043724-8d3b8d4507",
+      "intake_http_code": 200,
+      "file_ops": [],
+      "tree_snapshot": null
+    },
+    {
+      "mode": "simple",
+      "index": 2,
+      "case_id": "case-20260402-043725-2d766d5504",
+      "files_root_path": "/__vuln_cases__/case-20260402-043725-2d766d5504",
+      "intake_http_code": 200,
+      "file_ops": [],
+      "tree_snapshot": null
+    },
+    {
+      "mode": "simple",
+      "index": 3,
+      "case_id": "case-20260402-043725-7f73f319eb",
+      "files_root_path": "/__vuln_cases__/case-20260402-043725-7f73f319eb",
+      "intake_http_code": 200,
+      "file_ops": [],
+      "tree_snapshot": null
+    },
+    {
+      "mode": "simple",
+      "index": 4,
+      "case_id": "case-20260402-043725-fae07e3c5a",
+      "files_root_path": "/__vuln_cases__/case-20260402-043725-fae07e3c5a",
+      "intake_http_code": 200,
+      "file_ops": [],
+      "tree_snapshot": null
+    },
+    {
+      "mode": "simple",
+      "index": 5,
+      "case_id": "case-20260402-043725-25a43fa273",
+      "files_root_path": "/__vuln_cases__/case-20260402-043725-25a43fa273",
+      "intake_http_code": 200,
+      "file_ops": [],
+      "tree_snapshot": null
+    },
+    {
+      "mode": "with_files_nested_binary",
+      "index": 1,
+      "case_id": "case-20260402-043725-9043ed94be",
+      "files_root_path": "/__vuln_cases__/case-20260402-043725-9043ed94be",
+      "intake_http_code": 200,
+      "file_ops": [
+        {
+          "mkdirs": {
+            "ok": true,
+            "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/bin",
+            "entry_type": "directory",
+            "message": "目录创建成功"
+          }
+        },
+        {
+          "upload_text": {
+            "id": 20,
+            "filename": "evidence.json",
+            "original_filename": "evidence.json",
+            "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/http/parsed/evidence.json",
+            "content_type": "application/json",
+            "size": 135,
+            "sha256": "0d21a67de94a6498796d2445fe27acbc2b8bf8a705b7c2bfd626a18fde982646",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043725-9043ed94be/evidence/http/parsed/evidence.json",
+            "created_at": "2026-04-02T04:37:26",
+            "updated_at": "2026-04-02T04:37:26"
+          }
+        },
+        {
+          "upload_binary": {
+            "id": 21,
+            "filename": "capture.bin",
+            "original_filename": "capture.bin",
+            "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/bin/capture.bin",
+            "content_type": "application/octet-stream",
+            "size": 16384,
+            "sha256": "87b3793645dbfa81b00ca9a9712d3830319acae2aa27ce900acfeabf1aa18330",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043725-9043ed94be/evidence/bin/capture.bin",
+            "created_at": "2026-04-02T04:37:26",
+            "updated_at": "2026-04-02T04:37:26"
+          }
+        }
+      ],
+      "tree_snapshot": {
+        "path": "/__vuln_cases__/case-20260402-043725-9043ed94be",
+        "directories": [
+          {
+            "id": 44,
+            "name": "evidence",
+            "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence",
+            "created_at": "2026-04-02T04:37:26",
+            "updated_at": "2026-04-02T04:37:26"
+          }
+        ],
+        "files": [],
+        "children": [
+          {
+            "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence",
+            "directories": [
+              {
+                "id": 48,
+                "name": "bin",
+                "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/bin",
+                "created_at": "2026-04-02T04:37:26",
+                "updated_at": "2026-04-02T04:37:26"
+              },
+              {
+                "id": 45,
+                "name": "http",
+                "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/http",
+                "created_at": "2026-04-02T04:37:26",
+                "updated_at": "2026-04-02T04:37:26"
+              }
+            ],
+            "files": [],
+            "children": [
+              {
+                "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/bin",
+                "directories": [],
+                "files": [
+                  {
+                    "id": 21,
+                    "filename": "capture.bin",
+                    "original_filename": "capture.bin",
+                    "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/bin/capture.bin",
+                    "content_type": "application/octet-stream",
+                    "size": 16384,
+                    "sha256": "87b3793645dbfa81b00ca9a9712d3830319acae2aa27ce900acfeabf1aa18330",
+                    "storage_key": "files/44f9029d00650a10/8/case-20260402-043725-9043ed94be/evidence/bin/capture.bin",
+                    "created_at": "2026-04-02T04:37:26",
+                    "updated_at": "2026-04-02T04:37:26"
+                  }
+                ],
+                "children": []
+              },
+              {
+                "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/http",
+                "directories": [
+                  {
+                    "id": 47,
+                    "name": "parsed",
+                    "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/http/parsed",
+                    "created_at": "2026-04-02T04:37:26",
+                    "updated_at": "2026-04-02T04:37:26"
+                  },
+                  {
+                    "id": 46,
+                    "name": "raw",
+                    "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/http/raw",
+                    "created_at": "2026-04-02T04:37:26",
+                    "updated_at": "2026-04-02T04:37:26"
+                  }
+                ],
+                "files": [],
+                "children": [
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/http/parsed",
+                    "directories": [],
+                    "files": [
+                      {
+                        "id": 20,
+                        "filename": "evidence.json",
+                        "original_filename": "evidence.json",
+                        "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/http/parsed/evidence.json",
+                        "content_type": "application/json",
+                        "size": 135,
+                        "sha256": "0d21a67de94a6498796d2445fe27acbc2b8bf8a705b7c2bfd626a18fde982646",
+                        "storage_key": "files/44f9029d00650a10/8/case-20260402-043725-9043ed94be/evidence/http/parsed/evidence.json",
+                        "created_at": "2026-04-02T04:37:26",
+                        "updated_at": "2026-04-02T04:37:26"
+                      }
+                    ],
+                    "children": []
+                  },
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043725-9043ed94be/evidence/http/raw",
+                    "directories": [],
+                    "files": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "mode": "with_files_nested_binary",
+      "index": 2,
+      "case_id": "case-20260402-043726-48c74d7588",
+      "files_root_path": "/__vuln_cases__/case-20260402-043726-48c74d7588",
+      "intake_http_code": 200,
+      "file_ops": [
+        {
+          "mkdirs": {
+            "ok": true,
+            "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/bin",
+            "entry_type": "directory",
+            "message": "目录创建成功"
+          }
+        },
+        {
+          "upload_text": {
+            "id": 22,
+            "filename": "evidence.json",
+            "original_filename": "evidence.json",
+            "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/http/parsed/evidence.json",
+            "content_type": "application/json",
+            "size": 135,
+            "sha256": "4203a9fe473debe936dc5e6122cfe84b19a700868f1dcf724aa2706936bc15e2",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043726-48c74d7588/evidence/http/parsed/evidence.json",
+            "created_at": "2026-04-02T04:37:27",
+            "updated_at": "2026-04-02T04:37:27"
+          }
+        },
+        {
+          "upload_binary": {
+            "id": 23,
+            "filename": "capture.bin",
+            "original_filename": "capture.bin",
+            "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/bin/capture.bin",
+            "content_type": "application/octet-stream",
+            "size": 16384,
+            "sha256": "a94727c3ce0914c48b85ad1eee63ff4c2f239c0c75741a7a3a096634a793f3aa",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043726-48c74d7588/evidence/bin/capture.bin",
+            "created_at": "2026-04-02T04:37:27",
+            "updated_at": "2026-04-02T04:37:27"
+          }
+        }
+      ],
+      "tree_snapshot": {
+        "path": "/__vuln_cases__/case-20260402-043726-48c74d7588",
+        "directories": [
+          {
+            "id": 50,
+            "name": "evidence",
+            "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence",
+            "created_at": "2026-04-02T04:37:26",
+            "updated_at": "2026-04-02T04:37:26"
+          }
+        ],
+        "files": [],
+        "children": [
+          {
+            "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence",
+            "directories": [
+              {
+                "id": 54,
+                "name": "bin",
+                "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/bin",
+                "created_at": "2026-04-02T04:37:26",
+                "updated_at": "2026-04-02T04:37:26"
+              },
+              {
+                "id": 51,
+                "name": "http",
+                "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/http",
+                "created_at": "2026-04-02T04:37:26",
+                "updated_at": "2026-04-02T04:37:26"
+              }
+            ],
+            "files": [],
+            "children": [
+              {
+                "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/bin",
+                "directories": [],
+                "files": [
+                  {
+                    "id": 23,
+                    "filename": "capture.bin",
+                    "original_filename": "capture.bin",
+                    "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/bin/capture.bin",
+                    "content_type": "application/octet-stream",
+                    "size": 16384,
+                    "sha256": "a94727c3ce0914c48b85ad1eee63ff4c2f239c0c75741a7a3a096634a793f3aa",
+                    "storage_key": "files/44f9029d00650a10/8/case-20260402-043726-48c74d7588/evidence/bin/capture.bin",
+                    "created_at": "2026-04-02T04:37:27",
+                    "updated_at": "2026-04-02T04:37:27"
+                  }
+                ],
+                "children": []
+              },
+              {
+                "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/http",
+                "directories": [
+                  {
+                    "id": 53,
+                    "name": "parsed",
+                    "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/http/parsed",
+                    "created_at": "2026-04-02T04:37:26",
+                    "updated_at": "2026-04-02T04:37:26"
+                  },
+                  {
+                    "id": 52,
+                    "name": "raw",
+                    "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/http/raw",
+                    "created_at": "2026-04-02T04:37:26",
+                    "updated_at": "2026-04-02T04:37:26"
+                  }
+                ],
+                "files": [],
+                "children": [
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/http/parsed",
+                    "directories": [],
+                    "files": [
+                      {
+                        "id": 22,
+                        "filename": "evidence.json",
+                        "original_filename": "evidence.json",
+                        "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/http/parsed/evidence.json",
+                        "content_type": "application/json",
+                        "size": 135,
+                        "sha256": "4203a9fe473debe936dc5e6122cfe84b19a700868f1dcf724aa2706936bc15e2",
+                        "storage_key": "files/44f9029d00650a10/8/case-20260402-043726-48c74d7588/evidence/http/parsed/evidence.json",
+                        "created_at": "2026-04-02T04:37:27",
+                        "updated_at": "2026-04-02T04:37:27"
+                      }
+                    ],
+                    "children": []
+                  },
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043726-48c74d7588/evidence/http/raw",
+                    "directories": [],
+                    "files": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "mode": "with_files",
+      "index": 3,
+      "case_id": "case-20260402-043727-6e7faaa469",
+      "files_root_path": "/__vuln_cases__/case-20260402-043727-6e7faaa469",
+      "intake_http_code": 200,
+      "file_ops": [
+        {
+          "mkdirs": {
+            "ok": true,
+            "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/bin",
+            "entry_type": "directory",
+            "message": "目录创建成功"
+          }
+        },
+        {
+          "upload_text": {
+            "id": 24,
+            "filename": "evidence.json",
+            "original_filename": "evidence.json",
+            "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/http/parsed/evidence.json",
+            "content_type": "application/json",
+            "size": 135,
+            "sha256": "40bc9da486a83a235704f57b0e33a235ce248409f078253787556ba834963960",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043727-6e7faaa469/evidence/http/parsed/evidence.json",
+            "created_at": "2026-04-02T04:37:27",
+            "updated_at": "2026-04-02T04:37:27"
+          }
+        },
+        {
+          "upload_binary": {
+            "id": 25,
+            "filename": "capture.bin",
+            "original_filename": "capture.bin",
+            "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/bin/capture.bin",
+            "content_type": "application/octet-stream",
+            "size": 16384,
+            "sha256": "c50a85e78fca0ba3df1aeeeec6006020c57943ee58c8206bd95e9c73e38d1bb7",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043727-6e7faaa469/evidence/bin/capture.bin",
+            "created_at": "2026-04-02T04:37:28",
+            "updated_at": "2026-04-02T04:37:28"
+          }
+        }
+      ],
+      "tree_snapshot": {
+        "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469",
+        "directories": [
+          {
+            "id": 56,
+            "name": "evidence",
+            "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence",
+            "created_at": "2026-04-02T04:37:27",
+            "updated_at": "2026-04-02T04:37:27"
+          }
+        ],
+        "files": [],
+        "children": [
+          {
+            "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence",
+            "directories": [
+              {
+                "id": 60,
+                "name": "bin",
+                "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/bin",
+                "created_at": "2026-04-02T04:37:27",
+                "updated_at": "2026-04-02T04:37:27"
+              },
+              {
+                "id": 57,
+                "name": "http",
+                "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/http",
+                "created_at": "2026-04-02T04:37:27",
+                "updated_at": "2026-04-02T04:37:27"
+              }
+            ],
+            "files": [],
+            "children": [
+              {
+                "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/bin",
+                "directories": [],
+                "files": [
+                  {
+                    "id": 25,
+                    "filename": "capture.bin",
+                    "original_filename": "capture.bin",
+                    "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/bin/capture.bin",
+                    "content_type": "application/octet-stream",
+                    "size": 16384,
+                    "sha256": "c50a85e78fca0ba3df1aeeeec6006020c57943ee58c8206bd95e9c73e38d1bb7",
+                    "storage_key": "files/44f9029d00650a10/8/case-20260402-043727-6e7faaa469/evidence/bin/capture.bin",
+                    "created_at": "2026-04-02T04:37:28",
+                    "updated_at": "2026-04-02T04:37:28"
+                  }
+                ],
+                "children": []
+              },
+              {
+                "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/http",
+                "directories": [
+                  {
+                    "id": 59,
+                    "name": "parsed",
+                    "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/http/parsed",
+                    "created_at": "2026-04-02T04:37:27",
+                    "updated_at": "2026-04-02T04:37:27"
+                  },
+                  {
+                    "id": 58,
+                    "name": "raw",
+                    "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/http/raw",
+                    "created_at": "2026-04-02T04:37:27",
+                    "updated_at": "2026-04-02T04:37:27"
+                  }
+                ],
+                "files": [],
+                "children": [
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/http/parsed",
+                    "directories": [],
+                    "files": [
+                      {
+                        "id": 24,
+                        "filename": "evidence.json",
+                        "original_filename": "evidence.json",
+                        "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/http/parsed/evidence.json",
+                        "content_type": "application/json",
+                        "size": 135,
+                        "sha256": "40bc9da486a83a235704f57b0e33a235ce248409f078253787556ba834963960",
+                        "storage_key": "files/44f9029d00650a10/8/case-20260402-043727-6e7faaa469/evidence/http/parsed/evidence.json",
+                        "created_at": "2026-04-02T04:37:27",
+                        "updated_at": "2026-04-02T04:37:27"
+                      }
+                    ],
+                    "children": []
+                  },
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043727-6e7faaa469/evidence/http/raw",
+                    "directories": [],
+                    "files": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "mode": "with_files",
+      "index": 4,
+      "case_id": "case-20260402-043728-dd198cd9b7",
+      "files_root_path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7",
+      "intake_http_code": 200,
+      "file_ops": [
+        {
+          "mkdirs": {
+            "ok": true,
+            "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/bin",
+            "entry_type": "directory",
+            "message": "目录创建成功"
+          }
+        },
+        {
+          "upload_text": {
+            "id": 26,
+            "filename": "evidence.json",
+            "original_filename": "evidence.json",
+            "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/http/parsed/evidence.json",
+            "content_type": "application/json",
+            "size": 135,
+            "sha256": "fb986e5492ec2161d12fb9ad726f04b96d637dd2ea034712a08ea3c8cd94c148",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043728-dd198cd9b7/evidence/http/parsed/evidence.json",
+            "created_at": "2026-04-02T04:37:28",
+            "updated_at": "2026-04-02T04:37:28"
+          }
+        },
+        {
+          "upload_binary": {
+            "id": 27,
+            "filename": "capture.bin",
+            "original_filename": "capture.bin",
+            "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/bin/capture.bin",
+            "content_type": "application/octet-stream",
+            "size": 16384,
+            "sha256": "4cd0288d4d9192b0d47c7d10abefaa1c9e2fdf4fa2f2f7daa599380d8f64c04e",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043728-dd198cd9b7/evidence/bin/capture.bin",
+            "created_at": "2026-04-02T04:37:28",
+            "updated_at": "2026-04-02T04:37:28"
+          }
+        }
+      ],
+      "tree_snapshot": {
+        "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7",
+        "directories": [
+          {
+            "id": 62,
+            "name": "evidence",
+            "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence",
+            "created_at": "2026-04-02T04:37:28",
+            "updated_at": "2026-04-02T04:37:28"
+          }
+        ],
+        "files": [],
+        "children": [
+          {
+            "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence",
+            "directories": [
+              {
+                "id": 66,
+                "name": "bin",
+                "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/bin",
+                "created_at": "2026-04-02T04:37:28",
+                "updated_at": "2026-04-02T04:37:28"
+              },
+              {
+                "id": 63,
+                "name": "http",
+                "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/http",
+                "created_at": "2026-04-02T04:37:28",
+                "updated_at": "2026-04-02T04:37:28"
+              }
+            ],
+            "files": [],
+            "children": [
+              {
+                "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/bin",
+                "directories": [],
+                "files": [
+                  {
+                    "id": 27,
+                    "filename": "capture.bin",
+                    "original_filename": "capture.bin",
+                    "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/bin/capture.bin",
+                    "content_type": "application/octet-stream",
+                    "size": 16384,
+                    "sha256": "4cd0288d4d9192b0d47c7d10abefaa1c9e2fdf4fa2f2f7daa599380d8f64c04e",
+                    "storage_key": "files/44f9029d00650a10/8/case-20260402-043728-dd198cd9b7/evidence/bin/capture.bin",
+                    "created_at": "2026-04-02T04:37:28",
+                    "updated_at": "2026-04-02T04:37:28"
+                  }
+                ],
+                "children": []
+              },
+              {
+                "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/http",
+                "directories": [
+                  {
+                    "id": 65,
+                    "name": "parsed",
+                    "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/http/parsed",
+                    "created_at": "2026-04-02T04:37:28",
+                    "updated_at": "2026-04-02T04:37:28"
+                  },
+                  {
+                    "id": 64,
+                    "name": "raw",
+                    "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/http/raw",
+                    "created_at": "2026-04-02T04:37:28",
+                    "updated_at": "2026-04-02T04:37:28"
+                  }
+                ],
+                "files": [],
+                "children": [
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/http/parsed",
+                    "directories": [],
+                    "files": [
+                      {
+                        "id": 26,
+                        "filename": "evidence.json",
+                        "original_filename": "evidence.json",
+                        "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/http/parsed/evidence.json",
+                        "content_type": "application/json",
+                        "size": 135,
+                        "sha256": "fb986e5492ec2161d12fb9ad726f04b96d637dd2ea034712a08ea3c8cd94c148",
+                        "storage_key": "files/44f9029d00650a10/8/case-20260402-043728-dd198cd9b7/evidence/http/parsed/evidence.json",
+                        "created_at": "2026-04-02T04:37:28",
+                        "updated_at": "2026-04-02T04:37:28"
+                      }
+                    ],
+                    "children": []
+                  },
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043728-dd198cd9b7/evidence/http/raw",
+                    "directories": [],
+                    "files": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "mode": "with_files",
+      "index": 5,
+      "case_id": "case-20260402-043729-4e193d65f7",
+      "files_root_path": "/__vuln_cases__/case-20260402-043729-4e193d65f7",
+      "intake_http_code": 200,
+      "file_ops": [
+        {
+          "mkdirs": {
+            "ok": true,
+            "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/bin",
+            "entry_type": "directory",
+            "message": "目录创建成功"
+          }
+        },
+        {
+          "upload_text": {
+            "id": 28,
+            "filename": "evidence.json",
+            "original_filename": "evidence.json",
+            "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/http/parsed/evidence.json",
+            "content_type": "application/json",
+            "size": 135,
+            "sha256": "8b23910dfbc3f3d17a4ddb895374f0819398434f22a709d3ba626e6c2bb0df9a",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043729-4e193d65f7/evidence/http/parsed/evidence.json",
+            "created_at": "2026-04-02T04:37:29",
+            "updated_at": "2026-04-02T04:37:29"
+          }
+        },
+        {
+          "upload_binary": {
+            "id": 29,
+            "filename": "capture.bin",
+            "original_filename": "capture.bin",
+            "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/bin/capture.bin",
+            "content_type": "application/octet-stream",
+            "size": 16384,
+            "sha256": "c53f172f6150179998353fe8392b900f60e04ef6b9f4d57fd14660c671d8d3ae",
+            "storage_key": "files/44f9029d00650a10/8/case-20260402-043729-4e193d65f7/evidence/bin/capture.bin",
+            "created_at": "2026-04-02T04:37:29",
+            "updated_at": "2026-04-02T04:37:29"
+          }
+        }
+      ],
+      "tree_snapshot": {
+        "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7",
+        "directories": [
+          {
+            "id": 68,
+            "name": "evidence",
+            "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence",
+            "created_at": "2026-04-02T04:37:29",
+            "updated_at": "2026-04-02T04:37:29"
+          }
+        ],
+        "files": [],
+        "children": [
+          {
+            "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence",
+            "directories": [
+              {
+                "id": 72,
+                "name": "bin",
+                "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/bin",
+                "created_at": "2026-04-02T04:37:29",
+                "updated_at": "2026-04-02T04:37:29"
+              },
+              {
+                "id": 69,
+                "name": "http",
+                "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/http",
+                "created_at": "2026-04-02T04:37:29",
+                "updated_at": "2026-04-02T04:37:29"
+              }
+            ],
+            "files": [],
+            "children": [
+              {
+                "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/bin",
+                "directories": [],
+                "files": [
+                  {
+                    "id": 29,
+                    "filename": "capture.bin",
+                    "original_filename": "capture.bin",
+                    "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/bin/capture.bin",
+                    "content_type": "application/octet-stream",
+                    "size": 16384,
+                    "sha256": "c53f172f6150179998353fe8392b900f60e04ef6b9f4d57fd14660c671d8d3ae",
+                    "storage_key": "files/44f9029d00650a10/8/case-20260402-043729-4e193d65f7/evidence/bin/capture.bin",
+                    "created_at": "2026-04-02T04:37:29",
+                    "updated_at": "2026-04-02T04:37:29"
+                  }
+                ],
+                "children": []
+              },
+              {
+                "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/http",
+                "directories": [
+                  {
+                    "id": 71,
+                    "name": "parsed",
+                    "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/http/parsed",
+                    "created_at": "2026-04-02T04:37:29",
+                    "updated_at": "2026-04-02T04:37:29"
+                  },
+                  {
+                    "id": 70,
+                    "name": "raw",
+                    "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/http/raw",
+                    "created_at": "2026-04-02T04:37:29",
+                    "updated_at": "2026-04-02T04:37:29"
+                  }
+                ],
+                "files": [],
+                "children": [
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/http/parsed",
+                    "directories": [],
+                    "files": [
+                      {
+                        "id": 28,
+                        "filename": "evidence.json",
+                        "original_filename": "evidence.json",
+                        "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/http/parsed/evidence.json",
+                        "content_type": "application/json",
+                        "size": 135,
+                        "sha256": "8b23910dfbc3f3d17a4ddb895374f0819398434f22a709d3ba626e6c2bb0df9a",
+                        "storage_key": "files/44f9029d00650a10/8/case-20260402-043729-4e193d65f7/evidence/http/parsed/evidence.json",
+                        "created_at": "2026-04-02T04:37:29",
+                        "updated_at": "2026-04-02T04:37:29"
+                      }
+                    ],
+                    "children": []
+                  },
+                  {
+                    "path": "/__vuln_cases__/case-20260402-043729-4e193d65f7/evidence/http/raw",
+                    "directories": [],
+                    "files": [],
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

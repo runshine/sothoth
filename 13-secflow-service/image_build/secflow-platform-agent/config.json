@@ -62,6 +62,7 @@
   "service_sync_interval": 30,
   "enable_background_refresh": true,
   "leader_lock_timeout_sec": 90,
+  "agent_offline_grace_sec": 120,
   "max_workers": 5,
   "enable_task_workers": true,
   "task_worker_count": 5,

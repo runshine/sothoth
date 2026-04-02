@@ -45,7 +45,8 @@ class AgentManager:
                  nacos_username: str = None, nacos_password: str = None,
                  daemon_api_port: int = 11188,
                  daemon_auth_header: str = 'X-API-Token',
-                 daemon_auth_token: str = None):
+                 daemon_auth_token: str = None,
+                 agent_offline_grace_sec: int = 120):
         self.nacos_url = nacos_url.rstrip('/')
         self.nacos_namespace = nacos_namespace
         self.agent_api_port = agent_api_port
@@ -56,6 +57,7 @@ class AgentManager:
         self.db = db_manager
         self.redis_manager = redis_manager
         self.pod_id = pod_id
+        self.agent_offline_grace_sec = max(int(agent_offline_grace_sec or 0), 0)
 
         # 新增：Nacos认证信息
         self.nacos_username = nacos_username
@@ -488,6 +490,37 @@ class AgentManager:
             self.logger.debug(f"检查Nacos健康实例异常: service={service_name}, err={e}")
             return False
 
+    def _should_keep_online_on_transient_probe_failure(self, agent_key: str) -> bool:
+        """探测瞬时失败时的在线保留策略，避免多节点场景状态横跳。"""
+        if self.agent_offline_grace_sec <= 0:
+            return False
+
+        now = datetime.now()
+        cached = self.agents.get(agent_key)
+        if cached and str(cached.status or '').lower() == 'online' and cached.last_seen:
+            if (now - cached.last_seen).total_seconds() <= self.agent_offline_grace_sec:
+                return True
+
+        try:
+            table_name = self.db.get_table_name('agent_status')
+            row = self.db.fetch_one(
+                f"SELECT status, last_seen, updated_at FROM {table_name} WHERE agent_key = %s LIMIT 1"
+                if self.db.db_type == 'mysql' else
+                f"SELECT status, last_seen, updated_at FROM {table_name} WHERE agent_key = ? LIMIT 1",
+                (agent_key,),
+            )
+            if not row:
+                return False
+            if str(row.get('status') or '').lower() != 'online':
+                return False
+            stale_ref = self._parse_stale_reference(row.get('last_seen')) or \
+                self._parse_stale_reference(row.get('updated_at'))
+            if not stale_ref:
+                return False
+            return (now - stale_ref).total_seconds() <= self.agent_offline_grace_sec
+        except Exception:
+            return False
+
     def _check_secflow_agent_agent_status(self, agent: AgentInfo) -> bool:
         try:
             # 首先检查是否有有效的agent_key
@@ -540,16 +573,44 @@ class AgentManager:
 
                 return True
             else:
+                if self._should_keep_online_on_transient_probe_failure(agent.key):
+                    agent.status = 'online'
+                    agent.pod_id = self.pod_id
+                    self.logger.debug(
+                        f"Agent健康检查返回HTTP {response.status_code}，命中宽限期({self.agent_offline_grace_sec}s)保留online: {agent.key}"
+                    )
+                    return True
                 agent.status = 'error'
                 return False
 
         except requests.exceptions.ConnectionError:
+            if self._should_keep_online_on_transient_probe_failure(agent.key):
+                agent.status = 'online'
+                agent.pod_id = self.pod_id
+                self.logger.debug(
+                    f"Agent健康检查连接失败，命中宽限期({self.agent_offline_grace_sec}s)保留online: {agent.key}"
+                )
+                return True
             agent.status = 'offline'
             return False
         except requests.exceptions.Timeout:
+            if self._should_keep_online_on_transient_probe_failure(agent.key):
+                agent.status = 'online'
+                agent.pod_id = self.pod_id
+                self.logger.debug(
+                    f"Agent健康检查超时，命中宽限期({self.agent_offline_grace_sec}s)保留online: {agent.key}"
+                )
+                return True
             agent.status = 'timeout'
             return False
         except Exception:
+            if self._should_keep_online_on_transient_probe_failure(agent.key):
+                agent.status = 'online'
+                agent.pod_id = self.pod_id
+                self.logger.debug(
+                    f"Agent健康检查异常，命中宽限期({self.agent_offline_grace_sec}s)保留online: {agent.key}"
+                )
+                return True
             agent.status = 'error'
             return False
 
@@ -622,26 +683,58 @@ class AgentManager:
 
         self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个有效Agent")
 
+    def _parse_stale_reference(self, value: Any) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            stale_ref = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+            if stale_ref.tzinfo is not None:
+                stale_ref = stale_ref.astimezone().replace(tzinfo=None)
+            return stale_ref
+        except Exception:
+            return None
+
     def _mark_missing_agents_offline(self, active_keys: set):
         """将本轮Nacos未发现但数据库中仍标记在线的Agent收敛为离线。"""
         try:
+            now = datetime.now()
             table_name = self.db.get_table_name('agent_status')
             rows = self.db.fetch_all(
-                f"SELECT agent_key, project_id, status FROM {table_name}"
+                f"SELECT agent_key, project_id, status, last_seen, updated_at FROM {table_name}"
             ) or []
 
-            missing_online_keys = [
-                row['agent_key']
-                for row in rows
-                if row.get('agent_key')
-                and row.get('agent_key') not in active_keys
-                and (row.get('status') or '').lower() == 'online'
-            ]
+            missing_online_keys: List[str] = []
+            grace_skipped_keys: List[str] = []
+            for row in rows:
+                agent_key = row.get('agent_key')
+                if not agent_key or agent_key in active_keys:
+                    continue
+                if (row.get('status') or '').lower() != 'online':
+                    continue
+
+                stale_ref = self._parse_stale_reference(row.get('last_seen')) or \
+                    self._parse_stale_reference(row.get('updated_at'))
+                if stale_ref is None:
+                    missing_online_keys.append(agent_key)
+                    continue
+
+                missing_for_sec = (now - stale_ref).total_seconds()
+                if missing_for_sec >= self.agent_offline_grace_sec:
+                    missing_online_keys.append(agent_key)
+                else:
+                    grace_skipped_keys.append(agent_key)
+
+            if grace_skipped_keys:
+                self.logger.debug(
+                    f"跳过 {len(grace_skipped_keys)} 个暂时缺失Agent离线收敛（宽限期{self.agent_offline_grace_sec}s内）"
+                )
 
             if not missing_online_keys:
                 return
 
-            self.logger.info(f"将 {len(missing_online_keys)} 个未在Nacos中发现的旧在线Agent标记为offline")
+            self.logger.info(
+                f"将 {len(missing_online_keys)} 个未在Nacos中发现且超过宽限期({self.agent_offline_grace_sec}s)的在线Agent标记为offline"
+            )
 
             if self.db.db_type == 'mysql':
                 placeholders = ','.join(['%s'] * len(missing_online_keys))

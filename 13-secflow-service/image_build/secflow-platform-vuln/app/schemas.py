@@ -260,6 +260,25 @@ class CaseResponse(BaseModel):
     updated_at: datetime
 
 
+class CaseUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    severity: Optional[Literal["critical", "high", "medium", "low"]] = None
+    cvss_score: Optional[float] = None
+    confidence: Optional[int] = None
+    state: Optional[Literal["suspected", "confirmed", "rejected"]] = None
+    category: Optional[str] = None
+    rule_id: Optional[str] = None
+    rule_name: Optional[str] = None
+    fingerprint: Optional[str] = None
+    reported_at: Optional[datetime] = None
+    reporter: Optional[ReporterInfo] = None
+    subject: Optional[SubjectInfo] = None
+    evidence: Optional[EvidenceInfo] = None
+    artifacts: Optional[list[ArtifactItem]] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
 class StageTransitionRequest(BaseModel):
     to_stage: str
     reason: Optional[str] = None

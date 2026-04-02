@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import ensure_project_access, get_current_subject
 from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Result, ServiceRegistry, StageHistory, WorkflowRun, get_db
 from app.schemas import (
+    CaseUpdateRequest,
     CaseCreateRequest,
     DecisionRequest,
     DraftCaseCreateRequest,
@@ -311,6 +312,126 @@ async def get_case(case_id: str, user_and_token: tuple[dict, str] = Depends(get_
         ],
         "manual_tasks": [_manual_task_payload(item) for item in manual_tasks],
     }
+
+
+@router.patch("/{case_id}")
+async def update_case(
+    case_id: str,
+    request: CaseUpdateRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    item = db.query(Case).filter(Case.id == case_id).first()
+    if item is None:
+        raise HTTPException(status_code=404, detail="case not found")
+
+    user, token = user_and_token
+    await ensure_project_access(item.project_id, token)
+
+    fields_set = set(request.model_fields_set)
+    if not fields_set:
+        return _case_payload(item)
+
+    source_meta = json.loads(item.source_meta_json or "{}")
+    target_meta = json.loads(item.target_meta_json or "{}")
+    display_meta = json.loads(item.display_meta_json or "{}")
+
+    metadata = dict(display_meta.get("metadata") or {})
+    evidence = dict(display_meta.get("evidence") or {})
+    artifacts = list(display_meta.get("artifacts") or [])
+    fileserver_root = display_meta.get("fileserver_root")
+
+    changed_fields: list[str] = []
+
+    if "title" in fields_set:
+        if request.title is None or not str(request.title).strip():
+            raise HTTPException(status_code=400, detail="title cannot be empty")
+        item.title = request.title.strip()
+        changed_fields.append("title")
+    if "summary" in fields_set:
+        item.summary = (request.summary or "").strip() or None
+        changed_fields.append("summary")
+    if "severity" in fields_set:
+        if request.severity is None:
+            raise HTTPException(status_code=400, detail="severity cannot be empty")
+        item.severity = request.severity
+        changed_fields.append("severity")
+    if "confidence" in fields_set:
+        if request.confidence is None:
+            raise HTTPException(status_code=400, detail="confidence cannot be empty")
+        item.confidence = int(request.confidence)
+        changed_fields.append("confidence")
+    if "cvss_score" in fields_set:
+        source_meta["cvss_score"] = float(request.cvss_score or 0.0)
+        changed_fields.append("cvss_score")
+    if "state" in fields_set:
+        source_meta["state"] = request.state
+        changed_fields.append("state")
+    if "category" in fields_set:
+        source_meta["category"] = request.category
+        changed_fields.append("category")
+    if "rule_id" in fields_set:
+        source_meta["rule_id"] = request.rule_id
+        changed_fields.append("rule_id")
+    if "rule_name" in fields_set:
+        source_meta["rule_name"] = request.rule_name
+        changed_fields.append("rule_name")
+    if "fingerprint" in fields_set:
+        source_meta["fingerprint"] = request.fingerprint
+        changed_fields.append("fingerprint")
+    if "reported_at" in fields_set:
+        source_meta["reported_at"] = request.reported_at.isoformat() if request.reported_at else None
+        changed_fields.append("reported_at")
+    if "reporter" in fields_set:
+        if request.reporter is None:
+            raise HTTPException(status_code=400, detail="reporter cannot be empty")
+        source_meta["reporter"] = request.reporter.model_dump(mode="json")
+        changed_fields.append("reporter")
+    if "subject" in fields_set:
+        if request.subject is None:
+            raise HTTPException(status_code=400, detail="subject cannot be empty")
+        target_meta = request.subject.model_dump(mode="json")
+        changed_fields.append("subject")
+    if "evidence" in fields_set:
+        evidence = request.evidence.model_dump(mode="json") if request.evidence else {}
+        changed_fields.append("evidence")
+    if "artifacts" in fields_set:
+        artifacts = [artifact.model_dump(mode="json") for artifact in (request.artifacts or [])]
+        changed_fields.append("artifacts")
+    if "metadata" in fields_set:
+        metadata = dict(request.metadata or {})
+        changed_fields.append("metadata")
+
+    display_payload = {
+        "entity_label": display_meta.get("entity_label") or "疑点",
+        "preferred_render_type": display_meta.get("preferred_render_type") or "generic",
+        "evidence": evidence,
+        "artifacts": artifacts,
+        "metadata": metadata,
+    }
+    if fileserver_root:
+        display_payload["fileserver_root"] = fileserver_root
+
+    item.source_meta_json = json.dumps(source_meta, ensure_ascii=False)
+    item.target_meta_json = json.dumps(target_meta, ensure_ascii=False)
+    item.display_meta_json = json.dumps(display_payload, ensure_ascii=False)
+
+    db.add(CaseEvent(
+        id=uuid4().hex,
+        case_id=item.id,
+        event_type="case_intake_updated",
+        summary="intake fields updated",
+        payload_json=json.dumps(
+            {
+                "operator": user.get("username") or str(user.get("id")),
+                "changed_fields": changed_fields,
+            },
+            ensure_ascii=False,
+        ),
+    ))
+    db.commit()
+    db.refresh(item)
+    return _case_payload(item)
 
 
 @router.delete("/{case_id}")

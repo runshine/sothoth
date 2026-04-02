@@ -669,6 +669,98 @@ class DatabaseManager:
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_batches_project ON {table_ai_batches}(project_id)')
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_batches_status ON {table_ai_batches}(status)')
 
+            table_ai_single_sessions = f"{prefix}ai_agent_sessions_single"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_single_sessions} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               service_name VARCHAR(200) NOT NULL,
+                               session_id VARCHAR(128) NOT NULL,
+                               backend VARCHAR(128),
+                               agent_ids_json JSON,
+                               session_mode VARCHAR(32),
+                               status VARCHAR(32),
+                               pty_pid BIGINT NULL,
+                               backend_pid BIGINT NULL,
+                               pty_started_at VARCHAR(64),
+                               last_error TEXT,
+                               metadata_json JSON,
+                               raw_json JSON,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               UNIQUE KEY uniq_ai_single_session (project_id, agent_key, service_name, session_id),
+                               INDEX idx_ai_single_project (project_id),
+                               INDEX idx_ai_single_status (status),
+                               INDEX idx_ai_single_updated (updated_at)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_single_sessions} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               service_name TEXT NOT NULL,
+                               session_id TEXT NOT NULL,
+                               backend TEXT,
+                               agent_ids_json TEXT,
+                               session_mode TEXT,
+                               status TEXT,
+                               pty_pid INTEGER,
+                               backend_pid INTEGER,
+                               pty_started_at TEXT,
+                               last_error TEXT,
+                               metadata_json TEXT,
+                               raw_json TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS uniq_ai_single_session ON {table_ai_single_sessions}(project_id, agent_key, service_name, session_id)'
+                )
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_single_project ON {table_ai_single_sessions}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_single_status ON {table_ai_single_sessions}(status)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_single_updated ON {table_ai_single_sessions}(updated_at)')
+
+            table_ai_single_messages = f"{prefix}ai_agent_session_single_messages"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_single_messages} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               service_name VARCHAR(200) NOT NULL,
+                               session_id VARCHAR(128) NOT NULL,
+                               seq_no INT NOT NULL,
+                               role VARCHAR(20) DEFAULT 'user',
+                               content TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               UNIQUE KEY uniq_ai_single_message (project_id, agent_key, service_name, session_id, seq_no),
+                               INDEX idx_ai_single_messages_session (project_id, agent_key, service_name, session_id)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_single_messages} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               service_name TEXT NOT NULL,
+                               session_id TEXT NOT NULL,
+                               seq_no INTEGER NOT NULL,
+                               role TEXT DEFAULT 'user',
+                               content TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS uniq_ai_single_message ON {table_ai_single_messages}(project_id, agent_key, service_name, session_id, seq_no)'
+                )
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_single_messages_session ON {table_ai_single_messages}(project_id, agent_key, service_name, session_id)')
+
             table_ai_batch_items = f"{prefix}ai_agent_session_batch_items"
             if self.db_type == 'mysql':
                 db.execute(f'''

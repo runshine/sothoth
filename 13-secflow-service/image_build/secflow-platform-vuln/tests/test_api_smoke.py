@@ -117,7 +117,7 @@ def test_public_intake_catalog_downloads_and_examples(client: TestClient):
     catalog = client.get("/api/vuln/public/intake/catalog")
     assert catalog.status_code == 200
     payload = catalog.json()
-    assert payload["version"] == "2.0.0"
+    assert payload["version"] == "2.1.0"
     assert len(payload["items"]) == 4
 
     cli_download = client.get("/api/vuln/public/intake/sdk/cli")
@@ -339,6 +339,65 @@ def test_create_case_and_timeline(client: TestClient):
     timeline = client.get(f"/api/vuln/cases/{case_id}/timeline")
     assert timeline.status_code == 200
     assert timeline.json()["total"] >= 2
+
+
+def test_update_case_intake_partial_fields(client: TestClient):
+    create_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Before update",
+            summary="before summary",
+            reporter={"name": "before-reporter", "version": "1.0.0", "type": "human"},
+            subject={"type": "service", "locator": "svc://before", "name": "before"},
+            metadata={"source": {"source_service": "before-service"}},
+        ),
+    )
+    assert create_resp.status_code == 200
+    case_id = create_resp.json()["id"]
+    old_root = create_resp.json()["files_root_path"]
+
+    update_resp = client.patch(
+        f"/api/vuln/cases/{case_id}",
+        json={
+            "title": "After update",
+            "reporter": {"name": "after-reporter", "version": "2.0.0", "type": "api"},
+            "subject": {"type": "http_endpoint", "locator": "/after", "name": "after-api"},
+            "metadata": {"source": {"source_service": "after-service"}, "custom": {"tag": "updated"}},
+            "artifacts": [{"kind": "text", "name": "note.txt", "content": "updated"}],
+        },
+    )
+    assert update_resp.status_code == 200
+    payload = update_resp.json()
+    assert payload["title"] == "After update"
+    assert payload["summary"] == "before summary"
+    assert payload["reporter"]["name"] == "after-reporter"
+    assert payload["subject"]["locator"] == "/after"
+    assert payload["metadata"]["source"]["source_service"] == "after-service"
+    assert payload["artifacts"][0]["name"] == "note.txt"
+    assert payload["files_root_path"] == old_root
+
+    timeline = client.get(f"/api/vuln/cases/{case_id}/timeline")
+    assert timeline.status_code == 200
+    assert any(
+        item["payload"].get("event_type") == "case_intake_updated"
+        for item in timeline.json()["items"]
+        if item["item_type"] == "event"
+    )
+
+
+def test_update_case_intake_validation_error(client: TestClient):
+    create_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(title="Needs valid title"),
+    )
+    assert create_resp.status_code == 200
+    case_id = create_resp.json()["id"]
+
+    update_resp = client.patch(
+        f"/api/vuln/cases/{case_id}",
+        json={"title": ""},
+    )
+    assert update_resp.status_code == 400
 
 
 def test_delete_case_removes_suspicion(client: TestClient):

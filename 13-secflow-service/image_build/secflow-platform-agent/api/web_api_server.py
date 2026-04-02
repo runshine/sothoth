@@ -115,7 +115,8 @@ class WebAPIServer:
             config.get('nacos_password'),  # 新增：Nacos密码
             config.get('daemon_api_port', 11188),  # 新增：守护进程API端口
             config.get('daemon_auth_header', 'X-API-Token'),
-            config.get('daemon_auth_token') or config.get('agent_auth_token', 'default_token_change_me')
+            config.get('daemon_auth_token') or config.get('agent_auth_token', 'default_token_change_me'),
+            config.get('agent_offline_grace_sec', 120),
         )
 
         # 9. 初始化任务管理器（传递超时配置）
@@ -1527,6 +1528,292 @@ class WebAPIServer:
             if self.db_manager.db_type == 'mysql' else
             f"SELECT * FROM {table_name} WHERE batch_id = ? LIMIT 1",
             (batch_id,)
+        )
+
+    def _normalize_single_session(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        session = dict(payload or {})
+        session['session_id'] = str(session.get('session_id') or '').strip()
+        session['backend'] = str(session.get('backend') or '').strip()
+        session['agent_ids'] = list(session.get('agent_ids') or [])
+        session_mode = str(session.get('session_mode') or '').strip().lower()
+        session['session_mode'] = session_mode or 'invoke'
+        session['status'] = str(session.get('status') or '').strip().lower() or 'ready'
+        session['pty_pid'] = session.get('pty_pid')
+        session['backend_pid'] = session.get('backend_pid')
+        if session.get('backend_pid') is None:
+            session['backend_pid'] = session.get('pty_pid')
+        session['pty_started_at'] = session.get('pty_started_at')
+        session['last_error'] = session.get('last_error')
+        session['metadata'] = session.get('metadata') or {}
+        session['messages'] = list(session.get('messages') or [])
+        return session
+
+    def _upsert_ai_single_session(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        session: Dict[str, Any],
+    ) -> None:
+        table_name = self.db_manager.get_table_name('ai_agent_sessions_single')
+        now_ts = datetime.now().isoformat()
+        session_json = json.dumps(session, ensure_ascii=False)
+        agent_ids_json = json.dumps(session.get('agent_ids') or [], ensure_ascii=False)
+        metadata_json = json.dumps(session.get('metadata') or {}, ensure_ascii=False)
+        values = (
+            project_id,
+            agent_key,
+            service_name,
+            str(session.get('session_id') or ''),
+            str(session.get('backend') or ''),
+            agent_ids_json,
+            str(session.get('session_mode') or ''),
+            str(session.get('status') or ''),
+            session.get('pty_pid'),
+            session.get('backend_pid'),
+            session.get('pty_started_at'),
+            session.get('last_error'),
+            metadata_json,
+            session_json,
+        )
+        if self.db_manager.db_type == 'mysql':
+            self.db_manager.execute_query(
+                f"""
+                INSERT INTO {table_name}
+                (project_id, agent_key, service_name, session_id, backend, agent_ids_json, session_mode, status,
+                 pty_pid, backend_pid, pty_started_at, last_error, metadata_json, raw_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  backend=VALUES(backend),
+                  agent_ids_json=VALUES(agent_ids_json),
+                  session_mode=VALUES(session_mode),
+                  status=VALUES(status),
+                  pty_pid=VALUES(pty_pid),
+                  backend_pid=VALUES(backend_pid),
+                  pty_started_at=VALUES(pty_started_at),
+                  last_error=VALUES(last_error),
+                  metadata_json=VALUES(metadata_json),
+                  raw_json=VALUES(raw_json),
+                  updated_at=NOW()
+                """,
+                values,
+            )
+        else:
+            self.db_manager.execute_query(
+                f"""
+                INSERT INTO {table_name}
+                (project_id, agent_key, service_name, session_id, backend, agent_ids_json, session_mode, status,
+                 pty_pid, backend_pid, pty_started_at, last_error, metadata_json, raw_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, agent_key, service_name, session_id) DO UPDATE SET
+                  backend=excluded.backend,
+                  agent_ids_json=excluded.agent_ids_json,
+                  session_mode=excluded.session_mode,
+                  status=excluded.status,
+                  pty_pid=excluded.pty_pid,
+                  backend_pid=excluded.backend_pid,
+                  pty_started_at=excluded.pty_started_at,
+                  last_error=excluded.last_error,
+                  metadata_json=excluded.metadata_json,
+                  raw_json=excluded.raw_json,
+                  updated_at=excluded.updated_at
+                """,
+                values + (now_ts, now_ts),
+            )
+
+    def _replace_ai_single_session_messages(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        table_name = self.db_manager.get_table_name('ai_agent_session_single_messages')
+        self.db_manager.execute_query(
+            f"DELETE FROM {table_name} WHERE project_id = %s AND agent_key = %s AND service_name = %s AND session_id = %s"
+            if self.db_manager.db_type == 'mysql' else
+            f"DELETE FROM {table_name} WHERE project_id = ? AND agent_key = ? AND service_name = ? AND session_id = ?",
+            (project_id, agent_key, service_name, session_id),
+        )
+        if not messages:
+            return
+        for idx, item in enumerate(messages, start=1):
+            role = str((item or {}).get('role') or 'assistant').strip() or 'assistant'
+            content = str((item or {}).get('content') or '')
+            if self.db_manager.db_type == 'mysql':
+                self.db_manager.execute_query(
+                    f"""
+                    INSERT INTO {table_name}
+                    (project_id, agent_key, service_name, session_id, seq_no, role, content)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                      role=VALUES(role),
+                      content=VALUES(content)
+                    """,
+                    (project_id, agent_key, service_name, session_id, idx, role, content),
+                )
+            else:
+                now_ts = datetime.now().isoformat()
+                self.db_manager.execute_query(
+                    f"""
+                    INSERT INTO {table_name}
+                    (project_id, agent_key, service_name, session_id, seq_no, role, content, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(project_id, agent_key, service_name, session_id, seq_no) DO UPDATE SET
+                      role=excluded.role,
+                      content=excluded.content
+                    """,
+                    (project_id, agent_key, service_name, session_id, idx, role, content, now_ts),
+                )
+
+    def _save_ai_single_session(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        session = self._normalize_single_session(payload or {})
+        session_id = str(session.get('session_id') or '').strip()
+        if not session_id:
+            return session
+        self._upsert_ai_single_session(project_id, agent_key, service_name, session)
+        if isinstance(payload, dict) and 'messages' in payload:
+            self._replace_ai_single_session_messages(
+                project_id,
+                agent_key,
+                service_name,
+                session_id,
+                list(session.get('messages') or []),
+            )
+        return self._load_ai_single_session(project_id, agent_key, service_name, session_id) or session
+
+    def _load_ai_single_session(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        session_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        sessions_table = self.db_manager.get_table_name('ai_agent_sessions_single')
+        messages_table = self.db_manager.get_table_name('ai_agent_session_single_messages')
+        row = self.db_manager.fetch_one(
+            f"""
+            SELECT project_id, agent_key, service_name, session_id, backend, agent_ids_json, session_mode, status,
+                   pty_pid, backend_pid, pty_started_at, last_error, metadata_json, raw_json, created_at, updated_at
+            FROM {sessions_table}
+            WHERE project_id = %s AND agent_key = %s AND service_name = %s AND session_id = %s
+            LIMIT 1
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            SELECT project_id, agent_key, service_name, session_id, backend, agent_ids_json, session_mode, status,
+                   pty_pid, backend_pid, pty_started_at, last_error, metadata_json, raw_json, created_at, updated_at
+            FROM {sessions_table}
+            WHERE project_id = ? AND agent_key = ? AND service_name = ? AND session_id = ?
+            LIMIT 1
+            """,
+            (project_id, agent_key, service_name, session_id),
+        )
+        if not row:
+            return None
+        messages_rows = self.db_manager.fetch_all(
+            f"""
+            SELECT seq_no, role, content, created_at
+            FROM {messages_table}
+            WHERE project_id = %s AND agent_key = %s AND service_name = %s AND session_id = %s
+            ORDER BY seq_no ASC
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            SELECT seq_no, role, content, created_at
+            FROM {messages_table}
+            WHERE project_id = ? AND agent_key = ? AND service_name = ? AND session_id = ?
+            ORDER BY seq_no ASC
+            """,
+            (project_id, agent_key, service_name, session_id),
+        ) or []
+        agent_ids = []
+        if row.get('agent_ids_json'):
+            try:
+                agent_ids = json.loads(row.get('agent_ids_json')) if isinstance(row.get('agent_ids_json'), str) else list(row.get('agent_ids_json') or [])
+            except Exception:
+                agent_ids = []
+        metadata = {}
+        if row.get('metadata_json'):
+            try:
+                metadata = json.loads(row.get('metadata_json')) if isinstance(row.get('metadata_json'), str) else (row.get('metadata_json') or {})
+            except Exception:
+                metadata = {}
+        return {
+            'session_id': row.get('session_id'),
+            'backend': row.get('backend'),
+            'agent_ids': agent_ids,
+            'session_mode': row.get('session_mode') or 'invoke',
+            'status': row.get('status') or 'ready',
+            'pty_pid': row.get('pty_pid'),
+            'backend_pid': row.get('backend_pid'),
+            'pty_started_at': row.get('pty_started_at'),
+            'last_error': row.get('last_error'),
+            'metadata': metadata,
+            'messages': [
+                {
+                    'role': msg.get('role') or 'assistant',
+                    'content': msg.get('content') or '',
+                } for msg in messages_rows
+            ],
+            'created_at': row.get('created_at'),
+            'updated_at': row.get('updated_at'),
+        }
+
+    def _list_ai_single_sessions(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+    ) -> List[Dict[str, Any]]:
+        sessions_table = self.db_manager.get_table_name('ai_agent_sessions_single')
+        rows = self.db_manager.fetch_all(
+            f"""
+            SELECT session_id
+            FROM {sessions_table}
+            WHERE project_id = %s AND agent_key = %s AND service_name = %s
+            ORDER BY updated_at DESC, created_at DESC
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            SELECT session_id
+            FROM {sessions_table}
+            WHERE project_id = ? AND agent_key = ? AND service_name = ?
+            ORDER BY updated_at DESC, created_at DESC
+            """,
+            (project_id, agent_key, service_name),
+        ) or []
+        sessions: List[Dict[str, Any]] = []
+        for row in rows:
+            item = self._load_ai_single_session(project_id, agent_key, service_name, str(row.get('session_id') or ''))
+            if item:
+                sessions.append(item)
+        return sessions
+
+    def _delete_ai_single_session(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        session_id: str,
+    ) -> None:
+        sessions_table = self.db_manager.get_table_name('ai_agent_sessions_single')
+        messages_table = self.db_manager.get_table_name('ai_agent_session_single_messages')
+        self.db_manager.execute_query(
+            f"DELETE FROM {messages_table} WHERE project_id = %s AND agent_key = %s AND service_name = %s AND session_id = %s"
+            if self.db_manager.db_type == 'mysql' else
+            f"DELETE FROM {messages_table} WHERE project_id = ? AND agent_key = ? AND service_name = ? AND session_id = ?",
+            (project_id, agent_key, service_name, session_id),
+        )
+        self.db_manager.execute_query(
+            f"DELETE FROM {sessions_table} WHERE project_id = %s AND agent_key = %s AND service_name = %s AND session_id = %s"
+            if self.db_manager.db_type == 'mysql' else
+            f"DELETE FROM {sessions_table} WHERE project_id = ? AND agent_key = ? AND service_name = ? AND session_id = ?",
+            (project_id, agent_key, service_name, session_id),
         )
 
     @staticmethod
@@ -4229,23 +4516,38 @@ class WebAPIServer:
                 return jsonify({'error': 'project_id is required'}), 400
             try:
                 if request.method == 'GET':
-                    data, status_code = self._call_ai_helper_api(
-                        project_id,
-                        agent_key,
-                        service_name,
-                        'GET',
-                        '/api/ai-agents/sessions',
-                        None,
-                    )
-                else:
-                    data, status_code = self._call_ai_helper_api(
-                        project_id,
-                        agent_key,
-                        service_name,
-                        'POST',
-                        '/api/ai-agents/sessions',
-                        payload,
-                    )
+                    sessions = self._list_ai_single_sessions(project_id, agent_key, service_name)
+                    # Best effort bootstrap from helper for legacy sessions not yet persisted in platform.
+                    if not sessions:
+                        try:
+                            data, status_code = self._call_ai_helper_api(
+                                project_id,
+                                agent_key,
+                                service_name,
+                                'GET',
+                                '/api/ai-agents/sessions',
+                                None,
+                            )
+                            if status_code < 300 and isinstance(data, dict):
+                                for item in (data.get('items') or []):
+                                    if isinstance(item, dict):
+                                        self._save_ai_single_session(project_id, agent_key, service_name, item)
+                                sessions = self._list_ai_single_sessions(project_id, agent_key, service_name)
+                        except Exception:
+                            # Keep platform-first semantics; helper unavailable should not break history reads.
+                            pass
+                    return jsonify({'items': sessions, 'total': len(sessions)})
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'POST',
+                    '/api/ai-agents/sessions',
+                    payload,
+                )
+                if status_code < 300 and isinstance(data, dict):
+                    saved = self._save_ai_single_session(project_id, agent_key, service_name, data)
+                    return jsonify(saved), status_code
                 return jsonify(data), status_code
             except Exception as e:
                 self.logger.error(f"AI helper会话代理失败: {e}", exc_info=True)
@@ -4259,15 +4561,25 @@ class WebAPIServer:
                 return jsonify({'error': 'project_id is required'}), 400
             try:
                 if request.method == 'DELETE':
-                    data, status_code = self._call_ai_helper_api(
-                        project_id,
-                        agent_key,
-                        service_name,
-                        'DELETE',
-                        f"/api/ai-agents/sessions/{quote(session_id, safe='')}",
-                        payload if isinstance(payload, dict) else None,
-                    )
-                    return jsonify(data), status_code
+                    helper_result = {'deleted': True, 'session_id': session_id}
+                    status_code = 200
+                    try:
+                        helper_result, status_code = self._call_ai_helper_api(
+                            project_id,
+                            agent_key,
+                            service_name,
+                            'DELETE',
+                            f"/api/ai-agents/sessions/{quote(session_id, safe='')}",
+                            payload if isinstance(payload, dict) else None,
+                        )
+                    except Exception as exc:
+                        helper_result = {'deleted': False, 'session_id': session_id, 'helper_error': str(exc)}
+                        status_code = 207
+                    self._delete_ai_single_session(project_id, agent_key, service_name, session_id)
+                    return jsonify(helper_result), status_code
+                session = self._load_ai_single_session(project_id, agent_key, service_name, session_id)
+                if session:
+                    return jsonify(session)
                 data, status_code = self._call_ai_helper_api(
                     project_id,
                     agent_key,
@@ -4276,6 +4588,9 @@ class WebAPIServer:
                     f"/api/ai-agents/sessions/{quote(session_id, safe='')}",
                     None,
                 )
+                if status_code < 300 and isinstance(data, dict):
+                    saved = self._save_ai_single_session(project_id, agent_key, service_name, data)
+                    return jsonify(saved), status_code
                 return jsonify(data), status_code
             except Exception as e:
                 self.logger.error(f"查询AI helper会话失败: {e}", exc_info=True)
@@ -4308,14 +4623,57 @@ class WebAPIServer:
                         upstream.close()
                         return jsonify(err_payload), upstream.status_code
 
+                    stream_capture = {
+                        'buffer': '',
+                        'done_session': None,
+                    }
+
                     def _proxy_stream():
                         try:
                             for chunk in upstream.iter_content(chunk_size=1):
                                 if not chunk:
                                     continue
+                                try:
+                                    text = chunk.decode('utf-8', errors='ignore')
+                                    if text:
+                                        stream_capture['buffer'] += text
+                                        parts = stream_capture['buffer'].split('\n\n')
+                                        stream_capture['buffer'] = parts.pop() if parts else ''
+                                        for part in parts:
+                                            if not part.strip():
+                                                continue
+                                            data_lines = [
+                                                line[5:].strip()
+                                                for line in part.split('\n')
+                                                if line.startswith('data:')
+                                            ]
+                                            joined = '\n'.join(data_lines).strip()
+                                            if not joined or joined == '[DONE]':
+                                                continue
+                                            try:
+                                                event_payload = json.loads(joined)
+                                            except Exception:
+                                                event_payload = None
+                                            if isinstance(event_payload, dict) and str(event_payload.get('type') or '') == 'done':
+                                                if isinstance(event_payload.get('session'), dict):
+                                                    stream_capture['done_session'] = event_payload.get('session')
+                                except Exception:
+                                    pass
                                 yield chunk
                         finally:
                             upstream.close()
+                            if isinstance(stream_capture.get('done_session'), dict):
+                                try:
+                                    self._save_ai_single_session(
+                                        project_id,
+                                        agent_key,
+                                        service_name,
+                                        stream_capture.get('done_session') or {},
+                                    )
+                                except Exception as persist_exc:
+                                    self.logger.warning(
+                                        f"流式会话完成后持久化失败: {project_id}/{agent_key}/{service_name}/{session_id}: {persist_exc}"
+                                    )
 
                     return Response(
                         _proxy_stream(),
@@ -4336,6 +4694,10 @@ class WebAPIServer:
                     f"/api/ai-agents/sessions/{quote(session_id, safe='')}/messages",
                     payload,
                 )
+                if status_code < 300 and isinstance(data, dict):
+                    session_payload = data.get('session') if isinstance(data.get('session'), dict) else None
+                    if session_payload:
+                        self._save_ai_single_session(project_id, agent_key, service_name, session_payload)
                 return jsonify(data), status_code
             except Exception as e:
                 self.logger.error(f"发送AI helper会话消息失败: {e}", exc_info=True)

@@ -72,6 +72,8 @@ DEFAULT_CONFIG = {
     'service_sync_interval': 30,
     'enable_background_refresh': True,
     'leader_lock_timeout_sec': 90,
+    # Agent 缺失离线宽限期（秒）：避免多副本/多节点下瞬时发现不一致导致状态横跳
+    'agent_offline_grace_sec': 120,
     'max_workers': 10,
     'enable_task_workers': True,
     'task_worker_count': 5,
