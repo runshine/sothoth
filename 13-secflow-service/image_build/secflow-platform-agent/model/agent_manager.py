@@ -1482,19 +1482,31 @@ class AgentManager:
                 if 'Content-Type' not in request_headers:
                     request_headers['Content-Type'] = 'application/json'
 
-            # 发送请求
-            if method.upper() == 'GET':
-                response = requests.get(url, **request_kwargs)
-            elif method.upper() == 'POST':
-                response = requests.post(url, **request_kwargs)
-            elif method.upper() == 'PUT':
-                response = requests.put(url, **request_kwargs)
-            elif method.upper() == 'DELETE':
-                response = requests.delete(url, **request_kwargs)
-            elif method.upper() == 'PATCH':
-                response = requests.patch(url, **request_kwargs)
-            else:
-                return 400, {'error': f'Unsupported method: {method}'}
+            # 发送请求。对同步类GET请求做一次短重试，降低瞬时网络抖动导致的误失败。
+            method_upper = method.upper()
+            max_attempts = 2 if method_upper == 'GET' and timeout_type in ('proxy', 'health_check') else 1
+            response = None
+            last_request_exc = None
+            for attempt in range(max_attempts):
+                try:
+                    if method_upper == 'GET':
+                        response = requests.get(url, **request_kwargs)
+                    elif method_upper == 'POST':
+                        response = requests.post(url, **request_kwargs)
+                    elif method_upper == 'PUT':
+                        response = requests.put(url, **request_kwargs)
+                    elif method_upper == 'DELETE':
+                        response = requests.delete(url, **request_kwargs)
+                    elif method_upper == 'PATCH':
+                        response = requests.patch(url, **request_kwargs)
+                    else:
+                        return 400, {'error': f'Unsupported method: {method}'}
+                    break
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as req_exc:
+                    last_request_exc = req_exc
+                    if attempt >= max_attempts - 1:
+                        raise
+                    time.sleep(0.2)
 
             # 处理响应
             content_type = response.headers.get('Content-Type', '').lower()
