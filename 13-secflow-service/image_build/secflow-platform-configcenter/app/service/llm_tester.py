@@ -157,7 +157,15 @@ def _build_azure_request(payload: LlmProviderTestRequest) -> tuple[str, dict[str
 
 
 def _build_anthropic_request(payload: LlmProviderTestRequest) -> tuple[str, dict[str, str], dict[str, Any]]:
-    target = _join_url(payload.api_base, "/messages")
+    base = _trimmed(payload.api_base).rstrip("/")
+    if base.endswith("/v1/messages"):
+        target = base
+    elif base.endswith("/messages"):
+        target = f"{base[:-len('/messages')]}/v1/messages"
+    elif base.endswith("/v1"):
+        target = f"{base}/messages"
+    else:
+        target = f"{base}/v1/messages"
     headers = {
         "x-api-key": _trimmed(payload.api_key),
         "anthropic-version": _trimmed(payload.api_version) or DEFAULT_ANTHROPIC_VERSION,
