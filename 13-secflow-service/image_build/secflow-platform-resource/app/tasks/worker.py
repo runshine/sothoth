@@ -106,6 +106,9 @@ class ResourceTaskWorker:
             )
 
             if not created_pvc:
+                reason = (k8s_service.get_last_error() or "").strip()
+                if reason:
+                    raise Exception(f"Failed to create PVC: {pvc_name}. reason={reason}")
                 raise Exception(f"Failed to create PVC: {pvc_name}")
 
             # 记录创建的PVC（用于失败时清理）

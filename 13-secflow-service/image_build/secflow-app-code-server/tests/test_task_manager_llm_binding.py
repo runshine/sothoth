@@ -359,6 +359,58 @@ def test_create_with_multiple_llm_providers_merge_rules(monkeypatch):
     manager.executor.shutdown(wait=False)
 
 
+def test_create_with_llm_file_overrides_applied(monkeypatch):
+    code_server = _make_code_server()
+    db = FakeDB(code_server)
+    fake_k8s = FakeK8s()
+    fake_cc = FakeConfigCenter(
+        {
+            "provider-a": {
+                "provider_key": "provider-a",
+                "display_name": "Provider A",
+                "provider_type": "openai-compatible",
+                "model": "a-model",
+                "api_base": "https://a.example.com",
+                "env_bindings": {},
+                "file_bindings": [
+                    {"name": "a.cfg", "path": "/etc/llm/agent.yaml", "content": "from: A", "enabled": True},
+                    {"name": "b.cfg", "path": "/etc/llm/extra.json", "content": "{\"from\": \"A\"}", "enabled": True},
+                ],
+            }
+        }
+    )
+    monkeypatch.setattr("app.services.task_manager.get_k8s_service", lambda: fake_k8s)
+    monkeypatch.setattr("app.services.task_manager.get_configcenter_client", lambda: fake_cc)
+
+    manager = TaskManager()
+    task = SimpleNamespace(
+        project_id="p1",
+        params={
+            "code_server_id": "cs-1",
+            "namespace": "secflow-p1",
+            "name": "audit-env",
+            "custom_env": {},
+            "code_server_env": {},
+            "image": "",
+            "llm_provider_keys": ["provider-a"],
+            "llm_file_overrides": [
+                {"path": "/etc/llm/agent.yaml", "content": "from: user-override"},
+                {"path": "/etc/llm/not-exists.yaml", "content": "ignored"},
+            ],
+        },
+    )
+
+    manager._handle_create_task(task, db)
+
+    assert fake_k8s.created_configmap["data"] == {
+        "file-1": "from: user-override",
+        "file-2": "{\"from\": \"A\"}",
+    }
+    assert [item["content"] for item in code_server.llm_file_bindings] == ["from: user-override", "{\"from\": \"A\"}"]
+
+    manager.executor.shutdown(wait=False)
+
+
 def test_create_passes_preset_env_overrides(monkeypatch):
     code_server = _make_code_server()
     db = FakeDB(code_server)

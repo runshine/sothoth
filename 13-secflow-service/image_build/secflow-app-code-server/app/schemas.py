@@ -16,6 +16,11 @@ class LlmProviderFileBinding(BaseModel):
     provider_key: Optional[str] = None
 
 
+class LlmFileOverride(BaseModel):
+    path: str
+    content: str
+
+
 # ============ PVC相关Schema ============
 
 class PVCMount(BaseModel):
@@ -67,6 +72,7 @@ class CodeServerCreateRequest(BaseModel):
     fileserver_project_subpath: Optional[str] = Field(None, description="fileserver 项目目录下子路径（相对路径，禁止目录穿越）")
     llm_provider_key: Optional[str] = Field(None, description="可选，配置中心 LLM Provider Key")
     llm_provider_keys: Optional[List[str]] = Field(None, description="可选，按顺序绑定多个配置中心 LLM Provider Key")
+    llm_file_overrides: Optional[List[LlmFileOverride]] = Field(None, description="可选，按 path 覆盖 LLM Provider 文件内容")
 
 
 class CodeServerDeleteRequest(BaseModel):

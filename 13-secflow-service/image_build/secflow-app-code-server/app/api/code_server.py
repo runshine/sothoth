@@ -306,7 +306,8 @@ async def create_code_server(
         "fileserver_mount_path": request.fileserver_mount_path,
         "fileserver_project_subpath": request.fileserver_project_subpath,
         "llm_provider_key": (normalized_llm_provider_keys[-1] if normalized_llm_provider_keys else None),
-        "llm_provider_keys": normalized_llm_provider_keys
+        "llm_provider_keys": normalized_llm_provider_keys,
+        "llm_file_overrides": [{"path": item.path, "content": item.content} for item in (request.llm_file_overrides or [])]
     }
     task = task_manager.create_task(
         project_id=project_id,

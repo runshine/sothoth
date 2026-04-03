@@ -39,6 +39,11 @@ class KubernetesService:
         self.timeout = k8s_service_timeout
         self.client = httpx.Client(timeout=self.timeout)
         self.service_machine_token = service_machine_token
+        self.last_error: Optional[str] = None
+
+    def get_last_error(self) -> Optional[str]:
+        """Return latest k8s operation error message."""
+        return self.last_error
 
     def _request(
         self,
@@ -101,8 +106,10 @@ class KubernetesService:
         storage_class: Optional[str] = None,
     ) -> Optional[str]:
         """Create a PVC in the project namespace."""
+        self.last_error = None
         namespace = self.get_project_namespace(project_id)
         if not self.ensure_namespace(project_id):
+            self.last_error = f"Failed to ensure namespace: {namespace}"
             return None
 
         try:
@@ -135,9 +142,11 @@ class KubernetesService:
             if resp.status_code == 409:
                 return pvc_name
             logger.error(f"Failed to create PVC {pvc_name}: {resp.status_code} {resp.text}")
+            self.last_error = f"platform-k8s create pvc failed: HTTP {resp.status_code} {resp.text}"
             return None
         except Exception as e:
             logger.error(f"Failed to create PVC {pvc_name}: {e}")
+            self.last_error = f"platform-k8s create pvc exception: {e}"
             return None
 
     def get_pod(self, project_id: str, pod_name: str) -> Optional[Dict[str, Any]]:

@@ -11,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.models.database import (
     get_db, Resource, AsyncTaskLog, Project,
@@ -103,6 +104,53 @@ async def validate_project_access(
         return False, None
 
     return True, project
+
+
+async def ensure_project_record(
+    db: Session,
+    project_id: str,
+    token: str,
+    current_user: TokenPayload,
+    namespace: str,
+) -> Project:
+    """Ensure project exists locally before calling platform-k8s project-scoped APIs."""
+    project_record = db.query(Project).filter(Project.id == project_id).first()
+    if project_record:
+        return project_record
+
+    project_service = get_project_service()
+    try:
+        project_info = await project_service.get_project_info(project_id, token)
+    except Exception as error:
+        logger.warning(
+            "Failed to fetch project info from project service, fallback to minimal project record. project_id=%s error=%s",
+            project_id,
+            error,
+        )
+        project_info = {}
+
+    project_record = Project(
+        id=project_id,
+        name=project_info.get("name", project_id),
+        description=project_info.get("description"),
+        owner_id=project_info.get("owner_id", str(current_user.id)),
+        owner_name=project_info.get("owner_name"),
+        k8s_namespace=namespace,
+        status=project_info.get("status", "active") or "active",
+    )
+    db.add(project_record)
+    try:
+        # Commit before platform-k8s PVC APIs so project_id→namespace mapping is visible cross-service.
+        db.commit()
+    except IntegrityError:
+        # Concurrent requests may create the same project row; reload instead of failing creation flow.
+        db.rollback()
+        existing = db.query(Project).filter(Project.id == project_id).first()
+        if existing:
+            return existing
+        raise
+    db.refresh(project_record)
+    return project_record
 
 
 def get_upload_dir() -> str:
@@ -761,6 +809,14 @@ async def create_output_pvc(
     pvc_name = k8s_service.get_pvc_name(resource_uuid)
     namespace = k8s_service.get_project_namespace(request.project_id)
 
+    project_record = await ensure_project_record(
+        db=db,
+        project_id=request.project_id,
+        token=token,
+        current_user=current_user,
+        namespace=namespace,
+    )
+
     # 创建PVC
     created_pvc = k8s_service.create_pvc(
         project_id=request.project_id,
@@ -770,24 +826,11 @@ async def create_output_pvc(
     )
 
     if not created_pvc:
-        raise HTTPException(status_code=500, detail="Failed to create PVC")
-
-    # 获取或创建项目记录
-    project_record = db.query(Project).filter(Project.id == request.project_id).first()
-    if not project_record:
-        # 从project服务获取项目信息并创建本地记录
-        project_service = get_project_service()
-        project_info = await project_service.get_project_info(request.project_id, token)
-        project_record = Project(
-            id=request.project_id,
-            name=project_info.get("name", request.project_id),
-            description=project_info.get("description"),
-            owner_id=project_info.get("owner_id", str(current_user.id)),
-            owner_name=project_info.get("owner_name"),
-            k8s_namespace=namespace,
-            status="active"
-        )
-        db.add(project_record)
+        reason = (k8s_service.get_last_error() or "").strip()
+        detail = "Failed to create PVC"
+        if reason:
+            detail = f"{detail}: {reason}"
+        raise HTTPException(status_code=500, detail=detail)
 
     # 创建资源记录
     resource = Resource(
@@ -999,9 +1042,23 @@ async def create_manual_pvc_resource(
     k8s_service = get_k8s_service()
     config = get_config()
     storage_class = config.get("k8s", {}).get("storage_class_name") or k8s_service.storage_class_name
+    logger.info(
+        "Creating manual PVC with storageClassName=%s (project_id=%s, resource_type=%s)",
+        storage_class,
+        request.project_id,
+        request.resource_type.value if hasattr(request.resource_type, "value") else request.resource_type,
+    )
     resource_uuid = str(uuid.uuid4())
     pvc_name = k8s_service.get_pvc_name(resource_uuid)
     namespace = k8s_service.get_project_namespace(request.project_id)
+
+    project_record = await ensure_project_record(
+        db=db,
+        project_id=request.project_id,
+        token=token,
+        current_user=current_user,
+        namespace=namespace,
+    )
 
     created_pvc = k8s_service.create_pvc(
         project_id=request.project_id,
@@ -1010,22 +1067,11 @@ async def create_manual_pvc_resource(
         storage_class=storage_class
     )
     if not created_pvc:
-        raise HTTPException(status_code=500, detail="Failed to create PVC")
-
-    project_record = db.query(Project).filter(Project.id == request.project_id).first()
-    if not project_record:
-        project_service = get_project_service()
-        project_info = await project_service.get_project_info(request.project_id, token)
-        project_record = Project(
-            id=request.project_id,
-            name=project_info.get("name", request.project_id),
-            description=project_info.get("description"),
-            owner_id=project_info.get("owner_id", str(current_user.id)),
-            owner_name=project_info.get("owner_name"),
-            k8s_namespace=namespace,
-            status="active"
-        )
-        db.add(project_record)
+        reason = (k8s_service.get_last_error() or "").strip()
+        detail = "Failed to create PVC"
+        if reason:
+            detail = f"{detail}: {reason}"
+        raise HTTPException(status_code=500, detail=detail)
 
     resource = Resource(
         resource_uuid=resource_uuid,
