@@ -12,6 +12,12 @@ data:
     
     # File Root Directory Configuration
     file_root: "/app/resource"
+
+    # File IO Configuration
+    file_io:
+      upload_chunk_bytes: 524288
+      stream_chunk_bytes: 524288
+      max_upload_bytes: 2147483648
     
     # Auth Service Configuration (call external auth service)
     auth_service:

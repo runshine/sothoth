@@ -4,12 +4,13 @@
 
 import os
 import logging
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Body, UploadFile, File
 from pydantic import BaseModel
-from fastapi.responses import StreamingResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 import aiofiles
 from aiofiles import os as aio_os
 
@@ -20,6 +21,17 @@ from app.services.auth import get_auth_service, TokenInvalidError
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/deploy-script", tags=["DeployScript"])
+
+def _get_upload_chunk_bytes() -> int:
+    return max(64 * 1024, int(get_config().file_io.upload_chunk_bytes))
+
+
+def _get_stream_chunk_bytes() -> int:
+    return max(64 * 1024, int(get_config().file_io.stream_chunk_bytes))
+
+
+def _get_max_upload_bytes() -> int:
+    return max(1 * 1024 * 1024, int(get_config().file_io.max_upload_bytes))
 
 
 class EditFileRequest(BaseModel):
@@ -60,6 +72,43 @@ def validate_path(file_root: Path, path: str) -> Path:
         raise ValidationError("无效的路径")
 
     return resolved_path
+
+
+def _stream_file_chunks(file_path: Path, chunk_size: Optional[int] = None) -> Iterator[bytes]:
+    read_chunk = chunk_size or _get_stream_chunk_bytes()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(read_chunk)
+            if not chunk:
+                break
+            yield chunk
+
+
+async def _save_upload_stream(upload: UploadFile, target_path: Path) -> int:
+    upload_chunk = _get_upload_chunk_bytes()
+    max_upload = _get_max_upload_bytes()
+    total_size = 0
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="upload_", suffix=".part", dir=str(target_path.parent))
+    os.close(fd)
+    try:
+        with open(temp_path, "wb") as out:
+            while True:
+                chunk = await upload.read(upload_chunk)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > max_upload:
+                    raise ValidationError(f"文件过大，超过限制 {max_upload} bytes")
+                out.write(chunk)
+        os.replace(temp_path, target_path)
+        return total_size
+    except Exception:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise
+    finally:
+        await upload.close()
 
 
 async def get_current_user(
@@ -154,23 +203,17 @@ async def read_file(
     is_text = file_path.suffix.lower() in text_extensions
 
     if is_text:
-        # 返回文本内容
-        async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            content = await f.read()
-        return PlainTextResponse(
-            content=content,
-            media_type="text/plain; charset=utf-8"
-        )
-    else:
-        # 返回二进制流
-        async with aiofiles.open(file_path, 'rb') as f:
-            content = await f.read()
-
         return StreamingResponse(
-            iter([content]),
-            media_type="application/octet-stream",
-            headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'}
+            _stream_file_chunks(file_path),
+            media_type="text/plain; charset=utf-8",
         )
+
+    # 返回二进制流
+    return StreamingResponse(
+        _stream_file_chunks(file_path),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'}
+    )
 
 
 @router.get("/files{path:path}")
@@ -250,12 +293,8 @@ async def download_file(
     if file_path.is_dir():
         raise ValidationError("不能下载目录")
 
-    # 读取文件并返回
-    async with aiofiles.open(file_path, 'rb') as f:
-        content = await f.read()
-
     return StreamingResponse(
-        iter([content]),
+        _stream_file_chunks(file_path),
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{file_path.name}"'}
     )
@@ -282,16 +321,21 @@ async def upload_file(
     file_root = get_file_root()
     # Resolve to absolute path to avoid relative/absolute path mismatch
     file_root = file_root.resolve()
-    target_path = validate_path(file_root, path)
+    requested_path = validate_path(file_root, path)
+    if requested_path.exists() and requested_path.is_dir():
+        filename = (file.filename or "").strip()
+        if not filename:
+            raise ValidationError("文件名不能为空")
+        target_path = validate_path(file_root, "/" + str((requested_path / filename).relative_to(file_root)))
+    else:
+        target_path = requested_path
 
     # 如果目标不存在，尝试创建
     if not target_path.parent.exists():
         target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 写入文件
-    content = await file.read()
-    async with aiofiles.open(target_path, 'wb') as f:
-        await f.write(content)
+    # 分块流式写入，避免整文件读入内存
+    file_size = await _save_upload_stream(file, target_path)
 
     logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 上传文件: {target_path}")
 
@@ -299,7 +343,7 @@ async def upload_file(
         "message": "文件上传成功",
         "path": "/" + str(target_path.relative_to(file_root)),
         "filename": target_path.name,
-        "size": len(content),
+        "size": file_size,
     }
 
 
@@ -497,16 +541,16 @@ async def batch_upload(
 
     results = []
     for file in files:
-        target_path = target_dir / file.filename
-
-        content = await file.read()
-        async with aiofiles.open(target_path, 'wb') as f:
-            await f.write(content)
+        filename = (file.filename or "").strip()
+        if not filename:
+            raise ValidationError("文件名不能为空")
+        target_path = target_dir / filename
+        file_size = await _save_upload_stream(file, target_path)
 
         results.append({
-            "filename": file.filename,
+            "filename": filename,
             "path": "/" + str(target_path.relative_to(file_root)),
-            "size": len(content),
+            "size": file_size,
         })
 
     logger.info(f"用户 {current_user.get('id') if current_user else 'anonymous'} 批量上传 {len(files)} 个文件到: {target_dir}")

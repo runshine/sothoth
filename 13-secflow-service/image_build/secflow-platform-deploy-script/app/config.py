@@ -34,6 +34,13 @@ class AuthServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}{self.validate_token_path}"
 
 
+class FileIOConfig(BaseModel):
+    """文件读写配置"""
+    upload_chunk_bytes: int = 524288
+    stream_chunk_bytes: int = 524288
+    max_upload_bytes: int = 2147483648
+
+
 class MenuLevelConfig(BaseModel):
     """菜单级别配置"""
     name: Optional[str] = None
@@ -69,6 +76,7 @@ class Config(BaseModel):
     """主配置类"""
     app: AppConfig = Field(default_factory=AppConfig)
     file_root: str = "/app/resource"
+    file_io: FileIOConfig = Field(default_factory=FileIOConfig)
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
 
