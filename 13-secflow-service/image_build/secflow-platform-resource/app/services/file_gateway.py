@@ -104,6 +104,22 @@ class FileGatewayManager:
             "available_replicas": int(deployment_status.get("availableReplicas") or 0),
         }
 
+    def cleanup_worker(self, project_id: str, pvc_name: str) -> Dict[str, Any]:
+        worker_name = self._worker_name(project_id, pvc_name)
+        service_name = self._service_name(worker_name)
+        k8s = get_k8s_service()
+        service_deleted = k8s.delete_service(project_id, service_name)
+        deployment_deleted = k8s.delete_deployment(project_id, worker_name)
+        with self._lock:
+            self._worker_access_time.pop(worker_name, None)
+            self._worker_locks.pop(worker_name, None)
+        return {
+            "worker_name": worker_name,
+            "service_name": service_name,
+            "service_deleted": bool(service_deleted),
+            "deployment_deleted": bool(deployment_deleted),
+        }
+
     def _touch(self, worker_name: str) -> None:
         with self._lock:
             self._worker_access_time[worker_name] = time.time()
