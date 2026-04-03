@@ -357,3 +357,93 @@ def test_create_with_multiple_llm_providers_merge_rules(monkeypatch):
     ]
 
     manager.executor.shutdown(wait=False)
+
+
+def test_create_passes_preset_env_overrides(monkeypatch):
+    code_server = _make_code_server()
+    db = FakeDB(code_server)
+    fake_k8s = FakeK8s()
+
+    monkeypatch.setattr("app.services.task_manager.get_k8s_service", lambda: fake_k8s)
+    monkeypatch.setattr("app.services.task_manager.get_configcenter_client", lambda: FakeConfigCenter({}))
+
+    manager = TaskManager()
+    task = SimpleNamespace(
+        project_id="p1",
+        params={
+            "code_server_id": "cs-1",
+            "namespace": "secflow-p1",
+            "name": "audit-env",
+            "custom_env": {},
+            "preset_env": {"A": "1", "B": "2"},
+            "code_server_env": {},
+            "image": "",
+            "llm_provider_keys": [],
+        },
+    )
+
+    manager._handle_create_task(task, db)
+
+    assert fake_k8s.deployment_call["preset_env"] == {"A": "1", "B": "2"}
+
+    manager.executor.shutdown(wait=False)
+
+
+def test_create_with_fileserver_mount_only_allows_project_subpath(monkeypatch):
+    code_server = _make_code_server()
+    db = FakeDB(code_server)
+    fake_k8s = FakeK8s()
+
+    monkeypatch.setattr("app.services.task_manager.get_k8s_service", lambda: fake_k8s)
+    monkeypatch.setattr("app.services.task_manager.get_configcenter_client", lambda: FakeConfigCenter({}))
+
+    manager = TaskManager()
+    manager.config.fileserver_mount.enabled = True
+    manager.config.fileserver_mount.pvc_name = "fileserver-pvc"
+    manager.config.fileserver_mount.project_root_prefix = "files"
+    manager.config.fileserver_mount.mount_path = "/data/fileserver"
+
+    ok_task = SimpleNamespace(
+        project_id="p1",
+        params={
+            "code_server_id": "cs-1",
+            "namespace": "secflow-p1",
+            "name": "audit-env",
+            "custom_env": {},
+            "code_server_env": {},
+            "image": "",
+            "llm_provider_keys": [],
+            "fileserver_mount_enabled": True,
+            "fileserver_mount_path": "/workspace/files",
+            "fileserver_project_subpath": "code-audit/input",
+        },
+    )
+    manager._handle_create_task(ok_task, db)
+
+    assert fake_k8s.deployment_call["fileserver_mount"]["pvc_name"] == "fileserver-pvc"
+    assert fake_k8s.deployment_call["fileserver_mount"]["mount_path"] == "/workspace/files"
+    assert fake_k8s.deployment_call["fileserver_mount"]["sub_path"] == "files/p1/code-audit/input"
+
+    bad_task = SimpleNamespace(
+        project_id="p1",
+        params={
+            "code_server_id": "cs-1",
+            "namespace": "secflow-p1",
+            "name": "audit-env",
+            "custom_env": {},
+            "code_server_env": {},
+            "image": "",
+            "llm_provider_keys": [],
+            "fileserver_mount_enabled": True,
+            "fileserver_mount_path": "/workspace/files",
+            "fileserver_project_subpath": "../escape",
+        },
+    )
+    try:
+        manager._handle_create_task(bad_task, db)
+        raised = False
+    except ValueError as exc:
+        raised = "目录穿越" in str(exc)
+    assert raised
+
+    manager.executor.shutdown(wait=False)

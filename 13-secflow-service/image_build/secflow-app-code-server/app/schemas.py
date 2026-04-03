@@ -57,10 +57,14 @@ class CodeServerCreateRequest(BaseModel):
     source_pvcs: List[PVCMount] = Field(..., description="源码PVC列表（必须存在）")
     output_pvcs: List[OutputPVCMount] = Field(default=[], description="输出PVC列表（不存在则创建）")
     custom_env: Optional[Dict[str, str]] = Field(None, description="自定义环境变量")
+    preset_env: Optional[Dict[str, str]] = Field(None, description="预制环境变量（默认来自配置文件，可前端覆盖/删除）")
     # Code Server专属环境变量
     code_server_env: Optional[Dict[str, Any]] = Field(None, description="Code Server镜像环境变量配置（PUID, PGID, TZ, PASSWORD, SUDO_PASSWORD等）")
     # 自定义镜像
     image: Optional[str] = Field(None, description="自定义镜像地址，使用特定镜像创建Code Server")
+    fileserver_mount_enabled: Optional[bool] = Field(None, description="是否启用 fileserver 共享 PVC 挂载")
+    fileserver_mount_path: Optional[str] = Field(None, description="fileserver 在容器内的挂载路径（绝对路径）")
+    fileserver_project_subpath: Optional[str] = Field(None, description="fileserver 项目目录下子路径（相对路径，禁止目录穿越）")
     llm_provider_key: Optional[str] = Field(None, description="可选，配置中心 LLM Provider Key")
     llm_provider_keys: Optional[List[str]] = Field(None, description="可选，按顺序绑定多个配置中心 LLM Provider Key")
 
@@ -90,6 +94,7 @@ class CodeServerResponse(BaseModel):
     ingress_name: Optional[str]
     pod_name: Optional[str]
     access_url: Optional[str]
+    fileserver_mount: Optional[Dict[str, Any]] = None
     code_server_env: Optional[Dict[str, Any]] = None  # Code Server环境变量
     llm_provider_key: Optional[str] = None
     llm_provider_keys: List[str] = Field(default_factory=list)
@@ -124,6 +129,15 @@ class CodeServerStatusResponse(BaseModel):
     access_url: Optional[str]
     ready_replicas: int
     total_replicas: int
+
+
+class CodeServerDeployDefaultsResponse(BaseModel):
+    """部署默认配置响应"""
+    default_image: str
+    preset_env: Dict[str, str] = Field(default_factory=dict)
+    fileserver_mount_enabled: bool = False
+    fileserver_mount_path: str = "/data/fileserver"
+    fileserver_project_root_prefix: str = "files"
 
 
 # ============ 日志相关Schema ============

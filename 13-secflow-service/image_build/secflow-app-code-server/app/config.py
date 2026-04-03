@@ -117,6 +117,14 @@ class IngressConfig(BaseModel):
     tls_enabled: bool = True
 
 
+class FileserverMountConfig(BaseModel):
+    """Fileserver共享PVC挂载配置"""
+    enabled: bool = False
+    pvc_name: str = ""
+    project_root_prefix: str = "files"
+    mount_path: str = "/data/fileserver"
+
+
 class TasksConfig(BaseModel):
     """任务管理配置"""
     retention_days: int = 7
@@ -183,6 +191,7 @@ class Config(BaseModel):
     code_server: CodeServerConfig = Field(default_factory=CodeServerConfig)
     pvc: PVCConfig = Field(default_factory=PVCConfig)
     ingress: IngressConfig = Field(default_factory=IngressConfig)
+    fileserver_mount: FileserverMountConfig = Field(default_factory=FileserverMountConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)

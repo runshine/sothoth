@@ -126,6 +126,17 @@ ingress:
   # 是否启用TLS
   tls_enabled: true
 
+# Fileserver共享PVC挂载配置
+fileserver_mount:
+  # 是否默认启用 fileserver 挂载
+  enabled: false
+  # fileserver 使用的共享 PVC 名称（与 fileserver 服务一致）
+  pvc_name: "secflow-platform-fileserver-data-nfs-pvc"
+  # 项目目录前缀，最终 subPath = {project_root_prefix}/{project_id}/{可选子路径}
+  project_root_prefix: "files"
+  # 审计容器内默认挂载目录
+  mount_path: "/data/fileserver"
+
 # 任务管理配置
 tasks:
   # 任务保留天数（完成的任务保留时间）

@@ -17,7 +17,7 @@ from app.model import (
 from app.schemas import (
     CodeServerCreateRequest, CodeServerDeleteRequest, CodeServerRestartRequest,
     CodeServerResponse, CodeServerListResponse, CodeServerStatusResponse,
-    CodeServerLogsResponse, TaskResponse, TaskListResponse,
+    CodeServerLogsResponse, CodeServerDeployDefaultsResponse, TaskResponse, TaskListResponse,
     TaskCreatedResponse, SuccessResponse, PVCMount, OutputPVCMount
 )
 from app.services.k8s import get_k8s_service
@@ -171,6 +171,7 @@ def make_code_server_response(server: CodeServer, realtime_status: str = None) -
         ingress_name=server.ingress_name,
         pod_name=server.pod_name,
         access_url=server.access_url,
+        fileserver_mount=server.fileserver_mount or {},
         code_server_env=server.code_server_env or {},
         llm_provider_key=server.llm_provider_key,
         llm_provider_keys=provider_keys,
@@ -217,6 +218,22 @@ async def health_check():
         "status": "ok",
         "service": "code-server-manager"
     }
+
+
+@router.get("/deploy-defaults", response_model=CodeServerDeployDefaultsResponse)
+async def get_deploy_defaults():
+    """获取部署审计环境默认配置（镜像 + 预制环境变量）"""
+    cfg = get_config().code_server
+    preset_env_raw = cfg.env if isinstance(cfg.env, dict) else {}
+    preset_env = {str(k): str(v) for k, v in preset_env_raw.items()}
+    fs_cfg = get_config().fileserver_mount
+    return CodeServerDeployDefaultsResponse(
+        default_image=str(cfg.image or ""),
+        preset_env=preset_env,
+        fileserver_mount_enabled=bool(fs_cfg.enabled),
+        fileserver_mount_path=str(fs_cfg.mount_path or "/data/fileserver"),
+        fileserver_project_root_prefix=str(fs_cfg.project_root_prefix or "files").strip("/") or "files",
+    )
 
 
 # ============ Code Server CRUD ============
@@ -266,6 +283,7 @@ async def create_code_server(
             "mount_path": p.mount_path,
             "storage_size": p.storage_size
         } for p in request.output_pvcs],
+        fileserver_mount={},
         custom_env=request.custom_env or {},
         code_server_env=request.code_server_env or {},
         llm_provider_key=(normalized_llm_provider_keys[-1] if normalized_llm_provider_keys else None),
@@ -281,8 +299,12 @@ async def create_code_server(
         "namespace": request.namespace,
         "name": request.name,
         "custom_env": request.custom_env,
+        "preset_env": request.preset_env,
         "code_server_env": request.code_server_env,
         "image": request.image,  # 传递自定义镜像参数
+        "fileserver_mount_enabled": request.fileserver_mount_enabled,
+        "fileserver_mount_path": request.fileserver_mount_path,
+        "fileserver_project_subpath": request.fileserver_project_subpath,
         "llm_provider_key": (normalized_llm_provider_keys[-1] if normalized_llm_provider_keys else None),
         "llm_provider_keys": normalized_llm_provider_keys
     }
