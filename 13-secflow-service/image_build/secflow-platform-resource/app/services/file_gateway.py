@@ -162,79 +162,117 @@ class FileGatewayManager:
         service_name = self._service_name(worker_name)
         namespace = get_k8s_service().get_project_namespace(project_id)
         worker_lock = self._get_worker_lock(worker_name)
+        k8s = get_k8s_service()
+        for attempt in range(2):
+            with worker_lock:
+                labels = {
+                    "app": self.config.worker_app_label,
+                    "managed-by": self.config.name,
+                    "project-id": project_id,
+                    "pvc-name": pvc_name,
+                    "worker-name": worker_name,
+                }
 
-        with worker_lock:
-            k8s = get_k8s_service()
-            labels = {
-                "app": self.config.worker_app_label,
-                "managed-by": self.config.name,
-                "project-id": project_id,
-                "pvc-name": pvc_name,
-                "worker-name": worker_name,
-            }
+                service = k8s.get_service(project_id, service_name)
+                if not service:
+                    created_svc = k8s.create_service(
+                        project_id=project_id,
+                        name=service_name,
+                        selector={"worker-name": worker_name},
+                        ports=[{"name": "http", "port": self.config.worker_container_port, "target_port": self.config.worker_container_port}],
+                        service_type="ClusterIP",
+                    )
+                    if not created_svc:
+                        raise HTTPException(status_code=500, detail=f"Failed to create file gateway service: {service_name}")
 
-            service = k8s.get_service(project_id, service_name)
-            if not service:
-                created_svc = k8s.create_service(
-                    project_id=project_id,
-                    name=service_name,
-                    selector={"worker-name": worker_name},
-                    ports=[{"name": "http", "port": self.config.worker_container_port, "target_port": self.config.worker_container_port}],
-                    service_type="ClusterIP",
-                )
-                if not created_svc:
-                    raise HTTPException(status_code=500, detail=f"Failed to create file gateway service: {service_name}")
-
-            deployment = k8s.get_deployment(project_id, worker_name)
-            if not deployment:
-                manifest = {
-                    "apiVersion": "apps/v1",
-                    "kind": "Deployment",
-                    "metadata": {"name": worker_name, "labels": labels},
-                    "spec": {
-                        "replicas": 1,
-                        "selector": {"matchLabels": {"worker-name": worker_name}},
-                        "template": {
-                            "metadata": {"labels": {**labels, "worker-name": worker_name}},
-                            "spec": {
-                                "containers": [
-                                    {
-                                        "name": "secflow-platform-resource-file-gateway-worker",
-                                        "image": self.config.worker_image,
-                                        "imagePullPolicy": "Always",
-                                        "ports": [{"containerPort": self.config.worker_container_port}],
-                                        "env": [
-                                            {"name": "APP_PORT", "value": str(self.config.worker_container_port)},
-                                            {"name": "PVC_MOUNT_PATH", "value": self.config.worker_mount_path},
-                                            {"name": "FILE_GATEWAY_INTERNAL_TOKEN", "value": self.config.internal_token},
-                                        ],
-                                        "volumeMounts": [
-                                            {"name": "target-pvc", "mountPath": self.config.worker_mount_path}
-                                        ],
-                                        "resources": {
-                                            "requests": {"cpu": "50m", "memory": "64Mi"},
-                                            "limits": {"cpu": "500m", "memory": "512Mi"},
-                                        },
-                                    }
-                                ],
-                                "volumes": [
-                                    {"name": "target-pvc", "persistentVolumeClaim": {"claimName": pvc_name}}
-                                ],
+                deployment = k8s.get_deployment(project_id, worker_name)
+                if not deployment:
+                    manifest = {
+                        "apiVersion": "apps/v1",
+                        "kind": "Deployment",
+                        "metadata": {"name": worker_name, "labels": labels},
+                        "spec": {
+                            "replicas": 1,
+                            "selector": {"matchLabels": {"worker-name": worker_name}},
+                            "template": {
+                                "metadata": {"labels": {**labels, "worker-name": worker_name}},
+                                "spec": {
+                                    "containers": [
+                                        {
+                                            "name": "secflow-platform-resource-file-gateway-worker",
+                                            "image": self.config.worker_image,
+                                            "imagePullPolicy": "Always",
+                                            "ports": [{"containerPort": self.config.worker_container_port}],
+                                            "env": [
+                                                {"name": "APP_PORT", "value": str(self.config.worker_container_port)},
+                                                {"name": "PVC_MOUNT_PATH", "value": self.config.worker_mount_path},
+                                                {"name": "FILE_GATEWAY_INTERNAL_TOKEN", "value": self.config.internal_token},
+                                            ],
+                                            "readinessProbe": {
+                                                "httpGet": {
+                                                    "path": "/health",
+                                                    "port": self.config.worker_container_port,
+                                                },
+                                                "initialDelaySeconds": 1,
+                                                "periodSeconds": 2,
+                                                "timeoutSeconds": 1,
+                                                "failureThreshold": 15,
+                                            },
+                                            "livenessProbe": {
+                                                "httpGet": {
+                                                    "path": "/health",
+                                                    "port": self.config.worker_container_port,
+                                                },
+                                                "initialDelaySeconds": 5,
+                                                "periodSeconds": 10,
+                                                "timeoutSeconds": 2,
+                                                "failureThreshold": 3,
+                                            },
+                                            "volumeMounts": [
+                                                {"name": "target-pvc", "mountPath": self.config.worker_mount_path}
+                                            ],
+                                            "resources": {
+                                                "requests": {"cpu": "50m", "memory": "64Mi"},
+                                                "limits": {"cpu": "500m", "memory": "512Mi"},
+                                            },
+                                        }
+                                    ],
+                                    "volumes": [
+                                        {"name": "target-pvc", "persistentVolumeClaim": {"claimName": pvc_name}}
+                                    ],
+                                },
                             },
                         },
-                    },
-                }
-                created = k8s.create_deployment(project_id, manifest)
-                if not created:
-                    raise HTTPException(status_code=500, detail=f"Failed to create file gateway worker: {worker_name}")
+                    }
+                    created = k8s.create_deployment(project_id, manifest)
+                    if not created:
+                        raise HTTPException(status_code=500, detail=f"Failed to create file gateway worker: {worker_name}")
 
-            if not k8s.wait_for_deployment_ready(project_id, worker_name, timeout=self.config.worker_ready_timeout_seconds):
-                raise HTTPException(status_code=504, detail=f"File gateway worker not ready: {worker_name}")
+                if not k8s.wait_for_deployment_ready(project_id, worker_name, timeout=self.config.worker_ready_timeout_seconds):
+                    raise HTTPException(status_code=504, detail=f"File gateway worker not ready: {worker_name}")
 
-        self._touch(worker_name)
-        base_url = f"http://{service_name}.{namespace}.svc.cluster.local:{self.config.worker_container_port}"
-        self._health_check(base_url)
-        return {"worker_name": worker_name, "service_name": service_name, "base_url": base_url}
+            self._touch(worker_name)
+            base_url = f"http://{service_name}.{namespace}.svc.cluster.local:{self.config.worker_container_port}"
+            try:
+                self._health_check(base_url)
+                return {"worker_name": worker_name, "service_name": service_name, "base_url": base_url}
+            except HTTPException as error:
+                if attempt >= 1:
+                    raise
+                logger.warning(
+                    "File gateway health check failed, recreating worker once. project_id=%s pvc=%s worker=%s error=%s",
+                    project_id,
+                    pvc_name,
+                    worker_name,
+                    error.detail if hasattr(error, "detail") else str(error),
+                )
+                k8s.delete_service(project_id, service_name)
+                k8s.delete_deployment(project_id, worker_name)
+                with self._lock:
+                    self._worker_access_time.pop(worker_name, None)
+                time.sleep(1)
+
+        raise HTTPException(status_code=503, detail=f"File gateway worker unavailable: {worker_name}")
 
     def _request_worker(
         self,
@@ -284,15 +322,24 @@ class FileGatewayManager:
         headers = {}
         if self.config.internal_token:
             headers["X-Internal-Token"] = self.config.internal_token
+        deadline = time.time() + max(10, int(self.config.worker_ready_timeout_seconds))
+        last_error = None
         try:
-            with httpx.Client(timeout=httpx.Timeout(10)) as client:
-                response = client.get(f"{base_url}/health", headers=headers)
-            if response.status_code != 200:
-                raise HTTPException(status_code=503, detail="File gateway worker health check failed")
+            while time.time() < deadline:
+                try:
+                    with httpx.Client(timeout=httpx.Timeout(5)) as client:
+                        response = client.get(f"{base_url}/health", headers=headers)
+                    if response.status_code == 200:
+                        return
+                    last_error = f"health status={response.status_code}"
+                except Exception as error:
+                    last_error = str(error)
+                time.sleep(1)
+            if last_error:
+                raise HTTPException(status_code=503, detail=f"File gateway worker unavailable: {last_error}")
+            raise HTTPException(status_code=503, detail="File gateway worker health check failed")
         except HTTPException:
             raise
-        except Exception as error:
-            raise HTTPException(status_code=503, detail=f"File gateway worker unavailable: {error}") from error
 
     def list_children(self, project_id: str, pvc_name: str, path: str = "/") -> Dict[str, Any]:
         return self._request_worker("GET", project_id, pvc_name, "/fs/children", params={"path": path})
