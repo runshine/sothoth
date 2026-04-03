@@ -2101,20 +2101,26 @@ class KubernetesService:
         except ApiException as e:
             self._handle_api_exception(e, "PVC", "删除")
 
-    def check_pvc_in_use(self, namespace: str, name: str) -> Dict:
+    def check_pvc_in_use(self, namespace: str, name: str, ignore_pod_name_prefixes: Optional[List[str]] = None) -> Dict:
         """检查PVC是否被Pod/Job使用"""
+        ignore_prefixes = [p.strip() for p in (ignore_pod_name_prefixes or []) if p and p.strip()]
+        mounted_pods: List[str] = []
+        active_jobs: List[str] = []
         try:
             # PVC存在性检查
             self.core_v1.read_namespaced_persistent_volume_claim(name=name, namespace=namespace)
         except ApiException as e:
             if e.status == 404:
-                return {"in_use": False, "message": f"PVC {name} does not exist"}
+                return {"in_use": False, "message": f"PVC {name} does not exist", "pods": [], "jobs": []}
             self._handle_api_exception(e, "PVC", "检查使用状态")
 
         # 检查Pod挂载
         try:
             pods = self.core_v1.list_namespaced_pod(namespace=namespace)
             for pod in pods.items:
+                pod_name = pod.metadata.name if pod.metadata and pod.metadata.name else ""
+                if ignore_prefixes and any(pod_name.startswith(prefix) for prefix in ignore_prefixes):
+                    continue
                 if not pod.spec or not pod.spec.volumes:
                     continue
                 for volume in pod.spec.volumes:
@@ -2122,7 +2128,7 @@ class KubernetesService:
                     if pvc and pvc.claim_name == name:
                         phase = pod.status.phase if pod.status else "Unknown"
                         if phase in ["Running", "Pending", "Unknown"]:
-                            return {"in_use": True, "message": f"PVC mounted by pod {pod.metadata.name} ({phase})"}
+                            mounted_pods.append(f"{pod_name} ({phase})")
         except ApiException as e:
             self._handle_api_exception(e, "Pod", "检查PVC使用状态")
 
@@ -2140,11 +2146,24 @@ class KubernetesService:
                     if pvc and pvc.claim_name == name:
                         active = job.status.active if job.status else 0
                         if active and active > 0:
-                            return {"in_use": True, "message": f"PVC used by active job {job.metadata.name}"}
+                            active_jobs.append(str(job.metadata.name))
         except ApiException as e:
             self._handle_api_exception(e, "Job", "检查PVC使用状态")
 
-        return {"in_use": False, "message": "PVC is not in use"}
+        if mounted_pods or active_jobs:
+            parts = []
+            if mounted_pods:
+                parts.append(f"Pods: {', '.join(mounted_pods)}")
+            if active_jobs:
+                parts.append(f"Jobs: {', '.join(active_jobs)}")
+            return {
+                "in_use": True,
+                "message": "PVC in use - " + " ; ".join(parts),
+                "pods": mounted_pods,
+                "jobs": active_jobs,
+            }
+
+        return {"in_use": False, "message": "PVC is not in use", "pods": [], "jobs": []}
 
     def _pvc_to_dict(self, pvc) -> Dict:
         """PVC对象转字典"""

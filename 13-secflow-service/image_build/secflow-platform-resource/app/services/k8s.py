@@ -728,17 +728,27 @@ ls -la {target_path}/"""
         # Hand-created PVCs may have no storageClassName (None/empty); keep response model stable.
         return value or "n/a"
 
-    def check_pvc_in_use(self, project_id: str, pvc_name: str) -> tuple[bool, str]:
+    def check_pvc_in_use(
+        self,
+        project_id: str,
+        pvc_name: str,
+        ignore_worker_mounts: bool = False,
+    ) -> tuple[bool, str, List[str], List[str]]:
         """Check if a PVC is currently in use by any pod/job."""
         try:
-            resp = self._request("GET", f"/pvcs/{pvc_name}/usage", project_id=project_id)
+            params = {}
+            if ignore_worker_mounts:
+                params["ignore_pod_name_prefixes"] = "secflow-platform-resource-file-gateway-worker"
+            resp = self._request("GET", f"/pvcs/{pvc_name}/usage", project_id=project_id, params=params or None)
             if resp.status_code != 200:
-                return True, f"Error checking PVC usage: HTTP {resp.status_code}"
+                return True, f"Error checking PVC usage: HTTP {resp.status_code}", [], []
             data = resp.json() or {}
-            return bool(data.get("in_use", False)), data.get("message", "")
+            pods = data.get("pods") if isinstance(data.get("pods"), list) else []
+            jobs = data.get("jobs") if isinstance(data.get("jobs"), list) else []
+            return bool(data.get("in_use", False)), data.get("message", ""), [str(v) for v in pods], [str(v) for v in jobs]
         except Exception as e:
             logger.error(f"Failed to check PVC usage for {pvc_name}: {e}")
-            return True, f"Error checking PVC usage: {str(e)}"
+            return True, f"Error checking PVC usage: {str(e)}", [], []
 
 
 # Global K8S service instance

@@ -60,13 +60,6 @@ data:
       container_port: 8080
       # 默认环境变量
       env:
-        ANTHROPIC_BASE_URL: "http://192.168.12.90:3000"
-        ANTHROPIC_AUTH_TOKEN: "sk-SRhGNgYtCjlEsGh8wuiVVLvFyBMHIdcJgFNWV3EwHXhah6Zn"
-        ANTHROPIC_MODEL: "minimax/minimax-m2.1"
-        ANTHROPIC_SMALL_FAST_MODEL: "minimax/minimax-m2.1"
-        ANTHROPIC_DEFAULT_SONNET_MODEL: "minimax/minimax-m2.1"
-        ANTHROPIC_DEFAULT_OPUS_MODEL: "minimax/minimax-m2.1"
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: "minimax/minimax-m2.1"
         API_TIMEOUT_MS: "3000000"
         CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
       # code-server 镜像环境变量配置

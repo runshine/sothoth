@@ -531,11 +531,9 @@ async def delete_resource(
                 project_id = resource.projects[0].id
 
             if project_id:
-                gateway = get_file_gateway_manager()
-                await _run_blocking(gateway.cleanup_worker, project_id, resource.pvc_name)
                 logger.info(f"Checking PVC {resource.pvc_name} in namespace {pvc_namespace} for deletion")
-                in_use, message = await _run_blocking(
-                    k8s_service.check_pvc_in_use, project_id, resource.pvc_name
+                in_use, message, _, _ = await _run_blocking(
+                    k8s_service.check_pvc_in_use, project_id, resource.pvc_name, True
                 )
                 if in_use:
                     raise HTTPException(
@@ -932,14 +930,11 @@ async def delete_output_pvc(
     project_id = _resolve_resource_project_id(resource)
 
     k8s_service = get_k8s_service()
-    gateway = get_file_gateway_manager()
-    if resource.pvc_name:
-        await _run_blocking(gateway.cleanup_worker, project_id, resource.pvc_name)
 
     # 检查PVC是否被使用
     if resource.pvc_name:
-        in_use, message = await _run_blocking(
-            k8s_service.check_pvc_in_use, project_id, resource.pvc_name
+        in_use, message, _, _ = await _run_blocking(
+            k8s_service.check_pvc_in_use, project_id, resource.pvc_name, True
         )
         if in_use:
             raise HTTPException(
@@ -1014,9 +1009,12 @@ async def get_output_pvc(
     use_message = ""
     if project_id and resource.pvc_name:
         pvc_status = await _run_blocking(k8s_service.get_pvc_status, project_id, resource.pvc_name)
-        in_use, use_message = await _run_blocking(
+        in_use, use_message, use_pods, use_jobs = await _run_blocking(
             k8s_service.check_pvc_in_use, project_id, resource.pvc_name
         )
+    else:
+        use_pods = []
+        use_jobs = []
 
     return {
         "id": resource.id,
@@ -1032,6 +1030,8 @@ async def get_output_pvc(
         "pvc_k8s_status": pvc_status,
         "in_use": in_use,
         "use_message": use_message,
+        "in_use_pods": use_pods,
+        "in_use_jobs": use_jobs,
         "created_at": resource.created_at,
         "updated_at": resource.updated_at
     }
@@ -1160,7 +1160,7 @@ async def get_resource_pvc_detail(
     k8s_service = get_k8s_service()
     gateway = get_file_gateway_manager()
     pvc_status = await _run_blocking(k8s_service.get_pvc_status, project_id, resource.pvc_name)
-    in_use, use_message = await _run_blocking(
+    in_use, use_message, use_pods, use_jobs = await _run_blocking(
         k8s_service.check_pvc_in_use, project_id, resource.pvc_name
     )
     file_gateway = await _run_blocking(gateway.get_worker_info, project_id, resource.pvc_name)
@@ -1179,6 +1179,8 @@ async def get_resource_pvc_detail(
         "file_gateway": file_gateway,
         "in_use": in_use,
         "use_message": use_message,
+        "in_use_pods": use_pods,
+        "in_use_jobs": use_jobs,
         "created_at": resource.created_at,
         "updated_at": resource.updated_at
     }

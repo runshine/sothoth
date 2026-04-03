@@ -10,7 +10,7 @@ import secrets
 import threading
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import APIRouter, Depends, Header, Query, status, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import JSONResponse
@@ -1739,13 +1739,14 @@ async def get_pvc(
 async def get_pvc_usage(
     pvc_name: str,
     project_id: str = Query(..., description="项目ID"),
+    ignore_pod_name_prefixes: Optional[List[str]] = Query(None, description="忽略的Pod名称前缀"),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """检查PVC是否被Pod/Job使用"""
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
     k8s = get_k8s_service()
-    return k8s.check_pvc_in_use(namespace, pvc_name)
+    return k8s.check_pvc_in_use(namespace, pvc_name, ignore_pod_name_prefixes=ignore_pod_name_prefixes)
 
 
 @router.post("/pvcs", response_model=PVCInfo, status_code=status.HTTP_201_CREATED, summary="创建PVC")

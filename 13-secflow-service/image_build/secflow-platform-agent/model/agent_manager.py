@@ -1648,11 +1648,9 @@ class AgentManager:
                 stale_ref = self._latest_stale_reference(item.get('last_seen'), item.get('updated_at'))
                 if status == 'online' and stale_ref:
                     try:
-                        # 优先使用较新的时间基准，避免 last_seen 旧值覆盖 updated_at 新值导致误判离线。
+                        # 仅输出陈旧提示，不在读路径改写在线状态，避免与上下线事件日志不一致。
                         if datetime.now() - stale_ref > timedelta(minutes=5):
-                            status = 'offline'
-                            item['status'] = 'offline'
-                            item['status_reason'] = '节点超过5分钟未上报心跳，已自动视为离线'
+                            item['status_reason'] = '节点超过5分钟未上报心跳（提示），状态以后端实际写库为准'
                     except Exception:
                         pass
                 item['is_allowed'] = status == 'online'
