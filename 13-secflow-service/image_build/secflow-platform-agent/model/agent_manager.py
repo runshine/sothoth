@@ -541,8 +541,29 @@ class AgentManager:
 
             url = f"http://{agent.ip_address}:{self.agent_api_port}/api/health"
             headers = {'X-Auth-Token': self.agent_auth_token}
+            response = None
+            last_exc: Optional[Exception] = None
+            # 对短抖动做一次快速重试，避免单次网络毛刺触发上下线翻转
+            for attempt in range(2):
+                try:
+                    response = requests.get(url, headers=headers, timeout=5)
+                    last_exc = None
+                    break
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+                    last_exc = exc
+                    if attempt == 0:
+                        time.sleep(0.35)
+                        continue
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == 0:
+                        time.sleep(0.2)
+                        continue
+                break
 
-            response = requests.get(url, headers=headers, timeout=5)
+            if response is None and last_exc is not None:
+                raise last_exc
+
             if response.status_code == 200:
                 agent.status = 'online'
                 agent.last_seen = datetime.now()

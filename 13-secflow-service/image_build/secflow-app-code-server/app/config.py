@@ -74,6 +74,18 @@ class ConfigCenterServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}/api/configcenter"
 
 
+class ProjectServiceConfig(BaseModel):
+    """项目服务配置"""
+    enabled: bool = True
+    host: str = "secflow-platform-project"
+    port: int = 80
+    timeout: int = 15
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}/api/project"
+
+
 class CodeServerResources(BaseModel):
     """Code Server资源限制"""
     cpu: str = "100m"
@@ -188,6 +200,7 @@ class Config(BaseModel):
     k8s_service: K8sServiceConfig = Field(default_factory=K8sServiceConfig)
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
     configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
+    project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     code_server: CodeServerConfig = Field(default_factory=CodeServerConfig)
     pvc: PVCConfig = Field(default_factory=PVCConfig)
     ingress: IngressConfig = Field(default_factory=IngressConfig)

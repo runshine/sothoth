@@ -134,7 +134,7 @@ def test_create_without_llm_provider(monkeypatch):
             "code_server_id": "cs-1",
             "namespace": "secflow-p1",
             "name": "audit-env",
-            "custom_env": {"USER_ONLY": "v1"},
+            "env": {"USER_ONLY": "v1"},
             "code_server_env": {},
             "image": "",
             "llm_provider_key": "",
@@ -186,7 +186,7 @@ def test_create_with_llm_provider_env_override(monkeypatch):
             "code_server_id": "cs-1",
             "namespace": "secflow-p1",
             "name": "audit-env",
-            "custom_env": {"COMMON": "from-user", "USER_ONLY": "u-only"},
+            "env": {"COMMON": "from-user", "USER_ONLY": "u-only"},
             "code_server_env": {},
             "image": "",
             "llm_provider_key": "openai-prod",
@@ -250,7 +250,7 @@ def test_create_with_llm_file_bindings_and_delete_cleanup(monkeypatch):
             "code_server_id": "cs-1",
             "namespace": "secflow-p1",
             "name": "audit-env",
-            "custom_env": {},
+            "env": {},
             "code_server_env": {},
             "image": "",
             "llm_provider_key": "anthropic-prod",
@@ -328,7 +328,7 @@ def test_create_with_multiple_llm_providers_merge_rules(monkeypatch):
             "code_server_id": "cs-1",
             "namespace": "secflow-p1",
             "name": "audit-env",
-            "custom_env": {"COMMON": "from-user", "USER_ONLY": "u-only"},
+            "env": {"COMMON": "from-user", "USER_ONLY": "u-only"},
             "code_server_env": {},
             "image": "",
             "llm_provider_keys": ["provider-a", "provider-b"],
@@ -389,7 +389,7 @@ def test_create_with_llm_file_overrides_applied(monkeypatch):
             "code_server_id": "cs-1",
             "namespace": "secflow-p1",
             "name": "audit-env",
-            "custom_env": {},
+            "env": {},
             "code_server_env": {},
             "image": "",
             "llm_provider_keys": ["provider-a"],
@@ -411,7 +411,7 @@ def test_create_with_llm_file_overrides_applied(monkeypatch):
     manager.executor.shutdown(wait=False)
 
 
-def test_create_passes_preset_env_overrides(monkeypatch):
+def test_create_passes_unified_env(monkeypatch):
     code_server = _make_code_server()
     db = FakeDB(code_server)
     fake_k8s = FakeK8s()
@@ -426,8 +426,7 @@ def test_create_passes_preset_env_overrides(monkeypatch):
             "code_server_id": "cs-1",
             "namespace": "secflow-p1",
             "name": "audit-env",
-            "custom_env": {},
-            "preset_env": {"A": "1", "B": "2"},
+            "env": {"A": "1", "B": "2"},
             "code_server_env": {},
             "image": "",
             "llm_provider_keys": [],
@@ -436,7 +435,9 @@ def test_create_passes_preset_env_overrides(monkeypatch):
 
     manager._handle_create_task(task, db)
 
-    assert fake_k8s.deployment_call["preset_env"] == {"A": "1", "B": "2"}
+    assert fake_k8s.deployment_call["preset_env"] == {}
+    assert fake_k8s.deployment_call["custom_env"]["A"] == "1"
+    assert fake_k8s.deployment_call["custom_env"]["B"] == "2"
 
     manager.executor.shutdown(wait=False)
 
@@ -461,7 +462,7 @@ def test_create_with_fileserver_mount_only_allows_project_subpath(monkeypatch):
             "code_server_id": "cs-1",
             "namespace": "secflow-p1",
             "name": "audit-env",
-            "custom_env": {},
+            "env": {},
             "code_server_env": {},
             "image": "",
             "llm_provider_keys": [],
@@ -482,7 +483,7 @@ def test_create_with_fileserver_mount_only_allows_project_subpath(monkeypatch):
             "code_server_id": "cs-1",
             "namespace": "secflow-p1",
             "name": "audit-env",
-            "custom_env": {},
+            "env": {},
             "code_server_env": {},
             "image": "",
             "llm_provider_keys": [],

@@ -351,9 +351,9 @@ class TaskManager:
         code_server_id = params.get("code_server_id")
         namespace = params.get("namespace")
         name = params.get("name")
-        custom_env = dict(params.get("custom_env") or {})
-        preset_env_raw = params.get("preset_env")
-        preset_env = dict(preset_env_raw) if isinstance(preset_env_raw, dict) else None
+        env_raw = params.get("env")
+        custom_env = dict(env_raw) if isinstance(env_raw, dict) else {}
+        preset_env: Dict[str, str] = {}
         # 注入PROJECT_ID环境变量
         custom_env["PROJECT_ID"] = task.project_id
         code_server_env = params.get("code_server_env") or {}

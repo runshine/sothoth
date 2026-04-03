@@ -2002,7 +2002,8 @@ class WebAPIServer:
             summary['total_agents'] = len(agents)
 
             for agent_data in agents:
-                if agent_data.get('status') != 'online':
+                agent_status = str(agent_data.get('status') or '').strip().lower()
+                if agent_status != 'online':
                     summary['offline_agents'] += 1
                     if agent_data.get('key'):
                         self._mark_agent_services_stale(agent_data.get('key'))
@@ -6148,33 +6149,43 @@ class WebAPIServer:
                     agents, _ = self.agent_manager.list_agents(page=1, per_page=5000, project_id=project_id)
                     stale_keys = self._get_stale_agent_keys(project_id) if stale_only else set()
                     results = []
+                    candidate_total = 0
                     for item in agents:
-                        if item.get('status') != 'online':
+                        item_status = str(item.get('status') or '').strip().lower()
+                        item_key = str(item.get('key') or '').strip()
+                        if item_status != 'online':
                             continue
-                        if stale_only and item.get('key') not in stale_keys:
+                        if stale_only and item_key not in stale_keys:
                             continue
-                        agent = self.agent_manager.get_agent(item.get('key'))
+                        candidate_total += 1
+                        agent = self.agent_manager.get_agent(item_key)
                         if not agent:
                             continue
                         results.append(self._sync_single_agent_services(agent))
                     ok_count = len([r for r in results if r.get('ok')])
                     fail_count = len(results) - ok_count
+                    status_label = 'ok' if fail_count == 0 else 'partial'
+                    message = 'project service sync completed'
+                    if candidate_total == 0:
+                        status_label = 'empty'
+                        message = 'no online agents matched current sync scope'
                     self._record_service_sync_log(
                         scope='project',
-                        status='ok' if fail_count == 0 else 'partial',
+                        status=status_label,
                         project_id=project_id,
                         stale_only=stale_only,
                         total=len(results),
                         ok_count=ok_count,
                         fail_count=fail_count,
-                        message='project service sync completed',
+                        message=message,
                         details=results
                     )
                     return jsonify({
-                        'message': 'project service sync completed',
-                        'status': 'ok',
+                        'message': message,
+                        'status': status_label,
                         'project_id': project_id,
                         'stale_only': stale_only,
+                        'candidate_total': candidate_total,
                         'total': len(results),
                         'ok_count': ok_count,
                         'fail_count': fail_count,
@@ -6197,31 +6208,41 @@ class WebAPIServer:
 
                     stale_keys = self._get_stale_agent_keys()
                     results = []
+                    candidate_total = 0
                     for item in agents:
-                        if item.get('status') != 'online':
+                        item_status = str(item.get('status') or '').strip().lower()
+                        item_key = str(item.get('key') or '').strip()
+                        if item_status != 'online':
                             continue
-                        if item.get('key') not in stale_keys:
+                        if item_key not in stale_keys:
                             continue
-                        agent = self.agent_manager.get_agent(item.get('key'))
+                        candidate_total += 1
+                        agent = self.agent_manager.get_agent(item_key)
                         if not agent:
                             continue
                         results.append(self._sync_single_agent_services(agent))
                     ok_count = len([r for r in results if r.get('ok')])
                     fail_count = len(results) - ok_count
+                    status_label = 'ok' if fail_count == 0 else 'partial'
+                    message = 'global stale-agent service sync completed'
+                    if candidate_total == 0:
+                        status_label = 'empty'
+                        message = 'no online stale agents found'
                     self._record_service_sync_log(
                         scope='global',
-                        status='ok' if fail_count == 0 else 'partial',
+                        status=status_label,
                         stale_only=True,
                         total=len(results),
                         ok_count=ok_count,
                         fail_count=fail_count,
-                        message='global stale-agent service sync completed',
+                        message=message,
                         details=results
                     )
                     return jsonify({
-                        'message': 'global stale-agent service sync completed',
-                        'status': 'ok',
+                        'message': message,
+                        'status': status_label,
                         'stale_only': True,
+                        'candidate_total': candidate_total,
                         'total': len(results),
                         'ok_count': ok_count,
                         'fail_count': fail_count,

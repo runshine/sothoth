@@ -21,6 +21,7 @@ from app.schemas import (
     TaskCreatedResponse, SuccessResponse, PVCMount, OutputPVCMount
 )
 from app.services.k8s import get_k8s_service
+from app.services.project import get_project_client
 from app.services.task_manager import get_task_manager
 
 logger = logging.getLogger(__name__)
@@ -253,13 +254,19 @@ async def create_code_server(
     """
     k8s_service = get_k8s_service()
 
-    # 检查namespace是否存在
-    if not k8s_service.check_namespace_exists(request.namespace):
-        raise ValidationError(f"Namespace不存在: {request.namespace}")
+    # 强制以后端项目关联namespace为准，不信任前端提交namespace
+    project_client = get_project_client()
+    namespace = project_client.get_project_namespace(project_id)
+    req_namespace = str(request.namespace or "").strip()
+    if req_namespace and req_namespace != namespace:
+        logger.warning("忽略前端namespace，改用项目关联namespace: request=%s resolved=%s project_id=%s", req_namespace, namespace, project_id)
+
+    if not k8s_service.check_namespace_exists(namespace):
+        raise ValidationError(f"项目关联Namespace不存在: {namespace}")
 
     # 检查源码PVC是否存在
     for pvc_info in request.source_pvcs:
-        if not k8s_service.check_pvc_exists(request.namespace, pvc_info.pvc_name):
+        if not k8s_service.check_pvc_exists(namespace, pvc_info.pvc_name):
             raise ValidationError(f"源码PVC不存在: {pvc_info.pvc_name}")
 
     # 检查名称是否已存在
@@ -268,13 +275,14 @@ async def create_code_server(
         raise ConflictError(f"Code Server名称已存在: {request.name}")
 
     # 创建Code Server记录
+    resolved_env = dict(request.env or {})
     normalized_llm_provider_keys = normalize_llm_provider_keys(request.llm_provider_key, request.llm_provider_keys)
     code_server_id = generate_id()
     code_server = CodeServer(
         id=code_server_id,
         project_id=project_id,
         name=request.name,
-        namespace=request.namespace,
+        namespace=namespace,
         status=CodeServerStatus.PENDING.value,
         description=request.description,
         source_pvcs=[{"pvc_name": p.pvc_name, "mount_path": p.mount_path} for p in request.source_pvcs],
@@ -284,7 +292,7 @@ async def create_code_server(
             "storage_size": p.storage_size
         } for p in request.output_pvcs],
         fileserver_mount={},
-        custom_env=request.custom_env or {},
+        custom_env=resolved_env,
         code_server_env=request.code_server_env or {},
         llm_provider_key=(normalized_llm_provider_keys[-1] if normalized_llm_provider_keys else None),
         llm_provider_keys=normalized_llm_provider_keys
@@ -296,10 +304,9 @@ async def create_code_server(
     task_manager = get_task_manager()
     params = {
         "code_server_id": code_server_id,
-        "namespace": request.namespace,
+        "namespace": namespace,
         "name": request.name,
-        "custom_env": request.custom_env,
-        "preset_env": request.preset_env,
+        "env": resolved_env,
         "code_server_env": request.code_server_env,
         "image": request.image,  # 传递自定义镜像参数
         "fileserver_mount_enabled": request.fileserver_mount_enabled,

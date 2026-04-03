@@ -61,8 +61,7 @@ class CodeServerCreateRequest(BaseModel):
     description: Optional[str] = Field(None, description="描述")
     source_pvcs: List[PVCMount] = Field(..., description="源码PVC列表（必须存在）")
     output_pvcs: List[OutputPVCMount] = Field(default=[], description="输出PVC列表（不存在则创建）")
-    custom_env: Optional[Dict[str, str]] = Field(None, description="自定义环境变量")
-    preset_env: Optional[Dict[str, str]] = Field(None, description="预制环境变量（默认来自配置文件，可前端覆盖/删除）")
+    env: Dict[str, str] = Field(default_factory=dict, description="统一环境变量")
     # Code Server专属环境变量
     code_server_env: Optional[Dict[str, Any]] = Field(None, description="Code Server镜像环境变量配置（PUID, PGID, TZ, PASSWORD, SUDO_PASSWORD等）")
     # 自定义镜像
