@@ -246,14 +246,19 @@ async def upload_resource(
         os.makedirs(upload_dir, exist_ok=True)
         file_path = os.path.join(upload_dir, resource_uuid)
 
-        # 读取文件内容并保存
-        content = await file.read()
+        # 分块读取并保存，避免大文件占满内存导致进程重启
+        file_size = 0
+        chunk_size = 512 * 1024
         async with aiofiles.open(file_path, "wb") as f:
-            await f.write(content)
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                await f.write(chunk)
 
         # 获取原始文件名和大小
         original_file_name = file.filename or "archive"
-        file_size = len(content)
 
         # 推断文件格式
         original_file_format = None

@@ -357,6 +357,23 @@ class FileGatewayManager:
         files = {"file": (filename, content, "application/octet-stream")}
         return self._request_worker("POST", project_id, pvc_name, "/fs/upload", files=files, data={"path": path})
 
+    def upload_file_stream(
+        self,
+        project_id: str,
+        pvc_name: str,
+        path: str,
+        filename: str,
+        file_obj: Any,
+        content_type: str = "application/octet-stream",
+    ) -> Dict[str, Any]:
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
+        files = {"file": (filename, file_obj, content_type)}
+        return self._request_worker("POST", project_id, pvc_name, "/fs/upload", files=files, data={"path": path})
+
     def create_directory(self, project_id: str, pvc_name: str, path: str, name: str) -> Dict[str, Any]:
         return self._request_worker(
             "POST",
@@ -389,6 +406,23 @@ class FileGatewayManager:
 
     def extract_archive(self, project_id: str, pvc_name: str, path: str, filename: str, content: bytes) -> Dict[str, Any]:
         files = {"file": (filename, content, "application/octet-stream")}
+        return self._request_worker("POST", project_id, pvc_name, "/fs/extract", files=files, data={"path": path})
+
+    def extract_archive_stream(
+        self,
+        project_id: str,
+        pvc_name: str,
+        path: str,
+        filename: str,
+        file_obj: Any,
+        content_type: str = "application/octet-stream",
+    ) -> Dict[str, Any]:
+        if hasattr(file_obj, "seek"):
+            try:
+                file_obj.seek(0)
+            except Exception:
+                pass
+        files = {"file": (filename, file_obj, content_type)}
         return self._request_worker("POST", project_id, pvc_name, "/fs/extract", files=files, data={"path": path})
 
 

@@ -1,8 +1,11 @@
 """PVC browser service built on top of platform-k8s Pod exec."""
 
 import base64
+import asyncio
 import json
 import logging
+import os
+import tempfile
 import time
 from pathlib import PurePosixPath
 from typing import Any, Dict, Optional
@@ -15,6 +18,7 @@ from app.services.k8s import get_k8s_service
 
 
 logger = logging.getLogger(__name__)
+UPLOAD_CHUNK_SIZE = 512 * 1024
 
 
 def _normalize_browser_path(value: Optional[str]) -> str:
@@ -255,34 +259,64 @@ class PvcBrowserService:
         )
 
     async def upload_file(self, project_id: str, pvc_name: str, path: str, upload: UploadFile) -> Dict[str, Any]:
-        if self._use_file_gateway():
-            target_dir = _normalize_browser_path(path)
-            filename = _validate_target_name(upload.filename or "upload.bin")
-            raw = await upload.read()
-            ok, payload = self._call_gateway(
-                get_file_gateway_manager().upload_file_bytes,
-                project_id,
-                pvc_name,
-                target_dir,
-                filename,
-                raw,
-            )
-            if ok:
-                return payload
         target_dir = _normalize_browser_path(path)
         filename = _validate_target_name(upload.filename or "upload.bin")
-        raw = await upload.read()
-        payload = base64.b64encode(raw).decode("ascii")
-        script = _UPLOAD_FILE_SCRIPT
-        return self._exec_json(
-            project_id,
-            pvc_name,
-            script,
-            target_dir,
-            filename,
-            stdin=payload,
-            timeout=max(self.exec_timeout, 120),
-        )
+        temp_path = ""
+        total_size = 0
+        try:
+            fd, temp_path = tempfile.mkstemp(prefix="pvc-upload-", suffix=".tmp")
+            os.close(fd)
+            with open(temp_path, "wb") as temp_file:
+                while True:
+                    chunk = await upload.read(UPLOAD_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    temp_file.write(chunk)
+
+            if total_size == 0:
+                raise HTTPException(status_code=400, detail="Empty file is not allowed")
+
+            if hasattr(upload.file, "seek"):
+                upload.file.seek(0)
+
+            if self._use_file_gateway():
+                with open(temp_path, "rb") as temp_read:
+                    ok, payload = await asyncio.to_thread(
+                        self._call_gateway,
+                        get_file_gateway_manager().upload_file_stream,
+                        project_id,
+                        pvc_name,
+                        target_dir,
+                        filename,
+                        temp_read,
+                        upload.content_type or "application/octet-stream",
+                    )
+                if ok:
+                    return payload
+
+            if total_size > 16 * 1024 * 1024:
+                raise HTTPException(status_code=413, detail="File too large for fallback upload mode")
+
+            with open(temp_path, "rb") as temp_read:
+                raw = temp_read.read()
+            payload = base64.b64encode(raw).decode("ascii")
+            script = _UPLOAD_FILE_SCRIPT
+            return self._exec_json(
+                project_id,
+                pvc_name,
+                script,
+                target_dir,
+                filename,
+                stdin=payload,
+                timeout=max(self.exec_timeout, 120),
+            )
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
     def create_directory(self, project_id: str, pvc_name: str, path: str, name: str) -> Dict[str, Any]:
         ok, payload = self._call_gateway(

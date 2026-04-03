@@ -144,19 +144,19 @@ class ResourceTaskWorker:
                 f"Ensuring file gateway worker and extracting archive: {original_file_name}",
             )
 
-            with open(archive_path, "rb") as archive_file:
-                archive_bytes = archive_file.read()
             gateway = get_file_gateway_manager()
             if not gateway.is_enabled():
                 raise Exception("File gateway is disabled, upload extract task cannot continue")
-            await asyncio.to_thread(
-                gateway.extract_archive,
-                project_id,
-                pvc_name,
-                "/",
-                original_file_name or f"{resource_uuid}.zip",
-                archive_bytes,
-            )
+            with open(archive_path, "rb") as archive_file:
+                await asyncio.to_thread(
+                    gateway.extract_archive_stream,
+                    project_id,
+                    pvc_name,
+                    "/",
+                    original_file_name or f"{resource_uuid}.zip",
+                    archive_file,
+                    "application/octet-stream",
+                )
 
             await task_manager.append_task_log(task_id, "Upload and extract completed successfully")
             await task_manager.update_task_progress(task_id, 90, "Verifying extraction")

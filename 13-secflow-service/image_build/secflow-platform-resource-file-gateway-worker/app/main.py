@@ -19,6 +19,7 @@ from pydantic import BaseModel
 ROOT_PATH = Path(os.environ.get("PVC_MOUNT_PATH", "/data/pvc")).resolve()
 INTERNAL_TOKEN = os.environ.get("FILE_GATEWAY_INTERNAL_TOKEN", "")
 MAX_UPLOAD_BYTES = int(os.environ.get("FILE_GATEWAY_MAX_UPLOAD_BYTES", str(1024 * 1024 * 1024)))
+UPLOAD_CHUNK_BYTES = 512 * 1024
 
 app = FastAPI(title="secflow-platform-resource-file-gateway-worker", version="1.0.0")
 
@@ -204,14 +205,24 @@ async def upload_file(path: str = Form("/"), file: UploadFile = File(...), _: No
         raise HTTPException(status_code=400, detail="Target directory not found")
 
     filename = _validate_name(file.filename or "upload.bin", label="filename")
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File too large")
-
     target = directory / filename
-    target.write_bytes(content)
+    size = 0
+    try:
+        with target.open("wb") as out:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="File too large")
+                out.write(chunk)
+    except Exception:
+        if target.exists():
+            target.unlink()
+        raise
     target_path = directory_path.rstrip("/") + "/" + filename if directory_path != "/" else "/" + filename
-    return {"message": "File uploaded successfully", "path": target_path, "size": len(content)}
+    return {"message": "File uploaded successfully", "path": target_path, "size": size}
 
 
 @app.post("/fs/directories")
@@ -285,13 +296,23 @@ async def extract_archive(path: str = Form("/"), file: UploadFile = File(...), _
         raise HTTPException(status_code=400, detail="Target directory not found")
 
     original_name = _validate_name(file.filename or "archive.bin", label="filename")
-    content = await file.read()
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="File too large")
-
     tmp_name = f".upload-{os.getpid()}-{os.urandom(6).hex()}"
     archive_path = target_dir / tmp_name
-    archive_path.write_bytes(content)
+    size = 0
+    try:
+        with archive_path.open("wb") as out:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="File too large")
+                out.write(chunk)
+    except Exception:
+        if archive_path.exists():
+            archive_path.unlink()
+        raise
     try:
         _extract_to_directory(archive_path, target_dir, original_name)
     except (zipfile.BadZipFile, tarfile.ReadError, OSError, binascii.Error, gzip.BadGzipFile) as error:
@@ -304,7 +325,7 @@ async def extract_archive(path: str = Form("/"), file: UploadFile = File(...), _
         "message": "Archive extracted successfully",
         "path": target_path,
         "filename": original_name,
-        "size": len(content),
+        "size": size,
     }
 
 
@@ -312,4 +333,3 @@ def main() -> None:
     host = os.environ.get("APP_HOST", "0.0.0.0")
     port = int(os.environ.get("APP_PORT", "8081"))
     uvicorn.run(app, host=host, port=port)
-
