@@ -342,6 +342,53 @@ class DepartmentMemberResponse(BaseModel):
         from_attributes = True
 
 
+class DepartmentMemberImportRequest(BaseModel):
+    """部门成员导入请求"""
+    department_id: int
+    csv_content: str
+    filename: Optional[str] = None
+    mode: str = "skip_existing"
+
+
+class DepartmentMemberImportNormalizedRow(BaseModel):
+    """部门成员导入归一化行"""
+    username: str
+    department_id: int
+    department_name: str
+    role: str
+    action: str
+    existing_member_id: Optional[int] = None
+    existing_department_id: Optional[int] = None
+    existing_department_name: Optional[str] = None
+
+
+class DepartmentMemberImportRowResult(BaseModel):
+    """部门成员导入行结果"""
+    row_no: int
+    username: str = ""
+    status: str
+    messages: List[str] = []
+    normalized: Optional[DepartmentMemberImportNormalizedRow] = None
+    member_id: Optional[int] = None
+
+
+class DepartmentMemberImportPreviewResponse(BaseModel):
+    """部门成员导入预校验响应"""
+    total_rows: int
+    valid_rows: int
+    error_rows: int
+    rows: List[DepartmentMemberImportRowResult]
+
+
+class DepartmentMemberImportCommitResponse(BaseModel):
+    """部门成员导入执行响应"""
+    total_rows: int
+    success_rows: int
+    skipped_rows: int
+    failed_rows: int
+    rows: List[DepartmentMemberImportRowResult]
+
+
 class ProjectBase(BaseModel):
     """项目基础模式"""
     name: str

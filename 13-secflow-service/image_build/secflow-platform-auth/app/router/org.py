@@ -1,9 +1,11 @@
 """组织管理相关API"""
 
+import csv
+import io
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -18,6 +20,9 @@ from app.rbac import (
 from app.schema import (
     DepartmentCreate, DepartmentUpdate, DepartmentResponse,
     DepartmentMemberCreate, DepartmentMemberUpdate, DepartmentMemberResponse,
+    DepartmentMemberImportCommitResponse, DepartmentMemberImportNormalizedRow,
+    DepartmentMemberImportPreviewResponse, DepartmentMemberImportRequest,
+    DepartmentMemberImportRowResult,
     ProjectCreate, ProjectUpdate, ProjectResponse, ProjectDetailResponse,
     Message, UserPermissionInfo,
     UserDepartmentProjectListResponse, UserDepartmentProjectResponse
@@ -27,6 +32,16 @@ from app.service.project import get_project_service, ProjectServiceError
 router = APIRouter(prefix="/org", tags=["organization"])
 
 logger = logging.getLogger(__name__)
+
+DEPARTMENT_MEMBER_IMPORT_TEMPLATE = (
+    "username,role\n"
+    "zhangsan,member\n"
+    "lisi,member\n"
+)
+DEPARTMENT_MEMBER_IMPORT_REQUIRED_HEADERS = {"username"}
+DEPARTMENT_MEMBER_IMPORT_ALLOWED_HEADERS = {"username", "role"}
+DEPARTMENT_MEMBER_IMPORT_ALLOWED_ROLES = {"leader", "vice_leader", "member"}
+DEPARTMENT_MEMBER_IMPORT_ALLOWED_MODES = {"skip_existing", "update_role"}
 
 
 def log_access_denied(user: User, resource_type: str, resource_id: int, reason: str):
@@ -128,6 +143,205 @@ def can_move_member_between_departments(
         return False, "普通管理员只能调整普通成员的所属部门"
 
     return True, ""
+
+
+def ensure_department_member_management_scope(
+    db: Session,
+    current_user: User,
+    department_id: int
+) -> Department:
+    """确保当前用户可以管理目标部门成员。"""
+    department = db.query(Department).filter(Department.id == department_id).first()
+    if not department:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="部门不存在"
+        )
+
+    if is_super_admin(current_user):
+        return department
+
+    manageable_ids = get_manageable_department_ids(db, current_user) or []
+    if department_id not in manageable_ids:
+        log_access_denied(current_user, "部门成员", department_id, "目标部门不在可管理范围内")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="目标部门不在可管理范围内"
+        )
+    return department
+
+
+def get_import_allowed_roles(current_user: User) -> set[str]:
+    if is_super_admin(current_user):
+        return set(DEPARTMENT_MEMBER_IMPORT_ALLOWED_ROLES)
+    return {"member"}
+
+
+def normalize_import_csv(content: str) -> str:
+    return (content or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+
+
+def load_department_member_import_rows(csv_content: str) -> List[Tuple[int, Dict[str, str]]]:
+    normalized = normalize_import_csv(csv_content)
+    if not normalized.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV 内容不能为空"
+        )
+
+    reader = csv.DictReader(io.StringIO(normalized))
+    headers = [header.strip() for header in (reader.fieldnames or []) if header and header.strip()]
+    if not headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV 缺少表头"
+        )
+
+    missing_headers = DEPARTMENT_MEMBER_IMPORT_REQUIRED_HEADERS.difference(headers)
+    if missing_headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"CSV 缺少必填列: {', '.join(sorted(missing_headers))}"
+        )
+
+    unsupported_headers = [header for header in headers if header not in DEPARTMENT_MEMBER_IMPORT_ALLOWED_HEADERS]
+    if unsupported_headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"CSV 存在不支持的列: {', '.join(unsupported_headers)}"
+        )
+
+    rows: List[Tuple[int, Dict[str, str]]] = []
+    for row_no, row in enumerate(reader, start=2):
+        normalized_row = {
+            key.strip(): (value.strip() if isinstance(value, str) else "")
+            for key, value in (row or {}).items()
+            if key is not None and key.strip()
+        }
+        if not any(normalized_row.values()):
+            continue
+        rows.append((row_no, normalized_row))
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV 不包含有效数据行"
+        )
+    return rows
+
+
+def preview_department_member_import(
+    db: Session,
+    current_user: User,
+    request: DepartmentMemberImportRequest
+) -> DepartmentMemberImportPreviewResponse:
+    if request.mode not in DEPARTMENT_MEMBER_IMPORT_ALLOWED_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="mode 仅支持 skip_existing 或 update_role"
+        )
+
+    target_department = ensure_department_member_management_scope(db, current_user, request.department_id)
+    if not is_super_admin(current_user) and request.mode == "update_role":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="普通管理员不能通过导入批量修改角色"
+        )
+
+    rows = load_department_member_import_rows(request.csv_content)
+    allowed_roles = get_import_allowed_roles(current_user)
+    username_counts: Dict[str, int] = {}
+    leader_rows = 0
+
+    for _row_no, raw_row in rows:
+        username = (raw_row.get("username") or "").strip()
+        if username:
+            username_counts[username] = username_counts.get(username, 0) + 1
+        role = (raw_row.get("role") or "").strip().lower() or "member"
+        if role == "leader":
+            leader_rows += 1
+
+    current_leader = db.query(DepartmentMember).filter(
+        DepartmentMember.department_id == target_department.id,
+        DepartmentMember.role == "leader"
+    ).first()
+
+    results: List[DepartmentMemberImportRowResult] = []
+    for row_no, raw_row in rows:
+        messages: List[str] = []
+        errors: List[str] = []
+        username = (raw_row.get("username") or "").strip()
+        role = (raw_row.get("role") or "").strip().lower() or "member"
+
+        if not username:
+            errors.append("用户名不能为空")
+        elif username_counts.get(username, 0) > 1:
+            errors.append("CSV 文件内用户名重复")
+
+        if role not in DEPARTMENT_MEMBER_IMPORT_ALLOWED_ROLES:
+            errors.append("role 仅支持 leader、vice_leader、member")
+        elif role not in allowed_roles:
+            errors.append("当前角色权限仅允许导入普通成员")
+
+        user = db.query(User).filter(User.username == username).first() if username else None
+        if username and not user:
+            errors.append("用户不存在，请先创建账号")
+
+        existing_member = None
+        first_membership = None
+        if user:
+            existing_member = db.query(DepartmentMember).filter(
+                DepartmentMember.user_id == user.id,
+                DepartmentMember.department_id == target_department.id
+            ).first()
+            first_membership = db.query(DepartmentMember).filter(
+                DepartmentMember.user_id == user.id
+            ).order_by(DepartmentMember.id.asc()).first()
+
+        action = "create"
+        if existing_member:
+            if request.mode == "skip_existing":
+                action = "skip_existing"
+                messages.append("用户已在该部门，执行时将跳过")
+            elif request.mode == "update_role":
+                action = "update_role"
+                messages.append("用户已在该部门，执行时将更新角色")
+
+        if role == "leader":
+            if leader_rows > 1:
+                errors.append("同一批导入中只能有一个组长")
+            if current_leader:
+                if not existing_member or current_leader.id != existing_member.id:
+                    errors.append("该部门已经有组长")
+
+        normalized = DepartmentMemberImportNormalizedRow(
+            username=username,
+            department_id=target_department.id,
+            department_name=target_department.name,
+            role=role,
+            action=action,
+            existing_member_id=existing_member.id if existing_member else None,
+            existing_department_id=first_membership.department_id if first_membership else None,
+            existing_department_name=first_membership.department.name if first_membership and first_membership.department else None,
+        )
+        status_value = "valid" if not errors else "error"
+
+        results.append(DepartmentMemberImportRowResult(
+            row_no=row_no,
+            username=username,
+            status=status_value,
+            messages=errors + messages,
+            normalized=normalized,
+            member_id=existing_member.id if existing_member else None,
+        ))
+
+    valid_rows = sum(1 for item in results if item.status == "valid")
+    return DepartmentMemberImportPreviewResponse(
+        total_rows=len(results),
+        valid_rows=valid_rows,
+        error_rows=len(results) - valid_rows,
+        rows=results,
+    )
 
 
 def get_project_department_ids(db: Session, project_id: int) -> List[int]:
@@ -565,6 +779,173 @@ def delete_department(
 
 
 # ============ 部门成员管理 ============
+
+@router.get("/department-members/import/template")
+def download_department_member_import_template(
+    current_user: User = Depends(get_current_user_management_user)
+):
+    """下载部门成员导入模板。"""
+    if not (is_super_admin(current_user) or is_ordinary_admin(current_user)):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="当前用户无权导入部门成员"
+        )
+    return Response(
+        content=DEPARTMENT_MEMBER_IMPORT_TEMPLATE,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="secflow-department-member-import-template.csv"'
+        }
+    )
+
+
+@router.post("/department-members/import/preview", response_model=DepartmentMemberImportPreviewResponse)
+def preview_department_members_import(
+    request: DepartmentMemberImportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_management_user)
+):
+    """预校验部门成员导入。"""
+    return preview_department_member_import(db, current_user, request)
+
+
+@router.post("/department-members/import/commit", response_model=DepartmentMemberImportCommitResponse)
+def commit_department_members_import(
+    request: DepartmentMemberImportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user_management_user)
+):
+    """执行部门成员导入。按行提交，单行失败不影响整批。"""
+    preview = preview_department_member_import(db, current_user, request)
+    success_rows = 0
+    skipped_rows = 0
+    results: List[DepartmentMemberImportRowResult] = []
+
+    for row in preview.rows:
+        if row.status != "valid" or row.normalized is None:
+            results.append(row)
+            continue
+
+        normalized = row.normalized
+        try:
+            if normalized.action == "skip_existing":
+                skipped_rows += 1
+                results.append(DepartmentMemberImportRowResult(
+                    row_no=row.row_no,
+                    username=normalized.username,
+                    status="skipped",
+                    messages=["成员已存在，已跳过"],
+                    normalized=normalized,
+                    member_id=normalized.existing_member_id,
+                ))
+                continue
+
+            user = db.query(User).filter(User.username == normalized.username).first()
+            department = ensure_department_member_management_scope(db, current_user, normalized.department_id)
+            if not user:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="用户不存在，请先创建账号"
+                )
+
+            if normalized.role == "leader":
+                existing_leader = db.query(DepartmentMember).filter(
+                    DepartmentMember.department_id == department.id,
+                    DepartmentMember.role == "leader"
+                ).first()
+                if existing_leader and existing_leader.id != normalized.existing_member_id:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="该部门已经有组长"
+                    )
+
+            if normalized.action == "update_role":
+                if not is_super_admin(current_user):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail="普通管理员不能通过导入批量修改角色"
+                    )
+                db_member = db.query(DepartmentMember).filter(
+                    DepartmentMember.id == normalized.existing_member_id
+                ).first()
+                if not db_member:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="部门成员不存在"
+                    )
+                db_member.role = normalized.role
+                db.commit()
+                db.refresh(db_member)
+                success_rows += 1
+                results.append(DepartmentMemberImportRowResult(
+                    row_no=row.row_no,
+                    username=normalized.username,
+                    status="success",
+                    messages=["成员角色更新成功"],
+                    normalized=normalized,
+                    member_id=db_member.id,
+                ))
+                continue
+
+            existing_member = db.query(DepartmentMember).filter(
+                DepartmentMember.user_id == user.id,
+                DepartmentMember.department_id == department.id
+            ).first()
+            if existing_member:
+                skipped_rows += 1
+                results.append(DepartmentMemberImportRowResult(
+                    row_no=row.row_no,
+                    username=normalized.username,
+                    status="skipped",
+                    messages=["成员已存在，已跳过"],
+                    normalized=normalized,
+                    member_id=existing_member.id,
+                ))
+                continue
+
+            db_member = DepartmentMember(
+                user_id=user.id,
+                department_id=department.id,
+                role=normalized.role
+            )
+            db.add(db_member)
+            db.commit()
+            db.refresh(db_member)
+            success_rows += 1
+            results.append(DepartmentMemberImportRowResult(
+                row_no=row.row_no,
+                username=normalized.username,
+                status="success",
+                messages=["成员导入成功"],
+                normalized=normalized,
+                member_id=db_member.id,
+            ))
+        except HTTPException as exc:
+            db.rollback()
+            results.append(DepartmentMemberImportRowResult(
+                row_no=row.row_no,
+                username=normalized.username,
+                status="error",
+                messages=[str(exc.detail)],
+                normalized=normalized,
+            ))
+        except Exception as exc:
+            db.rollback()
+            results.append(DepartmentMemberImportRowResult(
+                row_no=row.row_no,
+                username=normalized.username,
+                status="error",
+                messages=[f"导入失败: {str(exc)}"],
+                normalized=normalized,
+            ))
+
+    return DepartmentMemberImportCommitResponse(
+        total_rows=len(results),
+        success_rows=success_rows,
+        skipped_rows=skipped_rows,
+        failed_rows=len([item for item in results if item.status == "error"]),
+        rows=results,
+    )
 
 @router.post("/department-members", response_model=DepartmentMemberResponse, status_code=status.HTTP_201_CREATED)
 def add_department_member(
