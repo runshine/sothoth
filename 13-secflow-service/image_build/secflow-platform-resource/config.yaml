@@ -58,6 +58,21 @@ k8s_service:
   base_url: "http://192.168.12.44:10008/api/k8s"
   timeout: 30
 
+# File Gateway Configuration
+file_gateway:
+  enabled: true
+  fallback_to_exec: false
+  name: "secflow-platform-resource-file-gateway"
+  worker_name_prefix: "secflow-platform-resource-file-gateway-worker"
+  worker_app_label: "secflow-platform-resource-file-gateway-worker"
+  worker_image: "ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:latest"
+  worker_container_port: 8081
+  worker_mount_path: "/data/pvc"
+  worker_idle_ttl_seconds: 900
+  worker_ready_timeout_seconds: 60
+  worker_request_timeout_seconds: 120
+  internal_token: "change-me-file-gateway-token"
+
 # Async Task Configuration
 task:
   # 任务日志目录

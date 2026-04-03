@@ -6,11 +6,12 @@ import asyncio
 import base64
 import aiofiles
 import logging
-from typing import Optional
+from typing import Any, Callable, Optional, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, UploadFile, File, Form, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.models.database import (
     get_db, Resource, AsyncTaskLog, Project,
@@ -30,14 +31,16 @@ from app.schemas import (
 from app.services.auth import get_auth_service
 from app.services.project import get_project_service
 from app.services.k8s import get_k8s_service
+from app.services.file_gateway import get_file_gateway_manager
 from app.services.pvc_browser import get_pvc_browser_service
 from app.tasks.manager import get_task_manager
-from app.tasks.worker import create_upload_extract_task, create_delete_resource_task
+from app.tasks.worker import create_upload_extract_task, create_delete_resource_task, create_manual_pvc_task
 from app.main import get_config
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/resource", tags=["resources"])
+T = TypeVar("T")
 
 
 @router.get("")
@@ -105,11 +108,63 @@ async def validate_project_access(
     return True, project
 
 
+async def ensure_project_record(
+    db: Session,
+    project_id: str,
+    token: str,
+    current_user: TokenPayload,
+    namespace: str,
+) -> Project:
+    """Ensure project exists locally before calling platform-k8s project-scoped APIs."""
+    project_record = db.query(Project).filter(Project.id == project_id).first()
+    if project_record:
+        return project_record
+
+    project_service = get_project_service()
+    try:
+        project_info = await project_service.get_project_info(project_id, token)
+    except Exception as error:
+        logger.warning(
+            "Failed to fetch project info from project service, fallback to minimal project record. project_id=%s error=%s",
+            project_id,
+            error,
+        )
+        project_info = {}
+
+    project_record = Project(
+        id=project_id,
+        name=project_info.get("name", project_id),
+        description=project_info.get("description"),
+        owner_id=project_info.get("owner_id", str(current_user.id)),
+        owner_name=project_info.get("owner_name"),
+        k8s_namespace=namespace,
+        status=project_info.get("status", "active") or "active",
+    )
+    db.add(project_record)
+    try:
+        # Commit before platform-k8s PVC APIs so project_id→namespace mapping is visible cross-service.
+        db.commit()
+    except IntegrityError:
+        # Concurrent requests may create the same project row; reload instead of failing creation flow.
+        db.rollback()
+        existing = db.query(Project).filter(Project.id == project_id).first()
+        if existing:
+            return existing
+        raise
+    db.refresh(project_record)
+    return project_record
+
+
 def get_upload_dir() -> str:
     """获取上传目录。"""
     config = get_config()
     app_config = config.get("app", {})
     return app_config.get("upload_dir", "/data/uploads")
+
+
+async def _run_blocking(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Run sync service calls in a worker thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 def _resolve_output_pvc_resource(db: Session, resource_id: int) -> Resource:
@@ -477,7 +532,9 @@ async def delete_resource(
 
             if project_id:
                 logger.info(f"Checking PVC {resource.pvc_name} in namespace {pvc_namespace} for deletion")
-                in_use, message = k8s_service.check_pvc_in_use(project_id, resource.pvc_name)
+                in_use, message = await _run_blocking(
+                    k8s_service.check_pvc_in_use, project_id, resource.pvc_name
+                )
                 if in_use:
                     raise HTTPException(
                         status_code=409,
@@ -655,7 +712,7 @@ async def get_pvc_statistics(
     - 包括：PVC总数、总存储容量、各状态数量、涉及的项目数
     """
     k8s_service = get_k8s_service()
-    stats = k8s_service.get_pvc_statistics(project_id)
+    stats = await _run_blocking(k8s_service.get_pvc_statistics, project_id)
 
     return {
         "total_pvcs": stats["total_pvcs"],
@@ -685,7 +742,8 @@ async def list_pvcs(
         raise HTTPException(status_code=403, detail="No permission to access this project")
 
     k8s_service = get_k8s_service()
-    pvcs = k8s_service.list_pvcs(project_id)
+    pvcs = await _run_blocking(k8s_service.list_pvcs, project_id)
+    default_namespace = await _run_blocking(k8s_service.get_project_namespace, project_id)
 
     # 查询该项目下所有资源，建立 pvc_name -> resource 的映射
     project_record = db.query(Project).filter(Project.id == project_id).first()
@@ -701,7 +759,7 @@ async def list_pvcs(
         if not pvc_name:
             continue
         resource = pvc_to_resource.get(pvc_name)
-        namespace = (pvc.get("namespace") or k8s_service.get_project_namespace(project_id)).strip() or k8s_service.get_project_namespace(project_id)
+        namespace = (pvc.get("namespace") or default_namespace).strip() or default_namespace
         capacity = str(pvc.get("capacity") or "0Gi").strip() or "0Gi"
         status = str(pvc.get("status") or "Unknown").strip() or "Unknown"
         storage_class = str(pvc.get("storage_class") or "n/a").strip() or "n/a"
@@ -758,36 +816,32 @@ async def create_output_pvc(
     resource_uuid = str(uuid.uuid4())
 
     # 生成PVC名称
-    pvc_name = k8s_service.get_pvc_name(resource_uuid)
-    namespace = k8s_service.get_project_namespace(request.project_id)
+    pvc_name = await _run_blocking(k8s_service.get_pvc_name, resource_uuid)
+    namespace = await _run_blocking(k8s_service.get_project_namespace, request.project_id)
+
+    project_record = await ensure_project_record(
+        db=db,
+        project_id=request.project_id,
+        token=token,
+        current_user=current_user,
+        namespace=namespace,
+    )
 
     # 创建PVC
-    created_pvc = k8s_service.create_pvc(
+    created_pvc = await _run_blocking(
+        k8s_service.create_pvc,
         project_id=request.project_id,
         pvc_name=pvc_name,
         size=request.pvc_size,
-        storage_class=storage_class
+        storage_class=storage_class,
     )
 
     if not created_pvc:
-        raise HTTPException(status_code=500, detail="Failed to create PVC")
-
-    # 获取或创建项目记录
-    project_record = db.query(Project).filter(Project.id == request.project_id).first()
-    if not project_record:
-        # 从project服务获取项目信息并创建本地记录
-        project_service = get_project_service()
-        project_info = await project_service.get_project_info(request.project_id, token)
-        project_record = Project(
-            id=request.project_id,
-            name=project_info.get("name", request.project_id),
-            description=project_info.get("description"),
-            owner_id=project_info.get("owner_id", str(current_user.id)),
-            owner_name=project_info.get("owner_name"),
-            k8s_namespace=namespace,
-            status="active"
-        )
-        db.add(project_record)
+        reason = (await _run_blocking(k8s_service.get_last_error) or "").strip()
+        detail = "Failed to create PVC"
+        if reason:
+            detail = f"{detail}: {reason}"
+        raise HTTPException(status_code=500, detail=detail)
 
     # 创建资源记录
     resource = Resource(
@@ -850,11 +904,14 @@ async def delete_output_pvc(
     project_id = _resolve_resource_project_id(resource)
 
     k8s_service = get_k8s_service()
-    get_pvc_browser_service().cleanup_browser_pod(project_id)
+    browser = get_pvc_browser_service()
+    await _run_blocking(browser.cleanup_browser_pod, project_id)
 
     # 检查PVC是否被使用
     if resource.pvc_name:
-        in_use, message = k8s_service.check_pvc_in_use(project_id, resource.pvc_name)
+        in_use, message = await _run_blocking(
+            k8s_service.check_pvc_in_use, project_id, resource.pvc_name
+        )
         if in_use:
             raise HTTPException(
                 status_code=409,
@@ -927,8 +984,10 @@ async def get_output_pvc(
     in_use = False
     use_message = ""
     if project_id and resource.pvc_name:
-        pvc_status = k8s_service.get_pvc_status(project_id, resource.pvc_name)
-        in_use, use_message = k8s_service.check_pvc_in_use(project_id, resource.pvc_name)
+        pvc_status = await _run_blocking(k8s_service.get_pvc_status, project_id, resource.pvc_name)
+        in_use, use_message = await _run_blocking(
+            k8s_service.check_pvc_in_use, project_id, resource.pvc_name
+        )
 
     return {
         "id": resource.id,
@@ -999,33 +1058,23 @@ async def create_manual_pvc_resource(
     k8s_service = get_k8s_service()
     config = get_config()
     storage_class = config.get("k8s", {}).get("storage_class_name") or k8s_service.storage_class_name
-    resource_uuid = str(uuid.uuid4())
-    pvc_name = k8s_service.get_pvc_name(resource_uuid)
-    namespace = k8s_service.get_project_namespace(request.project_id)
-
-    created_pvc = k8s_service.create_pvc(
-        project_id=request.project_id,
-        pvc_name=pvc_name,
-        size=request.pvc_size,
-        storage_class=storage_class
+    logger.info(
+        "Creating manual PVC with storageClassName=%s (project_id=%s, resource_type=%s)",
+        storage_class,
+        request.project_id,
+        request.resource_type.value if hasattr(request.resource_type, "value") else request.resource_type,
     )
-    if not created_pvc:
-        raise HTTPException(status_code=500, detail="Failed to create PVC")
+    resource_uuid = str(uuid.uuid4())
+    pvc_name = await _run_blocking(k8s_service.get_pvc_name, resource_uuid)
+    namespace = await _run_blocking(k8s_service.get_project_namespace, request.project_id)
 
-    project_record = db.query(Project).filter(Project.id == request.project_id).first()
-    if not project_record:
-        project_service = get_project_service()
-        project_info = await project_service.get_project_info(request.project_id, token)
-        project_record = Project(
-            id=request.project_id,
-            name=project_info.get("name", request.project_id),
-            description=project_info.get("description"),
-            owner_id=project_info.get("owner_id", str(current_user.id)),
-            owner_name=project_info.get("owner_name"),
-            k8s_namespace=namespace,
-            status="active"
-        )
-        db.add(project_record)
+    project_record = await ensure_project_record(
+        db=db,
+        project_id=request.project_id,
+        token=token,
+        current_user=current_user,
+        namespace=namespace,
+    )
 
     resource = Resource(
         resource_uuid=resource_uuid,
@@ -1035,8 +1084,8 @@ async def create_manual_pvc_resource(
         original_file_name="manual_pvc",
         original_file_size=0,
         original_file_format=None,
-        upload_status=ResourceUploadStatus.COMPLETED,
-        upload_message="Manual PVC created successfully",
+        upload_status=ResourceUploadStatus.PENDING,
+        upload_message="Manual PVC task queued",
         pvc_name=pvc_name,
         pvc_namespace=namespace,
         pvc_size=f"{request.pvc_size}Gi",
@@ -1048,14 +1097,27 @@ async def create_manual_pvc_resource(
     db.commit()
     db.refresh(resource)
 
+    task_id = await create_manual_pvc_task(
+        resource_id=resource.id,
+        project_id=request.project_id,
+        resource_uuid=resource_uuid,
+        resource_name=request.name,
+        resource_type=request.resource_type.value if hasattr(request.resource_type, "value") else str(request.resource_type),
+        pvc_name=pvc_name,
+        pvc_namespace=namespace,
+        pvc_size=request.pvc_size,
+        storage_class=storage_class,
+    )
+
     return ManualPVCCreateResponse(
+        task_id=task_id,
         resource_id=resource.id,
         resource_uuid=resource_uuid,
         resource_type=request.resource_type,
         pvc_name=pvc_name,
         namespace=namespace,
         capacity=f"{request.pvc_size}Gi",
-        message=f"Manual PVC '{request.name}' created successfully"
+        message=f"Manual PVC task queued: {task_id}"
     )
 
 
@@ -1067,8 +1129,12 @@ async def get_resource_pvc_detail(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     k8s_service = get_k8s_service()
-    pvc_status = k8s_service.get_pvc_status(project_id, resource.pvc_name)
-    in_use, use_message = k8s_service.check_pvc_in_use(project_id, resource.pvc_name)
+    gateway = get_file_gateway_manager()
+    pvc_status = await _run_blocking(k8s_service.get_pvc_status, project_id, resource.pvc_name)
+    in_use, use_message = await _run_blocking(
+        k8s_service.check_pvc_in_use, project_id, resource.pvc_name
+    )
+    file_gateway = await _run_blocking(gateway.get_worker_info, project_id, resource.pvc_name)
     return {
         "id": resource.id,
         "resource_uuid": resource.resource_uuid,
@@ -1081,6 +1147,7 @@ async def get_resource_pvc_detail(
         "status": resource.upload_status.value if hasattr(resource.upload_status, 'value') else resource.upload_status,
         "project_ids": [p.id for p in resource.projects],
         "pvc_k8s_status": pvc_status,
+        "file_gateway": file_gateway,
         "in_use": in_use,
         "use_message": use_message,
         "created_at": resource.created_at,
@@ -1096,7 +1163,7 @@ async def get_resource_pvc_browser_root(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.list_root(project_id, resource.pvc_name, resource.id)
+    payload = await _run_blocking(browser.list_root, project_id, resource.pvc_name, resource.id)
     payload["pvc_name"] = resource.pvc_name
     return PvcBrowserRootResponse(**payload)
 
@@ -1109,7 +1176,7 @@ async def get_resource_pvc_browser_tree(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.list_tree(project_id, resource.pvc_name, resource.id)
+    payload = await _run_blocking(browser.list_tree, project_id, resource.pvc_name, resource.id)
     payload["pvc_name"] = resource.pvc_name
     return PvcBrowserRootResponse(**payload)
 
@@ -1123,7 +1190,7 @@ async def get_resource_pvc_browser_children(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.list_children(project_id, resource.pvc_name, resource.id, path)
+    payload = await _run_blocking(browser.list_children, project_id, resource.pvc_name, resource.id, path)
     payload["pvc_name"] = resource.pvc_name
     return PvcBrowserChildrenResponse(**payload)
 
@@ -1138,7 +1205,7 @@ async def get_resource_pvc_browser_file(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.read_file(project_id, resource.pvc_name, path, max_bytes=max_bytes)
+    payload = await _run_blocking(browser.read_file, project_id, resource.pvc_name, path, max_bytes=max_bytes)
     return PvcBrowserFileResponse(**payload)
 
 
@@ -1151,7 +1218,7 @@ async def download_resource_pvc_browser_file(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.read_file(project_id, resource.pvc_name, path, max_bytes=0)
+    payload = await _run_blocking(browser.read_file, project_id, resource.pvc_name, path, max_bytes=0)
     raw = base64.b64decode(payload.get("base64") or "")
     media_type = payload.get("content_type") or "application/octet-stream"
     filename = payload.get("filename") or "download.bin"
@@ -1182,7 +1249,9 @@ async def create_resource_pvc_browser_directory(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    return browser.create_directory(project_id, resource.pvc_name, request.path, request.name)
+    return await _run_blocking(
+        browser.create_directory, project_id, resource.pvc_name, request.path, request.name
+    )
 
 
 @router.post("/resources/{resource_id}/browser/rename")
@@ -1194,7 +1263,9 @@ async def rename_resource_pvc_browser_node(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    return browser.rename_node(project_id, resource.pvc_name, request.path, request.target_name)
+    return await _run_blocking(
+        browser.rename_node, project_id, resource.pvc_name, request.path, request.target_name
+    )
 
 
 @router.post("/resources/{resource_id}/browser/move")
@@ -1206,7 +1277,9 @@ async def move_resource_pvc_browser_node(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    return browser.move_node(project_id, resource.pvc_name, request.path, request.target_path)
+    return await _run_blocking(
+        browser.move_node, project_id, resource.pvc_name, request.path, request.target_path
+    )
 
 
 @router.delete("/resources/{resource_id}/browser/node")
@@ -1218,7 +1291,7 @@ async def delete_resource_pvc_browser_node(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    return browser.delete_node(project_id, resource.pvc_name, path)
+    return await _run_blocking(browser.delete_node, project_id, resource.pvc_name, path)
 
 
 @router.get("/output-pvc/{resource_id}/browser/root", response_model=PvcBrowserRootResponse)
@@ -1229,7 +1302,7 @@ async def get_output_pvc_browser_root(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.list_root(project_id, resource.pvc_name, resource.id)
+    payload = await _run_blocking(browser.list_root, project_id, resource.pvc_name, resource.id)
     payload["pvc_name"] = resource.pvc_name
     return PvcBrowserRootResponse(**payload)
 
@@ -1242,7 +1315,7 @@ async def get_output_pvc_browser_tree(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.list_tree(project_id, resource.pvc_name, resource.id)
+    payload = await _run_blocking(browser.list_tree, project_id, resource.pvc_name, resource.id)
     payload["pvc_name"] = resource.pvc_name
     return PvcBrowserRootResponse(**payload)
 
@@ -1256,7 +1329,7 @@ async def get_output_pvc_browser_children(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.list_children(project_id, resource.pvc_name, resource.id, path)
+    payload = await _run_blocking(browser.list_children, project_id, resource.pvc_name, resource.id, path)
     payload["pvc_name"] = resource.pvc_name
     return PvcBrowserChildrenResponse(**payload)
 
@@ -1271,7 +1344,7 @@ async def get_output_pvc_browser_file(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.read_file(project_id, resource.pvc_name, path, max_bytes=max_bytes)
+    payload = await _run_blocking(browser.read_file, project_id, resource.pvc_name, path, max_bytes=max_bytes)
     return PvcBrowserFileResponse(**payload)
 
 
@@ -1284,7 +1357,7 @@ async def download_output_pvc_browser_file(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    payload = browser.read_file(project_id, resource.pvc_name, path, max_bytes=0)
+    payload = await _run_blocking(browser.read_file, project_id, resource.pvc_name, path, max_bytes=0)
     raw = base64.b64decode(payload.get("base64") or "")
     media_type = payload.get("content_type") or "application/octet-stream"
     filename = payload.get("filename") or "download.bin"
@@ -1315,7 +1388,9 @@ async def create_output_pvc_browser_directory(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    return browser.create_directory(project_id, resource.pvc_name, request.path, request.name)
+    return await _run_blocking(
+        browser.create_directory, project_id, resource.pvc_name, request.path, request.name
+    )
 
 
 @router.post("/output-pvc/{resource_id}/browser/rename")
@@ -1327,7 +1402,9 @@ async def rename_output_pvc_browser_node(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    return browser.rename_node(project_id, resource.pvc_name, request.path, request.target_name)
+    return await _run_blocking(
+        browser.rename_node, project_id, resource.pvc_name, request.path, request.target_name
+    )
 
 
 @router.post("/output-pvc/{resource_id}/browser/move")
@@ -1339,7 +1416,9 @@ async def move_output_pvc_browser_node(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    return browser.move_node(project_id, resource.pvc_name, request.path, request.target_path)
+    return await _run_blocking(
+        browser.move_node, project_id, resource.pvc_name, request.path, request.target_path
+    )
 
 
 @router.delete("/output-pvc/{resource_id}/browser/node")
@@ -1351,4 +1430,4 @@ async def delete_output_pvc_browser_node(
 ):
     resource, project_id, _ = await _load_output_pvc_with_access(resource_id, user_and_token, db)
     browser = get_pvc_browser_service()
-    return browser.delete_node(project_id, resource.pvc_name, path)
+    return await _run_blocking(browser.delete_node, project_id, resource.pvc_name, path)

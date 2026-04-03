@@ -115,6 +115,24 @@ def load_config(config_path: str = None) -> dict:
             config["auth_service"] = {}
         config["auth_service"]["token_cache_ttl"] = int(os.environ["TOKEN_CACHE_TTL"])
 
+    # File gateway runtime overrides
+    if os.environ.get("FILE_GATEWAY_WORKER_IMAGE"):
+        if "file_gateway" not in config:
+            config["file_gateway"] = {}
+        config["file_gateway"]["worker_image"] = os.environ["FILE_GATEWAY_WORKER_IMAGE"]
+    if os.environ.get("FILE_GATEWAY_ENABLED"):
+        if "file_gateway" not in config:
+            config["file_gateway"] = {}
+        config["file_gateway"]["enabled"] = os.environ["FILE_GATEWAY_ENABLED"].strip().lower() in {"1", "true", "yes", "on"}
+    if os.environ.get("FILE_GATEWAY_FALLBACK_TO_EXEC"):
+        if "file_gateway" not in config:
+            config["file_gateway"] = {}
+        config["file_gateway"]["fallback_to_exec"] = os.environ["FILE_GATEWAY_FALLBACK_TO_EXEC"].strip().lower() in {"1", "true", "yes", "on"}
+    if os.environ.get("FILE_GATEWAY_INTERNAL_TOKEN"):
+        if "file_gateway" not in config:
+            config["file_gateway"] = {}
+        config["file_gateway"]["internal_token"] = os.environ["FILE_GATEWAY_INTERNAL_TOKEN"]
+
     return config
 
 
@@ -159,6 +177,10 @@ def validate_config(config: dict) -> tuple[bool, list[str]]:
     if not k8s_service_config.get("base_url"):
         if not (k8s_service_config.get("host") and k8s_service_config.get("port")):
             errors.append("k8s_service.base_url or k8s_service.host+port is required")
+    file_gateway_config = config.get("file_gateway", {})
+    if bool(file_gateway_config.get("enabled", True)):
+        if not file_gateway_config.get("worker_image"):
+            errors.append("file_gateway.worker_image is required when file_gateway.enabled=true")
 
     # 检查认证服务配置
     auth_config = config.get("auth_service", {})

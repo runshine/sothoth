@@ -281,6 +281,24 @@ class TaskManager:
         }
 
     @staticmethod
+    def _normalize_llm_file_overrides(params: Dict[str, Any]) -> Dict[str, str]:
+        raw_items = params.get("llm_file_overrides")
+        if not isinstance(raw_items, list):
+            return {}
+        overrides: Dict[str, str] = {}
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            content = item.get("content")
+            if not path or not path.startswith("/") or ".." in path.split("/"):
+                continue
+            if not isinstance(content, str):
+                continue
+            overrides[path] = content
+        return overrides
+
+    @staticmethod
     def _normalize_fileserver_subpath(subpath: Optional[str]) -> str:
         raw = str(subpath or "").strip().replace("\\", "/")
         if not raw:
@@ -333,14 +351,15 @@ class TaskManager:
         code_server_id = params.get("code_server_id")
         namespace = params.get("namespace")
         name = params.get("name")
-        custom_env = dict(params.get("custom_env") or {})
-        preset_env_raw = params.get("preset_env")
-        preset_env = dict(preset_env_raw) if isinstance(preset_env_raw, dict) else None
+        env_raw = params.get("env")
+        custom_env = dict(env_raw) if isinstance(env_raw, dict) else {}
+        preset_env: Dict[str, str] = {}
         # 注入PROJECT_ID环境变量
         custom_env["PROJECT_ID"] = task.project_id
         code_server_env = params.get("code_server_env") or {}
         image = params.get("image")  # 获取自定义镜像参数
         llm_provider_keys = self._normalize_provider_keys(params)
+        llm_file_overrides = self._normalize_llm_file_overrides(params)
         fileserver_mount = self._build_fileserver_mount_config(params, task.project_id)
 
         k8s_service = get_k8s_service()
@@ -382,6 +401,11 @@ class TaskManager:
                 llm_provider_snapshots = merged_bindings["snapshots"]
                 llm_provider_mapped_env_keys = sorted(provider_env.keys())
                 llm_file_bindings = merged_bindings["files"]
+                if llm_file_overrides:
+                    for file_item in llm_file_bindings:
+                        path = str(file_item.get("path") or "").strip()
+                        if path and path in llm_file_overrides:
+                            file_item["content"] = llm_file_overrides[path]
 
                 if llm_file_bindings:
                     llm_configmap_name = f"code-server-llm-{code_server_id}"[:63].rstrip("-")
