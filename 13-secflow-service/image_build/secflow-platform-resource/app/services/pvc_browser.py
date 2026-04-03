@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import HTTPException, UploadFile
 
 from app.main import get_config
+from app.services.file_gateway import get_file_gateway_manager
 from app.services.k8s import get_k8s_service
 
 
@@ -53,6 +54,22 @@ class PvcBrowserService:
         self.container_name = browser_config.get("container_name", "browser")
         self.ready_timeout = int(browser_config.get("ready_timeout", 60))
         self.exec_timeout = int(browser_config.get("exec_timeout", 30))
+        self.file_gateway_enabled = bool(config.get("file_gateway", {}).get("enabled", True))
+        self.file_gateway_fallback = bool(config.get("file_gateway", {}).get("fallback_to_exec", False))
+
+    def _use_file_gateway(self) -> bool:
+        return self.file_gateway_enabled
+
+    def _call_gateway(self, action, *args, **kwargs):
+        if not self._use_file_gateway():
+            return False, None
+        try:
+            return True, action(*args, **kwargs)
+        except Exception as error:
+            if self.file_gateway_fallback:
+                logger.warning("File gateway call failed, fallback to exec mode. error=%s", error)
+                return False, None
+            raise
 
     def _pod_labels(self, pvc_name: str) -> Dict[str, str]:
         return {
@@ -63,6 +80,8 @@ class PvcBrowserService:
 
     def cleanup_browser_pod(self, project_id: str) -> None:
         """Remove the shared browser pod if it exists."""
+        if self._use_file_gateway():
+            return
         k8s = get_k8s_service()
         if k8s.delete_pod(project_id, self.pod_name):
             deadline = time.time() + 30
@@ -73,6 +92,9 @@ class PvcBrowserService:
 
     def ensure_browser_pod(self, project_id: str, pvc_name: str) -> str:
         """Create or reuse a project-scoped browser pod mounted to the target PVC."""
+        if self._use_file_gateway():
+            get_file_gateway_manager().ensure_worker(project_id, pvc_name)
+            return self.pod_name
         k8s = get_k8s_service()
         existing = k8s.get_pod(project_id, self.pod_name)
         if existing:
@@ -153,6 +175,15 @@ class PvcBrowserService:
         return json.loads(stdout)
 
     def list_root(self, project_id: str, pvc_name: str, resource_id: int) -> Dict[str, Any]:
+        ok, payload = self._call_gateway(get_file_gateway_manager().list_children, project_id, pvc_name, "/")
+        if ok:
+            items = payload.get("directories", []) + payload.get("files", [])
+            return {
+                "resource_id": resource_id,
+                "pvc_name": pvc_name,
+                "total": len(items),
+                "items": items,
+            }
         payload = self.list_children(project_id, pvc_name, resource_id, "/")
         return {
             "resource_id": resource_id,
@@ -161,15 +192,58 @@ class PvcBrowserService:
             "items": payload["directories"] + payload["files"],
         }
 
+    def _build_tree_with_gateway(self, project_id: str, pvc_name: str, base_path: str = "/") -> list[Dict[str, Any]]:
+        payload = get_file_gateway_manager().list_children(project_id, pvc_name, base_path)
+        directories = payload.get("directories", [])
+        files = payload.get("files", [])
+        nodes: list[Dict[str, Any]] = []
+        for directory in directories:
+            directory["children"] = self._build_tree_with_gateway(project_id, pvc_name, directory["path"])
+            nodes.append(directory)
+        nodes.extend(files)
+        return nodes
+
     def list_tree(self, project_id: str, pvc_name: str, resource_id: int) -> Dict[str, Any]:
+        if self._use_file_gateway():
+            try:
+                items = self._build_tree_with_gateway(project_id, pvc_name, "/")
+                return {
+                    "resource_id": resource_id,
+                    "pvc_name": pvc_name,
+                    "total": len(items),
+                    "items": items,
+                }
+            except Exception as error:
+                if not self.file_gateway_fallback:
+                    raise
+                logger.warning("File gateway tree build failed, fallback to exec mode. error=%s", error)
         script = _TREE_SCRIPT
         return self._exec_json(project_id, pvc_name, script, str(resource_id))
 
     def list_children(self, project_id: str, pvc_name: str, resource_id: int, path: str = "/") -> Dict[str, Any]:
+        ok, payload = self._call_gateway(get_file_gateway_manager().list_children, project_id, pvc_name, path)
+        if ok:
+            return {
+                "resource_id": resource_id,
+                "pvc_name": pvc_name,
+                "current_path": payload.get("current_path", "/"),
+                "breadcrumbs": payload.get("breadcrumbs", [{"path": "/", "name": "/"}]),
+                "directories": payload.get("directories", []),
+                "files": payload.get("files", []),
+            }
         script = _LIST_CHILDREN_SCRIPT
         return self._exec_json(project_id, pvc_name, script, str(resource_id), _normalize_browser_path(path))
 
     def read_file(self, project_id: str, pvc_name: str, path: str, max_bytes: Optional[int] = None) -> Dict[str, Any]:
+        ok, payload = self._call_gateway(
+            get_file_gateway_manager().read_file,
+            project_id,
+            pvc_name,
+            path,
+            max_bytes or 0,
+        )
+        if ok:
+            return payload
         script = _READ_FILE_SCRIPT
         return self._exec_json(
             project_id,
@@ -181,6 +255,20 @@ class PvcBrowserService:
         )
 
     async def upload_file(self, project_id: str, pvc_name: str, path: str, upload: UploadFile) -> Dict[str, Any]:
+        if self._use_file_gateway():
+            target_dir = _normalize_browser_path(path)
+            filename = _validate_target_name(upload.filename or "upload.bin")
+            raw = await upload.read()
+            ok, payload = self._call_gateway(
+                get_file_gateway_manager().upload_file_bytes,
+                project_id,
+                pvc_name,
+                target_dir,
+                filename,
+                raw,
+            )
+            if ok:
+                return payload
         target_dir = _normalize_browser_path(path)
         filename = _validate_target_name(upload.filename or "upload.bin")
         raw = await upload.read()
@@ -197,6 +285,15 @@ class PvcBrowserService:
         )
 
     def create_directory(self, project_id: str, pvc_name: str, path: str, name: str) -> Dict[str, Any]:
+        ok, payload = self._call_gateway(
+            get_file_gateway_manager().create_directory,
+            project_id,
+            pvc_name,
+            _normalize_browser_path(path),
+            _validate_target_name(name),
+        )
+        if ok:
+            return payload
         return self._exec_json(
             project_id,
             pvc_name,
@@ -206,6 +303,15 @@ class PvcBrowserService:
         )
 
     def rename_node(self, project_id: str, pvc_name: str, path: str, target_name: str) -> Dict[str, Any]:
+        ok, payload = self._call_gateway(
+            get_file_gateway_manager().rename_node,
+            project_id,
+            pvc_name,
+            _normalize_browser_path(path),
+            _validate_target_name(target_name),
+        )
+        if ok:
+            return payload
         return self._exec_json(
             project_id,
             pvc_name,
@@ -215,6 +321,15 @@ class PvcBrowserService:
         )
 
     def move_node(self, project_id: str, pvc_name: str, path: str, target_path: str) -> Dict[str, Any]:
+        ok, payload = self._call_gateway(
+            get_file_gateway_manager().move_node,
+            project_id,
+            pvc_name,
+            _normalize_browser_path(path),
+            _normalize_browser_path(target_path),
+        )
+        if ok:
+            return payload
         return self._exec_json(
             project_id,
             pvc_name,
@@ -227,6 +342,9 @@ class PvcBrowserService:
         normalized = _normalize_browser_path(path)
         if normalized == "/":
             raise HTTPException(status_code=400, detail="Root directory cannot be deleted")
+        ok, payload = self._call_gateway(get_file_gateway_manager().delete_node, project_id, pvc_name, normalized)
+        if ok:
+            return payload
         return self._exec_json(project_id, pvc_name, _DELETE_NODE_SCRIPT, normalized)
 
 

@@ -181,6 +181,93 @@ class KubernetesService:
             logger.error(f"Failed to delete Pod {pod_name}: {e}")
             return False
 
+    def get_deployment(self, project_id: str, deployment_name: str) -> Optional[Dict[str, Any]]:
+        """Get Deployment details."""
+        try:
+            resp = self._request("GET", f"/deployments/{deployment_name}", project_id=project_id)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to get Deployment {deployment_name}: {e}")
+            return None
+
+    def create_deployment(self, project_id: str, manifest: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Create a Deployment in project namespace."""
+        try:
+            resp = self._request("POST", "/deployments", project_id=project_id, json={"manifest": manifest})
+            if resp.status_code in (200, 201):
+                return resp.json()
+            logger.error(f"Failed to create Deployment: {resp.status_code} {resp.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create Deployment: {e}")
+            return None
+
+    def delete_deployment(self, project_id: str, deployment_name: str) -> bool:
+        """Delete a Deployment in project namespace."""
+        try:
+            resp = self._request("DELETE", f"/deployments/{deployment_name}", project_id=project_id)
+            return resp.status_code in (200, 404)
+        except Exception as e:
+            logger.error(f"Failed to delete Deployment {deployment_name}: {e}")
+            return False
+
+    def wait_for_deployment_ready(self, project_id: str, deployment_name: str, timeout: int = 60) -> bool:
+        """Wait for Deployment to have ready replica."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            deployment = self.get_deployment(project_id, deployment_name)
+            if deployment and int(deployment.get("ready_replicas", 0) or 0) > 0:
+                return True
+            time.sleep(1)
+        return False
+
+    def get_service(self, project_id: str, service_name: str) -> Optional[Dict[str, Any]]:
+        """Get Service details."""
+        try:
+            resp = self._request("GET", f"/services/{service_name}", project_id=project_id)
+            if resp.status_code != 200:
+                return None
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to get Service {service_name}: {e}")
+            return None
+
+    def create_service(
+        self,
+        project_id: str,
+        name: str,
+        selector: Dict[str, str],
+        ports: List[Dict[str, Any]],
+        service_type: str = "ClusterIP",
+    ) -> Optional[Dict[str, Any]]:
+        """Create a Service in project namespace."""
+        payload = {
+            "name": name,
+            "type": service_type,
+            "selector": selector,
+            "ports": ports,
+        }
+        try:
+            resp = self._request("POST", "/services", project_id=project_id, json=payload)
+            if resp.status_code in (200, 201):
+                return resp.json()
+            logger.error(f"Failed to create Service {name}: {resp.status_code} {resp.text}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to create Service {name}: {e}")
+            return None
+
+    def delete_service(self, project_id: str, service_name: str) -> bool:
+        """Delete a Service in project namespace."""
+        try:
+            resp = self._request("DELETE", f"/services/{service_name}", project_id=project_id)
+            return resp.status_code in (200, 404)
+        except Exception as e:
+            logger.error(f"Failed to delete Service {service_name}: {e}")
+            return False
+
     def wait_for_pod_running(self, project_id: str, pod_name: str, timeout: int = 60) -> bool:
         """Wait for a Pod to become Running."""
         deadline = time.time() + timeout
