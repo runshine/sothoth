@@ -193,6 +193,15 @@ class TaskDeleteResponse(BaseModel):
 
 class PVCInfoResponse(BaseModel):
     """PVC信息响应。"""
+    class FileGatewayBrief(BaseModel):
+        enabled: bool
+        worker_name: str
+        service_name: str
+        deployment_exists: bool
+        service_exists: bool
+        ready_replicas: int
+        available_replicas: int
+
     pvc_name: str
     namespace: str
     capacity: str
@@ -201,6 +210,7 @@ class PVCInfoResponse(BaseModel):
     resource_id: Optional[int]
     resource_name: Optional[str]
     resource_type: Optional[str]
+    file_gateway: Optional[FileGatewayBrief] = None
 
 
 class PVCListRequest(BaseModel):

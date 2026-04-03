@@ -531,6 +531,8 @@ async def delete_resource(
                 project_id = resource.projects[0].id
 
             if project_id:
+                gateway = get_file_gateway_manager()
+                await _run_blocking(gateway.cleanup_worker, project_id, resource.pvc_name)
                 logger.info(f"Checking PVC {resource.pvc_name} in namespace {pvc_namespace} for deletion")
                 in_use, message = await _run_blocking(
                     k8s_service.check_pvc_in_use, project_id, resource.pvc_name
@@ -742,6 +744,7 @@ async def list_pvcs(
         raise HTTPException(status_code=403, detail="No permission to access this project")
 
     k8s_service = get_k8s_service()
+    gateway = get_file_gateway_manager()
     pvcs = await _run_blocking(k8s_service.list_pvcs, project_id)
     default_namespace = await _run_blocking(k8s_service.get_project_namespace, project_id)
 
@@ -752,6 +755,21 @@ async def list_pvcs(
         for resource in project_record.resources:
             if resource.pvc_name:
                 pvc_to_resource[resource.pvc_name] = resource
+
+    worker_info_by_pvc: dict[str, dict[str, Any]] = {}
+    worker_tasks = []
+    for pvc in pvcs:
+        pvc_name = (pvc.get("name") or "").strip()
+        if pvc_name:
+            worker_tasks.append((pvc_name, _run_blocking(gateway.get_worker_info, project_id, pvc_name)))
+    if worker_tasks:
+        worker_results = await asyncio.gather(*(task for _, task in worker_tasks), return_exceptions=True)
+        for (pvc_name, _), worker_result in zip(worker_tasks, worker_results):
+            if isinstance(worker_result, Exception):
+                logger.warning("Load worker info failed. project_id=%s pvc=%s error=%s", project_id, pvc_name, worker_result)
+                continue
+            if isinstance(worker_result, dict):
+                worker_info_by_pvc[pvc_name] = worker_result
 
     result = []
     for pvc in pvcs:
@@ -764,6 +782,7 @@ async def list_pvcs(
         status = str(pvc.get("status") or "Unknown").strip() or "Unknown"
         storage_class = str(pvc.get("storage_class") or "n/a").strip() or "n/a"
 
+        worker = worker_info_by_pvc.get(pvc_name)
         result.append(PVCInfoResponse(
             pvc_name=pvc_name,
             namespace=namespace,
@@ -772,7 +791,16 @@ async def list_pvcs(
             storage_class=storage_class,
             resource_id=resource.id if resource else None,
             resource_name=resource.name if resource else None,
-            resource_type=resource.resource_type.value if resource else None
+            resource_type=resource.resource_type.value if resource else None,
+            file_gateway={
+                "enabled": bool(worker.get("enabled", True)),
+                "worker_name": str(worker.get("worker_name") or ""),
+                "service_name": str(worker.get("service_name") or ""),
+                "deployment_exists": bool(worker.get("deployment_exists", False)),
+                "service_exists": bool(worker.get("service_exists", False)),
+                "ready_replicas": int(worker.get("ready_replicas") or 0),
+                "available_replicas": int(worker.get("available_replicas") or 0),
+            } if worker else None
         ))
 
     return PVCListResponse(pvcs=result, total=len(result))
@@ -904,8 +932,9 @@ async def delete_output_pvc(
     project_id = _resolve_resource_project_id(resource)
 
     k8s_service = get_k8s_service()
-    browser = get_pvc_browser_service()
-    await _run_blocking(browser.cleanup_browser_pod, project_id)
+    gateway = get_file_gateway_manager()
+    if resource.pvc_name:
+        await _run_blocking(gateway.cleanup_worker, project_id, resource.pvc_name)
 
     # 检查PVC是否被使用
     if resource.pvc_name:

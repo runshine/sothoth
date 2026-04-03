@@ -249,8 +249,10 @@ class ResourceTaskWorker:
 
         task_manager = get_task_manager()
         k8s_service = get_k8s_service()
+        gateway = get_file_gateway_manager()
 
         deleted_pvc = False
+        deleted_worker = False
         deleted_file = False
         errors = []
 
@@ -260,10 +262,30 @@ class ResourceTaskWorker:
             )
             await task_manager.update_task_progress(task_id, 10, "Initializing delete task")
 
-            # 步骤1: 删除PVC（如果存在）
+            # 步骤1: 删除对应worker（如果存在）
+            if pvc_name and project_id:
+                await task_manager.append_task_log(task_id, f"Cleaning file gateway worker for PVC: {pvc_name}")
+                await task_manager.update_task_progress(task_id, 20, "Cleaning file gateway worker")
+                try:
+                    worker_result = await asyncio.to_thread(
+                        gateway.cleanup_worker,
+                        project_id,
+                        pvc_name,
+                    )
+                    deleted_worker = bool(worker_result.get("deployment_deleted") and worker_result.get("service_deleted"))
+                    await task_manager.append_task_log(
+                        task_id,
+                        f"Worker cleanup done: worker={worker_result.get('worker_name')} service={worker_result.get('service_name')}",
+                    )
+                except Exception as e:
+                    errors.append(f"Failed to clean file gateway worker: {str(e)}")
+                    await task_manager.append_task_log(task_id, f"Error cleaning file gateway worker: {str(e)}")
+                    logger.error(f"Error cleaning file gateway worker for pvc {pvc_name}: {e}")
+
+            # 步骤2: 删除PVC（如果存在）
             if pvc_name and project_id:
                 await task_manager.append_task_log(task_id, f"Deleting PVC: {pvc_name}")
-                await task_manager.update_task_progress(task_id, 30, "Deleting PVC")
+                await task_manager.update_task_progress(task_id, 40, "Deleting PVC")
 
                 try:
                     # 使用超时但不阻塞，在后台继续等待
@@ -291,14 +313,14 @@ class ResourceTaskWorker:
                     await task_manager.append_task_log(task_id, f"Error deleting PVC: {str(e)}")
                     logger.error(f"Error deleting PVC {pvc_name}: {e}")
 
-            await task_manager.update_task_progress(task_id, 60, "PVC deletion processed")
+            await task_manager.update_task_progress(task_id, 65, "PVC deletion processed")
 
-            # 步骤2: 删除上传的临时文件
+            # 步骤3: 删除上传的临时文件
             if upload_file_uuid:
                 await task_manager.append_task_log(
                     task_id, f"Deleting uploaded file: {upload_file_uuid}"
                 )
-                await task_manager.update_task_progress(task_id, 80, "Deleting temporary file")
+                await task_manager.update_task_progress(task_id, 82, "Deleting temporary file")
 
                 try:
                     config = get_config()
@@ -322,9 +344,9 @@ class ResourceTaskWorker:
                         task_id, f"Error deleting temporary file: {str(e)}"
                     )
 
-            # 步骤3: 删除资源记录
+            # 步骤4: 删除资源记录
             await task_manager.append_task_log(task_id, "Deleting resource record")
-            await task_manager.update_task_progress(task_id, 90, "Cleaning up database")
+            await task_manager.update_task_progress(task_id, 92, "Cleaning up database")
 
             try:
                 # 查找资源记录并删除
@@ -356,6 +378,7 @@ class ResourceTaskWorker:
             result = {
                 "resource_id": resource_id,
                 "resource_uuid": resource_uuid,
+                "deleted_worker": deleted_worker,
                 "deleted_pvc": deleted_pvc,
                 "deleted_file": deleted_file,
                 "errors": errors if errors else None
