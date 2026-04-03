@@ -84,6 +84,26 @@ class FileGatewayManager:
     def _service_name(self, worker_name: str) -> str:
         return f"{worker_name}-svc"
 
+    def get_worker_info(self, project_id: str, pvc_name: str) -> Dict[str, Any]:
+        worker_name = self._worker_name(project_id, pvc_name)
+        service_name = self._service_name(worker_name)
+        namespace = get_k8s_service().get_project_namespace(project_id)
+        service = get_k8s_service().get_service(project_id, service_name)
+        deployment = get_k8s_service().get_deployment(project_id, worker_name)
+        deployment_status = (deployment or {}).get("status", {}) if isinstance(deployment, dict) else {}
+        return {
+            "enabled": bool(self.config.enabled),
+            "worker_name": worker_name,
+            "service_name": service_name,
+            "namespace": namespace,
+            "worker_image": self.config.worker_image,
+            "service_exists": service is not None,
+            "deployment_exists": deployment is not None,
+            "replicas": int(deployment_status.get("replicas") or 0),
+            "ready_replicas": int(deployment_status.get("readyReplicas") or 0),
+            "available_replicas": int(deployment_status.get("availableReplicas") or 0),
+        }
+
     def _touch(self, worker_name: str) -> None:
         with self._lock:
             self._worker_access_time[worker_name] = time.time()
@@ -317,4 +337,3 @@ def get_file_gateway_manager() -> FileGatewayManager:
     if _file_gateway_manager is None:
         _file_gateway_manager = FileGatewayManager.from_runtime_config()
     return _file_gateway_manager
-

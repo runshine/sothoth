@@ -31,6 +31,7 @@ from app.schemas import (
 from app.services.auth import get_auth_service
 from app.services.project import get_project_service
 from app.services.k8s import get_k8s_service
+from app.services.file_gateway import get_file_gateway_manager
 from app.services.pvc_browser import get_pvc_browser_service
 from app.tasks.manager import get_task_manager
 from app.tasks.worker import create_upload_extract_task, create_delete_resource_task, create_manual_pvc_task
@@ -1128,10 +1129,12 @@ async def get_resource_pvc_detail(
 ):
     resource, project_id, _ = await _load_pvc_resource_with_access(resource_id, user_and_token, db)
     k8s_service = get_k8s_service()
+    gateway = get_file_gateway_manager()
     pvc_status = await _run_blocking(k8s_service.get_pvc_status, project_id, resource.pvc_name)
     in_use, use_message = await _run_blocking(
         k8s_service.check_pvc_in_use, project_id, resource.pvc_name
     )
+    file_gateway = await _run_blocking(gateway.get_worker_info, project_id, resource.pvc_name)
     return {
         "id": resource.id,
         "resource_uuid": resource.resource_uuid,
@@ -1144,6 +1147,7 @@ async def get_resource_pvc_detail(
         "status": resource.upload_status.value if hasattr(resource.upload_status, 'value') else resource.upload_status,
         "project_ids": [p.id for p in resource.projects],
         "pvc_k8s_status": pvc_status,
+        "file_gateway": file_gateway,
         "in_use": in_use,
         "use_message": use_message,
         "created_at": resource.created_at,
