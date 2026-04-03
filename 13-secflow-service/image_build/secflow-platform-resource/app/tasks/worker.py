@@ -288,13 +288,12 @@ class ResourceTaskWorker:
                 await task_manager.update_task_progress(task_id, 40, "Deleting PVC")
 
                 try:
-                    # 使用超时但不阻塞，在后台继续等待
-                    import asyncio
+                    # 使用超时等待，避免任务长时间卡在 running
                     pvc_deleted = await asyncio.to_thread(
                         k8s_service.delete_pvc,
                         project_id,
                         pvc_name,
-                        timeout=300  # 5分钟超时
+                        timeout=90
                     )
 
                     if pvc_deleted:
@@ -388,9 +387,9 @@ class ResourceTaskWorker:
                 await task_manager.append_task_log(
                     task_id, f"Delete task completed with warnings: {errors}"
                 )
-            else:
-                await task_manager.append_task_log(task_id, "Delete task completed successfully")
+                raise Exception("; ".join(errors))
 
+            await task_manager.append_task_log(task_id, "Delete task completed successfully")
             return result
 
         except Exception as e:
