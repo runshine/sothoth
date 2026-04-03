@@ -422,12 +422,10 @@ class WorkflowNodeConfig(BaseModel):
             if not self.service_ports or len(self.service_ports) == 0:
                 errors.append("service_ports cannot be empty when create_service is True")
             if self.create_ingress:
-                if not self.ingress_type or self.ingress_type != "nginx":
+                if not self.ingress_type:
+                    self.ingress_type = "nginx"
+                if self.ingress_type != "nginx":
                     errors.append("ingress_type must be nginx when create_ingress is True")
-                if not self.ingress_host or not self.ingress_host.strip():
-                    errors.append("ingress_host is required when create_ingress is True")
-                if not self.ingress_ip or not self.ingress_ip.strip():
-                    errors.append("ingress_ip is required when create_ingress is True")
             if errors:
                 raise ValueError("; ".join(errors))
         return self
@@ -600,12 +598,10 @@ class WorkflowNodeUpdate(BaseModel):
             if not self.service_ports or len(self.service_ports) == 0:
                 errors.append("service_ports cannot be empty when create_service is True")
             if self.create_ingress is True:
-                if not self.ingress_type or self.ingress_type != "nginx":
+                if not self.ingress_type:
+                    self.ingress_type = "nginx"
+                if self.ingress_type != "nginx":
                     errors.append("ingress_type must be nginx when create_ingress is True")
-                if not self.ingress_host or not self.ingress_host.strip():
-                    errors.append("ingress_host is required when create_ingress is True")
-                if not self.ingress_ip or not self.ingress_ip.strip():
-                    errors.append("ingress_ip is required when create_ingress is True")
             if errors:
                 raise ValueError("; ".join(errors))
         return self
