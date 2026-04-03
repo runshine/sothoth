@@ -46,6 +46,50 @@ class UserDetailResponse(UserResponse):
     role_ids: List[int] = []
 
 
+class UserImportRequest(BaseModel):
+    """用户导入请求"""
+    csv_content: str
+    filename: Optional[str] = None
+
+
+class UserImportNormalizedRow(BaseModel):
+    """归一化后的导入行"""
+    username: str
+    password_provided: bool = False
+    platform_role: str = "ordinary_user"
+    role_names: List[str] = []
+    department_name: Optional[str] = None
+    department_role: Optional[str] = None
+    is_active: bool = True
+
+
+class UserImportRowResult(BaseModel):
+    """用户导入行结果"""
+    row_no: int
+    username: str = ""
+    status: str
+    messages: List[str] = []
+    normalized: Optional[UserImportNormalizedRow] = None
+    generated_password: Optional[str] = None
+    user_id: Optional[int] = None
+
+
+class UserImportPreviewResponse(BaseModel):
+    """用户导入预校验响应"""
+    total_rows: int
+    valid_rows: int
+    error_rows: int
+    rows: List[UserImportRowResult]
+
+
+class UserImportCommitResponse(BaseModel):
+    """用户导入执行响应"""
+    total_rows: int
+    success_rows: int
+    failed_rows: int
+    rows: List[UserImportRowResult]
+
+
 # ============ 角色模式 ============
 
 class RoleBase(BaseModel):

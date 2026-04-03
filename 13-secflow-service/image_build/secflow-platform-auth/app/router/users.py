@@ -1,9 +1,12 @@
 """用户路由"""
 
+import csv
+import io
+import secrets
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.orm import Session
 
 from app.auth import cleanup_expired_sessions, get_password_hash, verify_password
@@ -15,6 +18,7 @@ from app.rbac import (
     filter_non_platform_roles,
     get_primary_platform_role,
     normalize_role,
+    normalize_role_name,
     set_user_platform_role,
 )
 from app.schema import (
@@ -26,6 +30,11 @@ from app.schema import (
     PlatformRoleUpdateRequest,
     UserCreate,
     UserDetailResponse,
+    UserImportCommitResponse,
+    UserImportNormalizedRow,
+    UserImportPreviewResponse,
+    UserImportRequest,
+    UserImportRowResult,
     UserResponse,
     UserRoleBindRequest,
     UserRoleResponse,
@@ -33,6 +42,249 @@ from app.schema import (
 )
 
 router = APIRouter(tags=["用户管理"], prefix="/users")
+
+USER_IMPORT_TEMPLATE = (
+    "username,password,platform_role,role_names,department_name,department_role,is_active\n"
+    "zhangsan,,ordinary_user,审计员,安全运营部,member,true\n"
+    "lisi,TempPass123!,ordinary_admin,,攻防实验室,leader,true\n"
+)
+USER_IMPORT_REQUIRED_HEADERS = {"username"}
+USER_IMPORT_ALLOWED_HEADERS = {
+    "username",
+    "password",
+    "platform_role",
+    "role_names",
+    "department_name",
+    "department_role",
+    "is_active",
+}
+USER_IMPORT_ALLOWED_DEPARTMENT_ROLES = {"leader", "vice_leader", "member"}
+
+
+def _normalize_csv_text(content: str) -> str:
+    return (content or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+
+
+def _split_role_names(raw_value: str) -> List[str]:
+    if not raw_value:
+        return []
+
+    normalized = raw_value
+    for separator in ["，", ";", "；", "|", "/", "\\"]:
+        normalized = normalized.replace(separator, ",")
+    return [item.strip() for item in normalized.split(",") if item.strip()]
+
+
+def _parse_bool(raw_value: str, default: bool = True) -> bool:
+    if raw_value is None:
+        return default
+
+    value = str(raw_value).strip().lower()
+    if not value:
+        return default
+    if value in {"true", "1", "yes", "y", "是", "启用", "active"}:
+        return True
+    if value in {"false", "0", "no", "n", "否", "禁用", "disabled"}:
+        return False
+    raise ValueError("is_active 仅支持 true/false、1/0、yes/no")
+
+
+def _load_import_rows(csv_content: str) -> Tuple[List[Tuple[int, Dict[str, str]]], List[str]]:
+    normalized = _normalize_csv_text(csv_content)
+    if not normalized.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV 内容不能为空"
+        )
+
+    reader = csv.DictReader(io.StringIO(normalized))
+    headers = [header.strip() for header in (reader.fieldnames or []) if header and header.strip()]
+    if not headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV 缺少表头"
+        )
+
+    missing_headers = USER_IMPORT_REQUIRED_HEADERS.difference(headers)
+    if missing_headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"CSV 缺少必填列: {', '.join(sorted(missing_headers))}"
+        )
+
+    unsupported_headers = [header for header in headers if header not in USER_IMPORT_ALLOWED_HEADERS]
+    if unsupported_headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"CSV 存在不支持的列: {', '.join(unsupported_headers)}"
+        )
+
+    rows: List[Tuple[int, Dict[str, str]]] = []
+    for row_no, row in enumerate(reader, start=2):
+        normalized_row = {
+            key.strip(): (value.strip() if isinstance(value, str) else "")
+            for key, value in (row or {}).items()
+            if key is not None and key.strip()
+        }
+        if not any(normalized_row.values()):
+            continue
+        rows.append((row_no, normalized_row))
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="CSV 不包含有效数据行"
+        )
+
+    return rows, headers
+
+
+def _validate_import_row(
+    db: Session,
+    row_no: int,
+    raw_row: Dict[str, str],
+    file_username_counts: Dict[str, int],
+    pending_leader_counts: Dict[int, int],
+    department_cache: Dict[str, Department],
+    role_cache: Dict[str, Role],
+) -> UserImportRowResult:
+    messages: List[str] = []
+    username = (raw_row.get("username") or "").strip()
+    password = (raw_row.get("password") or "").strip()
+    platform_role_raw = (raw_row.get("platform_role") or "").strip()
+    role_names = _split_role_names(raw_row.get("role_names") or "")
+    department_name = (raw_row.get("department_name") or "").strip() or None
+    department_role = (raw_row.get("department_role") or "").strip().lower() or None
+
+    if not username:
+        messages.append("用户名不能为空")
+    elif len(username) > 100:
+        messages.append("用户名长度不能超过100个字符")
+    elif file_username_counts.get(username, 0) > 1:
+        messages.append("CSV 文件内用户名重复")
+    elif db.query(User).filter(User.username == username).first():
+        messages.append("用户名已存在")
+
+    if password and len(password) < 6:
+        messages.append("密码长度至少6位")
+
+    platform_role = normalize_role_name(platform_role_raw) or "ordinary_user"
+    if platform_role not in {"ordinary_admin", "ordinary_user"}:
+        messages.append("platform_role 仅支持 ordinary_admin 或 ordinary_user")
+
+    resolved_roles: List[Role] = []
+    for role_name in role_names:
+        cached_role = role_cache.get(role_name)
+        if cached_role is None:
+            cached_role = db.query(Role).filter(Role.name == role_name).first()
+            if cached_role:
+                role_cache[role_name] = cached_role
+        if cached_role is None:
+            messages.append(f"角色不存在: {role_name}")
+            continue
+        if normalize_role(cached_role) in {"super_admin", "ordinary_admin", "ordinary_user"}:
+            messages.append(f"role_names 不允许包含平台保留角色: {role_name}")
+            continue
+        resolved_roles.append(cached_role)
+
+    resolved_department = None
+    if department_name:
+        resolved_department = department_cache.get(department_name)
+        if resolved_department is None:
+            resolved_department = db.query(Department).filter(Department.name == department_name).first()
+            if resolved_department:
+                department_cache[department_name] = resolved_department
+        if resolved_department is None:
+            messages.append(f"部门不存在: {department_name}")
+
+    if department_role and department_role not in USER_IMPORT_ALLOWED_DEPARTMENT_ROLES:
+        messages.append("department_role 仅支持 leader、vice_leader、member")
+
+    if department_name and not department_role:
+        department_role = "member"
+    if department_role and not department_name:
+        messages.append("填写 department_role 时必须同时提供 department_name")
+
+    if resolved_department and department_role == "leader":
+        existing_leader = db.query(DepartmentMember).filter(
+            DepartmentMember.department_id == resolved_department.id,
+            DepartmentMember.role == "leader"
+        ).first()
+        if existing_leader:
+            messages.append(f"部门已有组长: {department_name}")
+        if pending_leader_counts.get(resolved_department.id, 0) > 1:
+            messages.append(f"CSV 中部门组长重复: {department_name}")
+
+    try:
+        is_active = _parse_bool(raw_row.get("is_active") or "", default=True)
+    except ValueError as exc:
+        messages.append(str(exc))
+        is_active = True
+
+    status_value = "valid" if not messages else "error"
+    return UserImportRowResult(
+        row_no=row_no,
+        username=username,
+        status=status_value,
+        messages=messages,
+        normalized=UserImportNormalizedRow(
+            username=username,
+            password_provided=bool(password),
+            platform_role=platform_role,
+            role_names=[role.name for role in resolved_roles],
+            department_name=department_name,
+            department_role=department_role,
+            is_active=is_active,
+        )
+    )
+
+
+def _preview_import_rows(db: Session, csv_content: str) -> UserImportPreviewResponse:
+    rows, _headers = _load_import_rows(csv_content)
+    ensure_platform_roles_seeded(db)
+
+    file_username_counts: Dict[str, int] = {}
+    pending_leader_counts: Dict[int, int] = {}
+    department_cache: Dict[str, Department] = {}
+    role_cache: Dict[str, Role] = {}
+
+    for _row_no, raw_row in rows:
+        username = (raw_row.get("username") or "").strip()
+        if username:
+            file_username_counts[username] = file_username_counts.get(username, 0) + 1
+
+        department_name = (raw_row.get("department_name") or "").strip()
+        department_role = (raw_row.get("department_role") or "").strip().lower()
+        if department_name and department_role == "leader":
+            department = db.query(Department).filter(Department.name == department_name).first()
+            if department:
+                department_cache[department_name] = department
+                pending_leader_counts[department.id] = pending_leader_counts.get(department.id, 0) + 1
+
+    results = [
+        _validate_import_row(
+            db=db,
+            row_no=row_no,
+            raw_row=raw_row,
+            file_username_counts=file_username_counts,
+            pending_leader_counts=pending_leader_counts,
+            department_cache=department_cache,
+            role_cache=role_cache,
+        )
+        for row_no, raw_row in rows
+    ]
+
+    valid_rows = sum(1 for item in results if item.status == "valid")
+    return UserImportPreviewResponse(
+        total_rows=len(results),
+        valid_rows=valid_rows,
+        error_rows=len(results) - valid_rows,
+        rows=results,
+    )
+
+
+def _generate_initial_password() -> str:
+    return secrets.token_urlsafe(10)
 
 
 def _get_primary_department_membership(db: Session, user_id: int) -> Optional[DepartmentMember]:
@@ -136,6 +388,132 @@ def create_user(
     db.commit()
     db.refresh(user)
     return _build_user_response(db, user)
+
+
+@router.get("/import/template")
+def download_user_import_template(
+    current_user: User = Depends(get_current_super_admin)
+):
+    """下载用户导入 CSV 模板。"""
+    return Response(
+        content=USER_IMPORT_TEMPLATE,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="secflow-user-import-template.csv"'
+        }
+    )
+
+
+@router.post("/import/preview", response_model=UserImportPreviewResponse)
+def preview_user_import(
+    request: UserImportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
+):
+    """预校验用户导入 CSV。"""
+    return _preview_import_rows(db, request.csv_content)
+
+
+@router.post("/import/commit", response_model=UserImportCommitResponse)
+def commit_user_import(
+    request: UserImportRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_super_admin)
+):
+    """执行用户导入。按行提交，单行失败不影响整批。"""
+    preview = _preview_import_rows(db, request.csv_content)
+    raw_rows, _headers = _load_import_rows(request.csv_content)
+    raw_row_map = {row_no: item for row_no, item in raw_rows}
+    results: List[UserImportRowResult] = []
+
+    for row in preview.rows:
+        if row.status != "valid" or row.normalized is None:
+            results.append(row)
+            continue
+
+        normalized = row.normalized
+        raw_row = raw_row_map.get(row.row_no, {})
+        password = (raw_row.get("password") or "").strip() or _generate_initial_password()
+
+        try:
+            user = User(
+                username=normalized.username,
+                hashed_password=get_password_hash(password),
+                is_active=normalized.is_active,
+            )
+            db.add(user)
+            db.flush()
+
+            if normalized.platform_role == "ordinary_admin":
+                set_user_platform_role(db, user, normalized.platform_role)
+
+            if normalized.role_names:
+                roles = db.query(Role).filter(Role.name.in_(normalized.role_names)).all()
+                user.roles = list(user.roles) + filter_non_platform_roles(roles)
+
+            if normalized.department_name:
+                department = db.query(Department).filter(Department.name == normalized.department_name).first()
+                if not department:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"部门不存在: {normalized.department_name}"
+                    )
+
+                if normalized.department_role == "leader":
+                    existing_leader = db.query(DepartmentMember).filter(
+                        DepartmentMember.department_id == department.id,
+                        DepartmentMember.role == "leader"
+                    ).first()
+                    if existing_leader:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"部门已有组长: {normalized.department_name}"
+                        )
+
+                db.add(DepartmentMember(
+                    user_id=user.id,
+                    department_id=department.id,
+                    role=normalized.department_role or "member"
+                ))
+
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(user)
+            results.append(UserImportRowResult(
+                row_no=row.row_no,
+                username=normalized.username,
+                status="success",
+                messages=["导入成功"],
+                normalized=normalized,
+                generated_password=None if raw_row.get("password") else password,
+                user_id=user.id,
+            ))
+        except HTTPException as exc:
+            db.rollback()
+            results.append(UserImportRowResult(
+                row_no=row.row_no,
+                username=normalized.username,
+                status="error",
+                messages=[str(exc.detail)],
+                normalized=normalized,
+            ))
+        except Exception as exc:
+            db.rollback()
+            results.append(UserImportRowResult(
+                row_no=row.row_no,
+                username=normalized.username,
+                status="error",
+                messages=[f"导入失败: {str(exc)}"],
+                normalized=normalized,
+            ))
+
+    success_rows = sum(1 for item in results if item.status == "success")
+    return UserImportCommitResponse(
+        total_rows=len(results),
+        success_rows=success_rows,
+        failed_rows=len(results) - success_rows,
+        rows=results,
+    )
 
 
 @router.put("/{user_id}", response_model=UserResponse)
