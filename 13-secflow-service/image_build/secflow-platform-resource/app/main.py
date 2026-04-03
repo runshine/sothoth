@@ -116,10 +116,6 @@ def load_config(config_path: str = None) -> dict:
         config["auth_service"]["token_cache_ttl"] = int(os.environ["TOKEN_CACHE_TTL"])
 
     # File gateway runtime overrides
-    if os.environ.get("FILE_GATEWAY_WORKER_IMAGE"):
-        if "file_gateway" not in config:
-            config["file_gateway"] = {}
-        config["file_gateway"]["worker_image"] = os.environ["FILE_GATEWAY_WORKER_IMAGE"]
     if os.environ.get("FILE_GATEWAY_ENABLED"):
         if "file_gateway" not in config:
             config["file_gateway"] = {}

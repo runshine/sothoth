@@ -66,12 +66,14 @@ data:
       name: "secflow-platform-resource-file-gateway"
       worker_name_prefix: "secflow-platform-resource-file-gateway-worker"
       worker_app_label: "secflow-platform-resource-file-gateway-worker"
-      worker_image: "ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:latest"
+      worker_image: "${SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE}"
       worker_container_port: 8081
+      worker_processes: 1
       worker_mount_path: "/data/pvc"
       worker_idle_ttl_seconds: 900
       worker_ready_timeout_seconds: 60
       worker_request_timeout_seconds: 120
+      worker_upload_request_timeout_seconds: 3600
       internal_token: "change-me-file-gateway-token"
     # Async Task Configuration
     task:

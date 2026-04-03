@@ -5,6 +5,7 @@ NAMESPACE="${NAMESPACE:-secflow-ns}"
 B2S_IMAGE_REPO="${B2S_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-to-source}"
 RESOURCE_IMAGE_REPO="${RESOURCE_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource}"
 GATEWAY_WORKER_IMAGE_REPO="${GATEWAY_WORKER_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource-file-gateway-worker}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 B2S_MANAGER_DEPLOYMENT="secflow-app-binary-to-source-manager"
 B2S_WORKER_DEPLOYMENT="secflow-app-binary-to-source-worker"
@@ -29,7 +30,7 @@ Behavior:
   - No args: only rollout restart all deployments.
   - b2s image: update binary-to-source manager/worker image.
   - resource image: update secflow-platform-resource image.
-  - gateway-worker image: set FILE_GATEWAY_WORKER_IMAGE env on secflow-platform-resource.
+  - gateway-worker image: update file_gateway.worker_image in resource ConfigMap template vars.
 HELP
 }
 
@@ -86,6 +87,11 @@ B2S_IMAGE="$(resolve_image "${B2S_IMAGE_ARG}" "${B2S_IMAGE_REPO}")"
 RESOURCE_IMAGE="$(resolve_image "${RESOURCE_IMAGE_ARG}" "${RESOURCE_IMAGE_REPO}")"
 GATEWAY_WORKER_IMAGE="$(resolve_image "${GATEWAY_WORKER_IMAGE_ARG}" "${GATEWAY_WORKER_IMAGE_REPO}")"
 
+if [[ -f "${SCRIPT_DIR}/images.env" ]]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/images.env"
+fi
+
 if [[ -n "${B2S_IMAGE}" ]]; then
   echo "[INFO] Updating binary-to-source image to: ${B2S_IMAGE}"
   kubectl -n "${NAMESPACE}" set image deployment/"${B2S_MANAGER_DEPLOYMENT}" \
@@ -94,16 +100,22 @@ if [[ -n "${B2S_IMAGE}" ]]; then
     "${B2S_WORKER_CONTAINER}"="${B2S_IMAGE}"
 fi
 
-if [[ -n "${RESOURCE_IMAGE}" ]]; then
-  echo "[INFO] Updating resource service image to: ${RESOURCE_IMAGE}"
-  kubectl -n "${NAMESPACE}" set image deployment/"${RESOURCE_DEPLOYMENT}" \
-    "${RESOURCE_CONTAINER}"="${RESOURCE_IMAGE}"
-fi
+if [[ -n "${RESOURCE_IMAGE}" || -n "${GATEWAY_WORKER_IMAGE}" ]]; then
+  export SECFLOW_PLATFORM_RESOURCE_IMAGE="${RESOURCE_IMAGE:-${SECFLOW_PLATFORM_RESOURCE_IMAGE:-${RESOURCE_IMAGE_REPO}:latest}}"
+  export SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE="${GATEWAY_WORKER_IMAGE:-${SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE:-${GATEWAY_WORKER_IMAGE_REPO}:latest}}"
 
-if [[ -n "${GATEWAY_WORKER_IMAGE}" ]]; then
-  echo "[INFO] Setting FILE_GATEWAY_WORKER_IMAGE to: ${GATEWAY_WORKER_IMAGE}"
-  kubectl -n "${NAMESPACE}" set env deployment/"${RESOURCE_DEPLOYMENT}" \
-    FILE_GATEWAY_WORKER_IMAGE="${GATEWAY_WORKER_IMAGE}"
+  echo "[INFO] Applying resource ConfigMap with image vars:"
+  echo "       SECFLOW_PLATFORM_RESOURCE_IMAGE=${SECFLOW_PLATFORM_RESOURCE_IMAGE}"
+  echo "       SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE=${SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE}"
+
+  if ! command -v envsubst >/dev/null 2>&1; then
+    echo "[ERROR] envsubst is required to render resource image templates."
+    echo "        Please install gettext and retry."
+    exit 1
+  fi
+
+  envsubst < "${SCRIPT_DIR}/00-secflow-05-00-platform-resource-configmap.yaml" | kubectl apply -f -
+  envsubst < "${SCRIPT_DIR}/00-secflow-05-03-platform-resource-deployment.yaml" | kubectl apply -f -
 fi
 
 echo "[INFO] Restarting all deployments in namespace: ${NAMESPACE}"

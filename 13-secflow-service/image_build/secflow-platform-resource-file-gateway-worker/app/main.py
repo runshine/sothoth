@@ -130,6 +130,20 @@ def _extract_to_directory(archive_path: Path, target_dir: Path, original_name: s
     raise HTTPException(status_code=400, detail="Unsupported archive format")
 
 
+def _stream_upload_to_target(file: UploadFile, target: Path) -> int:
+    size = 0
+    with target.open("wb") as out:
+        while True:
+            chunk = file.file.read(UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail="File too large")
+            out.write(chunk)
+    return size
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "root": str(ROOT_PATH)}
@@ -199,24 +213,15 @@ def download_file(path: str = Query(...), _: None = Depends(_ensure_token)):
 
 
 @app.post("/fs/upload")
-async def upload_file(path: str = Form("/"), file: UploadFile = File(...), _: None = Depends(_ensure_token)) -> dict:
+def upload_file(path: str = Form("/"), file: UploadFile = File(...), _: None = Depends(_ensure_token)) -> dict:
     directory_path, directory = _resolve_target(path)
     if not directory.exists() or not directory.is_dir():
         raise HTTPException(status_code=400, detail="Target directory not found")
 
     filename = _validate_name(file.filename or "upload.bin", label="filename")
     target = directory / filename
-    size = 0
     try:
-        with target.open("wb") as out:
-            while True:
-                chunk = await file.read(UPLOAD_CHUNK_BYTES)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="File too large")
-                out.write(chunk)
+        size = _stream_upload_to_target(file, target)
     except Exception:
         if target.exists():
             target.unlink()
@@ -290,7 +295,7 @@ def delete_node(path: str = Query(...), _: None = Depends(_ensure_token)) -> dic
 
 
 @app.post("/fs/extract")
-async def extract_archive(path: str = Form("/"), file: UploadFile = File(...), _: None = Depends(_ensure_token)) -> dict:
+def extract_archive(path: str = Form("/"), file: UploadFile = File(...), _: None = Depends(_ensure_token)) -> dict:
     target_path, target_dir = _resolve_target(path)
     if not target_dir.exists() or not target_dir.is_dir():
         raise HTTPException(status_code=400, detail="Target directory not found")
@@ -298,17 +303,8 @@ async def extract_archive(path: str = Form("/"), file: UploadFile = File(...), _
     original_name = _validate_name(file.filename or "archive.bin", label="filename")
     tmp_name = f".upload-{os.getpid()}-{os.urandom(6).hex()}"
     archive_path = target_dir / tmp_name
-    size = 0
     try:
-        with archive_path.open("wb") as out:
-            while True:
-                chunk = await file.read(UPLOAD_CHUNK_BYTES)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
-                    raise HTTPException(status_code=413, detail="File too large")
-                out.write(chunk)
+        size = _stream_upload_to_target(file, archive_path)
     except Exception:
         if archive_path.exists():
             archive_path.unlink()
@@ -332,4 +328,6 @@ async def extract_archive(path: str = Form("/"), file: UploadFile = File(...), _
 def main() -> None:
     host = os.environ.get("APP_HOST", "0.0.0.0")
     port = int(os.environ.get("APP_PORT", "8081"))
-    uvicorn.run(app, host=host, port=port)
+    workers = max(1, int(os.environ.get("APP_WORKERS", "1")))
+    # Keep single-process by default, rely on threadpool concurrency for requests.
+    uvicorn.run("app.main:app", host=host, port=port, workers=workers)

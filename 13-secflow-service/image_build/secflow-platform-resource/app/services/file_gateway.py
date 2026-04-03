@@ -25,12 +25,14 @@ class FileGatewayConfig:
     name: str = "secflow-platform-resource-file-gateway"
     worker_name_prefix: str = "secflow-platform-resource-file-gateway-worker"
     worker_app_label: str = "secflow-platform-resource-file-gateway-worker"
-    worker_image: str = "ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:latest"
+    worker_image: str = ""
     worker_container_port: int = 8081
+    worker_processes: int = 1
     worker_mount_path: str = "/data/pvc"
     worker_idle_ttl_seconds: int = 900
     worker_ready_timeout_seconds: int = 60
     worker_request_timeout_seconds: int = 120
+    worker_upload_request_timeout_seconds: int = 3600
     internal_token: str = ""
 
 
@@ -53,19 +55,18 @@ class FileGatewayManager:
             name=str(fg.get("name", "secflow-platform-resource-file-gateway")),
             worker_name_prefix=str(fg.get("worker_name_prefix", "secflow-platform-resource-file-gateway-worker")),
             worker_app_label=str(fg.get("worker_app_label", "secflow-platform-resource-file-gateway-worker")),
-            worker_image=str(
-                fg.get(
-                    "worker_image",
-                    "ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:latest",
-                )
-            ),
+            worker_image=str(fg.get("worker_image", "")).strip(),
             worker_container_port=int(fg.get("worker_container_port", 8081)),
+            worker_processes=max(1, int(fg.get("worker_processes", 1))),
             worker_mount_path=str(fg.get("worker_mount_path", "/data/pvc")),
             worker_idle_ttl_seconds=int(fg.get("worker_idle_ttl_seconds", 900)),
             worker_ready_timeout_seconds=int(fg.get("worker_ready_timeout_seconds", 60)),
             worker_request_timeout_seconds=int(fg.get("worker_request_timeout_seconds", 120)),
+            worker_upload_request_timeout_seconds=int(fg.get("worker_upload_request_timeout_seconds", 3600)),
             internal_token=str(fg.get("internal_token", "")),
         )
+        if config.enabled and not config.worker_image:
+            raise RuntimeError("file_gateway.worker_image is required when file_gateway.enabled=true")
         return cls(config)
 
     def is_enabled(self) -> bool:
@@ -205,6 +206,7 @@ class FileGatewayManager:
                                             "ports": [{"containerPort": self.config.worker_container_port}],
                                             "env": [
                                                 {"name": "APP_PORT", "value": str(self.config.worker_container_port)},
+                                                {"name": "APP_WORKERS", "value": str(self.config.worker_processes)},
                                                 {"name": "PVC_MOUNT_PATH", "value": self.config.worker_mount_path},
                                                 {"name": "FILE_GATEWAY_INTERNAL_TOKEN", "value": self.config.internal_token},
                                             ],
@@ -213,20 +215,20 @@ class FileGatewayManager:
                                                     "path": "/health",
                                                     "port": self.config.worker_container_port,
                                                 },
-                                                "initialDelaySeconds": 1,
-                                                "periodSeconds": 2,
-                                                "timeoutSeconds": 1,
-                                                "failureThreshold": 15,
+                                                "initialDelaySeconds": 2,
+                                                "periodSeconds": 5,
+                                                "timeoutSeconds": 3,
+                                                "failureThreshold": 12,
                                             },
                                             "livenessProbe": {
                                                 "httpGet": {
                                                     "path": "/health",
                                                     "port": self.config.worker_container_port,
                                                 },
-                                                "initialDelaySeconds": 5,
-                                                "periodSeconds": 10,
-                                                "timeoutSeconds": 2,
-                                                "failureThreshold": 3,
+                                                "initialDelaySeconds": 60,
+                                                "periodSeconds": 30,
+                                                "timeoutSeconds": 5,
+                                                "failureThreshold": 20,
                                             },
                                             "volumeMounts": [
                                                 {"name": "target-pvc", "mountPath": self.config.worker_mount_path}
@@ -284,13 +286,14 @@ class FileGatewayManager:
         json_body: Optional[Dict[str, Any]] = None,
         files: Optional[Dict[str, Any]] = None,
         data: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[int] = None,
     ) -> Any:
         endpoint = self.ensure_worker(project_id, pvc_name)
         headers = {}
         if self.config.internal_token:
             headers["X-Internal-Token"] = self.config.internal_token
         url = f"{endpoint['base_url']}{path}"
-        timeout = httpx.Timeout(self.config.worker_request_timeout_seconds)
+        timeout = httpx.Timeout(timeout_seconds or self.config.worker_request_timeout_seconds)
         try:
             with httpx.Client(timeout=timeout) as client:
                 response = client.request(
@@ -355,7 +358,15 @@ class FileGatewayManager:
 
     def upload_file_bytes(self, project_id: str, pvc_name: str, path: str, filename: str, content: bytes) -> Dict[str, Any]:
         files = {"file": (filename, content, "application/octet-stream")}
-        return self._request_worker("POST", project_id, pvc_name, "/fs/upload", files=files, data={"path": path})
+        return self._request_worker(
+            "POST",
+            project_id,
+            pvc_name,
+            "/fs/upload",
+            files=files,
+            data={"path": path},
+            timeout_seconds=self.config.worker_upload_request_timeout_seconds,
+        )
 
     def upload_file_stream(
         self,
@@ -372,7 +383,15 @@ class FileGatewayManager:
             except Exception:
                 pass
         files = {"file": (filename, file_obj, content_type)}
-        return self._request_worker("POST", project_id, pvc_name, "/fs/upload", files=files, data={"path": path})
+        return self._request_worker(
+            "POST",
+            project_id,
+            pvc_name,
+            "/fs/upload",
+            files=files,
+            data={"path": path},
+            timeout_seconds=self.config.worker_upload_request_timeout_seconds,
+        )
 
     def create_directory(self, project_id: str, pvc_name: str, path: str, name: str) -> Dict[str, Any]:
         return self._request_worker(
@@ -406,7 +425,15 @@ class FileGatewayManager:
 
     def extract_archive(self, project_id: str, pvc_name: str, path: str, filename: str, content: bytes) -> Dict[str, Any]:
         files = {"file": (filename, content, "application/octet-stream")}
-        return self._request_worker("POST", project_id, pvc_name, "/fs/extract", files=files, data={"path": path})
+        return self._request_worker(
+            "POST",
+            project_id,
+            pvc_name,
+            "/fs/extract",
+            files=files,
+            data={"path": path},
+            timeout_seconds=self.config.worker_upload_request_timeout_seconds,
+        )
 
     def extract_archive_stream(
         self,
@@ -423,7 +450,15 @@ class FileGatewayManager:
             except Exception:
                 pass
         files = {"file": (filename, file_obj, content_type)}
-        return self._request_worker("POST", project_id, pvc_name, "/fs/extract", files=files, data={"path": path})
+        return self._request_worker(
+            "POST",
+            project_id,
+            pvc_name,
+            "/fs/extract",
+            files=files,
+            data={"path": path},
+            timeout_seconds=self.config.worker_upload_request_timeout_seconds,
+        )
 
 
 _file_gateway_manager: Optional[FileGatewayManager] = None
