@@ -2080,12 +2080,14 @@ class KubernetesService:
     def create_pvc(self, namespace: str, manifest: Dict) -> Dict:
         """创建PVC"""
         try:
-            from kubernetes.client import V1PersistentVolumeClaim
             pvc = self._dict_to_v1_pvc(manifest)
             result = self.core_v1.create_namespaced_persistent_volume_claim(namespace=namespace, body=pvc)
             return self._pvc_to_dict(result)
         except ApiException as e:
             self._handle_api_exception(e, "PVC", "创建")
+        except Exception as e:
+            logger.error(f"K8S PVC创建异常: {e}")
+            raise InternalError(f"PVC创建失败: {e}")
 
     def delete_pvc(self, namespace: str, name: str) -> Dict:
         """删除PVC"""
@@ -2165,9 +2167,17 @@ class KubernetesService:
     def _dict_to_v1_pvc(self, manifest: Dict):
         """字典转V1PersistentVolumeClaim对象"""
         from kubernetes.client import (
-            V1PersistentVolumeClaim, V1ObjectMeta,
-            V1PersistentVolumeClaimSpec, V1PersistentVolumeClaimResources,
+            V1PersistentVolumeClaim,
+            V1ObjectMeta,
+            V1PersistentVolumeClaimSpec,
         )
+
+        # kubernetes python client compatibility:
+        # some versions use V1PersistentVolumeClaimResources, others use V1VolumeResourceRequirements.
+        try:
+            from kubernetes.client import V1PersistentVolumeClaimResources as _PvcResources  # type: ignore
+        except ImportError:
+            from kubernetes.client import V1VolumeResourceRequirements as _PvcResources  # type: ignore
 
         metadata = manifest.get("metadata", {})
         spec = manifest.get("spec", {})
@@ -2175,11 +2185,11 @@ class KubernetesService:
         pvc_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=metadata.get("labels", metadata.get("label", {})) or {},
+            annotations=metadata.get("annotations", metadata.get("annotation", {})) or {},
         )
 
-        resources = V1PersistentVolumeClaimResources(
+        resources = _PvcResources(
             requests=spec.get("resources", {}).get("requests", {})
         )
 
