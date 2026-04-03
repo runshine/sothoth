@@ -598,6 +598,50 @@ class DatabaseManager:
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_name ON {table_agent_services}(service_name)')
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_agent_services_seen ON {table_agent_services}(last_seen_at)')
 
+            # 创建AI Helper健康快照表（后台周期刷新，前端读快照）
+            table_ai_helper_health = f"{prefix}ai_helper_health_snapshots"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_helper_health} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               service_name VARCHAR(200) NOT NULL,
+                               health_status VARCHAR(32) DEFAULT 'unknown',
+                               health_payload_json JSON,
+                               last_error TEXT,
+                               checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               pod_id VARCHAR(100),
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               UNIQUE KEY uniq_ai_helper_health (project_id, agent_key, service_name),
+                               INDEX idx_ai_helper_health_project (project_id),
+                               INDEX idx_ai_helper_health_status (health_status),
+                               INDEX idx_ai_helper_health_checked (checked_at)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_ai_helper_health} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               service_name TEXT NOT NULL,
+                               health_status TEXT DEFAULT 'unknown',
+                               health_payload_json TEXT,
+                               last_error TEXT,
+                               checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               pod_id TEXT,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(
+                    f'CREATE UNIQUE INDEX IF NOT EXISTS uniq_ai_helper_health '
+                    f'ON {table_ai_helper_health}(project_id, agent_key, service_name)'
+                )
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_helper_health_project ON {table_ai_helper_health}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_helper_health_status ON {table_ai_helper_health}(health_status)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_ai_helper_health_checked ON {table_ai_helper_health}(checked_at)')
+
             # 创建服务同步历史表
             table_sync_logs = f"{prefix}service_sync_logs"
             if self.db_type == 'mysql':

@@ -20,7 +20,7 @@ from urllib.parse import quote, urlencode, parse_qs
 
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Union
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 
 from model.connection import ConnectionChecker
@@ -169,6 +169,10 @@ class WebAPIServer:
         self.logger.info(f"Agent API超时配置: {agent_api_timeouts}")
         self.logger.info(f"Daemon API快速失败超时: {self.daemon_read_timeout_sec}s")
         self.logger.info(f"Agent TTYD端口: {self.agent_ttyd_port}, 探测超时: {self.ttyd_probe_timeout_sec}s")
+        self.logger.info(f"AI Helper固定REST端口: {self.config.get('helper_rest_port', 20001)}")
+        self.logger.info(
+            f"AI Helper健康快照刷新间隔: {int(self.config.get('helper_health_refresh_interval_sec', self.config.get('refresh_interval', 30)))}s"
+        )
         self.logger.info(f"ConfigCenter服务地址: {self.configcenter_service_url}, 超时: {self.configcenter_service_timeout_sec}s")
         self.logger.info(f"K8S服务地址: {self.k8s_service_url}, 超时: {self.k8s_service_timeout_sec}s")
         self.logger.info(f"代理功能: 已启用")
@@ -1358,20 +1362,11 @@ class WebAPIServer:
         }
 
     def _resolve_helper_rest_port(self, service_row: Dict[str, Any]) -> int:
-        ports = self._parse_ports_json(service_row.get('ports_json'))
-        for value in ports.values():
-            text = str(value or '').strip()
-            if not text:
-                continue
-            if ':' in text:
-                first = text.split(':', 1)[0]
-                if first.isdigit():
-                    return int(first)
-            if text.isdigit():
-                port = int(text)
-                if port == 20001:
-                    return port
-        return 20001
+        # Helper REST端口固定，不再从 ports_json 推断，避免误判 unhealthy。
+        try:
+            return int(self.config.get('helper_rest_port', 20001))
+        except Exception:
+            return 20001
 
     def _get_ai_helper_service_row(self, project_id: str, agent_key: str, service_name: str) -> Optional[Dict[str, Any]]:
         table_name = self.db_manager.get_table_name('agent_services')
@@ -1420,12 +1415,213 @@ class WebAPIServer:
 
         rest_port = self._resolve_helper_rest_port(row)
         target = f"http://{agent_ip}:{rest_port}{endpoint}"
+        self.logger.debug(
+            f"call_ai_helper_api target={target} project={project_id} agent={agent_key} service={service_name}"
+        )
         response = requests.request(method.upper(), target, json=payload, timeout=timeout)
         try:
             data = response.json() if response.content else {}
         except Exception:
             data = {'raw': response.text}
         return data, response.status_code
+
+    def _parse_ai_helper_health_payload(self, raw_payload: Any) -> Dict[str, Any]:
+        if isinstance(raw_payload, dict):
+            return raw_payload
+        if isinstance(raw_payload, str):
+            try:
+                parsed = json.loads(raw_payload)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                return {}
+        return {}
+
+    def _get_ai_helper_health_snapshot(self, project_id: str, agent_key: str, service_name: str) -> Dict[str, Any]:
+        table_name = self.db_manager.get_table_name('ai_helper_health_snapshots')
+        row = self.db_manager.fetch_one(
+            f"""
+            SELECT project_id, agent_key, service_name, health_status, health_payload_json, last_error, checked_at, pod_id
+            FROM {table_name}
+            WHERE project_id = %s AND agent_key = %s AND service_name = %s
+            LIMIT 1
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            SELECT project_id, agent_key, service_name, health_status, health_payload_json, last_error, checked_at, pod_id
+            FROM {table_name}
+            WHERE project_id = ? AND agent_key = ? AND service_name = ?
+            LIMIT 1
+            """,
+            (project_id, agent_key, service_name)
+        )
+        if not row:
+            return {
+                'health_status': 'unknown',
+                'health_payload': {'status': 'unknown'},
+                'last_error': '',
+                'checked_at': None,
+                'pod_id': None,
+            }
+        payload = self._parse_ai_helper_health_payload(row.get('health_payload_json'))
+        last_error = str(row.get('last_error') or '').strip()
+        if last_error:
+            payload = dict(payload or {})
+            payload['last_error'] = last_error
+        return {
+            'health_status': str(row.get('health_status') or 'unknown').strip().lower() or 'unknown',
+            'health_payload': payload if isinstance(payload, dict) else {},
+            'last_error': last_error,
+            'checked_at': str(row.get('checked_at')) if row.get('checked_at') else None,
+            'pod_id': row.get('pod_id'),
+        }
+
+    def _get_ai_helper_health_snapshot_map(self, project_id: str) -> Dict[Tuple[str, str], Dict[str, Any]]:
+        table_name = self.db_manager.get_table_name('ai_helper_health_snapshots')
+        rows = self.db_manager.fetch_all(
+            f"""
+            SELECT project_id, agent_key, service_name, health_status, health_payload_json, last_error, checked_at, pod_id
+            FROM {table_name}
+            WHERE project_id = %s
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            SELECT project_id, agent_key, service_name, health_status, health_payload_json, last_error, checked_at, pod_id
+            FROM {table_name}
+            WHERE project_id = ?
+            """,
+            (project_id,)
+        ) or []
+        result: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for row in rows:
+            key = (str(row.get('agent_key') or '').strip(), str(row.get('service_name') or '').strip())
+            if not key[0] or not key[1]:
+                continue
+            payload = self._parse_ai_helper_health_payload(row.get('health_payload_json'))
+            last_error = str(row.get('last_error') or '').strip()
+            if last_error:
+                payload = dict(payload or {})
+                payload['last_error'] = last_error
+            result[key] = {
+                'health_status': str(row.get('health_status') or 'unknown').strip().lower() or 'unknown',
+                'health_payload': payload if isinstance(payload, dict) else {},
+                'last_error': last_error,
+                'checked_at': str(row.get('checked_at')) if row.get('checked_at') else None,
+                'pod_id': row.get('pod_id'),
+            }
+        return result
+
+    def _upsert_ai_helper_health_snapshot(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        health_status: str,
+        health_payload: Dict[str, Any],
+        last_error: str = '',
+    ) -> None:
+        table_name = self.db_manager.get_table_name('ai_helper_health_snapshots')
+        status_text = str(health_status or 'unknown').strip().lower() or 'unknown'
+        payload_json = json.dumps(health_payload or {}, ensure_ascii=False)
+        if self.db_manager.db_type == 'mysql':
+            self.db_manager.execute_query(
+                f"""
+                INSERT INTO {table_name}
+                (project_id, agent_key, service_name, health_status, health_payload_json, last_error, checked_at, pod_id)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW(), %s)
+                ON DUPLICATE KEY UPDATE
+                  health_status = VALUES(health_status),
+                  health_payload_json = VALUES(health_payload_json),
+                  last_error = VALUES(last_error),
+                  checked_at = NOW(),
+                  pod_id = VALUES(pod_id),
+                  updated_at = NOW()
+                """,
+                (project_id, agent_key, service_name, status_text, payload_json, str(last_error or ''), self.config.get('pod_id', ''))
+            )
+        else:
+            now_ts = datetime.now().isoformat()
+            self.db_manager.execute_query(
+                f"""
+                INSERT INTO {table_name}
+                (project_id, agent_key, service_name, health_status, health_payload_json, last_error, checked_at, pod_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, agent_key, service_name) DO UPDATE SET
+                  health_status=excluded.health_status,
+                  health_payload_json=excluded.health_payload_json,
+                  last_error=excluded.last_error,
+                  checked_at=excluded.checked_at,
+                  pod_id=excluded.pod_id,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    project_id, agent_key, service_name, status_text, payload_json, str(last_error or ''),
+                    now_ts, self.config.get('pod_id', ''), now_ts
+                )
+            )
+
+    def _refresh_ai_helper_health_snapshots(self) -> Dict[str, Any]:
+        """周期刷新所有AI Helper健康快照（leader-only调用）。"""
+        table_name = self.db_manager.get_table_name('agent_services')
+        rows = self.db_manager.fetch_all(
+            f"""
+            SELECT project_id, agent_key, service_name, tags_json, is_stale
+            FROM {table_name}
+            WHERE is_stale = 0
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            SELECT project_id, agent_key, service_name, tags_json, is_stale
+            FROM {table_name}
+            WHERE is_stale = 0
+            """
+        ) or []
+
+        total = 0
+        success = 0
+        failed = 0
+        for row in rows:
+            project_id = str(row.get('project_id') or '').strip()
+            agent_key = str(row.get('agent_key') or '').strip()
+            service_name = str(row.get('service_name') or '').strip()
+            if not project_id or not agent_key or not service_name:
+                continue
+            if not self._has_ai_helper_tag(row.get('tags_json')):
+                continue
+            total += 1
+            try:
+                payload, code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'GET',
+                    '/api/ai-agents/health',
+                    None,
+                    timeout=(5, 20),
+                )
+                status = 'healthy' if code < 300 else 'unhealthy'
+                last_error = '' if code < 300 else f'upstream_status_{code}'
+                self._upsert_ai_helper_health_snapshot(project_id, agent_key, service_name, status, payload, last_error)
+                if code < 300:
+                    success += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                failed += 1
+                self._upsert_ai_helper_health_snapshot(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'unhealthy',
+                    {'status': 'unreachable', 'error': str(exc)},
+                    str(exc),
+                )
+        summary = {
+            'total': total,
+            'success': success,
+            'failed': failed,
+            'checked_at': datetime.now().isoformat(),
+            'pod_id': self.config.get('pod_id'),
+        }
+        self.logger.info(f"AI helper健康快照刷新完成: total={total} success={success} failed={failed}")
+        return summary
 
     def _serialize_ai_helper_item(self, row: Dict[str, Any], health_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         tags = self._normalize_service_tags(row.get('tags_json'))
@@ -2478,17 +2674,28 @@ class WebAPIServer:
                 return jsonify({'error': 'project_id parameter is required'}), 400
 
             agents, total = self.agent_manager.list_agents(page, per_page, project_id)
+            list_diag = self.agent_manager.get_last_list_diag()
+            refresh_diag = self.agent_manager.get_last_refresh_diag()
             return jsonify({
                 'agents': agents,
                 'page': page,
                 'per_page': per_page,
                 'total': total,
-                'project_id': project_id
+                'project_id': project_id,
+                'diagnostics': {
+                    'list': list_diag,
+                    'refresh': refresh_diag,
+                    'redis': {
+                        'enabled': bool(self.redis_manager.enabled),
+                        'used_for_agent_list_cache': False,
+                    },
+                    'note': 'agent list reads DB snapshot + in-memory merge; redis currently used for distributed locks'
+                }
             })
 
         @self.app.route('/api/agent/agents/refresh', methods=['POST'])
         def refresh_agents():
-            executed, message = self._run_refresh_cycle(include_service_sync=True)
+            executed, message = self._run_refresh_cycle(include_service_sync=True, include_helper_health_sync=True)
             status_code = 200 if executed else 202
             return jsonify({
                 'executed': executed,
@@ -2804,6 +3011,117 @@ class WebAPIServer:
                 })
             except Exception as e:
                 self.logger.error(f"获取Agent状态历史失败: {str(e)}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/agents/<agent_key>/diagnostics', methods=['GET'])
+        def get_agent_diagnostics(agent_key):
+            """获取指定Agent的稳定快照诊断信息，不触发主动探测。"""
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id parameter is required'}), 400
+
+                table_name = self.db_manager.get_table_name('agent_status')
+                if self.db_manager.db_type == 'mysql':
+                    row = self.db_manager.fetch_one(
+                        f"""
+                        SELECT agent_key, ip_address, hostname, project_id, status, last_seen, updated_at, pod_id
+                        FROM {table_name}
+                        WHERE agent_key = %s AND project_id = %s
+                        LIMIT 1
+                        """,
+                        (agent_key, project_id)
+                    )
+                else:
+                    row = self.db_manager.fetch_one(
+                        f"""
+                        SELECT agent_key, ip_address, hostname, project_id, status, last_seen, updated_at, pod_id
+                        FROM {table_name}
+                        WHERE agent_key = ? AND project_id = ?
+                        LIMIT 1
+                        """,
+                        (agent_key, project_id)
+                    )
+
+                if not row:
+                    return jsonify({'error': f'Agent {agent_key} not found in project {project_id}'}), 404
+
+                def _parse_dt(value: Any) -> Optional[datetime]:
+                    if not value:
+                        return None
+                    try:
+                        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+                        if dt.tzinfo is not None:
+                            dt = dt.astimezone().replace(tzinfo=None)
+                        return dt
+                    except Exception:
+                        return None
+
+                def _pick_ts(item: Dict[str, Any]) -> Optional[datetime]:
+                    observed = _parse_dt(item.get('observed_at'))
+                    if observed:
+                        return observed
+                    return _parse_dt(item.get('created_at'))
+
+                status = str(row.get('status') or 'unknown').lower()
+                last_seen_text = str(row.get('last_seen')) if row.get('last_seen') else None
+                updated_at_text = str(row.get('updated_at')) if row.get('updated_at') else None
+                status_reason = ''
+                if status == 'online':
+                    latest_ref = self.agent_manager._latest_stale_reference(last_seen_text, updated_at_text)
+                    if latest_ref:
+                        try:
+                            if datetime.now() - latest_ref > timedelta(minutes=5):
+                                status_reason = '节点超过5分钟未上报心跳（提示），状态以后端实际写库为准'
+                        except Exception:
+                            status_reason = ''
+
+                agent_snapshot = {
+                    'key': row.get('agent_key'),
+                    'project_id': row.get('project_id'),
+                    'status': status,
+                    'ip_address': row.get('ip_address'),
+                    'hostname': row.get('hostname'),
+                    'last_seen': last_seen_text,
+                    'updated_at': updated_at_text,
+                    'pod_id': row.get('pod_id'),
+                    'status_reason': status_reason or None,
+                }
+
+                events = self.agent_manager.list_agent_status_history(project_id, agent_key, limit=100)
+                latest_event = events[0] if events else None
+                now = datetime.now()
+                window_start = now - timedelta(hours=24)
+                ups_24h = 0
+                downs_24h = 0
+                for item in events:
+                    ts = _pick_ts(item)
+                    if not ts or ts < window_start:
+                        continue
+                    to_online = str(item.get('edge_state_to') or '').lower() == 'online'
+                    if to_online:
+                        ups_24h += 1
+                    else:
+                        downs_24h += 1
+
+                diagnostics = {
+                    'project_id': project_id,
+                    'agent_key': agent_key,
+                    'generated_at': datetime.now().isoformat(),
+                    'agent_snapshot': agent_snapshot,
+                    'refresh_diag': self.agent_manager.get_last_refresh_diag(),
+                    'list_diag': self.agent_manager.get_last_list_diag(),
+                    'event_diag': {
+                        'window_hours': 24,
+                        'up_count_24h': ups_24h,
+                        'down_count_24h': downs_24h,
+                        'latest_event': latest_event,
+                        'total_events': len(events),
+                    },
+                }
+                return jsonify(diagnostics)
+            except Exception as e:
+                self.logger.error(f"获取Agent诊断信息失败: {str(e)}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/agents/<agent_key>/ingress/rebind', methods=['POST'])
@@ -4144,6 +4462,7 @@ class WebAPIServer:
                     """,
                     (project_id,)
                 ) or []
+                health_map = self._get_ai_helper_health_snapshot_map(project_id)
 
                 items = []
                 for row in rows:
@@ -4151,26 +4470,23 @@ class WebAPIServer:
                         continue
                     if not self._has_ai_helper_tag(row.get('tags_json')):
                         continue
-                    health_payload: Dict[str, Any] = {}
-                    health_label = 'unknown'
-                    try:
-                        health_payload, health_code = self._call_ai_helper_api(
-                            project_id,
-                            str(row.get('agent_key') or ''),
-                            str(row.get('service_name') or ''),
-                            'GET',
-                            '/api/ai-agents/health',
-                            None,
-                            timeout=(5, 20),
-                        )
-                        health_label = 'healthy' if health_code < 300 else 'unhealthy'
-                    except Exception as exc:
-                        health_payload = {'status': 'unreachable', 'error': str(exc)}
-                        health_label = 'unhealthy'
+                    helper_key = (
+                        str(row.get('agent_key') or '').strip(),
+                        str(row.get('service_name') or '').strip(),
+                    )
+                    snapshot = health_map.get(helper_key) or {
+                        'health_status': 'unknown',
+                        'health_payload': {'status': 'unknown'},
+                        'checked_at': None,
+                    }
+                    health_payload = snapshot.get('health_payload') if isinstance(snapshot.get('health_payload'), dict) else {}
+                    health_label = str(snapshot.get('health_status') or 'unknown').strip().lower() or 'unknown'
                     if health_status and health_status != health_label:
                         continue
                     item = self._serialize_ai_helper_item(row, health_payload=health_payload)
                     item['health_status'] = health_label
+                    item['health_checked_at'] = snapshot.get('checked_at')
+                    item['health_source'] = 'snapshot'
                     items.append(item)
 
                 return jsonify({
@@ -4219,6 +4535,7 @@ class WebAPIServer:
                     """,
                     (project_id,)
                 ) or []
+                health_map = self._get_ai_helper_health_snapshot_map(project_id)
 
                 items = []
                 for row in rows:
@@ -4231,22 +4548,14 @@ class WebAPIServer:
                     if not self._has_ai_helper_tag(helper_tags):
                         continue
 
-                    helper_health_payload: Dict[str, Any] = {}
-                    helper_health_status = 'unknown'
-                    try:
-                        helper_health_payload, health_code = self._call_ai_helper_api(
-                            project_id,
-                            helper_agent_key,
-                            helper_service_name,
-                            'GET',
-                            '/api/ai-agents/health',
-                            None,
-                            timeout=(5, 20),
-                        )
-                        helper_health_status = 'healthy' if health_code < 300 else 'unhealthy'
-                    except Exception as exc:
-                        helper_health_payload = {'status': 'unreachable', 'error': str(exc)}
-                        helper_health_status = 'unhealthy'
+                    snapshot = health_map.get((helper_agent_key, helper_service_name)) or {
+                        'health_status': 'unknown',
+                        'health_payload': {'status': 'unknown'},
+                        'checked_at': None,
+                    }
+                    helper_health_payload = snapshot.get('health_payload') if isinstance(snapshot.get('health_payload'), dict) else {}
+                    helper_health_status = str(snapshot.get('health_status') or 'unknown').strip().lower() or 'unknown'
+                    helper_health_checked_at = snapshot.get('checked_at')
 
                     if target_helper_health and target_helper_health != helper_health_status:
                         continue
@@ -4292,6 +4601,8 @@ class WebAPIServer:
                             'health_status': helper_health_status,
                             'helper_tags': helper_tags,
                             'helper_health': helper_health_payload,
+                            'health_checked_at': helper_health_checked_at,
+                            'health_source': 'snapshot',
                             'agent_id': agent.get('agent_id'),
                             'name': agent.get('name'),
                             'backend_type': agent.get('backend_type'),
@@ -4445,12 +4756,26 @@ class WebAPIServer:
                 project_id = str(request.args.get('project_id') or '').strip()
                 if not project_id:
                     return jsonify({'error': 'project_id parameter is required'}), 400
+                realtime = str(request.args.get('realtime') or '').strip().lower() == 'true'
                 row = self._get_ai_helper_service_row(project_id, agent_key, service_name)
                 if not row:
                     return jsonify({'error': 'AI helper service not found'}), 404
-                health_payload, health_code = self._call_ai_helper_api(project_id, agent_key, service_name, 'GET', '/api/ai-agents/health', None, timeout=(5, 20))
+                if realtime:
+                    health_payload, health_code = self._call_ai_helper_api(
+                        project_id, agent_key, service_name, 'GET', '/api/ai-agents/health', None, timeout=(5, 20)
+                    )
+                    health_status = 'healthy' if health_code < 300 else 'unhealthy'
+                    health_checked_at = datetime.now().isoformat()
+                else:
+                    snapshot = self._get_ai_helper_health_snapshot(project_id, agent_key, service_name)
+                    health_payload = snapshot.get('health_payload') if isinstance(snapshot.get('health_payload'), dict) else {}
+                    health_code = 200 if str(snapshot.get('health_status') or '').lower() == 'healthy' else 503
+                    health_status = str(snapshot.get('health_status') or 'unknown').lower() or 'unknown'
+                    health_checked_at = snapshot.get('checked_at')
                 detail = self._serialize_ai_helper_item(row, health_payload=health_payload)
-                detail['health_status'] = 'healthy' if health_code < 300 else 'unhealthy'
+                detail['health_status'] = health_status
+                detail['health_checked_at'] = health_checked_at
+                detail['health_source'] = 'snapshot' if not realtime else 'realtime'
                 agents_payload, agents_code = self._call_ai_helper_api(project_id, agent_key, service_name, 'GET', '/api/ai-agents', None, timeout=(5, 30))
                 detail['agents'] = agents_payload.get('items', []) if agents_code < 300 and isinstance(agents_payload, dict) else []
                 return jsonify(detail)
@@ -8764,7 +9089,11 @@ class WebAPIServer:
                 return jsonify({'error': '模板不存在'}), 404
             return parse_template(template['name'])
 
-    def _run_refresh_cycle(self, include_service_sync: bool = False) -> Tuple[bool, str]:
+    def _run_refresh_cycle(
+        self,
+        include_service_sync: bool = False,
+        include_helper_health_sync: bool = False,
+    ) -> Tuple[bool, str]:
         """执行一次leader-only刷新周期。"""
         try:
             lock_timeout = int(self.config.get('leader_lock_timeout_sec', 90))
@@ -8777,6 +9106,8 @@ class WebAPIServer:
                 self.agent_manager.refresh_agents(use_distributed_lock=False)
                 if include_service_sync:
                     self._sync_all_agent_services()
+                if include_helper_health_sync:
+                    self._refresh_ai_helper_health_snapshots()
                 return True, "Agent列表刷新完成"
         except Exception as e:
             self.logger.error(f"执行刷新周期失败: {str(e)}")
@@ -8785,13 +9116,23 @@ class WebAPIServer:
     def _refresh_loop(self):
         """后台刷新循环"""
         service_sync_interval = int(self.config.get('service_sync_interval', self.config.get('refresh_interval', 30)))
+        helper_health_sync_interval = int(
+            self.config.get('helper_health_refresh_interval_sec', self.config.get('refresh_interval', 30))
+        )
         service_sync_elapsed = service_sync_interval
+        helper_health_sync_elapsed = helper_health_sync_interval
         while not self.should_stop:
             try:
                 include_service_sync = service_sync_elapsed >= service_sync_interval
-                executed, _ = self._run_refresh_cycle(include_service_sync=include_service_sync)
+                include_helper_health_sync = helper_health_sync_elapsed >= helper_health_sync_interval
+                executed, _ = self._run_refresh_cycle(
+                    include_service_sync=include_service_sync,
+                    include_helper_health_sync=include_helper_health_sync,
+                )
                 if executed and include_service_sync:
                     service_sync_elapsed = 0
+                if executed and include_helper_health_sync:
+                    helper_health_sync_elapsed = 0
             except Exception as e:
                 self.logger.error(f"后台刷新循环失败: {str(e)}")
 
@@ -8801,6 +9142,7 @@ class WebAPIServer:
                     break
                 time.sleep(1)
                 service_sync_elapsed += 1
+                helper_health_sync_elapsed += 1
 
     def start_refresh_thread(self):
         """启动后台刷新线程"""

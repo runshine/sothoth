@@ -97,6 +97,27 @@ class AgentManager:
         self.nacos_client_uuid_cache = {}
         self.nacos_client_cache_time = 0
         self.nacos_client_cache_ttl = 60  # 缓存60秒
+        self.diag_lock = threading.Lock()
+        self._last_refresh_diag: Dict[str, Any] = {
+            'attempted_at': None,
+            'completed_at': None,
+            'success': None,
+            'message': '',
+            'service_total': 0,
+            'service_parse_skipped': 0,
+            'service_unhealthy_skipped': 0,
+            'agent_key_missing_skipped': 0,
+            'agent_saved': 0,
+            'pod_id': self.pod_id,
+        }
+        self._last_list_diag: Dict[str, Any] = {
+            'generated_at': None,
+            'project_id': None,
+            'memory_lock_acquired': True,
+            'memory_agents_count': 0,
+            'db_rows_count': 0,
+            'pod_id': self.pod_id,
+        }
 
 
     def _test_nacos_connection(self) -> bool:
@@ -655,17 +676,40 @@ class AgentManager:
                 with self.redis_manager.get_lock(lock_key, timeout=30) as lock:
                     if not lock.is_acquired():
                         self.logger.warning(f"POD {self.pod_id} 无法获取锁，跳过本次刷新...")
+                        self._set_refresh_diag(
+                            success=False,
+                            message='refresh skipped: distributed lock not acquired',
+                        )
                         return
                     self._refresh_agents_without_lock()
             else:
                 self._refresh_agents_without_lock()
         except Exception as e:
             self.logger.error(f"刷新Agent列表异常: {str(e)}")
+            self._set_refresh_diag(
+                success=False,
+                message=f"refresh exception: {str(e)}",
+            )
 
     def _refresh_agents_without_lock(self):
+        parse_skipped = 0
+        unhealthy_skipped = 0
+        key_missing_skipped = 0
+        refresh_started_at = datetime.now().isoformat()
         services = self._fetch_nacos_services()
+        service_total = len(services or [])
         if not services:
             self.logger.warning("本轮未从Nacos获取到任何Agent服务，跳过缺失Agent下线收敛")
+            self._set_refresh_diag(
+                success=False,
+                message='no services returned from nacos',
+                attempted_at=refresh_started_at,
+                service_total=0,
+                service_parse_skipped=0,
+                service_unhealthy_skipped=0,
+                agent_key_missing_skipped=0,
+                agent_saved=0,
+            )
             return
 
         new_agents = {}
@@ -677,6 +721,7 @@ class AgentManager:
 
                 if not self._has_healthy_nacos_client_instance(service, ip_address):
                     self.logger.debug(f"跳过无健康实例的agent服务: {service}")
+                    unhealthy_skipped += 1
                     continue
 
                 # 使用新方法获取agent_key，传入service_name
@@ -685,6 +730,7 @@ class AgentManager:
                 # 如果没有获取到有效的agent_key，跳过这个agent
                 if not agent_key:
                     self.logger.debug(f"跳过无效的agent: {hostname} ({ip_address}), 服务: {service}")
+                    key_missing_skipped += 1
                     continue
 
                 agent = AgentInfo(
@@ -713,6 +759,8 @@ class AgentManager:
                     source='refresh_probe'
                 )
                 new_agents[agent_key] = agent
+            else:
+                parse_skipped += 1
 
         self._mark_missing_agents_offline(set(new_agents.keys()))
 
@@ -726,6 +774,42 @@ class AgentManager:
                 del self.agents[key]
 
         self.logger.info(f"Agent列表刷新完成，共 {len(new_agents)} 个有效Agent")
+        self._set_refresh_diag(
+            success=True,
+            message='refresh completed',
+            attempted_at=refresh_started_at,
+            service_total=service_total,
+            service_parse_skipped=parse_skipped,
+            service_unhealthy_skipped=unhealthy_skipped,
+            agent_key_missing_skipped=key_missing_skipped,
+            agent_saved=len(new_agents),
+        )
+
+    def _set_refresh_diag(self, success: bool, message: str, attempted_at: str = None, **kwargs):
+        with self.diag_lock:
+            payload = dict(self._last_refresh_diag)
+            payload.update(kwargs or {})
+            payload['attempted_at'] = attempted_at or datetime.now().isoformat()
+            payload['completed_at'] = datetime.now().isoformat()
+            payload['success'] = bool(success)
+            payload['message'] = message
+            payload['pod_id'] = self.pod_id
+            self._last_refresh_diag = payload
+
+    def get_last_refresh_diag(self) -> Dict[str, Any]:
+        with self.diag_lock:
+            return dict(self._last_refresh_diag)
+
+    def _set_list_diag(self, **kwargs):
+        with self.diag_lock:
+            payload = dict(self._last_list_diag)
+            payload.update(kwargs or {})
+            payload['pod_id'] = self.pod_id
+            self._last_list_diag = payload
+
+    def get_last_list_diag(self) -> Dict[str, Any]:
+        with self.diag_lock:
+            return dict(self._last_list_diag)
 
     def _parse_stale_reference(self, value: Any) -> Optional[datetime]:
         if not value:
@@ -1557,6 +1641,8 @@ class AgentManager:
                 'status': row.get('status') or 'unknown',
                 'pod_id': row.get('pod_id'),
                 'updated_at': str(row.get('updated_at')) if row.get('updated_at') else None,
+                'diag_data_source': 'db_snapshot',
+                'diag_memory_enriched': False,
             }
 
             last_seen = row.get('last_seen')
@@ -1600,7 +1686,10 @@ class AgentManager:
         try:
             if lock_acquired:
                 memory_agents = {
-                    key: agent.to_dict()
+                    key: dict(agent.to_dict(), **{
+                        'diag_data_source': 'memory_realtime',
+                        'diag_memory_enriched': False,
+                    })
                     for key, agent in self.agents.items()
                     if (not project_id) or agent.project_id == project_id
                 }
@@ -1640,9 +1729,12 @@ class AgentManager:
                 for field_name in ('system_info', 'daemon_info', 'services'):
                     if not existing.get(field_name) and agent_data.get(field_name):
                         existing[field_name] = agent_data.get(field_name)
+                        existing['diag_memory_enriched'] = True
                 agents_map[key] = existing
 
             agents_list = list(agents_map.values())
+            refresh_diag = self.get_last_refresh_diag()
+            generated_at = datetime.now().isoformat()
             for item in agents_list:
                 status = (item.get('status') or 'unknown').lower()
                 stale_ref = self._latest_stale_reference(item.get('last_seen'), item.get('updated_at'))
@@ -1656,10 +1748,20 @@ class AgentManager:
                 item['is_allowed'] = status == 'online'
                 item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
                 item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
+                item['diag_list_generated_at'] = generated_at
+                item['diag_last_refresh_completed_at'] = refresh_diag.get('completed_at')
+                item['diag_last_refresh_success'] = refresh_diag.get('success')
 
             total = len(agents_list)
             start_idx = (page - 1) * per_page
             end_idx = start_idx + per_page
+            self._set_list_diag(
+                generated_at=datetime.now().isoformat(),
+                project_id=project_id,
+                memory_lock_acquired=lock_acquired,
+                memory_agents_count=len(memory_agents),
+                db_rows_count=len(rows or []),
+            )
             return agents_list[start_idx:end_idx], total
 
         if self.db.db_type == 'mysql':
@@ -1686,12 +1788,28 @@ class AgentManager:
             for field_name in ('system_info', 'daemon_info', 'services'):
                 if not existing.get(field_name) and agent_data.get(field_name):
                     existing[field_name] = agent_data.get(field_name)
+                    existing['diag_memory_enriched'] = True
             agents_map[key] = existing
 
         agents_list = list(agents_map.values())
+        refresh_diag = self.get_last_refresh_diag()
+        generated_at = datetime.now().isoformat()
+        for item in agents_list:
+            item.setdefault('diag_data_source', 'db_snapshot')
+            item.setdefault('diag_memory_enriched', False)
+            item['diag_list_generated_at'] = generated_at
+            item['diag_last_refresh_completed_at'] = refresh_diag.get('completed_at')
+            item['diag_last_refresh_success'] = refresh_diag.get('success')
         total = len(agents_list)
         start_idx = (page - 1) * per_page
         end_idx = start_idx + per_page
+        self._set_list_diag(
+            generated_at=generated_at,
+            project_id=project_id,
+            memory_lock_acquired=lock_acquired,
+            memory_agents_count=len(memory_agents),
+            db_rows_count=len(rows or []),
+        )
         return agents_list[start_idx:end_idx], total
 
     def call_agent_api(self, agent_key: str, method: str, endpoint: str,
