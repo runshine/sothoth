@@ -251,6 +251,7 @@ class ManualPVCCreateRequest(BaseModel):
 
 class ManualPVCCreateResponse(BaseModel):
     """手动创建PVC资源响应。"""
+    task_id: Optional[str] = None
     resource_id: int
     resource_uuid: str
     resource_type: ResourceType

@@ -37,16 +37,17 @@ class PvcApiFlowTests(unittest.IsolatedAsyncioTestCase):
         fake_k8s.storage_class_name = 'nfs-storage-192.168.13.66'
         fake_k8s.get_pvc_name.return_value = 'secflow-pvc-test'
         fake_k8s.get_project_namespace.return_value = 'secflow-p1'
-        fake_k8s.create_pvc.return_value = True
 
         with (
             mock.patch('app.api.resources.validate_project_access', new=mock.AsyncMock(return_value=(True, {'id': 'p1'}))),
             mock.patch('app.api.resources.get_k8s_service', return_value=fake_k8s),
             mock.patch('app.api.resources.get_config', return_value={'k8s': {'storage_class_name': 'nfs-storage-192.168.13.66'}}),
+            mock.patch('app.api.resources.create_manual_pvc_task', new=mock.AsyncMock(return_value='task-manual-pvc-001')),
         ):
             response = await resources.create_manual_pvc_resource(request, (user, 'token'), db)
 
         self.assertEqual(response.resource_id, 123)
+        self.assertEqual(response.task_id, 'task-manual-pvc-001')
         self.assertEqual(response.pvc_name, 'secflow-pvc-test')
         self.assertEqual(response.namespace, 'secflow-p1')
         self.assertEqual(response.capacity, '3Gi')

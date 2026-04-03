@@ -33,7 +33,7 @@ from app.services.project import get_project_service
 from app.services.k8s import get_k8s_service
 from app.services.pvc_browser import get_pvc_browser_service
 from app.tasks.manager import get_task_manager
-from app.tasks.worker import create_upload_extract_task, create_delete_resource_task
+from app.tasks.worker import create_upload_extract_task, create_delete_resource_task, create_manual_pvc_task
 from app.main import get_config
 
 logger = logging.getLogger(__name__)
@@ -1060,19 +1060,6 @@ async def create_manual_pvc_resource(
         namespace=namespace,
     )
 
-    created_pvc = k8s_service.create_pvc(
-        project_id=request.project_id,
-        pvc_name=pvc_name,
-        size=request.pvc_size,
-        storage_class=storage_class
-    )
-    if not created_pvc:
-        reason = (k8s_service.get_last_error() or "").strip()
-        detail = "Failed to create PVC"
-        if reason:
-            detail = f"{detail}: {reason}"
-        raise HTTPException(status_code=500, detail=detail)
-
     resource = Resource(
         resource_uuid=resource_uuid,
         name=request.name,
@@ -1081,8 +1068,8 @@ async def create_manual_pvc_resource(
         original_file_name="manual_pvc",
         original_file_size=0,
         original_file_format=None,
-        upload_status=ResourceUploadStatus.COMPLETED,
-        upload_message="Manual PVC created successfully",
+        upload_status=ResourceUploadStatus.PENDING,
+        upload_message="Manual PVC task queued",
         pvc_name=pvc_name,
         pvc_namespace=namespace,
         pvc_size=f"{request.pvc_size}Gi",
@@ -1094,14 +1081,27 @@ async def create_manual_pvc_resource(
     db.commit()
     db.refresh(resource)
 
+    task_id = await create_manual_pvc_task(
+        resource_id=resource.id,
+        project_id=request.project_id,
+        resource_uuid=resource_uuid,
+        resource_name=request.name,
+        resource_type=request.resource_type.value if hasattr(request.resource_type, "value") else str(request.resource_type),
+        pvc_name=pvc_name,
+        pvc_namespace=namespace,
+        pvc_size=request.pvc_size,
+        storage_class=storage_class,
+    )
+
     return ManualPVCCreateResponse(
+        task_id=task_id,
         resource_id=resource.id,
         resource_uuid=resource_uuid,
         resource_type=request.resource_type,
         pvc_name=pvc_name,
         namespace=namespace,
         capacity=f"{request.pvc_size}Gi",
-        message=f"Manual PVC '{request.name}' created successfully"
+        message=f"Manual PVC task queued: {task_id}"
     )
 
 

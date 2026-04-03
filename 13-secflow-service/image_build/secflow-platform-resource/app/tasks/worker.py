@@ -384,6 +384,89 @@ class ResourceTaskWorker:
             await task_manager.append_task_log(task_id, f"Fatal error: {str(e)}")
             raise
 
+    @staticmethod
+    async def process_manual_pvc_create(
+        task_id: str,
+        db_session: Session,
+        task: AsyncTaskLog,
+        resource_id: int,
+        project_id: str,
+        resource_uuid: str,
+        resource_name: str,
+        resource_type: str,
+        pvc_name: str,
+        pvc_namespace: str,
+        pvc_size: int,
+        storage_class: Optional[str],
+    ) -> dict:
+        """处理手动创建空白PVC任务（异步）。"""
+        from app.tasks.manager import get_task_manager
+        task_manager = get_task_manager()
+        k8s_service = get_k8s_service()
+
+        try:
+            await task_manager.append_task_log(task_id, f"Starting manual pvc task for {resource_name}")
+            await task_manager.update_task_progress(task_id, 10, "Preparing PVC creation")
+
+            resource = db_session.query(Resource).filter(Resource.id == resource_id).first()
+            if not resource:
+                raise Exception(f"Resource not found: {resource_id}")
+
+            resource.upload_status = ResourceUploadStatus.UPLOADING
+            resource.upload_message = "Creating PVC"
+            db_session.commit()
+
+            await task_manager.append_task_log(
+                task_id,
+                f"Creating PVC name={pvc_name} namespace={pvc_namespace} storage_class={storage_class or k8s_service.storage_class_name}",
+            )
+            await task_manager.update_task_progress(task_id, 35, "Creating PVC")
+
+            created_pvc = k8s_service.create_pvc(
+                project_id=project_id,
+                pvc_name=pvc_name,
+                size=pvc_size,
+                storage_class=storage_class,
+            )
+            if not created_pvc:
+                reason = (k8s_service.get_last_error() or "").strip()
+                if reason:
+                    raise Exception(f"Failed to create PVC: {pvc_name}. reason={reason}")
+                raise Exception(f"Failed to create PVC: {pvc_name}")
+
+            await task_manager.update_task_progress(task_id, 70, "Waiting for PVC to be ready")
+            pvc_bound = k8s_service.wait_for_pvc_bound(project_id, pvc_name, timeout=120)
+            if not pvc_bound:
+                raise Exception(f"PVC {pvc_name} did not become Bound within timeout")
+
+            resource.upload_status = ResourceUploadStatus.COMPLETED
+            resource.upload_message = "Manual PVC created successfully"
+            db_session.commit()
+
+            await task_manager.append_task_log(task_id, f"Manual PVC created successfully: {pvc_name}")
+            await task_manager.update_task_progress(task_id, 100, "Task completed")
+
+            return {
+                "task_id": task_id,
+                "resource_id": resource_id,
+                "resource_uuid": resource_uuid,
+                "resource_type": resource_type,
+                "pvc_name": pvc_name,
+                "pvc_namespace": pvc_namespace,
+                "capacity": f"{pvc_size}Gi",
+                "status": "completed",
+            }
+
+        except Exception as e:
+            logger.error(f"Manual PVC task {task_id} failed: {e}")
+            resource = db_session.query(Resource).filter(Resource.id == resource_id).first()
+            if resource:
+                resource.upload_status = ResourceUploadStatus.FAILED
+                resource.upload_message = str(e)
+                db_session.commit()
+            await task_manager.append_task_log(task_id, f"Error: {str(e)}")
+            raise
+
 
 async def create_upload_extract_task(
     resource_uuid: str,
@@ -461,6 +544,61 @@ async def create_upload_extract_task(
             original_file_md5=original_file_md5,
             original_file_format=original_file_format
         )
+    )
+
+    return task.task_id
+
+
+async def create_manual_pvc_task(
+    resource_id: int,
+    project_id: str,
+    resource_uuid: str,
+    resource_name: str,
+    resource_type: str,
+    pvc_name: str,
+    pvc_namespace: str,
+    pvc_size: int,
+    storage_class: Optional[str] = None,
+) -> str:
+    """创建并启动手动空白PVC任务。"""
+    from app.models.database import TaskType
+    from app.tasks.manager import get_task_manager
+
+    task_manager = get_task_manager()
+
+    task = await task_manager.create_task(
+        task_type=TaskType.EXTRACT,
+        project_id=project_id,
+        resource_id=resource_id,
+        input_params={
+            "resource_id": resource_id,
+            "resource_uuid": resource_uuid,
+            "resource_name": resource_name,
+            "resource_type": resource_type,
+            "pvc_name": pvc_name,
+            "pvc_namespace": pvc_namespace,
+            "pvc_size": pvc_size,
+            "storage_class": storage_class,
+            "mode": "manual_pvc_create",
+        },
+    )
+
+    await task_manager.start_task(
+        task_id=task.task_id,
+        coro=ResourceTaskWorker.process_manual_pvc_create(
+            task_id=task.task_id,
+            db_session=database.SessionLocal(),
+            task=task,
+            resource_id=resource_id,
+            project_id=project_id,
+            resource_uuid=resource_uuid,
+            resource_name=resource_name,
+            resource_type=resource_type,
+            pvc_name=pvc_name,
+            pvc_namespace=pvc_namespace,
+            pvc_size=pvc_size,
+            storage_class=storage_class,
+        ),
     )
 
     return task.task_id
