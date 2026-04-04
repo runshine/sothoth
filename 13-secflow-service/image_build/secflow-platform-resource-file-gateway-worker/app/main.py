@@ -188,16 +188,20 @@ def read_file(path: str = Query(...), max_bytes: int = Query(1048576, ge=0, le=1
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
 
-    data = target.read_bytes()
-    truncated = False
-    if max_bytes and len(data) > max_bytes:
-        data = data[:max_bytes]
-        truncated = True
+    size = target.stat().st_size
+    if max_bytes <= 0:
+        data = b""
+        truncated = size > 0
+    else:
+        # Never read the full file into memory for preview detection.
+        with target.open("rb") as fh:
+            data = fh.read(max_bytes)
+        truncated = size > len(data)
 
     return {
         "path": target_path,
         "filename": target.name,
-        "size": target.stat().st_size,
+        "size": size,
         "content_type": mimetypes.guess_type(target.name)[0],
         "truncated": truncated,
         "base64": base64.b64encode(data).decode("ascii"),
