@@ -441,3 +441,34 @@ def test_create_passes_unified_env(monkeypatch):
 
     manager.executor.shutdown(wait=False)
 
+
+def test_create_sanitizes_k8s_resource_names(monkeypatch):
+    code_server = _make_code_server()
+    db = FakeDB(code_server)
+    fake_k8s = FakeK8s()
+
+    monkeypatch.setattr("app.services.task_manager.get_k8s_service", lambda: fake_k8s)
+    monkeypatch.setattr("app.services.task_manager.get_configcenter_client", lambda: FakeConfigCenter({}))
+
+    manager = TaskManager()
+    task = SimpleNamespace(
+        project_id="p1",
+        params={
+            "code_server_id": "cs-ABC12345",
+            "namespace": "secflow-p1",
+            "name": "NE",
+            "env": {},
+            "code_server_env": {},
+            "image": "",
+            "llm_provider_keys": [],
+        },
+    )
+
+    manager._handle_create_task(task, db)
+
+    assert code_server.deployment_name == "code-server-ne-csabc1"
+    assert code_server.service_name == "code-server-ne-csabc1"
+    assert code_server.ingress_name == "code-server-ne-csabc1"
+    assert fake_k8s.deployment_call["name"] == "code-server-ne-csabc1"
+
+    manager.executor.shutdown(wait=False)

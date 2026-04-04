@@ -108,6 +108,27 @@ class TaskManager:
         finally:
             db.close()
 
+    @staticmethod
+    def _build_k8s_resource_name(prefix: str, raw_name: str, unique_id: str = "") -> str:
+        """
+        生成符合 DNS-1123 的 K8S 资源名。
+        规则：
+        - 小写化
+        - 非 [a-z0-9-] 替换为 '-'
+        - 连续 '-' 压缩并去除首尾 '-'
+        - 追加短唯一后缀，避免仅大小写不同导致冲突
+        """
+        base_name = re.sub(r"[^a-z0-9-]+", "-", str(raw_name or "").lower())
+        base_name = re.sub(r"-{2,}", "-", base_name).strip("-") or "instance"
+        suffix = re.sub(r"[^a-z0-9]+", "", str(unique_id or "").lower())[:6]
+        if suffix:
+            max_base_len = 63 - len(prefix) - 1 - 1 - len(suffix)
+            safe_base = base_name[:max(1, max_base_len)].rstrip("-") or "instance"
+            return f"{prefix}-{safe_base}-{suffix}"
+        max_base_len = 63 - len(prefix) - 1
+        safe_base = base_name[:max(1, max_base_len)].rstrip("-") or "instance"
+        return f"{prefix}-{safe_base}"
+
     def create_task(self, project_id: str, task_type: str, params: Dict[str, Any],
                    code_server_id: str = None, code_server_name: str = None) -> Task:
         """创建任务"""
@@ -407,7 +428,11 @@ class TaskManager:
 
                 if not pvc_name:
                     # 生成PVC名称
-                    pvc_name = f"{name}-output-{len(output_pvcs_config)}"
+                    pvc_name = self._build_k8s_resource_name(
+                        "cs-out",
+                        f"{name}-{len(output_pvcs_config)}",
+                        code_server_id,
+                    )
 
                 # 检查并创建PVC
                 if not k8s_service.check_pvc_exists(namespace, pvc_name):
@@ -425,7 +450,8 @@ class TaskManager:
             db.commit()
 
             # 2. 创建Deployment
-            deployment_name = f"code-server-{name}"
+            resource_base_name = self._build_k8s_resource_name("code-server", name, code_server_id)
+            deployment_name = resource_base_name
             success, final_env = k8s_service.create_deployment(
                 namespace=namespace,
                 name=deployment_name,
@@ -449,7 +475,7 @@ class TaskManager:
             db.commit()
 
             # 3. 创建Service
-            service_name = f"code-server-{name}"
+            service_name = resource_base_name
             cluster_ip = k8s_service.create_service(namespace, service_name, code_server_id)
             if not cluster_ip:
                 raise RuntimeError(f"创建Service {service_name} 失败")
@@ -458,7 +484,7 @@ class TaskManager:
             db.commit()
 
             # 4. 创建Ingress
-            ingress_name = f"code-server-{name}"
+            ingress_name = resource_base_name
             host = k8s_service.create_ingress(namespace, ingress_name, code_server_id, service_name)
             if host is None:
                 raise RuntimeError(f"创建Ingress {ingress_name} 失败")
