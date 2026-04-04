@@ -1542,8 +1542,8 @@ class KubernetesService:
     def scale_deployment(self, namespace: str, name: str, replicas: int) -> Dict:
         """扩缩容Deployment"""
         try:
-            from kubernetes.client import V1Scale
-            scale = V1Scale(replicas=replicas)
+            from kubernetes.client import V1Scale, V1ScaleSpec
+            scale = V1Scale(spec=V1ScaleSpec(replicas=int(replicas)))
             result = self.apps_v1.replace_namespaced_deployment_scale(
                 name=name,
                 namespace=namespace,
