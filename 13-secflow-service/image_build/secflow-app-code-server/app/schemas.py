@@ -57,7 +57,7 @@ class CodeServerEnvResponse(BaseModel):
 class CodeServerCreateRequest(BaseModel):
     """创建Code Server请求"""
     name: str = Field(..., description="Code Server实例名称", min_length=1, max_length=64)
-    namespace: str = Field(..., description="目标K8S Namespace")
+    namespace: Optional[str] = Field(None, description="目标K8S Namespace（已废弃，后端按 project_id 查询）")
     description: Optional[str] = Field(None, description="描述")
     source_pvcs: List[PVCMount] = Field(..., description="源码PVC列表（必须存在）")
     output_pvcs: List[OutputPVCMount] = Field(default=[], description="输出PVC列表（不存在则创建）")

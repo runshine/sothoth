@@ -256,7 +256,17 @@ async def create_code_server(
 
     # 强制以后端项目关联namespace为准，不信任前端提交namespace
     project_client = get_project_client()
-    namespace = project_client.get_project_namespace(project_id)
+    try:
+        namespace = project_client.get_project_namespace(project_id)
+    except Exception as exc:
+        # 项目服务不可用/鉴权异常时回退，避免创建流程被上游短暂故障阻断
+        namespace = f"secflow-{project_id}".replace("_", "-")
+        logger.warning(
+            "查询项目namespace失败，回退到默认命名规则: project_id=%s namespace=%s error=%s",
+            project_id,
+            namespace,
+            exc,
+        )
     req_namespace = str(request.namespace or "").strip()
     if req_namespace and req_namespace != namespace:
         logger.warning("忽略前端namespace，改用项目关联namespace: request=%s resolved=%s project_id=%s", req_namespace, namespace, project_id)
