@@ -86,12 +86,46 @@ class FileGatewayManager:
         return f"{worker_name}-svc"
 
     def get_worker_info(self, project_id: str, pvc_name: str) -> Dict[str, Any]:
+        def _as_int(value: Any) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return 0
+
+        def _pick_int(data: Dict[str, Any], keys: list[str]) -> int:
+            for key in keys:
+                if key in data and data.get(key) is not None:
+                    return _as_int(data.get(key))
+            return 0
+
         worker_name = self._worker_name(project_id, pvc_name)
         service_name = self._service_name(worker_name)
         namespace = get_k8s_service().get_project_namespace(project_id)
         service = get_k8s_service().get_service(project_id, service_name)
         deployment = get_k8s_service().get_deployment(project_id, worker_name)
-        deployment_status = (deployment or {}).get("status", {}) if isinstance(deployment, dict) else {}
+        deployment_obj = deployment if isinstance(deployment, dict) else {}
+        deployment_status = deployment_obj.get("status", {}) if isinstance(deployment_obj.get("status"), dict) else {}
+        replicas = _pick_int(deployment_obj, ["replicas", "desired_replicas"])
+        if replicas <= 0:
+            replicas = _pick_int(deployment_status, ["replicas"])
+        ready_replicas = _pick_int(
+            deployment_obj,
+            ["ready_replicas", "readyReplicas", "readyReplicaCount"],
+        )
+        if ready_replicas <= 0:
+            ready_replicas = _pick_int(
+                deployment_status,
+                ["ready_replicas", "readyReplicas", "readyReplicaCount"],
+            )
+        available_replicas = _pick_int(
+            deployment_obj,
+            ["available_replicas", "availableReplicas", "availableReplicaCount"],
+        )
+        if available_replicas <= 0:
+            available_replicas = _pick_int(
+                deployment_status,
+                ["available_replicas", "availableReplicas", "availableReplicaCount"],
+            )
         return {
             "enabled": bool(self.config.enabled),
             "worker_name": worker_name,
@@ -100,9 +134,9 @@ class FileGatewayManager:
             "worker_image": self.config.worker_image,
             "service_exists": service is not None,
             "deployment_exists": deployment is not None,
-            "replicas": int(deployment_status.get("replicas") or 0),
-            "ready_replicas": int(deployment_status.get("readyReplicas") or 0),
-            "available_replicas": int(deployment_status.get("availableReplicas") or 0),
+            "replicas": replicas,
+            "ready_replicas": ready_replicas,
+            "available_replicas": available_replicas,
         }
 
     def cleanup_worker(self, project_id: str, pvc_name: str) -> Dict[str, Any]:
