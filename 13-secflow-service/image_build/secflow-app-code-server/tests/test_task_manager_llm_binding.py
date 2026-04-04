@@ -60,11 +60,11 @@ class FakeK8s:
     def create_service(self, namespace, name, code_server_id):
         return "10.0.0.1"
 
-    def create_ingress(self, namespace, name, host_prefix, service_name):
+    def create_ingress(self, namespace, name, host, service_name):
         self.ingress_call = {
             "namespace": namespace,
             "name": name,
-            "host_prefix": host_prefix,
+            "host": host,
             "service_name": service_name,
         }
         return "example.test"
@@ -481,7 +481,7 @@ def test_create_sanitizes_k8s_resource_names(monkeypatch):
     manager.executor.shutdown(wait=False)
 
 
-def test_create_uses_random_ingress_host_prefix(monkeypatch):
+def test_create_uses_random_ingress_host(monkeypatch):
     code_server = _make_code_server()
     db = FakeDB(code_server)
     fake_k8s = FakeK8s()
@@ -507,6 +507,6 @@ def test_create_uses_random_ingress_host_prefix(monkeypatch):
     manager._handle_create_task(task, db)
 
     assert fake_k8s.ingress_call is not None
-    assert fake_k8s.ingress_call["host_prefix"] == "cs-abcdef12"
+    assert fake_k8s.ingress_call["host"] == "cs-abcdef12-p1.code-server.sothothv2.com"
 
     manager.executor.shutdown(wait=False)

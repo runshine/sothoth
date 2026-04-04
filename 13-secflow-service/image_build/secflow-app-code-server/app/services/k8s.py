@@ -476,7 +476,7 @@ class K8SService:
             logger.error(f"删除Service失败: {e}")
             return False
 
-    def create_ingress(self, namespace: str, name: str, host_prefix: str, service_name: str) -> Optional[str]:
+    def create_ingress(self, namespace: str, name: str, host: str, service_name: str) -> Optional[str]:
         """创建Ingress（统一 host 规则，由 platform-k8s 生成）"""
         try:
             project_id = self._project_id_from_namespace(namespace)
@@ -485,7 +485,7 @@ class K8SService:
                 "name": name,
                 "service_name": service_name,
                 "service_port": 8443,
-                "host_prefix": host_prefix,
+                "host": host,
                 "ingress_type": config.ingress_class,
                 "path": "/",
                 "path_type": "Prefix"
@@ -496,7 +496,7 @@ class K8SService:
                 host = self._extract_host_from_ingress_response(data)
                 if host:
                     return host
-                fallback_host = self._build_fallback_ingress_host(project_id, host_prefix)
+                fallback_host = str(payload.get("host") or "").strip()
                 if fallback_host:
                     logger.warning(
                         "Ingress创建成功但响应缺少host，使用本地兜底规则推导host: namespace=%s name=%s host=%s",
