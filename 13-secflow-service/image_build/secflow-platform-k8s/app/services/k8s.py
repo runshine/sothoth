@@ -1603,6 +1603,7 @@ class KubernetesService:
             V1Deployment, V1ObjectMeta, V1DeploymentSpec,
             V1LabelSelector, V1PodTemplateSpec, V1PodSpec, V1Container,
             V1EnvVar, V1VolumeMount, V1SecurityContext, V1Volume, V1PersistentVolumeClaimVolumeSource, V1NFSVolumeSource,
+            V1ConfigMapVolumeSource,
             V1ContainerPort,
         )
 
@@ -1619,8 +1620,7 @@ class KubernetesService:
 
         selector = V1LabelSelector(match_labels=spec.get("selector", {}).get("matchLabels", {}))
 
-        containers = []
-        for c in template_spec.get("containers", []):
+        def _build_container(c: Dict[str, Any]) -> V1Container:
             ports = [V1ContainerPort(container_port=p.get("containerPort")) for p in c.get("ports", [])] if c.get("ports") else None
             env = [V1EnvVar(name=e.get("name"), value=e.get("value")) for e in c.get("env", [])] if c.get("env") else None
             
@@ -1652,7 +1652,10 @@ class KubernetesService:
             )
             if c.get("resources"):
                 container.resources = c["resources"]
-            containers.append(container)
+            return container
+
+        containers = [_build_container(c) for c in template_spec.get("containers", [])]
+        init_containers = [_build_container(c) for c in template_spec.get("initContainers", [])]
 
         volumes = None
         if template_spec.get("volumes"):
@@ -1674,9 +1677,17 @@ class KubernetesService:
                             read_only=v["nfs"].get("readOnly", False)
                         )
                     ))
+                elif v.get("configMap"):
+                    volumes.append(V1Volume(
+                        name=v.get("name"),
+                        config_map=V1ConfigMapVolumeSource(
+                            name=v["configMap"].get("name")
+                        )
+                    ))
 
         pod_spec = V1PodSpec(
             containers=containers,
+            init_containers=init_containers or None,
             volumes=volumes
         )
         
