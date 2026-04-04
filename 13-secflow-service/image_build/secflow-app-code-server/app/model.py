@@ -76,7 +76,6 @@ class CodeServer(Base):
 
     # 访问信息
     access_url = Column(String(256))
-    fileserver_mount = Column(JSON, default=dict)
 
     # 环境变量配置
     custom_env = Column(JSON, default=dict)          # 自定义环境变量
@@ -110,7 +109,6 @@ class CodeServer(Base):
             "ingress_name": self.ingress_name,
             "pod_name": self.pod_name,
             "access_url": self.access_url,
-            "fileserver_mount": self.fileserver_mount or {},
             "custom_env": self.custom_env or {},
             "code_server_env": self.code_server_env or {},
             "llm_provider_key": self.llm_provider_key,
@@ -226,8 +224,6 @@ def _ensure_code_server_columns(engine):
     to_add = []
     if "llm_provider_key" not in columns:
         to_add.append("llm_provider_key VARCHAR(128)")
-    if "fileserver_mount" not in columns:
-        to_add.append("fileserver_mount JSON")
     if "llm_provider_keys" not in columns:
         to_add.append("llm_provider_keys JSON")
     if "llm_provider_snapshot" not in columns:

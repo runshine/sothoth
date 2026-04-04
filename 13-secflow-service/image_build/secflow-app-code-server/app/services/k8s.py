@@ -170,7 +170,6 @@ class K8SService:
 
     def create_deployment(self, namespace: str, name: str, code_server_id: str,
                          source_pvcs: List[Dict], output_pvcs: List[Dict],
-                         fileserver_mount: Optional[Dict[str, str]] = None,
                          custom_env: Dict[str, str] = None,
                          preset_env: Optional[Dict[str, str]] = None,
                          code_server_env: Dict[str, Any] = None,
@@ -196,20 +195,6 @@ class K8SService:
                 volumes.append({"name": volume_name, "persistentVolumeClaim": {"claimName": pvc_info["pvc_name"]}})
                 volume_mounts.append({"name": volume_name, "mountPath": pvc_info["mount_path"]})
                 volume_index += 1
-            if fileserver_mount:
-                fs_pvc_name = str(fileserver_mount.get("pvc_name") or "").strip()
-                fs_mount_path = str(fileserver_mount.get("mount_path") or "").strip()
-                fs_sub_path = str(fileserver_mount.get("sub_path") or "").strip()
-                if fs_pvc_name and fs_mount_path and fs_sub_path:
-                    volumes.append({
-                        "name": "fileserver-shared-volume",
-                        "persistentVolumeClaim": {"claimName": fs_pvc_name},
-                    })
-                    volume_mounts.append({
-                        "name": "fileserver-shared-volume",
-                        "mountPath": fs_mount_path,
-                        "subPath": fs_sub_path,
-                    })
 
             import secrets
             final_code_server_env = {}

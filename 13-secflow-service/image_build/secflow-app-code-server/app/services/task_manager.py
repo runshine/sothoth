@@ -3,7 +3,6 @@ Code Server Manager - 任务管理服务
 """
 
 import logging
-import posixpath
 import re
 import threading
 import time
@@ -298,53 +297,6 @@ class TaskManager:
             overrides[path] = content
         return overrides
 
-    @staticmethod
-    def _normalize_fileserver_subpath(subpath: Optional[str]) -> str:
-        raw = str(subpath or "").strip().replace("\\", "/")
-        if not raw:
-            return ""
-        raw_parts = [item for item in raw.split("/") if item not in ("", ".")]
-        if any(item == ".." for item in raw_parts):
-            raise ValueError("fileserver_project_subpath 非法，禁止目录穿越")
-        normalized = posixpath.normpath("/" + raw).lstrip("/")
-        if normalized in ("", "."):
-            return ""
-        parts = [item for item in normalized.split("/") if item not in ("", ".")]
-        return "/".join(parts)
-
-    def _build_fileserver_mount_config(self, params: Dict[str, Any], project_id: str) -> Optional[Dict[str, str]]:
-        fs_cfg = self.config.fileserver_mount
-        enabled_raw = params.get("fileserver_mount_enabled")
-        enabled = bool(fs_cfg.enabled if enabled_raw is None else enabled_raw)
-        if not enabled:
-            return None
-
-        pvc_name = str(fs_cfg.pvc_name or "").strip()
-        if not pvc_name:
-            raise ValueError("fileserver_mount 已启用但未配置 pvc_name")
-
-        mount_path = str(params.get("fileserver_mount_path") or fs_cfg.mount_path or "").strip()
-        if not mount_path.startswith("/"):
-            raise ValueError("fileserver_mount_path 必须为绝对路径")
-        if ".." in mount_path.split("/"):
-            raise ValueError("fileserver_mount_path 非法，禁止目录穿越")
-
-        project_root_prefix = str(fs_cfg.project_root_prefix or "files").strip("/").strip()
-        if not project_root_prefix:
-            project_root_prefix = "files"
-        normalized_subpath = self._normalize_fileserver_subpath(params.get("fileserver_project_subpath"))
-
-        sub_path = f"{project_root_prefix}/{project_id}"
-        if normalized_subpath:
-            sub_path = f"{sub_path}/{normalized_subpath}"
-
-        return {
-            "pvc_name": pvc_name,
-            "mount_path": mount_path,
-            "sub_path": sub_path,
-            "project_subpath": normalized_subpath,
-        }
-
     def _handle_create_task(self, task: Task, db: Session) -> str:
         """处理创建任务"""
         params = task.params or {}
@@ -360,7 +312,6 @@ class TaskManager:
         image = params.get("image")  # 获取自定义镜像参数
         llm_provider_keys = self._normalize_provider_keys(params)
         llm_file_overrides = self._normalize_llm_file_overrides(params)
-        fileserver_mount = self._build_fileserver_mount_config(params, task.project_id)
 
         k8s_service = get_k8s_service()
         configcenter_client = get_configcenter_client()
@@ -448,9 +399,6 @@ class TaskManager:
                 code_server.llm_configmap_name = None
             db.commit()
 
-            if fileserver_mount and not k8s_service.check_pvc_exists(namespace, fileserver_mount["pvc_name"]):
-                raise RuntimeError(f"fileserver 共享PVC不存在: {fileserver_mount['pvc_name']}")
-
             # 1. 创建输出PVC（如果不存在）
             output_pvcs_config = []
             for pvc_info in code_server.output_pvcs or []:
@@ -484,7 +432,6 @@ class TaskManager:
                 code_server_id=code_server_id,
                 source_pvcs=code_server.source_pvcs or [],
                 output_pvcs=output_pvcs_config,
-                fileserver_mount=fileserver_mount,
                 custom_env=deployment_custom_env,
                 preset_env=preset_env,
                 code_server_env=code_server_env,
@@ -497,7 +444,6 @@ class TaskManager:
                 raise RuntimeError(f"创建Deployment {deployment_name} 失败")
 
             code_server.deployment_name = deployment_name
-            code_server.fileserver_mount = fileserver_mount or {}
             # 保存实际使用的环境变量（包含密码）
             code_server.code_server_env = final_env
             db.commit()
