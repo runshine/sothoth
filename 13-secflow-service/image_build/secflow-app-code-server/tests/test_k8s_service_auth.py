@@ -91,10 +91,10 @@ def test_create_ingress_uses_fallback_host_when_response_has_no_rules(monkeypatc
 
     monkeypatch.setattr(svc, "_request", _fake_request)
 
-    host = svc.create_ingress("secflow-p1", "ing", "h.example.local", "svc-1")
-    assert host == "h.example.local"
-    assert captured["json"].get("host") == "h.example.local"
-    assert "host_prefix" not in captured["json"]
+    host = svc.create_ingress("secflow-p1", "ing", "cs-1", "svc-1")
+    assert host == ""
+    assert captured["json"].get("host_prefix") == "cs-1"
+    assert "host" not in captured["json"]
 
 
 def test_create_ingress_parses_host_from_rule_field(monkeypatch):
@@ -112,5 +112,5 @@ def test_create_ingress_parses_host_from_rule_field(monkeypatch):
 
     monkeypatch.setattr(svc, "_request", _fake_request)
 
-    host = svc.create_ingress("secflow-p1", "ing", "h.example.local", "svc-1")
+    host = svc.create_ingress("secflow-p1", "ing", "cs-1", "svc-1")
     assert host == "h.example.local"

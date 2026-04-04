@@ -115,17 +115,6 @@ pvc:
   # 访问模式
   access_mode: "ReadWriteOnce"
 
-# Ingress配置
-ingress:
-  # 基础域名
-  base_domain: "code-server.sothothv2.com"
-  # TLS证书Secret名称
-  tls_secret_name: "wildcard-code-server.sothothv2.com-tls"
-  # Ingress Class名称
-  ingress_class: "nginx"
-  # 是否启用TLS
-  tls_enabled: true
-
 # 任务管理配置
 tasks:
   # 任务保留天数（完成的任务保留时间）

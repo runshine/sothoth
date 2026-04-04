@@ -191,11 +191,13 @@ class IngressInfo(BaseModel):
     """Ingress信息"""
     name: str
     namespace: str
+    host: Optional[str] = None
     label: Dict[str, str] = Field(default_factory=dict)
     annotation: Dict[str, str] = Field(default_factory=dict)
     ingress_class_name: Optional[str] = None
     tls: List[Dict[str, Any]] = Field(default_factory=list)
     rule: List[Dict[str, Any]] = Field(default_factory=list)
+    rules: List[Dict[str, Any]] = Field(default_factory=list)
     created_at: Optional[str] = None
 
 
@@ -232,6 +234,8 @@ class IngressSimpleCreateRequest(BaseModel):
     ingress_ip: Optional[str] = Field(default=None, description="Ingress Controller的外部IP地址（用于记录访问地址）")
     path: str = Field(default="/", description="路径，默认为根路径")
     path_type: str = Field(default="Prefix", description="路径类型: Prefix, Exact, ImplementationSpecific")
+    tls_enabled: Optional[bool] = Field(default=None, description="是否启用TLS（不传时使用平台默认）")
+    tls_secret_name: Optional[str] = Field(default=None, description="TLS Secret名称（启用TLS时必需）")
 
 
 class IngressDomainBindingRequest(BaseModel):

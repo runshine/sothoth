@@ -4,7 +4,6 @@ Code Server Manager - K8S API 客户端服务（统一通过 secflow-platform-k8
 
 import logging
 import os
-import re
 import shlex
 from typing import Optional, List, Dict, Any
 
@@ -36,23 +35,6 @@ class K8SService:
         if not namespace or not namespace.startswith("secflow-"):
             raise ValueError(f"无效namespace，无法解析project_id: {namespace}")
         return namespace.replace("secflow-", "", 1)
-
-    @staticmethod
-    def _sanitize_dns_label(value: str) -> str:
-        text = str(value or "").strip().lower()
-        text = re.sub(r"[^a-z0-9-]+", "-", text)
-        text = re.sub(r"-{2,}", "-", text).strip("-")
-        return text[:63] if text else "na"
-
-    def _build_fallback_ingress_host(self, project_id: str, host_prefix: str) -> Optional[str]:
-        # 兜底规则与平台一致：<host_prefix>-<project_id>.<domain_suffix>
-        domain_suffix = str(getattr(self.config.ingress, "base_domain", "") or "").strip().lower()
-        domain_suffix = re.sub(r"^https?://", "", domain_suffix).strip("/")
-        if not domain_suffix:
-            return None
-        prefix = self._sanitize_dns_label(host_prefix)
-        project = self._sanitize_dns_label(project_id)
-        return f"{prefix}-{project}.{domain_suffix}"
 
     @staticmethod
     def _extract_host_from_ingress_response(data: Dict[str, Any]) -> Optional[str]:
@@ -476,33 +458,22 @@ class K8SService:
             logger.error(f"删除Service失败: {e}")
             return False
 
-    def create_ingress(self, namespace: str, name: str, host: str, service_name: str) -> Optional[str]:
+    def create_ingress(self, namespace: str, name: str, host_prefix: str, service_name: str) -> Optional[str]:
         """创建Ingress（统一 host 规则，由 platform-k8s 生成）"""
         try:
             project_id = self._project_id_from_namespace(namespace)
-            config = self.config.ingress
             payload = {
                 "name": name,
                 "service_name": service_name,
                 "service_port": 8443,
-                "host": host,
-                "ingress_type": config.ingress_class,
-                "path": "/",
-                "path_type": "Prefix"
+                "host_prefix": host_prefix,
             }
             resp = self._request("POST", "/ingresses/simple", project_id=project_id, json=payload)
             if resp.status_code in (200, 201):
                 data = resp.json()
-                host = self._extract_host_from_ingress_response(data)
-                if host:
-                    return host
-                fallback_host = str(payload.get("host") or "").strip()
-                if fallback_host:
-                    logger.warning(
-                        "Ingress创建成功但响应缺少host，使用本地兜底规则推导host: namespace=%s name=%s host=%s",
-                        namespace, name, fallback_host
-                    )
-                    return fallback_host
+                resolved_host = self._extract_host_from_ingress_response(data)
+                if resolved_host:
+                    return resolved_host
                 logger.info("Ingress已创建但未返回host且无可用兜底域名: namespace=%s name=%s", namespace, name)
                 return ""
             logger.error(f"创建Ingress失败: {resp.status_code} {resp.text}")

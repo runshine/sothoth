@@ -110,7 +110,7 @@ class DynamicIngressConfig(BaseModel):
     default_path_type: str = "Prefix"
     default_service_port: int = 80
     default_websocket_enabled: bool = True
-    default_tls_enabled: bool = False
+    default_tls_enabled: bool = True
     default_tls_secret_name: Optional[str] = None
     default_proxy_body_size: str = "32m"
     default_proxy_connect_timeout: int = 15

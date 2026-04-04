@@ -564,7 +564,9 @@ class KubernetesService:
         ingress_type: str = "nginx",
         ingress_ip: str = None,
         path: str = "/",
-        path_type: str = "Prefix"
+        path_type: str = "Prefix",
+        tls_enabled: bool = False,
+        tls_secret_name: Optional[str] = None,
     ) -> Dict:
         """
         创建简化版Ingress（供工作流服务使用）
@@ -622,6 +624,11 @@ class KubernetesService:
 
         if ingress_ip:
             manifest["metadata"]["annotations"][INGRESS_IP_ANNOTATION] = ingress_ip
+        if tls_enabled and tls_secret_name:
+            manifest["spec"]["tls"] = [{
+                "hosts": [host],
+                "secret_name": tls_secret_name,
+            }]
 
         return self.create_ingress(namespace, manifest)
 
@@ -1163,11 +1170,36 @@ class KubernetesService:
 
     def _ingress_to_dict(self, ing) -> Dict:
         """Ingress对象转字典"""
+        rules = [
+            {
+                "host": rule.host,
+                "paths": [
+                    {
+                        "path": p.path,
+                        "path_type": p.path_type,
+                        "backend": {
+                            "service": {
+                                "name": p.backend.service.name,
+                                "port": {
+                                    "number": p.backend.service.port.number
+                                } if p.backend.service.port and p.backend.service.port.number else None,
+                            } if p.backend and p.backend.service else None,
+                        },
+                    }
+                    for p in (rule.http.paths or [])
+                ] if rule.http and rule.http.paths else []
+            }
+            for rule in (ing.spec.rules or [])
+        ] if ing.spec and ing.spec.rules else []
+
         return {
             "name": ing.metadata.name,
             "namespace": ing.metadata.namespace,
+            "host": rules[0].get("host") if rules else None,
             "labels": ing.metadata.labels or {},
+            "label": ing.metadata.labels or {},
             "annotations": ing.metadata.annotations or {},
+            "annotation": ing.metadata.annotations or {},
             "ingress_class_name": ing.spec.ingress_class_name,
             "tls": [
                 {
@@ -1176,27 +1208,8 @@ class KubernetesService:
                 }
                 for t in (ing.spec.tls or [])
             ] if ing.spec and ing.spec.tls else [],
-            "rules": [
-                {
-                    "host": rule.host,
-                    "paths": [
-                        {
-                            "path": p.path,
-                            "path_type": p.path_type,
-                            "backend": {
-                                "service": {
-                                    "name": p.backend.service.name,
-                                    "port": {
-                                        "number": p.backend.service.port.number
-                                    } if p.backend.service.port and p.backend.service.port.number else None,
-                                } if p.backend and p.backend.service else None,
-                            },
-                        }
-                        for p in (rule.http.paths or [])
-                    ] if rule.http and rule.http.paths else []
-                }
-                for rule in (ing.spec.rules or [])
-            ] if ing.spec and ing.spec.rules else [],
+            "rule": rules,
+            "rules": rules,
             "created_at": ing.metadata.creation_timestamp.isoformat() if ing.metadata.creation_timestamp else None,
         }
 

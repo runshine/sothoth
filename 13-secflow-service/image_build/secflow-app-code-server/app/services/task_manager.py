@@ -134,21 +134,6 @@ class TaskManager:
         # host_prefix 使用随机短ID，避免可预测
         return f"cs-{generate_id()[:8]}"
 
-    @staticmethod
-    def _sanitize_dns_label(value: str) -> str:
-        base = re.sub(r"[^a-z0-9-]+", "-", str(value or "").strip().lower())
-        base = re.sub(r"-{2,}", "-", base).strip("-")
-        return base or "na"
-
-    def _build_random_ingress_host(self, project_id: str) -> str:
-        prefix = self._build_random_ingress_host_prefix()
-        project = self._sanitize_dns_label(project_id)
-        domain = str(getattr(self.config.ingress, "base_domain", "") or "").strip().lower()
-        domain = re.sub(r"^https?://", "", domain).strip("/")
-        if not domain:
-            raise ValueError("ingress.base_domain 未配置，无法生成Ingress完整域名")
-        return f"{prefix}-{project}.{domain}"
-
     def create_task(self, project_id: str, task_type: str, params: Dict[str, Any],
                    code_server_id: str = None, code_server_name: str = None) -> Task:
         """创建任务"""
@@ -505,14 +490,14 @@ class TaskManager:
 
             # 4. 创建Ingress
             ingress_name = resource_base_name
-            ingress_host = self._build_random_ingress_host(task.project_id)
-            host = k8s_service.create_ingress(namespace, ingress_name, ingress_host, service_name)
+            ingress_host_prefix = self._build_random_ingress_host_prefix()
+            host = k8s_service.create_ingress(namespace, ingress_name, ingress_host_prefix, service_name)
             if host is None:
                 raise RuntimeError(f"创建Ingress {ingress_name} 失败")
 
             code_server.ingress_name = ingress_name
             if host:
-                code_server.access_url = f"https://{host}" if self.config.ingress.tls_enabled else f"http://{host}"
+                code_server.access_url = f"https://{host}"
             else:
                 code_server.access_url = None
 

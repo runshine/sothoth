@@ -168,8 +168,6 @@ def _resolve_dynamic_ingress_options(request, namespace: str) -> dict:
     path_type = request.path_type or conf.default_path_type
     tls_enabled = bool(conf.default_tls_enabled if request.tls_enabled is None else request.tls_enabled)
     tls_secret_name = request.tls_secret_name if request.tls_secret_name is not None else conf.default_tls_secret_name
-    if tls_secret_name == "wildcard-code-server.sothothv2.com-tls":
-        tls_secret_name = "wildcard-sothothv2.com-tls"
     if tls_enabled and (not tls_secret_name or not str(tls_secret_name).strip()):
         raise ValidationError("已启用TLS但未配置tls_secret_name，请配置公共TLS Secret名称")
     if tls_enabled:
@@ -807,6 +805,8 @@ async def create_simple_ingress(
     """
     project_id, namespace = await get_project_and_namespace(project_id, current_user, db)
 
+    conf = get_config().dynamic_ingress
+
     resolved_host = _resolve_ingress_host(
         project_id=project_id,
         explicit_host=request.host,
@@ -816,6 +816,18 @@ async def create_simple_ingress(
     if not resolved_host:
         raise ValidationError("host 或 host_prefix 必须至少提供一个，且需配置 dynamic_ingress.common_domain_suffix")
 
+    tls_enabled = bool(conf.default_tls_enabled if request.tls_enabled is None else request.tls_enabled)
+    tls_secret_name = request.tls_secret_name if request.tls_secret_name is not None else conf.default_tls_secret_name
+    if tls_enabled and (not tls_secret_name or not str(tls_secret_name).strip()):
+        raise ValidationError("已启用TLS但未配置tls_secret_name，请配置公共TLS Secret名称")
+    if tls_enabled:
+        try:
+            get_k8s_service().get_secret(namespace, tls_secret_name)
+        except Exception:
+            raise ValidationError(
+                f"目标命名空间缺少TLS Secret: {tls_secret_name}，请先在 {namespace} 中创建该公共Secret"
+            )
+
     k8s = get_k8s_service()
     return k8s.create_simple_ingress(
         namespace=namespace,
@@ -823,10 +835,12 @@ async def create_simple_ingress(
         service_name=request.service_name,
         service_port=request.service_port,
         host=resolved_host,
-        ingress_type=request.ingress_type,
+        ingress_type=request.ingress_type or conf.default_ingress_type,
         ingress_ip=request.ingress_ip,
-        path=request.path,
-        path_type=request.path_type
+        path=request.path or conf.default_path,
+        path_type=request.path_type or conf.default_path_type,
+        tls_enabled=tls_enabled,
+        tls_secret_name=tls_secret_name,
     )
 
 
@@ -1065,9 +1079,6 @@ async def create_dynamic_agent_ingress_route(
     service_port = int(request.service_port if request.service_port is not None else target_port)
     tls_enabled = bool(conf.default_tls_enabled if request.tls_enabled is None else request.tls_enabled)
     tls_secret_name = request.tls_secret_name if request.tls_secret_name is not None else conf.default_tls_secret_name
-    if tls_secret_name == "wildcard-code-server.sothothv2.com-tls":
-        # 兼容历史配置，统一切换到当前公共TLS Secret
-        tls_secret_name = "wildcard-sothothv2.com-tls"
     if tls_enabled and (not tls_secret_name or not str(tls_secret_name).strip()):
         raise ValidationError("已启用TLS但未配置tls_secret_name，请配置公共TLS Secret名称")
     if tls_enabled:

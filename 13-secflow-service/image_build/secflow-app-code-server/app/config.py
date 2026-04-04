@@ -121,14 +121,6 @@ class PVCConfig(BaseModel):
     access_mode: str = "ReadWriteOnce"
 
 
-class IngressConfig(BaseModel):
-    """Ingress配置"""
-    base_domain: str = "code-server.sothothv2.com"
-    tls_secret_name: str = "wildcard-code-server.sothothv2.com-tls"
-    ingress_class: str = "nginx"
-    tls_enabled: bool = True
-
-
 class TasksConfig(BaseModel):
     """任务管理配置"""
     retention_days: int = 7
@@ -195,7 +187,6 @@ class Config(BaseModel):
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     code_server: CodeServerConfig = Field(default_factory=CodeServerConfig)
     pvc: PVCConfig = Field(default_factory=PVCConfig)
-    ingress: IngressConfig = Field(default_factory=IngressConfig)
     tasks: TasksConfig = Field(default_factory=TasksConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
