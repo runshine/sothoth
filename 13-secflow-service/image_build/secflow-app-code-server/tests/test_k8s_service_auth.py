@@ -41,3 +41,34 @@ def test_request_keeps_custom_headers_with_machine_token():
     assert fake_client.last_kwargs is not None
     assert fake_client.last_kwargs["headers"]["X-Trace"] == "abc"
     assert fake_client.last_kwargs["headers"]["Authorization"] == "Bearer token-123"
+
+
+def test_create_service_uses_service_create_request_schema(monkeypatch):
+    svc = K8SService()
+    captured = {}
+
+    class _Resp:
+        status_code = 201
+
+        @staticmethod
+        def json():
+            return {"cluster_ip": "10.0.0.10"}
+
+    def _fake_request(method, path, project_id=None, **kwargs):
+        captured["method"] = method
+        captured["path"] = path
+        captured["project_id"] = project_id
+        captured["json"] = kwargs.get("json", {})
+        return _Resp()
+
+    monkeypatch.setattr(svc, "_request", _fake_request)
+
+    cluster_ip = svc.create_service("secflow-p1", "svc-test", "cs-1")
+
+    assert cluster_ip == "10.0.0.10"
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/services"
+    assert captured["project_id"] == "p1"
+    assert captured["json"]["name"] == "svc-test"
+    assert isinstance(captured["json"].get("ports"), list)
+    assert "manifest" not in captured["json"]

@@ -405,30 +405,18 @@ class K8SService:
         try:
             project_id = self._project_id_from_namespace(namespace)
             config = self.config.code_server
-            manifest = {
-                "apiVersion": "v1",
-                "kind": "Service",
-                "metadata": {
-                    "name": name,
-                    "namespace": namespace,
-                    "labels": {
-                        "app": "code-server",
-                        "code-server-id": code_server_id,
-                        "managed-by": "vscode-web-manager"
-                    }
-                },
-                "spec": {
-                    "type": config.service_type,
-                    "selector": {"app": "code-server", "code-server-id": code_server_id},
-                    "ports": [{
-                        "port": 8443,
-                        "targetPort": 8443,
-                        "protocol": "TCP",
-                        "name": "http"
-                    }]
-                }
+            payload = {
+                "name": name,
+                "type": config.service_type,
+                "selector": {"app": "code-server", "code-server-id": code_server_id},
+                "ports": [{
+                    "port": 8443,
+                    "targetPort": 8443,
+                    "protocol": "TCP",
+                    "name": "http",
+                }],
             }
-            resp = self._request("POST", "/services", project_id=project_id, json={"manifest": manifest})
+            resp = self._request("POST", "/services", project_id=project_id, json=payload)
             if resp.status_code in (200, 201):
                 data = resp.json()
                 return data.get("cluster_ip")
