@@ -32,6 +32,7 @@ class FakeK8s:
         self.created_configmap = None
         self.deleted_configmap = None
         self.deployment_call = None
+        self.ingress_call = None
 
     def check_pvc_exists(self, namespace, pvc_name):
         return True
@@ -59,7 +60,13 @@ class FakeK8s:
     def create_service(self, namespace, name, code_server_id):
         return "10.0.0.1"
 
-    def create_ingress(self, namespace, name, code_server_id, service_name):
+    def create_ingress(self, namespace, name, host_prefix, service_name):
+        self.ingress_call = {
+            "namespace": namespace,
+            "name": name,
+            "host_prefix": host_prefix,
+            "service_name": service_name,
+        }
         return "example.test"
 
     def get_pod_by_deployment(self, namespace, deployment_name):
@@ -470,5 +477,36 @@ def test_create_sanitizes_k8s_resource_names(monkeypatch):
     assert code_server.service_name == "code-server-ne-csabc1"
     assert code_server.ingress_name == "code-server-ne-csabc1"
     assert fake_k8s.deployment_call["name"] == "code-server-ne-csabc1"
+
+    manager.executor.shutdown(wait=False)
+
+
+def test_create_uses_random_ingress_host_prefix(monkeypatch):
+    code_server = _make_code_server()
+    db = FakeDB(code_server)
+    fake_k8s = FakeK8s()
+
+    monkeypatch.setattr("app.services.task_manager.get_k8s_service", lambda: fake_k8s)
+    monkeypatch.setattr("app.services.task_manager.get_configcenter_client", lambda: FakeConfigCenter({}))
+    monkeypatch.setattr("app.services.task_manager.generate_id", lambda: "abcdef1234567890")
+
+    manager = TaskManager()
+    task = SimpleNamespace(
+        project_id="p1",
+        params={
+            "code_server_id": "cs-ABC12345",
+            "namespace": "secflow-p1",
+            "name": "NE",
+            "env": {},
+            "code_server_env": {},
+            "image": "",
+            "llm_provider_keys": [],
+        },
+    )
+
+    manager._handle_create_task(task, db)
+
+    assert fake_k8s.ingress_call is not None
+    assert fake_k8s.ingress_call["host_prefix"] == "cs-abcdef12"
 
     manager.executor.shutdown(wait=False)

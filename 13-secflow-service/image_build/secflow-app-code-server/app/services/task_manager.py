@@ -129,6 +129,11 @@ class TaskManager:
         safe_base = base_name[:max(1, max_base_len)].rstrip("-") or "instance"
         return f"{prefix}-{safe_base}"
 
+    @staticmethod
+    def _build_random_ingress_host_prefix() -> str:
+        # host_prefix 使用随机短ID，避免可预测
+        return f"cs-{generate_id()[:8]}"
+
     def create_task(self, project_id: str, task_type: str, params: Dict[str, Any],
                    code_server_id: str = None, code_server_name: str = None) -> Task:
         """创建任务"""
@@ -485,7 +490,8 @@ class TaskManager:
 
             # 4. 创建Ingress
             ingress_name = resource_base_name
-            host = k8s_service.create_ingress(namespace, ingress_name, code_server_id, service_name)
+            ingress_host_prefix = self._build_random_ingress_host_prefix()
+            host = k8s_service.create_ingress(namespace, ingress_name, ingress_host_prefix, service_name)
             if host is None:
                 raise RuntimeError(f"创建Ingress {ingress_name} 失败")
 

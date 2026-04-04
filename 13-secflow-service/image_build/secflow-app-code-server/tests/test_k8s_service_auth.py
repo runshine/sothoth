@@ -74,8 +74,9 @@ def test_create_service_uses_service_create_request_schema(monkeypatch):
     assert "manifest" not in captured["json"]
 
 
-def test_create_ingress_returns_empty_host_when_response_has_no_rules(monkeypatch):
+def test_create_ingress_uses_fallback_host_when_response_has_no_rules(monkeypatch):
     svc = K8SService()
+    svc.config.ingress.base_domain = "agent.secflow.local"
 
     class _Resp:
         status_code = 201
@@ -90,4 +91,23 @@ def test_create_ingress_returns_empty_host_when_response_has_no_rules(monkeypatc
     monkeypatch.setattr(svc, "_request", _fake_request)
 
     host = svc.create_ingress("secflow-p1", "ing", "cs-1", "svc-1")
-    assert host == ""
+    assert host == "cs-1-p1.agent.secflow.local"
+
+
+def test_create_ingress_parses_host_from_rule_field(monkeypatch):
+    svc = K8SService()
+
+    class _Resp:
+        status_code = 201
+
+        @staticmethod
+        def json():
+            return {"name": "ing", "rule": [{"host": "h.example.local"}]}
+
+    def _fake_request(method, path, project_id=None, **kwargs):
+        return _Resp()
+
+    monkeypatch.setattr(svc, "_request", _fake_request)
+
+    host = svc.create_ingress("secflow-p1", "ing", "cs-1", "svc-1")
+    assert host == "h.example.local"
