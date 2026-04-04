@@ -1265,23 +1265,58 @@ class AgentManager:
         source: str = 'refresh',
     ):
         prev_status = ''
+        prev_row: Dict[str, Any] = {}
         table_name = self.db.get_table_name('agent_status')
         try:
             if self.db.db_type == 'mysql':
                 prev_row = self.db.fetch_one(
-                    f"SELECT status FROM {table_name} WHERE agent_key = %s LIMIT 1",
+                    f"SELECT status, system_info, daemon_info, services FROM {table_name} WHERE agent_key = %s LIMIT 1",
                     (agent.key,)
                 )
             else:
                 prev_row = self.db.fetch_one(
-                    f"SELECT status FROM {table_name} WHERE agent_key = ? LIMIT 1",
+                    f"SELECT status, system_info, daemon_info, services FROM {table_name} WHERE agent_key = ? LIMIT 1",
                     (agent.key,)
                 )
             prev_status = str((prev_row or {}).get('status') or '')
         except Exception:
             prev_status = ''
+            prev_row = {}
 
         try:
+            def _parse_prev_json(raw: Any, default_value: Any) -> Any:
+                if raw is None:
+                    return default_value
+                if isinstance(raw, (dict, list)):
+                    return raw
+                if isinstance(raw, str):
+                    text = raw.strip()
+                    if not text:
+                        return default_value
+                    try:
+                        return json.loads(text)
+                    except Exception:
+                        return default_value
+                return default_value
+
+            def _is_non_empty_dict(value: Any) -> bool:
+                return isinstance(value, dict) and len(value) > 0
+
+            def _is_non_empty_list(value: Any) -> bool:
+                return isinstance(value, list) and len(value) > 0
+
+            prev_system_info = _parse_prev_json(prev_row.get('system_info'), {})
+            prev_daemon_info = _parse_prev_json(prev_row.get('daemon_info'), {})
+            prev_services = _parse_prev_json(prev_row.get('services'), [])
+
+            # 关键修复：本轮详情拉取失败时，不允许用空值覆盖历史有效快照。
+            if (not _is_non_empty_dict(agent.system_info)) and _is_non_empty_dict(prev_system_info):
+                agent.system_info = prev_system_info
+            if (not _is_non_empty_dict(agent.daemon_info)) and _is_non_empty_dict(prev_daemon_info):
+                agent.daemon_info = prev_daemon_info
+            if (not _is_non_empty_list(agent.services)) and _is_non_empty_list(prev_services):
+                agent.services = prev_services
+
             system_info_json = json.dumps(agent.system_info) if agent.system_info else '{}'
             daemon_info_json = json.dumps(agent.daemon_info) if agent.daemon_info else '{}'
             services_json = json.dumps(agent.services) if agent.services else '[]'

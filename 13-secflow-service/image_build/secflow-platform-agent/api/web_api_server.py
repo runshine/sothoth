@@ -147,6 +147,8 @@ class WebAPIServer:
         self.ttyd_probe_timeout_sec = int(config.get('ttyd_probe_timeout_sec', 3))
         self.configcenter_service_url = (config.get('configcenter_service_url') or 'http://secflow-platform-configcenter').rstrip('/')
         self.configcenter_service_timeout_sec = int(config.get('configcenter_service_timeout_sec', 15))
+        self.configcenter_service_retries = max(0, int(config.get('configcenter_service_retries', 1)))
+        self.configcenter_service_retry_delay_sec = max(0.0, float(config.get('configcenter_service_retry_delay_sec', 0.2)))
         self.k8s_service_url = (config.get('k8s_service_url') or '').rstrip('/')
         self.k8s_service_timeout_sec = int(config.get('k8s_service_timeout_sec', 15))
         self.service_machine_token = config.get('service_machine_token')
@@ -173,7 +175,10 @@ class WebAPIServer:
         self.logger.info(
             f"AI Helper健康快照刷新间隔: {int(self.config.get('helper_health_refresh_interval_sec', self.config.get('refresh_interval', 30)))}s"
         )
-        self.logger.info(f"ConfigCenter服务地址: {self.configcenter_service_url}, 超时: {self.configcenter_service_timeout_sec}s")
+        self.logger.info(
+            f"ConfigCenter服务地址: {self.configcenter_service_url}, 超时: {self.configcenter_service_timeout_sec}s, "
+            f"重试: {self.configcenter_service_retries}"
+        )
         self.logger.info(f"K8S服务地址: {self.k8s_service_url}, 超时: {self.k8s_service_timeout_sec}s")
         self.logger.info(f"代理功能: 已启用")
 
@@ -318,14 +323,38 @@ class WebAPIServer:
             headers['Authorization'] = f"Bearer {self.service_machine_token}"
         if payload is not None:
             headers['Content-Type'] = 'application/json'
-        return requests.request(
-            method=method.upper(),
-            url=url,
-            params=params or None,
-            json=payload,
-            headers=headers,
-            timeout=(5, self.configcenter_service_timeout_sec),
-        )
+        attempts = self.configcenter_service_retries + 1
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = requests.request(
+                    method=method.upper(),
+                    url=url,
+                    params=params or None,
+                    json=payload,
+                    headers=headers,
+                    timeout=(5, self.configcenter_service_timeout_sec),
+                )
+                if response.status_code >= 500 and attempt < attempts:
+                    self.logger.warning(
+                        f"ConfigCenter请求返回{response.status_code}，准备重试 "
+                        f"({attempt}/{attempts}) path={path}"
+                    )
+                    time.sleep(self.configcenter_service_retry_delay_sec * attempt)
+                    continue
+                return response
+            except requests.RequestException as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                self.logger.warning(
+                    f"ConfigCenter请求异常，准备重试 ({attempt}/{attempts}) path={path}: {exc}"
+                )
+                time.sleep(self.configcenter_service_retry_delay_sec * attempt)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("ConfigCenter请求失败")
 
     def _resolve_request_ws_scheme(self) -> str:
         """根据请求上下文推断前端应使用的WS协议。"""
