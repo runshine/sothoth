@@ -1399,12 +1399,14 @@ class KubernetesService:
 
         metadata = manifest.get("metadata", {})
         data = manifest.get("data", {})
+        labels = metadata.get("labels", metadata.get("label", {})) or {}
+        annotations = metadata.get("annotations", metadata.get("annotation", {})) or {}
 
         secret_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=labels,
+            annotations=annotations,
         )
 
         return V1Secret(
@@ -1475,12 +1477,14 @@ class KubernetesService:
         metadata = manifest.get("metadata", {})
         data = manifest.get("data", {})
         binary_data = manifest.get("binaryData", {})
+        labels = metadata.get("labels", metadata.get("label", {})) or {}
+        annotations = metadata.get("annotations", metadata.get("annotation", {})) or {}
 
         configmap_metadata = V1ObjectMeta(
             name=metadata.get("name"),
             namespace=metadata.get("namespace"),
-            label=metadata.get("label", {}),
-            annotation=metadata.get("annotation", {})
+            labels=labels,
+            annotations=annotations,
         )
 
         return V1ConfigMap(
