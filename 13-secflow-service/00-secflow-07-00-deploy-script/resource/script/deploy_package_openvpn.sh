@@ -10,6 +10,9 @@ deploy_package.sh openvpn
 
 [ -d "${ROOT_DIR}/usr/etc/openvpn" ] || mkdir -p "${ROOT_DIR}/usr/etc/openvpn"
 
+RANDOM_MAC_HEX="$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"
+OPENVPN_LLADDR="02:$(echo "${RANDOM_MAC_HEX}" | sed -E 's/(..)(..)(..)(..)(..)/\1:\2:\3:\4:\5/')"
+
 cat <<EOF > "${ROOT_DIR}/usr/etc/openvpn/ca.crt"
 -----BEGIN CERTIFICATE-----
 MIID+TCCAuGgAwIBAgIUM+Zdm0FYUQP3dFXgwDaAygk25QwwDQYJKoZIhvcNAQEL
@@ -56,6 +59,7 @@ auth-user-pass ${ROOT_DIR}/usr/etc/openvpn/auth.txt
 nobind
 persist-key
 persist-tun
+lladdr ${OPENVPN_LLADDR}
 log ${ROOT_DIR}/var/log/openvpn.log
 status ${ROOT_DIR}/var/run/openvpn-status.log
 verb 3
@@ -92,4 +96,3 @@ EOF
 #fi
 
 #"${OPENVPN_ROOT_DIR}/../utils/openvpn" --config "${OPENVPN_ROOT_DIR}/conf/client.ovpn" --writepid "$OPENVPN_ROOT_DIR/run/client.pid" --iproute  "$OPENVPN_ROOT_DIR/../utils/ip" &
-
