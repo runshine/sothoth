@@ -5,6 +5,7 @@ from .agent_manager import AgentManager
 import json
 import logging
 import base64
+import time
 import requests
 
 # ===================== 代理管理器增强版 =====================
@@ -117,44 +118,60 @@ class EnhancedProxyManager:
 
             self.logger.info(f"代理请求: {method} {url} 到Agent {agent.hostname}, 超时: {timeout_tuple}")
 
-            # 发送请求
+            # 发送请求：对幂等请求做短重试，降低瞬时网络抖动导致的503
             response = None
-            try:
-                if method.upper() == 'GET':
-                    response = self.session.get(url, **request_kwargs)
-                elif method.upper() == 'POST':
-                    if files:
-                        request_kwargs['files'] = files
+            method_upper = method.upper()
+            idempotent_method = method_upper in ('GET', 'HEAD', 'OPTIONS')
+            max_attempts = 3 if idempotent_method else 1
+            last_exc: Optional[Exception] = None
+            for attempt in range(max_attempts):
+                try:
+                    if method_upper == 'GET':
+                        response = self.session.get(url, **request_kwargs)
+                    elif method_upper == 'POST':
+                        if files:
+                            request_kwargs['files'] = files
+                            if request_data:
+                                request_kwargs['data'] = request_data
+                        elif request_data:
+                            request_kwargs['json'] = request_data
+                        response = self.session.post(url, **request_kwargs)
+                    elif method_upper == 'PUT':
                         if request_data:
-                            request_kwargs['data'] = request_data
-                    elif request_data:
-                        request_kwargs['json'] = request_data
-                    response = self.session.post(url, **request_kwargs)
-                elif method.upper() == 'PUT':
-                    if request_data:
-                        request_kwargs['json'] = request_data
-                    response = self.session.put(url, **request_kwargs)
-                elif method.upper() == 'DELETE':
-                    if request_data:
-                        request_kwargs['json'] = request_data
-                    response = self.session.delete(url, **request_kwargs)
-                elif method.upper() == 'PATCH':
-                    if request_data:
-                        request_kwargs['json'] = request_data
-                    response = self.session.patch(url, **request_kwargs)
-                elif method.upper() == 'HEAD':
-                    response = self.session.head(url, **request_kwargs)
-                elif method.upper() == 'OPTIONS':
-                    response = self.session.options(url, **request_kwargs)
-                else:
-                    return 400, {'error': f'Unsupported method: {method}'}, {}
-            except requests.exceptions.Timeout:
-                return 504, {'error': f'Request timeout to agent {agent.hostname} (timeout: {timeout_tuple})'}, {}
-            except requests.exceptions.ConnectionError:
-                return 503, {'error': f'Connection failed to agent {agent.hostname}'}, {}
-            except Exception as e:
-                self.logger.error(f"发送请求失败: {str(e)}")
-                return 500, {'error': f'Failed to send request: {str(e)}'}, {}
+                            request_kwargs['json'] = request_data
+                        response = self.session.put(url, **request_kwargs)
+                    elif method_upper == 'DELETE':
+                        if request_data:
+                            request_kwargs['json'] = request_data
+                        response = self.session.delete(url, **request_kwargs)
+                    elif method_upper == 'PATCH':
+                        if request_data:
+                            request_kwargs['json'] = request_data
+                        response = self.session.patch(url, **request_kwargs)
+                    elif method_upper == 'HEAD':
+                        response = self.session.head(url, **request_kwargs)
+                    elif method_upper == 'OPTIONS':
+                        response = self.session.options(url, **request_kwargs)
+                    else:
+                        return 400, {'error': f'Unsupported method: {method}'}, {}
+                    last_exc = None
+                    break
+                except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                    last_exc = e
+                    if attempt >= max_attempts - 1:
+                        break
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                except Exception as e:
+                    self.logger.error(f"发送请求失败: {str(e)}")
+                    return 500, {'error': f'Failed to send request: {str(e)}'}, {}
+
+            if last_exc is not None:
+                if isinstance(last_exc, requests.exceptions.Timeout):
+                    return 504, {'error': f'Request timeout to agent {agent.hostname} (timeout: {timeout_tuple})'}, {}
+                if isinstance(last_exc, requests.exceptions.ConnectionError):
+                    return 503, {'error': f'Connection failed to agent {agent.hostname}'}, {}
+                return 500, {'error': f'Failed to send request: {str(last_exc)}'}, {}
 
             if response is None:
                 return 500, {'error': 'No response received from agent'}, {}

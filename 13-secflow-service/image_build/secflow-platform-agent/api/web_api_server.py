@@ -6950,24 +6950,6 @@ class WebAPIServer:
                 timeout=self.daemon_read_timeout_sec
             )
 
-            # 降级：守护进程临时不可达时，返回后台快照，避免前端频繁503抖动
-            if status_code in (503, 504):
-                try:
-                    agent = self.agent_manager.get_agent(agent_key)
-                    daemon_snapshot = (agent.daemon_info if agent and isinstance(agent.daemon_info, dict) else None)
-                    if daemon_snapshot:
-                        status_code = 200
-                        response_data = {
-                            'code': 0,
-                            'data': daemon_snapshot,
-                            'source': 'snapshot',
-                            'degraded': True,
-                        }
-                        response_headers = response_headers or {}
-                        response_headers['X-Daemon-Degraded'] = 'snapshot'
-                except Exception:
-                    pass
-
             response = jsonify(response_data)
             for key, value in response_headers.items():
                 if key.lower() == 'Content-Length'.lower():
@@ -6986,23 +6968,6 @@ class WebAPIServer:
                 port=self.agent_manager.daemon_api_port,
                 timeout=self.daemon_read_timeout_sec
             )
-
-            # 降级：连接失败时返回未知健康态，避免前端将节点误判为整体异常
-            if status_code in (503, 504):
-                status_code = 200
-                response_data = {
-                    'status': 'unknown',
-                    'timestamp': datetime.now().isoformat(),
-                    'source': 'snapshot',
-                    'degraded': True,
-                    'message': (
-                        response_data.get('error')
-                        if isinstance(response_data, dict)
-                        else 'daemon unavailable'
-                    ),
-                }
-                response_headers = response_headers or {}
-                response_headers['X-Daemon-Degraded'] = 'snapshot'
 
             response = jsonify(response_data)
             for key, value in response_headers.items():
@@ -7239,28 +7204,6 @@ class WebAPIServer:
                     port=self.agent_manager.daemon_api_port,
                     timeout=self.daemon_read_timeout_sec
                 )
-
-                # 降级：守护进程列表不可达时，优先使用daemon-info里的services快照
-                if status_code in (503, 504):
-                    try:
-                        agent = self.agent_manager.get_agent(agent_key)
-                        daemon_snapshot = (agent.daemon_info if agent and isinstance(agent.daemon_info, dict) else None)
-                        services_snapshot = []
-                        if daemon_snapshot and isinstance(daemon_snapshot.get('services'), list):
-                            services_snapshot = daemon_snapshot.get('services') or []
-                        status_code = 200
-                        response_data = {
-                            'code': 0,
-                            'data': {
-                                'services': services_snapshot,
-                                'source': 'snapshot',
-                                'degraded': True,
-                            }
-                        }
-                        response_headers = response_headers or {}
-                        response_headers['X-Daemon-Degraded'] = 'snapshot'
-                    except Exception:
-                        pass
 
                 response = jsonify(response_data)
                 for key, value in response_headers.items():
