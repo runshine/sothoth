@@ -456,9 +456,11 @@ class K8SService:
             resp = self._request("POST", "/ingresses/simple", project_id=project_id, json=payload)
             if resp.status_code in (200, 201):
                 data = resp.json()
-                rules = data.get("rules") or []
-                if rules and rules[0].get("host"):
-                    return rules[0]["host"]
+                rules = data.get("rules") or data.get("rule") or []
+                if rules and isinstance(rules, list) and rules[0].get("host"):
+                    return str(rules[0]["host"])
+                logger.info("Ingress已创建但未返回host: namespace=%s name=%s", namespace, name)
+                return ""
             logger.error(f"创建Ingress失败: {resp.status_code} {resp.text}")
             return None
         except Exception as e:

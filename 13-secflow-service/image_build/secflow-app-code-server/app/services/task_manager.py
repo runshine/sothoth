@@ -514,11 +514,14 @@ class TaskManager:
             # 4. 创建Ingress
             ingress_name = f"code-server-{name}"
             host = k8s_service.create_ingress(namespace, ingress_name, code_server_id, service_name)
-            if not host:
+            if host is None:
                 raise RuntimeError(f"创建Ingress {ingress_name} 失败")
 
             code_server.ingress_name = ingress_name
-            code_server.access_url = f"https://{host}" if self.config.ingress.tls_enabled else f"http://{host}"
+            if host:
+                code_server.access_url = f"https://{host}" if self.config.ingress.tls_enabled else f"http://{host}"
+            else:
+                code_server.access_url = None
 
             # 5. 获取Pod名称
             pod_info = k8s_service.get_pod_by_deployment(namespace, deployment_name)
