@@ -1453,8 +1453,40 @@ class AgentManager:
             return -1
 
     def get_project(self, project_id: str) -> Optional[ProjectInfo]:
-        with self.lock:
-            return self.projects.get(project_id)
+        if not project_id:
+            return None
+        table_name = self.db.get_table_name('agent_status')
+        try:
+            if self.db.db_type == 'mysql':
+                row = self.db.fetch_one(
+                    f"SELECT project_id, COUNT(*) AS agent_count, "
+                    f"SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) AS online_agents, "
+                    f"MAX(updated_at) AS last_refresh "
+                    f"FROM {table_name} WHERE project_id = %s GROUP BY project_id",
+                    (project_id,)
+                )
+            else:
+                row = self.db.fetch_one(
+                    f"SELECT project_id, COUNT(*) AS agent_count, "
+                    f"SUM(CASE WHEN status = 'online' THEN 1 ELSE 0 END) AS online_agents, "
+                    f"MAX(updated_at) AS last_refresh "
+                    f"FROM {table_name} WHERE project_id = ? GROUP BY project_id",
+                    (project_id,)
+                )
+            if not row:
+                return None
+            project = ProjectInfo(id=project_id)
+            project.agent_count = int(row.get('agent_count') or 0)
+            project.online_agents = int(row.get('online_agents') or 0)
+            last_refresh = row.get('last_refresh')
+            if last_refresh:
+                try:
+                    project.last_refresh = datetime.fromisoformat(str(last_refresh))
+                except Exception:
+                    project.last_refresh = datetime.now()
+            return project
+        except Exception:
+            return None
 
     def list_projects(self) -> List[Dict]:
         table_name = self.db.get_table_name('agent_status')
@@ -1476,37 +1508,25 @@ class AgentManager:
                 for row in rows if row.get('project_id') is not None
             ]
         except Exception:
-            with self.lock:
-                return [project.to_dict() for project in self.projects.values()]
+            return []
 
     def get_project_agents(self, project_id: str) -> List[Dict]:
         agents, _ = self.list_agents(1, 10000, project_id)
         return agents
 
     def get_agent(self, key: str) -> Optional[AgentInfo]:
-        with self.lock:
-            agent = self.agents.get(key)
-        if agent:
-            return agent
         return self.ensure_agent_exists(key)
 
     def ensure_agent_exists(self, agent_key: str) -> Optional[AgentInfo]:
         """
         确保指定agent存在：
-        1. 先查内存
-        2. 再查数据库
-        3. 最后从Nacos扫描并按agent_key反查创建
+        1. 先查数据库（唯一状态真源）
+        2. 再从Nacos扫描并按agent_key反查创建
         """
         if not agent_key:
             return None
 
-        # 1) 内存命中
-        with self.lock:
-            cached = self.agents.get(agent_key)
-        if cached:
-            return cached
-
-        # 2) DB命中并回填内存
+        # 1) DB命中并回填内存
         try:
             table_name = self.db.get_table_name('agent_status')
             if self.db.db_type == 'mysql':
@@ -1576,7 +1596,7 @@ class AgentManager:
         except Exception as e:
             self.logger.warning(f"数据库恢复Agent失败: key={agent_key}, err={e}")
 
-        # 3) Nacos反查发现并创建
+        # 2) Nacos反查发现并创建
         try:
             services = self._fetch_nacos_services()
             for service in services:
@@ -1681,25 +1701,7 @@ class AgentManager:
 
             return data
 
-        memory_agents: Dict[str, Dict] = {}
-        lock_acquired = self.lock.acquire(timeout=0.2)
-        try:
-            if lock_acquired:
-                memory_agents = {
-                    key: dict(agent.to_dict(), **{
-                        'diag_data_source': 'memory_realtime',
-                        'diag_memory_enriched': False,
-                    })
-                    for key, agent in self.agents.items()
-                    if (not project_id) or agent.project_id == project_id
-                }
-            else:
-                self.logger.warning(
-                    f"list_agents 获取内存锁超时，回退到数据库快照: project_id={project_id or '*'}"
-                )
-        finally:
-            if lock_acquired:
-                self.lock.release()
+        lock_acquired = False
 
         if project_id:
             if self.db.db_type == 'mysql':
@@ -1718,19 +1720,6 @@ class AgentManager:
                 decoded = _decode_row(row)
                 if decoded:
                     agents_map[decoded['key']] = decoded
-
-            for key, agent_data in memory_agents.items():
-                existing = agents_map.get(key)
-                if not existing:
-                    agents_map[key] = agent_data
-                    continue
-                # 多副本部署下以数据库快照为主，避免不同POD内存态覆盖导致前端状态横跳；
-                # 仅在数据库缺失时使用内存字段做补齐。
-                for field_name in ('system_info', 'daemon_info', 'services'):
-                    if not existing.get(field_name) and agent_data.get(field_name):
-                        existing[field_name] = agent_data.get(field_name)
-                        existing['diag_memory_enriched'] = True
-                agents_map[key] = existing
 
             agents_list = list(agents_map.values())
             refresh_diag = self.get_last_refresh_diag()
@@ -1759,7 +1748,7 @@ class AgentManager:
                 generated_at=datetime.now().isoformat(),
                 project_id=project_id,
                 memory_lock_acquired=lock_acquired,
-                memory_agents_count=len(memory_agents),
+                memory_agents_count=0,
                 db_rows_count=len(rows or []),
             )
             return agents_list[start_idx:end_idx], total
@@ -1779,18 +1768,6 @@ class AgentManager:
             if decoded:
                 agents_map[decoded['key']] = decoded
 
-        for key, agent_data in memory_agents.items():
-            existing = agents_map.get(key)
-            if not existing:
-                agents_map[key] = agent_data
-                continue
-            # 多副本部署下以数据库快照为主，避免不同POD内存态覆盖导致状态抖动。
-            for field_name in ('system_info', 'daemon_info', 'services'):
-                if not existing.get(field_name) and agent_data.get(field_name):
-                    existing[field_name] = agent_data.get(field_name)
-                    existing['diag_memory_enriched'] = True
-            agents_map[key] = existing
-
         agents_list = list(agents_map.values())
         refresh_diag = self.get_last_refresh_diag()
         generated_at = datetime.now().isoformat()
@@ -1807,7 +1784,7 @@ class AgentManager:
             generated_at=generated_at,
             project_id=project_id,
             memory_lock_acquired=lock_acquired,
-            memory_agents_count=len(memory_agents),
+            memory_agents_count=0,
             db_rows_count=len(rows or []),
         )
         return agents_list[start_idx:end_idx], total

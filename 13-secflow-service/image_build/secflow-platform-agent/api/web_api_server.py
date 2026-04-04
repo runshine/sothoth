@@ -2689,7 +2689,7 @@ class WebAPIServer:
                         'enabled': bool(self.redis_manager.enabled),
                         'used_for_agent_list_cache': False,
                     },
-                    'note': 'agent list reads DB snapshot + in-memory merge; redis currently used for distributed locks'
+                    'note': 'agent list reads DB snapshot only; redis currently used for distributed locks'
                 }
             })
 
