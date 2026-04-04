@@ -14,6 +14,7 @@ services:
       - TIMEOUT=180
       - PORT=20001
       - WORKDIR=/app
+      - AGENT_HEALTH_CACHE_TTL_SEC=3600
       - ALLOWED_COMMANDS=  # 留空表示允许所有（生产环境建议设置）
       - ANTHROPIC_BASE_URL="http://172.31.29.10:3456"
       - ANTHROPIC_AUTH_TOKEN="sk-12345678"
