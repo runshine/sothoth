@@ -41,7 +41,17 @@ class K8SService:
         params = dict(kwargs.pop("params", {}) or {})
         if project_id:
             params["project_id"] = project_id
-        resp = self.client.request(method=method.upper(), url=url, params=params, **kwargs)
+        headers = dict(kwargs.pop("headers", {}) or {})
+        machine_token = getattr(getattr(self.config, "auth_service", None), "service_machine_token", None)
+        if machine_token and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {machine_token}"
+        resp = self.client.request(
+            method=method.upper(),
+            url=url,
+            params=params,
+            headers=headers,
+            **kwargs,
+        )
         return resp
 
     def connect(self) -> bool:
