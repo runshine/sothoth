@@ -1542,15 +1542,20 @@ class KubernetesService:
     def scale_deployment(self, namespace: str, name: str, replicas: int) -> Dict:
         """扩缩容Deployment"""
         try:
-            from kubernetes.client import V1Scale, V1ScaleSpec
-            scale = V1Scale(spec=V1ScaleSpec(replicas=int(replicas)))
-            result = self.apps_v1.replace_namespaced_deployment_scale(
+            # 使用 patch scale 子资源，兼容性更好
+            scale_patch = {"spec": {"replicas": int(replicas)}}
+            result = self.apps_v1.patch_namespaced_deployment_scale(
                 name=name,
                 namespace=namespace,
-                body=scale
+                body=scale_patch
             )
-            return {"name": name, "replicas": result.spec.replicas}
+            current = result.spec.replicas if result and result.spec and result.spec.replicas is not None else int(replicas)
+            return {"name": name, "replicas": current}
         except ApiException as e:
+            logger.error(
+                "Deployment扩缩容失败: namespace=%s name=%s replicas=%s status=%s reason=%s body=%s",
+                namespace, name, replicas, e.status, e.reason, getattr(e, "body", None)
+            )
             self._handle_api_exception(e, "Deployment", "扩缩容")
 
     def _deployment_to_dict(self, dep) -> Dict:
