@@ -493,6 +493,61 @@ class WebAPIServer:
     def _upsert_single_agent_service(self, payload: Dict[str, Any], now_ts: Optional[str] = None):
         table_name = self.db_manager.get_table_name('agent_services')
         now_ts = now_ts or datetime.now().isoformat()
+        source_priority = {
+            'report_full': 40,
+            'report_delta': 30,
+            'pull_force': 20,
+            'pull': 10,
+        }
+
+        def _json_has_content(raw: Any) -> bool:
+            if raw is None:
+                return False
+            if isinstance(raw, (dict, list, tuple, set)):
+                return len(raw) > 0
+            if isinstance(raw, str):
+                text = raw.strip()
+                if not text:
+                    return False
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    return bool(text)
+                if isinstance(parsed, (dict, list, tuple, set)):
+                    return len(parsed) > 0
+                return parsed is not None and str(parsed).strip() != ''
+            return True
+
+        # 关键保护：如果本轮是低优先级来源且字段为空，不覆盖历史有效值。
+        existing_row = None
+        try:
+            placeholder = "%s" if self.db_manager.db_type == 'mysql' else "?"
+            existing_row = self.db_manager.fetch_one(
+                f"SELECT image, tags_json, ports_json, raw_json, source FROM {table_name} WHERE service_uid = {placeholder}",
+                (payload['service_uid'],)
+            )
+        except Exception:
+            existing_row = None
+
+        if isinstance(existing_row, dict):
+            old_source = str(existing_row.get('source') or '').strip().lower()
+            new_source = str(payload.get('source') or '').strip().lower()
+            old_pri = source_priority.get(old_source, 0)
+            new_pri = source_priority.get(new_source, 0)
+
+            old_image = str(existing_row.get('image') or '')
+            if not str(payload.get('image') or '').strip() and old_image.strip():
+                payload['image'] = old_image
+
+            if not _json_has_content(payload.get('tags_json')) and _json_has_content(existing_row.get('tags_json')):
+                payload['tags_json'] = existing_row.get('tags_json')
+            if not _json_has_content(payload.get('ports_json')) and _json_has_content(existing_row.get('ports_json')):
+                payload['ports_json'] = existing_row.get('ports_json')
+            if not _json_has_content(payload.get('raw_json')) and _json_has_content(existing_row.get('raw_json')):
+                payload['raw_json'] = existing_row.get('raw_json')
+
+            if old_pri > new_pri:
+                payload['source'] = existing_row.get('source') or payload.get('source')
 
         if self.db_manager.db_type == 'mysql':
             self.db_manager.execute_query(f'''
@@ -2694,8 +2749,9 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/agents', methods=['GET'])
         def list_agents():
-            page = int(request.args.get('page', 1))
-            per_page = int(request.args.get('per_page', 20))
+            page = max(int(request.args.get('page', 1) or 1), 1)
+            per_page = int(request.args.get('per_page', 20) or 20)
+            per_page = max(1, min(per_page, 1000))
             project_id = request.args.get('project_id')
 
             # project_id is required
@@ -6252,6 +6308,9 @@ class WebAPIServer:
                 project_id = request.args.get('project_id')
                 if not project_id:
                     return jsonify({'error': 'project_id parameter is required'}), 400
+                page = max(int(request.args.get('page', 1) or 1), 1)
+                per_page = int(request.args.get('per_page', 10) or 10)
+                per_page = max(1, min(per_page, 1000))
                 include_deleted = request.args.get('include_deleted', 'false').lower() == 'true'
                 auth_header = request.headers.get('Authorization')
 
@@ -6301,12 +6360,20 @@ class WebAPIServer:
                         'last_rebind_summary': latest_rebind_by_agent.get(agent_key),
                     })
 
+                total = len(enhanced_items)
+                start = (page - 1) * per_page
+                end = start + per_page
+                paged_items = enhanced_items[start:end]
+
                 return jsonify({
                     'project_id': project_id,
-                    'items': enhanced_items,
+                    'items': paged_items,
+                    'page': page,
+                    'per_page': per_page,
+                    'total': total,
                     'recent_rebind_events': self._get_recent_ingress_rebind_events(project_id, limit=20),
                     'stats': {
-                        'total': len(enhanced_items),
+                        'total': total,
                         'ready': ready_count,
                         'error': error_count,
                         'deleted': deleted_count,
