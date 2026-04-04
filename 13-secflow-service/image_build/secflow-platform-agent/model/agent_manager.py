@@ -1278,6 +1278,8 @@ class AgentManager:
                     f"SELECT status, system_info, daemon_info, services FROM {table_name} WHERE agent_key = ? LIMIT 1",
                     (agent.key,)
                 )
+            if not isinstance(prev_row, dict):
+                prev_row = {}
             prev_status = str((prev_row or {}).get('status') or '')
         except Exception:
             prev_status = ''
