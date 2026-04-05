@@ -4604,6 +4604,98 @@ class WebAPIServer:
                 self.logger.error(f"聚合服务查询失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/agent/services/global/cleanup-offline', methods=['POST'])
+        def cleanup_offline_global_services():
+            """一键清理 OFFLINE 状态服务（仅节点离线/孤儿服务）。"""
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                dry_run = bool(data.get('dry_run', False))
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+
+                services_table = self.db_manager.get_table_name('agent_services')
+                agents_table = self.db_manager.get_table_name('agents')
+                placeholder = '%s' if self.db_manager.db_type == 'mysql' else '?'
+
+                offline_clause = (
+                    f"s.agent_key IN (SELECT a.agent_key FROM {agents_table} a "
+                    f"WHERE a.project_id = {placeholder} AND COALESCE(a.status, 'unknown') <> 'online')"
+                )
+                orphan_clause = (
+                    f"s.agent_key IS NULL OR s.agent_key = '' OR "
+                    f"s.agent_key NOT IN (SELECT a.agent_key FROM {agents_table} a WHERE a.project_id = {placeholder})"
+                )
+                target_where = f"s.project_id = {placeholder} AND ({offline_clause} OR {orphan_clause})"
+
+                preview_sql = f"""
+                    SELECT s.service_uid, s.agent_key, s.service_name, s.is_stale,
+                           CASE
+                               WHEN {orphan_clause} THEN 'orphan_agent'
+                               ELSE 'offline_agent'
+                           END AS offline_reason
+                    FROM {services_table} s
+                    WHERE {target_where}
+                """
+                preview_params = (project_id, project_id, project_id, project_id)
+                preview_rows = self.db_manager.fetch_all(preview_sql, preview_params) or []
+
+                reason_stats = {'offline_agent': 0, 'orphan_agent': 0}
+                sample_items = []
+                for row in preview_rows:
+                    reason = str(row.get('offline_reason') or 'offline_agent')
+                    reason_stats[reason] = reason_stats.get(reason, 0) + 1
+                    if len(sample_items) < 100:
+                        sample_items.append({
+                            'service_uid': row.get('service_uid'),
+                            'agent_key': row.get('agent_key'),
+                            'service_name': row.get('service_name'),
+                            'reason': reason,
+                        })
+
+                if dry_run:
+                    return jsonify({
+                        'project_id': project_id,
+                        'dry_run': True,
+                        'target_count': len(preview_rows),
+                        'reason_stats': reason_stats,
+                        'items': sample_items,
+                    })
+
+                delete_sql = (
+                    f"DELETE FROM {services_table} WHERE project_id = %s AND ("
+                    f"agent_key IS NULL OR agent_key = '' OR "
+                    f"agent_key IN (SELECT agent_key FROM {agents_table} WHERE project_id = %s AND COALESCE(status, 'unknown') <> 'online') OR "
+                    f"agent_key NOT IN (SELECT agent_key FROM {agents_table} WHERE project_id = %s)"
+                    f")"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"DELETE FROM {services_table} WHERE project_id = ? AND ("
+                    f"agent_key IS NULL OR agent_key = '' OR "
+                    f"agent_key IN (SELECT agent_key FROM {agents_table} WHERE project_id = ? AND COALESCE(status, 'unknown') <> 'online') OR "
+                    f"agent_key NOT IN (SELECT agent_key FROM {agents_table} WHERE project_id = ?)"
+                    f")"
+                )
+                delete_params = (project_id, project_id, project_id)
+
+                conn = self.db_manager.get_connection()
+                try:
+                    cursor = conn.execute(delete_sql, delete_params)
+                    deleted = int(cursor.rowcount or 0)
+                    cursor.close()
+                finally:
+                    conn.close()
+
+                return jsonify({
+                    'project_id': project_id,
+                    'dry_run': False,
+                    'target_count': len(preview_rows),
+                    'deleted': deleted,
+                    'reason_stats': reason_stats,
+                })
+            except Exception as e:
+                self.logger.error(f"清理OFFLINE服务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/agent/ai-helpers', methods=['GET'])
         def list_ai_helpers():
             try:
