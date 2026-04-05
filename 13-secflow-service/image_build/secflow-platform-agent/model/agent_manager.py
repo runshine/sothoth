@@ -248,10 +248,40 @@ class AgentManager:
         根据服务名称获取对应的集群，然后从该集群的metadata中获取key为uuid的值
         如果获取不到，则不认为是一个有效的agent，忽略即可
         """
+        def _select_uuid_from_hosts(hosts: Any, expected_ip: str = '') -> Optional[str]:
+            if not isinstance(hosts, list) or not hosts:
+                return None
+
+            exp_ip = str(expected_ip or '').strip()
+            # 关键修复：优先使用 expected_ip 精确匹配，避免多实例场景取到错误节点的uuid
+            if exp_ip:
+                for instance in hosts:
+                    if not isinstance(instance, dict):
+                        continue
+                    if str(instance.get('ip') or '').strip() != exp_ip:
+                        continue
+                    metadata = instance.get('metadata') or {}
+                    if isinstance(metadata, dict):
+                        uuid_value = str(metadata.get('uuid') or '').strip()
+                        if uuid_value:
+                            return uuid_value
+                return None
+
+            # 无 expected_ip 时，回退为第一个可用uuid
+            for instance in hosts:
+                if not isinstance(instance, dict):
+                    continue
+                metadata = instance.get('metadata') or {}
+                if isinstance(metadata, dict):
+                    uuid_value = str(metadata.get('uuid') or '').strip()
+                    if uuid_value:
+                        return uuid_value
+            return None
+
         try:
             # 检查缓存
             current_time = time.time()
-            cache_key = f"{service_name}_nacos-client"
+            cache_key = f"{service_name}_nacos-client-{ip_address or ''}"
             if current_time - self.nacos_client_cache_time < self.nacos_client_cache_ttl:
                 uuid_value = self.nacos_client_uuid_cache.get(cache_key)
                 if uuid_value:
@@ -275,17 +305,26 @@ class AgentManager:
                     service_data = response.json()
                     self.logger.debug(f"使用新API获取服务 {service_name} 成功")
 
-                    # 尝试解析新的API返回格式，查找名为nacos-client的集群
-                    uuid_value = self._parse_nacos_v3_response_for_cluster(service_data, 'nacos-client')
+                    # 优先尝试从实例列表中按 expected_ip 精确匹配（若v3返回含hosts）
+                    hosts = []
+                    if isinstance(service_data, dict):
+                        if isinstance(service_data.get('hosts'), list):
+                            hosts = service_data.get('hosts') or []
+                        elif isinstance(service_data.get('data'), dict) and isinstance((service_data.get('data') or {}).get('hosts'), list):
+                            hosts = (service_data.get('data') or {}).get('hosts') or []
+                        elif isinstance(service_data.get('service'), dict) and isinstance((service_data.get('service') or {}).get('hosts'), list):
+                            hosts = (service_data.get('service') or {}).get('hosts') or []
+
+                    uuid_value = _select_uuid_from_hosts(hosts, expected_ip=ip_address)
                     if uuid_value:
                         # 更新缓存
                         self.nacos_client_uuid_cache[cache_key] = uuid_value
                         self.nacos_client_cache_time = current_time
 
-                        #self.logger.debug(f"从服务 {service_name} 的nacos-client集群获取到uuid: {uuid_value}")
+                        self.logger.debug(f"从服务 {service_name} 的v3实例精确匹配获取uuid: {uuid_value}")
                         return uuid_value
                     else:
-                        self.logger.debug(f"服务 {service_name} 中没有找到名为nacos-client的集群")
+                        self.logger.debug(f"服务 {service_name} 的v3响应未找到与expected_ip={ip_address}匹配的uuid")
 
             except Exception as e:
                 self.logger.debug(f"使用新API获取服务 {service_name} 失败: {str(e)}")
@@ -309,16 +348,16 @@ class AgentManager:
 
                     # 查找实例的metadata
                     if 'hosts' in instances_data and instances_data['hosts']:
-                        for instance in instances_data['hosts']:
-                            if 'metadata' in instance:
-                                uuid_value = instance['metadata'].get('uuid')
-                                if uuid_value:
-                                    # 更新缓存
-                                    self.nacos_client_uuid_cache[cache_key] = uuid_value
-                                    self.nacos_client_cache_time = current_time
+                        uuid_value = _select_uuid_from_hosts(instances_data['hosts'], expected_ip=ip_address)
+                        if uuid_value:
+                            # 更新缓存
+                            self.nacos_client_uuid_cache[cache_key] = uuid_value
+                            self.nacos_client_cache_time = current_time
 
-                                    self.logger.debug(f"从服务 {service_name} 的nacos-client集群实例获取到uuid: {uuid_value}")
-                                    return uuid_value
+                            self.logger.debug(
+                                f"从服务 {service_name} 的nacos-client实例按expected_ip={ip_address}获取uuid: {uuid_value}"
+                            )
+                            return uuid_value
 
                         self.logger.debug(f"服务 {service_name} 的nacos-client集群实例中没有找到uuid")
                     else:
@@ -350,7 +389,8 @@ class AgentManager:
                         for host in service_data['hosts']:
                             # 检查集群名称是否为nacos-client
                             cluster_name = host.get('clusterName', '')
-                            if cluster_name == 'nacos-client' and 'metadata' in host:
+                            host_ip = str(host.get('ip') or '').strip()
+                            if cluster_name == 'nacos-client' and (not ip_address or host_ip == str(ip_address).strip()) and 'metadata' in host:
                                 metadata = host['metadata']
                                 uuid_value = metadata.get('uuid')
 
