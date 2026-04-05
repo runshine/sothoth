@@ -4615,7 +4615,7 @@ class WebAPIServer:
                     return jsonify({'error': 'project_id is required'}), 400
 
                 services_table = self.db_manager.get_table_name('agent_services')
-                agents_table = self.db_manager.get_table_name('agents')
+                agents_table = self.db_manager.get_table_name('agent_status')
                 placeholder = '%s' if self.db_manager.db_type == 'mysql' else '?'
 
                 offline_clause = (
