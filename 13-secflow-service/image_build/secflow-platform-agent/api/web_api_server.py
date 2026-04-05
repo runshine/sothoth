@@ -458,10 +458,20 @@ class WebAPIServer:
             self._upsert_single_agent_service(payload, now_ts=now_ts)
             upserted += 1
 
-        # 标记本次快照里不存在的服务为 stale
-        # 对 pull_force / report_full 空快照增加宽限，避免瞬时抖动导致服务整机“消失”。
+        # pull_force 仅用于补充拉取，不参与缺失收敛，避免与 helper 全量上报语义冲突。
+        # 缺失收敛统一由 report_full 驱动。
         source_name = str(source or '').strip().lower()
-        if seen == 0 and source_name in ('pull_force', 'report_full'):
+        if source_name == 'pull_force':
+            if seen == 0:
+                self.logger.warning(
+                    f"pull_force 空快照（仅跳过，不标stale）: agent={getattr(agent, 'key', '')}, "
+                    f"project={getattr(agent, 'project_id', '')}"
+                )
+            return seen, upserted
+
+        # 标记本次快照里不存在的服务为 stale
+        # 对 report_full 空快照增加宽限，避免瞬时抖动导致服务整机“消失”。
+        if seen == 0 and source_name == 'report_full':
             self._mark_agent_services_stale_with_grace(agent.key, reason=f'{source_name}_empty_snapshot')
             return seen, upserted
 
