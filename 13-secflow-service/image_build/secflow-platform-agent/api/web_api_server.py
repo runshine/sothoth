@@ -459,6 +459,12 @@ class WebAPIServer:
             upserted += 1
 
         # 标记本次快照里不存在的服务为 stale
+        # 对 pull_force / report_full 空快照增加宽限，避免瞬时抖动导致服务整机“消失”。
+        source_name = str(source or '').strip().lower()
+        if seen == 0 and source_name in ('pull_force', 'report_full'):
+            self._mark_agent_services_stale_with_grace(agent.key, reason=f'{source_name}_empty_snapshot')
+            return seen, upserted
+
         if self.db_manager.db_type == 'mysql':
             if seen == 0:
                 self.db_manager.execute_query(
@@ -523,7 +529,7 @@ class WebAPIServer:
         try:
             placeholder = "%s" if self.db_manager.db_type == 'mysql' else "?"
             existing_row = self.db_manager.fetch_one(
-                f"SELECT image, tags_json, ports_json, raw_json, source FROM {table_name} WHERE service_uid = {placeholder}",
+                f"SELECT image, status, tags_json, ports_json, raw_json, source FROM {table_name} WHERE service_uid = {placeholder}",
                 (payload['service_uid'],)
             )
         except Exception:
@@ -534,6 +540,8 @@ class WebAPIServer:
             new_source = str(payload.get('source') or '').strip().lower()
             old_pri = source_priority.get(old_source, 0)
             new_pri = source_priority.get(new_source, 0)
+            old_status = str(existing_row.get('status') or '').strip()
+            new_status = str(payload.get('status') or '').strip()
 
             old_image = str(existing_row.get('image') or '')
             if not str(payload.get('image') or '').strip() and old_image.strip():
@@ -548,6 +556,9 @@ class WebAPIServer:
 
             if old_pri > new_pri:
                 payload['source'] = existing_row.get('source') or payload.get('source')
+                # 低优先级来源不覆盖高优先级来源的有效状态，减少刚拉起阶段抖动。
+                if old_status and (not new_status or new_status.lower() in ('unknown', 'not_found')):
+                    payload['status'] = old_status
 
         if self.db_manager.db_type == 'mysql':
             self.db_manager.execute_query(f'''
@@ -614,6 +625,62 @@ class WebAPIServer:
                 f"UPDATE {table_name} SET is_stale = 1, updated_at = datetime('now') WHERE agent_key = ?",
                 (agent_key,)
             )
+
+    def _parse_db_datetime(self, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace('Z', '+00:00')
+        try:
+            return datetime.fromisoformat(normalized)
+        except Exception:
+            pass
+        for fmt in ('%Y-%m-%d %H:%M:%S', '%a, %d %b %Y %H:%M:%S GMT'):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                continue
+        return None
+
+    def _get_service_stale_grace_seconds(self) -> int:
+        raw = self.config.get('service_stale_grace_sec', 120)
+        try:
+            return max(0, int(raw))
+        except Exception:
+            return 120
+
+    def _mark_agent_services_stale_with_grace(self, agent_key: str, reason: str = '') -> bool:
+        grace_sec = self._get_service_stale_grace_seconds()
+        if grace_sec <= 0:
+            self._mark_agent_services_stale(agent_key)
+            return True
+
+        table_name = self.db_manager.get_table_name('agent_services')
+        try:
+            row = self.db_manager.fetch_one(
+                f"SELECT MAX(last_seen_at) AS last_seen_at FROM {table_name} WHERE agent_key = %s AND is_stale = 0"
+                if self.db_manager.db_type == 'mysql' else
+                f"SELECT MAX(last_seen_at) AS last_seen_at FROM {table_name} WHERE agent_key = ? AND is_stale = 0",
+                (agent_key,)
+            )
+            last_seen = self._parse_db_datetime((row or {}).get('last_seen_at'))
+            if last_seen:
+                now = datetime.now(last_seen.tzinfo) if last_seen.tzinfo else datetime.now()
+                age_sec = (now - last_seen).total_seconds()
+                if age_sec < grace_sec:
+                    self.logger.info(
+                        f"延迟标记服务stale: agent={agent_key}, age={age_sec:.1f}s < grace={grace_sec}s, reason={reason or '-'}"
+                    )
+                    return False
+        except Exception as e:
+            self.logger.warning(f"检查服务stale宽限失败，按原策略执行: agent={agent_key}, err={e}")
+
+        self._mark_agent_services_stale(agent_key)
+        return True
 
     def _resolve_or_auto_create_agent_for_report(self, agent_key: str):
         """服务上报场景下，允许未知agent自动发现并创建。"""
@@ -2286,7 +2353,10 @@ class WebAPIServer:
                 if agent_status != 'online':
                     summary['offline_agents'] += 1
                     if agent_data.get('key'):
-                        self._mark_agent_services_stale(agent_data.get('key'))
+                        self._mark_agent_services_stale_with_grace(
+                            agent_data.get('key'),
+                            reason='agent_offline_during_sync'
+                        )
                     continue
                 summary['online_agents'] += 1
                 agent = self.agent_manager.get_agent(agent_data.get('key'))
@@ -2345,7 +2415,10 @@ class WebAPIServer:
                 status_code, response = retry_status, retry_response
 
         if status_code != 200:
-            self._mark_agent_services_stale(agent.key)
+            self._mark_agent_services_stale_with_grace(
+                agent.key,
+                reason=f'pull_force_status_{status_code}'
+            )
             reason = ''
             if isinstance(response, dict):
                 reason = str(response.get('error') or response.get('message') or '')
@@ -6872,6 +6945,11 @@ class WebAPIServer:
                         )
 
                 seen, upserted = self._upsert_agent_services_snapshot(agent, services, source='report_full')
+                if seen == 0:
+                    self.logger.warning(
+                        f"收到空服务全量上报: agent={agent_key}, project={getattr(agent, 'project_id', '')}, "
+                        f"source_ip={request.remote_addr}, services_len={len(services) if isinstance(services, list) else -1}"
+                    )
                 return jsonify({
                     'message': 'service snapshot accepted',
                     'agent_key': agent_key,

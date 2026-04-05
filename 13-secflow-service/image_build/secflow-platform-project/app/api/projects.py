@@ -150,7 +150,8 @@ def get_project_with_permission(
     if not project:
         raise NotFoundError("项目", project_id)
 
-    if is_project_machine_token(current_user, project_id):
+    # 机机Token（项目级或全局）均允许访问项目，供微服务间调用使用
+    if is_machine_token_user(current_user):
         return project
 
     user_id = get_human_user_id(current_user)
@@ -568,7 +569,7 @@ async def get_project(
         created_at=bind.created_at
     ) for bind in project.role_binds]
 
-    can_manage = is_project_machine_token(current_user, project_id)
+    can_manage = is_machine_token_user(current_user) or is_project_machine_token(current_user, project_id)
     if not can_manage and not is_machine_token_user(current_user):
         can_manage = can_manage_project(db, project, int(current_user["id"]))
 
