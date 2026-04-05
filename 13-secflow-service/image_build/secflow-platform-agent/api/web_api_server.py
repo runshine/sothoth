@@ -728,7 +728,7 @@ class WebAPIServer:
             if full_name:
                 agent.full_name = full_name
             elif agent.project_id and agent.hostname and agent.ip_address:
-                agent.full_name = f"{agent.project_id}-{agent.hostname}-{agent.ip_address}"
+                agent.full_name = f"{agent.project_id}-{agent.key}-{agent.hostname}-{agent.ip_address}"
             elif not agent.full_name:
                 agent.full_name = agent_key
 
@@ -747,7 +747,10 @@ class WebAPIServer:
         if not hostname:
             hostname = f"agent-{agent_key[:8]}"
         if not full_name:
-            full_name = f"{project_id}-{hostname}-{ip_address}" if ip_address else f"{project_id}-{hostname}"
+            full_name = (
+                f"{project_id}-{agent_key}-{hostname}-{ip_address}"
+                if ip_address else f"{project_id}-{agent_key}-{hostname}"
+            )
         created = AgentInfo(
             key=agent_key,
             ip_address=ip_address,

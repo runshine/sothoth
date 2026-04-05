@@ -212,8 +212,14 @@ class AgentManager:
         project.online_agents = online_count
         project.last_refresh = datetime.now()
 
-    def _parse_agent_name(self, service_name: str) -> Optional[Tuple[str, str, str]]:
-        # 找到第一个连字符，它分隔 project_id 和 hostname
+    def _parse_agent_name(self, service_name: str) -> Optional[Tuple[str, str, str, str]]:
+        # 目标格式：
+        #   {project_id}-{agent_id}-{hostname}-{service_ip}
+        # 兼容旧格式：
+        #   {project_id}-{hostname}-{service_ip}
+        # 其中 project_id/agent_id 都不包含 '-'
+
+        # 找到第一个连字符，它分隔 project_id 和后续字段
         first_dash = service_name.find('-')
         if first_dash == -1:
             return None
@@ -230,17 +236,32 @@ class AgentManager:
             return None
 
         ip_address = service_name[last_dash + 1:]
-        hostname = service_name[first_dash + 1:last_dash]
-
-        # 确保 hostname 不为空
-        if not hostname:
-            return None
+        middle = service_name[first_dash + 1:last_dash]
 
         # 验证 IP 地址
         if not self._is_ip_address(ip_address):
             return None
 
-        return project_id, hostname, ip_address
+        if not middle:
+            return None
+
+        agent_key = ''
+        hostname = middle
+
+        # 新格式优先：middle = {agent_id}-{hostname}
+        second_dash = middle.find('-')
+        if second_dash > 0:
+            candidate_agent_key = middle[:second_dash]
+            candidate_hostname = middle[second_dash + 1:]
+            if candidate_hostname and re.fullmatch(r'[A-Fa-f0-9]+', candidate_agent_key):
+                agent_key = candidate_agent_key
+                hostname = candidate_hostname
+
+        # 确保 hostname 不为空
+        if not hostname:
+            return None
+
+        return project_id, agent_key, hostname, ip_address
 
     def _get_agent_key(self, hostname: str, ip_address: str, service_name: str) -> Optional[str]:
         """
@@ -757,15 +778,18 @@ class AgentManager:
         for service in services:
             result = self._parse_agent_name(service)
             if result:
-                project_id, hostname, ip_address = result
+                project_id, parsed_agent_key, hostname, ip_address = result
 
                 if not self._has_healthy_nacos_client_instance(service, ip_address):
                     self.logger.debug(f"跳过无健康实例的agent服务: {service}")
                     unhealthy_skipped += 1
                     continue
 
-                # 使用新方法获取agent_key，传入service_name
-                agent_key = self._get_agent_key(hostname, ip_address, service)
+                # 优先使用服务名中的稳定agent_id，避免因service_ip变化导致映射抖动。
+                agent_key = str(parsed_agent_key or '').strip()
+                if not agent_key:
+                    # 兼容旧格式：回退到metadata.uuid读取
+                    agent_key = self._get_agent_key(hostname, ip_address, service)
 
                 # 如果没有获取到有效的agent_key，跳过这个agent
                 if not agent_key:
@@ -1680,8 +1704,10 @@ class AgentManager:
                 parsed = self._parse_agent_name(service)
                 if not parsed:
                     continue
-                project_id, hostname, ip_address = parsed
-                discovered_key = self._get_agent_key(hostname, ip_address, service)
+                project_id, parsed_agent_key, hostname, ip_address = parsed
+                discovered_key = str(parsed_agent_key or '').strip()
+                if not discovered_key:
+                    discovered_key = self._get_agent_key(hostname, ip_address, service)
                 if discovered_key != agent_key:
                     continue
 
