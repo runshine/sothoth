@@ -552,6 +552,7 @@ class DatabaseManager:
                                agent_ip VARCHAR(64),
                                service_name VARCHAR(200) NOT NULL,
                                image TEXT,
+                               images_json JSON,
                                status VARCHAR(32) DEFAULT 'unknown',
                                tags_json JSON,
                                ports_json JSON,
@@ -580,6 +581,7 @@ class DatabaseManager:
                                agent_ip TEXT,
                                service_name TEXT NOT NULL,
                                image TEXT,
+                               images_json TEXT,
                                status TEXT DEFAULT 'unknown',
                                tags_json TEXT,
                                ports_json TEXT,
@@ -1071,7 +1073,7 @@ class DatabaseManager:
             self.logger.error(f"检查/迁移 {table_name} 模板字段失败: {str(e)}")
 
     def _ensure_agent_services_columns(self, db: DatabaseConnection, table_name: str):
-        """确保 agent_services 表包含 tags_json 字段。"""
+        """确保 agent_services 表包含聚合快照字段。"""
         try:
             if self.db_type == 'mysql':
                 columns = db.fetch_all(
@@ -1086,12 +1088,24 @@ class DatabaseManager:
                 if 'tags_json' not in existing:
                     db.execute(f"ALTER TABLE {table_name} ADD COLUMN tags_json JSON NULL")
                     self.logger.info(f"数据库迁移: 已为 {table_name} 添加 tags_json 列")
+                if 'images_json' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN images_json JSON NULL")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 images_json 列")
+                if 'images_json' in existing and 'image' in existing:
+                    db.execute(
+                        f"UPDATE {table_name} SET images_json = JSON_ARRAY(image) "
+                        "WHERE (images_json IS NULL OR JSON_LENGTH(images_json) = 0) "
+                        "AND image IS NOT NULL AND image <> ''"
+                    )
             else:
                 columns = db.fetch_all(f"PRAGMA table_info({table_name})")
                 existing = {item['name'] for item in columns}
                 if 'tags_json' not in existing:
                     db.execute(f"ALTER TABLE {table_name} ADD COLUMN tags_json TEXT")
                     self.logger.info(f"数据库迁移: 已为 {table_name} 添加 tags_json 列")
+                if 'images_json' not in existing:
+                    db.execute(f"ALTER TABLE {table_name} ADD COLUMN images_json TEXT")
+                    self.logger.info(f"数据库迁移: 已为 {table_name} 添加 images_json 列")
         except Exception as e:
             self.logger.error(f"检查/迁移 {table_name} 服务聚合字段失败: {str(e)}")
 

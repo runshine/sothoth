@@ -129,6 +129,7 @@ class BackendRegistry:
             'llm_provider_applied_at': payload.get('llm_provider_applied_at', existing.get('llm_provider_applied_at')),
             'llm_provider_mapped_env_keys': payload.get('llm_provider_mapped_env_keys', existing.get('llm_provider_mapped_env_keys', [])),
             'llm_provider_file_bindings': payload.get('llm_provider_file_bindings', existing.get('llm_provider_file_bindings', [])),
+            'llm_provider_file_backups': payload.get('llm_provider_file_backups', existing.get('llm_provider_file_backups', [])),
             'llm_provider_merge_strategy': payload.get('llm_provider_merge_strategy', existing.get('llm_provider_merge_strategy', 'overwrite')),
         }
         backends[name] = merged

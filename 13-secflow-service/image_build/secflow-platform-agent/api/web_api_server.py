@@ -19,7 +19,7 @@ import zipfile
 from urllib.parse import quote, urlencode, parse_qs
 
 from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Union
+from typing import Dict, List, Any, Optional, Tuple, Union, Set
 from datetime import datetime, timedelta
 import json
 
@@ -422,7 +422,8 @@ class WebAPIServer:
 
         ports = self._normalize_service_ports(service.get('ports'))
         tags = self._normalize_service_tags(service.get('tags'))
-        image = service.get('image') or ''
+        images = self._extract_service_images(service)
+        image = images[0] if images else ''
         status = service.get('status') or service.get('state') or 'unknown'
 
         return {
@@ -433,6 +434,7 @@ class WebAPIServer:
             'agent_ip': getattr(agent, 'ip_address', '') or '',
             'service_name': service_name,
             'image': str(image),
+            'images_json': json.dumps(images, ensure_ascii=False),
             'status': str(status),
             'tags_json': json.dumps(tags, ensure_ascii=False),
             'ports_json': json.dumps(ports, ensure_ascii=False),
@@ -539,7 +541,7 @@ class WebAPIServer:
         try:
             placeholder = "%s" if self.db_manager.db_type == 'mysql' else "?"
             existing_row = self.db_manager.fetch_one(
-                f"SELECT image, status, tags_json, ports_json, raw_json, source FROM {table_name} WHERE service_uid = {placeholder}",
+                f"SELECT image, images_json, status, tags_json, ports_json, raw_json, source FROM {table_name} WHERE service_uid = {placeholder}",
                 (payload['service_uid'],)
             )
         except Exception:
@@ -556,6 +558,8 @@ class WebAPIServer:
             old_image = str(existing_row.get('image') or '')
             if not str(payload.get('image') or '').strip() and old_image.strip():
                 payload['image'] = old_image
+            if not _json_has_content(payload.get('images_json')) and _json_has_content(existing_row.get('images_json')):
+                payload['images_json'] = existing_row.get('images_json')
 
             if not _json_has_content(payload.get('tags_json')) and _json_has_content(existing_row.get('tags_json')):
                 payload['tags_json'] = existing_row.get('tags_json')
@@ -574,13 +578,14 @@ class WebAPIServer:
             self.db_manager.execute_query(f'''
                 INSERT INTO {table_name}
                 (service_uid, project_id, agent_key, agent_hostname, agent_ip, service_name,
-                 image, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, pod_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, NOW(), NOW(), %s)
+                 image, images_json, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, pod_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 0, NOW(), NOW(), %s)
                 ON DUPLICATE KEY UPDATE
                     project_id = VALUES(project_id),
                     agent_hostname = VALUES(agent_hostname),
                     agent_ip = VALUES(agent_ip),
                     image = VALUES(image),
+                    images_json = VALUES(images_json),
                     status = VALUES(status),
                     tags_json = VALUES(tags_json),
                     ports_json = VALUES(ports_json),
@@ -593,20 +598,21 @@ class WebAPIServer:
             ''', (
                 payload['service_uid'], payload['project_id'], payload['agent_key'],
                 payload['agent_hostname'], payload['agent_ip'], payload['service_name'],
-                payload['image'], payload['status'], payload['tags_json'], payload['ports_json'], payload['raw_json'],
+                payload['image'], payload.get('images_json') or '[]', payload['status'], payload['tags_json'], payload['ports_json'], payload['raw_json'],
                 payload['source'], payload['pod_id']
             ))
         else:
             self.db_manager.execute_query(f'''
                 INSERT INTO {table_name}
                 (service_uid, project_id, agent_key, agent_hostname, agent_ip, service_name,
-                 image, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, updated_at, pod_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                 image, images_json, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, updated_at, pod_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
                 ON CONFLICT(service_uid) DO UPDATE SET
                     project_id=excluded.project_id,
                     agent_hostname=excluded.agent_hostname,
                     agent_ip=excluded.agent_ip,
                     image=excluded.image,
+                    images_json=excluded.images_json,
                     status=excluded.status,
                     tags_json=excluded.tags_json,
                     ports_json=excluded.ports_json,
@@ -619,7 +625,7 @@ class WebAPIServer:
             ''', (
                 payload['service_uid'], payload['project_id'], payload['agent_key'],
                 payload['agent_hostname'], payload['agent_ip'], payload['service_name'],
-                payload['image'], payload['status'], payload['tags_json'], payload['ports_json'], payload['raw_json'],
+                payload['image'], payload.get('images_json') or '[]', payload['status'], payload['tags_json'], payload['ports_json'], payload['raw_json'],
                 payload['source'], now_ts, now_ts, now_ts, payload['pod_id']
             ))
 
@@ -715,6 +721,32 @@ class WebAPIServer:
         hostname = str(report_data.get('hostname') or '').strip()
         ip_address = str(report_data.get('ip_address') or report_data.get('agent_ip') or '').strip()
         full_name = str(report_data.get('full_name') or '').strip()
+        raw_system_info = report_data.get('system_info')
+        raw_daemon_info = report_data.get('daemon_info')
+        raw_services = report_data.get('services')
+
+        def _parse_json_like(value: Any, default_value: Any) -> Any:
+            if value is None:
+                return default_value
+            if isinstance(value, (dict, list)):
+                return value
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return default_value
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(default_value, dict) and isinstance(parsed, dict):
+                        return parsed
+                    if isinstance(default_value, list) and isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    return default_value
+            return default_value
+
+        report_system_info = _parse_json_like(raw_system_info, {})
+        report_daemon_info = _parse_json_like(raw_daemon_info, {})
+        report_services = _parse_json_like(raw_services, [])
 
         agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
         if agent:
@@ -734,6 +766,12 @@ class WebAPIServer:
 
             agent.status = 'online'
             agent.last_seen = datetime.now()
+            if isinstance(report_system_info, dict) and report_system_info:
+                agent.system_info = report_system_info
+            if isinstance(report_daemon_info, dict) and report_daemon_info:
+                agent.daemon_info = report_daemon_info
+            if isinstance(report_services, list):
+                agent.services = report_services
             self.agent_manager._save_agent_to_db(agent)
             if agent.project_id:
                 with self.agent_manager.lock:
@@ -761,6 +799,12 @@ class WebAPIServer:
             pod_id=self.config.get('pod_id', '')
         )
         created.last_seen = datetime.now()
+        if isinstance(report_system_info, dict) and report_system_info:
+            created.system_info = report_system_info
+        if isinstance(report_daemon_info, dict) and report_daemon_info:
+            created.daemon_info = report_daemon_info
+        if isinstance(report_services, list):
+            created.services = report_services
         self.agent_manager._save_agent_to_db(created)
         ensured = self.agent_manager.ensure_agent_exists(agent_key)
         if ensured and ensured.project_id:
@@ -1203,6 +1247,47 @@ class WebAPIServer:
                 return {}
         return {}
 
+    def _parse_images_json(self, raw_images: Any) -> List[str]:
+        if isinstance(raw_images, list):
+            return [str(item).strip() for item in raw_images if str(item).strip()]
+        if isinstance(raw_images, str):
+            text = raw_images.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+            except Exception:
+                return [text]
+        return []
+
+    def _extract_service_images(self, service: Dict[str, Any]) -> List[str]:
+        images: List[str] = []
+        seen: Set[str] = set()
+
+        def _append(value: Any):
+            text = str(value or '').strip()
+            if not text or text in seen:
+                return
+            seen.add(text)
+            images.append(text)
+
+        if isinstance(service.get('images'), list):
+            for item in service.get('images') or []:
+                _append(item)
+
+        real_status = service.get('real_status')
+        if isinstance(real_status, dict):
+            containers = real_status.get('containers')
+            if isinstance(containers, list):
+                for container in containers:
+                    if isinstance(container, dict):
+                        _append(container.get('Image') or container.get('image'))
+
+        _append(service.get('image'))
+        return images
+
     def _has_ai_helper_tag(self, tags: Any) -> bool:
         return 'AI_AGENT_HELPER' in self._normalize_service_tags(tags)
 
@@ -1557,31 +1642,16 @@ class WebAPIServer:
         }
         merged_env.update(mapped_env)
 
-        payload = {
-            'name': agent_id,
-            'backend_type': current_agent.get('backend_type'),
-            'command': current_agent.get('command'),
-            'args': current_agent.get('args') if isinstance(current_agent.get('args'), list) else [],
-            'cwd': current_agent.get('cwd'),
-            'env': merged_env,
-            'enabled': bool(current_agent.get('enabled', True)),
-            'description': current_agent.get('description', ''),
-            'llm_provider_key': provider_key,
-            'llm_provider_snapshot': self._build_llm_provider_snapshot(provider),
-            'llm_provider_applied_at': datetime.utcnow().isoformat(),
-            'llm_provider_mapped_env_keys': sorted(mapped_env.keys()),
-        }
-        updated, status_code = self._call_ai_helper_api(
-            project_id,
-            agent_key,
-            service_name,
-            'PUT',
-            f"/api/ai-agents/{quote(agent_id, safe='')}",
-            payload,
-            timeout=(5, 30),
+        update_result = self._configure_llm_for_ai_agent(
+            project_id=project_id,
+            agent_key=agent_key,
+            service_name=service_name,
+            agent_id=agent_id,
+            provider_keys=[provider_key],
+            env_overrides=merged_env,
+            file_overrides=[],
+            merge_strategy='overwrite',
         )
-        if status_code >= 300 or not isinstance(updated, dict):
-            raise ValueError(f'AI Agent应用LLM Provider失败: {updated}')
         return {
             'project_id': project_id,
             'agent_key': agent_key,
@@ -1591,7 +1661,8 @@ class WebAPIServer:
             'refresh': bool(refresh),
             'mapped_env_preview': mapped_env,
             'mapped_env_keys': sorted(mapped_env.keys()),
-            'updated_agent': updated,
+            'updated_agent': update_result.get('updated_config', {}),
+            'updated_config': update_result.get('updated_config', {}),
         }
 
     def _resolve_helper_rest_port(self, service_row: Dict[str, Any]) -> int:
@@ -4672,7 +4743,7 @@ class WebAPIServer:
                     keyword = f"%{q}%"
                     like_placeholder = "%s" if self.db_manager.db_type == 'mysql' else "?"
                     where_clauses.append(
-                        f"(service_name LIKE {like_placeholder} OR image LIKE {like_placeholder} OR agent_hostname LIKE {like_placeholder})"
+                        f"(service_name LIKE {like_placeholder} OR images_json LIKE {like_placeholder} OR agent_hostname LIKE {like_placeholder})"
                     )
                     params.extend([keyword, keyword, keyword])
                 if not include_stale:
@@ -4685,7 +4756,7 @@ class WebAPIServer:
 
                 query_sql = f'''
                     SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
-                           service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                           service_name, images_json, status, tags_json, ports_json, raw_json, source, is_stale,
                            first_seen_at, last_seen_at, updated_at
                     FROM {table_name}
                     WHERE {where_sql}
@@ -4908,6 +4979,7 @@ class WebAPIServer:
                         raw_payload
                     )
 
+                    image_versions = self._parse_images_json(row.get('images_json'))
                     items.append({
                         'id': row.get('service_uid'),
                         'service_uid': row.get('service_uid'),
@@ -4917,7 +4989,7 @@ class WebAPIServer:
                         'agent_ip': row.get('agent_ip'),
                         'name': row.get('service_name'),
                         'service_name': row.get('service_name'),
-                        'image': row.get('image') or '',
+                        'image_versions': image_versions,
                         'template_id': resolved_template.get('template_id'),
                         'template_name': resolved_template.get('template_name'),
                         'template_tags': self._normalize_service_tags(resolved_template.get('template_tags')),
@@ -5612,6 +5684,9 @@ class WebAPIServer:
                 if not project_id:
                     return jsonify({'error': 'project_id parameter is required'}), 400
 
+                page = max(int(request.args.get('page', 1) or 1), 1)
+                per_page = int(request.args.get('per_page', 100) or 100)
+                per_page = max(1, min(per_page, 1000))
                 target_agent_key = str(request.args.get('agent_key') or '').strip()
                 target_helper_health = str(request.args.get('health_status') or '').strip().lower()
                 target_backend_type = str(request.args.get('backend_type') or '').strip().lower()
@@ -5733,10 +5808,17 @@ class WebAPIServer:
                             'updated_at': row.get('updated_at'),
                         })
 
+                total = len(items)
+                start = (page - 1) * per_page
+                end = start + per_page
+                paged_items = items[start:end] if start < total else []
+
                 return jsonify({
                     'project_id': project_id,
-                    'items': items,
-                    'total': len(items),
+                    'page': page,
+                    'per_page': per_page,
+                    'items': paged_items,
+                    'total': total,
                 })
             except Exception as e:
                 self.logger.error(f"查询项目级AI Agent列表失败: {e}", exc_info=True)

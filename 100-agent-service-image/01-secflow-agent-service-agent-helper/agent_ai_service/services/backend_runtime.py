@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+from pathlib import Path
+import shutil
 from typing import Any, Dict, Generator, List
 
+from agent_ai_service.config import settings
 from agent_ai_service.adapters.claude_a2a_adapter import ClaudeA2AAdapter
 from agent_ai_service.adapters.claude_adapter import ClaudeAdapter
 from agent_ai_service.adapters.codex_adapter import CodexAdapter
@@ -79,6 +83,133 @@ class BackendRuntimeService:
             by_path[path] = item
         return [item for item in by_path.values() if bool(item.get('enabled', True))]
 
+    def _normalize_file_backups(self, backups: Any) -> List[Dict[str, Any]]:
+        if not isinstance(backups, list):
+            return []
+        normalized: List[Dict[str, Any]] = []
+        for item in backups:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get('path') or '').strip()
+            backup_path = str(item.get('backup_path') or '').strip()
+            if not path or not backup_path:
+                continue
+            normalized.append({
+                'path': path,
+                'backup_path': backup_path,
+                'existed': bool(item.get('existed', False)),
+            })
+        return normalized
+
+    def _resolve_target_path(self, binding_path: str, backend_cwd: str) -> Path:
+        raw = str(binding_path or '').strip()
+        if not raw:
+            raise ValueError('file path is empty')
+        target = Path(raw)
+        if target.is_absolute():
+            return target
+        base = Path(str(backend_cwd or '').strip() or '/')
+        return (base / target).resolve()
+
+    def _backup_dir_for_agent(self, name: str) -> Path:
+        safe = str(name or 'default').replace('/', '_')
+        return settings.state_dir / 'llm_file_backups' / safe
+
+    def _ensure_backup(self, name: str, target: Path, backup_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+        key = str(target)
+        existing = backup_map.get(key)
+        if existing:
+            return existing
+
+        backup_dir = self._backup_dir_for_agent(name)
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(key.encode('utf-8')).hexdigest()
+        backup_path = backup_dir / f'{digest}.bak'
+        existed = target.exists()
+        if existed:
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(target), str(backup_path))
+        else:
+            if backup_path.exists():
+                backup_path.unlink()
+        record = {
+            'path': key,
+            'backup_path': str(backup_path),
+            'existed': existed,
+        }
+        backup_map[key] = record
+        return record
+
+    def _restore_backup_record(self, record: Dict[str, Any]) -> None:
+        target = Path(str(record.get('path') or '').strip())
+        backup_path = Path(str(record.get('backup_path') or '').strip())
+        existed = bool(record.get('existed', False))
+        if not str(target):
+            return
+        try:
+            if existed and backup_path.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(backup_path), str(target))
+            elif not existed:
+                if target.exists() and target.is_file():
+                    target.unlink()
+        finally:
+            if backup_path.exists():
+                try:
+                    backup_path.unlink()
+                except Exception:
+                    pass
+
+    def _restore_removed_bindings(
+        self,
+        removed_paths: List[str],
+        backup_map: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        for path in removed_paths:
+            record = backup_map.get(path)
+            if not record:
+                continue
+            self._restore_backup_record(record)
+            backup_map.pop(path, None)
+        return backup_map
+
+    def _materialize_file_bindings(
+        self,
+        name: str,
+        backend_cwd: str,
+        final_files: List[Dict[str, Any]],
+        existing_backups: List[Dict[str, Any]],
+        previous_files: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        backup_map = {
+            str(item.get('path') or '').strip(): item
+            for item in existing_backups
+            if str(item.get('path') or '').strip()
+        }
+        previous_paths = set(
+            str(self._resolve_target_path(str(item.get('path') or '').strip(), backend_cwd))
+            for item in previous_files
+            if str(item.get('path') or '').strip()
+        )
+        next_paths = set(
+            str(self._resolve_target_path(str(item.get('path') or '').strip(), backend_cwd))
+            for item in final_files
+            if str(item.get('path') or '').strip()
+        )
+        removed_paths = sorted(list(previous_paths - next_paths))
+        if not next_paths and not previous_paths and backup_map:
+            removed_paths = sorted(list(backup_map.keys()))
+        if removed_paths:
+            backup_map = self._restore_removed_bindings(removed_paths, backup_map)
+
+        for item in final_files:
+            target = self._resolve_target_path(str(item.get('path') or '').strip(), backend_cwd)
+            self._ensure_backup(name, target, backup_map)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(item.get('content') or ''), encoding='utf-8')
+
+        return [backup_map[key] for key in sorted(backup_map.keys())]
+
     def list_backends(self) -> Dict[str, Any]:
         data = self.registry.list()
         items = []
@@ -106,6 +237,7 @@ class BackendRuntimeService:
                 'llm_provider_applied_at': cfg.get('llm_provider_applied_at'),
                 'llm_provider_mapped_env_keys': list(cfg.get('llm_provider_mapped_env_keys', []) or []),
                 'llm_provider_file_bindings': list(cfg.get('llm_provider_file_bindings', []) or []),
+                'llm_provider_file_backups': list(cfg.get('llm_provider_file_backups', []) or []),
                 'llm_provider_merge_strategy': cfg.get('llm_provider_merge_strategy') or 'overwrite',
             })
         return {
@@ -140,11 +272,41 @@ class BackendRuntimeService:
             'llm_provider_applied_at': cfg.get('llm_provider_applied_at'),
             'llm_provider_mapped_env_keys': list(cfg.get('llm_provider_mapped_env_keys', []) or []),
             'llm_provider_file_bindings': list(cfg.get('llm_provider_file_bindings', []) or []),
+            'llm_provider_file_backups': list(cfg.get('llm_provider_file_backups', []) or []),
             'llm_provider_merge_strategy': cfg.get('llm_provider_merge_strategy') or 'overwrite',
         }
 
     def upsert_backend(self, name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        self.registry.put(name, payload)
+        current = self.registry.get(name) or {}
+        next_payload = dict(payload or {})
+        requested_files = next_payload.get('llm_provider_file_bindings')
+        should_process_files = isinstance(requested_files, list)
+        if not should_process_files:
+            clear_llm = (
+                next_payload.get('llm_provider_key', '__keep__') is None
+                and isinstance(next_payload.get('llm_provider_mapped_env_keys', []), list)
+                and len(next_payload.get('llm_provider_mapped_env_keys', [])) == 0
+            )
+            if clear_llm and isinstance(current.get('llm_provider_file_bindings'), list):
+                requested_files = []
+                should_process_files = True
+
+        if should_process_files:
+            backend_cwd = str(next_payload.get('cwd') or current.get('cwd') or '/')
+            previous_files = self._normalize_file_bindings(current.get('llm_provider_file_bindings'))
+            target_files = self._normalize_file_bindings(requested_files)
+            existing_backups = self._normalize_file_backups(current.get('llm_provider_file_backups'))
+            updated_backups = self._materialize_file_bindings(
+                name=name,
+                backend_cwd=backend_cwd,
+                final_files=target_files,
+                existing_backups=existing_backups,
+                previous_files=previous_files,
+            )
+            next_payload['llm_provider_file_bindings'] = target_files
+            next_payload['llm_provider_file_backups'] = updated_backups
+
+        self.registry.put(name, next_payload)
         return self.get_backend(name)
 
     def delete_backend(self, name: str) -> None:
@@ -182,6 +344,7 @@ class BackendRuntimeService:
             'merge_strategy': detail.get('llm_provider_merge_strategy') or 'overwrite',
             'mapped_env_keys': list(detail.get('llm_provider_mapped_env_keys') or []),
             'file_bindings': list(detail.get('llm_provider_file_bindings') or []),
+            'file_backups': list(detail.get('llm_provider_file_backups') or []),
             'applied_at': detail.get('llm_provider_applied_at'),
             'env': detail.get('env', {}) or {},
         }
@@ -204,6 +367,7 @@ class BackendRuntimeService:
 
         existing_env = self._normalize_env_map(current.get('env'))
         existing_files = self._normalize_file_bindings(current.get('llm_provider_file_bindings'))
+        existing_backups = self._normalize_file_backups(current.get('llm_provider_file_backups'))
         if merge_strategy == 'merge':
             final_env = dict(existing_env)
             final_env.update(resolved_env)
@@ -213,6 +377,14 @@ class BackendRuntimeService:
             final_env = dict(resolved_env)
             final_env.update(env_overrides)
             final_files = self._merge_files(resolved_files, file_overrides)
+        backend_cwd = str(current.get('cwd') or '/')
+        updated_backups = self._materialize_file_bindings(
+            name=name,
+            backend_cwd=backend_cwd,
+            final_files=final_files,
+            existing_backups=existing_backups,
+            previous_files=existing_files,
+        )
 
         first_snapshot = provider_snapshots[0] if provider_snapshots else None
         self.registry.put(name, {
@@ -224,6 +396,7 @@ class BackendRuntimeService:
             'llm_provider_applied_at': datetime.now(timezone.utc).isoformat(),
             'llm_provider_mapped_env_keys': sorted(final_env.keys()),
             'llm_provider_file_bindings': final_files,
+            'llm_provider_file_backups': updated_backups,
             'llm_provider_merge_strategy': merge_strategy,
         })
         return self.get_backend_llm_config(name)
