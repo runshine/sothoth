@@ -1,5 +1,6 @@
 import unittest
 from unittest.mock import Mock, patch
+import json
 
 from agent_ai_service.services.claude_pipe_session_runtime import ClaudePipeSessionRuntime
 from agent_ai_service.models.agent_backend import BackendConfig
@@ -41,10 +42,16 @@ class ClaudePipeSessionRuntimeTests(unittest.TestCase):
             "session_id": "s-1",
             "backend": "claude",
             "vendor_session_id": "v-1",
+            "vendor_session_initialized": True,
         }
         self.session_store.patch.side_effect = lambda sid, payload: {**session, **payload}
         run_mock.side_effect = [
-            Mock(returncode=1, stdout="", stderr="resume failed"),
+            Mock(returncode=0, stdout=json.dumps({
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "errors": ["No conversation found with session ID: v-1"],
+            }), stderr=""),
             Mock(returncode=0, stdout="ok response", stderr=""),
         ]
 
@@ -57,6 +64,23 @@ class ClaudePipeSessionRuntimeTests(unittest.TestCase):
         self.assertIn("--session-id", second_cmd)
         self.assertEqual(result["output"], "ok response")
         self.assertTrue(result["raw"]["used_fallback"])
+        self.assertTrue(result["success"])
+
+    @patch("agent_ai_service.services.claude_pipe_session_runtime.subprocess.run")
+    def test_invoke_once_first_turn_uses_session_id(self, run_mock):
+        session = {
+            "session_id": "s-2",
+            "backend": "claude",
+        }
+        self.session_store.patch.side_effect = lambda sid, payload: {**session, **payload}
+        run_mock.return_value = Mock(returncode=0, stdout="first response", stderr="")
+
+        result = self.runtime.invoke_once(session, self.config, "hello")
+
+        cmd = run_mock.call_args.args[0]
+        self.assertIn("--session-id", cmd)
+        self.assertNotIn("--resume", cmd)
+        self.assertTrue(result["success"])
 
     def test_extract_text_from_stream_json(self):
         payload = {

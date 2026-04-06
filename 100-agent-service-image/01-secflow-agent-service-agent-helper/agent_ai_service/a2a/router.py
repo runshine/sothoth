@@ -306,25 +306,32 @@ class A2AService:
                     'raw': invoke_result,
                 }
             assistant_content = str(round_result.get('output') or '').strip()
-            self.session_store.append_message(session_id, 'assistant', assistant_content)
+            round_success = bool(round_result.get('success', True))
+            round_error = str(round_result.get('error') or '').strip()
+            if round_success:
+                self.session_store.append_message(session_id, 'assistant', assistant_content)
+            else:
+                if not round_error:
+                    round_error = assistant_content or 'backend invoke failed'
+                self.session_store.append_message(session_id, 'assistant', round_error)
             session = self.session_store.patch(session_id, {
-                'status': 'ready',
+                'status': 'ready' if round_success else 'broken',
                 'session_mode': mode,
                 'pty_pid': round_result.get('pid') if mode == 'pty' else None,
                 'backend_pid': round_result.get('pid') if mode in ('pty', 'pipe') else None,
-                'last_error': None,
+                'last_error': None if round_success else round_error,
             })
             result = {
-                'success': True,
+                'success': round_success,
                 'partial_success': False,
                 'agent_count': len(agent_ids),
-                'success_count': len(agent_ids),
+                'success_count': len(agent_ids) if round_success else 0,
                 'results': [{
                     'agent_id': agent_ids[0] if agent_ids else backend,
                     'backend': backend,
-                    'success': True,
-                    'output': assistant_content,
-                    'error': '',
+                    'success': round_success,
+                    'output': assistant_content if round_success else '',
+                    'error': '' if round_success else round_error,
                     'raw': round_result,
                 }],
             }
@@ -377,6 +384,7 @@ class A2AService:
 
         assistant_text_parts = []
         final_result = None
+        stream_error_payload = None
         try:
             session = self._ensure_session_runtime(session, allow_recreate=True)
             if mode == 'pipe':
@@ -431,6 +439,17 @@ class A2AService:
                     yield f"data: {json.dumps(delta_payload, ensure_ascii=False)}\n\n"
                 elif event_type == 'done':
                     stream_done = event
+                elif event_type == 'error':
+                    stream_error_payload = event if isinstance(event, dict) else {'error': str(event)}
+                    error_message = str((stream_error_payload or {}).get('error') or 'backend invoke stream failed')
+                    err_payload = {
+                        'type': 'error',
+                        'session_id': session_id,
+                        'error_message': error_message,
+                        'error_raw': stream_error_payload,
+                    }
+                    yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
+                    raise RuntimeError(error_message)
 
             assistant_content = ''.join(assistant_text_parts).strip()
             self.session_store.append_message(session_id, 'assistant', assistant_content)
@@ -464,6 +483,8 @@ class A2AService:
                 'session_id': session_id,
                 'error_message': error_message,
             }
+            if isinstance(stream_error_payload, dict):
+                err_payload['error_raw'] = stream_error_payload
             yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"
             final_result = {
                 'success': False,
@@ -476,7 +497,7 @@ class A2AService:
                     'success': False,
                     'output': '',
                     'error': error_message,
-                    'raw': {'error': error_message},
+                    'raw': stream_error_payload if isinstance(stream_error_payload, dict) else {'error': error_message},
                 }],
             }
         done_payload = {

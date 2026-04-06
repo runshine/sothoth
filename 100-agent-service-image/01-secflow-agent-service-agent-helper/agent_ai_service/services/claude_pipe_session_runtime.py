@@ -90,6 +90,48 @@ class ClaudePipeSessionRuntime:
             }
 
     @staticmethod
+    def _try_parse_json(text: str) -> Any:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _error_text_from_payload(payload: Any) -> str:
+        if isinstance(payload, dict):
+            errors = payload.get("errors")
+            if isinstance(errors, list) and errors:
+                joined = "; ".join(str(item) for item in errors if str(item).strip())
+                if joined:
+                    return joined
+            for key in ("error", "message", "reason"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
+    def _detect_cli_error(self, result: Dict[str, Any]) -> tuple[bool, str, Dict[str, Any] | None]:
+        returncode = int(result.get("returncode", 0))
+        stdout = str(result.get("stdout") or "")
+        stderr = str(result.get("stderr") or "")
+        payload = self._try_parse_json(stdout)
+
+        if isinstance(payload, dict):
+            is_error = bool(payload.get("is_error")) or str(payload.get("subtype") or "") == "error_during_execution"
+            if is_error:
+                text = self._error_text_from_payload(payload) or stderr.strip() or stdout.strip() or "backend invoke failed"
+                return True, text, payload
+
+        if returncode != 0:
+            text = stderr.strip() or stdout.strip() or "backend invoke failed"
+            return True, text, payload if isinstance(payload, dict) else None
+
+        return False, "", payload if isinstance(payload, dict) else None
+
+    @staticmethod
     def _extract_text_from_stream_json(payload: Any) -> list[str]:
         fragments: list[str] = []
 
@@ -160,23 +202,34 @@ class ClaudePipeSessionRuntime:
         vendor_session_id = str(session["vendor_session_id"])
         prompt = str(content or "")
 
-        resume_cmd = self._build_base_args(config) + ["--resume", vendor_session_id, prompt]
+        initialized = bool(session.get("vendor_session_initialized"))
+        if initialized:
+            resume_cmd = self._build_base_args(config) + ["--resume", vendor_session_id, prompt]
+        else:
+            resume_cmd = self._build_base_args(config) + ["--session-id", vendor_session_id, prompt]
         result = self._run_cli(config, resume_cmd)
-        self._record_vendor_state(session_id, command=resume_cmd, error=result.get("stderr") if not result.get("success") else None)
+        failed, error_text, error_raw = self._detect_cli_error(result)
+        self._record_vendor_state(session_id, command=resume_cmd, error=error_text if failed else "")
 
         used_fallback = False
-        if not result.get("success"):
+        if failed and initialized:
             used_fallback = True
             fallback_cmd = self._build_base_args(config) + ["--session-id", vendor_session_id, prompt]
             result = self._run_cli(config, fallback_cmd)
-            self._record_vendor_state(session_id, command=fallback_cmd, error=result.get("stderr") if not result.get("success") else None)
+            failed, error_text, error_raw = self._detect_cli_error(result)
+            self._record_vendor_state(session_id, command=fallback_cmd, error=error_text if failed else "")
 
-        output = str(result.get("stdout") or "").strip()
-        if not output:
-            output = str(result.get("stderr") or "").strip()
+        if not failed:
+            self.session_store.patch(session_id, {"vendor_session_initialized": True, "vendor_last_mode": "resume" if initialized else "session-id"})
+
+        output = str(result.get("stdout") or "").strip() or str(result.get("stderr") or "").strip()
+        if failed:
+            output = error_text or output
 
         return {
             "output": output,
+            "success": not failed,
+            "error": error_text if failed else "",
             "pid": None,
             "alive": False,
             "timed_out": bool(int(result.get("returncode", 0)) == -124),
@@ -184,6 +237,7 @@ class ClaudePipeSessionRuntime:
                 **result,
                 "used_fallback": used_fallback,
                 "vendor_session_id": vendor_session_id,
+                "error_raw": error_raw,
             },
         }
 
@@ -199,7 +253,8 @@ class ClaudePipeSessionRuntime:
         prompt = str(content or "")
 
         def stream_with(resume_first: bool) -> Generator[Dict[str, Any], None, None]:
-            if resume_first:
+            initialized = bool(session.get("vendor_session_initialized"))
+            if resume_first and initialized:
                 cmd = self._build_base_args(config) + ["--output-format", "stream-json", "--resume", vendor_session_id, prompt]
             else:
                 cmd = self._build_base_args(config) + ["--output-format", "stream-json", "--session-id", vendor_session_id, prompt]
@@ -239,6 +294,16 @@ class ClaudePipeSessionRuntime:
                         continue
                     try:
                         payload = json.loads(stripped)
+                        is_error = bool(payload.get("is_error")) or str(payload.get("subtype") or "") == "error_during_execution"
+                        if is_error:
+                            err = self._error_text_from_payload(payload) or stripped
+                            self._record_vendor_state(session_id, error=err)
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            yield {"type": "error", "error": err, "error_raw": payload, "returncode": proc.poll() if proc.poll() is not None else -1}
+                            return
                         fragments = self._extract_text_from_stream_json(payload)
                         if fragments:
                             for text in fragments:
@@ -278,6 +343,7 @@ class ClaudePipeSessionRuntime:
                 }
                 return
             self._record_vendor_state(session_id, error="")
+            self.session_store.patch(session_id, {"vendor_session_initialized": True, "vendor_last_mode": "resume" if (resume_first and initialized) else "session-id"})
             yield {
                 "type": "done",
                 "success": True,
