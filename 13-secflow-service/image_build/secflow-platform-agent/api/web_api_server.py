@@ -1728,8 +1728,71 @@ class WebAPIServer:
             """,
             tuple(params)
         ) or []
+
+        if not rows:
+            return None
+
+        # 首选服务自身 tags_json（兼容旧数据），再回退到模板 tags（与 /api/agent/services/global 逻辑一致）
         for row in rows:
             if self._has_process_monitor_tag(row.get('tags_json')):
+                return row
+
+        # 回退：根据模板绑定判断 PROCESS_MONITOR 能力
+        service_names = [str((row or {}).get('service_name') or '').strip() for row in rows]
+        service_names = [name for name in service_names if name]
+        if not service_names:
+            return None
+
+        placeholders = ','.join(['%s'] * len(service_names)) if self.db_manager.db_type == 'mysql' else ','.join(['?'] * len(service_names))
+        binding_table = self.db_manager.get_table_name('service_template_bindings')
+        template_table = self.db_manager.get_table_name('service_templates')
+        binding_rows = self.db_manager.fetch_all(
+            f"""
+            SELECT service_name, template_id, template_name
+            FROM {binding_table}
+            WHERE project_id = {'%s' if self.db_manager.db_type == 'mysql' else '?'}
+              AND agent_key = {'%s' if self.db_manager.db_type == 'mysql' else '?'}
+              AND service_name IN ({placeholders})
+            """,
+            tuple([project_id, agent_key] + service_names),
+        ) or []
+
+        template_rows = self.db_manager.fetch_all(
+            f"SELECT id, name, metadata FROM {template_table}",
+            tuple(),
+        ) or []
+        tags_by_template_id: Dict[str, List[str]] = {}
+        tags_by_template_name: Dict[str, List[str]] = {}
+        for tpl in template_rows:
+            metadata = tpl.get('metadata')
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+            elif not isinstance(metadata, dict):
+                metadata = {}
+            template_tags = self._normalize_service_tags((metadata or {}).get('tags'))
+            tpl_id = str(tpl.get('id') or '').strip()
+            tpl_name = str(tpl.get('name') or '').strip()
+            if tpl_id:
+                tags_by_template_id[tpl_id] = template_tags
+            if tpl_name:
+                tags_by_template_name[tpl_name] = template_tags
+
+        tags_by_service_name: Dict[str, List[str]] = {}
+        for binding in binding_rows:
+            bound_service_name = str(binding.get('service_name') or '').strip()
+            if not bound_service_name:
+                continue
+            template_id = str(binding.get('template_id') or '').strip()
+            template_name = str(binding.get('template_name') or '').strip()
+            template_tags = tags_by_template_id.get(template_id) or tags_by_template_name.get(template_name) or []
+            tags_by_service_name[bound_service_name] = template_tags
+
+        for row in rows:
+            candidate_service_name = str((row or {}).get('service_name') or '').strip()
+            if self._has_process_monitor_tag(tags_by_service_name.get(candidate_service_name) or []):
                 return row
         return None
 
