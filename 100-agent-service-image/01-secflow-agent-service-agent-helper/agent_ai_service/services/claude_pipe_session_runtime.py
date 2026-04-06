@@ -255,9 +255,9 @@ class ClaudePipeSessionRuntime:
         def stream_with(resume_first: bool) -> Generator[Dict[str, Any], None, None]:
             initialized = bool(session.get("vendor_session_initialized"))
             if resume_first and initialized:
-                cmd = self._build_base_args(config) + ["--output-format", "stream-json", "--resume", vendor_session_id, prompt]
+                cmd = self._build_base_args(config) + ["--verbose", "--output-format", "stream-json", "--resume", vendor_session_id, prompt]
             else:
-                cmd = self._build_base_args(config) + ["--output-format", "stream-json", "--session-id", vendor_session_id, prompt]
+                cmd = self._build_base_args(config) + ["--verbose", "--output-format", "stream-json", "--session-id", vendor_session_id, prompt]
 
             self._record_vendor_state(session_id, command=cmd)
             env = dict(**os.environ)

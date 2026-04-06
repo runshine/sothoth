@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 import json
+import io
 
 from agent_ai_service.services.claude_pipe_session_runtime import ClaudePipeSessionRuntime
 from agent_ai_service.models.agent_backend import BackendConfig
@@ -93,6 +94,30 @@ class ClaudePipeSessionRuntimeTests(unittest.TestCase):
         merged = "".join(fragments)
         self.assertIn("hello", merged)
         self.assertIn("world", merged)
+
+    @patch("agent_ai_service.services.claude_pipe_session_runtime.subprocess.Popen")
+    def test_invoke_stream_includes_verbose_flag(self, popen_mock):
+        session = {
+            "session_id": "s-3",
+            "backend": "claude",
+            "vendor_session_id": "v-3",
+            "vendor_session_initialized": False,
+        }
+        self.session_store.patch.side_effect = lambda sid, payload: {**session, **payload}
+        process = Mock()
+        process.stdout = io.StringIO('{"type":"result","is_error":false}\n')
+        process.stderr = io.StringIO("")
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        popen_mock.return_value = process
+
+        events = list(self.runtime.invoke_stream(session, self.config, "hello stream"))
+
+        cmd = popen_mock.call_args.args[0]
+        self.assertIn("--verbose", cmd)
+        self.assertIn("--output-format", cmd)
+        self.assertIn("stream-json", cmd)
+        self.assertTrue(any(event.get("type") == "done" for event in events))
 
 
 if __name__ == "__main__":

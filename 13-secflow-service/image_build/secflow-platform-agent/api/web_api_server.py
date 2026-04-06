@@ -2516,6 +2516,19 @@ class WebAPIServer:
                 metadata = json.loads(row.get('metadata_json')) if isinstance(row.get('metadata_json'), str) else (row.get('metadata_json') or {})
             except Exception:
                 metadata = {}
+        raw_payload: Dict[str, Any] = {}
+        if row.get('raw_json'):
+            try:
+                raw_payload = json.loads(row.get('raw_json')) if isinstance(row.get('raw_json'), str) else (row.get('raw_json') or {})
+            except Exception:
+                raw_payload = {}
+
+        def _pick_vendor_value(*keys: str) -> Any:
+            for key in keys:
+                if key in raw_payload and raw_payload.get(key) is not None:
+                    return raw_payload.get(key)
+            return None
+
         return {
             'session_id': row.get('session_id'),
             'backend': row.get('backend'),
@@ -2533,6 +2546,15 @@ class WebAPIServer:
                     'content': msg.get('content') or '',
                 } for msg in messages_rows
             ],
+            'vendor_session_id': _pick_vendor_value('vendor_session_id', 'claude_session_id'),
+            'vendor_session_kind': _pick_vendor_value('vendor_session_kind'),
+            'vendor_resume_mode': _pick_vendor_value('vendor_resume_mode'),
+            'vendor_session_initialized': _pick_vendor_value('vendor_session_initialized'),
+            'vendor_last_mode': _pick_vendor_value('vendor_last_mode'),
+            'vendor_last_cmd': _pick_vendor_value('vendor_last_cmd'),
+            'vendor_last_error': _pick_vendor_value('vendor_last_error'),
+            'claude_session_id': _pick_vendor_value('claude_session_id', 'vendor_session_id'),
+            'claude_workdir': _pick_vendor_value('claude_workdir'),
             'created_at': row.get('created_at'),
             'updated_at': row.get('updated_at'),
         }
