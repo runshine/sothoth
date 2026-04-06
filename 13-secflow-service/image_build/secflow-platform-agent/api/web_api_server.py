@@ -4116,6 +4116,50 @@ class WebAPIServer:
             response.status_code = status_code
             return response
 
+        @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>/update', methods=['POST'])
+        def agent_service_update(agent_key, service_name):
+            """更新Agent服务镜像并重启（快捷方式）"""
+            request_data = request.get_json(silent=True) or {}
+            encoded_service_name = quote(service_name, safe="")
+            status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                agent_key=agent_key,
+                method='POST',
+                endpoint=f'/api/services/{encoded_service_name}/update',
+                request_data=request_data
+            )
+
+            fallback_used = False
+            if status_code == 404:
+                # 兼容旧helper：无update接口时自动降级到restart。
+                fallback_used = True
+                status_code, response_data, response_headers = self.proxy_manager.proxy_request(
+                    agent_key=agent_key,
+                    method='POST',
+                    endpoint=f'/api/services/{encoded_service_name}/restart',
+                    request_data=request_data
+                )
+                if isinstance(response_data, dict):
+                    response_data = dict(response_data)
+                    response_data['fallback'] = 'restart'
+                    response_data['fallback_reason'] = 'helper_update_endpoint_not_found'
+
+            if status_code < 300:
+                try:
+                    reason = f'api_update:{service_name}'
+                    if fallback_used:
+                        reason = f'api_update_fallback_restart:{service_name}'
+                    self._sync_single_agent_services_by_key(agent_key, reason=reason)
+                except Exception:
+                    self.logger.warning(f"更新服务后同步快照失败: agent={agent_key}, service={service_name}", exc_info=True)
+
+            response = jsonify(response_data)
+            for key, value in response_headers.items():
+                if key.lower() == 'content-length':
+                    continue
+                response.headers[key] = value
+            response.status_code = status_code
+            return response
+
         @self.app.route('/api/agent/agent/<agent_key>/services/<service_name>', methods=['DELETE'])
         def agent_service_delete(agent_key, service_name):
             """删除Agent服务：先停服务，再删服务，并同步删除绑定的Ingress。"""
