@@ -123,9 +123,13 @@ class BackendRegistry:
             'cwd': normalized_cwd,
             'description': payload.get('description', existing.get('description', '')),
             'llm_provider_key': payload.get('llm_provider_key', existing.get('llm_provider_key')),
+            'llm_provider_keys': payload.get('llm_provider_keys', existing.get('llm_provider_keys', [])),
             'llm_provider_snapshot': payload.get('llm_provider_snapshot', existing.get('llm_provider_snapshot')),
+            'llm_provider_snapshots': payload.get('llm_provider_snapshots', existing.get('llm_provider_snapshots', [])),
             'llm_provider_applied_at': payload.get('llm_provider_applied_at', existing.get('llm_provider_applied_at')),
             'llm_provider_mapped_env_keys': payload.get('llm_provider_mapped_env_keys', existing.get('llm_provider_mapped_env_keys', [])),
+            'llm_provider_file_bindings': payload.get('llm_provider_file_bindings', existing.get('llm_provider_file_bindings', [])),
+            'llm_provider_merge_strategy': payload.get('llm_provider_merge_strategy', existing.get('llm_provider_merge_strategy', 'overwrite')),
         }
         backends[name] = merged
         self.store.write(data)

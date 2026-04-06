@@ -28,9 +28,13 @@ def _to_agent(detail):
         'pid': detail.get('pid'),
         'description': detail.get('description', ''),
         'llm_provider_key': detail.get('llm_provider_key'),
+        'llm_provider_keys': list(detail.get('llm_provider_keys', []) or []),
         'llm_provider_snapshot': detail.get('llm_provider_snapshot') if isinstance(detail.get('llm_provider_snapshot'), dict) else None,
+        'llm_provider_snapshots': list(detail.get('llm_provider_snapshots', []) or []),
         'llm_provider_applied_at': detail.get('llm_provider_applied_at'),
         'llm_provider_mapped_env_keys': list(detail.get('llm_provider_mapped_env_keys', []) or []),
+        'llm_provider_file_bindings': list(detail.get('llm_provider_file_bindings', []) or []),
+        'llm_provider_merge_strategy': detail.get('llm_provider_merge_strategy') or 'overwrite',
         'health': {
             'status': 'healthy' if detail.get('installed') else 'unavailable',
             'running': bool(detail.get('running', False)),
@@ -162,6 +166,23 @@ def delete_ai_agent_env(agent_id: str):
         return jsonify({'error': 'keys must be a list'}), 400
     try:
         return jsonify(runtime.delete_backend_env(agent_id, [str(k) for k in keys]))
+    except KeyError:
+        return jsonify({'error': 'ai agent not found'}), 404
+
+
+@bp.get('/api/ai-agents/<agent_id>/llm-config')
+def get_ai_agent_llm_config(agent_id: str):
+    try:
+        return jsonify(runtime.get_backend_llm_config(agent_id))
+    except KeyError:
+        return jsonify({'error': 'ai agent not found'}), 404
+
+
+@bp.put('/api/ai-agents/<agent_id>/llm-config')
+def put_ai_agent_llm_config(agent_id: str):
+    payload = request.get_json(silent=True) or {}
+    try:
+        return jsonify(runtime.apply_backend_llm_config(agent_id, payload))
     except KeyError:
         return jsonify({'error': 'ai agent not found'}), 404
 

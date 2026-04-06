@@ -1296,6 +1296,72 @@ class WebAPIServer:
 
         return env
 
+    def _normalize_llm_file_bindings(self, files: Any) -> List[Dict[str, Any]]:
+        if not isinstance(files, list):
+            return []
+        normalized: List[Dict[str, Any]] = []
+        for idx, item in enumerate(files):
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get('path') or '').strip()
+            content = item.get('content')
+            if not path or not isinstance(content, str):
+                continue
+            normalized.append({
+                'name': str(item.get('name') or '').strip() or f'file-{idx + 1}',
+                'path': path,
+                'content': content,
+                'format': str(item.get('format') or 'other').strip().lower() or 'other',
+                'enabled': bool(item.get('enabled', True)),
+                'provider_key': str(item.get('provider_key') or '').strip() or None,
+            })
+        return normalized
+
+    def _configure_llm_for_ai_agent(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        agent_id: str,
+        provider_keys: List[str],
+        env_overrides: Dict[str, Any],
+        file_overrides: List[Dict[str, Any]],
+        merge_strategy: str = 'overwrite',
+    ) -> Dict[str, Any]:
+        self._get_ai_helper_agent_detail(project_id, agent_key, service_name, agent_id)
+        merged_binding = self._merge_llm_provider_binding(provider_keys, '*', source='ai_agent_batch')
+        payload = {
+            'provider_keys': merged_binding.get('provider_keys', []),
+            'provider_snapshots': merged_binding.get('provider_snapshots', []),
+            'resolved_env': merged_binding.get('merged_env', {}),
+            'resolved_files': self._normalize_llm_file_bindings(merged_binding.get('merged_files', [])),
+            'env_overrides': env_overrides if isinstance(env_overrides, dict) else {},
+            'file_overrides': self._normalize_llm_file_bindings(file_overrides),
+            'merge_strategy': merge_strategy if merge_strategy in ('overwrite', 'merge') else 'overwrite',
+        }
+        data, status_code = self._call_ai_helper_api(
+            project_id,
+            agent_key,
+            service_name,
+            'PUT',
+            f"/api/ai-agents/{quote(agent_id, safe='')}/llm-config",
+            payload,
+            timeout=(5, 30),
+        )
+        if status_code >= 300 or not isinstance(data, dict):
+            raise ValueError(f'AI Agent配置下发失败: {data}')
+        return {
+            'project_id': project_id,
+            'agent_key': agent_key,
+            'service_name': service_name,
+            'agent_id': agent_id,
+            'provider_keys': merged_binding.get('provider_keys', []),
+            'merge_strategy': payload.get('merge_strategy'),
+            'env_overrides': payload.get('env_overrides', {}),
+            'file_overrides': payload.get('file_overrides', []),
+            'updated_config': data,
+        }
+
     def _merge_llm_provider_binding(
         self,
         provider_keys: List[str],
@@ -5011,6 +5077,114 @@ class WebAPIServer:
                 })
             except Exception as e:
                 self.logger.error(f"批量应用LLM Provider失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-agents/configure/batch', methods=['POST'])
+        def batch_configure_ai_agents():
+            try:
+                payload = request.get_json(silent=True) or {}
+                project_id = str(payload.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                provider_keys_raw = payload.get('provider_keys') if isinstance(payload.get('provider_keys'), list) else []
+                provider_keys = []
+                seen = set()
+                for item in provider_keys_raw:
+                    text = str(item or '').strip()
+                    if not text or text in seen:
+                        continue
+                    seen.add(text)
+                    provider_keys.append(text)
+                if not provider_keys:
+                    return jsonify({'error': 'provider_keys is required'}), 400
+                merge_strategy = str(payload.get('merge_strategy') or 'overwrite').strip().lower()
+                if merge_strategy not in ('overwrite', 'merge'):
+                    merge_strategy = 'overwrite'
+                env_overrides = payload.get('env_overrides') if isinstance(payload.get('env_overrides'), dict) else {}
+                file_overrides = payload.get('file_overrides') if isinstance(payload.get('file_overrides'), list) else []
+                targets = payload.get('targets') if isinstance(payload.get('targets'), list) else []
+                if not targets:
+                    return jsonify({'error': 'targets is required'}), 400
+
+                results = []
+                success_count = 0
+                for target in targets:
+                    if not isinstance(target, dict):
+                        continue
+                    target_agent_key = str(target.get('agent_key') or '').strip()
+                    target_service_name = str(target.get('service_name') or '').strip()
+                    target_agent_id = str(target.get('agent_id') or '').strip()
+                    if not target_agent_key or not target_service_name or not target_agent_id:
+                        results.append({
+                            'agent_key': target_agent_key,
+                            'service_name': target_service_name,
+                            'agent_id': target_agent_id,
+                            'success': False,
+                            'error': 'invalid target',
+                        })
+                        continue
+                    try:
+                        result = self._configure_llm_for_ai_agent(
+                            project_id,
+                            target_agent_key,
+                            target_service_name,
+                            target_agent_id,
+                            provider_keys,
+                            env_overrides,
+                            file_overrides,
+                            merge_strategy,
+                        )
+                        success_count += 1
+                        results.append({
+                            'agent_key': target_agent_key,
+                            'service_name': target_service_name,
+                            'agent_id': target_agent_id,
+                            'success': True,
+                            **result,
+                        })
+                    except Exception as exc:
+                        results.append({
+                            'agent_key': target_agent_key,
+                            'service_name': target_service_name,
+                            'agent_id': target_agent_id,
+                            'success': False,
+                            'error': str(exc),
+                        })
+
+                status = 'success' if results and success_count == len(results) else ('partial_success' if success_count > 0 else 'failed')
+                return jsonify({
+                    'project_id': project_id,
+                    'provider_keys': provider_keys,
+                    'merge_strategy': merge_strategy,
+                    'status': status,
+                    'results': results,
+                    'total': len(results),
+                    'success_count': success_count,
+                })
+            except Exception as e:
+                self.logger.error(f"批量配置AI Agent失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/ai-agents/<agent_key>/<service_name>/<agent_id>/config', methods=['GET'])
+        def get_ai_agent_config(agent_key, service_name, agent_id):
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'GET',
+                    f"/api/ai-agents/{quote(agent_id, safe='')}/llm-config",
+                    None,
+                    timeout=(5, 20),
+                )
+                return jsonify(data), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"读取AI Agent配置失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>', methods=['GET'])
