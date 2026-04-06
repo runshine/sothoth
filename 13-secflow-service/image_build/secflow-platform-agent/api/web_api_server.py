@@ -4489,7 +4489,7 @@ class WebAPIServer:
                 # 预加载模板映射：只使用部署时记录或Agent显式上报的模板信息，不再依赖名称/镜像猜测
                 template_table = self.db_manager.get_table_name('service_templates')
                 template_rows = self.db_manager.fetch_all(
-                    f"SELECT id, name FROM {template_table} ORDER BY id ASC",
+                    f"SELECT id, name, metadata FROM {template_table} ORDER BY id ASC",
                     tuple()
                 ) or []
                 templates_by_name: Dict[str, Dict[str, Any]] = {}
@@ -4497,9 +4497,19 @@ class WebAPIServer:
                     tpl_name = str(tpl.get('name') or '').strip()
                     if not tpl_name:
                         continue
+                    metadata = tpl.get('metadata')
+                    if isinstance(metadata, str):
+                        try:
+                            metadata = json.loads(metadata)
+                        except Exception:
+                            metadata = {}
+                    elif not isinstance(metadata, dict):
+                        metadata = {}
+                    template_tags = self._normalize_service_tags((metadata or {}).get('tags'))
                     templates_by_name[tpl_name] = {
                         'id': tpl.get('id'),
-                        'name': tpl_name
+                        'name': tpl_name,
+                        'template_tags': template_tags,
                     }
 
                 binding_table = self.db_manager.get_table_name('service_template_bindings')
@@ -4532,9 +4542,12 @@ class WebAPIServer:
 
                     binding = bindings_map.get(key)
                     if binding and str(binding.get('template_name') or '').strip():
+                        template_name = str(binding.get('template_name') or '').strip()
+                        known_template = templates_by_name.get(template_name) or {}
                         return {
                             'template_id': binding.get('template_id'),
-                            'template_name': str(binding.get('template_name') or '').strip()
+                            'template_name': template_name,
+                            'template_tags': self._normalize_service_tags(known_template.get('template_tags')),
                         }
 
                     payload = raw_payload if isinstance(raw_payload, dict) else {}
@@ -4544,7 +4557,8 @@ class WebAPIServer:
                         known_template = templates_by_name.get(payload_template_name)
                         resolved = {
                             'template_id': payload_template_id if payload_template_id not in (None, '') else (known_template or {}).get('id'),
-                            'template_name': payload_template_name
+                            'template_name': payload_template_name,
+                            'template_tags': self._normalize_service_tags((known_template or {}).get('template_tags')),
                         }
                         bindings_map[key] = resolved
                         try:
@@ -4606,7 +4620,8 @@ class WebAPIServer:
                             known_template = templates_by_name.get(template_name)
                             resolved = {
                                 'template_id': (known_template or {}).get('id'),
-                                'template_name': template_name
+                                'template_name': template_name,
+                                'template_tags': self._normalize_service_tags((known_template or {}).get('template_tags')),
                             }
                             bindings_map[key] = resolved
                             try:
@@ -4643,7 +4658,7 @@ class WebAPIServer:
                                 self.logger.warning(f"回填服务模板绑定失败: {key}", exc_info=True)
                             return resolved
 
-                    return {'template_id': None, 'template_name': ''}
+                    return {'template_id': None, 'template_name': '', 'template_tags': []}
 
                 items = []
                 for row in rows:
@@ -4693,6 +4708,7 @@ class WebAPIServer:
                         'image': row.get('image') or '',
                         'template_id': resolved_template.get('template_id'),
                         'template_name': resolved_template.get('template_name'),
+                        'template_tags': self._normalize_service_tags(resolved_template.get('template_tags')),
                         'status': row.get('status') or 'unknown',
                         'tags': tags,
                         'ports': ports,
