@@ -5344,7 +5344,7 @@ class WebAPIServer:
                         self.config.get('process_monitor_fileserver_base_url') or
                         'http://secflow-platform-fileserver/api/fileserver'
                     ).rstrip('/')
-                    subproject_id = data.get('subproject_id', self.config.get('process_monitor_default_subproject_id', 1))
+                    subproject_id = self.config.get('process_monitor_default_subproject_id', 1)
                     remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{int(subproject_id)}"
                 remote_path_prefix = f"/__file__sync__/{agent_key}"
 
@@ -5394,6 +5394,84 @@ class WebAPIServer:
                 return jsonify({'error': str(exc)}), 404
             except Exception as e:
                 self.logger.error(f"创建process-monitor同步任务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/sync/preview', methods=['POST'])
+        def preview_process_monitor_sync():
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                agent_key = str(data.get('agent_key') or '').strip()
+                service_name = str(data.get('service_name') or '').strip()
+                mode = str(data.get('mode') or '').strip()
+                preview_limit = int(data.get('preview_limit') or 50)
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                if not agent_key:
+                    return jsonify({'error': 'agent_key is required'}), 400
+                if mode not in ('pid_files', 'path_files'):
+                    return jsonify({'error': 'mode must be pid_files or path_files'}), 400
+                if mode == 'pid_files':
+                    pids = data.get('pids') or []
+                    if not isinstance(pids, list) or not pids:
+                        return jsonify({'error': 'pids is required for pid_files mode'}), 400
+                else:
+                    paths = data.get('paths') or []
+                    if not isinstance(paths, list) or not paths:
+                        return jsonify({'error': 'paths is required for path_files mode'}), 400
+
+                selected_row = self._get_process_monitor_service_row(project_id, agent_key, service_name or None)
+                if not selected_row:
+                    return jsonify({'error': f'process_monitor service not found: {agent_key}/{service_name or "*"}'}), 404
+                resolved_service_name = str(selected_row.get('service_name') or '').strip()
+
+                remote_root_url = str(data.get('remote_root_url') or '').strip()
+                if not remote_root_url:
+                    fileserver_base = str(
+                        self.config.get('process_monitor_fileserver_base_url') or
+                        'http://secflow-platform-fileserver/api/fileserver'
+                    ).rstrip('/')
+                    subproject_id = self.config.get('process_monitor_default_subproject_id', 1)
+                    remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{int(subproject_id)}"
+                remote_path_prefix = f"/__file__sync__/{agent_key}"
+
+                payload = {
+                    'mode': mode,
+                    'remote_root_url': remote_root_url,
+                    'remote_path_prefix': remote_path_prefix,
+                    'preview_limit': max(1, min(preview_limit, 200)),
+                }
+                if mode == 'pid_files':
+                    payload['pids'] = [int(item) for item in (data.get('pids') or [])]
+                else:
+                    payload['paths'] = [str(item) for item in (data.get('paths') or [])]
+
+                node_resp, status_code, _ = self._call_process_monitor_api(
+                    project_id,
+                    agent_key,
+                    resolved_service_name,
+                    'POST',
+                    '/api/sync/preview',
+                    payload,
+                    timeout=(10, 120),
+                )
+                if status_code >= 300:
+                    return jsonify(node_resp if isinstance(node_resp, dict) else {'error': 'upstream_error'}), status_code
+
+                preview_payload = node_resp if isinstance(node_resp, dict) else {}
+                preview_payload['service_name'] = resolved_service_name
+                preview_payload['agent_key'] = agent_key
+                preview_payload['project_id'] = project_id
+                preview_payload['target'] = {
+                    **(preview_payload.get('target') if isinstance(preview_payload.get('target'), dict) else {}),
+                    'remote_root_url': remote_root_url,
+                    'remote_path_prefix': remote_path_prefix,
+                }
+                return jsonify(preview_payload)
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"预览process-monitor同步任务失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/process-monitor/sync/tasks/history', methods=['GET', 'DELETE'])

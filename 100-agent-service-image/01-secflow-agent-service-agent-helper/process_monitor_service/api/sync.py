@@ -44,6 +44,45 @@ def create_task():
     return jsonify(task), 202
 
 
+@bp.post('/api/sync/preview')
+def preview_task():
+    payload = request.get_json(silent=True) or {}
+    mode = payload.get('mode')
+    remote_root_url = (payload.get('remote_root_url') or '').strip()
+    remote_path_prefix = payload.get('remote_path_prefix')
+    preview_limit = int(payload.get('preview_limit') or 50)
+    if mode not in {'pid_files', 'path_files'}:
+        return _json_error('invalid_mode')
+    if not remote_root_url.startswith('http://') and not remote_root_url.startswith('https://'):
+        return _json_error('invalid_remote_root_url')
+    try:
+        if mode == 'pid_files':
+            pids = payload.get('pids') or []
+            if not isinstance(pids, list) or not pids:
+                return _json_error('pids_required')
+            result = sync_task_service.preview_sync(
+                mode=mode,
+                remote_root_url=remote_root_url,
+                pids=[int(item) for item in pids],
+                remote_path_prefix=remote_path_prefix,
+                preview_limit=preview_limit,
+            )
+        else:
+            paths = payload.get('paths') or []
+            if not isinstance(paths, list) or not paths:
+                return _json_error('paths_required')
+            result = sync_task_service.preview_sync(
+                mode=mode,
+                remote_root_url=remote_root_url,
+                paths=[str(item) for item in paths],
+                remote_path_prefix=remote_path_prefix,
+                preview_limit=preview_limit,
+            )
+    except ValueError as exc:
+        return _json_error(str(exc))
+    return jsonify(result)
+
+
 @bp.get('/api/sync/tasks')
 def list_tasks():
     status = request.args.get('status')

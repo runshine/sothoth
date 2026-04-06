@@ -129,6 +129,84 @@ class SyncTaskService:
             remote_path_prefix=task.get('remote_path_prefix'),
         )
 
+    def preview_sync(
+        self,
+        mode: str,
+        remote_root_url: str,
+        *,
+        pids: list[int] | None = None,
+        paths: list[str] | None = None,
+        remote_path_prefix: str | None = None,
+        preview_limit: int = 50,
+    ) -> dict[str, Any]:
+        if mode not in {'pid_files', 'path_files'}:
+            raise ValueError('invalid_mode')
+        if not remote_root_url.startswith(('http://', 'https://')):
+            raise ValueError('invalid_remote_root_url')
+
+        normalized_prefix = self._normalize_remote_prefix(remote_path_prefix)
+        candidates: list[SyncFileCandidate] = []
+        issues: list[dict[str, Any]] = []
+        pid_summary: dict[str, Any] = {}
+        if mode == 'pid_files':
+            candidates, pid_summary, pid_results = self._collector.collect_from_pids([int(item) for item in (pids or [])])
+            for item in pid_results:
+                issues.append({
+                    'scope': 'pid',
+                    'pid': item.get('pid'),
+                    'status': item.get('status') or 'skipped',
+                    'reason': item.get('reason') or '',
+                })
+        else:
+            candidates, path_issues = self._collector.collect_from_paths([str(item) for item in (paths or [])])
+            for item in path_issues:
+                issues.append({
+                    'scope': 'path',
+                    'path': item.get('path'),
+                    'status': item.get('status') or 'skipped',
+                    'reason': item.get('reason') or '',
+                })
+
+        estimated_total_bytes = sum(int(item.size or 0) for item in candidates if item.entry_type == 'file')
+        total_files = sum(1 for item in candidates if item.entry_type == 'file')
+        total_symlinks = sum(1 for item in candidates if item.entry_type == 'symlink')
+        failed_count = sum(1 for item in issues if str(item.get('status') or '') == 'failed')
+        skipped_count = sum(1 for item in issues if str(item.get('status') or '') != 'failed')
+        safe_limit = max(1, min(int(preview_limit or 50), 200))
+
+        preview_items: list[dict[str, Any]] = []
+        for candidate in candidates[:safe_limit]:
+            remote_relative_path = self._join_remote_path(normalized_prefix, candidate.relative_path)
+            preview_items.append({
+                'source_path': candidate.host_path,
+                'relative_path': candidate.relative_path,
+                'remote_relative_path': remote_relative_path,
+                'entry_type': candidate.entry_type,
+                'size': candidate.size,
+                'refs': self._refs(candidate),
+            })
+        sample_remote_paths = [str(item.get('remote_relative_path') or '') for item in preview_items if str(item.get('remote_relative_path') or '')]
+
+        return {
+            'mode': mode,
+            'summary': {
+                'total_candidates': len(candidates),
+                'total_files': total_files,
+                'total_symlinks': total_symlinks,
+                'estimated_total_bytes': estimated_total_bytes,
+                'failed_count': failed_count,
+                'skipped_count': skipped_count,
+            },
+            'items_preview': preview_items,
+            'issues': issues,
+            'pid_summary': pid_summary if mode == 'pid_files' else {},
+            'target': {
+                'remote_root_url': remote_root_url,
+                'remote_path_prefix': normalized_prefix,
+                'sample_remote_paths': sample_remote_paths,
+            },
+        }
+
     def _worker_loop(self) -> None:
         while True:
             task_id = self._queue.get()
