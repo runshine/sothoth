@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from flask import Blueprint, jsonify, request
 import psutil
 
@@ -151,4 +152,68 @@ def get_process_sync_candidates(pid: int):
         'tree': _build_path_tree(paths),
         'summary': summary,
         'issues': issues,
+    })
+
+
+@bp.get('/api/filesystem/tree')
+def get_filesystem_tree():
+    raw_path = str(request.args.get('path') or '/').strip() or '/'
+    include_hidden = str(request.args.get('include_hidden') or 'false').strip().lower() == 'true'
+    try:
+        limit = int(request.args.get('limit') or 500)
+    except Exception:
+        limit = 500
+    limit = max(1, min(limit, 2000))
+
+    if not raw_path.startswith('/'):
+        return _json_error('path_must_be_absolute', 400)
+
+    fs_path = os.path.normpath(raw_path)
+    if not os.path.exists(fs_path):
+        return _json_error('path_not_found', 404)
+    if not os.path.isdir(fs_path):
+        return _json_error('path_not_directory', 400)
+
+    items: list[dict] = []
+    errors: list[dict] = []
+
+    try:
+        with os.scandir(fs_path) as it:
+            entries = sorted(list(it), key=lambda entry: (not entry.is_dir(follow_symlinks=False), entry.name.lower()))
+            for entry in entries:
+                if len(items) >= limit:
+                    break
+                name = str(entry.name or '')
+                if not name:
+                    continue
+                if not include_hidden and name.startswith('.'):
+                    continue
+                entry_path = os.path.join(fs_path, name)
+                node_type = 'dir' if entry.is_dir(follow_symlinks=False) else 'file'
+                has_children = False
+                if node_type == 'dir':
+                    try:
+                        with os.scandir(entry_path) as child_it:
+                            has_children = next(child_it, None) is not None
+                    except Exception:
+                        has_children = False
+                items.append({
+                    'name': name,
+                    'path': entry_path,
+                    'type': node_type,
+                    'has_children': has_children,
+                })
+    except PermissionError:
+        return _json_error('permission_denied', 403)
+    except FileNotFoundError:
+        return _json_error('path_not_found', 404)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
+
+    return jsonify({
+        'path': fs_path,
+        'total': len(items),
+        'items': items,
+        'truncated': len(items) >= limit,
+        'errors': errors,
     })

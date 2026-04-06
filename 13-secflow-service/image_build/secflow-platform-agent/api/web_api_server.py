@@ -5274,6 +5274,42 @@ class WebAPIServer:
                 self.logger.error(f"查询节点进程同步候选失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/agent/process-monitor/nodes/<agent_key>/services/<service_name>/filesystem/tree', methods=['GET'])
+        def get_node_filesystem_tree(agent_key, service_name):
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                path = str(request.args.get('path') or '/').strip() or '/'
+                include_hidden = str(request.args.get('include_hidden') or 'false').strip().lower() == 'true'
+                try:
+                    limit = int(request.args.get('limit') or 500)
+                except Exception:
+                    limit = 500
+                query = urlencode({
+                    'path': path,
+                    'include_hidden': 'true' if include_hidden else 'false',
+                    'limit': max(1, min(limit, 2000)),
+                })
+                data, status_code, row = self._call_process_monitor_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'GET',
+                    f'/api/filesystem/tree?{query}',
+                    None,
+                    timeout=(5, 30),
+                )
+                payload = data if isinstance(data, dict) else {}
+                payload['service_name'] = row.get('service_name')
+                payload['agent_key'] = row.get('agent_key')
+                return jsonify(payload), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"查询节点文件系统树失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/agent/process-monitor/sync/tasks', methods=['POST'])
         def create_process_monitor_sync_task():
             try:
