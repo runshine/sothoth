@@ -691,6 +691,53 @@ class DatabaseManager:
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_project ON {table_sync_logs}(project_id)')
                 db.execute(f'CREATE INDEX IF NOT EXISTS idx_sync_logs_agent ON {table_sync_logs}(agent_key)')
 
+            # 创建进程同步历史表
+            table_process_sync_logs = f"{prefix}process_sync_logs"
+            if self.db_type == 'mysql':
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_process_sync_logs} (
+                               id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                               sync_id VARCHAR(64) UNIQUE NOT NULL,
+                               project_id VARCHAR(100) NOT NULL,
+                               agent_key VARCHAR(64) NOT NULL,
+                               service_name VARCHAR(200) NOT NULL,
+                               node_task_id VARCHAR(64),
+                               mode VARCHAR(32) NOT NULL,
+                               status VARCHAR(32) NOT NULL DEFAULT 'created',
+                               request_json JSON,
+                               node_snapshot_json JSON,
+                               message TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                               INDEX idx_process_sync_created (created_at),
+                               INDEX idx_process_sync_project (project_id),
+                               INDEX idx_process_sync_agent (agent_key),
+                               INDEX idx_process_sync_status (status)
+                           ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                           ''')
+            else:
+                db.execute(f'''
+                           CREATE TABLE IF NOT EXISTS {table_process_sync_logs} (
+                               id INTEGER PRIMARY KEY AUTOINCREMENT,
+                               sync_id TEXT UNIQUE NOT NULL,
+                               project_id TEXT NOT NULL,
+                               agent_key TEXT NOT NULL,
+                               service_name TEXT NOT NULL,
+                               node_task_id TEXT,
+                               mode TEXT NOT NULL,
+                               status TEXT NOT NULL DEFAULT 'created',
+                               request_json TEXT,
+                               node_snapshot_json TEXT,
+                               message TEXT,
+                               created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                               updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                           )
+                           ''')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_process_sync_created ON {table_process_sync_logs}(created_at)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_process_sync_project ON {table_process_sync_logs}(project_id)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_process_sync_agent ON {table_process_sync_logs}(agent_key)')
+                db.execute(f'CREATE INDEX IF NOT EXISTS idx_process_sync_status ON {table_process_sync_logs}(status)')
+
             # 创建服务实例与模板绑定表
             table_service_bindings = f"{prefix}service_template_bindings"
             if self.db_type == 'mysql':

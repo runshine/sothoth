@@ -16,6 +16,7 @@ def create_task():
     payload = request.get_json(silent=True) or {}
     mode = payload.get('mode')
     remote_root_url = (payload.get('remote_root_url') or '').strip()
+    remote_path_prefix = payload.get('remote_path_prefix')
     if mode not in {'pid_files', 'path_files'}:
         return _json_error('invalid_mode')
     if not remote_root_url.startswith('http://') and not remote_root_url.startswith('https://'):
@@ -24,12 +25,22 @@ def create_task():
         pids = payload.get('pids') or []
         if not isinstance(pids, list) or not pids:
             return _json_error('pids_required')
-        task = sync_task_service.create_task(mode, remote_root_url, pids=[int(item) for item in pids])
+        task = sync_task_service.create_task(
+            mode,
+            remote_root_url,
+            pids=[int(item) for item in pids],
+            remote_path_prefix=remote_path_prefix,
+        )
     else:
         paths = payload.get('paths') or []
         if not isinstance(paths, list) or not paths:
             return _json_error('paths_required')
-        task = sync_task_service.create_task(mode, remote_root_url, paths=[str(item) for item in paths])
+        task = sync_task_service.create_task(
+            mode,
+            remote_root_url,
+            paths=[str(item) for item in paths],
+            remote_path_prefix=remote_path_prefix,
+        )
     return jsonify(task), 202
 
 
@@ -82,3 +93,17 @@ def retry_task(task_id: str):
     except KeyError:
         return _json_error('task_not_found', 404)
     return jsonify(task), 202
+
+
+@bp.delete('/api/sync/tasks')
+def purge_tasks():
+    payload = request.get_json(silent=True) or {}
+    task_ids = payload.get('task_ids') if isinstance(payload.get('task_ids'), list) else None
+    status = payload.get('status')
+    include_running = bool(payload.get('include_running', False))
+    result = sync_task_service.purge_tasks(
+        task_ids=[str(item) for item in task_ids] if task_ids else None,
+        status=str(status).strip() if status else None,
+        include_running=include_running,
+    )
+    return jsonify(result)

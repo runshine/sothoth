@@ -4,8 +4,10 @@ from flask import Blueprint, jsonify, request
 import psutil
 
 from process_monitor_service.services.process_service import process_service
+from process_monitor_service.services.file_collectors import FileCollectorService
 
 bp = Blueprint('processes', __name__)
+collector_service = FileCollectorService()
 
 
 def _json_error(message: str, status: int = 400):
@@ -93,3 +95,60 @@ def signal_processes():
         return jsonify(result)
     except ValueError as exc:
         return _json_error(str(exc))
+
+
+def _build_path_tree(paths: list[str]) -> list[dict]:
+    root: dict = {'name': '/', 'path': '/', 'type': 'dir', 'children': {}}
+    for raw_path in sorted({str(item).strip() for item in paths if str(item).strip()}):
+        if not raw_path.startswith('/'):
+            continue
+        segments = [item for item in raw_path.split('/') if item]
+        cursor = root
+        current_path = ''
+        for index, segment in enumerate(segments):
+            current_path += '/' + segment
+            is_leaf = index == len(segments) - 1
+            if segment not in cursor['children']:
+                cursor['children'][segment] = {
+                    'name': segment,
+                    'path': current_path,
+                    'type': 'file' if is_leaf else 'dir',
+                    'children': {},
+                }
+            node = cursor['children'][segment]
+            if is_leaf:
+                node['type'] = 'file'
+            cursor = node
+
+    def to_list(node: dict) -> list[dict]:
+        items: list[dict] = []
+        for child_name in sorted(node.get('children', {}).keys()):
+            child = node['children'][child_name]
+            children = to_list(child)
+            payload = {
+                'name': child['name'],
+                'path': child['path'],
+                'type': 'dir' if children else child['type'],
+            }
+            if children:
+                payload['children'] = children
+            items.append(payload)
+        return items
+
+    return to_list(root)
+
+
+@bp.get('/api/processes/<int:pid>/sync-candidates')
+def get_process_sync_candidates(pid: int):
+    candidates, pid_summary, pid_results = collector_service.collect_from_pids([int(pid)])
+    paths = [item.host_path for item in candidates]
+    issues = [item for item in pid_results if int(item.get('pid', -1)) == int(pid)]
+    summary = pid_summary.get(str(pid), {})
+    return jsonify({
+        'pid': pid,
+        'total_paths': len(paths),
+        'paths': sorted(paths),
+        'tree': _build_path_tree(paths),
+        'summary': summary,
+        'issues': issues,
+    })

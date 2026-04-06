@@ -9,6 +9,7 @@ from agent_ai_service.a2a.session_store import SessionStore
 from agent_ai_service.services.backend_runtime import BackendRuntimeService
 from agent_ai_service.services.session_pipe_manager import SessionPipeManager
 from agent_ai_service.services.session_pty_manager import SessionPtyManager
+from agent_ai_service.services.claude_pipe_session_runtime import ClaudePipeSessionRuntime
 
 
 class A2AService:
@@ -18,11 +19,13 @@ class A2AService:
         session_store: SessionStore,
         session_pty_manager: SessionPtyManager,
         session_pipe_manager: SessionPipeManager,
+        claude_pipe_runtime: ClaudePipeSessionRuntime,
     ):
         self.backend_runtime = backend_runtime
         self.session_store = session_store
         self.session_pty_manager = session_pty_manager
         self.session_pipe_manager = session_pipe_manager
+        self.claude_pipe_runtime = claude_pipe_runtime
 
     def discovery(self) -> Dict[str, Any]:
         backends = self.backend_runtime.list_backends()
@@ -57,6 +60,11 @@ class A2AService:
     def _session_mode(self, session: Dict[str, Any]) -> str:
         # Backward compatibility: old sessions without session_mode are treated as PTY sessions.
         return self._resolve_session_mode(session.get('session_mode'), default='pty')
+
+    def _is_claude_backend(self, backend: str) -> bool:
+        cfg = self.backend_runtime.registry.get(str(backend or '').strip()) or {}
+        backend_type = str(cfg.get('backend_type') or backend or '').strip().lower()
+        return backend_type == 'claude'
 
     def _invoke_for_agents(self, agent_ids: list[str], prompt: str, messages: list[dict[str, Any]] | None = None) -> Dict[str, Any]:
         results = []
@@ -115,6 +123,16 @@ class A2AService:
                     'last_error': None,
                 })
             if session_mode == 'pipe':
+                if self._is_claude_backend(str(backend)):
+                    created = self.session_store.patch(session['session_id'], {
+                        'session_mode': 'pipe',
+                        'status': 'ready',
+                        'pty_pid': None,
+                        'backend_pid': None,
+                        'pty_started_at': None,
+                        'last_error': None,
+                    })
+                    return self.claude_pipe_runtime.create_or_get_vendor_session(created, model)
                 pipe_state = self.session_pipe_manager.create_session_pipe(session['session_id'], model)
                 return self.session_store.patch(session['session_id'], {
                     'session_mode': 'pipe',
@@ -174,6 +192,16 @@ class A2AService:
             })
 
         if mode == 'pipe':
+            if self._is_claude_backend(backend):
+                model = self.backend_runtime.registry.to_model(backend)
+                patched = self.session_store.patch(session_id, {
+                    'session_mode': 'pipe',
+                    'status': 'ready',
+                    'pty_pid': None,
+                    'backend_pid': None,
+                    'last_error': None,
+                })
+                return self.claude_pipe_runtime.create_or_get_vendor_session(patched, model)
             if self.session_pipe_manager.is_alive(session_id):
                 pid = self.session_pipe_manager.get_pid(session_id)
                 return self.session_store.patch(session_id, {
@@ -205,21 +233,29 @@ class A2AService:
         })
 
     def _mark_session_broken(self, session_id: str, error_message: str, mode: str = 'pty') -> Dict[str, Any]:
+        session = self.session_store.get(session_id) or {}
+        is_claude_pipe = mode == 'pipe' and self._is_claude_backend(str(session.get('backend') or ''))
         if mode == 'pipe':
             self.session_pipe_manager.mark_broken(session_id, error_message)
         elif mode == 'pty':
             self.session_pty_manager.mark_broken(session_id, error_message)
-        return self.session_store.patch(session_id, {
+        patch_payload = {
             'status': 'broken',
             'last_error': str(error_message or ''),
             'backend_pid': None,
-        })
+        }
+        if is_claude_pipe:
+            patch_payload['vendor_last_error'] = str(error_message or '')
+        return self.session_store.patch(session_id, patch_payload)
 
     def delete_session(self, session_id: str) -> Dict[str, Any]:
         session = self.session_store.get(session_id)
         mode = self._session_mode(session or {}) if isinstance(session, dict) else 'pty'
         if mode == 'pipe':
-            self.session_pipe_manager.close_session_pipe(session_id)
+            if self._is_claude_backend(str((session or {}).get('backend') or '')):
+                pass
+            else:
+                self.session_pipe_manager.close_session_pipe(session_id)
         elif mode == 'pty':
             self.session_pty_manager.close_session_pty(session_id)
         # Best effort cleanup of the other runtime store in case of historical mismatch.
@@ -243,12 +279,16 @@ class A2AService:
         try:
             session = self._ensure_session_runtime(session, allow_recreate=True)
             if mode == 'pipe':
-                self.session_pipe_manager.write_stdin(session_id, str(content), append_newline=True)
-                round_result = self.session_pipe_manager.read_until_idle(
-                    session_id,
-                    quiet_window_ms=settings.session_pty_quiet_window_ms,
-                    max_window_ms=settings.session_pty_max_window_ms,
-                )
+                if self._is_claude_backend(backend):
+                    model = self.backend_runtime.registry.to_model(backend)
+                    round_result = self.claude_pipe_runtime.invoke_once(session, model, str(content))
+                else:
+                    self.session_pipe_manager.write_stdin(session_id, str(content), append_newline=True)
+                    round_result = self.session_pipe_manager.read_until_idle(
+                        session_id,
+                        quiet_window_ms=settings.session_pty_quiet_window_ms,
+                        max_window_ms=settings.session_pty_max_window_ms,
+                    )
             elif mode == 'pty':
                 self.session_pty_manager.write_stdin(session_id, str(content), append_newline=True)
                 round_result = self.session_pty_manager.read_until_idle(
@@ -340,12 +380,16 @@ class A2AService:
         try:
             session = self._ensure_session_runtime(session, allow_recreate=True)
             if mode == 'pipe':
-                self.session_pipe_manager.write_stdin(session_id, content, append_newline=True)
-                stream_iter = self.session_pipe_manager.stream_round(
-                    session_id,
-                    quiet_window_ms=settings.session_pty_quiet_window_ms,
-                    max_window_ms=settings.session_pty_max_window_ms,
-                )
+                if self._is_claude_backend(backend):
+                    model = self.backend_runtime.registry.to_model(backend)
+                    stream_iter = self.claude_pipe_runtime.invoke_stream(session, model, content)
+                else:
+                    self.session_pipe_manager.write_stdin(session_id, content, append_newline=True)
+                    stream_iter = self.session_pipe_manager.stream_round(
+                        session_id,
+                        quiet_window_ms=settings.session_pty_quiet_window_ms,
+                        max_window_ms=settings.session_pty_max_window_ms,
+                    )
             elif mode == 'pty':
                 self.session_pty_manager.write_stdin(session_id, content, append_newline=True)
                 stream_iter = self.session_pty_manager.stream_round(

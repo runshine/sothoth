@@ -66,6 +66,7 @@ class SyncTask:
     pids: list[int] = field(default_factory=list)
     paths: list[str] = field(default_factory=list)
     source_task_id: str | None = None
+    remote_path_prefix: str | None = None
     total_files: int = 0
     completed_files: int = 0
     failed_files: int = 0

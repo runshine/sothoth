@@ -6,15 +6,18 @@ from agent_ai_service.a2a.router import A2AService
 from agent_ai_service.a2a.session_store import SessionStore
 from agent_ai_service.config import settings
 from agent_ai_service.api.backends import runtime
+from agent_ai_service.services.claude_pipe_session_runtime import ClaudePipeSessionRuntime
 from agent_ai_service.services.session_pipe_manager import SessionPipeManager
 from agent_ai_service.services.session_pty_manager import SessionPtyManager
 
 bp = Blueprint('a2a', __name__)
+session_store = SessionStore()
 a2a = A2AService(
     runtime,
-    SessionStore(),
+    session_store,
     SessionPtyManager(settings.state_dir),
     SessionPipeManager(settings.state_dir),
+    ClaudePipeSessionRuntime(session_store),
 )
 
 

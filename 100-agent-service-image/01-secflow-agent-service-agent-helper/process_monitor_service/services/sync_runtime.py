@@ -31,8 +31,19 @@ class SyncTaskService:
         self._worker = threading.Thread(target=self._worker_loop, name='process-sync-worker', daemon=True)
         self._worker.start()
 
-    def create_task(self, mode: str, remote_root_url: str, *, pids: list[int] | None = None, paths: list[str] | None = None, source_task_id: str | None = None, preset_results: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def create_task(
+        self,
+        mode: str,
+        remote_root_url: str,
+        *,
+        pids: list[int] | None = None,
+        paths: list[str] | None = None,
+        source_task_id: str | None = None,
+        preset_results: list[dict[str, Any]] | None = None,
+        remote_path_prefix: str | None = None,
+    ) -> dict[str, Any]:
         task_id = uuid.uuid4().hex
+        normalized_prefix = self._normalize_remote_prefix(remote_path_prefix)
         task = SyncTask(
             task_id=task_id,
             mode=mode,
@@ -42,6 +53,7 @@ class SyncTaskService:
             pids=pids or [],
             paths=paths or [],
             source_task_id=source_task_id,
+            remote_path_prefix=normalized_prefix or None,
         )
         with self._lock:
             self._tasks[task_id] = task.to_dict()
@@ -100,8 +112,22 @@ class SyncTaskService:
         retry_paths = sorted({item['source_path'] for item in failed_items if item.get('source_path')})
         retry_pids = sorted({int(item['pid']) for item in failed_items if item.get('pid') is not None})
         if task['mode'] == 'pid_files':
-            return self.create_task('pid_files', task['remote_root_url'], pids=retry_pids, source_task_id=task_id, preset_results=[])
-        return self.create_task('path_files', task['remote_root_url'], paths=retry_paths, source_task_id=task_id, preset_results=[])
+            return self.create_task(
+                'pid_files',
+                task['remote_root_url'],
+                pids=retry_pids,
+                source_task_id=task_id,
+                preset_results=[],
+                remote_path_prefix=task.get('remote_path_prefix'),
+            )
+        return self.create_task(
+            'path_files',
+            task['remote_root_url'],
+            paths=retry_paths,
+            source_task_id=task_id,
+            preset_results=[],
+            remote_path_prefix=task.get('remote_path_prefix'),
+        )
 
     def _worker_loop(self) -> None:
         while True:
@@ -157,59 +183,74 @@ class SyncTaskService:
         total_bytes = sum(item.size or 0 for item in candidates if item.entry_type == 'file')
         self._update_task(task_id, total_files=len(candidates), total_bytes=total_bytes)
         client = FileserverSyncClient(task['remote_root_url'])
-        dirs = [str(Path(item.relative_path).parent) for item in candidates if str(Path(item.relative_path).parent) not in ('', '.')]
+        prefix = self._normalize_remote_prefix(task.get('remote_path_prefix'))
+        effective_paths = [self._join_remote_path(prefix, item.relative_path) for item in candidates]
+        dirs = [str(Path(item).parent) for item in effective_paths if str(Path(item).parent) not in ('', '.')]
         client.ensure_dirs(dirs)
+        if prefix:
+            client.ensure_dirs([prefix])
         recent_bytes = 0
         recent_ts = time.time()
-        for candidate in candidates:
-            self._append_event(task_id, 'info', 'file_started', f'start {candidate.relative_path}', {'path': candidate.relative_path, 'entry_type': candidate.entry_type})
+        for index, candidate in enumerate(candidates):
+            remote_relative_path = effective_paths[index]
+            self._append_event(task_id, 'info', 'file_started', f'start {remote_relative_path}', {'path': remote_relative_path, 'source_path': candidate.relative_path, 'entry_type': candidate.entry_type})
             try:
-                meta = client.head_object(candidate.relative_path)
+                meta = client.head_object(remote_relative_path)
                 if self._should_skip(candidate, meta):
                     self._append_result(task_id, SyncResult(
-                        item_id=candidate.relative_path,
+                        item_id=remote_relative_path,
                         source_path=candidate.host_path,
-                        relative_path=candidate.relative_path,
+                        relative_path=remote_relative_path,
                         entry_type=candidate.entry_type,
                         status='skipped',
                         size=candidate.size,
                         reason='remote_same_content',
                         refs=self._refs(candidate),
                     ).to_dict())
-                    self._append_event(task_id, 'info', 'file_skipped', f'skip {candidate.relative_path}', {'path': candidate.relative_path})
+                    self._append_event(task_id, 'info', 'file_skipped', f'skip {remote_relative_path}', {'path': remote_relative_path, 'source_path': candidate.relative_path})
                     self._touch_progress(task_id, completed_inc=1, skipped_inc=1)
                     continue
                 uploaded_bytes_counter = {'delta': 0}
                 def on_progress(chunk_size: int) -> None:
                     uploaded_bytes_counter['delta'] += chunk_size
                     self._touch_progress(task_id, uploaded_bytes_inc=chunk_size)
-                payload = client.upload(candidate, progress_cb=on_progress)
+                upload_candidate = SyncFileCandidate(
+                    host_path=candidate.host_path,
+                    real_path=candidate.real_path,
+                    relative_path=remote_relative_path,
+                    size=candidate.size,
+                    entry_type=candidate.entry_type,
+                    symlink_target=candidate.symlink_target,
+                    pid_refs=list(candidate.pid_refs),
+                    path_refs=list(candidate.path_refs),
+                )
+                payload = client.upload(upload_candidate, progress_cb=on_progress)
                 sha256 = payload.get('sha256')
                 size = self._result_size(candidate, payload)
                 self._append_result(task_id, SyncResult(
-                    item_id=candidate.relative_path,
+                    item_id=remote_relative_path,
                     source_path=candidate.host_path,
-                    relative_path=candidate.relative_path,
+                    relative_path=remote_relative_path,
                     entry_type=candidate.entry_type,
                     status='uploaded',
                     size=size,
                     sha256=sha256,
                     refs=self._refs(candidate),
                 ).to_dict())
-                self._append_event(task_id, 'info', 'file_uploaded', f'uploaded {candidate.relative_path}', {'path': candidate.relative_path, 'size': size})
+                self._append_event(task_id, 'info', 'file_uploaded', f'uploaded {remote_relative_path}', {'path': remote_relative_path, 'source_path': candidate.relative_path, 'size': size})
                 self._touch_progress(task_id, completed_inc=1)
             except Exception as exc:
                 self._append_result(task_id, SyncResult(
-                    item_id=candidate.relative_path,
+                    item_id=remote_relative_path,
                     source_path=candidate.host_path,
-                    relative_path=candidate.relative_path,
+                    relative_path=remote_relative_path,
                     entry_type=candidate.entry_type,
                     status='failed',
                     size=candidate.size,
                     error=str(exc),
                     refs=self._refs(candidate),
                 ).to_dict())
-                self._append_event(task_id, 'error', 'file_failed', f'failed {candidate.relative_path}', {'path': candidate.relative_path, 'error': str(exc)})
+                self._append_event(task_id, 'error', 'file_failed', f'failed {remote_relative_path}', {'path': remote_relative_path, 'source_path': candidate.relative_path, 'error': str(exc)})
                 self._touch_progress(task_id, completed_inc=1, failed_inc=1)
             now = time.time()
             snapshot = self.get_task(task_id)
@@ -333,6 +374,39 @@ class SyncTaskService:
         except OSError:
             return None
 
+    def purge_tasks(
+        self,
+        *,
+        task_ids: list[str] | None = None,
+        status: str | None = None,
+        include_running: bool = False,
+    ) -> dict[str, Any]:
+        with self._lock:
+            candidates = sorted(self._tasks.keys())
+            if task_ids:
+                requested = {str(item).strip() for item in task_ids if str(item).strip()}
+                candidates = [item for item in candidates if item in requested]
+            if status:
+                status_value = str(status).strip()
+                candidates = [item for item in candidates if str(self._tasks.get(item, {}).get('status') or '') == status_value]
+            default_allowed = {'success', 'partial_success', 'failed', 'cancelled'}
+            removed: list[str] = []
+            skipped: list[dict[str, Any]] = []
+            for task_id in candidates:
+                task = self._tasks.get(task_id) or {}
+                task_status = str(task.get('status') or '').strip()
+                if not include_running and task_status not in default_allowed:
+                    skipped.append({'task_id': task_id, 'reason': f'status_not_allowed:{task_status or "unknown"}'})
+                    continue
+                self._tasks.pop(task_id, None)
+                self._results.pop(task_id, None)
+                self._events_index.pop(task_id, None)
+                removed.append(task_id)
+            if removed:
+                self._rewrite_events_locked()
+            self._persist_locked()
+        return {'deleted': len(removed), 'deleted_task_ids': removed, 'skipped': skipped}
+
     def _load_events(self) -> dict[str, list[dict[str, Any]]]:
         items: dict[str, list[dict[str, Any]]] = {}
         if not self._events_path.exists():
@@ -355,6 +429,30 @@ class SyncTaskService:
     def _persist_locked(self) -> None:
         self._tasks_store.save(self._tasks)
         self._results_store.save(self._results)
+
+    def _rewrite_events_locked(self) -> None:
+        with self._events_path.open('w', encoding='utf-8') as fh:
+            for task_id, events in self._events_index.items():
+                for event in events:
+                    fh.write(json.dumps({'task_id': task_id, **event}, ensure_ascii=True) + '\n')
+
+    def _normalize_remote_prefix(self, remote_path_prefix: str | None) -> str:
+        text = str(remote_path_prefix or '').strip()
+        if not text:
+            return ''
+        if not text.startswith('/'):
+            text = '/' + text
+        normalized = str(Path(text).as_posix()).strip()
+        if normalized in ('', '/', '.'):
+            return ''
+        return normalized.rstrip('/')
+
+    def _join_remote_path(self, prefix: str, relative_path: str) -> str:
+        path_value = str(relative_path or '').strip()
+        if not path_value:
+            return prefix or '/'
+        normalized_relative = '/' + path_value.lstrip('/')
+        return f'{prefix}{normalized_relative}' if prefix else normalized_relative
 
 
 sync_task_service = SyncTaskService()

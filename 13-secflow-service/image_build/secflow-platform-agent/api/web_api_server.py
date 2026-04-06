@@ -1206,6 +1206,9 @@ class WebAPIServer:
     def _has_ai_helper_tag(self, tags: Any) -> bool:
         return 'AI_AGENT_HELPER' in self._normalize_service_tags(tags)
 
+    def _has_process_monitor_tag(self, tags: Any) -> bool:
+        return 'PROCESS_MONITOR' in self._normalize_service_tags(tags)
+
     def _load_configcenter_payload(self, response: requests.Response) -> Dict[str, Any]:
         try:
             payload = response.json() if response.content else {}
@@ -1598,6 +1601,12 @@ class WebAPIServer:
         except Exception:
             return 20001
 
+    def _resolve_process_monitor_rest_port(self, service_row: Dict[str, Any]) -> int:
+        try:
+            return int(self.config.get('helper_process_monitor_port', 20004))
+        except Exception:
+            return 20004
+
     def _get_ai_helper_service_row(self, project_id: str, agent_key: str, service_name: str) -> Optional[Dict[str, Any]]:
         table_name = self.db_manager.get_table_name('agent_services')
         row = self.db_manager.fetch_one(
@@ -1624,6 +1633,34 @@ class WebAPIServer:
         if not self._has_ai_helper_tag(row.get('tags_json')):
             return None
         return row
+
+    def _get_process_monitor_service_row(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        table_name = self.db_manager.get_table_name('agent_services')
+        params: List[Any] = [project_id, agent_key]
+        where_clause = "project_id = %s AND agent_key = %s" if self.db_manager.db_type == 'mysql' else "project_id = ? AND agent_key = ?"
+        if service_name:
+            where_clause += " AND service_name = %s" if self.db_manager.db_type == 'mysql' else " AND service_name = ?"
+            params.append(service_name)
+        rows = self.db_manager.fetch_all(
+            f"""
+            SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                   service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                   first_seen_at, last_seen_at, updated_at
+            FROM {table_name}
+            WHERE {where_clause}
+            ORDER BY last_seen_at DESC
+            """,
+            tuple(params)
+        ) or []
+        for row in rows:
+            if self._has_process_monitor_tag(row.get('tags_json')):
+                return row
+        return None
 
     def _call_ai_helper_api(
         self,
@@ -1654,6 +1691,181 @@ class WebAPIServer:
         except Exception:
             data = {'raw': response.text}
         return data, response.status_code
+
+    def _call_process_monitor_api(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: Optional[str],
+        method: str,
+        endpoint: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: Tuple[int, int] = (10, 300),
+    ) -> Tuple[Dict[str, Any], int, Dict[str, Any]]:
+        row = self._get_process_monitor_service_row(project_id, agent_key, service_name)
+        if not row:
+            raise ValueError(f'process_monitor service not found: {agent_key}/{service_name or "*"}')
+        agent_ip = str(row.get('agent_ip') or '').strip()
+        if not agent_ip:
+            raise ValueError(f'process_monitor service has no agent IP: {agent_key}/{service_name or "*"}')
+        rest_port = self._resolve_process_monitor_rest_port(row)
+        target = f"http://{agent_ip}:{rest_port}{endpoint}"
+        self.logger.debug(
+            f"call_process_monitor_api target={target} project={project_id} agent={agent_key} service={row.get('service_name')}"
+        )
+        response = requests.request(method.upper(), target, json=payload, timeout=timeout)
+        try:
+            data = response.json() if response.content else {}
+        except Exception:
+            data = {'raw': response.text}
+        return data if isinstance(data, dict) else {'raw': data}, response.status_code, row
+
+    def _record_process_sync_log(
+        self,
+        project_id: str,
+        agent_key: str,
+        service_name: str,
+        mode: str,
+        status: str,
+        request_payload: Dict[str, Any],
+        node_task_payload: Dict[str, Any],
+        message: str = '',
+        sync_id: Optional[str] = None,
+    ) -> str:
+        sync_log_id = str(sync_id or uuid.uuid4().hex)
+        table_name = self.db_manager.get_table_name('process_sync_logs')
+        request_json = json.dumps(request_payload or {}, ensure_ascii=False)
+        node_json = json.dumps(node_task_payload or {}, ensure_ascii=False)
+        node_task_id = str((node_task_payload or {}).get('task_id') or '')
+        if self.db_manager.db_type == 'mysql':
+            self.db_manager.execute_query(
+                f"""
+                INSERT INTO {table_name}
+                (sync_id, project_id, agent_key, service_name, node_task_id, mode, status, request_json, node_snapshot_json, message)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                  node_task_id=VALUES(node_task_id),
+                  mode=VALUES(mode),
+                  status=VALUES(status),
+                  request_json=VALUES(request_json),
+                  node_snapshot_json=VALUES(node_snapshot_json),
+                  message=VALUES(message),
+                  updated_at=NOW()
+                """,
+                (sync_log_id, project_id, agent_key, service_name, node_task_id, mode, status, request_json, node_json, message)
+            )
+        else:
+            now_ts = datetime.now().isoformat()
+            self.db_manager.execute_query(
+                f"""
+                INSERT INTO {table_name}
+                (sync_id, project_id, agent_key, service_name, node_task_id, mode, status, request_json, node_snapshot_json, message, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sync_id) DO UPDATE SET
+                  node_task_id=excluded.node_task_id,
+                  mode=excluded.mode,
+                  status=excluded.status,
+                  request_json=excluded.request_json,
+                  node_snapshot_json=excluded.node_snapshot_json,
+                  message=excluded.message,
+                  updated_at=excluded.updated_at
+                """,
+                (sync_log_id, project_id, agent_key, service_name, node_task_id, mode, status, request_json, node_json, message, now_ts, now_ts)
+            )
+        return sync_log_id
+
+    def _list_process_monitor_services(self, project_id: str, include_stale: bool = False) -> List[Dict[str, Any]]:
+        services_table = self.db_manager.get_table_name('agent_services')
+        template_table = self.db_manager.get_table_name('service_templates')
+        binding_table = self.db_manager.get_table_name('service_template_bindings')
+        where_sql = "project_id = %s" if self.db_manager.db_type == 'mysql' else "project_id = ?"
+        params: List[Any] = [project_id]
+        if not include_stale:
+            where_sql += " AND is_stale = 0"
+        rows = self.db_manager.fetch_all(
+            f"""
+            SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip,
+                   service_name, image, status, tags_json, ports_json, raw_json, source, is_stale,
+                   first_seen_at, last_seen_at, updated_at
+            FROM {services_table}
+            WHERE {where_sql}
+            ORDER BY last_seen_at DESC
+            """,
+            tuple(params)
+        ) or []
+
+        template_rows = self.db_manager.fetch_all(
+            f"SELECT id, name, metadata FROM {template_table} ORDER BY id ASC",
+            tuple()
+        ) or []
+        templates_by_name: Dict[str, Dict[str, Any]] = {}
+        for tpl in template_rows:
+            tpl_name = str(tpl.get('name') or '').strip()
+            if not tpl_name:
+                continue
+            metadata = tpl.get('metadata')
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+            elif not isinstance(metadata, dict):
+                metadata = {}
+            templates_by_name[tpl_name] = {
+                'id': tpl.get('id'),
+                'name': tpl_name,
+                'template_tags': self._normalize_service_tags((metadata or {}).get('tags')),
+            }
+
+        binding_rows = self.db_manager.fetch_all(
+            f"SELECT project_id, agent_key, service_name, template_id, template_name FROM {binding_table} WHERE project_id = %s"
+            if self.db_manager.db_type == 'mysql' else
+            f"SELECT project_id, agent_key, service_name, template_id, template_name FROM {binding_table} WHERE project_id = ?",
+            (project_id,)
+        ) or []
+        bindings_map: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        for row in binding_rows:
+            key = (
+                str(row.get('project_id') or '').strip(),
+                str(row.get('agent_key') or '').strip(),
+                str(row.get('service_name') or '').strip(),
+            )
+            bindings_map[key] = {
+                'template_id': row.get('template_id'),
+                'template_name': str(row.get('template_name') or '').strip(),
+            }
+
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            key = (
+                str(row.get('project_id') or '').strip(),
+                str(row.get('agent_key') or '').strip(),
+                str(row.get('service_name') or '').strip(),
+            )
+            binding = bindings_map.get(key) or {}
+            template_name = str(binding.get('template_name') or '').strip()
+            template_meta = templates_by_name.get(template_name) or {}
+            template_tags = self._normalize_service_tags(template_meta.get('template_tags'))
+            item = {
+                'service_uid': row.get('service_uid'),
+                'project_id': row.get('project_id'),
+                'agent_key': row.get('agent_key'),
+                'agent_hostname': row.get('agent_hostname'),
+                'agent_ip': row.get('agent_ip'),
+                'service_name': row.get('service_name'),
+                'image': row.get('image') or '',
+                'status': row.get('status') or 'unknown',
+                'template_id': binding.get('template_id') or template_meta.get('id'),
+                'template_name': template_name,
+                'template_tags': template_tags,
+                'tags': self._normalize_service_tags(row.get('tags_json')),
+                'is_stale': bool(row.get('is_stale')),
+                'last_seen_at': row.get('last_seen_at'),
+                'updated_at': row.get('updated_at'),
+            }
+            if self._has_process_monitor_tag(template_tags):
+                items.append(item)
+        return items
 
     def _parse_ai_helper_health_payload(self, raw_payload: Any) -> Dict[str, Any]:
         if isinstance(raw_payload, dict):
@@ -4820,6 +5032,512 @@ class WebAPIServer:
                 })
             except Exception as e:
                 self.logger.error(f"清理OFFLINE服务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/nodes', methods=['GET'])
+        def list_process_monitor_nodes():
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                include_stale = str(request.args.get('include_stale', 'false')).lower() == 'true'
+                q = str(request.args.get('q') or '').strip().lower()
+                agent_key_filter = str(request.args.get('agent_key') or '').strip()
+                items = self._list_process_monitor_services(project_id, include_stale=include_stale)
+                if agent_key_filter:
+                    items = [item for item in items if str(item.get('agent_key') or '') == agent_key_filter]
+                if q:
+                    items = [
+                        item for item in items
+                        if q in str(item.get('agent_key') or '').lower()
+                        or q in str(item.get('service_name') or '').lower()
+                        or q in str(item.get('agent_hostname') or '').lower()
+                        or q in str(item.get('agent_ip') or '').lower()
+                    ]
+                items.sort(key=lambda item: str(item.get('last_seen_at') or ''), reverse=True)
+                return jsonify({'project_id': project_id, 'total': len(items), 'items': items})
+            except Exception as e:
+                self.logger.error(f"查询process-monitor节点列表失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/nodes/<agent_key>/services/<service_name>/processes', methods=['GET'])
+        def list_node_processes(agent_key, service_name):
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                name = str(request.args.get('name') or '').strip()
+                keyword = str(request.args.get('keyword') or '').strip()
+                endpoint = '/api/processes'
+                query_params = {}
+                if name:
+                    query_params['name'] = name
+                if keyword:
+                    query_params['keyword'] = keyword
+                if query_params:
+                    endpoint = f"{endpoint}?{urlencode(query_params)}"
+                data, status_code, row = self._call_process_monitor_api(
+                    project_id, agent_key, service_name, 'GET', endpoint, None, timeout=(5, 30)
+                )
+                payload = data if isinstance(data, dict) else {'items': [], 'total': 0}
+                payload['service_name'] = row.get('service_name')
+                payload['agent_key'] = row.get('agent_key')
+                return jsonify(payload), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"查询节点进程列表失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/nodes/<agent_key>/services/<service_name>/processes/<int:pid>', methods=['GET'])
+        def get_node_process_detail(agent_key, service_name, pid):
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                data, status_code, row = self._call_process_monitor_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'GET',
+                    f'/api/processes/{int(pid)}',
+                    None,
+                    timeout=(5, 30),
+                )
+                payload = data if isinstance(data, dict) else {}
+                payload['service_name'] = row.get('service_name')
+                payload['agent_key'] = row.get('agent_key')
+                return jsonify(payload), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"查询节点进程详情失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/nodes/<agent_key>/services/<service_name>/processes/<int:pid>/sync-candidates', methods=['GET'])
+        def get_node_process_sync_candidates(agent_key, service_name, pid):
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                data, status_code, row = self._call_process_monitor_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'GET',
+                    f'/api/processes/{int(pid)}/sync-candidates',
+                    None,
+                    timeout=(5, 30),
+                )
+                payload = data if isinstance(data, dict) else {}
+                payload['service_name'] = row.get('service_name')
+                payload['agent_key'] = row.get('agent_key')
+                return jsonify(payload), status_code
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"查询节点进程同步候选失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/sync/tasks', methods=['POST'])
+        def create_process_monitor_sync_task():
+            try:
+                data = request.get_json(silent=True) or {}
+                project_id = str(data.get('project_id') or '').strip()
+                agent_key = str(data.get('agent_key') or '').strip()
+                service_name = str(data.get('service_name') or '').strip()
+                mode = str(data.get('mode') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                if not agent_key:
+                    return jsonify({'error': 'agent_key is required'}), 400
+                if mode not in ('pid_files', 'path_files'):
+                    return jsonify({'error': 'mode must be pid_files or path_files'}), 400
+                if mode == 'pid_files':
+                    pids = data.get('pids') or []
+                    if not isinstance(pids, list) or not pids:
+                        return jsonify({'error': 'pids is required for pid_files mode'}), 400
+                else:
+                    paths = data.get('paths') or []
+                    if not isinstance(paths, list) or not paths:
+                        return jsonify({'error': 'paths is required for path_files mode'}), 400
+
+                selected_row = self._get_process_monitor_service_row(project_id, agent_key, service_name or None)
+                if not selected_row:
+                    return jsonify({'error': f'process_monitor service not found: {agent_key}/{service_name or "*"}'}), 404
+                resolved_service_name = str(selected_row.get('service_name') or '').strip()
+
+                remote_root_url = str(data.get('remote_root_url') or '').strip()
+                if not remote_root_url:
+                    fileserver_base = str(
+                        self.config.get('process_monitor_fileserver_base_url') or
+                        'http://secflow-platform-fileserver/api/fileserver'
+                    ).rstrip('/')
+                    subproject_id = data.get('subproject_id', self.config.get('process_monitor_default_subproject_id', 1))
+                    remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{int(subproject_id)}"
+                remote_path_prefix = f"/__file__sync__/{agent_key}"
+
+                payload = {
+                    'mode': mode,
+                    'remote_root_url': remote_root_url,
+                    'remote_path_prefix': remote_path_prefix,
+                }
+                if mode == 'pid_files':
+                    payload['pids'] = [int(item) for item in (data.get('pids') or [])]
+                else:
+                    payload['paths'] = [str(item) for item in (data.get('paths') or [])]
+
+                node_resp, status_code, _ = self._call_process_monitor_api(
+                    project_id,
+                    agent_key,
+                    resolved_service_name,
+                    'POST',
+                    '/api/sync/tasks',
+                    payload,
+                    timeout=(10, 120),
+                )
+                if status_code >= 300:
+                    return jsonify(node_resp if isinstance(node_resp, dict) else {'error': 'upstream_error'}), status_code
+
+                node_payload = node_resp if isinstance(node_resp, dict) else {}
+                platform_sync_id = self._record_process_sync_log(
+                    project_id=project_id,
+                    agent_key=agent_key,
+                    service_name=resolved_service_name,
+                    mode=mode,
+                    status=str(node_payload.get('status') or 'created'),
+                    request_payload=payload,
+                    node_task_payload=node_payload,
+                    message='process monitor sync task created',
+                )
+                return jsonify({
+                    'sync_id': platform_sync_id,
+                    'project_id': project_id,
+                    'agent_key': agent_key,
+                    'service_name': resolved_service_name,
+                    'node_task': node_payload,
+                    'remote_root_url': remote_root_url,
+                    'remote_path_prefix': remote_path_prefix,
+                }), 202
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 404
+            except Exception as e:
+                self.logger.error(f"创建process-monitor同步任务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/sync/tasks/history', methods=['GET', 'DELETE'])
+        def process_monitor_sync_history():
+            table_name = self.db_manager.get_table_name('process_sync_logs')
+            try:
+                if request.method == 'GET':
+                    project_id = str(request.args.get('project_id') or '').strip()
+                    if not project_id:
+                        return jsonify({'error': 'project_id is required'}), 400
+                    page = max(int(request.args.get('page', 1)), 1)
+                    per_page = min(max(int(request.args.get('per_page', 50)), 1), 500)
+                    status_filter = str(request.args.get('status') or '').strip()
+                    mode_filter = str(request.args.get('mode') or '').strip()
+                    agent_key_filter = str(request.args.get('agent_key') or '').strip()
+
+                    where = ["project_id = %s" if self.db_manager.db_type == 'mysql' else "project_id = ?"]
+                    params: List[Any] = [project_id]
+                    if status_filter:
+                        where.append("status = %s" if self.db_manager.db_type == 'mysql' else "status = ?")
+                        params.append(status_filter)
+                    if mode_filter:
+                        where.append("mode = %s" if self.db_manager.db_type == 'mysql' else "mode = ?")
+                        params.append(mode_filter)
+                    if agent_key_filter:
+                        where.append("agent_key = %s" if self.db_manager.db_type == 'mysql' else "agent_key = ?")
+                        params.append(agent_key_filter)
+                    where_sql = " AND ".join(where)
+
+                    count_row = self.db_manager.fetch_one(
+                        f"SELECT COUNT(*) as count FROM {table_name} WHERE {where_sql}",
+                        tuple(params),
+                    )
+                    total = int((count_row or {}).get('count', 0))
+                    offset = (page - 1) * per_page
+                    query_sql = f"""
+                        SELECT sync_id, project_id, agent_key, service_name, node_task_id,
+                               mode, status, request_json, node_snapshot_json, message, created_at, updated_at
+                        FROM {table_name}
+                        WHERE {where_sql}
+                        ORDER BY created_at DESC
+                    """
+                    if self.db_manager.db_type == 'mysql':
+                        query_sql += " LIMIT %s OFFSET %s"
+                    else:
+                        query_sql += " LIMIT ? OFFSET ?"
+                    rows = self.db_manager.fetch_all(query_sql, tuple(params + [per_page, offset])) or []
+                    items: List[Dict[str, Any]] = []
+                    for row in rows:
+                        request_json = row.get('request_json')
+                        node_json = row.get('node_snapshot_json')
+                        if isinstance(request_json, str):
+                            try:
+                                request_json = json.loads(request_json)
+                            except Exception:
+                                request_json = {}
+                        if isinstance(node_json, str):
+                            try:
+                                node_json = json.loads(node_json)
+                            except Exception:
+                                node_json = {}
+                        items.append({
+                            'sync_id': row.get('sync_id'),
+                            'project_id': row.get('project_id'),
+                            'agent_key': row.get('agent_key'),
+                            'service_name': row.get('service_name'),
+                            'node_task_id': row.get('node_task_id'),
+                            'mode': row.get('mode'),
+                            'status': row.get('status'),
+                            'request': request_json if isinstance(request_json, dict) else {},
+                            'node_snapshot': node_json if isinstance(node_json, dict) else {},
+                            'message': row.get('message'),
+                            'created_at': row.get('created_at'),
+                            'updated_at': row.get('updated_at'),
+                        })
+                    return jsonify({
+                        'project_id': project_id,
+                        'page': page,
+                        'per_page': per_page,
+                        'total': total,
+                        'items': items,
+                    })
+
+                payload = request.get_json(silent=True) or {}
+                project_id = str(payload.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                sync_ids = payload.get('sync_ids') if isinstance(payload.get('sync_ids'), list) else []
+                include_running = bool(payload.get('include_running', False))
+                ended_statuses = {'success', 'partial_success', 'failed', 'cancelled', 'cleared'}
+                rows = self.db_manager.fetch_all(
+                    f"SELECT sync_id, status FROM {table_name} WHERE project_id = %s"
+                    if self.db_manager.db_type == 'mysql' else
+                    f"SELECT sync_id, status FROM {table_name} WHERE project_id = ?",
+                    (project_id,),
+                ) or []
+                selected_rows = rows
+                if sync_ids:
+                    selected = {str(item).strip() for item in sync_ids if str(item).strip()}
+                    selected_rows = [item for item in rows if str(item.get('sync_id') or '') in selected]
+                to_delete: List[str] = []
+                skipped: List[Dict[str, Any]] = []
+                for row in selected_rows:
+                    sync_id = str(row.get('sync_id') or '').strip()
+                    status_value = str(row.get('status') or '').strip().lower()
+                    if not include_running and status_value not in ended_statuses:
+                        skipped.append({'sync_id': sync_id, 'reason': f'status_not_allowed:{status_value or "unknown"}'})
+                        continue
+                    to_delete.append(sync_id)
+                deleted = 0
+                for sync_id in to_delete:
+                    self.db_manager.execute_query(
+                        f"DELETE FROM {table_name} WHERE sync_id = %s"
+                        if self.db_manager.db_type == 'mysql' else
+                        f"DELETE FROM {table_name} WHERE sync_id = ?",
+                        (sync_id,),
+                    )
+                    deleted += 1
+                return jsonify({'project_id': project_id, 'deleted': deleted, 'deleted_sync_ids': to_delete, 'skipped': skipped})
+            except Exception as e:
+                self.logger.error(f"处理process-monitor同步历史失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/sync/tasks/live', methods=['GET', 'DELETE'])
+        def process_monitor_sync_live():
+            try:
+                if request.method == 'GET':
+                    project_id = str(request.args.get('project_id') or '').strip()
+                    if not project_id:
+                        return jsonify({'error': 'project_id is required'}), 400
+                    agent_key_raw = str(request.args.get('agent_keys') or request.args.get('agent_key') or '').strip()
+                    requested_keys = {item.strip() for item in agent_key_raw.split(',') if item.strip()} if agent_key_raw else set()
+                    services = self._list_process_monitor_services(project_id, include_stale=False)
+                    if requested_keys:
+                        services = [item for item in services if str(item.get('agent_key') or '') in requested_keys]
+                    dedup_map: Dict[str, Dict[str, Any]] = {}
+                    for item in services:
+                        key = str(item.get('agent_key') or '')
+                        if not key:
+                            continue
+                        prev = dedup_map.get(key)
+                        if prev is None or str(item.get('last_seen_at') or '') > str(prev.get('last_seen_at') or ''):
+                            dedup_map[key] = item
+                    selected_services = list(dedup_map.values())
+                    items: List[Dict[str, Any]] = []
+                    errors: List[Dict[str, Any]] = []
+                    for svc in selected_services:
+                        agent_key = str(svc.get('agent_key') or '')
+                        service_name = str(svc.get('service_name') or '')
+                        try:
+                            node_data, status_code, _ = self._call_process_monitor_api(
+                                project_id, agent_key, service_name, 'GET', '/api/sync/tasks', None, timeout=(5, 30)
+                            )
+                            if status_code >= 300:
+                                errors.append({'agent_key': agent_key, 'service_name': service_name, 'error': f'upstream_status_{status_code}', 'response': node_data})
+                                continue
+                            task_items = node_data.get('items') if isinstance(node_data, dict) else []
+                            if not isinstance(task_items, list):
+                                task_items = []
+                            for task in task_items:
+                                if not isinstance(task, dict):
+                                    continue
+                                table_name = self.db_manager.get_table_name('process_sync_logs')
+                                node_task_id = str(task.get('task_id') or '').strip()
+                                if node_task_id:
+                                    self.db_manager.execute_query(
+                                        f"""
+                                        UPDATE {table_name}
+                                        SET status = %s, node_snapshot_json = %s, updated_at = NOW()
+                                        WHERE project_id = %s AND agent_key = %s AND service_name = %s AND node_task_id = %s
+                                        """ if self.db_manager.db_type == 'mysql' else
+                                        f"""
+                                        UPDATE {table_name}
+                                        SET status = ?, node_snapshot_json = ?, updated_at = ?
+                                        WHERE project_id = ? AND agent_key = ? AND service_name = ? AND node_task_id = ?
+                                        """,
+                                        (
+                                            str(task.get('status') or 'unknown'),
+                                            json.dumps(task, ensure_ascii=False),
+                                            project_id,
+                                            agent_key,
+                                            service_name,
+                                            node_task_id,
+                                        ) if self.db_manager.db_type == 'mysql' else
+                                        (
+                                            str(task.get('status') or 'unknown'),
+                                            json.dumps(task, ensure_ascii=False),
+                                            datetime.now().isoformat(),
+                                            project_id,
+                                            agent_key,
+                                            service_name,
+                                            node_task_id,
+                                        )
+                                    )
+                                items.append({
+                                    'agent_key': agent_key,
+                                    'service_name': service_name,
+                                    'node_task_id': node_task_id or task.get('task_id'),
+                                    'task': task,
+                                })
+                        except Exception as exc:
+                            errors.append({'agent_key': agent_key, 'service_name': service_name, 'error': str(exc)})
+                    return jsonify({
+                        'project_id': project_id,
+                        'total_nodes': len(selected_services),
+                        'total_tasks': len(items),
+                        'items': items,
+                        'errors': errors,
+                    })
+
+                payload = request.get_json(silent=True) or {}
+                project_id = str(payload.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                task_ids = payload.get('task_ids') if isinstance(payload.get('task_ids'), list) else []
+                include_running = bool(payload.get('include_running', False))
+                target_agents = payload.get('agent_keys') if isinstance(payload.get('agent_keys'), list) else []
+                requested_keys = {str(item).strip() for item in target_agents if str(item).strip()}
+                services = self._list_process_monitor_services(project_id, include_stale=False)
+                if requested_keys:
+                    services = [item for item in services if str(item.get('agent_key') or '') in requested_keys]
+                dedup_map: Dict[str, Dict[str, Any]] = {}
+                for item in services:
+                    key = str(item.get('agent_key') or '')
+                    if not key:
+                        continue
+                    prev = dedup_map.get(key)
+                    if prev is None or str(item.get('last_seen_at') or '') > str(prev.get('last_seen_at') or ''):
+                        dedup_map[key] = item
+                selected_services = list(dedup_map.values())
+                outputs: List[Dict[str, Any]] = []
+                for svc in selected_services:
+                    agent_key = str(svc.get('agent_key') or '')
+                    service_name = str(svc.get('service_name') or '')
+                    try:
+                        node_data, status_code, _ = self._call_process_monitor_api(
+                            project_id,
+                            agent_key,
+                            service_name,
+                            'DELETE',
+                            '/api/sync/tasks',
+                            {
+                                'task_ids': [str(item) for item in task_ids],
+                                'include_running': include_running,
+                            },
+                            timeout=(5, 30),
+                        )
+                        outputs.append({
+                            'agent_key': agent_key,
+                            'service_name': service_name,
+                            'status_code': status_code,
+                            'result': node_data,
+                        })
+                        deleted_task_ids = node_data.get('deleted_task_ids') if isinstance(node_data, dict) else []
+                        if status_code < 300 and isinstance(deleted_task_ids, list):
+                            table_name = self.db_manager.get_table_name('process_sync_logs')
+                            for node_task_id in [str(item).strip() for item in deleted_task_ids if str(item).strip()]:
+                                self.db_manager.execute_query(
+                                    f"""
+                                    UPDATE {table_name}
+                                    SET status = %s, message = %s, updated_at = NOW()
+                                    WHERE project_id = %s AND agent_key = %s AND service_name = %s AND node_task_id = %s
+                                    """ if self.db_manager.db_type == 'mysql' else
+                                    f"""
+                                    UPDATE {table_name}
+                                    SET status = ?, message = ?, updated_at = ?
+                                    WHERE project_id = ? AND agent_key = ? AND service_name = ? AND node_task_id = ?
+                                    """,
+                                    ('cleared', 'cleared from live node', project_id, agent_key, service_name, node_task_id)
+                                    if self.db_manager.db_type == 'mysql' else
+                                    ('cleared', 'cleared from live node', datetime.now().isoformat(), project_id, agent_key, service_name, node_task_id)
+                                )
+                    except Exception as exc:
+                        outputs.append({
+                            'agent_key': agent_key,
+                            'service_name': service_name,
+                            'status_code': 500,
+                            'result': {'error': str(exc)},
+                        })
+                return jsonify({'project_id': project_id, 'total_nodes': len(selected_services), 'results': outputs})
+            except Exception as e:
+                self.logger.error(f"处理process-monitor实时任务失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/sync/tasks/live/<agent_key>/<service_name>/<task_id>', methods=['GET'])
+        def process_monitor_sync_live_task_detail(agent_key, service_name, task_id):
+            try:
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                task_data, task_status, _ = self._call_process_monitor_api(
+                    project_id, agent_key, service_name, 'GET', f'/api/sync/tasks/{quote(task_id, safe="")}', None, timeout=(5, 30)
+                )
+                progress_data, progress_status, _ = self._call_process_monitor_api(
+                    project_id, agent_key, service_name, 'GET', f'/api/sync/tasks/{quote(task_id, safe="")}/progress', None, timeout=(5, 30)
+                )
+                events_data, events_status, _ = self._call_process_monitor_api(
+                    project_id, agent_key, service_name, 'GET', f'/api/sync/tasks/{quote(task_id, safe="")}/events', None, timeout=(5, 30)
+                )
+                results_data, results_status, _ = self._call_process_monitor_api(
+                    project_id, agent_key, service_name, 'GET', f'/api/sync/tasks/{quote(task_id, safe="")}/results', None, timeout=(5, 30)
+                )
+                status_code = max(task_status, progress_status, events_status, results_status)
+                return jsonify({
+                    'project_id': project_id,
+                    'agent_key': agent_key,
+                    'service_name': service_name,
+                    'task_id': task_id,
+                    'task': task_data,
+                    'progress': progress_data,
+                    'events': events_data,
+                    'results': results_data,
+                }), status_code
+            except Exception as e:
+                self.logger.error(f"查询process-monitor实时任务详情失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/ai-helpers', methods=['GET'])
