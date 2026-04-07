@@ -1693,6 +1693,19 @@ class WebAPIServer:
             return '__file__sync__'
         return text
 
+    def _resolve_process_monitor_fileserver_base_url(self) -> str:
+        configured = str(self.config.get('process_monitor_fileserver_base_url') or '').strip()
+        if configured:
+            return configured.rstrip('/')
+        service_name = str(self.config.get('process_monitor_fileserver_service_name') or 'secflow-platform-fileserver').strip() or 'secflow-platform-fileserver'
+        namespace = (
+            str(os.environ.get('PROCESS_MONITOR_FILESERVER_NAMESPACE') or '').strip()
+            or str(os.environ.get('POD_NAMESPACE') or '').strip()
+            or str(os.environ.get('K8S_NAMESPACE') or '').strip()
+            or 'default'
+        )
+        return f"http://{service_name}.{namespace}.svc.cluster.local/api/fileserver"
+
     def _normalize_process_monitor_public_path(self, value: Any) -> Any:
         text = str(value or '')
         if not text:
@@ -2914,13 +2927,13 @@ class WebAPIServer:
 
         begin = time.time()
         status_code, response = self.agent_manager.call_agent_api(
-            agent.key, 'GET', '/api/services', timeout_type='proxy', log_connection_error=False
+            agent.key, 'GET', '/api/services?refresh=1', timeout_type='proxy', log_connection_error=False
         )
         # 对节点 API 的瞬时连接抖动做一次轻量重试，避免前端在线状态频繁抖动。
         if status_code in (503, 504):
             time.sleep(0.2)
             retry_status, retry_response = self.agent_manager.call_agent_api(
-                agent.key, 'GET', '/api/services', timeout_type='proxy', log_connection_error=False
+                agent.key, 'GET', '/api/services?refresh=1', timeout_type='proxy', log_connection_error=False
             )
             if retry_status == 200:
                 status_code, response = retry_status, retry_response
@@ -2976,6 +2989,17 @@ class WebAPIServer:
                 'duration_ms': int((time.time() - begin) * 1000)
             }
 
+        service_names = []
+        try:
+            service_names = [
+                str((item or {}).get('name') or (item or {}).get('service_name') or '').strip()
+                for item in services
+                if isinstance(item, dict)
+            ]
+            service_names = [name for name in service_names if name]
+        except Exception:
+            service_names = []
+
         try:
             seen, upserted = self._upsert_agent_services_snapshot(agent, services, source='pull_force')
             return {
@@ -2983,6 +3007,7 @@ class WebAPIServer:
                 'agent_key': agent.key,
                 'seen': seen,
                 'upserted': upserted,
+                'service_names': service_names,
                 'reason_code': 'success',
                 'reason': '同步成功',
                 'status_code': 200,
@@ -3098,6 +3123,19 @@ class WebAPIServer:
                 f"任务完成后同步服务状态失败: agent={agent_key}, reason={reason}, result={result}"
             )
         return result
+
+    def _mark_service_stale(self, project_id: str, agent_key: str, service_name: str):
+        table_name = self.db_manager.get_table_name('agent_services')
+        if self.db_manager.db_type == 'mysql':
+            self.db_manager.execute_query(
+                f"UPDATE {table_name} SET is_stale = 1, updated_at = NOW() WHERE project_id = %s AND agent_key = %s AND service_name = %s",
+                (project_id, agent_key, service_name)
+            )
+        else:
+            self.db_manager.execute_query(
+                f"UPDATE {table_name} SET is_stale = 1, updated_at = datetime('now') WHERE project_id = ? AND agent_key = ? AND service_name = ?",
+                (project_id, agent_key, service_name)
+            )
 
     def _service_exists_on_agent(self, agent_key: str, service_name: str) -> bool:
         """检查Agent上是否已存在同名服务。"""
@@ -4675,10 +4713,25 @@ class WebAPIServer:
                     auth_header=auth_header
                 )
 
+                sync_result = None
                 try:
-                    self._sync_single_agent_services_by_key(agent_key, reason=f'api_delete:{service_name}')
+                    sync_result = self._sync_single_agent_services_by_key(agent_key, reason=f'api_delete:{service_name}')
                 except Exception:
                     self.logger.warning(f"删除服务后同步快照失败: agent={agent_key}, service={service_name}", exc_info=True)
+
+                try:
+                    synced_service_names = set()
+                    if isinstance(sync_result, dict):
+                        names = sync_result.get('service_names')
+                        if isinstance(names, list):
+                            synced_service_names = {str(item).strip() for item in names if str(item).strip()}
+                    if sync_result and sync_result.get('ok') and service_name not in synced_service_names:
+                        self._mark_service_stale(project_id, agent_key, service_name)
+                except Exception:
+                    self.logger.warning(
+                        f"删除服务后执行定向stale收敛失败: project={project_id}, agent={agent_key}, service={service_name}",
+                        exc_info=True
+                    )
 
                 response_status = 200 if len(ingress_cleanup.get('failed', [])) == 0 else 207
                 return jsonify({
@@ -5430,10 +5483,7 @@ class WebAPIServer:
 
                 remote_root_url = str(data.get('remote_root_url') or '').strip()
                 if not remote_root_url:
-                    fileserver_base = str(
-                        self.config.get('process_monitor_fileserver_base_url') or
-                        'http://secflow-platform-fileserver/api/fileserver'
-                    ).rstrip('/')
+                    fileserver_base = self._resolve_process_monitor_fileserver_base_url()
                     subproject_id = self._process_monitor_sync_subproject_id()
                     remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{quote(subproject_id, safe='')}"
                 remote_path_prefix = f"/{agent_key}"
@@ -5546,10 +5596,7 @@ class WebAPIServer:
 
                 remote_root_url = str(data.get('remote_root_url') or '').strip()
                 if not remote_root_url:
-                    fileserver_base = str(
-                        self.config.get('process_monitor_fileserver_base_url') or
-                        'http://secflow-platform-fileserver/api/fileserver'
-                    ).rstrip('/')
+                    fileserver_base = self._resolve_process_monitor_fileserver_base_url()
                     subproject_id = self._process_monitor_sync_subproject_id()
                     remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{quote(subproject_id, safe='')}"
                 remote_path_prefix = f"/{agent_key}"
