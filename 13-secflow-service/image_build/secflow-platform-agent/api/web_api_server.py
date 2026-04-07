@@ -2728,6 +2728,34 @@ class WebAPIServer:
         )
         return any(marker in text for marker in benign_markers)
 
+    def _can_ignore_delete_response(self, status_code: int, payload: Any) -> bool:
+        if status_code in (200, 202, 204, 404):
+            return True
+
+        text_parts: List[str] = []
+        if isinstance(payload, dict):
+            text_parts.extend([
+                str(payload.get('error') or ''),
+                str(payload.get('message') or ''),
+                str(payload.get('detail') or ''),
+            ])
+        elif payload is not None:
+            text_parts.append(str(payload))
+
+        text = ' '.join(text_parts).strip().lower()
+        benign_markers = (
+            'service not found',
+            'no such service',
+            'not found',
+            'already removed',
+            'already deleted',
+            '不存在',
+            '已删除',
+            '已经删除',
+            '未找到',
+        )
+        return any(marker in text for marker in benign_markers)
+
     def _delete_service_bound_ingress_routes(
         self,
         project_id: str,
@@ -4684,7 +4712,7 @@ class WebAPIServer:
                     {},
                     timeout_type='undeploy'
                 )
-                if delete_status_code not in (200, 204, 404):
+                if not self._can_ignore_delete_response(delete_status_code, delete_payload):
                     return jsonify({
                         'error': f'删除服务失败: {service_name}',
                         'code': 'DELETE_SERVICE_FAILED',
