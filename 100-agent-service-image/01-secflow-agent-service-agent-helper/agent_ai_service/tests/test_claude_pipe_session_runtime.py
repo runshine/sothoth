@@ -95,7 +95,7 @@ class ClaudePipeSessionRuntimeTests(unittest.TestCase):
         self.assertIn("hello", merged)
         self.assertIn("world", merged)
 
-    def test_extract_text_from_stream_json_ignores_system_and_thinking(self):
+    def test_extract_text_from_stream_json_ignores_system_and_result(self):
         system_payload = {"type": "system", "subtype": "init", "cwd": "/host"}
         thinking_payload = {
             "type": "assistant",
@@ -104,7 +104,9 @@ class ClaudePipeSessionRuntimeTests(unittest.TestCase):
         result_payload = {"type": "result", "result": "final text"}
 
         self.assertEqual(self.runtime._extract_text_from_stream_json(system_payload), [])
-        self.assertEqual(self.runtime._extract_text_from_stream_json(thinking_payload), [])
+        thinking_fragments = self.runtime._extract_text_from_stream_json(thinking_payload)
+        self.assertTrue(any("internal" in part for part in thinking_fragments))
+        self.assertTrue(any("<reasoning_content>" in part for part in thinking_fragments))
         self.assertEqual(self.runtime._extract_text_from_stream_json(result_payload), [])
 
     @patch("agent_ai_service.services.claude_pipe_session_runtime.subprocess.Popen")
@@ -133,7 +135,9 @@ class ClaudePipeSessionRuntimeTests(unittest.TestCase):
         events = list(self.runtime.invoke_stream(session, self.config, "hi"))
         chunks = [str(event.get("text") or "") for event in events if event.get("type") == "chunk"]
 
-        self.assertEqual(chunks, ["hello"])
+        self.assertEqual(len(chunks), 2)
+        self.assertIn("secret", chunks[0])
+        self.assertIn("hello", chunks[1])
         self.assertTrue(any(event.get("type") == "done" for event in events))
 
     @patch("agent_ai_service.services.claude_pipe_session_runtime.subprocess.Popen")

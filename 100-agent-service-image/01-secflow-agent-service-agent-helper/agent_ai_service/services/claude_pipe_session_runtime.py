@@ -139,8 +139,8 @@ class ClaudePipeSessionRuntime:
             return fragments
 
         event_type = str(payload.get("type") or "").strip().lower()
-        # Claude stream-json emits structured metadata lines (system/result/thinking);
-        # only text-like assistant chunks should reach UI/session messages.
+        # Claude stream-json emits structured metadata lines.
+        # Keep assistant-facing text and thinking, skip pure system/result wrappers.
         if event_type in ("system", "result"):
             return fragments
 
@@ -165,11 +165,15 @@ class ClaudePipeSessionRuntime:
                         text = item.get("text")
                         if isinstance(text, str) and text:
                             fragments.append(text)
+                    elif item_type == "thinking":
+                        thinking = item.get("thinking")
+                        if isinstance(thinking, str) and thinking.strip():
+                            fragments.append(f"\n<reasoning_content>\n{thinking}\n</reasoning_content>\n")
                     elif item_type in ("output_text", "delta"):
                         text = item.get("text") if isinstance(item.get("text"), str) else item.get("delta")
                         if isinstance(text, str) and text:
                             fragments.append(text)
-                    # Deliberately ignore `thinking` and other non-user-facing blocks.
+                    # Ignore other non-user-facing blocks.
 
         return fragments
 
