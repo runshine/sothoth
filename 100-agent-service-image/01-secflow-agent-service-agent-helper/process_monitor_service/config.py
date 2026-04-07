@@ -17,6 +17,8 @@ class Settings:
     state_dir: str = os.getenv('AGENT_HELPER_STATE_DIR', '/app/data')
     host_root: str = os.getenv('HOST_ROOT', '/host')
     proc_root: str = os.getenv('PROCESS_MONITOR_PROC_ROOT', '/host/proc')
+    dns_server: str = os.getenv('DNS_SERVER', '')
+    resolv_conf_path: str = os.getenv('PROCESS_MONITOR_RESOLV_CONF_PATH', '/etc/resolv.conf')
 
 
 settings = Settings()

@@ -34,6 +34,7 @@ services:
       - HOST_ROOT=/host
       - PROCESS_MONITOR_PROC_ROOT=/host/proc
       - CODE_SERVER_PASSWORD=your-password-here  # 建议设置固定密码，留空则自动生成
+      - DNS_SERVER=10.96.0.10
 
     # 端口映射
     ports:

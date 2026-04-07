@@ -40,6 +40,8 @@
   },
   "k8s_service_url": "http://172.31.30.100:10010",
   "k8s_service_timeout_sec": 15,
+  "process_monitor_fileserver_base_url": "",
+  "process_monitor_fileserver_service_name": "secflow-platform-fileserver",
   "agent_api_port": 11197,
   "daemon_api_port": 11188,
   "agent_ttyd_port": 11198,
