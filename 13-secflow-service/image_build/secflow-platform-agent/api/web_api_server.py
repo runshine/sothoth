@@ -1294,6 +1294,80 @@ class WebAPIServer:
     def _has_process_monitor_tag(self, tags: Any) -> bool:
         return 'PROCESS_MONITOR' in self._normalize_service_tags(tags)
 
+    def _load_service_template_tags_map(self, project_id: str) -> Dict[Tuple[str, str], List[str]]:
+        project_id_text = str(project_id or '').strip()
+        if not project_id_text:
+            return {}
+
+        template_table = self.db_manager.get_table_name('service_templates')
+        binding_table = self.db_manager.get_table_name('service_template_bindings')
+
+        template_rows = self.db_manager.fetch_all(
+            f"SELECT id, name, metadata FROM {template_table}",
+            tuple(),
+        ) or []
+
+        tags_by_template_id: Dict[str, List[str]] = {}
+        tags_by_template_name: Dict[str, List[str]] = {}
+        for tpl in template_rows:
+            metadata = tpl.get('metadata')
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except Exception:
+                    metadata = {}
+            elif not isinstance(metadata, dict):
+                metadata = {}
+            template_tags = self._normalize_service_tags((metadata or {}).get('tags'))
+            tpl_id = str(tpl.get('id') or '').strip()
+            tpl_name = str(tpl.get('name') or '').strip()
+            if tpl_id:
+                tags_by_template_id[tpl_id] = template_tags
+            if tpl_name:
+                tags_by_template_name[tpl_name] = template_tags
+
+        binding_rows = self.db_manager.fetch_all(
+            f"""
+            SELECT agent_key, service_name, template_id, template_name
+            FROM {binding_table}
+            WHERE project_id = %s
+            """ if self.db_manager.db_type == 'mysql' else
+            f"""
+            SELECT agent_key, service_name, template_id, template_name
+            FROM {binding_table}
+            WHERE project_id = ?
+            """,
+            (project_id_text,),
+        ) or []
+
+        tags_by_service_key: Dict[Tuple[str, str], List[str]] = {}
+        for binding in binding_rows:
+            agent_key = str(binding.get('agent_key') or '').strip()
+            service_name = str(binding.get('service_name') or '').strip()
+            if not agent_key or not service_name:
+                continue
+            template_id = str(binding.get('template_id') or '').strip()
+            template_name = str(binding.get('template_name') or '').strip()
+            template_tags = tags_by_template_id.get(template_id) or tags_by_template_name.get(template_name) or []
+            tags_by_service_key[(agent_key, service_name)] = self._normalize_service_tags(template_tags)
+        return tags_by_service_key
+
+    def _is_ai_helper_service_row(
+        self,
+        row: Dict[str, Any],
+        template_tags_map: Optional[Dict[Tuple[str, str], List[str]]] = None,
+    ) -> bool:
+        if self._has_ai_helper_tag((row or {}).get('tags_json')):
+            return True
+        project_id = str((row or {}).get('project_id') or '').strip()
+        agent_key = str((row or {}).get('agent_key') or '').strip()
+        service_name = str((row or {}).get('service_name') or '').strip()
+        if not project_id or not agent_key or not service_name:
+            return False
+        effective_map = template_tags_map if template_tags_map is not None else self._load_service_template_tags_map(project_id)
+        template_tags = (effective_map or {}).get((agent_key, service_name)) or []
+        return self._has_ai_helper_tag(template_tags)
+
     def _load_configcenter_payload(self, response: requests.Response) -> Dict[str, Any]:
         try:
             payload = response.json() if response.content else {}
@@ -1778,7 +1852,7 @@ class WebAPIServer:
         )
         if not row:
             return None
-        if not self._has_ai_helper_tag(row.get('tags_json')):
+        if not self._is_ai_helper_service_row(row):
             return None
         return row
 
@@ -2230,13 +2304,18 @@ class WebAPIServer:
         total = 0
         success = 0
         failed = 0
+        template_tags_map_by_project: Dict[str, Dict[Tuple[str, str], List[str]]] = {}
         for row in rows:
             project_id = str(row.get('project_id') or '').strip()
             agent_key = str(row.get('agent_key') or '').strip()
             service_name = str(row.get('service_name') or '').strip()
             if not project_id or not agent_key or not service_name:
                 continue
-            if not self._has_ai_helper_tag(row.get('tags_json')):
+            template_tags_map = template_tags_map_by_project.get(project_id)
+            if template_tags_map is None:
+                template_tags_map = self._load_service_template_tags_map(project_id)
+                template_tags_map_by_project[project_id] = template_tags_map
+            if not self._is_ai_helper_service_row(row, template_tags_map):
                 continue
             total += 1
             try:
@@ -6148,13 +6227,14 @@ class WebAPIServer:
                     """,
                     (project_id,)
                 ) or []
+                template_tags_map = self._load_service_template_tags_map(project_id)
                 health_map = self._get_ai_helper_health_snapshot_map(project_id)
 
                 items = []
                 for row in rows:
                     if target_agent_key and str(row.get('agent_key') or '').strip() != target_agent_key:
                         continue
-                    if not self._has_ai_helper_tag(row.get('tags_json')):
+                    if not self._is_ai_helper_service_row(row, template_tags_map):
                         continue
                     helper_key = (
                         str(row.get('agent_key') or '').strip(),
@@ -6224,6 +6304,7 @@ class WebAPIServer:
                     """,
                     (project_id,)
                 ) or []
+                template_tags_map = self._load_service_template_tags_map(project_id)
                 health_map = self._get_ai_helper_health_snapshot_map(project_id)
 
                 items = []
@@ -6231,10 +6312,14 @@ class WebAPIServer:
                     helper_agent_key = str(row.get('agent_key') or '').strip()
                     helper_service_name = str(row.get('service_name') or '').strip()
                     helper_tags = self._normalize_service_tags(row.get('tags_json'))
+                    template_tags = self._normalize_service_tags(
+                        (template_tags_map or {}).get((helper_agent_key, helper_service_name)) or []
+                    )
+                    helper_effective_tags = self._normalize_service_tags(helper_tags + template_tags)
 
                     if target_agent_key and helper_agent_key != target_agent_key:
                         continue
-                    if not self._has_ai_helper_tag(helper_tags):
+                    if not self._has_ai_helper_tag(helper_effective_tags):
                         continue
 
                     snapshot = health_map.get((helper_agent_key, helper_service_name)) or {
@@ -6288,7 +6373,8 @@ class WebAPIServer:
                             'image': row.get('image') or '',
                             'status': row.get('status') or 'unknown',
                             'health_status': helper_health_status,
-                            'helper_tags': helper_tags,
+                            'helper_tags': helper_effective_tags,
+                            'helper_template_tags': template_tags,
                             'helper_health': helper_health_payload,
                             'health_checked_at': helper_health_checked_at,
                             'health_source': 'snapshot',
@@ -6933,8 +7019,9 @@ class WebAPIServer:
                     """,
                     (project_id,)
                 ) or []
+                template_tags_map = self._load_service_template_tags_map(project_id)
 
-                helper_rows = [row for row in rows if self._has_ai_helper_tag(row.get('tags_json'))]
+                helper_rows = [row for row in rows if self._is_ai_helper_service_row(row, template_tags_map)]
 
                 items: List[Dict[str, Any]] = []
                 helper_unreachable: List[Dict[str, Any]] = []
@@ -7303,6 +7390,7 @@ class WebAPIServer:
                     f"SELECT service_uid, project_id, agent_key, agent_hostname, agent_ip, service_name, image, status, tags_json, ports_json, raw_json, source, is_stale, first_seen_at, last_seen_at, updated_at FROM {table_name} WHERE project_id = ? AND is_stale = 0",
                     (project_id,)
                 ) or []
+                template_tags_map = self._load_service_template_tags_map(project_id)
                 requested_helpers = payload.get('helpers') or []
                 requested_map = {
                     f"{str(item.get('agent_key') or '').strip()}::{str(item.get('service_name') or '').strip()}": item
@@ -7311,7 +7399,7 @@ class WebAPIServer:
 
                 helper_rows = []
                 for row in rows:
-                    if not self._has_ai_helper_tag(row.get('tags_json')):
+                    if not self._is_ai_helper_service_row(row, template_tags_map):
                         continue
                     key = f"{str(row.get('agent_key') or '').strip()}::{str(row.get('service_name') or '').strip()}"
                     if requested_map and key not in requested_map:
