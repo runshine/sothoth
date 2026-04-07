@@ -95,6 +95,47 @@ class ClaudePipeSessionRuntimeTests(unittest.TestCase):
         self.assertIn("hello", merged)
         self.assertIn("world", merged)
 
+    def test_extract_text_from_stream_json_ignores_system_and_thinking(self):
+        system_payload = {"type": "system", "subtype": "init", "cwd": "/host"}
+        thinking_payload = {
+            "type": "assistant",
+            "message": {"content": [{"type": "thinking", "thinking": "internal"}]},
+        }
+        result_payload = {"type": "result", "result": "final text"}
+
+        self.assertEqual(self.runtime._extract_text_from_stream_json(system_payload), [])
+        self.assertEqual(self.runtime._extract_text_from_stream_json(thinking_payload), [])
+        self.assertEqual(self.runtime._extract_text_from_stream_json(result_payload), [])
+
+    @patch("agent_ai_service.services.claude_pipe_session_runtime.subprocess.Popen")
+    def test_invoke_stream_emits_only_user_facing_text(self, popen_mock):
+        session = {
+            "session_id": "s-4",
+            "backend": "claude",
+            "vendor_session_id": "v-4",
+            "vendor_session_initialized": True,
+        }
+        self.session_store.patch.side_effect = lambda sid, payload: {**session, **payload}
+        process = Mock()
+        process.stdout = io.StringIO(
+            "\n".join([
+                '{"type":"system","subtype":"init"}',
+                '{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"secret"}]}}',
+                '{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}',
+                '{"type":"result","subtype":"success","result":"hello"}',
+            ]) + "\n"
+        )
+        process.stderr = io.StringIO("")
+        process.wait.return_value = 0
+        process.poll.return_value = 0
+        popen_mock.return_value = process
+
+        events = list(self.runtime.invoke_stream(session, self.config, "hi"))
+        chunks = [str(event.get("text") or "") for event in events if event.get("type") == "chunk"]
+
+        self.assertEqual(chunks, ["hello"])
+        self.assertTrue(any(event.get("type") == "done" for event in events))
+
     @patch("agent_ai_service.services.claude_pipe_session_runtime.subprocess.Popen")
     def test_invoke_stream_includes_verbose_flag(self, popen_mock):
         session = {

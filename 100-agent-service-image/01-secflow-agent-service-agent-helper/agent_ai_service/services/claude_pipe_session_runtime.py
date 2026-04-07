@@ -135,45 +135,42 @@ class ClaudePipeSessionRuntime:
     def _extract_text_from_stream_json(payload: Any) -> list[str]:
         fragments: list[str] = []
 
-        def walk(node: Any) -> None:
-            if isinstance(node, str):
-                return
-            if isinstance(node, list):
-                for item in node:
-                    walk(item)
-                return
-            if not isinstance(node, dict):
-                return
+        if not isinstance(payload, dict):
+            return fragments
 
-            # Common shapes from Claude stream-json and message chunk payloads.
-            text_value = node.get("text")
-            if isinstance(text_value, str) and text_value:
-                fragments.append(text_value)
-            delta_value = node.get("delta")
-            if isinstance(delta_value, str) and delta_value:
-                fragments.append(delta_value)
-            elif isinstance(delta_value, dict):
-                delta_text = delta_value.get("text")
-                if isinstance(delta_text, str) and delta_text:
-                    fragments.append(delta_text)
-            message = node.get("message")
-            if isinstance(message, dict):
-                walk(message)
-            content = node.get("content")
+        event_type = str(payload.get("type") or "").strip().lower()
+        # Claude stream-json emits structured metadata lines (system/result/thinking);
+        # only text-like assistant chunks should reach UI/session messages.
+        if event_type in ("system", "result"):
+            return fragments
+
+        # Anthropic/OpenAI-like delta payloads.
+        delta_value = payload.get("delta")
+        if isinstance(delta_value, dict):
+            delta_text = delta_value.get("text")
+            if isinstance(delta_text, str) and delta_text:
+                fragments.append(delta_text)
+        elif isinstance(delta_value, str) and delta_value and event_type in ("content_block_delta",):
+            fragments.append(delta_value)
+
+        message = payload.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
             if isinstance(content, list):
                 for item in content:
-                    if isinstance(item, dict):
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("type") or "").strip().lower()
+                    if item_type == "text":
                         text = item.get("text")
                         if isinstance(text, str) and text:
                             fragments.append(text)
-                        delta = item.get("delta")
-                        if isinstance(delta, str) and delta:
-                            fragments.append(delta)
-            output = node.get("output")
-            if isinstance(output, str) and output:
-                fragments.append(output)
+                    elif item_type in ("output_text", "delta"):
+                        text = item.get("text") if isinstance(item.get("text"), str) else item.get("delta")
+                        if isinstance(text, str) and text:
+                            fragments.append(text)
+                    # Deliberately ignore `thinking` and other non-user-facing blocks.
 
-        walk(payload)
         return fragments
 
     def _record_vendor_state(
@@ -308,8 +305,7 @@ class ClaudePipeSessionRuntime:
                         if fragments:
                             for text in fragments:
                                 yield {"type": "chunk", "source": "stdout", "text": text}
-                        else:
-                            yield {"type": "chunk", "source": "stdout", "text": stripped}
+                        # JSON line parsed but produced no user-facing text; skip it.
                     except json.JSONDecodeError:
                         yield {"type": "chunk", "source": "stdout", "text": raw_line}
 
