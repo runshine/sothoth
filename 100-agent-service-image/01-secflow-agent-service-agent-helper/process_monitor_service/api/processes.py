@@ -6,9 +6,11 @@ import psutil
 
 from process_monitor_service.services.process_service import process_service
 from process_monitor_service.services.file_collectors import FileCollectorService
+from process_monitor_service.services.path_mapper import HostPathMapper
 
 bp = Blueprint('processes', __name__)
 collector_service = FileCollectorService()
+path_mapper = HostPathMapper()
 
 
 def _json_error(message: str, status: int = 400):
@@ -168,7 +170,12 @@ def get_filesystem_tree():
     if not raw_path.startswith('/'):
         return _json_error('path_must_be_absolute', 400)
 
-    fs_path = os.path.normpath(raw_path)
+    try:
+        canonical_path = path_mapper.canonicalize_input_path(raw_path)
+        fs_path = path_mapper.to_real_path(canonical_path)
+    except ValueError as exc:
+        return _json_error(str(exc), 400)
+
     if not os.path.exists(fs_path):
         return _json_error('path_not_found', 404)
     if not os.path.isdir(fs_path):
@@ -199,7 +206,7 @@ def get_filesystem_tree():
                         has_children = False
                 items.append({
                     'name': name,
-                    'path': entry_path,
+                    'path': path_mapper.to_host_path(entry_path),
                     'type': node_type,
                     'has_children': has_children,
                 })
@@ -211,7 +218,7 @@ def get_filesystem_tree():
         return _json_error(str(exc), 500)
 
     return jsonify({
-        'path': fs_path,
+        'path': canonical_path,
         'total': len(items),
         'items': items,
         'truncated': len(items) >= limit,

@@ -9,31 +9,31 @@ import psutil
 
 from process_monitor_service.config import settings
 from process_monitor_service.models.sync_models import SyncFileCandidate
+from process_monitor_service.services.path_mapper import HostPathMapper
 
 
 class HostPathResolver:
     def __init__(self) -> None:
         self.host_root = Path(settings.host_root)
         self.proc_root = Path(settings.proc_root)
+        self.mapper = HostPathMapper()
 
     def to_real_path(self, host_path: str) -> str:
-        if not host_path.startswith('/'):
-            raise ValueError(f'host_path_must_be_absolute: {host_path}')
-        return str((self.host_root / host_path.lstrip('/')).resolve(strict=False))
+        return self.mapper.to_real_path(host_path)
+
+    def to_host_path(self, real_path: str) -> str:
+        return self.mapper.to_host_path(real_path)
 
     def to_relative_path(self, host_path: str) -> str:
-        if not host_path.startswith('/'):
-            raise ValueError(f'host_path_must_be_absolute: {host_path}')
-        return host_path
+        return self.mapper.canonicalize_input_path(host_path)
 
     def validate_host_path(self, host_path: str) -> str:
-        if not host_path or not host_path.startswith('/'):
-            raise ValueError(f'invalid_host_path: {host_path}')
-        real_path = self.to_real_path(host_path)
-        host_root_real = str(self.host_root.resolve(strict=False))
-        if not real_path.startswith(host_root_real.rstrip('/') + '/') and real_path != host_root_real:
-            raise ValueError(f'path_escapes_host_root: {host_path}')
+        canonical = self.mapper.canonicalize_input_path(host_path)
+        real_path = self.to_real_path(canonical)
         return real_path
+
+    def canonicalize_host_path(self, host_path: str) -> str:
+        return self.mapper.canonicalize_input_path(host_path)
 
 
 class FileCollectorService:
@@ -43,11 +43,12 @@ class FileCollectorService:
     def collect_from_paths(self, paths: list[str]) -> tuple[list[SyncFileCandidate], list[dict[str, Any]]]:
         candidates: dict[str, SyncFileCandidate] = {}
         issues: list[dict[str, Any]] = []
-        for host_path in paths:
+        for raw_path in paths:
             try:
+                host_path = self.resolver.canonicalize_host_path(raw_path)
                 real_path = self.resolver.validate_host_path(host_path)
             except ValueError as exc:
-                issues.append({'path': host_path, 'reason': str(exc), 'status': 'failed'})
+                issues.append({'path': str(raw_path), 'reason': str(exc), 'status': 'failed'})
                 continue
             self._collect_path_recursive(host_path, real_path, candidates, issues, ref_path=host_path)
         return list(candidates.values()), issues
@@ -120,8 +121,8 @@ class FileCollectorService:
             return
         if path_obj.is_dir() and not path_obj.is_symlink():
             for child in sorted(path_obj.iterdir(), key=lambda item: item.name):
-                child_host = os.path.join(host_path.rstrip('/'), child.name)
                 child_real = str(child)
+                child_host = self.resolver.to_host_path(child_real)
                 self._collect_path_recursive(child_host, child_real, candidates, issues, ref_path=ref_path)
             return
         stat_info = self._stat_path(real_path)
@@ -201,7 +202,8 @@ class FileCollectorService:
             real_path = self.resolver.validate_host_path(host_path)
         except ValueError as exc:
             return {'skip_reason': str(exc), 'evidence': evidence}
-        return {'host_path': host_path, 'real_path': real_path, 'evidence': evidence}
+        canonical_host = self.resolver.canonicalize_host_path(host_path)
+        return {'host_path': canonical_host, 'real_path': real_path, 'evidence': evidence}
 
     def _stat_path(self, real_path: str) -> dict[str, Any]:
         path_obj = Path(real_path)

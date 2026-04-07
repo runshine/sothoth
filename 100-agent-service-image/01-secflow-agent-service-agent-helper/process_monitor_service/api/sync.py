@@ -3,12 +3,21 @@ from __future__ import annotations
 from flask import Blueprint, jsonify, request
 
 from process_monitor_service.services.sync_runtime import sync_task_service
+from process_monitor_service.services.path_mapper import HostPathMapper
 
 bp = Blueprint('sync', __name__)
+path_mapper = HostPathMapper()
 
 
 def _json_error(message: str, status: int = 400):
     return jsonify({'status': 'error', 'error': message}), status
+
+
+def _normalize_paths(items: list[str]) -> list[str]:
+    normalized: list[str] = []
+    for raw in items:
+        normalized.append(path_mapper.canonicalize_input_path(str(raw)))
+    return normalized
 
 
 @bp.post('/api/sync/tasks')
@@ -35,10 +44,14 @@ def create_task():
         paths = payload.get('paths') or []
         if not isinstance(paths, list) or not paths:
             return _json_error('paths_required')
+        try:
+            normalized_paths = _normalize_paths([str(item) for item in paths])
+        except ValueError as exc:
+            return _json_error(str(exc), 400)
         task = sync_task_service.create_task(
             mode,
             remote_root_url,
-            paths=[str(item) for item in paths],
+            paths=normalized_paths,
             remote_path_prefix=remote_path_prefix,
         )
     return jsonify(task), 202
@@ -71,10 +84,11 @@ def preview_task():
             paths = payload.get('paths') or []
             if not isinstance(paths, list) or not paths:
                 return _json_error('paths_required')
+            normalized_paths = _normalize_paths([str(item) for item in paths])
             result = sync_task_service.preview_sync(
                 mode=mode,
                 remote_root_url=remote_root_url,
-                paths=[str(item) for item in paths],
+                paths=normalized_paths,
                 remote_path_prefix=remote_path_prefix,
                 preview_limit=preview_limit,
             )

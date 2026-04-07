@@ -1678,6 +1678,61 @@ class WebAPIServer:
         except Exception:
             return 20004
 
+    def _process_monitor_host_root(self) -> str:
+        text = str(self.config.get('process_monitor_host_root', '/host') or '/host').strip()
+        if not text.startswith('/'):
+            text = '/' + text.lstrip('/')
+        return text.rstrip('/') or '/host'
+
+    def _normalize_process_monitor_public_path(self, value: Any) -> Any:
+        text = str(value or '')
+        if not text:
+            return value
+        suffix = ''
+        if text.endswith(' (deleted)'):
+            suffix = ' (deleted)'
+            text = text[:-10]
+        if not text.startswith('/'):
+            return value
+        normalized = os.path.normpath(text)
+        host_root = self._process_monitor_host_root()
+        if normalized == host_root:
+            normalized = '/'
+        elif normalized.startswith(host_root + '/'):
+            rel = normalized[len(host_root) + 1:].lstrip('/')
+            normalized = '/' + rel if rel else '/'
+        if not normalized.startswith('/'):
+            normalized = '/' + normalized.lstrip('/')
+        return f'{normalized}{suffix}'
+
+    def _canonicalize_process_monitor_input_path(self, value: Any) -> str:
+        text = str(value or '').strip()
+        if not text.startswith('/'):
+            raise ValueError(f'path_must_be_absolute: {value}')
+        normalized = self._normalize_process_monitor_public_path(text)
+        if not str(normalized).startswith('/'):
+            raise ValueError(f'path_must_be_absolute: {value}')
+        return str(normalized)
+
+    def _normalize_process_monitor_payload_paths(self, node: Any, key_name: str = '') -> Any:
+        if isinstance(node, dict):
+            return {key: self._normalize_process_monitor_payload_paths(value, str(key)) for key, value in node.items()}
+        if isinstance(node, list):
+            if key_name == 'paths':
+                normalized_paths: List[Any] = []
+                for item in node:
+                    if isinstance(item, str) and item.startswith('/'):
+                        normalized_paths.append(self._normalize_process_monitor_public_path(item))
+                    else:
+                        normalized_paths.append(item)
+                return normalized_paths
+            return [self._normalize_process_monitor_payload_paths(item, key_name) for item in node]
+        if isinstance(node, str) and key_name in {
+            'path', 'source_path', 'relative_path', 'host_path', 'procfs_root', 'cwd', 'exe', 'target', 'symlink_target'
+        }:
+            return self._normalize_process_monitor_public_path(node)
+        return node
+
     def _get_ai_helper_service_row(self, project_id: str, agent_key: str, service_name: str) -> Optional[Dict[str, Any]]:
         table_name = self.db_manager.get_table_name('agent_services')
         row = self.db_manager.fetch_one(
@@ -5261,7 +5316,7 @@ class WebAPIServer:
                     None,
                     timeout=(5, 30),
                 )
-                payload = data if isinstance(data, dict) else {}
+                payload = self._normalize_process_monitor_payload_paths(data if isinstance(data, dict) else {})
                 payload['service_name'] = row.get('service_name')
                 payload['agent_key'] = row.get('agent_key')
                 return jsonify(payload), status_code
@@ -5286,7 +5341,7 @@ class WebAPIServer:
                     None,
                     timeout=(5, 30),
                 )
-                payload = data if isinstance(data, dict) else {}
+                payload = self._normalize_process_monitor_payload_paths(data if isinstance(data, dict) else {})
                 payload['service_name'] = row.get('service_name')
                 payload['agent_key'] = row.get('agent_key')
                 return jsonify(payload), status_code
@@ -5302,7 +5357,8 @@ class WebAPIServer:
                 project_id = str(request.args.get('project_id') or '').strip()
                 if not project_id:
                     return jsonify({'error': 'project_id is required'}), 400
-                path = str(request.args.get('path') or '/').strip() or '/'
+                raw_path = str(request.args.get('path') or '/').strip() or '/'
+                path = self._canonicalize_process_monitor_input_path(raw_path)
                 include_hidden = str(request.args.get('include_hidden') or 'false').strip().lower() == 'true'
                 try:
                     limit = int(request.args.get('limit') or 500)
@@ -5322,12 +5378,15 @@ class WebAPIServer:
                     None,
                     timeout=(5, 30),
                 )
-                payload = data if isinstance(data, dict) else {}
+                payload = self._normalize_process_monitor_payload_paths(data if isinstance(data, dict) else {})
                 payload['service_name'] = row.get('service_name')
                 payload['agent_key'] = row.get('agent_key')
                 return jsonify(payload), status_code
             except ValueError as exc:
-                return jsonify({'error': str(exc)}), 404
+                error_text = str(exc)
+                if error_text.startswith('path_must_be_absolute'):
+                    return jsonify({'error': error_text}), 400
+                return jsonify({'error': error_text}), 404
             except Exception as e:
                 self.logger.error(f"查询节点文件系统树失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
@@ -5378,7 +5437,7 @@ class WebAPIServer:
                 if mode == 'pid_files':
                     payload['pids'] = [int(item) for item in (data.get('pids') or [])]
                 else:
-                    payload['paths'] = [str(item) for item in (data.get('paths') or [])]
+                    payload['paths'] = [self._canonicalize_process_monitor_input_path(item) for item in (data.get('paths') or [])]
 
                 node_resp, status_code, _ = self._call_process_monitor_api(
                     project_id,
@@ -5392,7 +5451,7 @@ class WebAPIServer:
                 if status_code >= 300:
                     return jsonify(node_resp if isinstance(node_resp, dict) else {'error': 'upstream_error'}), status_code
 
-                node_payload = node_resp if isinstance(node_resp, dict) else {}
+                node_payload = self._normalize_process_monitor_payload_paths(node_resp if isinstance(node_resp, dict) else {})
                 platform_sync_id = self._record_process_sync_log(
                     project_id=project_id,
                     agent_key=agent_key,
@@ -5413,7 +5472,10 @@ class WebAPIServer:
                     'remote_path_prefix': remote_path_prefix,
                 }), 202
             except ValueError as exc:
-                return jsonify({'error': str(exc)}), 404
+                error_text = str(exc)
+                if error_text.startswith('path_must_be_absolute'):
+                    return jsonify({'error': error_text}), 400
+                return jsonify({'error': error_text}), 404
             except Exception as e:
                 self.logger.error(f"创建process-monitor同步任务失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
@@ -5466,7 +5528,7 @@ class WebAPIServer:
                 if mode == 'pid_files':
                     payload['pids'] = [int(item) for item in (data.get('pids') or [])]
                 else:
-                    payload['paths'] = [str(item) for item in (data.get('paths') or [])]
+                    payload['paths'] = [self._canonicalize_process_monitor_input_path(item) for item in (data.get('paths') or [])]
 
                 node_resp, status_code, _ = self._call_process_monitor_api(
                     project_id,
@@ -5480,7 +5542,7 @@ class WebAPIServer:
                 if status_code >= 300:
                     return jsonify(node_resp if isinstance(node_resp, dict) else {'error': 'upstream_error'}), status_code
 
-                preview_payload = node_resp if isinstance(node_resp, dict) else {}
+                preview_payload = self._normalize_process_monitor_payload_paths(node_resp if isinstance(node_resp, dict) else {})
                 preview_payload['service_name'] = resolved_service_name
                 preview_payload['agent_key'] = agent_key
                 preview_payload['project_id'] = project_id
@@ -5491,7 +5553,10 @@ class WebAPIServer:
                 }
                 return jsonify(preview_payload)
             except ValueError as exc:
-                return jsonify({'error': str(exc)}), 404
+                error_text = str(exc)
+                if error_text.startswith('path_must_be_absolute'):
+                    return jsonify({'error': error_text}), 400
+                return jsonify({'error': error_text}), 404
             except Exception as e:
                 self.logger.error(f"预览process-monitor同步任务失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500

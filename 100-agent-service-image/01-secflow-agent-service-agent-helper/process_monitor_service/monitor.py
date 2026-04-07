@@ -12,6 +12,7 @@ from typing import Any
 import psutil
 
 from process_monitor_service.config import settings
+from process_monitor_service.services.path_mapper import HostPathMapper
 
 
 class ProcessService:
@@ -51,6 +52,7 @@ class ProcessService:
         self._stop = threading.Event()
         self._snapshot_path = Path(settings.state_dir) / 'process_monitor_snapshot.json'
         self._proc_root = self._resolve_proc_root()
+        self._path_mapper = HostPathMapper()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -105,12 +107,13 @@ class ProcessService:
     def get_process_details(self, pid: int) -> dict[str, Any]:
         proc = psutil.Process(pid)
         procfs_root = self._proc_root / str(pid)
-        return {
+        payload = {
             'pid': pid,
             'process': self._rich_info(proc),
             'procfs_root': str(procfs_root),
             'proc_entries': self._collect_proc_entries(procfs_root),
         }
+        return self._normalize_paths_for_public(payload)
 
     def send_signal(self, *, pids: list[int], signal_value: str | int | None = None, force: bool = False) -> dict[str, Any]:
         resolved_signal = self._resolve_signal(signal_value, force)
@@ -437,3 +440,14 @@ class ProcessService:
             else:
                 items[text] = ''
         return items
+
+    def _normalize_paths_for_public(self, node: Any, key_name: str = '') -> Any:
+        if isinstance(node, dict):
+            return {key: self._normalize_paths_for_public(value, str(key)) for key, value in node.items()}
+        if isinstance(node, list):
+            return [self._normalize_paths_for_public(item, key_name) for item in node]
+        if isinstance(node, str):
+            if key_name in {'path', 'procfs_root', 'cwd', 'exe', 'target', 'symlink_target'}:
+                return self._path_mapper.map_public_path(node)
+            return node
+        return node
