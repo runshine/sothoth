@@ -79,5 +79,6 @@
   "lock_timeout": 30,
   "max_task_logs": 1000,
   "task_log_retention_days": 7,
-  "external_agent_ips": ["172.31.30.100"]
+  "external_agent_ips": ["172.31.30.100"],
+  "process_monitor_fileserver_namespace": "secflow-ns"
 }

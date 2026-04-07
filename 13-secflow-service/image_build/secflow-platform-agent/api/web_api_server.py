@@ -1773,10 +1773,11 @@ class WebAPIServer:
             return configured.rstrip('/')
         service_name = str(self.config.get('process_monitor_fileserver_service_name') or 'secflow-platform-fileserver').strip() or 'secflow-platform-fileserver'
         namespace = (
-            str(os.environ.get('PROCESS_MONITOR_FILESERVER_NAMESPACE') or '').strip()
+            str(self.config.get('process_monitor_fileserver_namespace') or '').strip()
+            or str(os.environ.get('PROCESS_MONITOR_FILESERVER_NAMESPACE') or '').strip()
             or str(os.environ.get('POD_NAMESPACE') or '').strip()
             or str(os.environ.get('K8S_NAMESPACE') or '').strip()
-            or 'default'
+            or 'secflow-ns'
         )
         return f"http://{service_name}.{namespace}.svc.cluster.local/api/fileserver"
 
@@ -6027,6 +6028,7 @@ class WebAPIServer:
                     selected_services = list(dedup_map.values())
                     items: List[Dict[str, Any]] = []
                     errors: List[Dict[str, Any]] = []
+                    table_name = self.db_manager.get_table_name('process_sync_logs')
                     for svc in selected_services:
                         agent_key = str(svc.get('agent_key') or '')
                         service_name = str(svc.get('service_name') or '')
@@ -6079,10 +6081,43 @@ class WebAPIServer:
                                     'agent_key': agent_key,
                                     'service_name': service_name,
                                     'node_task_id': node_task_id or task.get('task_id'),
+                                    'platform_sync_id': None,
+                                    'platform_status': None,
                                     'task': task,
                                 })
                         except Exception as exc:
                             errors.append({'agent_key': agent_key, 'service_name': service_name, 'error': str(exc)})
+                    # Enrich live tasks with platform-side status snapshot.
+                    for item in items:
+                        node_task_id = str(item.get('node_task_id') or '').strip()
+                        agent_key = str(item.get('agent_key') or '').strip()
+                        service_name = str(item.get('service_name') or '').strip()
+                        if not node_task_id or not agent_key or not service_name:
+                            continue
+                        try:
+                            row = self.db_manager.fetch_one(
+                                f"""
+                                SELECT sync_id, status
+                                FROM {table_name}
+                                WHERE project_id = %s AND agent_key = %s AND service_name = %s AND node_task_id = %s
+                                ORDER BY updated_at DESC
+                                LIMIT 1
+                                """ if self.db_manager.db_type == 'mysql' else
+                                f"""
+                                SELECT sync_id, status
+                                FROM {table_name}
+                                WHERE project_id = ? AND agent_key = ? AND service_name = ? AND node_task_id = ?
+                                ORDER BY updated_at DESC
+                                LIMIT 1
+                                """,
+                                (project_id, agent_key, service_name, node_task_id),
+                            ) or {}
+                            if row:
+                                item['platform_sync_id'] = row.get('sync_id')
+                                item['platform_status'] = row.get('status')
+                        except Exception:
+                            # Keep live list resilient even if platform lookup fails.
+                            pass
                     return jsonify({
                         'project_id': project_id,
                         'total_nodes': len(selected_services),
