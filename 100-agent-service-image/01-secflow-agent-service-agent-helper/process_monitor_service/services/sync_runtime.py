@@ -36,16 +36,17 @@ class SyncTaskService:
         mode: str,
         remote_root_url: str,
         *,
+        task_id: str | None = None,
         pids: list[int] | None = None,
         paths: list[str] | None = None,
         source_task_id: str | None = None,
         preset_results: list[dict[str, Any]] | None = None,
         remote_path_prefix: str | None = None,
     ) -> dict[str, Any]:
-        task_id = uuid.uuid4().hex
+        resolved_task_id = str(task_id or '').strip() or uuid.uuid4().hex
         normalized_prefix = self._normalize_remote_prefix(remote_path_prefix)
         task = SyncTask(
-            task_id=task_id,
+            task_id=resolved_task_id,
             mode=mode,
             remote_root_url=remote_root_url,
             status='pending',
@@ -56,11 +57,13 @@ class SyncTaskService:
             remote_path_prefix=normalized_prefix or None,
         )
         with self._lock:
-            self._tasks[task_id] = task.to_dict()
-            self._results.setdefault(task_id, preset_results or [])
+            if resolved_task_id in self._tasks:
+                raise ValueError('task_id_conflict')
+            self._tasks[resolved_task_id] = task.to_dict()
+            self._results.setdefault(resolved_task_id, preset_results or [])
             self._persist_locked()
-            self._queue.put(task_id)
-            return self._tasks[task_id]
+            self._queue.put(resolved_task_id)
+            return self._tasks[resolved_task_id]
 
     def list_tasks(self, status: str | None = None) -> list[dict[str, Any]]:
         with self._lock:

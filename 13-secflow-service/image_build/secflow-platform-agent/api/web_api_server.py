@@ -5437,8 +5437,10 @@ class WebAPIServer:
                     subproject_id = self._process_monitor_sync_subproject_id()
                     remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{quote(subproject_id, safe='')}"
                 remote_path_prefix = f"/{agent_key}"
+                platform_sync_id = uuid.uuid4().hex
 
                 payload = {
+                    'task_id': platform_sync_id,
                     'mode': mode,
                     'remote_root_url': remote_root_url,
                     'remote_path_prefix': remote_path_prefix,
@@ -5461,7 +5463,30 @@ class WebAPIServer:
                     return jsonify(node_resp if isinstance(node_resp, dict) else {'error': 'upstream_error'}), status_code
 
                 node_payload = self._normalize_process_monitor_payload_paths(node_resp if isinstance(node_resp, dict) else {})
-                platform_sync_id = self._record_process_sync_log(
+                node_task_id = str(node_payload.get('task_id') or '').strip()
+                id_consistent = bool(node_task_id) and node_task_id == platform_sync_id
+                if not id_consistent:
+                    self._record_process_sync_log(
+                        project_id=project_id,
+                        agent_key=agent_key,
+                        service_name=resolved_service_name,
+                        mode=mode,
+                        status='failed',
+                        request_payload=payload,
+                        node_task_payload=node_payload,
+                        message='id_mismatch: platform_sync_id and node_task_id are inconsistent',
+                        sync_id=platform_sync_id,
+                    )
+                    return jsonify({
+                        'error': 'id_mismatch',
+                        'sync_id': platform_sync_id,
+                        'node_task_id': node_task_id or None,
+                        'project_id': project_id,
+                        'agent_key': agent_key,
+                        'service_name': resolved_service_name,
+                    }), 502
+
+                self._record_process_sync_log(
                     project_id=project_id,
                     agent_key=agent_key,
                     service_name=resolved_service_name,
@@ -5470,6 +5495,7 @@ class WebAPIServer:
                     request_payload=payload,
                     node_task_payload=node_payload,
                     message='process monitor sync task created',
+                    sync_id=platform_sync_id,
                 )
                 return jsonify({
                     'sync_id': platform_sync_id,
@@ -5635,6 +5661,7 @@ class WebAPIServer:
                             'agent_key': row.get('agent_key'),
                             'service_name': row.get('service_name'),
                             'node_task_id': row.get('node_task_id'),
+                            'id_consistent': bool(str(row.get('sync_id') or '').strip()) and str(row.get('sync_id') or '').strip() == str(row.get('node_task_id') or '').strip(),
                             'mode': row.get('mode'),
                             'status': row.get('status'),
                             'request': request_json if isinstance(request_json, dict) else {},
@@ -5689,6 +5716,138 @@ class WebAPIServer:
                 return jsonify({'project_id': project_id, 'deleted': deleted, 'deleted_sync_ids': to_delete, 'skipped': skipped})
             except Exception as e:
                 self.logger.error(f"处理process-monitor同步历史失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/agent/process-monitor/sync/tasks/history/<sync_id>/detail', methods=['GET'])
+        def process_monitor_sync_history_detail(sync_id):
+            try:
+                sync_id = str(sync_id or '').strip()
+                project_id = str(request.args.get('project_id') or '').strip()
+                if not project_id:
+                    return jsonify({'error': 'project_id is required'}), 400
+                if not sync_id:
+                    return jsonify({'error': 'sync_id is required'}), 400
+
+                table_name = self.db_manager.get_table_name('process_sync_logs')
+                row = self.db_manager.fetch_one(
+                    f"""
+                    SELECT sync_id, project_id, agent_key, service_name, node_task_id,
+                           mode, status, request_json, node_snapshot_json, message, created_at, updated_at
+                    FROM {table_name}
+                    WHERE project_id = %s AND sync_id = %s
+                    """ if self.db_manager.db_type == 'mysql' else
+                    f"""
+                    SELECT sync_id, project_id, agent_key, service_name, node_task_id,
+                           mode, status, request_json, node_snapshot_json, message, created_at, updated_at
+                    FROM {table_name}
+                    WHERE project_id = ? AND sync_id = ?
+                    """,
+                    (project_id, sync_id),
+                ) or {}
+                if not row:
+                    return jsonify({'error': 'sync_task_not_found'}), 404
+
+                request_json = row.get('request_json')
+                if isinstance(request_json, str):
+                    try:
+                        request_json = json.loads(request_json)
+                    except Exception:
+                        request_json = {}
+                node_json = row.get('node_snapshot_json')
+                if isinstance(node_json, str):
+                    try:
+                        node_json = json.loads(node_json)
+                    except Exception:
+                        node_json = {}
+
+                agent_key = str(row.get('agent_key') or '').strip()
+                service_name = str(row.get('service_name') or '').strip()
+                node_task_id = str(row.get('node_task_id') or '').strip()
+                id_consistent = bool(sync_id) and bool(node_task_id) and sync_id == node_task_id
+
+                task_payload: Dict[str, Any] = {}
+                progress_payload: Dict[str, Any] = {}
+                events_payload: Dict[str, Any] = {}
+                results_payload: Dict[str, Any] = {}
+                live_errors: List[Dict[str, Any]] = []
+                if agent_key and service_name and node_task_id:
+                    for part_name, endpoint in [
+                        ('task', f'/api/sync/tasks/{quote(node_task_id, safe="")}'),
+                        ('progress', f'/api/sync/tasks/{quote(node_task_id, safe="")}/progress'),
+                        ('events', f'/api/sync/tasks/{quote(node_task_id, safe="")}/events'),
+                        ('results', f'/api/sync/tasks/{quote(node_task_id, safe="")}/results'),
+                    ]:
+                        try:
+                            payload_data, status_code, _ = self._call_process_monitor_api(
+                                project_id, agent_key, service_name, 'GET', endpoint, None, timeout=(5, 30)
+                            )
+                            normalized_payload = self._normalize_process_monitor_payload_paths(payload_data if isinstance(payload_data, dict) else {})
+                            if status_code >= 300:
+                                live_errors.append({
+                                    'part': part_name,
+                                    'status_code': status_code,
+                                    'error': normalized_payload.get('error') or f'upstream_status_{status_code}',
+                                    'response': normalized_payload,
+                                })
+                            if part_name == 'task':
+                                task_payload = normalized_payload
+                            elif part_name == 'progress':
+                                progress_payload = normalized_payload
+                            elif part_name == 'events':
+                                events_payload = normalized_payload
+                            elif part_name == 'results':
+                                results_payload = normalized_payload
+                        except Exception as exc:
+                            live_errors.append({'part': part_name, 'error': str(exc)})
+                else:
+                    live_errors.append({'part': 'task', 'error': 'missing_agent_service_or_node_task_id'})
+
+                failed_samples: List[Dict[str, Any]] = []
+                results_items = results_payload.get('items') if isinstance(results_payload, dict) else []
+                if isinstance(results_items, list):
+                    for item in results_items:
+                        if isinstance(item, dict) and str(item.get('status') or '').lower() == 'failed':
+                            failed_samples.append({
+                                'item_id': item.get('item_id'),
+                                'source_path': item.get('source_path'),
+                                'relative_path': item.get('relative_path'),
+                                'error': item.get('error') or item.get('reason'),
+                            })
+                            if len(failed_samples) >= 20:
+                                break
+
+                return jsonify({
+                    'project_id': project_id,
+                    'sync_id': sync_id,
+                    'node_task_id': node_task_id or None,
+                    'id_consistent': id_consistent,
+                    'platform': {
+                        'sync_id': row.get('sync_id'),
+                        'project_id': row.get('project_id'),
+                        'agent_key': row.get('agent_key'),
+                        'service_name': row.get('service_name'),
+                        'mode': row.get('mode'),
+                        'status': row.get('status'),
+                        'message': row.get('message'),
+                        'created_at': row.get('created_at'),
+                        'updated_at': row.get('updated_at'),
+                        'request': request_json if isinstance(request_json, dict) else {},
+                        'node_snapshot': node_json if isinstance(node_json, dict) else {},
+                    },
+                    'live': {
+                        'task': task_payload,
+                        'progress': progress_payload,
+                        'events': events_payload,
+                        'results': results_payload,
+                        'errors': live_errors,
+                    },
+                    'failure_summary': {
+                        'failed_count': len(failed_samples),
+                        'failed_samples': failed_samples,
+                    },
+                })
+            except Exception as e:
+                self.logger.error(f"查询process-monitor同步历史详情失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/agent/process-monitor/sync/tasks/live', methods=['GET', 'DELETE'])

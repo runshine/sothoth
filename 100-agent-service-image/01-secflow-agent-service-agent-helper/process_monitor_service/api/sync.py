@@ -26,34 +26,42 @@ def create_task():
     mode = payload.get('mode')
     remote_root_url = (payload.get('remote_root_url') or '').strip()
     remote_path_prefix = payload.get('remote_path_prefix')
+    task_id = str(payload.get('task_id') or '').strip() or None
     if mode not in {'pid_files', 'path_files'}:
         return _json_error('invalid_mode')
     if not remote_root_url.startswith('http://') and not remote_root_url.startswith('https://'):
         return _json_error('invalid_remote_root_url')
-    if mode == 'pid_files':
-        pids = payload.get('pids') or []
-        if not isinstance(pids, list) or not pids:
-            return _json_error('pids_required')
-        task = sync_task_service.create_task(
-            mode,
-            remote_root_url,
-            pids=[int(item) for item in pids],
-            remote_path_prefix=remote_path_prefix,
-        )
-    else:
-        paths = payload.get('paths') or []
-        if not isinstance(paths, list) or not paths:
-            return _json_error('paths_required')
-        try:
-            normalized_paths = _normalize_paths([str(item) for item in paths])
-        except ValueError as exc:
-            return _json_error(str(exc), 400)
-        task = sync_task_service.create_task(
-            mode,
-            remote_root_url,
-            paths=normalized_paths,
-            remote_path_prefix=remote_path_prefix,
-        )
+    try:
+        if mode == 'pid_files':
+            pids = payload.get('pids') or []
+            if not isinstance(pids, list) or not pids:
+                return _json_error('pids_required')
+            task = sync_task_service.create_task(
+                mode,
+                remote_root_url,
+                task_id=task_id,
+                pids=[int(item) for item in pids],
+                remote_path_prefix=remote_path_prefix,
+            )
+        else:
+            paths = payload.get('paths') or []
+            if not isinstance(paths, list) or not paths:
+                return _json_error('paths_required')
+            try:
+                normalized_paths = _normalize_paths([str(item) for item in paths])
+            except ValueError as exc:
+                return _json_error(str(exc), 400)
+            task = sync_task_service.create_task(
+                mode,
+                remote_root_url,
+                task_id=task_id,
+                paths=normalized_paths,
+                remote_path_prefix=remote_path_prefix,
+            )
+    except ValueError as exc:
+        if str(exc) == 'task_id_conflict':
+            return _json_error('task_id_conflict', 409)
+        return _json_error(str(exc), 400)
     return jsonify(task), 202
 
 
