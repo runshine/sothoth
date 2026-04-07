@@ -108,8 +108,8 @@ class PVCConfig(BaseModel):
 
 class IngressConfig(BaseModel):
     """Ingress配置"""
-    base_domain: str = "secmate-ng.sothothv2.com"
-    tls_secret_name: str = "wildcard-secmate-ng.sothothv2.com-tls"
+    base_domain: str = "secmate-ng.ai.icsl.huawei.com"
+    tls_secret_name: str = "wildcard-secflow-tls"
     ingress_class: str = "nginx"
     tls_enabled: bool = True
 

@@ -14,10 +14,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - nacos.sothothv2.com
-      secretName: wildcard-sothothv2.com-tls
+        - nacos.ai.icsl.huawei.com
+      secretName: wildcard-secflow-tls
   rules:
-    - host: nacos.sothothv2.com
+    - host: nacos.ai.icsl.huawei.com
       http:
         paths:
           - path: /

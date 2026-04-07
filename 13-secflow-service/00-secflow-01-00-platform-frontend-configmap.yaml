@@ -67,5 +67,5 @@ data:
     // SecFlow 运行时配置文件
     window.__SECFLOW_CONFIG__ = {
       // 知微平台域名 - 根据实际部署环境修改
-      ZHIWEI_DOMAIN: "https://gaiasec.sothothv2.com"
+      ZHIWEI_DOMAIN: "https://gaiasec.ai.icsl.huawei.com"
     };

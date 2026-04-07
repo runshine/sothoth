@@ -17,10 +17,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - elasticsearch.sothothv2.com
-      secretName: wildcard-sothothv2.com-tls
+        - elasticsearch.ai.icsl.huawei.com
+      secretName: wildcard-secflow-tls
   rules:
-    - host: elasticsearch.sothothv2.com
+    - host: elasticsearch.ai.icsl.huawei.com
       http:
         paths:
           - path: /

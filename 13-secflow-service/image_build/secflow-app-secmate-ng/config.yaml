@@ -7,7 +7,7 @@ app:
   debug: false
   # CORS允许的源列表（生产环境使用，开发模式下自动允许所有源）
   allowed_origins:
-    - "https://secmate-ng.sothothv2.com"
+    - "https://secmate-ng.ai.icsl.huawei.com"
     - "http://localhost:3000"
 
 # 数据库配置 (支持 mysql 和 sqlite)
@@ -70,8 +70,8 @@ pvc:
 
 # Ingress配置
 ingress:
-  base_domain: "secmate-ng.sothothv2.com"
-  tls_secret_name: "wildcard-secmate-ng.sothothv2.com-tls"
+  base_domain: "secmate-ng.ai.icsl.huawei.com"
+  tls_secret_name: "wildcard-secflow-tls"
   ingress_class: "nginx"
   tls_enabled: true
 

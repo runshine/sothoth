@@ -114,9 +114,9 @@ data:
     # Ingress配置
     ingress:
       # 基础域名
-      base_domain: "code-server.sothothv2.com"
+      base_domain: "code-server.ai.icsl.huawei.com"
       # TLS证书Secret名称
-      tls_secret_name: "wildcard-code-server.sothothv2.com-tls"
+      tls_secret_name: "wildcard-secflow-tls"
       # Ingress Class名称
       ingress_class: "nginx"
       # 是否启用TLS

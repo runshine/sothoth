@@ -21,10 +21,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - sothoth.sothothv2.com
-      secretName: wildcard-sothothv2.com-tls
+        - sothoth.ai.icsl.huawei.com
+      secretName: wildcard-secflow-tls
   rules:
-    - host: sothoth.sothothv2.com
+    - host: sothoth.ai.icsl.huawei.com
       http:
         paths:
           - path: /

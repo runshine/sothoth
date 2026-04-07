@@ -57,7 +57,7 @@ dynamic_ingress:
   default_service_port: 80
   default_websocket_enabled: true
   default_tls_enabled: true
-  default_tls_secret_name: "wildcard-code-server.sothothv2.com-tls"
+  default_tls_secret_name: "wildcard-secflow-tls"
   default_proxy_body_size: "32m"
   default_proxy_connect_timeout: 15
   default_proxy_send_timeout: 120

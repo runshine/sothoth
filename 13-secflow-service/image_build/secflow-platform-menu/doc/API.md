@@ -153,7 +153,7 @@ SecFlow Menu Service 是一个动态菜单注册管理微服务，提供服务�
       "api_prefix": "/api/vuln",
       "menu_item_id": "vuln-root",
       "menu_path": "/vuln-overview",
-      "health_url": "http://secflow.sothothv2.com/api/vuln/health",
+      "health_url": "http://secflow.ai.icsl.huawei.com/api/vuln/health",
       "health": {
         "status": "healthy",
         "last_check": 1700000000.123,

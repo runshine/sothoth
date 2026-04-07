@@ -14,10 +14,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - cloudbeaver.sothothv2.com
-      secretName: wildcard-sothothv2.com-tls
+        - cloudbeaver.ai.icsl.huawei.com
+      secretName: wildcard-secflow-tls
   rules:
-    - host: cloudbeaver.sothothv2.com
+    - host: cloudbeaver.ai.icsl.huawei.com
       http:
         paths:
           - path: /

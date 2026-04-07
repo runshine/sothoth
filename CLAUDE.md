@@ -86,7 +86,7 @@ All services connect to:
 
 ### Ingress Routing
 
-All services are exposed via NGINX Ingress with domain `secflow.sothothv2.com`:
+All services are exposed via NGINX Ingress with domain `secflow.ai.icsl.huawei.com`:
 
 ```
 /api/menu      -> secflow-platform-menu:80

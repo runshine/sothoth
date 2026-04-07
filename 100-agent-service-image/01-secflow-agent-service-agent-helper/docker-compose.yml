@@ -1,6 +1,6 @@
 name: secflow-agent-service-agent-helper
 services:
-  remote-debugger:
+  agent-helper:
     # 镜像由 GitHub Actions 自动构建并推送到 GitHub Container Registry
     # 标签策略: latest (最新版) 或 YYYYMMDD (日期标签，如 20260317)
     image: ghcr.io/runshine/secflow-agent-service-agent-helper:latest

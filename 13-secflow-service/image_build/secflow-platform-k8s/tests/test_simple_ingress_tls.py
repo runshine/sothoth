@@ -26,13 +26,13 @@ class SimpleIngressTlsTests(unittest.TestCase):
             path="/",
             path_type="Prefix",
             tls_enabled=True,
-            tls_secret_name="wildcard-code-server.sothothv2.com-tls",
+            tls_secret_name="wildcard-secflow-tls",
         )
 
         manifest = self.captured["manifest"]
         self.assertEqual(manifest["spec"]["rules"][0]["host"], "h.example.local")
         self.assertEqual(manifest["spec"]["tls"][0]["hosts"], ["h.example.local"])
-        self.assertEqual(manifest["spec"]["tls"][0]["secret_name"], "wildcard-code-server.sothothv2.com-tls")
+        self.assertEqual(manifest["spec"]["tls"][0]["secret_name"], "wildcard-secflow-tls")
 
 
 if __name__ == "__main__":

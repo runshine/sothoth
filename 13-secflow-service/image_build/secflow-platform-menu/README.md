@@ -57,7 +57,7 @@ health_scheduler_interval: 5
 health_check_interval: 30
 health_check_timeout: 2.0
 health_failure_threshold: 2
-service_gateway_url: "http://secflow.sothothv2.com"
+service_gateway_url: "http://secflow.ai.icsl.huawei.com"
 log_level: "INFO"
 ```
 

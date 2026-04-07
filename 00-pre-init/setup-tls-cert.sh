@@ -39,7 +39,7 @@ create_ca_certificate() {
 
     # 生成CA自签名证书
     openssl req -new -x509 -days 3650 -key "$CA_KEY" -out "$CA_CRT" \
-        -subj "/C=CN/ST=State/L=City/O=Organization/OU=Unit/CN=sothothv2.com"
+        -subj "/C=CN/ST=State/L=City/O=Organization/OU=Unit/CN=ai.icsl.huawei.com"
 
     echo "CA证书已创建:"
     echo "  - 私钥: $CA_KEY"

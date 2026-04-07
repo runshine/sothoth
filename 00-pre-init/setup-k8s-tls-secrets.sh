@@ -43,14 +43,14 @@ main() {
     echo ""
 
     # 设置第一个域
-    setup_tls_secret "*.sothothv2.com"             "sothothv2-ns" "wildcard-sothothv2.com-tls"
+    setup_tls_secret "*.ai.icsl.huawei.com"             "sothothv2-ns" "wildcard-secflow-tls"
 
-    setup_tls_secret "*.sothothv2.com"             "sothoth" "wildcard-sothothv2.com-tls"
+    setup_tls_secret "*.ai.icsl.huawei.com"             "sothoth" "wildcard-secflow-tls"
 
-    setup_tls_secret "*.sothothv2.com"             "secflow-ns" "wildcard-sothothv2.com-tls"
+    setup_tls_secret "*.ai.icsl.huawei.com"             "secflow-ns" "wildcard-secflow-tls"
 
     # 设置第二个域
-    setup_tls_secret "*.code-server.sothothv2.com" "vscode" "wildcard-code-server.sothothv2.com-tls"
+    setup_tls_secret "*.code-server.ai.icsl.huawei.com" "vscode" "wildcard-secflow-tls"
 
     echo -e "\n=== 设置完成！ ==="
 }

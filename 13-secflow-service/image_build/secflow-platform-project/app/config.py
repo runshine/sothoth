@@ -93,9 +93,9 @@ class K8sServiceConfig(BaseModel):
 
 class TLSSecretConfig(BaseModel):
     """TLS Secret配置"""
-    name: str = "wildcard-sothothv2.com-tls"
+    name: str = "wildcard-secflow-tls"
     source_namespace: str = "secflow-ns"
-    source_secret_name: str = "wildcard-sothothv2.com-tls"
+    source_secret_name: str = "wildcard-secflow-tls"
 
 
 class AppConfig(BaseModel):

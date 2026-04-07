@@ -19,7 +19,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-    - host: secflow.sothothv2.com
+    - host: secflow.ai.icsl.huawei.com
       http:
         paths:
           - path: /
@@ -129,5 +129,5 @@ spec:
                   number: 80
   tls:
     - hosts:
-        - secflow.sothothv2.com
-      secretName: wildcard-sothothv2.com-tls
+        - secflow.ai.icsl.huawei.com
+      secretName: wildcard-secflow-tls

@@ -11,7 +11,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-  - host: gaiasec.sothothv2.com
+  - host: gaiasec.ai.icsl.huawei.com
     http:
       paths:
       - path: /
@@ -30,6 +30,6 @@ spec:
               number: 443
   tls:
   - hosts:
-    - gaiasec.sothothv2.com
-    secretName: wildcard-sothothv2.com-tls
+    - gaiasec.ai.icsl.huawei.com
+    secretName: wildcard-secflow-tls
 

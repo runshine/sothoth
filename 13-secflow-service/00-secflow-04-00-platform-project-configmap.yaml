@@ -72,11 +72,11 @@ data:
     # 用于在项目的K8S Namespace中创建TLS Secret
     tls_secret:
       # 目标项目命名空间中的 TLS Secret 名称
-      name: "wildcard-sothothv2.com-tls"
+      name: "wildcard-secflow-tls"
       # 源公共TLS Secret所在命名空间
       source_namespace: "secflow-ns"
       # 源公共TLS Secret名称（由 setup-ingress-tls.sh 初始化）
-      source_secret_name: "wildcard-sothothv2.com-tls"
+      source_secret_name: "wildcard-secflow-tls"
     # Application Configuration
     app:
       host: "0.0.0.0"

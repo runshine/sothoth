@@ -75,7 +75,7 @@
 - 入口文件是 [index.tsx](/home/runshine/CLionProjects/sothoth/13-secflow-service/image_build/secflow-frontend/index.tsx)
 - 开发配置在 [vite.config.ts](/home/runshine/CLionProjects/sothoth/13-secflow-service/image_build/secflow-frontend/vite.config.ts)
 - 默认开发端口 `3000`
-- `/api` 代理到 `http://secflow.sothothv2.com`
+- `/api` 代理到 `http://secflow.ai.icsl.huawei.com`
 
 ### 后端
 

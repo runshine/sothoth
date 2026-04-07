@@ -88,8 +88,8 @@ pvc:
 
 # Ingress配置
 ingress:
-  base_domain: "code-server.sothothv2.com"
-  tls_secret_name: "wildcard-code-server.sothothv2.com-tls"
+  base_domain: "code-server.ai.icsl.huawei.com"
+  tls_secret_name: "wildcard-secflow-tls"
 ```
 
 ### 3. 启动服务
@@ -194,7 +194,7 @@ GET /api/app/code-server/projects/{project_id}/code-servers/{name}/status
     "pod_status": "Running",
     "pod_ip": "10.42.0.15",
     "node_name": "node-1",
-    "access_url": "https://a1b2c3d4e5f6g7h8.code-server.sothothv2.com",
+    "access_url": "https://a1b2c3d4e5f6g7h8.code-server.ai.icsl.huawei.com",
     "ready_replicas": 1,
     "total_replicas": 1
 }
@@ -256,8 +256,8 @@ GET /ready
 | `code_server.env` | 默认环境变量 | ANTHROPIC_*等 |
 | `pvc.storage_class` | PVC StorageClass | `standard` |
 | `pvc.storage_size` | PVC大小 | `5Gi` |
-| `ingress.base_domain` | Ingress基础域名 | `code-server.sothothv2.com` |
-| `ingress.tls_secret_name` | TLS证书Secret | `wildcard-code-server.sothothv2.com-tls` |
+| `ingress.base_domain` | Ingress基础域名 | `code-server.ai.icsl.huawei.com` |
+| `ingress.tls_secret_name` | TLS证书Secret | `wildcard-secflow-tls` |
 | `tasks.retention_days` | 任务保留天数 | `7` |
 | `logging.level` | 日志级别 | `INFO` |
 

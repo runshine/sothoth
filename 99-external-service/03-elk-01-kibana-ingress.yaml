@@ -18,10 +18,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - kibana.sothothv2.com
-      secretName: wildcard-sothothv2.com-tls
+        - kibana.ai.icsl.huawei.com
+      secretName: wildcard-secflow-tls
   rules:
-    - host: kibana.sothothv2.com
+    - host: kibana.ai.icsl.huawei.com
       http:
         paths:
           - path: /

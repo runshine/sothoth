@@ -17,4 +17,4 @@ cd "${SCRIPT_DIR}"
 
 "${PYTHON_BIN}" -m pip install requests tqdm requests_toolbelt
 "${PYTHON_BIN}" download_from_github_release.py https://github.com/runshine/static_binary_tools/releases/tag/v1.0 "${DOWNLOAD_DIR}"
-"${PYTHON_BIN}" upload_to_static_binary_service.py --folder "${DOWNLOAD_DIR}" --url https://secflow.sothothv2.com:443 --workers 1 --retries 1
+"${PYTHON_BIN}" upload_to_static_binary_service.py --folder "${DOWNLOAD_DIR}" --url https://secflow.ai.icsl.huawei.com:443 --workers 1 --retries 1
