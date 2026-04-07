@@ -1684,6 +1684,15 @@ class WebAPIServer:
             text = '/' + text.lstrip('/')
         return text.rstrip('/') or '/host'
 
+    def _process_monitor_sync_subproject_id(self) -> str:
+        text = str(self.config.get('process_monitor_default_subproject_id', '__file__sync__') or '__file__sync__').strip()
+        if not text:
+            return '__file__sync__'
+        if '/' in text or '\\' in text:
+            # Keep fileserver path safe even if config is malformed.
+            return '__file__sync__'
+        return text
+
     def _normalize_process_monitor_public_path(self, value: Any) -> Any:
         text = str(value or '')
         if not text:
@@ -5425,8 +5434,8 @@ class WebAPIServer:
                         self.config.get('process_monitor_fileserver_base_url') or
                         'http://secflow-platform-fileserver/api/fileserver'
                     ).rstrip('/')
-                    subproject_id = self.config.get('process_monitor_default_subproject_id', 1)
-                    remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{int(subproject_id)}"
+                    subproject_id = self._process_monitor_sync_subproject_id()
+                    remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{quote(subproject_id, safe='')}"
                 remote_path_prefix = f"/__file__sync__/{agent_key}"
 
                 payload = {
@@ -5515,8 +5524,8 @@ class WebAPIServer:
                         self.config.get('process_monitor_fileserver_base_url') or
                         'http://secflow-platform-fileserver/api/fileserver'
                     ).rstrip('/')
-                    subproject_id = self.config.get('process_monitor_default_subproject_id', 1)
-                    remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{int(subproject_id)}"
+                    subproject_id = self._process_monitor_sync_subproject_id()
+                    remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{quote(subproject_id, safe='')}"
                 remote_path_prefix = f"/__file__sync__/{agent_key}"
 
                 payload = {

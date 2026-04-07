@@ -594,8 +594,20 @@ def absolute_storage_path(storage_key: str) -> str:
     return os.path.join(get_config().storage.root_dir, storage_key)
 
 
-def sync_subproject_root(project_id: str, subproject_id: int) -> str:
-    return os.path.join(get_config().storage.root_dir, "files", project_id, str(subproject_id))
+def sync_subproject_root(project_id: str, subproject_id: Any) -> str:
+    normalized_subproject = normalize_sync_subproject_id(subproject_id)
+    return os.path.join(get_config().storage.root_dir, "files", project_id, normalized_subproject)
+
+
+def normalize_sync_subproject_id(subproject_id: Any) -> str:
+    text = str(subproject_id or "").strip()
+    if not text:
+        raise ValidationError("subproject_id不能为空")
+    if text in {".", ".."}:
+        raise ValidationError("subproject_id非法")
+    if "/" in text or "\\" in text:
+        raise ValidationError("subproject_id不能包含路径分隔符")
+    return text
 
 
 def normalize_sync_path(path: str) -> tuple[str, str]:
@@ -612,7 +624,7 @@ def normalize_sync_path(path: str) -> tuple[str, str]:
     return normalized.lstrip("/"), normalized
 
 
-def sync_target_path(project_id: str, subproject_id: int, relative_path: str) -> str:
+def sync_target_path(project_id: str, subproject_id: Any, relative_path: str) -> str:
     relative_no_lead, _ = normalize_sync_path(relative_path)
     return os.path.join(sync_subproject_root(project_id, subproject_id), relative_no_lead)
 
@@ -714,14 +726,14 @@ async def persist_upload(upload: UploadFile, destination_dir: str) -> tuple[str,
 
 
 @router.head("/sync/root/{project_id}/{subproject_id}/object")
-async def sync_head_object(project_id: str, subproject_id: int, path: str = Query(...)):
+async def sync_head_object(project_id: str, subproject_id: str, path: str = Query(...)):
     target_path = sync_target_path(project_id, subproject_id, path)
     meta = compute_existing_sync_meta(target_path)
     return Response(status_code=200 if meta.get("exists") else 404, headers=build_sync_headers(meta))
 
 
 @router.get("/sync/root/{project_id}/{subproject_id}/object/meta")
-async def sync_object_meta(project_id: str, subproject_id: int, path: str = Query(...)):
+async def sync_object_meta(project_id: str, subproject_id: str, path: str = Query(...)):
     target_path = sync_target_path(project_id, subproject_id, path)
     meta = compute_existing_sync_meta(target_path)
     if not meta.get("exists"):
@@ -733,7 +745,7 @@ async def sync_object_meta(project_id: str, subproject_id: int, path: str = Quer
 
 
 @router.post("/sync/root/{project_id}/{subproject_id}/mkdirs")
-async def sync_mkdirs(project_id: str, subproject_id: int, payload: dict[str, list[str]] = Body(...)):
+async def sync_mkdirs(project_id: str, subproject_id: str, payload: dict[str, list[str]] = Body(...)):
     paths = payload.get("paths") or []
     created: list[str] = []
     for item in paths:
@@ -747,7 +759,7 @@ async def sync_mkdirs(project_id: str, subproject_id: int, payload: dict[str, li
 @router.put("/sync/root/{project_id}/{subproject_id}/object")
 async def sync_put_object(
     project_id: str,
-    subproject_id: int,
+    subproject_id: str,
     request: Request,
     path: str = Query(...),
     size: int = Query(0),
