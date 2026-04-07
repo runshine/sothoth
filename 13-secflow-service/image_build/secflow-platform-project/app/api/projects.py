@@ -576,6 +576,30 @@ async def get_project(
     return make_project_response(project, roles, can_manage=can_manage)
 
 
+@router.post("/{project_id}/tls-secret/rebuild", response_model=SuccessResponse)
+async def rebuild_project_tls_secret(
+    project_id: str,
+    authorization: Optional[str] = Header(None),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    重建项目 Ingress TLS Secret
+
+    - 仅归属部门管理员或其上级部门管理员可操作
+    - 行为与创建项目时的 TLS Secret 同步一致
+    """
+    get_project_with_permission(db, project_id, current_user, require_manage=True)
+
+    k8s_client = get_k8s_client()
+    tls_success, tls_error = k8s_client.create_tls_secret(project_id, authorization=authorization)
+    if not tls_success:
+        logger.error(f"重建TLS Secret失败: {project_id}, 错误: {tls_error}")
+        raise HTTPException(status_code=500, detail=f"重建TLS Secret失败: {tls_error}")
+
+    return SuccessResponse(message=f"项目 {project_id} Ingress TLS 重建成功")
+
+
 @router.put("/{project_id}", response_model=ProjectResponse)
 async def update_project(
     project_id: str,

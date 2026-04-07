@@ -49,9 +49,6 @@ main() {
 
     setup_tls_secret "*.ai.icsl.huawei.com"             "secflow-ns" "wildcard-secflow-tls"
 
-    # 设置第二个域
-    setup_tls_secret "*.code-server.ai.icsl.huawei.com" "vscode" "wildcard-secflow-tls"
-
     echo -e "\n=== 设置完成！ ==="
 }
 
