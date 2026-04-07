@@ -5436,7 +5436,7 @@ class WebAPIServer:
                     ).rstrip('/')
                     subproject_id = self._process_monitor_sync_subproject_id()
                     remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{quote(subproject_id, safe='')}"
-                remote_path_prefix = f"/__file__sync__/{agent_key}"
+                remote_path_prefix = f"/{agent_key}"
 
                 payload = {
                     'mode': mode,
@@ -5526,7 +5526,7 @@ class WebAPIServer:
                     ).rstrip('/')
                     subproject_id = self._process_monitor_sync_subproject_id()
                     remote_root_url = f"{fileserver_base}/sync/root/{quote(project_id, safe='')}/{quote(subproject_id, safe='')}"
-                remote_path_prefix = f"/__file__sync__/{agent_key}"
+                remote_path_prefix = f"/{agent_key}"
 
                 payload = {
                     'mode': mode,
