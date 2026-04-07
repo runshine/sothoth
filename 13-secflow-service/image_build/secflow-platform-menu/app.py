@@ -363,6 +363,16 @@ class MenuManager:
             explicit_url=health_url,
             explicit_path=health_path,
         )
+        logger.info(
+            "Resolved health target for %s: host=%s port=%s api_prefix=%s explicit_url=%s resolved_path=%s resolved_url=%s",
+            service_id,
+            host,
+            port,
+            normalized_api_prefix,
+            health_url,
+            resolved_health_path,
+            resolved_health_url,
+        )
 
         service = self._get_service(service_id)
         if service is not None:
@@ -490,6 +500,14 @@ class MenuManager:
         try:
             with urlopen(request_obj, timeout=service.health_timeout_seconds) as response:
                 latency_ms = int((time.time() - started_at) * 1000)
+                logger.debug(
+                    "Health probe success: service_id=%s url=%s method=%s status=%s latency_ms=%s",
+                    service.service_id,
+                    service.health_url,
+                    service.health_method,
+                    response.status,
+                    latency_ms,
+                )
                 return {
                     "ok": 200 <= response.status < 400,
                     "http_status": response.status,
@@ -497,6 +515,13 @@ class MenuManager:
                     "error": None,
                 }
         except HTTPError as exc:
+            logger.warning(
+                "Health probe HTTP error: service_id=%s url=%s method=%s status=%s",
+                service.service_id,
+                service.health_url,
+                service.health_method,
+                exc.code,
+            )
             return {
                 "ok": False,
                 "http_status": exc.code,
@@ -505,6 +530,13 @@ class MenuManager:
             }
         except URLError as exc:
             reason = getattr(exc, "reason", exc)
+            logger.warning(
+                "Health probe URL error: service_id=%s url=%s method=%s reason=%s",
+                service.service_id,
+                service.health_url,
+                service.health_method,
+                reason,
+            )
             return {
                 "ok": False,
                 "http_status": None,
@@ -512,6 +544,13 @@ class MenuManager:
                 "error": str(reason),
             }
         except Exception as exc:
+            logger.warning(
+                "Health probe unexpected error: service_id=%s url=%s method=%s error=%s",
+                service.service_id,
+                service.health_url,
+                service.health_method,
+                exc,
+            )
             return {
                 "ok": False,
                 "http_status": None,
@@ -542,6 +581,14 @@ class MenuManager:
                 HealthStatus.DEGRADED
                 if service.consecutive_failures < self.health_failure_threshold
                 else HealthStatus.UNHEALTHY
+            )
+            logger.warning(
+                "Health refresh failed: service_id=%s health_url=%s status=%s consecutive_failures=%s error=%s",
+                service_id,
+                service.health_url,
+                service.last_health_status.value,
+                service.consecutive_failures,
+                service.last_health_error,
             )
         self._save_service(service)
         return {
@@ -1128,6 +1175,14 @@ if __name__ == '__main__':
     if os.path.exists(args.config):
         with open(args.config, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f) or {}
+    logger.info(
+        "Starting menu service with config: service_gateway_url=%s redis_url=%s redis_enabled=%s redis_key_prefix=%s k8s_service_url=%s",
+        config.get('service_gateway_url', ''),
+        config.get('redis_url', 'redis://localhost:6379/0'),
+        config.get('redis_enabled', False),
+        config.get('redis_key_prefix', 'secflow:menu'),
+        config.get('k8s_service_url', ''),
+    )
 
     # 初始化菜单管理器
     menu_manager = MenuManager(
