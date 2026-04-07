@@ -26,8 +26,6 @@ except ImportError:  # pragma: no cover - 允许本地无 redis 依赖时完成�
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-FORCED_TEST_HEALTH_GATEWAY_URL = "http://secflow.ai.icsl.huawei.com"
-
 
 class ServiceMaturity(Enum):
     """服务成熟度枚举"""
@@ -328,7 +326,7 @@ class MenuManager:
 
         health_path = self._resolve_health_path(api_prefix, explicit_path)
         normalized_host = (host or "").strip()
-        gateway_url = (FORCED_TEST_HEALTH_GATEWAY_URL or self.service_gateway_url).rstrip("/")
+        gateway_url = self.service_gateway_url.rstrip("/")
 
         # 优先使用统一网关地址，规避部分服务注册时上报 0.0.0.0 / 127.0.0.1 的问题。
         if gateway_url and api_prefix:
