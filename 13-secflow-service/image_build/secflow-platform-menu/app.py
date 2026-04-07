@@ -367,7 +367,7 @@ class MenuManager:
             explicit_path=health_path,
         )
         logger.info(
-            "Resolved health target for %s: host=%s port=%s api_prefix=%s explicit_url=%s resolved_path=%s resolved_url=%s",
+            "服务[%s]健康检查目标已解析: host=%s port=%s api_prefix=%s explicit_url=%s resolved_path=%s resolved_url=%s",
             service_id,
             host,
             port,
@@ -504,7 +504,7 @@ class MenuManager:
             with urlopen(request_obj, timeout=service.health_timeout_seconds) as response:
                 latency_ms = int((time.time() - started_at) * 1000)
                 logger.debug(
-                    "Health probe success: service_id=%s url=%s method=%s status=%s latency_ms=%s",
+                    "健康探测成功: service_id=%s url=%s method=%s status=%s latency_ms=%s",
                     service.service_id,
                     service.health_url,
                     service.health_method,
@@ -519,7 +519,7 @@ class MenuManager:
                 }
         except HTTPError as exc:
             logger.warning(
-                "Health probe HTTP error: service_id=%s url=%s method=%s status=%s",
+                "健康探测HTTP错误: service_id=%s url=%s method=%s status=%s",
                 service.service_id,
                 service.health_url,
                 service.health_method,
@@ -534,7 +534,7 @@ class MenuManager:
         except URLError as exc:
             reason = getattr(exc, "reason", exc)
             logger.warning(
-                "Health probe URL error: service_id=%s url=%s method=%s reason=%s",
+                "健康探测URL错误: service_id=%s url=%s method=%s reason=%s",
                 service.service_id,
                 service.health_url,
                 service.health_method,
@@ -548,7 +548,7 @@ class MenuManager:
             }
         except Exception as exc:
             logger.warning(
-                "Health probe unexpected error: service_id=%s url=%s method=%s error=%s",
+                "健康探测发生未知异常: service_id=%s url=%s method=%s error=%s",
                 service.service_id,
                 service.health_url,
                 service.health_method,
@@ -586,7 +586,7 @@ class MenuManager:
                 else HealthStatus.UNHEALTHY
             )
             logger.warning(
-                "Health refresh failed: service_id=%s health_url=%s status=%s consecutive_failures=%s error=%s",
+                "服务健康状态刷新失败: service_id=%s health_url=%s status=%s consecutive_failures=%s error=%s",
                 service_id,
                 service.health_url,
                 service.last_health_status.value,
@@ -1179,7 +1179,7 @@ if __name__ == '__main__':
         with open(args.config, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f) or {}
     logger.info(
-        "Starting menu service with config: service_gateway_url=%s redis_url=%s redis_enabled=%s redis_key_prefix=%s k8s_service_url=%s",
+        "菜单服务启动配置: service_gateway_url=%s redis_url=%s redis_enabled=%s redis_key_prefix=%s k8s_service_url=%s",
         config.get('service_gateway_url', ''),
         config.get('redis_url', 'redis://localhost:6379/0'),
         config.get('redis_enabled', False),
