@@ -99,6 +99,20 @@ echo "Workdir: ${WORKDIR}"
 echo "Container ID: $(cat /proc/self/cgroup | head -1 | cut -d/ -f3)"
 echo "=========================================="
 
+# DNS hijack at container startup:
+# when DNS_SERVER is configured, overwrite /etc/resolv.conf with that value only.
+if [ -n "${DNS_SERVER:-}" ]; then
+    echo "DNS_SERVER detected, overwriting /etc/resolv.conf ..."
+    : > /etc/resolv.conf
+    printf '%s' "${DNS_SERVER}" | tr ',; \t' '\n' | while IFS= read -r dns_item; do
+        dns_item="$(echo "${dns_item}" | xargs)"
+        [ -z "${dns_item}" ] && continue
+        echo "nameserver ${dns_item}" >> /etc/resolv.conf
+    done
+else
+    echo "DNS_SERVER is empty, skip /etc/resolv.conf overwrite."
+fi
+
 echo "Available Debug Tools:"
 echo "----------------------"
 which gcc g++ clang gdb lldb strace ltrace make cmake python3 || true
@@ -151,7 +165,12 @@ fi
 # 智能体后端进程由 REST API 统一管理，不在入口脚本中自动启动
 
 echo "Starting Process monitor service on port ${PROCESS_MONITOR_PORT}..."
-python3 -m process_monitor_service.app >> /tmp/process-monitor.log 2>&1 &
+echo "Process monitor DNS_SERVER: ${DNS_SERVER:-<empty>}"
+if [ -f "/etc/resolv.conf" ]; then
+    echo "Process monitor resolv.conf nameservers(before start):"
+    grep -E '^\s*nameserver\s+' /etc/resolv.conf || echo "(no nameserver entries)"
+fi
+python3 -u -m process_monitor_service.app > >(tee -a /tmp/process-monitor.log) 2>&1 &
 PROCESS_MONITOR_PID=$!
 
 if [ -d "/host" ]; then
