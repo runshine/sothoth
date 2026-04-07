@@ -40,7 +40,7 @@ status_sync:
   retry_interval: 2  # 重试间隔（秒）
 
 registry:
-  enabled: false
+  enabled: true
   menu_service_url: "http://secflow-platform-menu:80"
   service_id: "secflow-workflow-status"
   service_name: "工作流状态管理服务"

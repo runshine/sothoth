@@ -24,7 +24,7 @@ auth_service:
 
 # Menu Registration Center Configuration
 registry:
-  enabled: false
+  enabled: true
   menu_service_url: "http://secflow-platform-menu:80"
   service_id: "secflow-workflow"
   service_name: "工作流编排服务"
