@@ -325,15 +325,86 @@ class TaskManager:
             return result
         return {}
 
+    @staticmethod
+    def _sanitize_llm_file_token(value: str) -> str:
+        normalized = ''.join(ch if str(ch).isalnum() else '_' for ch in str(value or '').strip().lower())
+        normalized = normalized.strip('_')
+        if not normalized:
+            normalized = 'llm_file'
+        return normalized[:48]
+
+    def _collect_template_llm_files_for_yaml(self, template_name: str, yaml_content: str) -> List[Dict[str, str]]:
+        """
+        从模板目录收集 compose 引用的本地 file/config 文件内容，避免部署时 bind 源路径缺失。
+        """
+        try:
+            template = self.template_manager.get_template(template_name)
+            if not template:
+                return []
+            template_dir = self.template_manager.templates_root / str(template_name or '')
+            if not template_dir.exists():
+                return []
+            compose_data = yaml.safe_load(yaml_content) or {}
+            if not isinstance(compose_data, dict):
+                return []
+            configs = compose_data.get('configs')
+            if not isinstance(configs, dict):
+                return []
+            files: List[Dict[str, str]] = []
+            seen = set()
+            for cfg in configs.values():
+                if not isinstance(cfg, dict):
+                    continue
+                rel = str(cfg.get('file') or '').strip()
+                if not rel or rel.startswith('/'):
+                    continue
+                rel_path = Path(rel)
+                if '..' in rel_path.parts:
+                    continue
+                abs_path = (template_dir / rel_path).resolve()
+                try:
+                    abs_path.relative_to(template_dir.resolve())
+                except Exception:
+                    continue
+                if not abs_path.exists() or not abs_path.is_file():
+                    continue
+                rel_norm = rel_path.as_posix()
+                if rel_norm in seen:
+                    continue
+                try:
+                    content = abs_path.read_text(encoding='utf-8')
+                except Exception:
+                    continue
+                seen.add(rel_norm)
+                files.append({'relative_path': rel_norm, 'content': content})
+            return files
+        except Exception:
+            return []
+
     def _apply_llm_provider_binding_to_yaml(self, yaml_content: str, binding: Optional[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
         if not binding or not isinstance(binding, dict):
-            return yaml_content, {'applied': False, 'provider_keys': [], 'target_services': [], 'mapped_env_keys': []}
+            return yaml_content, {
+                'applied': False,
+                'provider_keys': [],
+                'target_services': [],
+                'mapped_env_keys': [],
+                'mapped_file_paths': [],
+                'generated_files': [],
+            }
 
         merged_env = binding.get('merged_env') if isinstance(binding.get('merged_env'), dict) else {}
+        merged_files = binding.get('merged_files') if isinstance(binding.get('merged_files'), list) else []
         provider_keys = [str(item) for item in (binding.get('provider_keys') or []) if str(item).strip()]
         target_services = binding.get('target_services', '*')
-        if not merged_env or not provider_keys:
-            return yaml_content, {'applied': False, 'provider_keys': provider_keys, 'target_services': [], 'mapped_env_keys': sorted(merged_env.keys())}
+        if (not merged_env and not merged_files) or not provider_keys:
+            return yaml_content, {
+                'applied': False,
+                'provider_keys': provider_keys,
+                'target_services': [],
+                'mapped_env_keys': sorted(merged_env.keys()),
+                'mapped_file_paths': [],
+                'generated_files': [],
+            }
 
         compose_data = yaml.safe_load(yaml_content) or {}
         if not isinstance(compose_data, dict):
@@ -351,6 +422,30 @@ class TaskManager:
             if missing:
                 raise ValueError(f"LLM Provider 目标服务不存在: {', '.join(missing)}")
 
+        mapped_file_paths: List[str] = []
+        generated_files: List[Dict[str, str]] = []
+        llm_service_configs: Dict[str, Dict[str, Any]] = {}
+        if merged_files:
+            compose_configs = compose_data.get('configs')
+            if not isinstance(compose_configs, dict):
+                compose_configs = {}
+                compose_data['configs'] = compose_configs
+            for idx, raw_item in enumerate(merged_files):
+                if not isinstance(raw_item, dict):
+                    continue
+                file_path = str(raw_item.get('path') or '').strip()
+                content = raw_item.get('content')
+                if not file_path or not isinstance(content, str):
+                    continue
+                file_name_token = hashlib.sha1(file_path.encode('utf-8')).hexdigest()[:12]
+                file_ext = Path(file_path).suffix or '.txt'
+                relative_file_path = Path('.llm-provider-files') / f"{idx + 1:02d}_{file_name_token}{file_ext}"
+                config_name = f"llm_file_{self._sanitize_llm_file_token(file_name_token)}"
+                compose_configs[config_name] = {'file': relative_file_path.as_posix()}
+                llm_service_configs[file_path] = {'source': config_name, 'target': file_path}
+                mapped_file_paths.append(file_path)
+                generated_files.append({'relative_path': relative_file_path.as_posix(), 'content': content})
+
         for service_name in selected_services:
             service_cfg = services.get(service_name)
             if not isinstance(service_cfg, dict):
@@ -358,6 +453,25 @@ class TaskManager:
             env_map = self._normalize_compose_environment(service_cfg.get('environment'))
             env_map.update({str(k): '' if v is None else str(v) for k, v in merged_env.items()})
             service_cfg['environment'] = env_map
+            if llm_service_configs:
+                existing_configs = service_cfg.get('configs')
+                normalized_existing: List[Dict[str, Any]] = []
+                if isinstance(existing_configs, list):
+                    for item in existing_configs:
+                        if isinstance(item, str):
+                            normalized_existing.append({'source': item})
+                        elif isinstance(item, dict):
+                            source = str(item.get('source') or '').strip()
+                            if source:
+                                record: Dict[str, Any] = {'source': source}
+                                target = str(item.get('target') or '').strip()
+                                if target:
+                                    record['target'] = target
+                                normalized_existing.append(record)
+                target_path_set = set(llm_service_configs.keys())
+                cleaned = [item for item in normalized_existing if str(item.get('target') or '').strip() not in target_path_set]
+                cleaned.extend(llm_service_configs.values())
+                service_cfg['configs'] = cleaned
 
         updated_yaml = yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
         return updated_yaml, {
@@ -365,6 +479,8 @@ class TaskManager:
             'provider_keys': provider_keys,
             'target_services': selected_services,
             'mapped_env_keys': sorted(merged_env.keys()),
+            'mapped_file_paths': sorted(set(mapped_file_paths)),
+            'generated_files': generated_files,
         }
 
     def _build_archive_bytes_with_llm_binding(self, template_name: str, binding: Optional[Dict[str, Any]]) -> Tuple[bytes, str, Dict[str, Any]]:
@@ -918,10 +1034,28 @@ class TaskManager:
 
             llm_binding = extra_params.get('resolved_llm_provider_binding') if isinstance(extra_params, dict) else None
             yaml_content, injection = self._apply_llm_provider_binding_to_yaml(yaml_content, llm_binding)
+            files_payload_by_path: Dict[str, Dict[str, str]] = {}
+            for item in (injection.get('generated_files') or []):
+                if not isinstance(item, dict):
+                    continue
+                rel = str(item.get('relative_path') or '').strip()
+                content = item.get('content')
+                if rel and isinstance(content, str):
+                    files_payload_by_path[rel] = {'relative_path': rel, 'content': content}
+            for item in self._collect_template_llm_files_for_yaml(template_name, yaml_content):
+                rel = str(item.get('relative_path') or '').strip()
+                content = item.get('content')
+                if rel and isinstance(content, str) and rel not in files_payload_by_path:
+                    files_payload_by_path[rel] = {'relative_path': rel, 'content': content}
+            files_payload = list(files_payload_by_path.values())
             if injection.get('applied'):
                 self._add_task_log(task_id, 'INFO', f"注入LLM Provider: {', '.join(injection['provider_keys'])}")
                 self._add_task_log(task_id, 'INFO', f"注入目标服务: {', '.join(injection['target_services'])}")
                 self._add_task_log(task_id, 'INFO', f"注入环境变量键: {', '.join(injection['mapped_env_keys'])}")
+                if injection.get('mapped_file_paths'):
+                    self._add_task_log(task_id, 'INFO', f"注入配置文件路径: {', '.join(injection['mapped_file_paths'])}")
+            if files_payload:
+                self._add_task_log(task_id, 'INFO', f"随YAML下发配置文件: {len(files_payload)} 个")
 
             self._add_task_log(task_id, 'INFO', f"YAML内容大小: {len(yaml_content)} 字符")
 
@@ -930,7 +1064,8 @@ class TaskManager:
                 'name': service_name,
                 'yaml': yaml_content,
                 'template_name': template_name,
-                'template_id': template_id
+                'template_id': template_id,
+                'files': files_payload,
             }
 
             # 添加额外参数（如果有）
