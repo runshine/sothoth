@@ -1624,8 +1624,6 @@ class WebAPIServer:
                 continue
             seen.add(text)
             provider_keys.append(text)
-        if not provider_keys:
-            return None
 
         target_services_raw = raw_binding.get('target_services', '*')
         if target_services_raw == '*' or target_services_raw is None:
@@ -1647,9 +1645,24 @@ class WebAPIServer:
             if missing:
                 raise ValueError(f"目标服务不存在: {', '.join(missing)}")
 
+        env_overrides = {}
+        if isinstance(raw_binding.get('env_overrides'), dict):
+            for key, value in raw_binding.get('env_overrides').items():
+                normalized_key = str(key or '').strip()
+                if not normalized_key:
+                    continue
+                env_overrides[normalized_key] = '' if value is None else str(value)
+
+        file_overrides = self._normalize_llm_file_bindings(raw_binding.get('file_overrides'))
+
+        if not provider_keys and not env_overrides and not file_overrides:
+            return None
+
         return {
             'provider_keys': provider_keys,
             'target_services': target_services,
+            'env_overrides': env_overrides,
+            'file_overrides': file_overrides,
             'updated_at': datetime.utcnow().isoformat(),
         }
 
@@ -1669,16 +1682,48 @@ class WebAPIServer:
             allowed_services=self._extract_template_service_names(template),
         )
         if override_binding:
-            prepared['llm_provider_binding'] = {
-                'provider_keys': override_binding.get('provider_keys', []),
-                'target_services': override_binding.get('target_services', '*'),
-                'source': 'deployment_override',
-            }
-            prepared['resolved_llm_provider_binding'] = self._merge_llm_provider_binding(
+            merged_binding = self._merge_llm_provider_binding(
                 override_binding.get('provider_keys', []),
                 override_binding.get('target_services', '*'),
                 source='deployment_override',
             )
+            merged_env = dict(merged_binding.get('merged_env') or {})
+            merged_env.update(override_binding.get('env_overrides') or {})
+
+            merged_files_by_path: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+            for item in self._normalize_llm_file_bindings(merged_binding.get('merged_files') or []):
+                file_path = str(item.get('path') or '').strip()
+                if not file_path:
+                    continue
+                merged_files_by_path[file_path] = item
+            for item in self._normalize_llm_file_bindings(override_binding.get('file_overrides') or []):
+                file_path = str(item.get('path') or '').strip()
+                if not file_path:
+                    continue
+                if item.get('enabled') is False:
+                    merged_files_by_path.pop(file_path, None)
+                    continue
+                merged_files_by_path[file_path] = item
+            merged_files = list(merged_files_by_path.values())
+
+            prepared['llm_provider_binding'] = {
+                'provider_keys': override_binding.get('provider_keys', []),
+                'target_services': override_binding.get('target_services', '*'),
+                'env_overrides': override_binding.get('env_overrides', {}),
+                'file_overrides': override_binding.get('file_overrides', []),
+                'source': 'deployment_override',
+            }
+            prepared['resolved_llm_provider_binding'] = {
+                **merged_binding,
+                'merged_env': merged_env,
+                'mapped_env_keys': sorted(merged_env.keys()),
+                'merged_files': merged_files,
+                'mapped_file_paths': sorted([
+                    str(item.get('path') or '').strip()
+                    for item in merged_files
+                    if str(item.get('path') or '').strip()
+                ]),
+            }
         return prepared
 
     def _get_ai_helper_agent_detail(
