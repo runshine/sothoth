@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timezone
+import json
 
 from flask import Blueprint, Response, jsonify, request
 
@@ -299,3 +300,109 @@ def send_ai_agent_session_message_stream(session_id: str):
         )
     except KeyError:
         return jsonify({'error': 'session not found'}), 404
+
+
+def _normalize_invoke_payload(payload: dict) -> dict:
+    normalized = dict(payload or {})
+    content = normalized.get('content')
+    prompt = normalized.get('prompt')
+    task = normalized.get('task')
+    if not prompt and not task:
+        messages = normalized.get('messages')
+        if isinstance(messages, list):
+            for item in reversed(messages):
+                if not isinstance(item, dict):
+                    continue
+                msg_content = item.get('content')
+                if isinstance(msg_content, str) and msg_content.strip():
+                    prompt = msg_content.strip()
+                    task = prompt
+                    break
+    if not prompt and isinstance(content, str):
+        prompt = content
+    if not task and isinstance(prompt, str):
+        task = prompt
+    if not prompt and isinstance(task, str):
+        prompt = task
+    normalized['prompt'] = prompt or ''
+    normalized['task'] = task or normalized['prompt']
+    return normalized
+
+
+@bp.post('/api/ai-agents/invoke')
+def invoke_ai_agent_once():
+    payload = request.get_json(silent=True) or {}
+    normalized = _normalize_invoke_payload(payload)
+    return jsonify(a2a.invoke(normalized))
+
+
+@bp.post('/api/ai-agents/invoke/stream')
+def invoke_ai_agent_stream():
+    payload = request.get_json(silent=True) or {}
+    normalized = _normalize_invoke_payload(payload)
+
+    def _translate_stream():
+        try:
+            for chunk in a2a.invoke_sse(normalized):
+                text = str(chunk or '')
+                if not text:
+                    continue
+                parts = text.split('\n\n')
+                for part in parts:
+                    block = part.strip()
+                    if not block:
+                        continue
+                    event_name = ''
+                    data_lines = []
+                    for line in block.split('\n'):
+                        if line.startswith('event:'):
+                            event_name = line[6:].strip()
+                        elif line.startswith('data:'):
+                            data_lines.append(line[5:].strip())
+                    if not data_lines:
+                        continue
+                    raw_data = '\n'.join(data_lines).strip()
+                    if not raw_data:
+                        continue
+                    try:
+                        payload_obj = json.loads(raw_data)
+                    except Exception:
+                        payload_obj = {'text': raw_data}
+
+                    if event_name == 'meta':
+                        out = {
+                            'type': 'start',
+                            'agent_ids': payload_obj.get('agent_ids') if isinstance(payload_obj, dict) else [],
+                        }
+                    elif event_name == 'chunk':
+                        out = {
+                            'type': 'delta',
+                            'agent_id': payload_obj.get('agent_id') if isinstance(payload_obj, dict) else None,
+                            'delta': payload_obj.get('text') if isinstance(payload_obj, dict) else raw_data,
+                            'source': 'stdout',
+                        }
+                    elif event_name == 'done':
+                        out = {
+                            'type': 'done',
+                            'result': payload_obj,
+                        }
+                    else:
+                        out = {
+                            'type': 'delta',
+                            'delta': raw_data,
+                            'source': 'stdout',
+                        }
+                    yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            err = {'type': 'error', 'error_message': str(exc)}
+            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
+
+    return Response(
+        _translate_stream(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+        },
+    )

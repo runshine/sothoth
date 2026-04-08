@@ -117,6 +117,8 @@ class WebAPIServer:
             config.get('daemon_auth_header', 'X-API-Token'),
             config.get('daemon_auth_token') or config.get('agent_auth_token', 'default_token_change_me'),
             config.get('agent_offline_grace_sec', 120),
+            config.get('agent_status_stale_hint_sec', 300),
+            config.get('agent_refresh_probe_workers', 8),
         )
 
         # 9. 初始化任务管理器（传递超时配置）
@@ -772,7 +774,12 @@ class WebAPIServer:
                 agent.daemon_info = report_daemon_info
             if isinstance(report_services, list):
                 agent.services = report_services
-            self.agent_manager._save_agent_to_db(agent)
+            self.agent_manager._save_agent_to_db(
+                agent,
+                reason_code='report_heartbeat',
+                reason_message='agent report accepted',
+                source='report',
+            )
             if agent.project_id:
                 with self.agent_manager.lock:
                     self.agent_manager.agents[agent.key] = agent
@@ -805,7 +812,12 @@ class WebAPIServer:
             created.daemon_info = report_daemon_info
         if isinstance(report_services, list):
             created.services = report_services
-        self.agent_manager._save_agent_to_db(created)
+        self.agent_manager._save_agent_to_db(
+            created,
+            reason_code='report_heartbeat',
+            reason_message='agent report accepted(auto-created)',
+            source='report',
+        )
         ensured = self.agent_manager.ensure_agent_exists(agent_key)
         if ensured and ensured.project_id:
             with self.agent_manager.lock:
@@ -3390,9 +3402,10 @@ class WebAPIServer:
     def _record_service_sync_log(self, scope: str, status: str = 'ok',
                                  project_id: Optional[str] = None, agent_key: Optional[str] = None,
                                  stale_only: bool = False, total: int = 0, ok_count: int = 0,
-                                 fail_count: int = 0, message: str = '', details: Optional[List[Dict[str, Any]]] = None):
+                                 fail_count: int = 0, message: str = '', details: Optional[List[Dict[str, Any]]] = None,
+                                 sync_id: Optional[str] = None) -> str:
         table_name = self.db_manager.get_table_name('service_sync_logs')
-        sync_id = uuid.uuid4().hex
+        sync_id = str(sync_id or uuid.uuid4().hex).strip() or uuid.uuid4().hex
         details_json = json.dumps(details or [], ensure_ascii=False)
         pod_id = self.config.get('pod_id', '')
         if self.db_manager.db_type == 'mysql':
@@ -3400,13 +3413,38 @@ class WebAPIServer:
                 INSERT INTO {table_name}
                 (sync_id, scope, project_id, agent_key, stale_only, status, total, ok_count, fail_count, message, details_json, pod_id, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON DUPLICATE KEY UPDATE
+                    scope = VALUES(scope),
+                    project_id = VALUES(project_id),
+                    agent_key = VALUES(agent_key),
+                    stale_only = VALUES(stale_only),
+                    status = VALUES(status),
+                    total = VALUES(total),
+                    ok_count = VALUES(ok_count),
+                    fail_count = VALUES(fail_count),
+                    message = VALUES(message),
+                    details_json = VALUES(details_json),
+                    pod_id = VALUES(pod_id)
             ''', (sync_id, scope, project_id, agent_key, int(stale_only), status, total, ok_count, fail_count, message, details_json, pod_id))
         else:
             self.db_manager.execute_query(f'''
                 INSERT INTO {table_name}
                 (sync_id, scope, project_id, agent_key, stale_only, status, total, ok_count, fail_count, message, details_json, pod_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(sync_id) DO UPDATE SET
+                    scope = excluded.scope,
+                    project_id = excluded.project_id,
+                    agent_key = excluded.agent_key,
+                    stale_only = excluded.stale_only,
+                    status = excluded.status,
+                    total = excluded.total,
+                    ok_count = excluded.ok_count,
+                    fail_count = excluded.fail_count,
+                    message = excluded.message,
+                    details_json = excluded.details_json,
+                    pod_id = excluded.pod_id
             ''', (sync_id, scope, project_id, agent_key, int(stale_only), status, total, ok_count, fail_count, message, details_json, pod_id))
+        return sync_id
 
     def _register_routes(self):
         """注册路由"""
@@ -5038,6 +5076,7 @@ class WebAPIServer:
                 agent_key = request.args.get('agent_key')
                 q = (request.args.get('q') or '').strip()
                 include_stale = request.args.get('include_stale', 'false').lower() == 'true'
+                repair_bindings = request.args.get('repair_bindings', 'false').lower() == 'true'
 
                 table_name = self.db_manager.get_table_name('agent_services')
                 where_clauses = ["project_id = " + ("%s" if self.db_manager.db_type == 'mysql' else "?")]
@@ -5125,6 +5164,7 @@ class WebAPIServer:
                     }
 
                 task_table = self.db_manager.get_table_name('tasks')
+                task_template_cache: Dict[Tuple[str, str, str], Optional[str]] = {}
 
                 def _resolve_template(project_id_value: str, agent_key_value: str, service_name: str, raw_payload: Any = None) -> Dict[str, Any]:
                     key = (
@@ -5154,75 +5194,13 @@ class WebAPIServer:
                             'template_tags': self._normalize_service_tags((known_template or {}).get('template_tags')),
                         }
                         bindings_map[key] = resolved
-                        try:
-                            self.db_manager.execute_query(
-                                f"""
-                                INSERT INTO {binding_table}
-                                (project_id, agent_key, service_name, template_id, template_name, source)
-                                VALUES (%s, %s, %s, %s, %s, 'agent_report')
-                                ON DUPLICATE KEY UPDATE
-                                    template_id = VALUES(template_id),
-                                    template_name = VALUES(template_name),
-                                    source = VALUES(source),
-                                    updated_at = NOW()
-                                """ if self.db_manager.db_type == 'mysql' else
-                                f"""
-                                INSERT INTO {binding_table}
-                                (project_id, agent_key, service_name, template_id, template_name, source, created_at, updated_at)
-                                VALUES (?, ?, ?, ?, ?, 'agent_report', ?, ?)
-                                ON CONFLICT(project_id, agent_key, service_name) DO UPDATE SET
-                                    template_id=excluded.template_id,
-                                    template_name=excluded.template_name,
-                                    source=excluded.source,
-                                    updated_at=excluded.updated_at
-                                """,
-                                (
-                                    key[0], key[1], key[2], resolved.get('template_id'), resolved.get('template_name')
-                                ) if self.db_manager.db_type == 'mysql' else
-                                (
-                                    key[0], key[1], key[2], resolved.get('template_id'), resolved.get('template_name'),
-                                    datetime.now().isoformat(), datetime.now().isoformat()
-                                )
-                            )
-                        except Exception:
-                            self.logger.warning(f"写入Agent上报模板绑定失败: {key}", exc_info=True)
-                        return resolved
-
-                    task_row = self.db_manager.fetch_one(
-                        f"""
-                        SELECT template_name
-                        FROM {task_table}
-                        WHERE project_id = %s AND agent_key = %s AND service_name = %s
-                          AND task_type = 'deploy' AND status = 'success' AND template_name IS NOT NULL AND template_name <> ''
-                        ORDER BY completed_at DESC, created_at DESC
-                        LIMIT 1
-                        """ if self.db_manager.db_type == 'mysql' else
-                        f"""
-                        SELECT template_name
-                        FROM {task_table}
-                        WHERE project_id = ? AND agent_key = ? AND service_name = ?
-                          AND task_type = 'deploy' AND status = 'success' AND template_name IS NOT NULL AND template_name <> ''
-                        ORDER BY completed_at DESC, created_at DESC
-                        LIMIT 1
-                        """,
-                        key
-                    )
-                    if task_row:
-                        template_name = str(task_row.get('template_name') if isinstance(task_row, dict) else task_row['template_name'] or '').strip()
-                        if template_name:
-                            known_template = templates_by_name.get(template_name)
-                            resolved = {
-                                'template_id': (known_template or {}).get('id'),
-                                'template_name': template_name,
-                                'template_tags': self._normalize_service_tags((known_template or {}).get('template_tags')),
-                            }
-                            bindings_map[key] = resolved
+                        if repair_bindings:
                             try:
                                 self.db_manager.execute_query(
                                     f"""
                                     INSERT INTO {binding_table}
                                     (project_id, agent_key, service_name, template_id, template_name, source)
-                                    VALUES (%s, %s, %s, %s, %s, 'task_history')
+                                    VALUES (%s, %s, %s, %s, %s, 'agent_report')
                                     ON DUPLICATE KEY UPDATE
                                         template_id = VALUES(template_id),
                                         template_name = VALUES(template_name),
@@ -5232,7 +5210,7 @@ class WebAPIServer:
                                     f"""
                                     INSERT INTO {binding_table}
                                     (project_id, agent_key, service_name, template_id, template_name, source, created_at, updated_at)
-                                    VALUES (?, ?, ?, ?, ?, 'task_history', ?, ?)
+                                    VALUES (?, ?, ?, ?, ?, 'agent_report', ?, ?)
                                     ON CONFLICT(project_id, agent_key, service_name) DO UPDATE SET
                                         template_id=excluded.template_id,
                                         template_name=excluded.template_name,
@@ -5248,7 +5226,75 @@ class WebAPIServer:
                                     )
                                 )
                             except Exception:
-                                self.logger.warning(f"回填服务模板绑定失败: {key}", exc_info=True)
+                                self.logger.warning(f"写入Agent上报模板绑定失败: {key}", exc_info=True)
+                        return resolved
+
+                    if key not in task_template_cache:
+                        task_row = self.db_manager.fetch_one(
+                            f"""
+                            SELECT template_name
+                            FROM {task_table}
+                            WHERE project_id = %s AND agent_key = %s AND service_name = %s
+                              AND task_type = 'deploy' AND status = 'success' AND template_name IS NOT NULL AND template_name <> ''
+                            ORDER BY completed_at DESC, created_at DESC
+                            LIMIT 1
+                            """ if self.db_manager.db_type == 'mysql' else
+                            f"""
+                            SELECT template_name
+                            FROM {task_table}
+                            WHERE project_id = ? AND agent_key = ? AND service_name = ?
+                              AND task_type = 'deploy' AND status = 'success' AND template_name IS NOT NULL AND template_name <> ''
+                            ORDER BY completed_at DESC, created_at DESC
+                            LIMIT 1
+                            """,
+                            key
+                        )
+                        template_name = str(task_row.get('template_name') if isinstance(task_row, dict) else (task_row['template_name'] if task_row else '') or '').strip() if task_row else ''
+                        task_template_cache[key] = template_name or None
+                    cached_template_name = task_template_cache.get(key)
+                    if cached_template_name:
+                        template_name = str(cached_template_name).strip()
+                        if template_name:
+                            known_template = templates_by_name.get(template_name)
+                            resolved = {
+                                'template_id': (known_template or {}).get('id'),
+                                'template_name': template_name,
+                                'template_tags': self._normalize_service_tags((known_template or {}).get('template_tags')),
+                            }
+                            bindings_map[key] = resolved
+                            if repair_bindings:
+                                try:
+                                    self.db_manager.execute_query(
+                                        f"""
+                                        INSERT INTO {binding_table}
+                                        (project_id, agent_key, service_name, template_id, template_name, source)
+                                        VALUES (%s, %s, %s, %s, %s, 'task_history')
+                                        ON DUPLICATE KEY UPDATE
+                                            template_id = VALUES(template_id),
+                                            template_name = VALUES(template_name),
+                                            source = VALUES(source),
+                                            updated_at = NOW()
+                                        """ if self.db_manager.db_type == 'mysql' else
+                                        f"""
+                                        INSERT INTO {binding_table}
+                                        (project_id, agent_key, service_name, template_id, template_name, source, created_at, updated_at)
+                                        VALUES (?, ?, ?, ?, ?, 'task_history', ?, ?)
+                                        ON CONFLICT(project_id, agent_key, service_name) DO UPDATE SET
+                                            template_id=excluded.template_id,
+                                            template_name=excluded.template_name,
+                                            source=excluded.source,
+                                            updated_at=excluded.updated_at
+                                        """,
+                                        (
+                                            key[0], key[1], key[2], resolved.get('template_id'), resolved.get('template_name')
+                                        ) if self.db_manager.db_type == 'mysql' else
+                                        (
+                                            key[0], key[1], key[2], resolved.get('template_id'), resolved.get('template_name'),
+                                            datetime.now().isoformat(), datetime.now().isoformat()
+                                        )
+                                    )
+                                except Exception:
+                                    self.logger.warning(f"回填服务模板绑定失败: {key}", exc_info=True)
                             return resolved
 
                     return {'template_id': None, 'template_name': '', 'template_tags': []}
@@ -7013,6 +7059,66 @@ class WebAPIServer:
                 self.logger.error(f"发送AI helper会话消息失败: {e}", exc_info=True)
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/agent/ai-helpers/<agent_key>/<service_name>/invoke', methods=['POST'])
+        def invoke_ai_helper_once(agent_key, service_name):
+            payload = request.get_json(silent=True) or {}
+            project_id = str(payload.get('project_id') or request.args.get('project_id') or '').strip()
+            if not project_id:
+                return jsonify({'error': 'project_id is required'}), 400
+            stream = str(request.args.get('stream') or '').lower() == 'true'
+            invoke_payload = dict(payload) if isinstance(payload, dict) else {}
+            invoke_payload.pop('project_id', None)
+            try:
+                if stream:
+                    row = self._get_ai_helper_service_row(project_id, agent_key, service_name)
+                    if not row:
+                        return jsonify({'error': f'AI helper service not found: {agent_key}/{service_name}'}), 404
+                    agent_ip = str(row.get('agent_ip') or '').strip()
+                    if not agent_ip:
+                        return jsonify({'error': f'AI helper service has no agent IP: {agent_key}/{service_name}'}), 400
+                    rest_port = self._resolve_helper_rest_port(row)
+                    target = f"http://{agent_ip}:{rest_port}/api/ai-agents/invoke/stream"
+                    upstream = requests.request('POST', target, json=invoke_payload, timeout=(10, 300), stream=True)
+                    if upstream.status_code >= 400:
+                        try:
+                            err_payload = upstream.json()
+                        except Exception:
+                            err_payload = {'error': upstream.text or f'upstream status {upstream.status_code}'}
+                        upstream.close()
+                        return jsonify(err_payload), upstream.status_code
+
+                    def _proxy_stream():
+                        try:
+                            for chunk in upstream.iter_content(chunk_size=1):
+                                if chunk:
+                                    yield chunk
+                        finally:
+                            upstream.close()
+
+                    return Response(
+                        _proxy_stream(),
+                        status=upstream.status_code,
+                        mimetype='text/event-stream',
+                        headers={
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive',
+                            'X-Accel-Buffering': 'no',
+                        },
+                    )
+
+                data, status_code = self._call_ai_helper_api(
+                    project_id,
+                    agent_key,
+                    service_name,
+                    'POST',
+                    '/api/ai-agents/invoke',
+                    invoke_payload,
+                )
+                return jsonify(data), status_code
+            except Exception as e:
+                self.logger.error(f"调用AI helper经典模式失败: {e}", exc_info=True)
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/agent/ai-helpers/sessions/global', methods=['GET'])
         def list_project_ai_agent_sessions_global():
             try:
@@ -7447,44 +7553,70 @@ class WebAPIServer:
                 success_count = 0
                 for row in helper_rows:
                     helper_request = requested_map.get(f"{row.get('agent_key')}::{row.get('service_name')}", {})
+                    helper_mode = str(helper_request.get('session_mode') or payload.get('session_mode') or 'invoke').strip().lower()
                     helper_payload = {
                         'agent_id': helper_request.get('agent_id'),
                         'agent_ids': helper_request.get('agent_ids') or payload.get('agent_ids'),
-                        'session_mode': helper_request.get('session_mode') or payload.get('session_mode'),
+                        'session_mode': helper_mode,
                         'metadata': payload.get('metadata') or {},
                     }
                     try:
-                        data, status_code = self._call_ai_helper_api(
-                            project_id,
-                            str(row.get('agent_key') or ''),
-                            str(row.get('service_name') or ''),
-                            'POST',
-                            '/api/ai-agents/sessions',
-                            helper_payload,
-                        )
-                        ok = status_code < 300 and isinstance(data, dict) and bool(data.get('session_id'))
-                        if ok:
+                        if helper_mode == 'invoke':
+                            helper_agent_ids = helper_payload.get('agent_ids') if isinstance(helper_payload.get('agent_ids'), list) else []
+                            if not helper_agent_ids and helper_payload.get('agent_id'):
+                                helper_agent_ids = [str(helper_payload.get('agent_id'))]
+                            self._upsert_ai_batch_item(
+                                batch_id,
+                                project_id,
+                                str(row.get('agent_key') or ''),
+                                str(row.get('service_name') or ''),
+                                None,
+                                helper_agent_ids,
+                                'success',
+                                '',
+                            )
                             success_count += 1
-                        agent_ids = data.get('agent_ids') if isinstance(data, dict) else []
-                        self._upsert_ai_batch_item(
-                            batch_id,
-                            project_id,
-                            str(row.get('agent_key') or ''),
-                            str(row.get('service_name') or ''),
-                            data.get('session_id') if isinstance(data, dict) else None,
-                            agent_ids if isinstance(agent_ids, list) else [],
-                            'success' if ok else 'failed',
-                            '' if ok else str(data),
-                        )
-                        results.append({
-                            'agent_key': row.get('agent_key'),
-                            'service_name': row.get('service_name'),
-                            'success': ok,
-                            'status_code': status_code,
-                            'helper_session_id': data.get('session_id') if isinstance(data, dict) else None,
-                            'helper_agent_ids': agent_ids if isinstance(agent_ids, list) else [],
-                            'response': data,
-                        })
+                            results.append({
+                                'agent_key': row.get('agent_key'),
+                                'service_name': row.get('service_name'),
+                                'success': True,
+                                'status_code': 200,
+                                'helper_session_id': None,
+                                'helper_agent_ids': helper_agent_ids,
+                                'response': {'mode': 'invoke', 'session_required': False},
+                            })
+                        else:
+                            data, status_code = self._call_ai_helper_api(
+                                project_id,
+                                str(row.get('agent_key') or ''),
+                                str(row.get('service_name') or ''),
+                                'POST',
+                                '/api/ai-agents/sessions',
+                                helper_payload,
+                            )
+                            ok = status_code < 300 and isinstance(data, dict) and bool(data.get('session_id'))
+                            if ok:
+                                success_count += 1
+                            agent_ids = data.get('agent_ids') if isinstance(data, dict) else []
+                            self._upsert_ai_batch_item(
+                                batch_id,
+                                project_id,
+                                str(row.get('agent_key') or ''),
+                                str(row.get('service_name') or ''),
+                                data.get('session_id') if isinstance(data, dict) else None,
+                                agent_ids if isinstance(agent_ids, list) else [],
+                                'success' if ok else 'failed',
+                                '' if ok else str(data),
+                            )
+                            results.append({
+                                'agent_key': row.get('agent_key'),
+                                'service_name': row.get('service_name'),
+                                'success': ok,
+                                'status_code': status_code,
+                                'helper_session_id': data.get('session_id') if isinstance(data, dict) else None,
+                                'helper_agent_ids': agent_ids if isinstance(agent_ids, list) else [],
+                                'response': data,
+                            })
                     except Exception as exc:
                         self._upsert_ai_batch_item(
                             batch_id,
@@ -7534,6 +7666,19 @@ class WebAPIServer:
                     items_table = self.db_manager.get_table_name('ai_agent_session_batch_items')
                     messages_table = self.db_manager.get_table_name('ai_agent_session_batch_messages')
                     batch_table = self.db_manager.get_table_name('ai_agent_session_batches')
+                    request_payload = {}
+                    raw_request = batch.get('request_json')
+                    if raw_request:
+                        try:
+                            request_payload = json.loads(raw_request) if isinstance(raw_request, str) else (raw_request or {})
+                        except Exception:
+                            request_payload = {}
+                    helper_mode_map = {}
+                    for cfg_item in (request_payload.get('helpers') if isinstance(request_payload, dict) else []) or []:
+                        if not isinstance(cfg_item, dict):
+                            continue
+                        key = f"{str(cfg_item.get('agent_key') or '').strip()}::{str(cfg_item.get('service_name') or '').strip()}"
+                        helper_mode_map[key] = str(cfg_item.get('session_mode') or request_payload.get('session_mode') or 'invoke').strip().lower()
                     items = self.db_manager.fetch_all(
                         f"SELECT agent_key, service_name, helper_session_id FROM {items_table} WHERE batch_id = %s ORDER BY agent_key, service_name"
                         if self.db_manager.db_type == 'mysql' else
@@ -7542,15 +7687,20 @@ class WebAPIServer:
                     ) or []
                     helper_cleanup = []
                     for item in items:
+                        item_mode = helper_mode_map.get(
+                            f"{str(item.get('agent_key') or '').strip()}::{str(item.get('service_name') or '').strip()}",
+                            str((request_payload.get('session_mode') if isinstance(request_payload, dict) else None) or 'invoke').strip().lower(),
+                        )
                         helper_session_id = str(item.get('helper_session_id') or '').strip()
                         if not helper_session_id:
                             helper_cleanup.append({
                                 'agent_key': item.get('agent_key'),
                                 'service_name': item.get('service_name'),
                                 'session_id': helper_session_id,
-                                'deleted': False,
+                                'deleted': item_mode == 'invoke',
                                 'status_code': 0,
-                                'error': 'missing helper_session_id',
+                                'error': '' if item_mode == 'invoke' else 'missing helper_session_id',
+                                'skipped': item_mode == 'invoke',
                             })
                             continue
                         try:
@@ -7705,6 +7855,19 @@ class WebAPIServer:
                     (batch_id,)
                 ) or []
                 next_round = int((round_rows[0].get('max_round') if round_rows else 0) or 0) + 1
+                request_payload = {}
+                raw_request = batch.get('request_json')
+                if raw_request:
+                    try:
+                        request_payload = json.loads(raw_request) if isinstance(raw_request, str) else (raw_request or {})
+                    except Exception:
+                        request_payload = {}
+                helper_mode_map = {}
+                for cfg_item in (request_payload.get('helpers') if isinstance(request_payload, dict) else []) or []:
+                    if not isinstance(cfg_item, dict):
+                        continue
+                    key = f"{str(cfg_item.get('agent_key') or '').strip()}::{str(cfg_item.get('service_name') or '').strip()}"
+                    helper_mode_map[key] = str(cfg_item.get('session_mode') or request_payload.get('session_mode') or 'invoke').strip().lower()
 
                 if stream:
                     def _batch_stream():
@@ -7722,10 +7885,69 @@ class WebAPIServer:
                             success_count = 0
                             for item in item_rows:
                                 helper_session_id = str(item.get('helper_session_id') or '').strip()
+                                item_mode = helper_mode_map.get(
+                                    f"{str(item.get('agent_key') or '').strip()}::{str(item.get('service_name') or '').strip()}",
+                                    str((request_payload.get('session_mode') if isinstance(request_payload, dict) else None) or 'invoke').strip().lower(),
+                                )
                                 item_key = {
                                     'agent_key': item.get('agent_key'),
                                     'service_name': item.get('service_name'),
                                 }
+                                helper_agent_ids = []
+                                raw_helper_agent_ids = item.get('helper_agent_ids_json')
+                                if raw_helper_agent_ids:
+                                    try:
+                                        helper_agent_ids = json.loads(raw_helper_agent_ids) if isinstance(raw_helper_agent_ids, str) else list(raw_helper_agent_ids or [])
+                                    except Exception:
+                                        helper_agent_ids = []
+                                if item_mode == 'invoke':
+                                    try:
+                                        invoke_payload = {'role': role, 'content': content}
+                                        if helper_agent_ids:
+                                            invoke_payload['agent_ids'] = helper_agent_ids
+                                        data, status_code = self._call_ai_helper_api(
+                                            str(batch.get('project_id') or ''),
+                                            str(item.get('agent_key') or ''),
+                                            str(item.get('service_name') or ''),
+                                            'POST',
+                                            '/api/ai-agents/invoke',
+                                            invoke_payload,
+                                        )
+                                        ok = status_code < 300 and bool(data.get('success', True))
+                                        success_count += 1 if ok else 0
+                                        self._upsert_ai_batch_item(
+                                            batch_id,
+                                            str(batch.get('project_id') or ''),
+                                            str(item.get('agent_key') or ''),
+                                            str(item.get('service_name') or ''),
+                                            None,
+                                            helper_agent_ids,
+                                            'success' if ok else 'failed',
+                                            '' if ok else str(data),
+                                        )
+                                        item_result = {
+                                            **item_key,
+                                            'success': ok,
+                                            'status_code': status_code,
+                                            'response': data,
+                                        }
+                                        results.append(item_result)
+                                        yield f"data: {json.dumps({'type': 'item', 'batch_id': batch_id, **item_result}, ensure_ascii=False)}\n\n"
+                                    except Exception as exc:
+                                        self._upsert_ai_batch_item(
+                                            batch_id,
+                                            str(batch.get('project_id') or ''),
+                                            str(item.get('agent_key') or ''),
+                                            str(item.get('service_name') or ''),
+                                            None,
+                                            helper_agent_ids,
+                                            'failed',
+                                            str(exc),
+                                        )
+                                        item_result = {**item_key, 'success': False, 'error': str(exc)}
+                                        results.append(item_result)
+                                        yield f"data: {json.dumps({'type': 'item', 'batch_id': batch_id, **item_result}, ensure_ascii=False)}\n\n"
+                                    continue
                                 if not helper_session_id:
                                     item_result = {
                                         **item_key,
@@ -7736,13 +7958,6 @@ class WebAPIServer:
                                     yield f"data: {json.dumps({'type': 'item', 'batch_id': batch_id, **item_result}, ensure_ascii=False)}\n\n"
                                     continue
                                 try:
-                                    helper_agent_ids = []
-                                    raw_helper_agent_ids = item.get('helper_agent_ids_json')
-                                    if raw_helper_agent_ids:
-                                        try:
-                                            helper_agent_ids = json.loads(raw_helper_agent_ids) if isinstance(raw_helper_agent_ids, str) else list(raw_helper_agent_ids or [])
-                                        except Exception:
-                                            helper_agent_ids = []
                                     data, status_code = self._call_ai_helper_api(
                                         str(batch.get('project_id') or ''),
                                         str(item.get('agent_key') or ''),
@@ -7836,6 +8051,67 @@ class WebAPIServer:
                 success_count = 0
                 for item in item_rows:
                     helper_session_id = str(item.get('helper_session_id') or '').strip()
+                    item_mode = helper_mode_map.get(
+                        f"{str(item.get('agent_key') or '').strip()}::{str(item.get('service_name') or '').strip()}",
+                        str((request_payload.get('session_mode') if isinstance(request_payload, dict) else None) or 'invoke').strip().lower(),
+                    )
+                    helper_agent_ids = []
+                    raw_helper_agent_ids = item.get('helper_agent_ids_json')
+                    if raw_helper_agent_ids:
+                        try:
+                            helper_agent_ids = json.loads(raw_helper_agent_ids) if isinstance(raw_helper_agent_ids, str) else list(raw_helper_agent_ids or [])
+                        except Exception:
+                            helper_agent_ids = []
+                    if item_mode == 'invoke':
+                        try:
+                            invoke_payload = {'role': role, 'content': content}
+                            if helper_agent_ids:
+                                invoke_payload['agent_ids'] = helper_agent_ids
+                            data, status_code = self._call_ai_helper_api(
+                                str(batch.get('project_id') or ''),
+                                str(item.get('agent_key') or ''),
+                                str(item.get('service_name') or ''),
+                                'POST',
+                                '/api/ai-agents/invoke',
+                                invoke_payload,
+                            )
+                            ok = status_code < 300 and bool(data.get('success', True))
+                            success_count += 1 if ok else 0
+                            self._upsert_ai_batch_item(
+                                batch_id,
+                                str(batch.get('project_id') or ''),
+                                str(item.get('agent_key') or ''),
+                                str(item.get('service_name') or ''),
+                                None,
+                                helper_agent_ids,
+                                'success' if ok else 'failed',
+                                '' if ok else str(data),
+                            )
+                            results.append({
+                                'agent_key': item.get('agent_key'),
+                                'service_name': item.get('service_name'),
+                                'success': ok,
+                                'status_code': status_code,
+                                'response': data,
+                            })
+                        except Exception as exc:
+                            self._upsert_ai_batch_item(
+                                batch_id,
+                                str(batch.get('project_id') or ''),
+                                str(item.get('agent_key') or ''),
+                                str(item.get('service_name') or ''),
+                                None,
+                                helper_agent_ids,
+                                'failed',
+                                str(exc),
+                            )
+                            results.append({
+                                'agent_key': item.get('agent_key'),
+                                'service_name': item.get('service_name'),
+                                'success': False,
+                                'error': str(exc),
+                            })
+                        continue
                     if not helper_session_id:
                         results.append({
                             'agent_key': item.get('agent_key'),
@@ -7845,13 +8121,6 @@ class WebAPIServer:
                         })
                         continue
                     try:
-                        helper_agent_ids = []
-                        raw_helper_agent_ids = item.get('helper_agent_ids_json')
-                        if raw_helper_agent_ids:
-                            try:
-                                helper_agent_ids = json.loads(raw_helper_agent_ids) if isinstance(raw_helper_agent_ids, str) else list(raw_helper_agent_ids or [])
-                            except Exception:
-                                helper_agent_ids = []
                         data, status_code = self._call_ai_helper_api(
                             str(batch.get('project_id') or ''),
                             str(item.get('agent_key') or ''),
@@ -8377,169 +8646,275 @@ class WebAPIServer:
 
         @self.app.route('/api/agent/services/global/sync', methods=['POST'])
         def sync_global_services_now():
-            """手动触发聚合同步（支持全量/项目/单Agent强制同步）。"""
+            """手动触发聚合同步（支持全量/项目/单Agent强制同步，强制等待刷新锁后执行）。"""
             try:
                 data = request.get_json(silent=True) or {}
                 project_id = data.get('project_id')
                 agent_key = data.get('agent_key')
                 stale_only = bool(data.get('stale_only', False))
+                lock_timeout_sec = max(5, int(data.get('leader_lock_timeout_sec', self.config.get('leader_lock_timeout_sec', 90)) or 90))
+                lock_poll_interval_sec = max(0.2, float(data.get('lock_poll_interval_sec', 1.0) or 1.0))
+                # 0 表示无限等待（默认）
+                lock_wait_timeout_sec = max(0, int(data.get('lock_wait_timeout_sec', 0) or 0))
 
-                # 1) 单Agent强制同步
-                if agent_key:
-                    agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
-                    if not agent:
-                        return jsonify({'error': f'Agent {agent_key} not found'}), 404
-                    result = self._sync_single_agent_services(agent)
-                    self._record_service_sync_log(
-                        scope='agent',
-                        status='ok' if result.get('ok') else 'failed',
-                        agent_key=agent_key,
-                        stale_only=False,
-                        total=1,
-                        ok_count=1 if result.get('ok') else 0,
-                        fail_count=0 if result.get('ok') else 1,
-                        message='agent service sync completed',
-                        details=[result]
-                    )
-                    return jsonify({
-                        'message': 'agent service sync triggered',
-                        'status': 'ok' if result.get('ok') else 'failed',
-                        'result': result
-                    }), 200 if result.get('ok') else 502
+                scope = 'agent' if agent_key else ('project' if project_id else 'global')
+                sync_id = self._record_service_sync_log(
+                    scope=scope,
+                    status='queued',
+                    project_id=project_id,
+                    agent_key=agent_key,
+                    stale_only=stale_only,
+                    total=0,
+                    ok_count=0,
+                    fail_count=0,
+                    message='sync task created, waiting refresh leader lock',
+                    details=[{
+                        'phase': 'queued',
+                        'pod_id': self.config.get('pod_id'),
+                    }],
+                )
+                wait_started_at = time.time()
+                waited_rounds = 0
 
-                # 2) 项目范围强制同步
-                if project_id:
-                    agents, _ = self.agent_manager.list_agents(page=1, per_page=5000, project_id=project_id)
-                    stale_keys = self._get_stale_agent_keys(project_id) if stale_only else set()
-                    results = []
-                    candidate_total = 0
-                    for item in agents:
-                        item_status = str(item.get('status') or '').strip().lower()
-                        item_key = str(item.get('key') or '').strip()
-                        if item_status != 'online':
-                            continue
-                        if stale_only and item_key not in stale_keys:
-                            continue
-                        candidate_total += 1
-                        agent = self.agent_manager.get_agent(item_key)
-                        if not agent:
-                            continue
-                        results.append(self._sync_single_agent_services(agent))
-                    ok_count = len([r for r in results if r.get('ok')])
-                    fail_count = len(results) - ok_count
-                    status_label = 'ok' if fail_count == 0 else 'partial'
-                    message = 'project service sync completed'
-                    if candidate_total == 0:
-                        status_label = 'empty'
-                        message = 'no online agents matched current sync scope'
-                    self._record_service_sync_log(
-                        scope='project',
-                        status=status_label,
-                        project_id=project_id,
-                        stale_only=stale_only,
-                        total=len(results),
-                        ok_count=ok_count,
-                        fail_count=fail_count,
-                        message=message,
-                        details=results
-                    )
-                    return jsonify({
-                        'message': message,
-                        'status': status_label,
-                        'project_id': project_id,
-                        'stale_only': stale_only,
-                        'candidate_total': candidate_total,
-                        'total': len(results),
-                        'ok_count': ok_count,
-                        'fail_count': fail_count,
-                        'results': results
-                    })
+                while True:
+                    waited_rounds += 1
+                    with self.redis_manager.get_lock(self.refresh_leader_lock_key, timeout=lock_timeout_sec) as lock:
+                        if lock.is_acquired():
+                            lock_wait_sec = max(0.0, time.time() - wait_started_at)
+                            self._record_service_sync_log(
+                                scope=scope,
+                                status='running',
+                                project_id=project_id,
+                                agent_key=agent_key,
+                                stale_only=stale_only,
+                                total=0,
+                                ok_count=0,
+                                fail_count=0,
+                                message=f'refresh leader lock acquired, waited {lock_wait_sec:.1f}s',
+                                details=[{
+                                    'phase': 'running',
+                                    'lock_wait_sec': round(lock_wait_sec, 3),
+                                    'wait_rounds': waited_rounds,
+                                    'lock_timeout_sec': lock_timeout_sec,
+                                }],
+                                sync_id=sync_id,
+                            )
 
-                # 3) 全量同步（默认）
-                if stale_only:
-                    agents = []
-                    page = 1
-                    per_page = 1000
-                    while True:
-                        batch, total = self.agent_manager.list_agents(page=page, per_page=per_page)
-                        if not batch:
-                            break
-                        agents.extend(batch)
-                        if len(agents) >= total:
-                            break
-                        page += 1
+                            # 1) 单Agent强制同步
+                            if agent_key:
+                                agent = self.agent_manager.get_agent(agent_key) or self.agent_manager.ensure_agent_exists(agent_key)
+                                if not agent:
+                                    self._record_service_sync_log(
+                                        scope='agent',
+                                        status='failed',
+                                        project_id=project_id,
+                                        agent_key=agent_key,
+                                        stale_only=False,
+                                        total=0,
+                                        ok_count=0,
+                                        fail_count=1,
+                                        message=f'Agent {agent_key} not found',
+                                        details=[],
+                                        sync_id=sync_id,
+                                    )
+                                    return jsonify({'error': f'Agent {agent_key} not found', 'sync_id': sync_id}), 404
+                                result = self._sync_single_agent_services(agent)
+                                result_status = 'ok' if result.get('ok') else 'failed'
+                                self._record_service_sync_log(
+                                    scope='agent',
+                                    status=result_status,
+                                    project_id=project_id,
+                                    agent_key=agent_key,
+                                    stale_only=False,
+                                    total=1,
+                                    ok_count=1 if result.get('ok') else 0,
+                                    fail_count=0 if result.get('ok') else 1,
+                                    message='agent service sync completed',
+                                    details=[result],
+                                    sync_id=sync_id,
+                                )
+                                return jsonify({
+                                    'sync_id': sync_id,
+                                    'message': 'agent service sync triggered',
+                                    'status': result_status,
+                                    'lock_wait_sec': round(lock_wait_sec, 3),
+                                    'result': result
+                                }), 200 if result.get('ok') else 502
 
-                    stale_keys = self._get_stale_agent_keys()
-                    results = []
-                    candidate_total = 0
-                    for item in agents:
-                        item_status = str(item.get('status') or '').strip().lower()
-                        item_key = str(item.get('key') or '').strip()
-                        if item_status != 'online':
-                            continue
-                        if item_key not in stale_keys:
-                            continue
-                        candidate_total += 1
-                        agent = self.agent_manager.get_agent(item_key)
-                        if not agent:
-                            continue
-                        results.append(self._sync_single_agent_services(agent))
-                    ok_count = len([r for r in results if r.get('ok')])
-                    fail_count = len(results) - ok_count
-                    status_label = 'ok' if fail_count == 0 else 'partial'
-                    message = 'global stale-agent service sync completed'
-                    if candidate_total == 0:
-                        status_label = 'empty'
-                        message = 'no online stale agents found'
-                    self._record_service_sync_log(
-                        scope='global',
-                        status=status_label,
-                        stale_only=True,
-                        total=len(results),
-                        ok_count=ok_count,
-                        fail_count=fail_count,
-                        message=message,
-                        details=results
-                    )
-                    return jsonify({
-                        'message': message,
-                        'status': status_label,
-                        'stale_only': True,
-                        'candidate_total': candidate_total,
-                        'total': len(results),
-                        'ok_count': ok_count,
-                        'fail_count': fail_count,
-                        'results': results
-                    })
-                else:
-                    summary = self._sync_all_agent_services()
-                    details = summary.get('results') or []
-                    total = int(summary.get('online_agents') or 0)
-                    ok_count = int(summary.get('ok_count') or 0)
-                    fail_count = int(summary.get('fail_count') or 0)
-                    self._record_service_sync_log(
-                        scope='global',
-                        status='ok' if fail_count == 0 else 'partial',
-                        stale_only=False,
-                        total=total,
-                        ok_count=ok_count,
-                        fail_count=fail_count,
-                        message='global service sync completed',
-                        details=details
-                    )
-                    return jsonify({
-                        'message': 'global service sync completed',
-                        'status': 'ok' if fail_count == 0 else 'partial',
-                        'total': total,
-                        'ok_count': ok_count,
-                        'fail_count': fail_count,
-                        'results': details
-                    })
+                            # 2) 项目范围强制同步
+                            if project_id:
+                                agents, _ = self.agent_manager.list_agents(page=1, per_page=5000, project_id=project_id)
+                                stale_keys = self._get_stale_agent_keys(project_id) if stale_only else set()
+                                results = []
+                                candidate_total = 0
+                                for item in agents:
+                                    item_status = str(item.get('status') or '').strip().lower()
+                                    item_key = str(item.get('key') or '').strip()
+                                    if item_status != 'online':
+                                        continue
+                                    if stale_only and item_key not in stale_keys:
+                                        continue
+                                    candidate_total += 1
+                                    agent = self.agent_manager.get_agent(item_key)
+                                    if not agent:
+                                        continue
+                                    results.append(self._sync_single_agent_services(agent))
+                                ok_count = len([r for r in results if r.get('ok')])
+                                fail_count = len(results) - ok_count
+                                status_label = 'ok' if fail_count == 0 else 'partial'
+                                message = 'project service sync completed'
+                                if candidate_total == 0:
+                                    status_label = 'empty'
+                                    message = 'no online agents matched current sync scope'
+                                self._record_service_sync_log(
+                                    scope='project',
+                                    status=status_label,
+                                    project_id=project_id,
+                                    stale_only=stale_only,
+                                    total=len(results),
+                                    ok_count=ok_count,
+                                    fail_count=fail_count,
+                                    message=message,
+                                    details=results,
+                                    sync_id=sync_id,
+                                )
+                                return jsonify({
+                                    'sync_id': sync_id,
+                                    'message': message,
+                                    'status': status_label,
+                                    'project_id': project_id,
+                                    'stale_only': stale_only,
+                                    'lock_wait_sec': round(lock_wait_sec, 3),
+                                    'candidate_total': candidate_total,
+                                    'total': len(results),
+                                    'ok_count': ok_count,
+                                    'fail_count': fail_count,
+                                    'results': results
+                                })
+
+                            # 3) 全量同步（默认）
+                            if stale_only:
+                                agents = []
+                                page = 1
+                                per_page = 1000
+                                while True:
+                                    batch, total = self.agent_manager.list_agents(page=page, per_page=per_page)
+                                    if not batch:
+                                        break
+                                    agents.extend(batch)
+                                    if len(agents) >= total:
+                                        break
+                                    page += 1
+
+                                stale_keys = self._get_stale_agent_keys()
+                                results = []
+                                candidate_total = 0
+                                for item in agents:
+                                    item_status = str(item.get('status') or '').strip().lower()
+                                    item_key = str(item.get('key') or '').strip()
+                                    if item_status != 'online':
+                                        continue
+                                    if item_key not in stale_keys:
+                                        continue
+                                    candidate_total += 1
+                                    agent = self.agent_manager.get_agent(item_key)
+                                    if not agent:
+                                        continue
+                                    results.append(self._sync_single_agent_services(agent))
+                                ok_count = len([r for r in results if r.get('ok')])
+                                fail_count = len(results) - ok_count
+                                status_label = 'ok' if fail_count == 0 else 'partial'
+                                message = 'global stale-agent service sync completed'
+                                if candidate_total == 0:
+                                    status_label = 'empty'
+                                    message = 'no online stale agents found'
+                                self._record_service_sync_log(
+                                    scope='global',
+                                    status=status_label,
+                                    stale_only=True,
+                                    total=len(results),
+                                    ok_count=ok_count,
+                                    fail_count=fail_count,
+                                    message=message,
+                                    details=results,
+                                    sync_id=sync_id,
+                                )
+                                return jsonify({
+                                    'sync_id': sync_id,
+                                    'message': message,
+                                    'status': status_label,
+                                    'stale_only': True,
+                                    'lock_wait_sec': round(lock_wait_sec, 3),
+                                    'candidate_total': candidate_total,
+                                    'total': len(results),
+                                    'ok_count': ok_count,
+                                    'fail_count': fail_count,
+                                    'results': results
+                                })
+
+                            summary = self._sync_all_agent_services()
+                            details = summary.get('results') or []
+                            total = int(summary.get('online_agents') or 0)
+                            ok_count = int(summary.get('ok_count') or 0)
+                            fail_count = int(summary.get('fail_count') or 0)
+                            status_label = 'ok' if fail_count == 0 else 'partial'
+                            self._record_service_sync_log(
+                                scope='global',
+                                status=status_label,
+                                stale_only=False,
+                                total=total,
+                                ok_count=ok_count,
+                                fail_count=fail_count,
+                                message='global service sync completed',
+                                details=details,
+                                sync_id=sync_id,
+                            )
+                            return jsonify({
+                                'sync_id': sync_id,
+                                'message': 'global service sync completed',
+                                'status': status_label,
+                                'lock_wait_sec': round(lock_wait_sec, 3),
+                                'total': total,
+                                'ok_count': ok_count,
+                                'fail_count': fail_count,
+                                'results': details
+                            })
+
+                    waited_sec = time.time() - wait_started_at
+                    if lock_wait_timeout_sec > 0 and waited_sec >= lock_wait_timeout_sec:
+                        self._record_service_sync_log(
+                            scope=scope,
+                            status='failed',
+                            project_id=project_id,
+                            agent_key=agent_key,
+                            stale_only=stale_only,
+                            total=0,
+                            ok_count=0,
+                            fail_count=1,
+                            message=f'wait refresh leader lock timeout after {waited_sec:.1f}s',
+                            details=[{
+                                'phase': 'lock_timeout',
+                                'lock_wait_sec': round(waited_sec, 3),
+                                'wait_rounds': waited_rounds,
+                                'lock_timeout_sec': lock_timeout_sec,
+                            }],
+                            sync_id=sync_id,
+                        )
+                        return jsonify({
+                            'error': 'wait refresh leader lock timeout',
+                            'sync_id': sync_id,
+                            'lock_wait_sec': round(waited_sec, 3),
+                            'wait_rounds': waited_rounds,
+                        }), 409
+
+                    time.sleep(lock_poll_interval_sec)
             except Exception as e:
                 self.logger.error(f"手动触发服务聚合同步失败: {e}", exc_info=True)
                 try:
                     self._record_service_sync_log(
-                        scope='global',
+                        scope='agent' if str((request.get_json(silent=True) or {}).get('agent_key') or '').strip() else (
+                            'project' if str((request.get_json(silent=True) or {}).get('project_id') or '').strip() else 'global'
+                        ),
                         status='failed',
                         message=f'service sync failed: {e}'
                     )

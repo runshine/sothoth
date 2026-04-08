@@ -74,6 +74,10 @@ DEFAULT_CONFIG = {
     'leader_lock_timeout_sec': 90,
     # Agent 缺失离线宽限期（秒）：避免多副本/多节点下瞬时发现不一致导致状态横跳
     'agent_offline_grace_sec': 120,
+    # Agent在线状态陈旧提示阈值（秒），用于列表页面提示，不直接改写状态
+    'agent_status_stale_hint_sec': 300,
+    # Agent 刷新探测并发度（每轮refresh）
+    'agent_refresh_probe_workers': 8,
     'max_workers': 10,
     'enable_task_workers': True,
     'task_worker_count': 5,

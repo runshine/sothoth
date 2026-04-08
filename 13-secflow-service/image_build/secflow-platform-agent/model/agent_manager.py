@@ -13,7 +13,7 @@ import tempfile
 import threading
 import logging
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -46,7 +46,9 @@ class AgentManager:
                  daemon_api_port: int = 11188,
                  daemon_auth_header: str = 'X-API-Token',
                  daemon_auth_token: str = None,
-                 agent_offline_grace_sec: int = 120):
+                 agent_offline_grace_sec: int = 120,
+                 agent_status_stale_hint_sec: int = 300,
+                 agent_refresh_probe_workers: int = 8):
         self.nacos_url = nacos_url.rstrip('/')
         self.nacos_namespace = nacos_namespace
         self.agent_api_port = agent_api_port
@@ -58,6 +60,8 @@ class AgentManager:
         self.redis_manager = redis_manager
         self.pod_id = pod_id
         self.agent_offline_grace_sec = max(int(agent_offline_grace_sec or 0), 0)
+        self.agent_status_stale_hint_sec = max(int(agent_status_stale_hint_sec or 0), 0)
+        self.agent_refresh_probe_workers = max(1, int(agent_refresh_probe_workers or 1))
 
         # 新增：Nacos认证信息
         self.nacos_username = nacos_username
@@ -773,36 +777,42 @@ class AgentManager:
             )
             return
 
-        new_agents = {}
+        def _process_single_service(service_name: str) -> Dict[str, Any]:
+            outcome: Dict[str, Any] = {
+                'parse_skipped': 0,
+                'unhealthy_skipped': 0,
+                'key_missing_skipped': 0,
+                'agent': None,
+            }
+            try:
+                result = self._parse_agent_name(service_name)
+                if not result:
+                    outcome['parse_skipped'] = 1
+                    return outcome
 
-        for service in services:
-            result = self._parse_agent_name(service)
-            if result:
                 project_id, parsed_agent_key, hostname, ip_address = result
-
-                if not self._has_healthy_nacos_client_instance(service, ip_address):
-                    self.logger.debug(f"跳过无健康实例的agent服务: {service}")
-                    unhealthy_skipped += 1
-                    continue
+                if not self._has_healthy_nacos_client_instance(service_name, ip_address):
+                    self.logger.debug(f"跳过无健康实例的agent服务: {service_name}")
+                    outcome['unhealthy_skipped'] = 1
+                    return outcome
 
                 # 优先使用服务名中的稳定agent_id，避免因service_ip变化导致映射抖动。
                 agent_key = str(parsed_agent_key or '').strip()
                 if not agent_key:
                     # 兼容旧格式：回退到metadata.uuid读取
-                    agent_key = self._get_agent_key(hostname, ip_address, service)
+                    agent_key = self._get_agent_key(hostname, ip_address, service_name)
 
-                # 如果没有获取到有效的agent_key，跳过这个agent
                 if not agent_key:
-                    self.logger.debug(f"跳过无效的agent: {hostname} ({ip_address}), 服务: {service}")
-                    key_missing_skipped += 1
-                    continue
+                    self.logger.debug(f"跳过无效的agent: {hostname} ({ip_address}), 服务: {service_name}")
+                    outcome['key_missing_skipped'] = 1
+                    return outcome
 
                 agent = AgentInfo(
                     key=agent_key,
                     ip_address=ip_address,
                     hostname=hostname,
                     project_id=project_id,
-                    full_name=service,
+                    full_name=service_name,
                     status='unknown',
                     pod_id=self.pod_id
                 )
@@ -822,9 +832,30 @@ class AgentManager:
                     reason_message=f"refresh probe result: {agent.status}",
                     source='refresh_probe'
                 )
-                new_agents[agent_key] = agent
-            else:
-                parse_skipped += 1
+                outcome['agent'] = agent
+                return outcome
+            except Exception as e:
+                self.logger.warning(f"刷新单个Agent失败: service={service_name}, err={e}")
+                outcome['parse_skipped'] = 1
+                return outcome
+
+        new_agents: Dict[str, AgentInfo] = {}
+        probe_workers = max(1, min(self.agent_refresh_probe_workers, len(services)))
+        with ThreadPoolExecutor(max_workers=probe_workers) as executor:
+            futures = [executor.submit(_process_single_service, str(service or '').strip()) for service in services]
+            for future in as_completed(futures):
+                outcome = future.result() if future else {}
+                parse_skipped += int((outcome or {}).get('parse_skipped') or 0)
+                unhealthy_skipped += int((outcome or {}).get('unhealthy_skipped') or 0)
+                key_missing_skipped += int((outcome or {}).get('key_missing_skipped') or 0)
+                agent = (outcome or {}).get('agent')
+                if not isinstance(agent, AgentInfo):
+                    continue
+                # 同一agent_key若有重复结果，优先保留online状态记录。
+                existing = new_agents.get(agent.key)
+                if existing and str(existing.status or '').lower() == 'online' and str(agent.status or '').lower() != 'online':
+                    continue
+                new_agents[agent.key] = agent
 
         self._mark_missing_agents_offline(set(new_agents.keys()))
 
@@ -1334,12 +1365,12 @@ class AgentManager:
         try:
             if self.db.db_type == 'mysql':
                 prev_row = self.db.fetch_one(
-                    f"SELECT status, system_info, daemon_info, services FROM {table_name} WHERE agent_key = %s LIMIT 1",
+                    f"SELECT status, system_info, daemon_info, services, last_seen, updated_at FROM {table_name} WHERE agent_key = %s LIMIT 1",
                     (agent.key,)
                 )
             else:
                 prev_row = self.db.fetch_one(
-                    f"SELECT status, system_info, daemon_info, services FROM {table_name} WHERE agent_key = ? LIMIT 1",
+                    f"SELECT status, system_info, daemon_info, services, last_seen, updated_at FROM {table_name} WHERE agent_key = ? LIMIT 1",
                     (agent.key,)
                 )
             if not isinstance(prev_row, dict):
@@ -1374,6 +1405,9 @@ class AgentManager:
             prev_system_info = _parse_prev_json(prev_row.get('system_info'), {})
             prev_daemon_info = _parse_prev_json(prev_row.get('daemon_info'), {})
             prev_services = _parse_prev_json(prev_row.get('services'), [])
+            prev_last_seen = self._latest_stale_reference(prev_row.get('last_seen'), None)
+            prev_updated_at = self._latest_stale_reference(None, prev_row.get('updated_at'))
+            now = datetime.now()
 
             # 关键修复：本轮详情拉取失败时，不允许用空值覆盖历史有效快照。
             if (not _is_non_empty_dict(agent.system_info)) and _is_non_empty_dict(prev_system_info):
@@ -1382,6 +1416,17 @@ class AgentManager:
                 agent.daemon_info = prev_daemon_info
             if (not _is_non_empty_list(agent.services)) and _is_non_empty_list(prev_services):
                 agent.services = prev_services
+
+            # 刷新探测路径的降级保护：
+            # 当上一次状态仍在在线宽限期内时，避免一次探测失败把在线状态抖动为离线/异常。
+            current_status = str(agent.status or '').lower()
+            previous_status = str(prev_status or '').lower()
+            if source in {'refresh_probe', 'refresh'} and previous_status == 'online' and current_status != 'online':
+                stale_ref = self._latest_stale_reference(prev_last_seen, prev_updated_at)
+                if stale_ref and (now - stale_ref).total_seconds() <= self.agent_offline_grace_sec:
+                    agent.status = 'online'
+                    if not agent.last_seen and prev_last_seen:
+                        agent.last_seen = prev_last_seen
 
             system_info_json = json.dumps(agent.system_info) if agent.system_info else '{}'
             daemon_info_json = json.dumps(agent.daemon_info) if agent.daemon_info else '{}'
@@ -1805,68 +1850,22 @@ class AgentManager:
             return data
 
         lock_acquired = False
+        where_sql = "WHERE project_id = %s" if (project_id and self.db.db_type == 'mysql') else (
+            "WHERE project_id = ?" if project_id else ""
+        )
+        params: Tuple[Any, ...] = (project_id,) if project_id else tuple()
+        placeholder = "%s" if self.db.db_type == 'mysql' else "?"
 
-        if project_id:
-            if self.db.db_type == 'mysql':
-                rows = self.db.fetch_all(
-                    f"SELECT * FROM {table_name} WHERE project_id = %s ORDER BY updated_at DESC",
-                    (project_id,)
-                )
-            else:
-                rows = self.db.fetch_all(
-                    f"SELECT * FROM {table_name} WHERE project_id = ? ORDER BY updated_at DESC",
-                    (project_id,)
-                )
+        count_query = f"SELECT COUNT(*) AS count FROM {table_name} {where_sql}"
+        count_row = self.db.fetch_one(count_query, params) or {}
+        total = int(count_row.get('count') or 0)
 
-            agents_map: Dict[str, Dict] = {}
-            for row in rows or []:
-                decoded = _decode_row(row)
-                if decoded:
-                    agents_map[decoded['key']] = decoded
-
-            agents_list = list(agents_map.values())
-            refresh_diag = self.get_last_refresh_diag()
-            generated_at = datetime.now().isoformat()
-            for item in agents_list:
-                status = (item.get('status') or 'unknown').lower()
-                stale_ref = self._latest_stale_reference(item.get('last_seen'), item.get('updated_at'))
-                if status == 'online' and stale_ref:
-                    try:
-                        # 仅输出陈旧提示，不在读路径改写在线状态，避免与上下线事件日志不一致。
-                        if datetime.now() - stale_ref > timedelta(minutes=5):
-                            item['status_reason'] = '节点超过5分钟未上报心跳（提示），状态以后端实际写库为准'
-                    except Exception:
-                        pass
-                item['is_allowed'] = status == 'online'
-                item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
-                item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
-                item['diag_list_generated_at'] = generated_at
-                item['diag_last_refresh_completed_at'] = refresh_diag.get('completed_at')
-                item['diag_last_refresh_success'] = refresh_diag.get('success')
-
-            total = len(agents_list)
-            start_idx = (page - 1) * per_page
-            end_idx = start_idx + per_page
-            self._set_list_diag(
-                generated_at=datetime.now().isoformat(),
-                project_id=project_id,
-                memory_lock_acquired=lock_acquired,
-                memory_agents_count=0,
-                db_rows_count=len(rows or []),
-            )
-            return agents_list[start_idx:end_idx], total
-
-        if self.db.db_type == 'mysql':
-            rows = self.db.fetch_all(
-                f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
-            )
-        else:
-            rows = self.db.fetch_all(
-                f"SELECT * FROM {table_name} ORDER BY updated_at DESC"
-            )
+        offset = max(0, (page - 1) * per_page)
+        query = f"SELECT * FROM {table_name} {where_sql} ORDER BY updated_at DESC LIMIT {placeholder} OFFSET {placeholder}"
+        rows = self.db.fetch_all(query, tuple(list(params) + [per_page, offset])) or []
 
         agents_map: Dict[str, Dict] = {}
-        for row in rows or []:
+        for row in rows:
             decoded = _decode_row(row)
             if decoded:
                 agents_map[decoded['key']] = decoded
@@ -1874,23 +1873,37 @@ class AgentManager:
         agents_list = list(agents_map.values())
         refresh_diag = self.get_last_refresh_diag()
         generated_at = datetime.now().isoformat()
+        stale_hint_sec = self.agent_status_stale_hint_sec if self.agent_status_stale_hint_sec > 0 else 300
         for item in agents_list:
+            status = (item.get('status') or 'unknown').lower()
+            stale_ref = self._latest_stale_reference(item.get('last_seen'), item.get('updated_at'))
+            if status == 'online' and stale_ref:
+                try:
+                    # 仅输出陈旧提示，不在读路径改写在线状态，避免与上下线事件日志不一致。
+                    if (datetime.now() - stale_ref).total_seconds() > stale_hint_sec:
+                        stale_minutes = round(stale_hint_sec / 60.0, 1)
+                        item['status_reason'] = f'节点超过{stale_minutes}分钟未上报心跳（提示），状态以后端实际写库为准'
+                except Exception:
+                    pass
+
+            item['is_allowed'] = status == 'online'
+            item['is_offline'] = status in {'offline', 'error', 'timeout', 'unknown'}
+            item['allow_reason'] = '在线可调度' if item['is_allowed'] else f"状态为 {status}，不可调度"
             item.setdefault('diag_data_source', 'db_snapshot')
             item.setdefault('diag_memory_enriched', False)
             item['diag_list_generated_at'] = generated_at
             item['diag_last_refresh_completed_at'] = refresh_diag.get('completed_at')
             item['diag_last_refresh_success'] = refresh_diag.get('success')
-        total = len(agents_list)
-        start_idx = (page - 1) * per_page
-        end_idx = start_idx + per_page
+
         self._set_list_diag(
             generated_at=generated_at,
             project_id=project_id,
             memory_lock_acquired=lock_acquired,
             memory_agents_count=0,
-            db_rows_count=len(rows or []),
+            db_rows_count=total,
+            db_page_rows=len(rows),
         )
-        return agents_list[start_idx:end_idx], total
+        return agents_list, total
 
     def call_agent_api(self, agent_key: str, method: str, endpoint: str,
                        data: Any = None, params: Dict = None,
