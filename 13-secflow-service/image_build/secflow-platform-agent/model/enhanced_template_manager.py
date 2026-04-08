@@ -522,7 +522,6 @@ class EnhancedTemplateManager:
                 raise ValueError(f"LLM Provider 目标服务不存在: {', '.join(missing)}")
 
         mapped_file_paths: List[str] = []
-        llm_service_configs: Dict[str, Dict[str, Any]] = {}
         if merged_files:
             if template_dir is None:
                 raise ValueError('模板目录不存在，无法写入 LLM Provider 文件')
@@ -530,10 +529,6 @@ class EnhancedTemplateManager:
             if llm_files_dir.exists():
                 shutil.rmtree(llm_files_dir, ignore_errors=True)
             llm_files_dir.mkdir(parents=True, exist_ok=True)
-            compose_configs = compose_data.get('configs')
-            if not isinstance(compose_configs, dict):
-                compose_configs = {}
-                compose_data['configs'] = compose_configs
 
             for idx, raw_item in enumerate(merged_files):
                 if not isinstance(raw_item, dict):
@@ -548,13 +543,6 @@ class EnhancedTemplateManager:
                 absolute_file_path = template_dir / relative_file_path
                 absolute_file_path.parent.mkdir(parents=True, exist_ok=True)
                 absolute_file_path.write_text(content, encoding='utf-8')
-
-                config_name = f"llm_file_{self._sanitize_config_name(file_name_token)}"
-                compose_configs[config_name] = {'file': relative_file_path.as_posix()}
-                llm_service_configs[file_path] = {
-                    'source': config_name,
-                    'target': file_path,
-                }
                 mapped_file_paths.append(file_path)
 
         for service_name in selected_services:
@@ -564,15 +552,17 @@ class EnhancedTemplateManager:
             env_map = self._normalize_compose_environment(service_cfg.get('environment'))
             env_map.update({str(k): '' if v is None else str(v) for k, v in merged_env.items()})
             service_cfg['environment'] = env_map
-            if llm_service_configs:
+            if mapped_file_paths:
                 existing_configs = self._normalize_service_configs(service_cfg.get('configs'))
-                target_path_set = set(llm_service_configs.keys())
+                target_path_set = set(mapped_file_paths)
                 cleaned_configs = [
                     item for item in existing_configs
                     if str(item.get('target') or '').strip() not in target_path_set
                 ]
-                cleaned_configs.extend(llm_service_configs.values())
-                service_cfg['configs'] = cleaned_configs
+                if cleaned_configs:
+                    service_cfg['configs'] = cleaned_configs
+                else:
+                    service_cfg.pop('configs', None)
 
         updated_yaml = yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
         return updated_yaml, {

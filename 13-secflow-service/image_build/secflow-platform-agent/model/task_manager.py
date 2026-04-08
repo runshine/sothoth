@@ -424,12 +424,7 @@ class TaskManager:
 
         mapped_file_paths: List[str] = []
         generated_files: List[Dict[str, str]] = []
-        llm_service_configs: Dict[str, Dict[str, Any]] = {}
         if merged_files:
-            compose_configs = compose_data.get('configs')
-            if not isinstance(compose_configs, dict):
-                compose_configs = {}
-                compose_data['configs'] = compose_configs
             for idx, raw_item in enumerate(merged_files):
                 if not isinstance(raw_item, dict):
                     continue
@@ -440,9 +435,6 @@ class TaskManager:
                 file_name_token = hashlib.sha1(file_path.encode('utf-8')).hexdigest()[:12]
                 file_ext = Path(file_path).suffix or '.txt'
                 relative_file_path = Path('.llm-provider-files') / f"{idx + 1:02d}_{file_name_token}{file_ext}"
-                config_name = f"llm_file_{self._sanitize_llm_file_token(file_name_token)}"
-                compose_configs[config_name] = {'file': relative_file_path.as_posix()}
-                llm_service_configs[file_path] = {'source': config_name, 'target': file_path}
                 mapped_file_paths.append(file_path)
                 generated_files.append({'relative_path': relative_file_path.as_posix(), 'content': content})
 
@@ -453,7 +445,7 @@ class TaskManager:
             env_map = self._normalize_compose_environment(service_cfg.get('environment'))
             env_map.update({str(k): '' if v is None else str(v) for k, v in merged_env.items()})
             service_cfg['environment'] = env_map
-            if llm_service_configs:
+            if mapped_file_paths:
                 existing_configs = service_cfg.get('configs')
                 normalized_existing: List[Dict[str, Any]] = []
                 if isinstance(existing_configs, list):
@@ -468,10 +460,12 @@ class TaskManager:
                                 if target:
                                     record['target'] = target
                                 normalized_existing.append(record)
-                target_path_set = set(llm_service_configs.keys())
+                target_path_set = set(mapped_file_paths)
                 cleaned = [item for item in normalized_existing if str(item.get('target') or '').strip() not in target_path_set]
-                cleaned.extend(llm_service_configs.values())
-                service_cfg['configs'] = cleaned
+                if cleaned:
+                    service_cfg['configs'] = cleaned
+                else:
+                    service_cfg.pop('configs', None)
 
         updated_yaml = yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
         return updated_yaml, {
