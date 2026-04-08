@@ -2839,6 +2839,8 @@ class WebAPIServer:
             'service not found',
             'no such service',
             'not found',
+            'does not exist',
+            'not exist',
             'already removed',
             'already deleted',
             '不存在',
@@ -2847,6 +2849,29 @@ class WebAPIServer:
             '未找到',
         )
         return any(marker in text for marker in benign_markers)
+
+    def _delete_service_snapshot_records(self, project_id: str, agent_key: str, service_name: str):
+        """删除服务在平台侧的聚合快照与健康快照，避免删除后长期停留 stale/checking。"""
+        services_table = self.db_manager.get_table_name('agent_services')
+        health_table = self.db_manager.get_table_name('ai_helper_health_snapshots')
+        if self.db_manager.db_type == 'mysql':
+            self.db_manager.execute_query(
+                f"DELETE FROM {services_table} WHERE project_id = %s AND agent_key = %s AND service_name = %s",
+                (project_id, agent_key, service_name)
+            )
+            self.db_manager.execute_query(
+                f"DELETE FROM {health_table} WHERE project_id = %s AND agent_key = %s AND service_name = %s",
+                (project_id, agent_key, service_name)
+            )
+        else:
+            self.db_manager.execute_query(
+                f"DELETE FROM {services_table} WHERE project_id = ? AND agent_key = ? AND service_name = ?",
+                (project_id, agent_key, service_name)
+            )
+            self.db_manager.execute_query(
+                f"DELETE FROM {health_table} WHERE project_id = ? AND agent_key = ? AND service_name = ?",
+                (project_id, agent_key, service_name)
+            )
 
     def _delete_service_bound_ingress_routes(
         self,
@@ -4872,10 +4897,10 @@ class WebAPIServer:
                         if isinstance(names, list):
                             synced_service_names = {str(item).strip() for item in names if str(item).strip()}
                     if sync_result and sync_result.get('ok') and service_name not in synced_service_names:
-                        self._mark_service_stale(project_id, agent_key, service_name)
+                        self._delete_service_snapshot_records(project_id, agent_key, service_name)
                 except Exception:
                     self.logger.warning(
-                        f"删除服务后执行定向stale收敛失败: project={project_id}, agent={agent_key}, service={service_name}",
+                        f"删除服务后清理聚合快照失败: project={project_id}, agent={agent_key}, service={service_name}",
                         exc_info=True
                     )
 
