@@ -477,6 +477,57 @@ class TaskManager:
             'generated_files': generated_files,
         }
 
+    def _sanitize_readonly_codex_configs_from_yaml(self, yaml_content: str) -> Tuple[str, Dict[str, Any]]:
+        """移除会导致 helper 运行时写入失败的 codex 只读 configs 挂载。"""
+        blocked_targets = {'/root/.codex/config.toml', '/root/.codex/auth.json'}
+        compose_data = yaml.safe_load(yaml_content) or {}
+        if not isinstance(compose_data, dict):
+            return yaml_content, {'removed_targets': [], 'removed_sources': []}
+        services = compose_data.get('services')
+        if not isinstance(services, dict) or not services:
+            return yaml_content, {'removed_targets': [], 'removed_sources': []}
+
+        removed_targets: List[str] = []
+        removed_sources: set = set()
+
+        for service_cfg in services.values():
+            if not isinstance(service_cfg, dict):
+                continue
+            raw_configs = service_cfg.get('configs')
+            if not isinstance(raw_configs, list):
+                continue
+            cleaned_configs: List[Any] = []
+            for item in raw_configs:
+                if isinstance(item, dict):
+                    target = str(item.get('target') or '').strip()
+                    if target in blocked_targets:
+                        removed_targets.append(target)
+                        source = str(item.get('source') or item.get('config') or '').strip()
+                        if source:
+                            removed_sources.add(source)
+                        continue
+                cleaned_configs.append(item)
+            if cleaned_configs:
+                service_cfg['configs'] = cleaned_configs
+            else:
+                service_cfg.pop('configs', None)
+
+        compose_configs = compose_data.get('configs')
+        if isinstance(compose_configs, dict) and removed_sources:
+            for source in list(removed_sources):
+                compose_configs.pop(source, None)
+            if not compose_configs:
+                compose_data.pop('configs', None)
+
+        if not removed_targets:
+            return yaml_content, {'removed_targets': [], 'removed_sources': []}
+
+        updated_yaml = yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
+        return updated_yaml, {
+            'removed_targets': sorted(set(removed_targets)),
+            'removed_sources': sorted(removed_sources),
+        }
+
     def _build_archive_bytes_with_llm_binding(self, template_name: str, binding: Optional[Dict[str, Any]]) -> Tuple[bytes, str, Dict[str, Any]]:
         template = self.template_manager.get_template(template_name)
         if not template:
@@ -1028,6 +1079,7 @@ class TaskManager:
 
             llm_binding = extra_params.get('resolved_llm_provider_binding') if isinstance(extra_params, dict) else None
             yaml_content, injection = self._apply_llm_provider_binding_to_yaml(yaml_content, llm_binding)
+            yaml_content, sanitize_meta = self._sanitize_readonly_codex_configs_from_yaml(yaml_content)
             files_payload_by_path: Dict[str, Dict[str, str]] = {}
             for item in (injection.get('generated_files') or []):
                 if not isinstance(item, dict):
@@ -1048,6 +1100,12 @@ class TaskManager:
                 self._add_task_log(task_id, 'INFO', f"注入环境变量键: {', '.join(injection['mapped_env_keys'])}")
                 if injection.get('mapped_file_paths'):
                     self._add_task_log(task_id, 'INFO', f"注入配置文件路径: {', '.join(injection['mapped_file_paths'])}")
+            if sanitize_meta.get('removed_targets'):
+                self._add_task_log(
+                    task_id,
+                    'INFO',
+                    f"清理只读codex配置挂载: {', '.join(sanitize_meta['removed_targets'])}"
+                )
             if files_payload:
                 self._add_task_log(task_id, 'INFO', f"随YAML下发配置文件: {len(files_payload)} 个")
 
