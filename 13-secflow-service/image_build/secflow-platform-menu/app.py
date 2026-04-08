@@ -8,6 +8,7 @@ import os
 import json
 import time
 import threading
+import ssl
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -25,6 +26,8 @@ except ImportError:  # pragma: no cover - 允许本地无 redis 依赖时完成�
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+UNVERIFIED_SSL_CONTEXT = ssl._create_unverified_context()
 
 
 class ServiceMaturity(Enum):
@@ -499,7 +502,11 @@ class MenuManager:
         started_at = time.time()
         request_obj = Request(service.health_url, method=service.health_method)
         try:
-            with urlopen(request_obj, timeout=service.health_timeout_seconds) as response:
+            with urlopen(
+                request_obj,
+                timeout=service.health_timeout_seconds,
+                context=UNVERIFIED_SSL_CONTEXT,
+            ) as response:
                 latency_ms = int((time.time() - started_at) * 1000)
                 logger.debug(
                     "健康探测成功: service_id=%s url=%s method=%s status=%s latency_ms=%s",
