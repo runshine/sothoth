@@ -264,6 +264,15 @@ setup_exception_handlers(app)
 app.include_router(code_server_router)
 
 
+@app.get("/api/code-server/health")
+async def health_check_alias():
+    """兼容 menu 健康探测路径。"""
+    return {
+        "status": "ok",
+        "service": "code-server-manager"
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
 

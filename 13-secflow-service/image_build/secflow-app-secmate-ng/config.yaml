@@ -96,7 +96,7 @@ registry:
   port: 10011
   maturity: "开发中"
   description: "Secmate-NG实例管理微服务"
-  api_prefix: "/api/app/secmate-ng"
+  api_prefix: "/api/secmate-ng"
   menu:
     id: "secmate-ng-manager"
     path: "/secmate-ng-manager"

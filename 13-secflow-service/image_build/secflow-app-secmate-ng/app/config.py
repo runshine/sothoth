@@ -163,7 +163,7 @@ class RegistryConfig(BaseModel):
     port: int = 10011
     maturity: str = "开发中"
     description: str = "Secmate-NG实例管理微服务"
-    api_prefix: str = "/api/app/secmate-ng"
+    api_prefix: str = "/api/secmate-ng"
     menu: MenuConfig = Field(default_factory=MenuConfig)
 
 

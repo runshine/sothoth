@@ -275,6 +275,15 @@ setup_exception_handlers(app)
 app.include_router(secmate_ng_router)
 
 
+@app.get("/api/secmate-ng/health")
+async def health_check_alias():
+    """兼容 menu 健康探测路径。"""
+    return {
+        "status": "ok",
+        "service": "secmate-ng-manager"
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
 

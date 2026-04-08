@@ -1829,6 +1829,7 @@ def get_statistics():
 
 
 @app.route('/api/packages/health', methods=['GET'])
+@app.route('/api/static-binary/health', methods=['GET'])
 def health_check():
     """健康检查接口"""
     try:

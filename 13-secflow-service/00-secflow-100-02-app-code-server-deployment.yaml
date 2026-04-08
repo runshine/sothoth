@@ -34,13 +34,13 @@ spec:
             cpu: "500m"
         livenessProbe:
           httpGet:
-            path: /api/app/code-server/health
+            path: /api/code-server/health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
         readinessProbe:
           httpGet:
-            path: /api/app/code-server/health
+            path: /api/code-server/health
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30

@@ -46,6 +46,8 @@ services:
     volumes:
       # 主机根目录只读挂载
       - /:/host:ro
+      # LLM Provider 配置文件目录需可写（用于动态更新 Codex/Claude 等配置）
+      - /root/.codex:/root/.codex:rw
 
       # 核心调试目录（保持与主机一致）
       - /proc:/proc:rw
