@@ -482,6 +482,16 @@ class EnhancedTemplateManager:
         return normalized
 
     @staticmethod
+    def _extract_volume_target(volume_item: Any) -> str:
+        if isinstance(volume_item, dict):
+            return str(volume_item.get('target') or '').strip()
+        if isinstance(volume_item, str):
+            parts = volume_item.split(':')
+            if len(parts) >= 2:
+                return str(parts[1] or '').strip()
+        return ''
+
+    @staticmethod
     def _sanitize_config_name(value: str) -> str:
         normalized = ''.join(ch if str(ch).isalnum() else '_' for ch in str(value or '').strip().lower())
         normalized = normalized.strip('_')
@@ -522,6 +532,7 @@ class EnhancedTemplateManager:
                 raise ValueError(f"LLM Provider 目标服务不存在: {', '.join(missing)}")
 
         mapped_file_paths: List[str] = []
+        mapped_file_mounts: List[Tuple[str, str]] = []
         if merged_files:
             if template_dir is None:
                 raise ValueError('模板目录不存在，无法写入 LLM Provider 文件')
@@ -544,6 +555,7 @@ class EnhancedTemplateManager:
                 absolute_file_path.parent.mkdir(parents=True, exist_ok=True)
                 absolute_file_path.write_text(content, encoding='utf-8')
                 mapped_file_paths.append(file_path)
+                mapped_file_mounts.append((relative_file_path.as_posix(), file_path))
 
         for service_name in selected_services:
             service_cfg = services.get(service_name)
@@ -564,6 +576,18 @@ class EnhancedTemplateManager:
                 else:
                     service_cfg.pop('configs', None)
 
+                target_path_set = set(mapped_file_paths)
+                existing_volumes = service_cfg.get('volumes')
+                cleaned_volumes: List[Any] = []
+                if isinstance(existing_volumes, list):
+                    for item in existing_volumes:
+                        if self._extract_volume_target(item) in target_path_set:
+                            continue
+                        cleaned_volumes.append(item)
+                for rel_src, target_path in mapped_file_mounts:
+                    cleaned_volumes.append(f"{rel_src}:{target_path}:rw")
+                service_cfg['volumes'] = cleaned_volumes
+
         updated_yaml = yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
         return updated_yaml, {
             'applied': True,
@@ -572,6 +596,90 @@ class EnhancedTemplateManager:
             'mapped_env_keys': sorted(merged_env.keys()),
             'mapped_file_paths': sorted(set(mapped_file_paths)),
         }
+
+    @staticmethod
+    def _strip_llm_mix_from_compose_yaml(
+        yaml_content: str,
+        llm_mix_state: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        compose_data = yaml.safe_load(yaml_content) or {}
+        if not isinstance(compose_data, dict):
+            return yaml_content
+
+        mix_state = llm_mix_state if isinstance(llm_mix_state, dict) else {}
+        mapped_env_keys = set(str(item).strip() for item in (mix_state.get('mapped_env_keys') or []) if str(item).strip())
+        mapped_file_paths = set(str(item).strip() for item in (mix_state.get('mapped_file_paths') or []) if str(item).strip())
+
+        services = compose_data.get('services')
+        if not isinstance(services, dict):
+            return yaml_content
+
+        removed_config_sources: set = set()
+        for service_cfg in services.values():
+            if not isinstance(service_cfg, dict):
+                continue
+
+            if mapped_env_keys:
+                env_map = EnhancedTemplateManager._normalize_compose_environment(service_cfg.get('environment'))
+                for key in list(mapped_env_keys):
+                    env_map.pop(key, None)
+                if env_map:
+                    service_cfg['environment'] = env_map
+                else:
+                    service_cfg.pop('environment', None)
+
+            if mapped_file_paths:
+                existing_configs = EnhancedTemplateManager._normalize_service_configs(service_cfg.get('configs'))
+                cleaned_configs: List[Dict[str, Any]] = []
+                for item in existing_configs:
+                    target = str(item.get('target') or '').strip()
+                    if target and target in mapped_file_paths:
+                        source = str(item.get('source') or '').strip()
+                        if source:
+                            removed_config_sources.add(source)
+                        continue
+                    cleaned_configs.append(item)
+                if cleaned_configs:
+                    service_cfg['configs'] = cleaned_configs
+                else:
+                    service_cfg.pop('configs', None)
+
+                existing_volumes = service_cfg.get('volumes')
+                cleaned_volumes: List[Any] = []
+                if isinstance(existing_volumes, list):
+                    for item in existing_volumes:
+                        remove = False
+                        if isinstance(item, str):
+                            parts = item.split(':')
+                            source = str(parts[0] or '').strip() if len(parts) >= 1 else ''
+                            target = str(parts[1] or '').strip() if len(parts) >= 2 else ''
+                            if source.startswith('.llm-provider-files') or target in mapped_file_paths:
+                                remove = True
+                        elif isinstance(item, dict):
+                            source = str(item.get('source') or '').strip()
+                            target = str(item.get('target') or '').strip()
+                            if source.startswith('.llm-provider-files') or target in mapped_file_paths:
+                                remove = True
+                        if not remove:
+                            cleaned_volumes.append(item)
+                if cleaned_volumes:
+                    service_cfg['volumes'] = cleaned_volumes
+                else:
+                    service_cfg.pop('volumes', None)
+
+        compose_configs = compose_data.get('configs')
+        if isinstance(compose_configs, dict):
+            for name in list(compose_configs.keys()):
+                cfg = compose_configs.get(name)
+                cfg_file = ''
+                if isinstance(cfg, dict):
+                    cfg_file = str(cfg.get('file') or '').strip()
+                if name in removed_config_sources or cfg_file.startswith('.llm-provider-files/'):
+                    compose_configs.pop(name, None)
+            if not compose_configs:
+                compose_data.pop('configs', None)
+
+        return yaml.safe_dump(compose_data, sort_keys=False, allow_unicode=True)
 
     def _rebuild_template_archive(self, template: Dict[str, Any], template_dir: Path):
         archive_path = Path(str(template.get('file_path') or ''))
@@ -669,15 +777,33 @@ class EnhancedTemplateManager:
 
         metadata = self._load_template_metadata_dict(template)
         try:
-            backup_info, original_compose = self._ensure_original_compose_backup(template_id, template, metadata)
             template_dir = self.templates_root / str(template.get('name') or '')
             llm_files_dir = template_dir / '.llm-provider-files'
             if llm_files_dir.exists():
                 shutil.rmtree(llm_files_dir, ignore_errors=True)
+            backup_info = metadata.get('original_compose_backup') if isinstance(metadata.get('original_compose_backup'), dict) else None
             main_compose_path = str((backup_info or {}).get('main_compose_path') or self._get_main_compose_relative_path(template, metadata))
             compose_path = template_dir / main_compose_path
             compose_path.parent.mkdir(parents=True, exist_ok=True)
-            compose_path.write_text(original_compose, encoding='utf-8')
+            restored_by_backup = False
+            backup_compose = None
+            if backup_info:
+                backup_file = template_dir / str(backup_info.get('file_path') or '')
+                if backup_file.exists():
+                    backup_compose = backup_file.read_text(encoding='utf-8')
+                    restored_by_backup = True
+
+            if backup_compose is not None:
+                compose_path.write_text(backup_compose, encoding='utf-8')
+            else:
+                if not compose_path.exists():
+                    return False, f'模板主 compose 不存在: {main_compose_path}', None
+                current_compose = compose_path.read_text(encoding='utf-8')
+                cleaned_compose = self._strip_llm_mix_from_compose_yaml(
+                    current_compose,
+                    metadata.get('llm_mix_state') if isinstance(metadata.get('llm_mix_state'), dict) else None
+                )
+                compose_path.write_text(cleaned_compose, encoding='utf-8')
             if str(template.get('type') or '') == 'archive':
                 self._rebuild_template_archive(template, template_dir)
             metadata.pop('llm_mix_state', None)
@@ -686,7 +812,9 @@ class EnhancedTemplateManager:
             self._update_template_metadata(template_id, metadata)
             if template.get('name'):
                 self.parse_template_compose(str(template.get('name')))
-            return True, '模板已恢复为原始内容', self.get_template_by_id(template_id)
+            if restored_by_backup:
+                return True, '模板已恢复为原始内容', self.get_template_by_id(template_id)
+            return True, '模板已清理LLM混合配置（未找到原始备份）', self.get_template_by_id(template_id)
         except Exception as e:
             self.logger.error(f"恢复原始模板失败: {str(e)}", exc_info=True)
             return False, f"恢复原始模板失败: {str(e)}", None
