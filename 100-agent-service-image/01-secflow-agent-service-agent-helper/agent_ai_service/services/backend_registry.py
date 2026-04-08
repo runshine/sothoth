@@ -46,9 +46,36 @@ DEFAULT_BACKENDS = {
 def _normalize_backend_args(backend_type: Any, args: Any) -> List[str]:
     normalized = [str(item) for item in (args or []) if str(item).strip()]
     backend = str(backend_type or '').strip().lower()
-    # Codex CLI 在 helper 的非 TTY 调用场景下应走 `codex exec <prompt>`
-    if backend == 'codex' and not normalized:
-        return ['exec']
+    # Codex CLI 默认参数：
+    # - exec: 统一走非交互执行入口
+    # - --skip-git-repo-check / --yolo / --dangerously-bypass-approvals-and-sandbox:
+    #   作为 helper 侧默认运行参数
+    if backend == 'codex':
+        required = ['exec', '--skip-git-repo-check', '--yolo']
+        if not normalized:
+            return required
+        seen = set()
+        result: List[str] = []
+        # exec 固定放在首位，避免被附加到 prompt 后导致参数顺序异常
+        if 'exec' in normalized:
+            result.append('exec')
+            seen.add('exec')
+        for item in normalized:
+            text = str(item).strip()
+            if not text or text == 'exec' or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        # 若原参数未携带 exec，则补到首位
+        if 'exec' not in seen:
+            result.insert(0, 'exec')
+            seen.add('exec')
+        # 补齐默认参数（不重复）
+        for item in ('--skip-git-repo-check', '--yolo', '--dangerously-bypass-approvals-and-sandbox'):
+            if item not in seen:
+                result.append(item)
+                seen.add(item)
+        return result
     return normalized
 
 
