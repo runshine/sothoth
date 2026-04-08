@@ -133,6 +133,29 @@ async def resolve_llm_binding(
     }
 
 
+async def resolve_llm_bindings(
+    bindings: Optional[List[AppWorkflowLlmBindingRequest]],
+) -> List[Dict[str, Any]]:
+    if not bindings:
+        return []
+    resolved: List[Dict[str, Any]] = []
+    for binding in bindings:
+        snapshot = await resolve_llm_binding(binding)
+        if snapshot:
+            resolved.append(snapshot)
+    return resolved
+
+
+def normalize_persisted_llm_bindings(node_config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw_bindings = node_config.get("llm_bindings")
+    if isinstance(raw_bindings, list):
+        return [item for item in raw_bindings if isinstance(item, dict)]
+    legacy_binding = node_config.get("llm_binding")
+    if isinstance(legacy_binding, dict):
+        return [legacy_binding]
+    return []
+
+
 def build_app_workflow_response(
     instance: WorkflowInstance,
     node: WorkflowNodeInstance,
@@ -151,7 +174,8 @@ def build_app_workflow_response(
     create_service = node_config.get("create_service")
     if create_service is None:
         create_service = True
-    llm_binding = node_config.get("llm_binding")
+    llm_bindings = normalize_persisted_llm_bindings(node_config)
+    llm_binding = llm_bindings[0] if llm_bindings else None
 
     return {
         "id": instance.id,
@@ -189,6 +213,7 @@ def build_app_workflow_response(
             "ingress_access_url": node_config.get("ingress_access_url"),
             "ingress_tls_enabled": node_config.get("ingress_tls_enabled"),
             "llm_binding": llm_binding,
+            "llm_bindings": llm_bindings,
             "init_logs": node.init_logs,
         },
         "service_name": display_service_name,
@@ -208,6 +233,7 @@ def build_app_workflow_response(
         "ingress_access_url": node_config.get("ingress_access_url"),
         "ingress_tls_enabled": node_config.get("ingress_tls_enabled"),
         "llm_binding": llm_binding,
+        "llm_bindings": llm_bindings,
         "template_id": node.template_id,
         "template_name": template.name if template else None,
         "created_by": instance.created_by,
@@ -328,7 +354,8 @@ async def create_app_workflow(
     # 3. 生成工作流ID和节点ID
     instance_id = generate_id(workflow_data.name)
     node_id = generate_id(f"{instance_id}_node")
-    llm_binding = await resolve_llm_binding(workflow_data.llm_binding)
+    llm_bindings = await resolve_llm_bindings(workflow_data.llm_bindings)
+    llm_binding = llm_bindings[0] if llm_bindings else None
     resolved_volume_mounts, raw_volume_mounts, normalized_project_mounts = await resolve_requested_volume_mounts(
         workflow_data.project_id,
         workflow_data.volume_mounts,
@@ -365,6 +392,7 @@ async def create_app_workflow(
         "ingress_host": workflow_data.ingress_host,
         "ingress_ip": workflow_data.ingress_ip,
         "llm_binding": llm_binding,
+        "llm_bindings": llm_bindings,
     }
 
     # 5. 创建 WorkflowInstance
@@ -803,8 +831,10 @@ async def update_app_workflow(
     if workflow_data.timeout_seconds is not None:
         node.timeout_seconds = workflow_data.timeout_seconds
         node_config["timeout_seconds"] = workflow_data.timeout_seconds
-    if workflow_data.llm_binding is not None:
-        node_config["llm_binding"] = await resolve_llm_binding(workflow_data.llm_binding)
+    if workflow_data.llm_bindings is not None or workflow_data.llm_binding is not None:
+        llm_bindings = await resolve_llm_bindings(workflow_data.llm_bindings)
+        node_config["llm_bindings"] = llm_bindings
+        node_config["llm_binding"] = llm_bindings[0] if llm_bindings else None
     if workflow_data.create_ingress is not None:
         node_config["create_ingress"] = workflow_data.create_ingress
         if workflow_data.create_ingress is False:

@@ -3,7 +3,7 @@ Pydantic schemas for workflow service
 """
 
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from enum import Enum
 import re
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -854,6 +854,32 @@ class AppWorkflowLlmBindingSource(str, Enum):
     CUSTOM = "custom"
 
 
+LlmProviderFileFormat = Literal["json", "yaml", "yml", "toml", "env", "conf", "txt", "md", "xml", "ini", "other"]
+
+
+class LlmProviderFileBindingPayload(BaseModel):
+    name: str
+    path: str
+    content: str
+    format: LlmProviderFileFormat = "other"
+    enabled: bool = True
+
+    @field_validator("name", "path")
+    @classmethod
+    def validate_required_file_str(cls, value: str) -> str:
+        value = (value or "").strip()
+        if not value:
+            raise ValueError("字段不能为空")
+        return value
+
+    @field_validator("content")
+    @classmethod
+    def normalize_file_content(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("content 必须是字符串")
+        return value
+
+
 class LlmProviderConfigPayload(BaseModel):
     provider_key: str
     display_name: str
@@ -869,6 +895,7 @@ class LlmProviderConfigPayload(BaseModel):
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
     env_bindings: Dict[str, Any] = Field(default_factory=dict)
+    file_bindings: List[LlmProviderFileBindingPayload] = Field(default_factory=list)
     extra_config: Dict[str, Any] = Field(default_factory=dict)
     description: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -966,7 +993,8 @@ class AppWorkflowCreate(BaseModel):
     ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
     ingress_host: Optional[str] = Field(None, description="Ingress域名 (例如: myapp.example.com)")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller外部IP地址")
-    llm_binding: Optional[AppWorkflowLlmBindingRequest] = Field(None, description="LLM配置绑定")
+    llm_binding: Optional[AppWorkflowLlmBindingRequest] = Field(None, description="兼容旧版的单个 LLM 配置绑定")
+    llm_bindings: Optional[List[AppWorkflowLlmBindingRequest]] = Field(None, description="多个 LLM 配置绑定，按顺序覆盖同名环境变量和同路径文件")
 
     @model_validator(mode='after')
     def validate_ingress_config(self):
@@ -975,6 +1003,8 @@ class AppWorkflowCreate(BaseModel):
                 self.ingress_type = "nginx"
             if self.ingress_type != "nginx":
                 raise ValueError("ingress_type must be nginx when create_ingress is True")
+        if self.llm_bindings is None and self.llm_binding is not None:
+            self.llm_bindings = [self.llm_binding]
         return self
 
 
@@ -999,7 +1029,8 @@ class AppWorkflowUpdate(BaseModel):
     ingress_type: Optional[str] = Field(None, description="Ingress类型: nginx")
     ingress_host: Optional[str] = Field(None, description="Ingress域名")
     ingress_ip: Optional[str] = Field(None, description="Ingress Controller外部IP地址")
-    llm_binding: Optional[AppWorkflowLlmBindingRequest] = Field(None, description="LLM配置绑定")
+    llm_binding: Optional[AppWorkflowLlmBindingRequest] = Field(None, description="兼容旧版的单个 LLM 配置绑定")
+    llm_bindings: Optional[List[AppWorkflowLlmBindingRequest]] = Field(None, description="多个 LLM 配置绑定，按顺序覆盖同名环境变量和同路径文件")
 
     @model_validator(mode='after')
     def validate_ingress_config(self):
@@ -1008,6 +1039,8 @@ class AppWorkflowUpdate(BaseModel):
                 self.ingress_type = "nginx"
             if self.ingress_type != "nginx":
                 raise ValueError("ingress_type must be nginx when create_ingress is True")
+        if self.llm_bindings is None and self.llm_binding is not None:
+            self.llm_bindings = [self.llm_binding]
         return self
 
 
@@ -1044,6 +1077,7 @@ class AppWorkflowNodeResponse(BaseModel):
     ingress_access_url: Optional[str] = None
     ingress_tls_enabled: Optional[bool] = None
     llm_binding: Optional[AppWorkflowLlmBindingResponse] = None
+    llm_bindings: List[AppWorkflowLlmBindingResponse] = Field(default_factory=list)
 
 
 class AppWorkflowResponse(BaseModel):
@@ -1076,6 +1110,7 @@ class AppWorkflowResponse(BaseModel):
     ingress_access_url: Optional[str] = None
     ingress_tls_enabled: Optional[bool] = None
     llm_binding: Optional[AppWorkflowLlmBindingResponse] = None
+    llm_bindings: List[AppWorkflowLlmBindingResponse] = Field(default_factory=list)
 
     # 模板信息
     template_id: str
