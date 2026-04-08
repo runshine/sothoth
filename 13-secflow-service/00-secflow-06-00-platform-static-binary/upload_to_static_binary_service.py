@@ -33,6 +33,7 @@ class PackageUploader:
         self.base_url = base_url.rstrip('/')
         self.max_workers = max_workers
         self.session = requests.Session()
+        self.session.verify = False
 
         # 统计信息
         self.stats = {

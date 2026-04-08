@@ -14,10 +14,13 @@ import requests
 import hashlib
 import json
 import re
+import urllib3
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from urllib.parse import urlparse
 import threading
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class GitHubReleaseDownloader:
     def __init__(self, max_retries: int = 10):
@@ -29,6 +32,7 @@ class GitHubReleaseDownloader:
         """
         self.max_retries = max_retries
         self.session = requests.Session()
+        self.session.verify = False
         # 设置合理的请求头，模拟浏览器访问
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
