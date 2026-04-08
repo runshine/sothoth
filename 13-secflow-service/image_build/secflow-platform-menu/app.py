@@ -318,18 +318,25 @@ class MenuManager:
 
     def _resolve_health_url(
         self,
+        service_id: str,
         host: str,
         port: int,
         api_prefix: Optional[str],
         explicit_url: Optional[str],
         explicit_path: Optional[str],
     ) -> str:
-        if explicit_url:
-            return explicit_url
-
         health_path = self._resolve_health_path(api_prefix, explicit_path)
+        normalized_service_id = (service_id or "").strip().rstrip("/")
         normalized_host = (host or "").strip()
         gateway_url = self.service_gateway_url.rstrip("/")
+
+        if normalized_service_id:
+            if normalized_service_id.startswith(("http://", "https://")):
+                return f"{normalized_service_id}{health_path}"
+            return f"http://{normalized_service_id}{health_path}"
+
+        if explicit_url:
+            return explicit_url
 
         # 优先使用统一网关地址，规避部分服务注册时上报 0.0.0.0 / 127.0.0.1 的问题。
         if gateway_url and api_prefix:
@@ -361,6 +368,7 @@ class MenuManager:
         normalized_api_prefix = self._normalize_api_prefix(api_prefix)
         resolved_health_path = self._resolve_health_path(normalized_api_prefix, health_path)
         resolved_health_url = self._resolve_health_url(
+            service_id=service_id,
             host=host,
             port=port,
             api_prefix=normalized_api_prefix,
