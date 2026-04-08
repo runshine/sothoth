@@ -103,12 +103,22 @@ echo "=========================================="
 # when DNS_SERVER is configured, overwrite /etc/resolv.conf with that value only.
 if [ -n "${DNS_SERVER:-}" ]; then
     echo "DNS_SERVER detected, overwriting /etc/resolv.conf ..."
-    : > /etc/resolv.conf
-    printf '%s' "${DNS_SERVER}" | tr ',; \t' '\n' | while IFS= read -r dns_item; do
+    tmp_resolv="/tmp/resolv.conf.$$"
+    write_count=0
+    : > "${tmp_resolv}"
+    while IFS= read -r dns_item || [ -n "${dns_item}" ]; do
         dns_item="$(echo "${dns_item}" | xargs)"
         [ -z "${dns_item}" ] && continue
-        echo "nameserver ${dns_item}" >> /etc/resolv.conf
-    done
+        echo "nameserver ${dns_item}" >> "${tmp_resolv}"
+        write_count=$((write_count + 1))
+    done < <(printf '%s\n' "${DNS_SERVER}" | tr ',; \t' '\n')
+
+    if [ "${write_count}" -gt 0 ]; then
+        cp "${tmp_resolv}" /etc/resolv.conf
+    else
+        echo "WARNING: DNS_SERVER has no valid entries after parsing, skip overwrite /etc/resolv.conf"
+    fi
+    rm -f "${tmp_resolv}"
 else
     echo "DNS_SERVER is empty, skip /etc/resolv.conf overwrite."
 fi
