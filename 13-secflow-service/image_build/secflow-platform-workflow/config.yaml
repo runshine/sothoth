@@ -26,7 +26,7 @@ auth_service:
 registry:
   enabled: true
   menu_service_url: "http://secflow-platform-menu:80"
-  service_id: "secflow-workflow"
+  service_id: "secflow-platform-workflow"
   service_name: "工作流编排服务"
   host: "0.0.0.0"
   port: 80
