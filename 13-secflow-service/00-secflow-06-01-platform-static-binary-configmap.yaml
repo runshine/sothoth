@@ -29,7 +29,7 @@ data:
     registry:
       enabled: true
       menu_service_url: "http://secflow-platform-menu:80"
-      service_id: "secflow-static-binary"
+      service_id: "secflow-platform-static-binary"
       service_name: "静态二进制包服务"
       host: "0.0.0.0"
       port: 8080

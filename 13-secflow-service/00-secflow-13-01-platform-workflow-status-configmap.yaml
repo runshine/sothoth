@@ -46,7 +46,7 @@ data:
     registry:
       enabled: false
       menu_service_url: "http://secflow-platform-menu:80"
-      service_id: "secflow-workflow-status"
+      service_id: "secflow-platform-workflow-status"
       service_name: "工作流状态管理服务"
       host: "0.0.0.0"
       port: 80
