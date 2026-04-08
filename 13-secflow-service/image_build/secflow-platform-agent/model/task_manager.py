@@ -335,7 +335,8 @@ class TaskManager:
 
     def _collect_template_llm_files_for_yaml(self, template_name: str, yaml_content: str) -> List[Dict[str, str]]:
         """
-        从模板目录收集 compose 引用的本地 file/config 文件内容，避免部署时 bind 源路径缺失。
+        从模板目录收集 compose 引用的本地文件内容（configs.file + services.volumes 相对路径），
+        避免部署时 bind 源路径缺失被自动创建为目录。
         """
         try:
             template = self.template_manager.get_template(template_name)
@@ -347,15 +348,41 @@ class TaskManager:
             compose_data = yaml.safe_load(yaml_content) or {}
             if not isinstance(compose_data, dict):
                 return []
+
+            candidate_rel_paths: List[str] = []
+            # 1) 顶层 configs.*.file
             configs = compose_data.get('configs')
-            if not isinstance(configs, dict):
-                return []
+            if isinstance(configs, dict):
+                for cfg in configs.values():
+                    if not isinstance(cfg, dict):
+                        continue
+                    rel = str(cfg.get('file') or '').strip()
+                    if rel:
+                        candidate_rel_paths.append(rel)
+
+            # 2) services.*.volumes 中的相对源路径
+            services = compose_data.get('services')
+            if isinstance(services, dict):
+                for service_cfg in services.values():
+                    if not isinstance(service_cfg, dict):
+                        continue
+                    volumes = service_cfg.get('volumes')
+                    if not isinstance(volumes, list):
+                        continue
+                    for item in volumes:
+                        source = ''
+                        if isinstance(item, str):
+                            parts = item.split(':')
+                            if len(parts) >= 2:
+                                source = str(parts[0] or '').strip()
+                        elif isinstance(item, dict):
+                            source = str(item.get('source') or '').strip()
+                        if source:
+                            candidate_rel_paths.append(source)
+
             files: List[Dict[str, str]] = []
             seen = set()
-            for cfg in configs.values():
-                if not isinstance(cfg, dict):
-                    continue
-                rel = str(cfg.get('file') or '').strip()
+            for rel in candidate_rel_paths:
                 if not rel or rel.startswith('/'):
                     continue
                 rel_path = Path(rel)
