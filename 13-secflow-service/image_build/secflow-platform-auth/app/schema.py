@@ -345,7 +345,8 @@ class DepartmentMemberResponse(BaseModel):
 class DepartmentMemberImportRequest(BaseModel):
     """部门成员导入请求"""
     department_id: int
-    csv_content: str
+    csv_content: Optional[str] = None
+    file_content_base64: Optional[str] = None
     filename: Optional[str] = None
     mode: str = "skip_existing"
 

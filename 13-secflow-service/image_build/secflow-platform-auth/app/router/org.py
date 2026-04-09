@@ -1,11 +1,15 @@
 """组织管理相关API"""
 
+import base64
 import csv
 import io
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -33,15 +37,11 @@ router = APIRouter(prefix="/org", tags=["organization"])
 
 logger = logging.getLogger(__name__)
 
-DEPARTMENT_MEMBER_IMPORT_TEMPLATE = (
-    "username,role\n"
-    "zhangsan,member\n"
-    "lisi,member\n"
-)
 DEPARTMENT_MEMBER_IMPORT_REQUIRED_HEADERS = {"username"}
 DEPARTMENT_MEMBER_IMPORT_ALLOWED_HEADERS = {"username", "role"}
 DEPARTMENT_MEMBER_IMPORT_ALLOWED_ROLES = {"leader", "vice_leader", "member"}
 DEPARTMENT_MEMBER_IMPORT_ALLOWED_MODES = {"skip_existing", "update_role"}
+DEPARTMENT_MEMBER_IMPORT_TEMPLATE_FILENAME = "secflow-department-member-import-template.xlsx"
 
 
 def log_access_denied(user: User, resource_type: str, resource_id: int, reason: str):
@@ -181,7 +181,29 @@ def normalize_import_csv(content: str) -> str:
     return (content or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
 
 
-def load_department_member_import_rows(csv_content: str) -> List[Tuple[int, Dict[str, str]]]:
+def _validate_import_headers(headers: List[str], file_label: str) -> None:
+    if not headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{file_label} 缺少表头"
+        )
+
+    missing_headers = DEPARTMENT_MEMBER_IMPORT_REQUIRED_HEADERS.difference(headers)
+    if missing_headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{file_label} 缺少必填列: {', '.join(sorted(missing_headers))}"
+        )
+
+    unsupported_headers = [header for header in headers if header not in DEPARTMENT_MEMBER_IMPORT_ALLOWED_HEADERS]
+    if unsupported_headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{file_label} 存在不支持的列: {', '.join(unsupported_headers)}"
+        )
+
+
+def _load_department_member_import_rows_from_csv(csv_content: str) -> List[Tuple[int, Dict[str, str]]]:
     normalized = normalize_import_csv(csv_content)
     if not normalized.strip():
         raise HTTPException(
@@ -191,25 +213,7 @@ def load_department_member_import_rows(csv_content: str) -> List[Tuple[int, Dict
 
     reader = csv.DictReader(io.StringIO(normalized))
     headers = [header.strip() for header in (reader.fieldnames or []) if header and header.strip()]
-    if not headers:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="CSV 缺少表头"
-        )
-
-    missing_headers = DEPARTMENT_MEMBER_IMPORT_REQUIRED_HEADERS.difference(headers)
-    if missing_headers:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"CSV 缺少必填列: {', '.join(sorted(missing_headers))}"
-        )
-
-    unsupported_headers = [header for header in headers if header not in DEPARTMENT_MEMBER_IMPORT_ALLOWED_HEADERS]
-    if unsupported_headers:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"CSV 存在不支持的列: {', '.join(unsupported_headers)}"
-        )
+    _validate_import_headers(headers, "CSV")
 
     rows: List[Tuple[int, Dict[str, str]]] = []
     for row_no, row in enumerate(reader, start=2):
@@ -230,6 +234,112 @@ def load_department_member_import_rows(csv_content: str) -> List[Tuple[int, Dict
     return rows
 
 
+def _load_department_member_import_rows_from_excel(file_bytes: bytes) -> List[Tuple[int, Dict[str, str]]]:
+    try:
+        workbook = load_workbook(filename=io.BytesIO(file_bytes), data_only=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Excel 文件解析失败: {exc}"
+        ) from exc
+
+    sheet = workbook.active
+    header_cells = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    headers = [str(cell).strip() for cell in (header_cells or []) if str(cell or "").strip()]
+    _validate_import_headers(headers, "Excel")
+
+    rows: List[Tuple[int, Dict[str, str]]] = []
+    for row_no, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+        normalized_row: Dict[str, str] = {}
+        has_value = False
+        for index, header in enumerate(headers):
+            cell_value = values[index] if values and index < len(values) else ""
+            value = str(cell_value).strip() if cell_value is not None else ""
+            normalized_row[header] = value
+            if value:
+                has_value = True
+        if not has_value:
+            continue
+        rows.append((row_no, normalized_row))
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Excel 不包含有效数据行"
+        )
+    return rows
+
+
+def load_department_member_import_rows(request: DepartmentMemberImportRequest) -> List[Tuple[int, Dict[str, str]]]:
+    if request.file_content_base64:
+        if not request.filename:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Excel 导入缺少文件名"
+            )
+        try:
+            file_bytes = base64.b64decode(request.file_content_base64)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"导入文件内容解码失败: {exc}"
+            ) from exc
+
+        suffix = Path(request.filename).suffix.lower()
+        if suffix == ".csv":
+            try:
+                csv_content = file_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                csv_content = file_bytes.decode("gbk")
+            return _load_department_member_import_rows_from_csv(csv_content)
+        if suffix == ".xlsx":
+            return _load_department_member_import_rows_from_excel(file_bytes)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="当前仅支持导入 .xlsx 或 .csv 文件"
+        )
+
+    if request.csv_content is not None:
+        return _load_department_member_import_rows_from_csv(request.csv_content)
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="请上传 Excel/CSV 文件，或提供 CSV 内容"
+    )
+
+
+def build_department_member_import_template_workbook() -> bytes:
+    workbook = Workbook()
+    template_sheet = workbook.active
+    template_sheet.title = "成员导入模板"
+    template_sheet.append(["username", "role"])
+    template_sheet.append(["", ""])
+    template_sheet.append(["", ""])
+    template_sheet.freeze_panes = "A2"
+    template_sheet.column_dimensions["A"].width = 28
+    template_sheet.column_dimensions["B"].width = 18
+    for cell in template_sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="2563EB")
+
+    guide_sheet = workbook.create_sheet("填写说明")
+    guide_sheet.column_dimensions["A"].width = 22
+    guide_sheet.column_dimensions["B"].width = 90
+    guide_sheet.append(["项目", "说明"])
+    guide_sheet.append(["username", "必填，填写系统里已经存在的用户名，例如 zhangsan"])
+    guide_sheet.append(["role", "可选，可填写 member / vice_leader / leader；普通管理员只允许 member"])
+    guide_sheet.append(["目标部门", "不用填在文件里，系统会自动导入到你当前选中的部门"])
+    guide_sheet.append(["导入模式", "已存在则跳过；超级管理员还可以选择已存在则更新角色"])
+    guide_sheet.append(["注意事项", "每个部门同一时间只能有一个 leader；文件第一行必须是表头"])
+    for cell in guide_sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="0F766E")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 def preview_department_member_import(
     db: Session,
     current_user: User,
@@ -248,7 +358,7 @@ def preview_department_member_import(
             detail="普通管理员不能通过导入批量修改角色"
         )
 
-    rows = load_department_member_import_rows(request.csv_content)
+    rows = load_department_member_import_rows(request)
     allowed_roles = get_import_allowed_roles(current_user)
     username_counts: Dict[str, int] = {}
     leader_rows = 0
@@ -791,10 +901,10 @@ def download_department_member_import_template(
             detail="当前用户无权导入部门成员"
         )
     return Response(
-        content=DEPARTMENT_MEMBER_IMPORT_TEMPLATE,
-        media_type="text/csv; charset=utf-8",
+        content=build_department_member_import_template_workbook(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": 'attachment; filename="secflow-department-member-import-template.csv"'
+            "Content-Disposition": f'attachment; filename="{DEPARTMENT_MEMBER_IMPORT_TEMPLATE_FILENAME}"'
         }
     )
 
