@@ -1,12 +1,16 @@
 """用户路由"""
 
+import base64
 import csv
 import io
 import secrets
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill
 from sqlalchemy.orm import Session
 
 from app.auth import cleanup_expired_sessions, get_password_hash, verify_password
@@ -43,11 +47,7 @@ from app.schema import (
 
 router = APIRouter(tags=["用户管理"], prefix="/users")
 
-USER_IMPORT_TEMPLATE = (
-    "username,password,platform_role,role_names,department_name,department_role,is_active\n"
-    "zhangsan,,ordinary_user,审计员,安全运营部,member,true\n"
-    "lisi,TempPass123!,ordinary_admin,,攻防实验室,leader,true\n"
-)
+USER_IMPORT_TEMPLATE_FILENAME = "secflow-user-import-template.xlsx"
 USER_IMPORT_REQUIRED_HEADERS = {"username"}
 USER_IMPORT_ALLOWED_HEADERS = {
     "username",
@@ -137,6 +137,166 @@ def _load_import_rows(csv_content: str) -> Tuple[List[Tuple[int, Dict[str, str]]
         )
 
     return rows, headers
+
+
+def _load_import_rows_from_excel(file_bytes: bytes) -> Tuple[List[Tuple[int, Dict[str, str]]], List[str]]:
+    try:
+        workbook = load_workbook(filename=io.BytesIO(file_bytes), data_only=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Excel 文件解析失败: {exc}"
+        ) from exc
+
+    sheet = workbook.active
+    header_cells = next(sheet.iter_rows(min_row=1, max_row=1, values_only=True), None)
+    headers = [str(cell).strip() for cell in (header_cells or []) if str(cell or "").strip()]
+    if not headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Excel 缺少表头"
+        )
+
+    missing_headers = USER_IMPORT_REQUIRED_HEADERS.difference(headers)
+    if missing_headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Excel 缺少必填列: {', '.join(sorted(missing_headers))}"
+        )
+
+    unsupported_headers = [header for header in headers if header not in USER_IMPORT_ALLOWED_HEADERS]
+    if unsupported_headers:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Excel 存在不支持的列: {', '.join(unsupported_headers)}"
+        )
+
+    rows: List[Tuple[int, Dict[str, str]]] = []
+    for row_no, values in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+        normalized_row: Dict[str, str] = {}
+        has_value = False
+        for index, header in enumerate(headers):
+            cell_value = values[index] if values and index < len(values) else ""
+            value = str(cell_value).strip() if cell_value is not None else ""
+            normalized_row[header] = value
+            if value:
+                has_value = True
+        if not has_value:
+            continue
+        rows.append((row_no, normalized_row))
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Excel 不包含有效数据行"
+        )
+
+    return rows, headers
+
+
+def _load_import_payload_rows(request: UserImportRequest) -> Tuple[List[Tuple[int, Dict[str, str]]], List[str]]:
+    if request.file_content_base64:
+        if not request.filename:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="导入文件缺少文件名"
+            )
+        try:
+            file_bytes = base64.b64decode(request.file_content_base64)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"导入文件内容解码失败: {exc}"
+            ) from exc
+
+        suffix = Path(request.filename).suffix.lower()
+        if suffix == ".csv":
+            try:
+                csv_content = file_bytes.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                csv_content = file_bytes.decode("gbk")
+            return _load_import_rows(csv_content)
+        if suffix == ".xlsx":
+            return _load_import_rows_from_excel(file_bytes)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="当前仅支持导入 .xlsx 或 .csv 文件"
+        )
+
+    if request.csv_content is not None:
+        return _load_import_rows(request.csv_content)
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="请上传 Excel/CSV 文件，或提供 CSV 内容"
+    )
+
+
+def _build_user_import_template_workbook() -> bytes:
+    workbook = Workbook()
+    template_sheet = workbook.active
+    template_sheet.title = "用户导入模板"
+    template_sheet.append([
+        "username",
+        "password",
+        "platform_role",
+        "role_names",
+        "department_name",
+        "department_role",
+        "is_active",
+    ])
+    template_sheet.append([
+        "zhangsan",
+        "",
+        "ordinary_user",
+        "审计员",
+        "安全运营部",
+        "member",
+        "true",
+    ])
+    template_sheet.append([
+        "lisi",
+        "TempPass123!",
+        "ordinary_admin",
+        "",
+        "攻防实验室",
+        "leader",
+        "true",
+    ])
+    template_sheet.freeze_panes = "A2"
+    for column, width in {
+        "A": 20,
+        "B": 20,
+        "C": 18,
+        "D": 28,
+        "E": 22,
+        "F": 18,
+        "G": 14,
+    }.items():
+        template_sheet.column_dimensions[column].width = width
+    for cell in template_sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="2563EB")
+
+    guide_sheet = workbook.create_sheet("填写说明")
+    guide_sheet.column_dimensions["A"].width = 24
+    guide_sheet.column_dimensions["B"].width = 96
+    guide_sheet.append(["字段", "说明"])
+    guide_sheet.append(["username", "必填，填写要创建的用户名，系统内不能重复"])
+    guide_sheet.append(["password", "可选，留空则系统自动生成初始密码，并在导入结果里仅展示一次"])
+    guide_sheet.append(["platform_role", "可选，填写 ordinary_user 或 ordinary_admin；留空默认 ordinary_user"])
+    guide_sheet.append(["role_names", "可选，填写系统中已存在的普通角色名；多个角色可用逗号分隔"])
+    guide_sheet.append(["department_name", "可选，填写系统中已存在的部门名称"])
+    guide_sheet.append(["department_role", "可选，填写 member / vice_leader / leader；若填了部门但未填角色，默认 member"])
+    guide_sheet.append(["is_active", "可选，填写 true/false、1/0、yes/no；留空默认 true"])
+    guide_sheet.append(["填写建议", "通常只要填写 username，其余按需补充；先下载模板，再直接覆盖示例数据即可"])
+    for cell in guide_sheet[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="0F766E")
+
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
 
 
 def _validate_import_row(
@@ -239,8 +399,8 @@ def _validate_import_row(
     )
 
 
-def _preview_import_rows(db: Session, csv_content: str) -> UserImportPreviewResponse:
-    rows, _headers = _load_import_rows(csv_content)
+def _preview_import_rows(db: Session, request: UserImportRequest) -> UserImportPreviewResponse:
+    rows, _headers = _load_import_payload_rows(request)
     ensure_platform_roles_seeded(db)
 
     file_username_counts: Dict[str, int] = {}
@@ -394,12 +554,13 @@ def create_user(
 def download_user_import_template(
     current_user: User = Depends(get_current_super_admin)
 ):
-    """下载用户导入 CSV 模板。"""
+    """下载用户导入 Excel 模板。"""
+    workbook_bytes = _build_user_import_template_workbook()
     return Response(
-        content=USER_IMPORT_TEMPLATE,
-        media_type="text/csv; charset=utf-8",
+        content=workbook_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": 'attachment; filename="secflow-user-import-template.csv"'
+            "Content-Disposition": f'attachment; filename="{USER_IMPORT_TEMPLATE_FILENAME}"'
         }
     )
 
@@ -410,8 +571,8 @@ def preview_user_import(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_super_admin)
 ):
-    """预校验用户导入 CSV。"""
-    return _preview_import_rows(db, request.csv_content)
+    """预校验用户导入文件。"""
+    return _preview_import_rows(db, request)
 
 
 @router.post("/import/commit", response_model=UserImportCommitResponse)
@@ -421,8 +582,8 @@ def commit_user_import(
     current_user: User = Depends(get_current_super_admin)
 ):
     """执行用户导入。按行提交，单行失败不影响整批。"""
-    preview = _preview_import_rows(db, request.csv_content)
-    raw_rows, _headers = _load_import_rows(request.csv_content)
+    preview = _preview_import_rows(db, request)
+    raw_rows, _headers = _load_import_payload_rows(request)
     raw_row_map = {row_no: item for row_no, item in raw_rows}
     results: List[UserImportRowResult] = []
 

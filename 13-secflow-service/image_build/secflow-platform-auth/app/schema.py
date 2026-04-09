@@ -48,7 +48,8 @@ class UserDetailResponse(UserResponse):
 
 class UserImportRequest(BaseModel):
     """用户导入请求"""
-    csv_content: str
+    csv_content: Optional[str] = None
+    file_content_base64: Optional[str] = None
     filename: Optional[str] = None
 
 
