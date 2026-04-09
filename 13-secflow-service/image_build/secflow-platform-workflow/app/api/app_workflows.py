@@ -156,6 +156,44 @@ def normalize_persisted_llm_bindings(node_config: Dict[str, Any]) -> List[Dict[s
     return []
 
 
+def merge_template_and_instance_env_vars(
+    template: Optional[AppTemplate],
+    instance_env_vars: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Merge template fixed env vars with instance overrides/additions."""
+    merged: List[Dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for container in (template.containers or []) if template else []:
+        for env in container.get("env_vars") or []:
+            name = str(env.get("name") or "").strip()
+            if not name or name in seen_names:
+                continue
+            merged.append({
+                "name": name,
+                "value": env.get("value", ""),
+            })
+            seen_names.add(name)
+
+    for env in instance_env_vars or []:
+        name = str(env.get("name") or "").strip()
+        if not name:
+            continue
+        payload = {
+            "name": name,
+            "value": env.get("value", ""),
+        }
+        for idx, existing in enumerate(merged):
+            if existing.get("name") == name:
+                merged[idx] = payload
+                break
+        else:
+            merged.append(payload)
+        seen_names.add(name)
+
+    return merged
+
+
 def build_app_workflow_response(
     instance: WorkflowInstance,
     node: WorkflowNodeInstance,
@@ -176,6 +214,7 @@ def build_app_workflow_response(
         create_service = True
     llm_bindings = normalize_persisted_llm_bindings(node_config)
     llm_binding = llm_bindings[0] if llm_bindings else None
+    merged_env_vars = merge_template_and_instance_env_vars(template, node.env_vars or [])
 
     return {
         "id": instance.id,
@@ -197,7 +236,7 @@ def build_app_workflow_response(
             "started_at": node.started_at.isoformat() if node.started_at else None,
             "finished_at": node.finished_at.isoformat() if node.finished_at else None,
             "created_at": node.created_at.isoformat() if node.created_at else None,
-            "env_vars": node.env_vars or [],
+            "env_vars": merged_env_vars,
             "volume_mounts": node_config.get("volume_mounts", node.volume_mounts or []),
             "project_file_mounts": node_config.get("project_file_mounts", []),
             "resources": node.resources,
@@ -220,7 +259,7 @@ def build_app_workflow_response(
         "service_ports": node_config.get("service_ports", []),
         "service_type": node_config.get("service_type"),
         "replicas": node_config.get("replicas"),
-        "env_vars": node.env_vars or [],
+        "env_vars": merged_env_vars,
         "volume_mounts": node_config.get("volume_mounts", node.volume_mounts or []),
         "project_file_mounts": node_config.get("project_file_mounts", []),
         "resources": node.resources,
