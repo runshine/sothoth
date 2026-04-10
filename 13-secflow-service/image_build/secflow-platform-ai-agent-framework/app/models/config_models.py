@@ -177,6 +177,58 @@ class FrameworkConfig(StrictModel):
     composite_workflows: List[CompositeWorkflowConfig]
     root_workflow_id: str = Field(..., min_length=1)
 
+    def resolve_entry_input_task_type(self) -> str:
+        composite_by_id = {item.id: item for item in self.composite_workflows}
+        atomic_by_id = {item.id: item for item in self.atomic_workflows}
+
+        def resolve(workflow_id: str, visiting: set[str]) -> str:
+            if workflow_id in visiting:
+                raise ValueError(f"composite workflow cycle detected while resolving entry: {workflow_id}")
+            workflow = composite_by_id.get(workflow_id)
+            if workflow is None or not workflow.stages:
+                raise ValueError(f"composite workflow has no stages: {workflow_id}")
+            visiting.add(workflow_id)
+            try:
+                head = next((stage for stage in workflow.stages if stage.previous_stage_id is None), None)
+                if head is None:
+                    raise ValueError(f"composite workflow has no head stage: {workflow_id}")
+                if head.workflow_kind == WorkflowKind.ATOMIC:
+                    atomic = atomic_by_id.get(head.workflow_ref)
+                    if atomic is None:
+                        raise ValueError(f"unknown atomic workflow in entry chain: {head.workflow_ref}")
+                    return atomic.input_task_type
+                return resolve(head.workflow_ref, visiting)
+            finally:
+                visiting.remove(workflow_id)
+
+        return resolve(self.root_workflow_id, set())
+
+    def resolve_final_output_task_type(self) -> str:
+        composite_by_id = {item.id: item for item in self.composite_workflows}
+        atomic_by_id = {item.id: item for item in self.atomic_workflows}
+
+        def resolve(workflow_id: str, visiting: set[str]) -> str:
+            if workflow_id in visiting:
+                raise ValueError(f"composite workflow cycle detected while resolving final output: {workflow_id}")
+            workflow = composite_by_id.get(workflow_id)
+            if workflow is None or not workflow.stages:
+                raise ValueError(f"composite workflow has no stages: {workflow_id}")
+            visiting.add(workflow_id)
+            try:
+                tail = next((stage for stage in workflow.stages if stage.next_stage_id is None), None)
+                if tail is None:
+                    raise ValueError(f"composite workflow has no tail stage: {workflow_id}")
+                if tail.workflow_kind == WorkflowKind.ATOMIC:
+                    atomic = atomic_by_id.get(tail.workflow_ref)
+                    if atomic is None:
+                        raise ValueError(f"unknown atomic workflow in final chain: {tail.workflow_ref}")
+                    return atomic.output_task_type
+                return resolve(tail.workflow_ref, visiting)
+            finally:
+                visiting.remove(workflow_id)
+
+        return resolve(self.root_workflow_id, set())
+
     @model_validator(mode="after")
     def validate_references(self) -> "FrameworkConfig":
         prompt_ids = set(self.prompts)
@@ -242,4 +294,8 @@ class FrameworkConfig(StrictModel):
             raise ValueError("run.next_task_generator.agent_instance_id not found")
         if generator.system_prompt_ref not in prompt_ids or generator.user_prompt_ref not in prompt_ids:
             raise ValueError("run.next_task_generator prompt refs not found")
+
+        # Ensure root composite workflow has a resolvable atomic entry and terminal output chain.
+        self.resolve_entry_input_task_type()
+        self.resolve_final_output_task_type()
         return self

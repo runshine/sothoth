@@ -35,6 +35,31 @@ class WorkflowService:
     def validate_definition_payload(self, definition_json: dict) -> FrameworkConfig:
         return FrameworkConfig.model_validate(definition_json)
 
+    def _definition_response(self, definition: WorkflowDefinition, validated: FrameworkConfig | None = None) -> WorkflowDefinitionResponse:
+        config = validated or self.validate_definition_payload(definition.definition_json)
+        payload = {
+            "id": definition.id,
+            "name": definition.name,
+            "description": definition.description,
+            "project_id": definition.project_id,
+            "root_workflow_id": definition.root_workflow_id,
+            "trigger_type": definition.trigger_type,
+            "trigger_enabled": definition.trigger_enabled,
+            "is_active": definition.is_active,
+            "enabled": definition.enabled,
+            "max_concurrency": definition.max_concurrency,
+            "priority_default": definition.priority_default,
+            "workspace_base_dir": definition.workspace_base_dir,
+            "execution_timeout_seconds": definition.execution_timeout_seconds,
+            "entry_input_task_type": config.resolve_entry_input_task_type(),
+            "final_output_task_type": config.resolve_final_output_task_type(),
+            "created_by": definition.created_by,
+            "updated_by": definition.updated_by,
+            "created_at": definition.created_at,
+            "updated_at": definition.updated_at,
+        }
+        return WorkflowDefinitionResponse.model_validate(payload)
+
     def _ensure_project_access(self, principal: dict, project_id: str) -> None:
         project_ids = _project_ids(principal)
         if project_ids and project_id not in project_ids:
@@ -89,19 +114,19 @@ class WorkflowService:
         self._create_version_snapshot(db, definition, actor)
         db.commit()
         db.refresh(definition)
-        return WorkflowDefinitionResponse.model_validate(definition, from_attributes=True)
+        return self._definition_response(definition, validated)
 
     def list_definitions(self, db: Session, principal: dict) -> List[WorkflowDefinitionResponse]:
         project_ids = _project_ids(principal)
         query = db.query(WorkflowDefinition).order_by(WorkflowDefinition.created_at.desc())
         if project_ids:
             query = query.filter(WorkflowDefinition.project_id.in_(project_ids))
-        return [WorkflowDefinitionResponse.model_validate(item, from_attributes=True) for item in query.all()]
+        return [self._definition_response(item) for item in query.all()]
 
     def get_definition(self, db: Session, definition_id: str, principal: dict) -> WorkflowDefinitionResponse:
         definition = self._get_definition_or_404(db, definition_id)
         self._ensure_project_access(principal, definition.project_id)
-        return WorkflowDefinitionResponse.model_validate(definition, from_attributes=True)
+        return self._definition_response(definition)
 
     def update_definition(
         self,
@@ -137,7 +162,7 @@ class WorkflowService:
         db.add(definition)
         db.commit()
         db.refresh(definition)
-        return WorkflowDefinitionResponse.model_validate(definition, from_attributes=True)
+        return self._definition_response(definition)
 
     def delete_definition(self, db: Session, definition_id: str, principal: dict) -> None:
         definition = self._get_definition_or_404(db, definition_id)
@@ -188,7 +213,7 @@ class WorkflowService:
         db.add(definition)
         db.commit()
         db.refresh(definition)
-        return WorkflowDefinitionResponse.model_validate(definition, from_attributes=True)
+        return self._definition_response(definition)
 
 
 _workflow_service: WorkflowService | None = None

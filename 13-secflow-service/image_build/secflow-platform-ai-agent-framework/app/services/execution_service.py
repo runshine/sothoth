@@ -227,10 +227,17 @@ class ExecutionService:
         *,
         input_tasks: List[TriggerTaskInputTask],
         workspace_root: Path,
+        entry_input_task_type: str,
     ) -> List[TaskItem]:
         task_inputs_root = ensure_dir(workspace_root / "trigger_inputs")
         normalized: List[TaskItem] = []
         for index, raw_task in enumerate(input_tasks, start=1):
+            provided_task_type = (raw_task.task_type or "").strip()
+            if provided_task_type and provided_task_type != entry_input_task_type:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"task {raw_task.task_id or index} task_type '{provided_task_type}' does not match entry_input_task_type '{entry_input_task_type}'",
+                )
             task_id = raw_task.task_id or _new_id(f"task{index}")
             task_slug = sanitize_name(task_id)
             task_dir = ensure_dir(task_inputs_root / task_slug)
@@ -252,7 +259,7 @@ class ExecutionService:
                 input_dir / "task.json",
                 {
                     "task_id": task_id,
-                    "task_type": raw_task.task_type,
+                    "task_type": entry_input_task_type,
                     "title": raw_task.title,
                     "metadata": raw_task.metadata,
                     "upstream_refs": raw_task.upstream_refs,
@@ -262,7 +269,7 @@ class ExecutionService:
             normalized.append(
                 TaskItem(
                     task_id=task_id,
-                    task_type=raw_task.task_type,
+                    task_type=entry_input_task_type,
                     title=raw_task.title,
                     task_md_path=abs_path(task_md_path),
                     metadata=dict(raw_task.metadata),
@@ -400,9 +407,12 @@ class ExecutionService:
             authorization_token=authorization_token,
             created_by=actor,
         )
+        validated_definition = get_workflow_service().validate_definition_payload(definition.definition_json)
+        entry_input_task_type = validated_definition.resolve_entry_input_task_type()
         normalized_tasks = self._normalize_trigger_tasks(
             input_tasks=payload.input_tasks,
             workspace_root=workspace_root,
+            entry_input_task_type=entry_input_task_type,
         )
         input_manifest_path = write_task_manifest(workspace_root / "input" / "tasks.json", normalized_tasks)
         write_json(
@@ -413,6 +423,7 @@ class ExecutionService:
                 "trigger_id": trigger_id,
                 "execution_id": execution_id,
                 "trigger_type": trigger_type,
+                "entry_input_task_type": entry_input_task_type,
                 "workspace_root": abs_path(workspace_root),
                 "input_manifest_path": abs_path(input_manifest_path),
             },

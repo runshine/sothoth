@@ -32,6 +32,8 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
     definition = create_response.json()
     definition_id = definition["id"]
     assert definition["root_workflow_id"] == framework_config_payload["root_workflow_id"]
+    assert definition["entry_input_task_type"] == "package_list"
+    assert definition["final_output_task_type"] == "verified_vuln"
 
     versions_response = client.get(f"/api/ai-agent-framework/workflow-definitions/{definition_id}/versions")
     assert versions_response.status_code == 200
@@ -57,7 +59,6 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
             "input_tasks": [
                 {
                     "task_id": "task-001",
-                    "task_type": "package_list",
                     "title": "样例输入任务",
                     "task_markdown": "# Package List\n\n- demo.tar.gz\n",
                     "metadata": {"source": "rest-test"},
@@ -87,6 +88,23 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
         assert (workspace_root / "trigger_inputs" / "task-001" / "input" / "task.md").exists()
     finally:
         db.close()
+
+    wrong_type_trigger = client.post(
+        f"/api/ai-agent-framework/workflow-definitions/{definition_id}/trigger-tasks",
+        json={
+            "input_tasks": [
+                {
+                    "task_id": "task-002",
+                    "task_type": "wrong_type",
+                    "title": "错误类型任务",
+                    "task_markdown": "# Wrong Type\n",
+                    "metadata": {},
+                    "upstream_refs": [],
+                }
+            ]
+        },
+    )
+    assert wrong_type_trigger.status_code == 422
 
     cancel_response = client.post(f"/api/ai-agent-framework/trigger-tasks/{trigger_task_id}/cancel")
     assert cancel_response.status_code == 200

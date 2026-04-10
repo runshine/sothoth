@@ -51,6 +51,8 @@ class WorkflowDefinitionResponse(BaseModel):
     priority_default: int
     workspace_base_dir: Optional[str]
     execution_timeout_seconds: int
+    entry_input_task_type: str
+    final_output_task_type: str
     created_by: str
     updated_by: str
     created_at: datetime
@@ -73,7 +75,7 @@ class TriggerTaskCreate(BaseModel):
 
 class TriggerTaskInputTask(BaseModel):
     task_id: Optional[str] = None
-    task_type: str = Field(..., min_length=1)
+    task_type: Optional[str] = None
     title: str = Field(..., min_length=1)
     task_markdown: Optional[str] = None
     task_md_path: Optional[str] = None
