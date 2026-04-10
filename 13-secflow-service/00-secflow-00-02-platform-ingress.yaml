@@ -120,6 +120,13 @@ spec:
                 name: secflow-platform-system-analysis
                 port:
                   number: 80
+          - path: /api/ai-agent-framework
+            pathType: Prefix
+            backend:
+              service:
+                name: secflow-platform-ai-agent-framework
+                port:
+                  number: 80
           - path: /api/app/code-server
             pathType: Prefix
             backend:
