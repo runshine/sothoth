@@ -128,7 +128,7 @@ def can_move_member_between_departments(
     target_member: DepartmentMember,
     new_department_id: int,
 ) -> tuple[bool, str]:
-    """普通管理员仅能移动其部门树内的普通成员。"""
+    """普通管理员仅能移动其部门树内的成员。"""
     if is_super_admin(current_user):
         return True, ""
 
@@ -139,10 +139,26 @@ def can_move_member_between_departments(
     if new_department_id not in manageable_ids:
         return False, "目标部门不在可管理范围内"
 
-    if target_member.role != "member":
-        return False, "普通管理员只能调整普通成员的所属部门"
-
     return True, ""
+
+
+def ensure_department_member_operation_scope(
+    db: Session,
+    current_user: User,
+    member: DepartmentMember
+) -> DepartmentMember:
+    """确保当前用户可以操作目标成员。"""
+    if is_super_admin(current_user):
+        return member
+
+    manageable_ids = get_manageable_department_ids(db, current_user) or []
+    if member.department_id not in manageable_ids:
+        log_access_denied(current_user, "部门成员", member.department_id, "目标成员不在可管理范围内")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="目标成员不在可管理范围内"
+        )
+    return member
 
 
 def ensure_department_member_management_scope(
@@ -1061,16 +1077,10 @@ def commit_department_members_import(
 def add_department_member(
     member: DepartmentMemberCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
-    """添加部门成员。仅超级管理员可用。"""
-    # 验证部门是否存在
-    department = db.query(Department).filter(Department.id == member.department_id).first()
-    if not department:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="部门不存在"
-        )
+    """添加部门成员。普通管理员可管理所属部门及下级部门的成员。"""
+    department = ensure_department_member_management_scope(db, current_user, member.department_id)
     
     # 验证用户是否存在
     user = db.query(User).filter(User.id == member.user_id).first()
@@ -1182,7 +1192,7 @@ def update_department_member(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user_management_user)
 ):
-    """更新部门成员。普通管理员仅能在自己部门树内移动普通成员。"""
+    """更新部门成员。普通管理员可管理自己部门树内的成员。"""
     # 验证成员是否存在
     db_member = db.query(DepartmentMember).filter(DepartmentMember.id == member_id).first()
     if not db_member:
@@ -1190,6 +1200,7 @@ def update_department_member(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="部门成员不存在"
         )
+    ensure_department_member_operation_scope(db, current_user, db_member)
     
     if member_update.role is None and member_update.department_id is None:
         raise HTTPException(
@@ -1200,12 +1211,6 @@ def update_department_member(
     old_role = db_member.role
 
     if member_update.role is not None:
-        if not is_super_admin(current_user):
-            log_access_denied(current_user, "部门成员角色", db_member.department_id, "普通管理员无权编辑部门成员角色")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="只有超级管理员可以编辑部门成员角色"
-            )
         if member_update.role == "leader":
             existing_leader = db.query(DepartmentMember).filter(
                 DepartmentMember.department_id == db_member.department_id,
@@ -1268,9 +1273,9 @@ def update_department_member(
 def remove_department_member(
     member_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
-    """移除部门成员。仅超级管理员可用。"""
+    """移除部门成员。普通管理员可管理所属部门及下级部门的成员。"""
     # 验证成员是否存在
     db_member = db.query(DepartmentMember).filter(DepartmentMember.id == member_id).first()
     if not db_member:
@@ -1278,6 +1283,7 @@ def remove_department_member(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="部门成员不存在"
         )
+    ensure_department_member_operation_scope(db, current_user, db_member)
     
     # 不允许移除自己
     if db_member.user_id == current_user.id:

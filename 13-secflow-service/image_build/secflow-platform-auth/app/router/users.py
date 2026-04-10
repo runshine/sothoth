@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.auth import cleanup_expired_sessions, get_password_hash, verify_password
 from app.database import get_db
-from app.dependencies import get_current_super_admin, get_current_user
+from app.dependencies import get_current_super_admin, get_current_user, get_current_user_management_user
 from app.model import Department, DepartmentMember, Role, User, UserSession
 from app.rbac import (
     ensure_platform_roles_seeded,
@@ -486,9 +486,9 @@ def _validate_role_ids_exist(db: Session, role_ids: List[int]) -> List[Role]:
 @router.get("/user_list", response_model=List[UserResponse])
 def list_users(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_super_admin)
+    current_user: User = Depends(get_current_user_management_user)
 ):
-    """获取用户列表。仅超级管理员可访问。"""
+    """获取用户列表。用户管理范围内的管理员可访问。"""
     ensure_platform_roles_seeded(db)
     users = db.query(User).order_by(User.id.asc()).all()
     return [_build_user_response(db, user) for user in users]
