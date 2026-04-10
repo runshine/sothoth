@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.models.database import WorkflowExecution, get_db_session
 
 
 def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framework_root: Path, framework_config_payload: dict):
@@ -50,10 +51,20 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
     assert activate_response.status_code == 200
     assert activate_response.json()["is_active"] is True
 
-    input_tasks = json.loads((framework_root / "examples" / "input_tasks.json").read_text(encoding="utf-8"))["tasks"]
     trigger_response = client.post(
         f"/api/ai-agent-framework/workflow-definitions/{definition_id}/trigger-tasks",
-        json={"input_tasks": input_tasks},
+        json={
+            "input_tasks": [
+                {
+                    "task_id": "task-001",
+                    "task_type": "package_list",
+                    "title": "样例输入任务",
+                    "task_markdown": "# Package List\n\n- demo.tar.gz\n",
+                    "metadata": {"source": "rest-test"},
+                    "upstream_refs": [],
+                }
+            ]
+        },
     )
     assert trigger_response.status_code == 201
     trigger_task_id = trigger_response.json()["id"]
@@ -63,6 +74,19 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
     assert execution_list_response.status_code == 200
     assert len(execution_list_response.json()) == 1
     assert execution_list_response.json()[0]["status"] == "pending"
+    execution_id = execution_list_response.json()[0]["id"]
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        assert execution.workspace_root is not None
+        workspace_root = Path(execution.workspace_root)
+        assert workspace_root.exists()
+        assert (workspace_root / "input" / "tasks.json").exists()
+        assert (workspace_root / "trigger_inputs" / "task-001" / "input" / "task.md").exists()
+    finally:
+        db.close()
 
     cancel_response = client.post(f"/api/ai-agent-framework/trigger-tasks/{trigger_task_id}/cancel")
     assert cancel_response.status_code == 200
@@ -70,4 +94,3 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
     trigger_detail_response = client.get(f"/api/ai-agent-framework/trigger-tasks/{trigger_task_id}")
     assert trigger_detail_response.status_code == 200
     assert trigger_detail_response.json()["status"] == "cancelled"
-

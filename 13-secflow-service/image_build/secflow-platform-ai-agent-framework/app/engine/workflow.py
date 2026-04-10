@@ -154,25 +154,26 @@ class WorkflowExecutor:
             for task in current_tasks:
                 self.check_interruption(checkpoint="before_task", stage_id=stage.id, task=task)
                 task_dir = self.workspace.task_dir(stage_dir, sanitize_name(task.task_id))
+                stage_task = self._materialize_task_input(task=task, task_dir=task_dir)
                 try:
                     if stage.workflow_kind == WorkflowKind.ATOMIC:
                         result = self.execute_atomic(
                             workflow_config=self.atomic_by_id[stage.workflow_ref],
-                            task=task,
+                            task=stage_task,
                             task_dir=task_dir,
                         )
                     else:
                         nested_dir = self.workspace.nested_composite_dir(task_dir, stage.workflow_ref)
                         result = self.execute_composite(
                             workflow_config=self.composite_by_id[stage.workflow_ref],
-                            tasks=[task],
+                            tasks=[stage_task],
                             workflow_dir=nested_dir,
                         )
                     manifest = load_task_manifest(result.next_tasks_manifest_path if isinstance(result, AtomicResult) else result.output_manifest_path)
                     next_tasks.extend(manifest.tasks)
                     task_records.append(
                         StageTaskRecord(
-                            task_id=task.task_id,
+                            task_id=stage_task.task_id,
                             state=result.state,
                             message=getattr(result, "message", ""),
                             produced_task_count=len(manifest.tasks),
@@ -186,7 +187,7 @@ class WorkflowExecutor:
                 except ExitWorkflowError as exc:
                     task_records.append(
                         StageTaskRecord(
-                            task_id=task.task_id,
+                            task_id=stage_task.task_id,
                             state=ExecutionState.EXITED,
                             message=str(exc),
                             produced_task_count=0,
@@ -200,7 +201,7 @@ class WorkflowExecutor:
                     logger.exception("stage task execution failed: %s", exc)
                     task_records.append(
                         StageTaskRecord(
-                            task_id=task.task_id,
+                            task_id=stage_task.task_id,
                             state=ExecutionState.FAILED,
                             message=str(exc),
                             produced_task_count=0,
@@ -223,6 +224,25 @@ class WorkflowExecutor:
             output_task_count=len(current_tasks),
             workflow_dir=abs_path(workflow_dir),
         )
+
+    def _materialize_task_input(self, *, task: TaskItem, task_dir: Path) -> TaskItem:
+        input_dir = ensure_dir(task_dir / "input")
+        source_path = Path(task.task_md_path)
+        if not source_path.exists():
+            raise FileNotFoundError(f"task markdown not found: {task.task_md_path}")
+        task_md_path = write_text(input_dir / source_path.name, source_path.read_text(encoding="utf-8"))
+        write_json(
+            input_dir / "task.json",
+            {
+                "task_id": task.task_id,
+                "task_type": task.task_type,
+                "title": task.title,
+                "metadata": task.metadata,
+                "upstream_refs": task.upstream_refs,
+                "source_task_md_path": task.task_md_path,
+            },
+        )
+        return task.model_copy(update={"task_md_path": abs_path(task_md_path)})
 
     def execute_atomic(self, *, workflow_config: AtomicWorkflowConfig, task: TaskItem, task_dir: Path) -> AtomicResult:
         if task.task_type != workflow_config.input_task_type:
@@ -316,6 +336,7 @@ class WorkflowExecutor:
                 ),
                 task_scope=worker_scope,
                 session_mode_override=workflow_config.worker.session_mode_override,
+                cwd_override=abs_path(task_dir),
             )
             if not worker_response.success:
                 raise RuntimeError(worker_response.error or "worker failed")
@@ -332,6 +353,7 @@ class WorkflowExecutor:
                     ),
                     task_scope=worker_scope,
                     session_mode_override=workflow_config.worker.session_mode_override,
+                    cwd_override=abs_path(task_dir),
                 )
                 if not reflection_response.success:
                     raise RuntimeError(reflection_response.error or "reflection failed")
@@ -509,6 +531,7 @@ class WorkflowExecutor:
             ),
             task_scope=worker_scope,
             session_mode_override=workflow_config.worker.session_mode_override,
+            cwd_override=abs_path(task_dir),
         )
         if not summary_response.success:
             raise RuntimeError(summary_response.error or "summary failed")
@@ -577,6 +600,7 @@ class WorkflowExecutor:
                 task=task,
                 workflow_config=workflow_config,
                 round_no=round_no,
+                task_dir=task_dir,
                 summary_json_path=summary_json_path,
                 results_manifest_path=results_manifest_path,
                 review_dir=task_dir / "reviews" / "global" / sanitize_name(reviewer.id),
@@ -621,6 +645,7 @@ class WorkflowExecutor:
                     task=task,
                     workflow_config=workflow_config,
                     round_no=round_no,
+                    task_dir=task_dir,
                     summary_json_path=None,
                     results_manifest_path=results_manifest_path,
                     review_dir=task_dir / "reviews" / "results" / sanitize_name(result_item.result_id) / sanitize_name(reviewer.id),
@@ -654,6 +679,7 @@ class WorkflowExecutor:
         task: TaskItem,
         workflow_config: AtomicWorkflowConfig,
         round_no: int,
+        task_dir: Path,
         summary_json_path: Path | None,
         results_manifest_path: Path,
         review_dir: Path,
@@ -698,6 +724,7 @@ class WorkflowExecutor:
             ),
             task_scope=f"{workflow_config.id}:{task.task_id}:{scope}:{reviewer.id}:{target_id}",
             force_new_session=True,
+            cwd_override=abs_path(task_dir),
         )
         if not response.success:
             raise RuntimeError(response.error or f"{scope} review failed")

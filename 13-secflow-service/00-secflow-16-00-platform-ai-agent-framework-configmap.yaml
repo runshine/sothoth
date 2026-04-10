@@ -29,6 +29,14 @@ data:
       service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
       timeout: 10
 
+    fileserver_service:
+      enabled: true
+      base_url: "http://secflow-platform-fileserver/api/fileserver"
+      timeout: 10
+      data_mount_path: "/data"
+      project_files_dirname: "files"
+      aiwf_subproject_name: "AI_AGENT_FRAMEWORK"
+
     registry:
       enabled: true
       menu_service_url: "http://secflow-platform-menu:80"
@@ -51,7 +59,7 @@ data:
         level3_name: ""
 
     service:
-      workspace_base_dir: "/tmp/secflow-ai-agent-framework"
+      workspace_base_dir: "/data/files"
       default_execution_timeout_seconds: 7200
       execution_cancel_check_interval_seconds: 1
       trigger_retry_limit: 3

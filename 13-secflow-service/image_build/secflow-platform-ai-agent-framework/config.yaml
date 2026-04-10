@@ -19,6 +19,14 @@ auth_service:
   validate_machine_token_path: /api/auth/validate-token
   timeout: 10
 
+fileserver_service:
+  enabled: true
+  base_url: http://secflow-platform-fileserver/api/fileserver
+  timeout: 10
+  data_mount_path: /data
+  project_files_dirname: files
+  aiwf_subproject_name: AI_AGENT_FRAMEWORK
+
 registry:
   enabled: false
   menu_service_url: http://secflow-platform-menu

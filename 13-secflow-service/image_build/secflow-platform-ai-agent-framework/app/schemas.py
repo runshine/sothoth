@@ -67,8 +67,22 @@ class WorkflowDefinitionVersionResponse(BaseModel):
 
 
 class TriggerTaskCreate(BaseModel):
-    input_tasks: List[TaskItem]
+    input_tasks: List["TriggerTaskInputTask"]
     priority: Optional[int] = None
+
+
+class TriggerTaskInputTask(BaseModel):
+    task_id: Optional[str] = None
+    task_type: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    task_markdown: Optional[str] = None
+    task_md_path: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    upstream_refs: List[str] = Field(default_factory=list)
+
+
+class TriggerTaskInputPreview(TaskItem):
+    task_input_dir: Optional[str] = None
 
 
 class TriggerTaskResponse(BaseModel):

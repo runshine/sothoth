@@ -28,7 +28,7 @@ class RuntimeManager:
     def __init__(self, config: FrameworkConfig):
         self.config = config
         self._runtimes: Dict[str, BaseAgentRuntime] = {}
-        self._session_cache: Dict[Tuple[str, str, str], str] = {}
+        self._session_cache: Dict[Tuple[str, str, str, str], str] = {}
 
     def _backend_config(self, agent_instance_id: str) -> RuntimeBackendConfig:
         instance = next(item for item in self.config.agent_instances if item.id == agent_instance_id)
@@ -78,36 +78,38 @@ class RuntimeManager:
         task_scope: str,
         session_mode_override: SessionMode | None = None,
         force_new_session: bool = False,
+        cwd_override: str | None = None,
     ) -> RuntimeResponse:
         runtime = self._get_runtime(agent_instance_id)
         backend = runtime.backend_config
         mode = session_mode_override or backend.session_mode_default
+        effective_cwd = cwd_override or backend.cwd
         if mode == SessionMode.INVOKE:
-            return runtime.invoke_once(prompt, mode)
+            return runtime.invoke_once(prompt, mode, cwd_override=effective_cwd)
         if backend.reset_context or force_new_session:
-            session_id = runtime.create_session(mode)
+            session_id = runtime.create_session(mode, cwd_override=effective_cwd)
             try:
                 return runtime.send_message(session_id, prompt)
             finally:
                 runtime.close_session(session_id)
 
-        cache_key = (task_scope, agent_instance_id, mode.value)
+        cache_key = (task_scope, agent_instance_id, mode.value, effective_cwd or "")
         session_id = self._session_cache.get(cache_key)
         if not session_id:
-            session_id = runtime.create_session(mode)
+            session_id = runtime.create_session(mode, cwd_override=effective_cwd)
             self._session_cache[cache_key] = session_id
         return runtime.send_message(session_id, prompt)
 
     def close_task_scope(self, task_scope: str) -> None:
         to_delete = [cache_key for cache_key in self._session_cache if cache_key[0] == task_scope]
         for cache_key in to_delete:
-            _, agent_instance_id, _ = cache_key
+            _, agent_instance_id, _, _ = cache_key
             session_id = self._session_cache.pop(cache_key)
             self._get_runtime(agent_instance_id).close_session(session_id)
 
     def close_all(self) -> None:
         cache_keys = list(self._session_cache.keys())
-        for task_scope, agent_instance_id, mode in cache_keys:
-            session_id = self._session_cache.pop((task_scope, agent_instance_id, mode), None)
+        for task_scope, agent_instance_id, mode, cwd in cache_keys:
+            session_id = self._session_cache.pop((task_scope, agent_instance_id, mode, cwd), None)
             if session_id:
                 self._get_runtime(agent_instance_id).close_session(session_id)

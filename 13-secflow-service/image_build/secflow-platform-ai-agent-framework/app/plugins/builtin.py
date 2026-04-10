@@ -57,6 +57,7 @@ class NextTaskGeneratorPlugin(BasePlugin):
             prompt=prompt,
             task_scope=f"{ctx.workflow_config.id}:{ctx.task.task_id}:next-task-generator",
             force_new_session=True,
+            cwd_override=abs_path(ctx.task_dir),
         )
         if not response.success:
             return PluginResult(status=PluginStatus.FAIL_EXIT_WORKFLOW, message=response.error)

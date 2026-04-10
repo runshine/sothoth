@@ -114,7 +114,14 @@ async def create_trigger_task(
     db: Session = Depends(get_db),
 ):
     principal, token = subject
-    return get_execution_service().create_trigger_task(db, definition_id, payload, principal, trigger_type="manual")
+    return get_execution_service().create_trigger_task(
+        db,
+        definition_id,
+        payload,
+        principal,
+        trigger_type="manual",
+        authorization_token=token,
+    )
 
 
 @router.post("/trigger/{definition_id}", response_model=TriggerTaskResponse, status_code=status.HTTP_201_CREATED)
@@ -125,7 +132,14 @@ async def http_trigger_definition(
     db: Session = Depends(get_db),
 ):
     principal, token = subject
-    return get_execution_service().create_trigger_task(db, definition_id, payload, principal, trigger_type="http")
+    return get_execution_service().create_trigger_task(
+        db,
+        definition_id,
+        payload,
+        principal,
+        trigger_type="http",
+        authorization_token=token,
+    )
 
 
 @router.get("/trigger-tasks", response_model=List[TriggerTaskResponse])
@@ -150,7 +164,7 @@ async def cancel_trigger_task(trigger_task_id: str, subject=Depends(get_current_
 @router.post("/trigger-tasks/{trigger_task_id}/retry", response_model=TriggerTaskResponse, status_code=status.HTTP_201_CREATED)
 async def retry_trigger_task(trigger_task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, token = subject
-    return get_execution_service().retry_trigger_task(db, trigger_task_id, principal)
+    return get_execution_service().retry_trigger_task(db, trigger_task_id, principal, authorization_token=token)
 
 
 @router.get("/executions", response_model=List[WorkflowExecutionResponse])

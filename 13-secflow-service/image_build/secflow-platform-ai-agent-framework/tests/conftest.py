@@ -38,6 +38,12 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
         "app": {"host": "127.0.0.1", "port": 18080, "debug": False},
         "database": {"url": f"sqlite:///{tmp_path / 'service.db'}", "table_prefix": "test_aiwf_"},
         "auth_service": {"enabled": False},
+        "fileserver_service": {
+            "enabled": False,
+            "data_mount_path": str(tmp_path / "data"),
+            "project_files_dirname": "files",
+            "aiwf_subproject_name": "AI_AGENT_FRAMEWORK",
+        },
         "registry": {"enabled": False},
         "service": {"workspace_base_dir": str(tmp_path / "workspace")},
         "scheduler": {

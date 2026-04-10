@@ -39,7 +39,7 @@ def test_scheduler_claim_respects_single_owner_and_definition_concurrency(
                     "task_id": "task-1",
                     "task_type": "package_list",
                     "title": "Task 1",
-                    "task_md_path": "/tmp/task-1.md",
+                    "task_markdown": "# Task 1\n",
                     "metadata": {},
                     "upstream_refs": [],
                 }
@@ -61,7 +61,7 @@ def test_scheduler_claim_respects_single_owner_and_definition_concurrency(
                         "task_id": "task-2",
                         "task_type": "package_list",
                         "title": "Task 2",
-                        "task_md_path": "/tmp/task-2.md",
+                        "task_markdown": "# Task 2\n",
                         "metadata": {},
                         "upstream_refs": [],
                     }

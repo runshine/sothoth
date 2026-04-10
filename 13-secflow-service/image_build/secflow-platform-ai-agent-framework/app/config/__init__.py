@@ -49,6 +49,15 @@ class AuthServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}{self.validate_machine_token_path}"
 
 
+class FileserverServiceConfig(BaseModel):
+    enabled: bool = True
+    base_url: str = "http://secflow-platform-fileserver/api/fileserver"
+    timeout: int = 10
+    data_mount_path: str = "/data"
+    project_files_dirname: str = "files"
+    aiwf_subproject_name: str = "AI_AGENT_FRAMEWORK"
+
+
 class MenuConfig(BaseModel):
     id: str = "ai-agent-framework"
     path: str = "/ai-agent-framework"
@@ -102,6 +111,7 @@ class Config(BaseModel):
     app: AppConfig = Field(default_factory=AppConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
+    fileserver_service: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

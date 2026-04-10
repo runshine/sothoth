@@ -54,16 +54,17 @@ class BaseAgentRuntime(ABC):
             "installed": exists,
         }
 
-    def create_session(self, session_mode: Optional[SessionMode] = None) -> str:
+    def create_session(self, session_mode: Optional[SessionMode] = None, cwd_override: Optional[str] = None) -> str:
         mode = session_mode or self.backend_config.session_mode_default
         session = self.session_store.create(self.backend_config.backend_id, mode.value)
         command = self.build_command()
         env = self.build_env()
+        cwd = cwd_override or self.backend_config.cwd
         if mode == SessionMode.PIPE:
-            pid = self.pipe_manager.create_session(session.session_id, command, self.backend_config.cwd, env)
+            pid = self.pipe_manager.create_session(session.session_id, command, cwd, env)
             self.session_store.patch(session.session_id, pid=pid)
         elif mode == SessionMode.PTY:
-            pid = self.pty_manager.create_session(session.session_id, command, self.backend_config.cwd, env)
+            pid = self.pty_manager.create_session(session.session_id, command, cwd, env)
             self.session_store.patch(session.session_id, pid=pid)
         return session.session_id
 
@@ -82,14 +83,19 @@ class BaseAgentRuntime(ABC):
         payload = self.pty_manager.read_until_idle(session_id, self.quiet_window_ms, self.max_window_ms)
         return RuntimeResponse(success=True, output=str(payload.get("output", "")), timed_out=bool(payload.get("timed_out", False)), raw=payload)
 
-    def invoke_once(self, prompt: str, session_mode: Optional[SessionMode] = None) -> RuntimeResponse:
+    def invoke_once(
+        self,
+        prompt: str,
+        session_mode: Optional[SessionMode] = None,
+        cwd_override: Optional[str] = None,
+    ) -> RuntimeResponse:
         mode = session_mode or SessionMode.INVOKE
         command = self.build_command(prompt if mode == SessionMode.INVOKE else None)
         env = self.build_env()
         try:
             completed = subprocess.run(
                 command,
-                cwd=self.backend_config.cwd or None,
+                cwd=cwd_override or self.backend_config.cwd or None,
                 env=env,
                 text=True,
                 capture_output=True,

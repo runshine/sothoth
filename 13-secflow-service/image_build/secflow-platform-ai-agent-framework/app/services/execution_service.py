@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import shutil
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -11,11 +9,11 @@ from typing import Any, Dict, List, Optional
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.artifacts.io import ensure_dir, write_task_manifest
+from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, write_task_manifest, write_text
 from app.config import get_config
 from app.engine.workflow import ExitWorkflowError, WorkflowExecutor
 from app.models.config_models import FrameworkConfig
-from app.models.contracts import ExecutionState, TaskManifest
+from app.models.contracts import ExecutionState, TaskItem, TaskManifest
 from app.models.database import (
     TriggerTask,
     WorkflowDefinition,
@@ -24,11 +22,13 @@ from app.models.database import (
     get_db_session,
 )
 from app.schemas import (
+    TriggerTaskInputTask,
     TriggerTaskCreate,
     TriggerTaskResponse,
     WorkflowExecutionEventResponse,
     WorkflowExecutionResponse,
 )
+from app.services.fileserver_client import get_fileserver_client
 from app.services.workflow_service import get_workflow_service
 
 
@@ -221,6 +221,75 @@ class ExecutionService:
         base_dir = definition.workspace_base_dir or get_config().service.workspace_base_dir
         return ensure_dir(Path(base_dir) / execution_id)
 
+    def _normalize_trigger_tasks(
+        self,
+        *,
+        input_tasks: List[TriggerTaskInputTask],
+        workspace_root: Path,
+    ) -> List[TaskItem]:
+        task_inputs_root = ensure_dir(workspace_root / "trigger_inputs")
+        normalized: List[TaskItem] = []
+        for index, raw_task in enumerate(input_tasks, start=1):
+            task_id = raw_task.task_id or _new_id(f"task{index}")
+            task_slug = sanitize_name(task_id)
+            task_dir = ensure_dir(task_inputs_root / task_slug)
+            input_dir = ensure_dir(task_dir / "input")
+            markdown = raw_task.task_markdown
+            if markdown is None and raw_task.task_md_path:
+                markdown = Path(raw_task.task_md_path).read_text(encoding="utf-8")
+            if markdown is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"task {task_id} missing task_markdown",
+                )
+            task_md_path = write_text(input_dir / "task.md", markdown.strip() + "\n")
+            write_json(
+                input_dir / "task.json",
+                {
+                    "task_id": task_id,
+                    "task_type": raw_task.task_type,
+                    "title": raw_task.title,
+                    "metadata": raw_task.metadata,
+                    "upstream_refs": raw_task.upstream_refs,
+                },
+            )
+            normalized.append(
+                TaskItem(
+                    task_id=task_id,
+                    task_type=raw_task.task_type,
+                    title=raw_task.title,
+                    task_md_path=abs_path(task_md_path),
+                    metadata=dict(raw_task.metadata),
+                    upstream_refs=list(raw_task.upstream_refs),
+                )
+            )
+        return normalized
+
+    def _build_project_workspace_root(
+        self,
+        *,
+        definition: WorkflowDefinition,
+        trigger_id: str,
+        execution_id: str,
+        authorization_token: str | None,
+        created_by: str,
+    ) -> Path:
+        subproject = get_fileserver_client().ensure_subproject(
+            project_id=definition.project_id,
+            authorization_token=authorization_token,
+            created_by=created_by,
+        )
+        base_root = Path(subproject["root_dir"])
+        return ensure_dir(
+            base_root
+            / "workflow-definitions"
+            / sanitize_name(definition.id)
+            / "trigger-tasks"
+            / sanitize_name(trigger_id)
+            / "executions"
+            / sanitize_name(execution_id)
+        )
+
     def _set_terminal_state(
         self,
         db: Session,
@@ -256,6 +325,7 @@ class ExecutionService:
         principal: dict,
         *,
         trigger_type: str,
+        authorization_token: str | None = None,
     ) -> TriggerTaskResponse:
         definition = self._definition_or_404(db, definition_id)
         self._ensure_project_access(principal, definition.project_id)
@@ -264,11 +334,37 @@ class ExecutionService:
         if trigger_type == "http":
             if definition.trigger_type != "http" or not definition.trigger_enabled or not definition.is_active:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="workflow definition http trigger is unavailable")
-        manifest = TaskManifest(tasks=payload.input_tasks)
         actor = _principal_id(principal)
         now = datetime.utcnow()
+        trigger_id = _new_id("tt")
+        execution_id = _new_id("exec")
+        workspace_root = self._build_project_workspace_root(
+            definition=definition,
+            trigger_id=trigger_id,
+            execution_id=execution_id,
+            authorization_token=authorization_token,
+            created_by=actor,
+        )
+        normalized_tasks = self._normalize_trigger_tasks(
+            input_tasks=payload.input_tasks,
+            workspace_root=workspace_root,
+        )
+        input_manifest_path = write_task_manifest(workspace_root / "input" / "tasks.json", normalized_tasks)
+        write_json(
+            workspace_root / "execution_meta.json",
+            {
+                "workflow_definition_id": definition.id,
+                "project_id": definition.project_id,
+                "trigger_id": trigger_id,
+                "execution_id": execution_id,
+                "trigger_type": trigger_type,
+                "workspace_root": abs_path(workspace_root),
+                "input_manifest_path": abs_path(input_manifest_path),
+            },
+        )
+        manifest = TaskManifest(tasks=normalized_tasks)
         trigger = TriggerTask(
-            id=_new_id("tt"),
+            id=trigger_id,
             workflow_definition_id=definition.id,
             project_id=definition.project_id,
             trigger_type=trigger_type,
@@ -281,11 +377,12 @@ class ExecutionService:
             updated_at=now,
         )
         execution = WorkflowExecution(
-            id=_new_id("exec"),
+            id=execution_id,
             trigger_task_id=trigger.id,
             workflow_definition_id=definition.id,
             project_id=definition.project_id,
             status="pending",
+            workspace_root=abs_path(workspace_root),
             message="pending dispatch",
             created_at=now,
             updated_at=now,
@@ -332,12 +429,39 @@ class ExecutionService:
             db.add(execution)
         db.commit()
 
-    def retry_trigger_task(self, db: Session, trigger_task_id: str, principal: dict) -> TriggerTaskResponse:
+    def retry_trigger_task(
+        self,
+        db: Session,
+        trigger_task_id: str,
+        principal: dict,
+        *,
+        authorization_token: str | None = None,
+    ) -> TriggerTaskResponse:
         trigger = self._trigger_or_404(db, trigger_task_id)
         self._ensure_project_access(principal, trigger.project_id)
         definition = self._definition_or_404(db, trigger.workflow_definition_id)
-        payload = TriggerTaskCreate(input_tasks=TaskManifest.model_validate(trigger.input_tasks_json).tasks, priority=trigger.priority)
-        return self.create_trigger_task(db, definition.id, payload, principal, trigger_type=trigger.trigger_type)
+        payload = TriggerTaskCreate(
+            input_tasks=[
+                TriggerTaskInputTask(
+                    task_id=item.task_id,
+                    task_type=item.task_type,
+                    title=item.title,
+                    task_md_path=item.task_md_path,
+                    metadata=item.metadata,
+                    upstream_refs=item.upstream_refs,
+                )
+                for item in TaskManifest.model_validate(trigger.input_tasks_json).tasks
+            ],
+            priority=trigger.priority,
+        )
+        return self.create_trigger_task(
+            db,
+            definition.id,
+            payload,
+            principal,
+            trigger_type=trigger.trigger_type,
+            authorization_token=authorization_token,
+        )
 
     def list_executions(self, db: Session, principal: dict) -> List[WorkflowExecutionResponse]:
         project_ids = _project_ids(principal)
@@ -424,11 +548,12 @@ class ExecutionService:
             trigger = self._trigger_or_404(db, execution.trigger_task_id)
             definition = self._definition_or_404(db, execution.workflow_definition_id)
             framework_config = get_workflow_service().validate_definition_payload(definition.definition_json)
-            workspace_root = self._build_workspace_root(execution.id, definition)
-            input_dir = ensure_dir(workspace_root / "input")
-            input_manifest_path = write_task_manifest(input_dir / "tasks.json", TaskManifest.model_validate(trigger.input_tasks_json).tasks)
+            workspace_root = Path(execution.workspace_root) if execution.workspace_root else self._build_workspace_root(execution.id, definition)
+            input_manifest_path = workspace_root / "input" / "tasks.json"
+            if not input_manifest_path.exists():
+                input_manifest_path = write_task_manifest(input_manifest_path, TaskManifest.model_validate(trigger.input_tasks_json).tasks)
 
-            execution.workspace_root = str(workspace_root)
+            execution.workspace_root = abs_path(workspace_root)
             execution.message = "execution running"
             if execution.started_at is None:
                 execution.started_at = datetime.utcnow()
