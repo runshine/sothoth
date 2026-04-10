@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -243,6 +244,10 @@ class ExecutionService:
                     detail=f"task {task_id} missing task_markdown",
                 )
             task_md_path = write_text(input_dir / "task.md", markdown.strip() + "\n")
+            copied_inputs = self._copy_uploaded_inputs_to_task_dir(
+                task_input_dir=input_dir,
+                metadata=raw_task.metadata,
+            )
             write_json(
                 input_dir / "task.json",
                 {
@@ -251,6 +256,7 @@ class ExecutionService:
                     "title": raw_task.title,
                     "metadata": raw_task.metadata,
                     "upstream_refs": raw_task.upstream_refs,
+                    "copied_input_files": copied_inputs,
                 },
             )
             normalized.append(
@@ -264,6 +270,55 @@ class ExecutionService:
                 )
             )
         return normalized
+
+    def _copy_uploaded_inputs_to_task_dir(self, *, task_input_dir: Path, metadata: Dict[str, Any]) -> List[Dict[str, str]]:
+        uploads = metadata.get("task_input_uploads")
+        if not isinstance(uploads, list) or not uploads:
+            return []
+        copied: List[Dict[str, str]] = []
+        data_mount_path = Path(get_config().fileserver_service.data_mount_path)
+        assets_dir = ensure_dir(task_input_dir / "assets")
+
+        for item in uploads:
+            if not isinstance(item, dict):
+                continue
+            storage_key = str(item.get("storage_key") or "").strip()
+            if not storage_key:
+                continue
+            relative_path_raw = str(item.get("relative_path") or item.get("filename") or "").strip()
+            if not relative_path_raw:
+                continue
+            relative_path = Path(relative_path_raw)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"invalid uploaded relative path: {relative_path_raw}",
+                )
+            storage_path = Path(storage_key)
+            if storage_path.is_absolute() or ".." in storage_path.parts:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"invalid uploaded storage key: {storage_key}",
+                )
+            source_path = data_mount_path / storage_path
+            if not source_path.exists() or not source_path.is_file():
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"uploaded file not found in pvc: {storage_key}",
+                )
+            target_path = assets_dir / relative_path
+            ensure_dir(target_path.parent)
+            shutil.copy2(source_path, target_path)
+            copied.append(
+                {
+                    "relative_path": relative_path.as_posix(),
+                    "target_path": abs_path(target_path),
+                    "source_storage_key": storage_key,
+                }
+            )
+        if copied:
+            write_json(task_input_dir / "uploaded_assets_manifest.json", {"items": copied})
+        return copied
 
     def _build_project_workspace_root(
         self,
