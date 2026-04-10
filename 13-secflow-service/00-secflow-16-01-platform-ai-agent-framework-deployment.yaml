@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-platform-ai-agent-framework
+  namespace: secflow-ns
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      name: secflow-platform-ai-agent-framework
+  template:
+    metadata:
+      labels:
+        name: secflow-platform-ai-agent-framework
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: secflow-platform-ai-agent-framework
+        image: ghcr.io/runshine/secflow-platform-ai-agent-framework:20260410
+        imagePullPolicy: Always
+        env:
+        - name: CONFIG_PATH
+          value: /app/config.yaml
+        - name: POD_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: secflow-platform-ai-agent-framework-config
+          mountPath: /app/config.yaml
+          subPath: config.yaml
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "150m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/ai-agent-framework/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/ai-agent-framework/ready
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 15
+      volumes:
+      - name: secflow-platform-ai-agent-framework-config
+        configMap:
+          name: secflow-platform-ai-agent-framework-config
+          items:
+            - key: config.yaml
+              path: config.yaml

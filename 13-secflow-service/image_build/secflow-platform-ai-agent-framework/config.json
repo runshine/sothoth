@@ -1,0 +1,532 @@
+{
+  "schema_version": "v1",
+  "run": {
+    "next_task_generator": {
+      "agent_instance_id": "codex-generator",
+      "system_prompt_ref": "next_task_system",
+      "user_prompt_ref": "next_task_user",
+      "allow_empty": true
+    },
+    "session_quiet_window_ms": 200,
+    "session_max_window_ms": 3000,
+    "plugin_search_packages": [
+      "plugins"
+    ]
+  },
+  "prompts": {
+    "worker_package_unpack": "You are handling `{{task_type}}`. Read the markdown task at `{{task_md_path}}` and produce outputs for `{{output_task_type}}`.",
+    "worker_system_analysis": "You are handling `{{task_type}}`. Read the markdown task at `{{task_md_path}}` and produce outputs for `{{output_task_type}}`.",
+    "worker_decompile_optimize": "You are handling `{{task_type}}`. Read the markdown task at `{{task_md_path}}` and produce outputs for `{{output_task_type}}`.",
+    "worker_external_entry_analysis": "You are handling `{{task_type}}`. Read the markdown task at `{{task_md_path}}` and produce outputs for `{{output_task_type}}`.",
+    "worker_dataflow_analysis": "You are handling `{{task_type}}`. Read the markdown task at `{{task_md_path}}` and produce outputs for `{{output_task_type}}`.",
+    "worker_vuln_identify": "You are handling `{{task_type}}`. Read the markdown task at `{{task_md_path}}` and produce outputs for `{{output_task_type}}`.",
+    "worker_vuln_filter": "You are handling `{{task_type}}`. Read the markdown task at `{{task_md_path}}` and produce outputs for `{{output_task_type}}`.",
+    "reflection_primary": "Review your last worker execution for task `{{task_id}}` and refine your approach if needed.",
+    "reflection_secondary": "Check whether the expected `{{output_task_type}}` artifacts are complete for `{{task_id}}`.",
+    "summary_prompt": "Summarize the work for task `{{task_id}}` and emit result artifacts for `{{output_task_type}}`.",
+    "global_review_system": "You are a global advisor reviewing task `{{task_id}}` with summary `{{summary_json_path}}` and result manifest `{{results_manifest_path}}`.",
+    "global_review_user": "Review the full task outcome.",
+    "result_review_system": "You are a result advisor reviewing result `{{result_id}}` from `{{result_json_path}}`.",
+    "result_review_user": "Review the single result and decide whether it should pass.",
+    "next_task_system": "You convert a finished task into next-stage tasks. Output tasks of type `{{output_task_type}}`.",
+    "next_task_user": "Read the summary and results and generate the next task list for `{{output_task_type}}`."
+  },
+  "agent_types": [
+    {
+      "id": "codex_type",
+      "name": "Codex",
+      "type": "codex",
+      "runtime": {
+        "adapter": "codex",
+        "session_mode_default": "invoke",
+        "command_or_sdk": {
+          "kind": "command",
+          "command": "python",
+          "args": [
+            "-m",
+            "app.runtime.mock_agent_cli"
+          ]
+        },
+        "env_from": [],
+        "cwd": null
+      }
+    },
+    {
+      "id": "claude_code_type",
+      "name": "Claude Code",
+      "type": "claude_code",
+      "runtime": {
+        "adapter": "claude_code",
+        "session_mode_default": "pipe",
+        "command_or_sdk": {
+          "kind": "command",
+          "command": "python",
+          "args": [
+            "-m",
+            "app.runtime.mock_agent_cli"
+          ]
+        },
+        "env_from": [],
+        "cwd": null
+      }
+    },
+    {
+      "id": "opencode_type",
+      "name": "OpenCode",
+      "type": "opencode",
+      "runtime": {
+        "adapter": "opencode",
+        "session_mode_default": "pty",
+        "command_or_sdk": {
+          "kind": "command",
+          "command": "python",
+          "args": [
+            "-m",
+            "app.runtime.mock_agent_cli"
+          ]
+        },
+        "env_from": [],
+        "cwd": null
+      }
+    },
+    {
+      "id": "pi_agent_type",
+      "name": "Pi Agent",
+      "type": "pi_agent",
+      "runtime": {
+        "adapter": "pi_agent",
+        "session_mode_default": "invoke",
+        "command_or_sdk": {
+          "kind": "command",
+          "command": "python",
+          "args": [
+            "-m",
+            "app.runtime.mock_agent_cli"
+          ]
+        },
+        "env_from": [],
+        "cwd": null
+      }
+    }
+  ],
+  "agent_instances": [
+    {
+      "id": "codex-worker",
+      "agent_type_id": "codex_type",
+      "reset_context": false
+    },
+    {
+      "id": "claude-global-reviewer",
+      "agent_type_id": "claude_code_type",
+      "reset_context": true,
+      "runtime_overrides": {
+        "session_mode": "invoke",
+        "env": {}
+      }
+    },
+    {
+      "id": "opencode-result-reviewer",
+      "agent_type_id": "opencode_type",
+      "reset_context": true,
+      "runtime_overrides": {
+        "session_mode": "invoke",
+        "env": {}
+      }
+    },
+    {
+      "id": "pi-result-reviewer",
+      "agent_type_id": "pi_agent_type",
+      "reset_context": true
+    },
+    {
+      "id": "codex-generator",
+      "agent_type_id": "codex_type",
+      "reset_context": true
+    }
+  ],
+  "plugins": [
+    {
+      "id": "prepare_env",
+      "kind": "python",
+      "module": "plugins.workflow_plugins",
+      "class_name": "WorkflowControlPlugin",
+      "config": {
+        "status": "SUCCESS_NEXT",
+        "message": "prepared environment",
+        "export_env": "SECFLOW_FRAMEWORK_READY",
+        "export_value": "1"
+      }
+    },
+    {
+      "id": "remember_task",
+      "kind": "python",
+      "module": "plugins.workflow_plugins",
+      "class_name": "TaskMetadataPlugin",
+      "config": {
+        "key": "current_task_title"
+      }
+    }
+  ],
+  "atomic_workflows": [
+    {
+      "id": "package_unpack",
+      "input_task_type": "package_list",
+      "output_task_type": "unpacked_package",
+      "max_rounds": 2,
+      "max_restart_attempts": 1,
+      "pre_plugins": [
+        "prepare_env",
+        "remember_task"
+      ],
+      "worker": {
+        "agent_instance_id": "codex-worker",
+        "task_prompt_ref": "worker_package_unpack"
+      },
+      "reflection_prompt_refs": [
+        "reflection_primary",
+        "reflection_secondary"
+      ],
+      "summary": {
+        "prompt_ref": "summary_prompt"
+      },
+      "advisor": {
+        "global_reviewers": [
+          {
+            "id": "package_unpack_global",
+            "agent_instance_id": "claude-global-reviewer",
+            "system_prompt_ref": "global_review_system",
+            "user_prompt_ref": "global_review_user",
+            "rerun_on_next_round": true
+          }
+        ],
+        "result_reviewers": [
+          {
+            "id": "package_unpack_result_primary",
+            "agent_instance_id": "opencode-result-reviewer",
+            "system_prompt_ref": "result_review_system",
+            "user_prompt_ref": "result_review_user",
+            "rerun_on_next_round": false
+          },
+          {
+            "id": "package_unpack_result_secondary",
+            "agent_instance_id": "pi-result-reviewer",
+            "system_prompt_ref": "result_review_system",
+            "user_prompt_ref": "result_review_user",
+            "rerun_on_next_round": false
+          }
+        ]
+      },
+      "post_plugins": []
+    },
+    {
+      "id": "system_analysis",
+      "input_task_type": "unpacked_package",
+      "output_task_type": "high_risk_module",
+      "max_rounds": 2,
+      "max_restart_attempts": 1,
+      "pre_plugins": [
+        "prepare_env"
+      ],
+      "worker": {
+        "agent_instance_id": "codex-worker",
+        "task_prompt_ref": "worker_system_analysis"
+      },
+      "reflection_prompt_refs": [
+        "reflection_primary"
+      ],
+      "summary": {
+        "prompt_ref": "summary_prompt"
+      },
+      "advisor": {
+        "global_reviewers": [
+          {
+            "id": "system_analysis_global",
+            "agent_instance_id": "claude-global-reviewer",
+            "system_prompt_ref": "global_review_system",
+            "user_prompt_ref": "global_review_user",
+            "rerun_on_next_round": true
+          }
+        ],
+        "result_reviewers": [
+          {
+            "id": "system_analysis_result",
+            "agent_instance_id": "opencode-result-reviewer",
+            "system_prompt_ref": "result_review_system",
+            "user_prompt_ref": "result_review_user",
+            "rerun_on_next_round": false
+          }
+        ]
+      },
+      "post_plugins": []
+    },
+    {
+      "id": "decompile_optimize",
+      "input_task_type": "high_risk_module",
+      "output_task_type": "optimized_module",
+      "max_rounds": 2,
+      "max_restart_attempts": 1,
+      "pre_plugins": [
+        "prepare_env"
+      ],
+      "worker": {
+        "agent_instance_id": "codex-worker",
+        "task_prompt_ref": "worker_decompile_optimize"
+      },
+      "reflection_prompt_refs": [
+        "reflection_primary"
+      ],
+      "summary": {
+        "prompt_ref": "summary_prompt"
+      },
+      "advisor": {
+        "global_reviewers": [
+          {
+            "id": "decompile_optimize_global",
+            "agent_instance_id": "claude-global-reviewer",
+            "system_prompt_ref": "global_review_system",
+            "user_prompt_ref": "global_review_user",
+            "rerun_on_next_round": true
+          }
+        ],
+        "result_reviewers": [
+          {
+            "id": "decompile_optimize_result",
+            "agent_instance_id": "opencode-result-reviewer",
+            "system_prompt_ref": "result_review_system",
+            "user_prompt_ref": "result_review_user",
+            "rerun_on_next_round": false
+          }
+        ]
+      },
+      "post_plugins": []
+    },
+    {
+      "id": "external_entry_analysis",
+      "input_task_type": "optimized_module",
+      "output_task_type": "external_entry",
+      "max_rounds": 2,
+      "max_restart_attempts": 1,
+      "pre_plugins": [
+        "prepare_env"
+      ],
+      "worker": {
+        "agent_instance_id": "codex-worker",
+        "task_prompt_ref": "worker_external_entry_analysis"
+      },
+      "reflection_prompt_refs": [
+        "reflection_primary"
+      ],
+      "summary": {
+        "prompt_ref": "summary_prompt"
+      },
+      "advisor": {
+        "global_reviewers": [
+          {
+            "id": "external_entry_analysis_global",
+            "agent_instance_id": "claude-global-reviewer",
+            "system_prompt_ref": "global_review_system",
+            "user_prompt_ref": "global_review_user",
+            "rerun_on_next_round": true
+          }
+        ],
+        "result_reviewers": [
+          {
+            "id": "external_entry_analysis_result",
+            "agent_instance_id": "opencode-result-reviewer",
+            "system_prompt_ref": "result_review_system",
+            "user_prompt_ref": "result_review_user",
+            "rerun_on_next_round": false
+          }
+        ]
+      },
+      "post_plugins": []
+    },
+    {
+      "id": "dataflow_analysis",
+      "input_task_type": "external_entry",
+      "output_task_type": "dataflow_trace",
+      "max_rounds": 2,
+      "max_restart_attempts": 1,
+      "pre_plugins": [
+        "prepare_env"
+      ],
+      "worker": {
+        "agent_instance_id": "codex-worker",
+        "task_prompt_ref": "worker_dataflow_analysis"
+      },
+      "reflection_prompt_refs": [
+        "reflection_primary"
+      ],
+      "summary": {
+        "prompt_ref": "summary_prompt"
+      },
+      "advisor": {
+        "global_reviewers": [
+          {
+            "id": "dataflow_analysis_global",
+            "agent_instance_id": "claude-global-reviewer",
+            "system_prompt_ref": "global_review_system",
+            "user_prompt_ref": "global_review_user",
+            "rerun_on_next_round": true
+          }
+        ],
+        "result_reviewers": [
+          {
+            "id": "dataflow_analysis_result",
+            "agent_instance_id": "opencode-result-reviewer",
+            "system_prompt_ref": "result_review_system",
+            "user_prompt_ref": "result_review_user",
+            "rerun_on_next_round": false
+          }
+        ]
+      },
+      "post_plugins": []
+    },
+    {
+      "id": "vuln_identify",
+      "input_task_type": "dataflow_trace",
+      "output_task_type": "suspected_vuln",
+      "max_rounds": 2,
+      "max_restart_attempts": 1,
+      "pre_plugins": [
+        "prepare_env"
+      ],
+      "worker": {
+        "agent_instance_id": "codex-worker",
+        "task_prompt_ref": "worker_vuln_identify"
+      },
+      "reflection_prompt_refs": [
+        "reflection_primary"
+      ],
+      "summary": {
+        "prompt_ref": "summary_prompt"
+      },
+      "advisor": {
+        "global_reviewers": [
+          {
+            "id": "vuln_identify_global",
+            "agent_instance_id": "claude-global-reviewer",
+            "system_prompt_ref": "global_review_system",
+            "user_prompt_ref": "global_review_user",
+            "rerun_on_next_round": true
+          }
+        ],
+        "result_reviewers": [
+          {
+            "id": "vuln_identify_result",
+            "agent_instance_id": "opencode-result-reviewer",
+            "system_prompt_ref": "result_review_system",
+            "user_prompt_ref": "result_review_user",
+            "rerun_on_next_round": false
+          }
+        ]
+      },
+      "post_plugins": []
+    },
+    {
+      "id": "vuln_filter",
+      "input_task_type": "suspected_vuln",
+      "output_task_type": "verified_vuln",
+      "max_rounds": 2,
+      "max_restart_attempts": 1,
+      "pre_plugins": [
+        "prepare_env"
+      ],
+      "worker": {
+        "agent_instance_id": "codex-worker",
+        "task_prompt_ref": "worker_vuln_filter"
+      },
+      "reflection_prompt_refs": [
+        "reflection_primary"
+      ],
+      "summary": {
+        "prompt_ref": "summary_prompt"
+      },
+      "advisor": {
+        "global_reviewers": [
+          {
+            "id": "vuln_filter_global",
+            "agent_instance_id": "claude-global-reviewer",
+            "system_prompt_ref": "global_review_system",
+            "user_prompt_ref": "global_review_user",
+            "rerun_on_next_round": true
+          }
+        ],
+        "result_reviewers": [
+          {
+            "id": "vuln_filter_result",
+            "agent_instance_id": "opencode-result-reviewer",
+            "system_prompt_ref": "result_review_system",
+            "user_prompt_ref": "result_review_user",
+            "rerun_on_next_round": false
+          }
+        ]
+      },
+      "post_plugins": []
+    }
+  ],
+  "composite_workflows": [
+    {
+      "id": "secflow_vuln_pipeline",
+      "stages": [
+        {
+          "id": "stage_package_unpack",
+          "workflow_kind": "atomic",
+          "workflow_ref": "package_unpack",
+          "previous_stage_id": null,
+          "next_stage_id": "stage_system_analysis",
+          "task_failure_policy": "continue"
+        },
+        {
+          "id": "stage_system_analysis",
+          "workflow_kind": "atomic",
+          "workflow_ref": "system_analysis",
+          "previous_stage_id": "stage_package_unpack",
+          "next_stage_id": "stage_decompile_optimize",
+          "task_failure_policy": "continue"
+        },
+        {
+          "id": "stage_decompile_optimize",
+          "workflow_kind": "atomic",
+          "workflow_ref": "decompile_optimize",
+          "previous_stage_id": "stage_system_analysis",
+          "next_stage_id": "stage_external_entry_analysis",
+          "task_failure_policy": "continue"
+        },
+        {
+          "id": "stage_external_entry_analysis",
+          "workflow_kind": "atomic",
+          "workflow_ref": "external_entry_analysis",
+          "previous_stage_id": "stage_decompile_optimize",
+          "next_stage_id": "stage_dataflow_analysis",
+          "task_failure_policy": "continue"
+        },
+        {
+          "id": "stage_dataflow_analysis",
+          "workflow_kind": "atomic",
+          "workflow_ref": "dataflow_analysis",
+          "previous_stage_id": "stage_external_entry_analysis",
+          "next_stage_id": "stage_vuln_identify",
+          "task_failure_policy": "continue"
+        },
+        {
+          "id": "stage_vuln_identify",
+          "workflow_kind": "atomic",
+          "workflow_ref": "vuln_identify",
+          "previous_stage_id": "stage_dataflow_analysis",
+          "next_stage_id": "stage_vuln_filter",
+          "task_failure_policy": "continue"
+        },
+        {
+          "id": "stage_vuln_filter",
+          "workflow_kind": "atomic",
+          "workflow_ref": "vuln_filter",
+          "previous_stage_id": "stage_vuln_identify",
+          "next_stage_id": null,
+          "task_failure_policy": "continue"
+        }
+      ]
+    }
+  ],
+  "root_workflow_id": "secflow_vuln_pipeline"
+}
