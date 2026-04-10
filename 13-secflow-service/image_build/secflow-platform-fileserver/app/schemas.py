@@ -244,3 +244,53 @@ class ProjectPathOperationResponse(BaseModel):
     path: str
     entry_type: str
     message: Optional[str] = None
+
+
+class ProjectFilesystemBreadcrumbItem(BaseModel):
+    node_type: str
+    name: str
+    path: str
+
+
+class ProjectFilesystemEntry(BaseModel):
+    node_type: str
+    name: str
+    path: str
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+    updated_at: Optional[datetime] = None
+    has_children: bool = False
+    special_badge: Optional[str] = None
+
+
+class ProjectFilesystemRootResponse(BaseModel):
+    project_id: str
+    root_name: str
+    total: int
+    items: List[ProjectFilesystemEntry]
+
+
+class ProjectFilesystemChildrenResponse(BaseModel):
+    project_id: str
+    current_path: str
+    current_name: str
+    breadcrumbs: List[ProjectFilesystemBreadcrumbItem]
+    directories: List[ProjectFilesystemEntry]
+    files: List[ProjectFilesystemEntry]
+
+
+class ProjectFilesystemDirectoryCreate(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=32)
+    path: str = Field(..., min_length=1, max_length=1024)
+
+
+class ProjectFilesystemRenameRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=32)
+    path: str = Field(..., min_length=1, max_length=1024)
+    name: str = Field(..., min_length=1, max_length=255)
+
+
+class ProjectFilesystemMoveRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=32)
+    source_path: str = Field(..., min_length=1, max_length=1024)
+    target_directory_path: str = Field(..., min_length=1, max_length=1024)

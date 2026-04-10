@@ -1,5 +1,6 @@
 """Fileserver API routes."""
 
+from datetime import datetime, timezone
 import hashlib
 import logging
 import mimetypes
@@ -39,6 +40,13 @@ from app.schemas import (
     ProjectPathFileEntry,
     ProjectPathMkdirsRequest,
     ProjectPathOperationResponse,
+    ProjectFilesystemBreadcrumbItem,
+    ProjectFilesystemChildrenResponse,
+    ProjectFilesystemDirectoryCreate,
+    ProjectFilesystemEntry,
+    ProjectFilesystemMoveRequest,
+    ProjectFilesystemRenameRequest,
+    ProjectFilesystemRootResponse,
     StoragePVCResponse,
     SubprojectCreate,
     SubprojectListResponse,
@@ -629,6 +637,194 @@ def sync_target_path(project_id: str, subproject_id: Any, relative_path: str) ->
     return os.path.join(sync_subproject_root(project_id, subproject_id), relative_no_lead)
 
 
+def project_files_root(project_id: str) -> str:
+    root = os.path.join(get_config().storage.root_dir, "files", project_id)
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def normalize_project_filesystem_path(path: str) -> tuple[str, str]:
+    raw = (path or "").strip() or "/"
+    normalized = posixpath.normpath(raw)
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    if normalized.startswith("/../") or normalized == "/..":
+        raise ValidationError("项目路径不能越权")
+    if normalized == "//":
+        normalized = "/"
+    return normalized.lstrip("/"), normalized
+
+
+def project_filesystem_target_path(project_id: str, path: str) -> tuple[str, str]:
+    relative_no_lead, normalized = normalize_project_filesystem_path(path)
+    root = os.path.abspath(project_files_root(project_id))
+    target_path = os.path.abspath(os.path.join(root, relative_no_lead))
+    if os.path.commonpath([target_path, root]) != root:
+        raise ValidationError("项目路径不能越权")
+    return target_path, normalized
+
+
+def ensure_project_realpath_inside_root(project_id: str, target_path: str) -> str:
+    root = os.path.realpath(project_files_root(project_id))
+    resolved = os.path.realpath(target_path)
+    if os.path.commonpath([resolved, root]) != root:
+        raise ForbiddenError("项目路径超出允许范围")
+    return resolved
+
+
+def path_parent(path: str) -> str:
+    _, normalized = normalize_project_filesystem_path(path)
+    if normalized == "/":
+        return "/"
+    parent = posixpath.dirname(normalized.rstrip("/")) or "/"
+    return parent if parent.startswith("/") else f"/{parent}"
+
+
+def path_basename(path: str) -> str:
+    _, normalized = normalize_project_filesystem_path(path)
+    if normalized == "/":
+        return "/"
+    return posixpath.basename(normalized.rstrip("/"))
+
+
+def is_root_level_directory(path: str) -> bool:
+    _, normalized = normalize_project_filesystem_path(path)
+    parts = [item for item in normalized.strip("/").split("/") if item]
+    return len(parts) == 1
+
+
+def infer_preview_mode_by_filename(filename: str, content_type: Optional[str]) -> str:
+    guessed = guess_content_type(filename, content_type)
+    if guessed.startswith("text/"):
+        return "text"
+    if guessed in {"application/json", "application/xml", "application/javascript"}:
+        return "text"
+    if guessed.startswith("image/"):
+        return "image"
+    if guessed == "application/pdf":
+        return "pdf"
+    if guessed.startswith("audio/"):
+        return "audio"
+    if guessed.startswith("video/"):
+        return "video"
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension in {"yml", "yaml", "md", "log", "csv", "sql", "sh", "py", "java", "go", "ts", "js", "tsx", "jsx", "xml", "json", "txt"}:
+        return "text"
+    return "binary"
+
+
+def safe_dir_has_children(path: str) -> bool:
+    try:
+        with os.scandir(path) as iterator:
+            for _ in iterator:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def to_project_filesystem_entry(parent_path: str, entry: os.DirEntry[str], *, root_level: bool) -> ProjectFilesystemEntry:
+    child_path = "/" + entry.name if parent_path == "/" else f"{parent_path.rstrip('/')}/{entry.name}"
+    node_type = "file"
+    has_children = False
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+    special_badge: Optional[str] = None
+
+    try:
+        stat_result = entry.stat(follow_symlinks=False)
+    except OSError:
+        stat_result = None
+
+    if entry.is_dir(follow_symlinks=False):
+        node_type = "subproject" if root_level else "directory"
+        has_children = safe_dir_has_children(entry.path)
+        if root_level:
+            special_badge = "SUBPROJECT"
+    else:
+        content_type = guess_content_type(entry.name, None)
+        size = stat_result.st_size if stat_result else None
+
+    updated_at = (
+        datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc)
+        if stat_result is not None
+        else None
+    )
+    return ProjectFilesystemEntry(
+        node_type=node_type,
+        name=entry.name,
+        path=child_path,
+        content_type=content_type,
+        size=size,
+        updated_at=updated_at,
+        has_children=has_children,
+        special_badge=special_badge,
+    )
+
+
+def list_project_filesystem_entries(project_id: str, path: str) -> tuple[str, str, list[ProjectFilesystemEntry], list[ProjectFilesystemEntry]]:
+    target_path, normalized = project_filesystem_target_path(project_id, path)
+    if not os.path.exists(target_path):
+        raise NotFoundError("项目目录", normalized)
+    if not os.path.isdir(target_path):
+        raise ValidationError("当前路径不是目录")
+    ensure_project_realpath_inside_root(project_id, target_path)
+
+    directories: list[ProjectFilesystemEntry] = []
+    files: list[ProjectFilesystemEntry] = []
+    with os.scandir(target_path) as iterator:
+        for entry in iterator:
+            item = to_project_filesystem_entry(normalized, entry, root_level=(normalized == "/"))
+            if item.node_type in {"subproject", "directory"}:
+                directories.append(item)
+            else:
+                files.append(item)
+
+    directories.sort(key=lambda item: item.name.lower())
+    files.sort(key=lambda item: item.name.lower())
+    current_name = project_id if normalized == "/" else path_basename(normalized)
+    return target_path, current_name, directories, files
+
+
+def build_project_filesystem_breadcrumbs(project_id: str, path: str) -> list[ProjectFilesystemBreadcrumbItem]:
+    _, normalized = normalize_project_filesystem_path(path)
+    breadcrumbs = [ProjectFilesystemBreadcrumbItem(node_type="project", name=project_id, path="/")]
+    if normalized == "/":
+        return breadcrumbs
+    parts = [item for item in normalized.strip("/").split("/") if item]
+    current = ""
+    for index, part in enumerate(parts):
+        current = f"{current}/{part}" if current else f"/{part}"
+        breadcrumbs.append(
+            ProjectFilesystemBreadcrumbItem(
+                node_type="subproject" if index == 0 else "directory",
+                name=part,
+                path=current,
+            )
+        )
+    return breadcrumbs
+
+
+def load_project_filesystem_entry(project_id: str, path: str) -> ProjectFilesystemEntry:
+    target_path, normalized = project_filesystem_target_path(project_id, path)
+    if not os.path.lexists(target_path):
+        raise NotFoundError("项目文件", normalized)
+    ensure_project_realpath_inside_root(project_id, path_parent(normalized) == "/" and target_path or os.path.dirname(target_path))
+    stat_result = os.lstat(target_path)
+    is_directory = os.path.isdir(target_path) and not os.path.islink(target_path)
+    node_type = "subproject" if is_directory and is_root_level_directory(normalized) else ("directory" if is_directory else "file")
+    return ProjectFilesystemEntry(
+        node_type=node_type,
+        name=path_basename(normalized),
+        path=normalized,
+        content_type=None if is_directory else guess_content_type(path_basename(normalized), None),
+        size=None if is_directory else stat_result.st_size,
+        updated_at=datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc),
+        has_children=safe_dir_has_children(target_path) if is_directory else False,
+        special_badge="SUBPROJECT" if node_type == "subproject" else None,
+    )
+
+
 def compute_existing_sync_meta(target_path: str) -> dict[str, Any]:
     if not os.path.lexists(target_path):
         return {"exists": False}
@@ -824,6 +1020,219 @@ async def sync_put_object(
         "size": computed_size,
         "sha256": computed_sha256,
     }
+
+
+@router.get("/project-filesystem/root", response_model=ProjectFilesystemRootResponse)
+async def get_project_filesystem_root(
+    project_id: str = Query(...),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(project_id, authorization)
+    project_files_root(project_id)
+    _, _, directories, files = list_project_filesystem_entries(project_id, "/")
+    return ProjectFilesystemRootResponse(
+        project_id=project_id,
+        root_name=project_id,
+        total=len(directories) + len(files),
+        items=[*directories, *files],
+    )
+
+
+@router.get("/project-filesystem/children", response_model=ProjectFilesystemChildrenResponse)
+async def get_project_filesystem_children(
+    project_id: str = Query(...),
+    path: str = Query("/"),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(project_id, authorization)
+    project_files_root(project_id)
+    _, current_name, directories, files = list_project_filesystem_entries(project_id, path)
+    _, normalized = normalize_project_filesystem_path(path)
+    return ProjectFilesystemChildrenResponse(
+        project_id=project_id,
+        current_path=normalized,
+        current_name=current_name,
+        breadcrumbs=build_project_filesystem_breadcrumbs(project_id, normalized),
+        directories=directories,
+        files=files,
+    )
+
+
+@router.post("/project-filesystem/directories", response_model=ProjectFilesystemEntry)
+async def create_project_filesystem_directory(
+    payload: ProjectFilesystemDirectoryCreate,
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(payload.project_id, authorization)
+    target_path, normalized = project_filesystem_target_path(payload.project_id, payload.path)
+    if normalized == "/":
+        raise ValidationError("不能直接创建项目根目录")
+    parent_path = path_parent(normalized)
+    parent_target_path, _ = project_filesystem_target_path(payload.project_id, parent_path)
+    if not os.path.isdir(parent_target_path):
+        raise NotFoundError("父目录", parent_path)
+    ensure_project_realpath_inside_root(payload.project_id, parent_target_path)
+    directory_name = sanitize_name(path_basename(normalized))
+    final_target_path = os.path.join(parent_target_path, directory_name)
+    if os.path.lexists(final_target_path):
+        raise ConflictError(f"目录已存在: {normalized}")
+    os.mkdir(final_target_path)
+    return load_project_filesystem_entry(payload.project_id, normalized)
+
+
+@router.post("/project-filesystem/files/upload", response_model=ProjectFilesystemEntry)
+async def upload_project_filesystem_file(
+    project_id: str = Form(...),
+    path: str = Form("/"),
+    file: UploadFile = File(...),
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    del current_user
+    await verify_project_access(project_id, authorization)
+    target_directory_path, normalized_directory = project_filesystem_target_path(project_id, path)
+    if not os.path.isdir(target_directory_path):
+        raise NotFoundError("目录", normalized_directory)
+    ensure_project_realpath_inside_root(project_id, target_directory_path)
+    filename = sanitize_name(file.filename or "upload.bin")
+    destination_path = os.path.join(target_directory_path, filename)
+    if os.path.lexists(destination_path):
+        raise ConflictError(f"目录下已存在同名文件: {filename}")
+
+    config = get_config()
+    temp_path, _, _ = await persist_upload(file, config.storage.temp_dir)
+    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+    os.replace(temp_path, destination_path)
+    file_path = "/" + filename if normalized_directory == "/" else f"{normalized_directory.rstrip('/')}/{filename}"
+    return load_project_filesystem_entry(project_id, file_path)
+
+
+@router.post("/project-filesystem/rename", response_model=ProjectFilesystemEntry)
+async def rename_project_filesystem_node(
+    payload: ProjectFilesystemRenameRequest,
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    del current_user
+    await verify_project_access(payload.project_id, authorization)
+    source_path, normalized_source = project_filesystem_target_path(payload.project_id, payload.path)
+    if normalized_source == "/":
+        raise ValidationError("不能重命名项目根目录")
+    if not os.path.lexists(source_path):
+        raise NotFoundError("项目文件", normalized_source)
+    parent_path = path_parent(normalized_source)
+    parent_target_path, _ = project_filesystem_target_path(payload.project_id, parent_path)
+    ensure_project_realpath_inside_root(payload.project_id, parent_target_path)
+    new_name = sanitize_name(payload.name)
+    target_normalized = "/" + new_name if parent_path == "/" else f"{parent_path.rstrip('/')}/{new_name}"
+    target_path, _ = project_filesystem_target_path(payload.project_id, target_normalized)
+    if os.path.lexists(target_path):
+        raise ConflictError(f"目标已存在: {target_normalized}")
+    os.replace(source_path, target_path)
+    return load_project_filesystem_entry(payload.project_id, target_normalized)
+
+
+@router.post("/project-filesystem/move", response_model=ProjectFilesystemEntry)
+async def move_project_filesystem_node(
+    payload: ProjectFilesystemMoveRequest,
+    current_user: TokenUser = Depends(get_current_user),
+    authorization: Optional[str] = Header(None),
+):
+    del current_user
+    await verify_project_access(payload.project_id, authorization)
+    source_path, normalized_source = project_filesystem_target_path(payload.project_id, payload.source_path)
+    target_directory_path, normalized_target_directory = project_filesystem_target_path(payload.project_id, payload.target_directory_path)
+    if normalized_source == "/":
+        raise ValidationError("不能移动项目根目录")
+    if not os.path.lexists(source_path):
+        raise NotFoundError("项目文件", normalized_source)
+    if not os.path.isdir(target_directory_path):
+        raise NotFoundError("目录", normalized_target_directory)
+    ensure_project_realpath_inside_root(payload.project_id, target_directory_path)
+    if os.path.isdir(source_path) and not os.path.islink(source_path) and is_root_level_directory(normalized_source):
+        raise ValidationError("一级子项目目录不支持拖拽移动")
+    source_name = path_basename(normalized_source)
+    target_normalized = "/" + source_name if normalized_target_directory == "/" else f"{normalized_target_directory.rstrip('/')}/{source_name}"
+    target_path, _ = project_filesystem_target_path(payload.project_id, target_normalized)
+    if os.path.lexists(target_path):
+        raise ConflictError(f"目标已存在: {target_normalized}")
+    if os.path.isdir(source_path) and not os.path.islink(source_path):
+        source_real = ensure_project_realpath_inside_root(payload.project_id, source_path)
+        target_real_parent = ensure_project_realpath_inside_root(payload.project_id, target_directory_path)
+        if os.path.commonpath([target_real_parent, source_real]) == source_real:
+            raise ConflictError("目录不能移动到自己的子目录下")
+    os.replace(source_path, target_path)
+    return load_project_filesystem_entry(payload.project_id, target_normalized)
+
+
+@router.delete("/project-filesystem", response_model=SuccessResponse)
+async def delete_project_filesystem_node(
+    project_id: str = Query(...),
+    path: str = Query(...),
+    recursive: bool = Query(True),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(project_id, authorization)
+    target_path, normalized = project_filesystem_target_path(project_id, path)
+    if normalized == "/":
+        raise ValidationError("不能删除项目根目录")
+    if not os.path.lexists(target_path):
+        raise NotFoundError("项目文件", normalized)
+    parent_target = os.path.dirname(target_path) or project_files_root(project_id)
+    ensure_project_realpath_inside_root(project_id, parent_target)
+    if os.path.isdir(target_path) and not os.path.islink(target_path):
+        if recursive:
+            shutil.rmtree(target_path, ignore_errors=True)
+        else:
+            os.rmdir(target_path)
+    else:
+        os.remove(target_path)
+    return SuccessResponse(message="删除成功")
+
+
+@router.get("/project-filesystem/preview")
+async def preview_project_filesystem_file(
+    project_id: str = Query(...),
+    path: str = Query(...),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(project_id, authorization)
+    target_path, normalized = project_filesystem_target_path(project_id, path)
+    if not os.path.lexists(target_path):
+        raise NotFoundError("项目文件", normalized)
+    if os.path.isdir(target_path) and not os.path.islink(target_path):
+        raise ValidationError("目录不支持预览")
+    resolved = ensure_project_realpath_inside_root(project_id, target_path)
+    filename = path_basename(normalized)
+    media_type = guess_content_type(filename, None)
+    return FileResponse(
+        path=resolved,
+        filename=filename,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "X-Preview-Mode": infer_preview_mode_by_filename(filename, media_type),
+        },
+    )
+
+
+@router.get("/project-filesystem/download")
+async def download_project_filesystem_file(
+    project_id: str = Query(...),
+    path: str = Query(...),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(project_id, authorization)
+    target_path, normalized = project_filesystem_target_path(project_id, path)
+    if not os.path.lexists(target_path):
+        raise NotFoundError("项目文件", normalized)
+    if os.path.isdir(target_path) and not os.path.islink(target_path):
+        raise ValidationError("目录不支持下载")
+    resolved = ensure_project_realpath_inside_root(project_id, target_path)
+    filename = path_basename(normalized)
+    media_type = guess_content_type(filename, None)
+    return FileResponse(path=resolved, filename=filename, media_type=media_type or "application/octet-stream")
 
 
 @router.get("/vuln/project-path/children", response_model=ProjectPathChildrenResponse)
