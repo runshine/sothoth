@@ -16,6 +16,7 @@ def test_scheduler_claim_respects_single_owner_and_definition_concurrency(
 ):
     config = get_config()
     config.scheduler.enabled = True
+    entry_task_type = get_workflow_service().validate_definition_payload(framework_config_payload).resolve_entry_input_task_type()
 
     db = get_db_session()
     try:
@@ -33,22 +34,21 @@ def test_scheduler_claim_respects_single_owner_and_definition_concurrency(
             {"user_id": "tester", "project_ids": ["default"]},
         )
 
-        payload = TriggerTaskCreate(
-            input_tasks=[
-                {
-                    "task_id": "task-1",
-                    "task_type": "package_list",
-                    "title": "Task 1",
-                    "task_markdown": "# Task 1\n",
-                    "metadata": {},
-                    "upstream_refs": [],
-                }
-            ]
-        )
         get_execution_service().create_trigger_task(
             db,
             definition.id,
-            payload,
+            TriggerTaskCreate(
+                input_tasks=[
+                    {
+                        "task_id": "task-1",
+                        "task_type": entry_task_type,
+                        "title": "Task 1",
+                        "task_markdown": "# Task 1\n",
+                        "metadata": {},
+                        "upstream_refs": [],
+                    }
+                ]
+            ),
             {"user_id": "tester", "project_ids": ["default"]},
             trigger_type="manual",
         )
@@ -59,7 +59,7 @@ def test_scheduler_claim_respects_single_owner_and_definition_concurrency(
                 input_tasks=[
                     {
                         "task_id": "task-2",
-                        "task_type": "package_list",
+                        "task_type": entry_task_type,
                         "title": "Task 2",
                         "task_markdown": "# Task 2\n",
                         "metadata": {},

@@ -4,10 +4,11 @@ import uuid
 from typing import Iterable, List
 
 from fastapi import HTTPException, status
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from app.models.config_models import FrameworkConfig
 from app.models.database import WorkflowDefinition, WorkflowDefinitionVersion
+from app.pi_vuln_core.config.models import FrameworkConfig
 from app.schemas import (
     WorkflowDefinitionCreate,
     WorkflowDefinitionResponse,
@@ -33,7 +34,10 @@ class WorkflowService:
         return None
 
     def validate_definition_payload(self, definition_json: dict) -> FrameworkConfig:
-        return FrameworkConfig.model_validate(definition_json)
+        try:
+            return FrameworkConfig.model_validate(definition_json)
+        except (ValidationError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
     def _definition_response(self, definition: WorkflowDefinition, validated: FrameworkConfig | None = None) -> WorkflowDefinitionResponse:
         config = validated or self.validate_definition_payload(definition.definition_json)
@@ -42,7 +46,7 @@ class WorkflowService:
             "name": definition.name,
             "description": definition.description,
             "project_id": definition.project_id,
-            "root_workflow_id": definition.root_workflow_id,
+            "root_workflow_id": config.root_workflow_id,
             "trigger_type": definition.trigger_type,
             "trigger_enabled": definition.trigger_enabled,
             "is_active": definition.is_active,

@@ -13,7 +13,9 @@ if str(FRAMEWORK_ROOT) not in sys.path:
 
 from app.config import reset_config
 from app.models.database import init_database, reset_database_state
-from app.models.config_models import FrameworkConfig
+from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
+from app.pi_vuln_core.config.models import FrameworkConfig
+from tests.mock_agent_runtime import MockAgentRuntime
 
 
 @pytest.fixture()
@@ -29,6 +31,16 @@ def framework_config_payload(framework_root: Path) -> dict:
 @pytest.fixture()
 def framework_config(framework_config_payload: dict) -> FrameworkConfig:
     return FrameworkConfig.model_validate(framework_config_payload)
+
+
+@pytest.fixture()
+def patch_mock_agent_runtime(monkeypatch: pytest.MonkeyPatch):
+    original = dict(AgentRuntimeRegistry.RUNTIME_MAP)
+    for runtime_name in ("claude_code", "codex", "opencode", "pi_agent"):
+        monkeypatch.setitem(AgentRuntimeRegistry.RUNTIME_MAP, runtime_name, MockAgentRuntime)
+    yield
+    AgentRuntimeRegistry.RUNTIME_MAP.clear()
+    AgentRuntimeRegistry.RUNTIME_MAP.update(original)
 
 
 @pytest.fixture()
@@ -62,10 +74,11 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     monkeypatch.setenv("CONFIG_PATH", str(config_path))
     reset_config()
     reset_database_state()
-    from app.services import auth, execution_service, scheduler, workflow_service
+    from app.services import auth, execution_service, fileserver_client, scheduler, workflow_service
 
     auth._auth_service = None
     execution_service._execution_service = None
+    fileserver_client._fileserver_client = None
     scheduler._scheduler_service = None
     workflow_service._workflow_service = None
     init_database()
@@ -74,5 +87,6 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     reset_database_state()
     auth._auth_service = None
     execution_service._execution_service = None
+    fileserver_client._fileserver_client = None
     scheduler._scheduler_service = None
     workflow_service._workflow_service = None

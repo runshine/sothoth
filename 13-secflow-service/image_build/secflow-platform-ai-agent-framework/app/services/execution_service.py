@@ -12,8 +12,6 @@ from sqlalchemy.orm import Session
 
 from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, write_task_manifest, write_text
 from app.config import get_config
-from app.engine.workflow import ExitWorkflowError, WorkflowExecutor
-from app.models.config_models import FrameworkConfig
 from app.models.contracts import ExecutionState, TaskItem, TaskManifest
 from app.models.database import (
     TriggerTask,
@@ -29,6 +27,13 @@ from app.schemas import (
     WorkflowExecutionEventResponse,
     WorkflowExecutionResponse,
 )
+from app.pi_vuln_core.runner import build_runtime_framework_config, run_framework_config
+from app.services.pi_vuln_adapter import (
+    DbExecutionObserver,
+    DbExecutionRecorder,
+    build_core_tasks,
+    write_final_task_manifest,
+)
 from app.services.fileserver_client import get_fileserver_client
 from app.services.workflow_service import get_workflow_service
 
@@ -43,146 +48,6 @@ def _principal_id(principal: dict) -> str:
 
 def _project_ids(principal: dict) -> set[str]:
     return set(principal.get("project_ids") or [])
-
-
-class CancellationRequestedError(ExitWorkflowError):
-    pass
-
-
-class ServiceWorkflowExecutor(WorkflowExecutor):
-    def __init__(self, framework_config: FrameworkConfig, execution_id: str):
-        super().__init__(framework_config)
-        self.execution_id = execution_id
-
-    def _emit(
-        self,
-        *,
-        event_type: str,
-        message: str,
-        stage_id: str | None = None,
-        round_no: int | None = None,
-        level: str = "info",
-        payload_json: dict[str, Any] | None = None,
-    ) -> None:
-        service = get_execution_service()
-        db = get_db_session()
-        try:
-            service.record_event(
-                db,
-                execution_id=self.execution_id,
-                event_type=event_type,
-                message=message,
-                stage_id=stage_id,
-                round_no=round_no,
-                level=level,
-                payload_json=payload_json or {},
-            )
-        finally:
-            db.close()
-
-    def check_interruption(
-        self,
-        *,
-        checkpoint: str,
-        stage_id: str | None = None,
-        task=None,
-        round_no: int | None = None,
-        task_dir: Path | None = None,
-    ) -> None:
-        db = get_db_session()
-        try:
-            execution = db.get(WorkflowExecution, self.execution_id)
-            if execution is None:
-                raise CancellationRequestedError("execution disappeared")
-            trigger = db.get(TriggerTask, execution.trigger_task_id)
-            cancelled = execution.status in {"cancel_requested", "cancelled"} or (
-                trigger is not None and trigger.status in {"cancel_requested", "cancelled"}
-            )
-            if cancelled:
-                self._emit(
-                    event_type="execution_cancel_checkpoint",
-                    message=f"execution cancel requested at {checkpoint}",
-                    stage_id=stage_id,
-                    round_no=round_no,
-                    level="warning",
-                    payload_json={
-                        "checkpoint": checkpoint,
-                        "task_id": getattr(task, "task_id", None),
-                        "task_dir": str(task_dir) if task_dir else None,
-                    },
-                )
-                raise CancellationRequestedError(f"execution cancelled at {checkpoint}")
-        finally:
-            db.close()
-
-    def on_stage_started(self, *, workflow_config, stage, stage_dir: Path, tasks) -> None:
-        db = get_db_session()
-        try:
-            execution = db.get(WorkflowExecution, self.execution_id)
-            if execution is not None:
-                execution.current_stage_id = stage.id
-                db.add(execution)
-                db.commit()
-            self._emit(
-                event_type="stage_started",
-                message=f"stage {stage.id} started",
-                stage_id=stage.id,
-                payload_json={"workflow_ref": stage.workflow_ref, "task_count": len(tasks), "stage_dir": str(stage_dir)},
-            )
-        finally:
-            db.close()
-
-    def on_stage_completed(self, *, workflow_config, stage, stage_dir: Path, task_records) -> None:
-        self._emit(
-            event_type="stage_completed",
-            message=f"stage {stage.id} completed",
-            stage_id=stage.id,
-            payload_json={
-                "workflow_ref": stage.workflow_ref,
-                "task_count": len(task_records),
-                "produced_task_count": sum(record.produced_task_count for record in task_records),
-                "stage_dir": str(stage_dir),
-            },
-        )
-
-    def on_round_started(self, *, workflow_config, task, round_no: int, round_dir: Path) -> None:
-        self._emit(
-            event_type="round_started",
-            message=f"round {round_no} started for task {task.task_id}",
-            round_no=round_no,
-            payload_json={"task_id": task.task_id, "workflow_id": workflow_config.id, "round_dir": str(round_dir)},
-        )
-
-    def on_round_feedback(self, *, workflow_config, task, round_no: int, feedback_path: Path, feedback_scope: str) -> None:
-        self._emit(
-            event_type="round_feedback",
-            message=f"round {round_no} produced {feedback_scope} feedback for task {task.task_id}",
-            round_no=round_no,
-            level="warning",
-            payload_json={"task_id": task.task_id, "feedback_scope": feedback_scope, "feedback_path": str(feedback_path)},
-        )
-
-    def on_round_completed(self, *, workflow_config, task, round_no: int, state, message: str, task_dir: Path) -> None:
-        self._emit(
-            event_type="round_completed",
-            message=message,
-            round_no=round_no,
-            payload_json={"task_id": task.task_id, "workflow_id": workflow_config.id, "state": state.value, "task_dir": str(task_dir)},
-        )
-
-    def on_plugin_completed(self, *, plugin_id: str, phase: str, ctx, result, log_path: Path) -> None:
-        self._emit(
-            event_type="plugin_completed",
-            message=f"plugin {plugin_id} finished with {result.status.value}",
-            round_no=ctx.round_no or None,
-            payload_json={
-                "plugin_id": plugin_id,
-                "phase": phase,
-                "status": result.status.value,
-                "task_id": ctx.task.task_id,
-                "log_path": str(log_path),
-            },
-        )
 
 
 class ExecutionService:
@@ -231,6 +96,8 @@ class ExecutionService:
     ) -> List[TaskItem]:
         task_inputs_root = ensure_dir(workspace_root / "trigger_inputs")
         normalized: List[TaskItem] = []
+        if not input_tasks:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="input_tasks must not be empty")
         for index, raw_task in enumerate(input_tasks, start=1):
             provided_task_type = (raw_task.task_type or "").strip()
             if provided_task_type and provided_task_type != entry_input_task_type:
@@ -635,9 +502,32 @@ class ExecutionService:
                 message="execution claimed and started",
                 payload_json={"workspace_root": str(workspace_root), "owner_pod_id": execution.owner_pod_id},
             )
-
-            executor = ServiceWorkflowExecutor(framework_config, execution.id)
-            result = executor.run(str(input_manifest_path), str(workspace_root))
+            service_manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+            runtime_config = build_runtime_framework_config(
+                definition.definition_json,
+                workspace_root=abs_path(workspace_root),
+                execution_id=execution.id,
+                input_task_file=service_manifest.tasks[0].task_md_path,
+                input_task_id=service_manifest.tasks[0].task_id,
+                output_dir=abs_path(workspace_root / "output"),
+                summary_file=abs_path(workspace_root / "output" / "execution_summary.json"),
+                runtime_mode="rest_service",
+            )
+            observer = DbExecutionObserver(execution.id)
+            recorder = DbExecutionRecorder(abs_path(workspace_root), execution.id)
+            artifacts = asyncio.run(
+                run_framework_config(
+                    runtime_config,
+                    initial_tasks=build_core_tasks(service_manifest),
+                    observer=observer,
+                    recorder=recorder,
+                )
+            )
+            output_manifest_path = write_final_task_manifest(
+                workspace_root=workspace_root,
+                final_tasks=artifacts.result.final_tasks,
+                final_output_task_type=runtime_config.resolve_final_output_task_type(),
+            )
 
             db.refresh(execution)
             db.refresh(trigger)
@@ -645,10 +535,10 @@ class ExecutionService:
                 db,
                 execution=execution,
                 trigger=trigger,
-                execution_status="succeeded" if result.state == ExecutionState.SUCCEEDED else "failed",
-                message="execution completed",
-                output_manifest_path=result.output_manifest_path,
-                output_task_count=result.output_task_count,
+                execution_status="succeeded" if artifacts.result.success else "failed",
+                message="execution completed" if artifacts.result.success else (artifacts.result.error or "execution failed"),
+                output_manifest_path=abs_path(output_manifest_path),
+                output_task_count=len(artifacts.result.final_tasks),
             )
             db.commit()
             self.record_event(
@@ -662,21 +552,26 @@ class ExecutionService:
                     "output_task_count": execution.output_task_count,
                 },
             )
-        except CancellationRequestedError as exc:
-            if execution is None or trigger is None:
-                return
-            db.refresh(execution)
-            db.refresh(trigger)
-            self._set_terminal_state(db, execution=execution, trigger=trigger, execution_status="cancelled", message=str(exc))
-            db.commit()
-            self.record_event(
-                db,
-                execution_id=execution.id,
-                event_type="execution_cancelled",
-                message=str(exc),
-                level="warning",
-            )
         except Exception as exc:
+            from app.pi_vuln_core.observer import ExecutionCancelledError
+
+            if isinstance(exc, ExecutionCancelledError):
+                if execution is None or trigger is None:
+                    return
+                db.refresh(execution)
+                db.refresh(trigger)
+                self._set_terminal_state(db, execution=execution, trigger=trigger, execution_status="cancelled", message=str(exc))
+                db.commit()
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="execution_cancelled",
+                    message=str(exc),
+                    level="warning",
+                )
+                return
+            if execution is None or trigger is None:
+                raise
             if execution is not None and trigger is not None:
                 db.refresh(execution)
                 db.refresh(trigger)

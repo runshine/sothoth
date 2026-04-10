@@ -1,41 +1,54 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
-from app.engine.workflow import WorkflowExecutor
-from app.models.config_models import FrameworkConfig
+import pytest
+
+from app.pi_vuln_core.runner import build_runtime_framework_config, run_framework_config
 
 
-def test_full_pipeline_run(framework_root, framework_config, tmp_path):
-    executor = WorkflowExecutor(framework_config)
-    result = executor.run(str(framework_root / "examples" / "input_tasks.json"), str(tmp_path / "workspace"))
+@pytest.mark.asyncio
+async def test_full_pipeline_run(framework_config_payload: dict, tmp_path: Path, patch_mock_agent_runtime):
+    input_task = tmp_path / "input-task.md"
+    input_task.write_text("# Test Task\n\nAnalyze mock binary.\n", encoding="utf-8")
 
-    assert result.state.value == "succeeded"
-    assert Path(result.output_manifest_path).exists()
-    payload = json.loads(Path(result.output_manifest_path).read_text(encoding="utf-8"))
-    assert payload["tasks"] == []
-
-    root_dir = tmp_path / "workspace" / framework_config.root_workflow_id
-    assert (root_dir / "stage_package_unpack" / "stage_summary.json").exists()
-    assert (root_dir / "stage_vuln_filter" / "stage_summary.json").exists()
-
-
-def test_feedback_loop_reaches_second_round(framework_root, framework_config_payload, tmp_path):
-    payload = framework_config_payload
-    payload["prompts"]["global_review_user"] = "REQUIRE_FEEDBACK_LOOP Review the full task outcome."
-    config = FrameworkConfig.model_validate(payload)
-    executor = WorkflowExecutor(config)
-    result = executor.run(str(framework_root / "examples" / "input_tasks.json"), str(tmp_path / "workspace"))
-
-    assert result.state.value == "succeeded"
-    attempt_dir = (
-        tmp_path
-        / "workspace"
-        / config.root_workflow_id
-        / "stage_package_unpack"
-        / "package-list-001"
-        / "attempt-001"
+    config = build_runtime_framework_config(
+        framework_config_payload,
+        workspace_root=str(tmp_path / "workspace"),
+        execution_id="test-run-001",
+        input_task_file=str(input_task),
+        input_task_id="task-001",
+        output_dir=str(tmp_path / "output"),
+        summary_file=str(tmp_path / "output" / "execution_summary.json"),
+        runtime_mode="local_test",
     )
-    assert (attempt_dir / "review_feedback" / "round-001.json").exists()
-    assert (attempt_dir / "round-002" / "summary.json").exists()
+    artifacts = await run_framework_config(config)
+
+    assert artifacts.result.success is True
+    assert len(artifacts.result.final_tasks) == 2
+    assert Path(artifacts.summary_file or "").exists()
+    assert (Path(artifacts.result.working_dir) / "_meta" / "workflow_result.json").exists()
+    assert (Path(artifacts.result.working_dir) / "stage_01_scan").exists()
+
+
+@pytest.mark.asyncio
+async def test_summary_and_review_artifacts_are_recorded(framework_config_payload: dict, tmp_path: Path, patch_mock_agent_runtime):
+    input_task = tmp_path / "input-task.md"
+    input_task.write_text("# Test Task\n\nAnalyze mock binary.\n", encoding="utf-8")
+
+    config = build_runtime_framework_config(
+        framework_config_payload,
+        workspace_root=str(tmp_path / "workspace"),
+        execution_id="test-run-002",
+        input_task_file=str(input_task),
+        input_task_id="task-002",
+        output_dir=str(tmp_path / "output"),
+        summary_file=str(tmp_path / "output" / "execution_summary.json"),
+        runtime_mode="local_test",
+    )
+    artifacts = await run_framework_config(config)
+    workflow_dir = Path(artifacts.result.working_dir)
+
+    assert list(workflow_dir.rglob("summary.md"))
+    assert list(workflow_dir.rglob("reviews/global/**/*.json"))
+    assert list(workflow_dir.rglob("reviews/results/**/*.json"))

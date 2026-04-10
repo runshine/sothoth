@@ -1,60 +1,53 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
-from app.engine.workflow import ExitWorkflowError, RetryWorkflowError, WorkflowExecutor
-from app.models.config_models import FrameworkConfig
-from app.models.contracts import ExecutionState, PluginStatus, TaskItem
-from app.plugins.base import PluginExecutionContext
+from app.pi_vuln_core.plugins.base import BasePlugin, PluginContext, PluginResult, PluginResultCode
+from app.pi_vuln_core.plugins.executor import PluginChainExecutor
+from app.pi_vuln_core.plugins.registry import PluginRegistry
 
 
+class StaticPlugin(BasePlugin):
+    def __init__(self, plugin_id: str, code: PluginResultCode):
+        self._plugin_id = plugin_id
+        self._code = code
+
+    @property
+    def plugin_id(self) -> str:
+        return self._plugin_id
+
+    async def execute(self, ctx: PluginContext) -> PluginResult:
+        return PluginResult(code=self._code, message=self._code.value)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("status", "expected_state", "expected_exception"),
+    ("code", "expected_action"),
     [
-        ("SUCCESS_NEXT", None, None),
-        ("SUCCESS_END_STAGE", None, None),
-        ("RETRY_WORKFLOW", None, RetryWorkflowError),
-        ("FAIL_END_STAGE_CONTINUE", ExecutionState.ABNORMAL_CONTINUE, None),
-        ("FAIL_EXIT_WORKFLOW", None, ExitWorkflowError),
-        ("FAIL_CONTINUE_NEXT_PLUGIN", None, None),
+        (PluginResultCode.OK_NEXT, "completed"),
+        (PluginResultCode.OK_END_STAGE, "end_stage_normal"),
+        (PluginResultCode.ERROR_CONTINUE, "completed"),
+        (PluginResultCode.ERROR_END_NEXT, "end_stage_skip_next"),
+        (PluginResultCode.ERROR_RESTART, "restart_workflow"),
+        (PluginResultCode.ERROR_EXIT, "exit_workflow"),
     ],
 )
-def test_plugin_phase_statuses(status, expected_state, expected_exception, framework_config_payload, tmp_path):
-    payload = framework_config_payload
-    payload["plugins"].append(
-        {
-            "id": "test_plugin",
-            "kind": "python",
-            "module": "plugins.workflow_plugins",
-            "class_name": "WorkflowControlPlugin",
-            "config": {"status": status, "message": status},
-        }
-    )
-    executor = WorkflowExecutor(FrameworkConfig.model_validate(payload))
-    workflow = executor.framework_config.atomic_workflows[0]
-    ctx = PluginExecutionContext(
-        framework_config=executor.framework_config,
-        workflow_config=workflow,
-        plugin_definition=None,
-        phase="pre",
-        task=TaskItem(
-            task_id="task-001",
-            task_type=workflow.input_task_type,
-            title="Plugin test",
-            task_md_path="/tmp/task.md",
-            metadata={},
-            upstream_refs=[],
+async def test_plugin_phase_statuses(code: PluginResultCode, expected_action: str):
+    registry = PluginRegistry()
+    registry.register_instance("test_plugin", StaticPlugin("test_plugin", code), config={})
+    executor = PluginChainExecutor(registry)
+    result = await executor.execute_chain(
+        ["test_plugin"],
+        PluginContext(
+            workflow_id="wf",
+            task_id="task",
+            execution_id="exec",
+            working_dir="/tmp",
+            task_file="/tmp/task.md",
+            plugin_config={},
+            shared_state={},
+            global_config={},
         ),
-        task_dir=Path(tmp_path),
-        workspace_root=Path(tmp_path),
-        round_no=0,
-        runtime_manager=executor.runtime_manager,
+        phase="start",
     )
-    if expected_exception:
-        with pytest.raises(expected_exception):
-            executor._run_plugin_phase(plugin_ids=["test_plugin"], ctx=ctx, phase_dir=Path(tmp_path) / "phase")
-    else:
-        outcome = executor._run_plugin_phase(plugin_ids=["test_plugin"], ctx=ctx, phase_dir=Path(tmp_path) / "phase")
-        assert outcome.stage_state == expected_state
+    assert result.action == expected_action

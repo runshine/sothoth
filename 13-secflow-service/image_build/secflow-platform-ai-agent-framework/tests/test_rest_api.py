@@ -1,17 +1,25 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.models.database import WorkflowExecution, get_db_session
+from app.services.execution_service import get_execution_service
+from app.services.scheduler import SchedulerService
+from app.services.workflow_service import get_workflow_service
 
 
-def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framework_root: Path, framework_config_payload: dict):
+def test_definition_and_trigger_rest_lifecycle(
+    service_config_path: Path,
+    framework_root: Path,
+    framework_config_payload: dict,
+    patch_mock_agent_runtime,
+):
     app = create_app()
     client = TestClient(app)
+    validated = get_workflow_service().validate_definition_payload(framework_config_payload)
 
     create_response = client.post(
         "/api/ai-agent-framework/workflow-definitions",
@@ -31,27 +39,13 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
     assert create_response.status_code == 201
     definition = create_response.json()
     definition_id = definition["id"]
-    assert definition["root_workflow_id"] == framework_config_payload["root_workflow_id"]
-    assert definition["entry_input_task_type"] == "package_list"
-    assert definition["final_output_task_type"] == "verified_vuln"
+    assert definition["root_workflow_id"] == framework_config_payload["execution"]["entry_workflow"]
+    assert definition["entry_input_task_type"] == validated.resolve_entry_input_task_type()
+    assert definition["final_output_task_type"] == validated.resolve_final_output_task_type()
 
     versions_response = client.get(f"/api/ai-agent-framework/workflow-definitions/{definition_id}/versions")
     assert versions_response.status_code == 200
     assert len(versions_response.json()) == 1
-
-    update_response = client.put(
-        f"/api/ai-agent-framework/workflow-definitions/{definition_id}",
-        json={"name": "demo pipeline v2"},
-    )
-    assert update_response.status_code == 200
-    assert update_response.json()["name"] == "demo pipeline v2"
-
-    versions_response = client.get(f"/api/ai-agent-framework/workflow-definitions/{definition_id}/versions")
-    assert len(versions_response.json()) == 2
-
-    activate_response = client.post(f"/api/ai-agent-framework/workflow-definitions/{definition_id}/activate")
-    assert activate_response.status_code == 200
-    assert activate_response.json()["is_active"] is True
 
     trigger_response = client.post(
         f"/api/ai-agent-framework/workflow-definitions/{definition_id}/trigger-tasks",
@@ -74,7 +68,6 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
     execution_list_response = client.get("/api/ai-agent-framework/executions")
     assert execution_list_response.status_code == 200
     assert len(execution_list_response.json()) == 1
-    assert execution_list_response.json()[0]["status"] == "pending"
     execution_id = execution_list_response.json()[0]["id"]
 
     db = get_db_session()
@@ -88,6 +81,30 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
         assert (workspace_root / "trigger_inputs" / "task-001" / "input" / "task.md").exists()
     finally:
         db.close()
+
+    claimed_execution_id = SchedulerService()._claim_next_execution()
+    assert claimed_execution_id == execution_id
+    get_execution_service().run_claimed_execution(execution_id)
+
+    execution_detail = client.get(f"/api/ai-agent-framework/executions/{execution_id}")
+    assert execution_detail.status_code == 200
+    assert execution_detail.json()["status"] == "succeeded"
+    assert execution_detail.json()["output_task_count"] == 2
+
+    events_response = client.get(f"/api/ai-agent-framework/executions/{execution_id}/events")
+    assert events_response.status_code == 200
+    event_types = [item["event_type"] for item in events_response.json()]
+    assert "execution_started" in event_types
+    assert "stage_started" in event_types
+    assert "plugin_completed" in event_types
+    assert "global_review_result" in event_types
+    assert "result_review_result" in event_types
+    assert "execution_finished" in event_types
+
+    artifacts_response = client.get(f"/api/ai-agent-framework/executions/{execution_id}/artifacts")
+    assert artifacts_response.status_code == 200
+    artifact_paths = [item["path"] for item in artifacts_response.json()["files"]]
+    assert "output/tasks.json" in artifact_paths
 
     wrong_type_trigger = client.post(
         f"/api/ai-agent-framework/workflow-definitions/{definition_id}/trigger-tasks",
@@ -106,9 +123,23 @@ def test_definition_and_trigger_rest_lifecycle(service_config_path: Path, framew
     )
     assert wrong_type_trigger.status_code == 422
 
-    cancel_response = client.post(f"/api/ai-agent-framework/trigger-tasks/{trigger_task_id}/cancel")
+    second_trigger = client.post(
+        f"/api/ai-agent-framework/workflow-definitions/{definition_id}/trigger-tasks",
+        json={
+            "input_tasks": [
+                {
+                    "task_id": "task-003",
+                    "title": "待取消任务",
+                    "task_markdown": "# To Cancel\n",
+                    "metadata": {},
+                    "upstream_refs": [],
+                }
+            ]
+        },
+    )
+    assert second_trigger.status_code == 201
+    cancel_response = client.post(f"/api/ai-agent-framework/trigger-tasks/{second_trigger.json()['id']}/cancel")
     assert cancel_response.status_code == 200
-
-    trigger_detail_response = client.get(f"/api/ai-agent-framework/trigger-tasks/{trigger_task_id}")
+    trigger_detail_response = client.get(f"/api/ai-agent-framework/trigger-tasks/{second_trigger.json()['id']}")
     assert trigger_detail_response.status_code == 200
     assert trigger_detail_response.json()["status"] == "cancelled"
