@@ -5,7 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from app.main import create_app
-from app.models.database import WorkflowExecution, get_db_session
+from app.models.database import WorkflowDefinition, WorkflowExecution, get_db_session
 from app.services.execution_service import get_execution_service
 from app.services.scheduler import SchedulerService
 from app.services.workflow_service import get_workflow_service
@@ -143,3 +143,57 @@ def test_definition_and_trigger_rest_lifecycle(
     trigger_detail_response = client.get(f"/api/ai-agent-framework/trigger-tasks/{second_trigger.json()['id']}")
     assert trigger_detail_response.status_code == 200
     assert trigger_detail_response.json()["status"] == "cancelled"
+
+
+def test_definition_list_tolerates_invalid_legacy_schema(
+    service_config_path: Path,
+):
+    app = create_app()
+    client = TestClient(app)
+
+    db = get_db_session()
+    try:
+        db.add(
+            WorkflowDefinition(
+                id="wfd-legacy-001",
+                name="legacy definition",
+                description="old schema",
+                project_id="default",
+                definition_json={
+                    "schema_version": "v1",
+                    "plugins": [
+                        {"id": "prepare_env", "kind": "python", "class_name": "WorkflowControlPlugin"},
+                    ],
+                    "run": {"next_task_generator": {}},
+                },
+                root_workflow_id="legacy-root",
+                trigger_type="manual",
+                trigger_enabled=False,
+                is_active=False,
+                enabled=True,
+                max_concurrency=1,
+                priority_default=100,
+                workspace_base_dir=None,
+                execution_timeout_seconds=7200,
+                created_by="system",
+                updated_by="system",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    list_response = client.get("/api/ai-agent-framework/workflow-definitions")
+    assert list_response.status_code == 200
+    payload = list_response.json()
+    assert len(payload) == 1
+    assert payload[0]["id"] == "wfd-legacy-001"
+    assert payload[0]["definition_valid"] is False
+    assert payload[0]["validation_error"]
+    assert payload[0]["root_workflow_id"] == "legacy-root"
+    assert payload[0]["entry_input_task_type"] is None
+    assert payload[0]["final_output_task_type"] is None
+
+    detail_response = client.get("/api/ai-agent-framework/workflow-definitions/wfd-legacy-001")
+    assert detail_response.status_code == 200
+    assert detail_response.json()["definition_valid"] is False

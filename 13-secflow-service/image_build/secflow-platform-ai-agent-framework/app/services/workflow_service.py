@@ -39,14 +39,23 @@ class WorkflowService:
         except (ValidationError, ValueError) as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
 
+    def _validate_definition_soft(self, definition_json: dict) -> tuple[FrameworkConfig | None, str | None]:
+        try:
+            return FrameworkConfig.model_validate(definition_json), None
+        except (ValidationError, ValueError) as exc:
+            return None, str(exc)
+
     def _definition_response(self, definition: WorkflowDefinition, validated: FrameworkConfig | None = None) -> WorkflowDefinitionResponse:
-        config = validated or self.validate_definition_payload(definition.definition_json)
+        config = validated
+        validation_error: str | None = None
+        if config is None:
+            config, validation_error = self._validate_definition_soft(definition.definition_json)
         payload = {
             "id": definition.id,
             "name": definition.name,
             "description": definition.description,
             "project_id": definition.project_id,
-            "root_workflow_id": config.root_workflow_id,
+            "root_workflow_id": config.root_workflow_id if config else definition.root_workflow_id,
             "trigger_type": definition.trigger_type,
             "trigger_enabled": definition.trigger_enabled,
             "is_active": definition.is_active,
@@ -55,8 +64,10 @@ class WorkflowService:
             "priority_default": definition.priority_default,
             "workspace_base_dir": definition.workspace_base_dir,
             "execution_timeout_seconds": definition.execution_timeout_seconds,
-            "entry_input_task_type": config.resolve_entry_input_task_type(),
-            "final_output_task_type": config.resolve_final_output_task_type(),
+            "entry_input_task_type": config.resolve_entry_input_task_type() if config else None,
+            "final_output_task_type": config.resolve_final_output_task_type() if config else None,
+            "definition_valid": config is not None,
+            "validation_error": validation_error,
             "created_by": definition.created_by,
             "updated_by": definition.updated_by,
             "created_at": definition.created_at,

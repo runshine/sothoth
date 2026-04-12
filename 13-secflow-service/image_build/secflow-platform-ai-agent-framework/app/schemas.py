@@ -42,7 +42,7 @@ class WorkflowDefinitionResponse(BaseModel):
     name: str
     description: Optional[str]
     project_id: str
-    root_workflow_id: str
+    root_workflow_id: Optional[str] = None
     trigger_type: str
     trigger_enabled: bool
     is_active: bool
@@ -51,8 +51,10 @@ class WorkflowDefinitionResponse(BaseModel):
     priority_default: int
     workspace_base_dir: Optional[str]
     execution_timeout_seconds: int
-    entry_input_task_type: str
-    final_output_task_type: str
+    entry_input_task_type: Optional[str] = None
+    final_output_task_type: Optional[str] = None
+    definition_valid: bool = True
+    validation_error: Optional[str] = None
     created_by: str
     updated_by: str
     created_at: datetime
