@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_super_admin, get_current_user_management_user
@@ -635,6 +635,63 @@ def get_user_department_info(db: Session, user_id: int) -> tuple[Optional[int], 
     return department.id, department.name
 
 
+def get_user_primary_department_map(db: Session, user_ids: List[int]) -> Dict[int, Tuple[Optional[int], Optional[str]]]:
+    """批量获取用户主部门信息，避免项目列表场景下的逐条查询。"""
+    unique_user_ids = [user_id for user_id in set(user_ids) if user_id is not None]
+    if not unique_user_ids:
+        return {}
+
+    memberships = db.query(
+        DepartmentMember.user_id,
+        DepartmentMember.department_id,
+        Department.name,
+        DepartmentMember.id,
+    ).join(
+        Department, Department.id == DepartmentMember.department_id
+    ).filter(
+        DepartmentMember.user_id.in_(unique_user_ids)
+    ).order_by(
+        DepartmentMember.user_id.asc(),
+        DepartmentMember.id.asc(),
+    ).all()
+
+    result: Dict[int, Tuple[Optional[int], Optional[str]]] = {}
+    for membership in memberships:
+        if membership.user_id not in result:
+            result[membership.user_id] = (membership.department_id, membership.name)
+    return result
+
+
+def get_project_department_map(db: Session, project_ids: List[int]) -> Dict[int, List[Department]]:
+    """批量获取项目绑定的部门信息。"""
+    unique_project_ids = [project_id for project_id in set(project_ids) if project_id is not None]
+    if not unique_project_ids:
+        return {}
+
+    rows = db.query(ProjectDepartment.project_id, Department).join(
+        Department, Department.id == ProjectDepartment.department_id
+    ).filter(
+        ProjectDepartment.project_id.in_(unique_project_ids)
+    ).all()
+
+    result: Dict[int, List[Department]] = {project_id: [] for project_id in unique_project_ids}
+    for project_id, department in rows:
+        result.setdefault(project_id, []).append(department)
+    return result
+
+
+def get_org_project_map_by_names(db: Session, project_names: List[str]) -> Dict[str, Project]:
+    """按项目名称批量获取组织架构项目。"""
+    unique_names = [name for name in set(project_names) if name]
+    if not unique_names:
+        return {}
+
+    projects = db.query(Project).options(
+        selectinload(Project.departments).selectinload(ProjectDepartment.department)
+    ).filter(Project.name.in_(unique_names)).all()
+    return {project.name: project for project in projects}
+
+
 @router.get("/user-department-projects", response_model=UserDepartmentProjectListResponse)
 def get_user_department_projects(
     authorization: str = Header(None),
@@ -667,6 +724,20 @@ def get_user_department_projects(
             detail=f"无法获取项目列表: {str(e)}"
         )
 
+    owner_ids: List[int] = []
+    for proj in projects_data:
+        owner_id_str = proj.get("owner_id")
+        if not owner_id_str:
+            continue
+        try:
+            owner_ids.append(int(owner_id_str))
+        except (ValueError, TypeError):
+            continue
+    owner_department_map = get_user_primary_department_map(db, owner_ids)
+    org_project_map = get_org_project_map_by_names(
+        db, [str(proj.get("name") or "") for proj in projects_data]
+    )
+
     # 筛选项目
     result_projects = []
     for proj in projects_data:
@@ -675,15 +746,37 @@ def get_user_department_projects(
         project_department_id = proj.get("department_id")
         project_department_name = proj.get("department_name")
         can_manage = bool(proj.get("can_manage", False))
+        org_project = org_project_map.get(str(proj.get("name") or ""))
 
         owner_dept_id = None
         owner_dept_name = None
         if owner_id_str:
             try:
                 owner_id = int(owner_id_str)
-                owner_dept_id, owner_dept_name = get_user_department_info(db, owner_id)
+                owner_dept_id, owner_dept_name = owner_department_map.get(owner_id, (None, None))
             except (ValueError, TypeError):
                 pass
+
+        org_departments = []
+        if org_project:
+            org_departments = [
+                {
+                    "id": rel.department.id,
+                    "name": rel.department.name,
+                    "description": rel.department.description,
+                    "parent_id": rel.department.parent_id,
+                    "created_at": rel.department.created_at,
+                    "updated_at": rel.department.updated_at,
+                }
+                for rel in (org_project.departments or [])
+                if rel.department is not None
+            ]
+
+        effective_project_department_id = project_department_id
+        effective_project_department_name = project_department_name
+        if not effective_project_department_id and org_departments:
+            effective_project_department_id = org_departments[0]["id"]
+            effective_project_department_name = org_departments[0]["name"]
 
         # 公开项目：所有人可见
         if is_public:
@@ -697,19 +790,21 @@ def get_user_department_projects(
                 k8s_namespace=proj.get("k8s_namespace"),
                 status=proj.get("status"),
                 is_public=is_public,
-                department_id=project_department_id,
-                department_name=project_department_name,
+                department_id=effective_project_department_id,
+                department_name=effective_project_department_name,
                 can_manage=can_manage,
                 created_at=proj.get("created_at"),
                 updated_at=proj.get("updated_at"),
                 roles=roles,
                 owner_department_id=owner_dept_id,
-                owner_department_name=owner_dept_name
+                owner_department_name=owner_dept_name,
+                org_id=org_project.id if org_project else None,
+                org_departments=org_departments,
             ))
         else:
             # 非公开项目：仅项目归属部门在当前用户可访问部门范围内时可见
-            effective_department_id = project_department_id or owner_dept_id
-            effective_department_name = project_department_name or owner_dept_name
+            effective_department_id = effective_project_department_id or owner_dept_id
+            effective_department_name = effective_project_department_name or owner_dept_name
 
             if effective_department_id is None:
                 continue
@@ -731,7 +826,9 @@ def get_user_department_projects(
                     updated_at=proj.get("updated_at"),
                     roles=roles,
                     owner_department_id=owner_dept_id,
-                    owner_department_name=owner_dept_name
+                    owner_department_name=owner_dept_name,
+                    org_id=org_project.id if org_project else None,
+                    org_departments=org_departments,
                 ))
 
     return UserDepartmentProjectListResponse(
@@ -1163,26 +1260,28 @@ def get_department_members(
             detail="部门不存在"
         )
     
-    # 获取部门成员
-    members = db.query(DepartmentMember).filter(DepartmentMember.department_id == department_id).all()
-    
-    # 构建响应
-    response = []
-    for member in members:
-        user = db.query(User).filter(User.id == member.user_id).first()
-        if user:
-            response.append(DepartmentMemberResponse(
-                id=member.id,
-                user_id=member.user_id,
-                username=user.username,
-                department_id=member.department_id,
-                department_name=department.name,
-                role=member.role,
-                created_at=member.created_at,
-                updated_at=member.updated_at
-            ))
-    
-    return response
+    member_rows = db.query(DepartmentMember, User.username).join(
+        User, User.id == DepartmentMember.user_id
+    ).filter(
+        DepartmentMember.department_id == department_id
+    ).order_by(
+        DepartmentMember.role.asc(),
+        User.username.asc()
+    ).all()
+
+    return [
+        DepartmentMemberResponse(
+            id=member.id,
+            user_id=member.user_id,
+            username=username,
+            department_id=member.department_id,
+            department_name=department.name,
+            role=member.role,
+            created_at=member.created_at,
+            updated_at=member.updated_at
+        )
+        for member, username in member_rows
+    ]
 
 
 @router.put("/department-members/{member_id}", response_model=DepartmentMemberResponse)
@@ -1391,13 +1490,27 @@ def get_projects(
     current_user: User = Depends(get_current_user_management_user)
 ):
     """获取项目列表"""
+    from app.schema import DepartmentResponse
+
     projects = db.query(Project).all()
-    
+    project_departments_map = get_project_department_map(db, [project.id for project in projects])
+
     result = []
     for project in projects:
         allowed, _ = can_manage_org_project(db, current_user, project)
         if allowed:
-            result.append(build_project_detail_response(db, project))
+            result.append(ProjectDetailResponse(
+                id=project.id,
+                name=project.name,
+                description=project.description,
+                is_public=project.is_public,
+                created_at=project.created_at,
+                updated_at=project.updated_at,
+                departments=[
+                    DepartmentResponse.from_orm(department)
+                    for department in project_departments_map.get(project.id, [])
+                ]
+            ))
     
     return result
 

@@ -503,6 +503,8 @@ class UserDepartmentProjectResponse(BaseModel):
     roles: List[ProjectRoleBindResponse] = []
     owner_department_id: Optional[int] = None
     owner_department_name: Optional[str] = None
+    org_id: Optional[int] = None
+    org_departments: List[DepartmentResponse] = []
 
     class Config:
         from_attributes = True
