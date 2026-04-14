@@ -289,6 +289,8 @@ def _build_user_import_template_workbook() -> bytes:
     guide_sheet.append(["department_name", "可选，填写系统中已存在的部门名称"])
     guide_sheet.append(["department_role", "可选，填写 member / vice_leader / leader；若填了部门但未填角色，默认 member"])
     guide_sheet.append(["is_active", "可选，填写 true/false、1/0、yes/no；留空默认 true"])
+    guide_sheet.append(["统一初始密码", "在导入弹窗中可选填写；当某一行未填写 password 时优先使用统一初始密码"])
+    guide_sheet.append(["首次登录强制改密", "在导入弹窗中可勾选；启用后，用户登录后必须先修改密码，其他页面会被限制访问"])
     guide_sheet.append(["填写建议", "通常只要填写 username，其余按需补充；先下载模板，再直接覆盖示例数据即可"])
     for cell in guide_sheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
@@ -403,6 +405,7 @@ def _validate_import_row(
             department_name=department_name,
             department_role=department_role,
             is_active=is_active,
+            force_password_change=False,
         )
     )
 
@@ -410,6 +413,12 @@ def _validate_import_row(
 def _preview_import_rows(db: Session, request: UserImportRequest) -> UserImportPreviewResponse:
     rows, _headers = _load_import_payload_rows(request)
     ensure_platform_roles_seeded(db)
+
+    if request.default_password and len(request.default_password) < 6:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="统一初始密码长度至少6位"
+        )
 
     file_username_counts: Dict[str, int] = {}
     pending_leader_counts: Dict[int, int] = {}
@@ -492,11 +501,16 @@ def _preview_import_rows(db: Session, request: UserImportRequest) -> UserImportP
     ]
 
     valid_rows = sum(1 for item in results if item.status == "valid")
+    preview_rows = []
+    for item in results:
+        normalized = item.normalized.model_copy(update={"force_password_change": request.force_password_change}) if item.normalized else None
+        preview_rows.append(item.model_copy(update={"normalized": normalized}))
+
     return UserImportPreviewResponse(
-        total_rows=len(results),
+        total_rows=len(preview_rows),
         valid_rows=valid_rows,
-        error_rows=len(results) - valid_rows,
-        rows=results,
+        error_rows=len(preview_rows) - valid_rows,
+        rows=preview_rows,
     )
 
 
@@ -552,6 +566,7 @@ def _build_user_response(
         id=user.id,
         username=user.username,
         is_active=user.is_active,
+        must_change_password=bool(getattr(user, "must_change_password", False)),
         created_at=user.created_at,
         updated_at=user.updated_at,
         role=user.get_all_role_names(),
@@ -702,13 +717,18 @@ def commit_user_import(
 
         normalized = row.normalized
         raw_row = raw_row_map.get(row.row_no, {})
-        password = (raw_row.get("password") or "").strip() or _generate_initial_password()
+        password = (
+            (raw_row.get("password") or "").strip()
+            or (request.default_password or "").strip()
+            or _generate_initial_password()
+        )
 
         try:
             user = User(
                 username=normalized.username,
                 hashed_password=get_password_hash(password),
                 is_active=normalized.is_active,
+                must_change_password=request.force_password_change,
             )
             db.add(user)
             db.flush()
@@ -1068,6 +1088,7 @@ def change_password(
         )
 
     user.hashed_password = get_password_hash(request.new_password)
+    user.must_change_password = False
     user.updated_at = datetime.utcnow()
 
     db.commit()
@@ -1097,6 +1118,7 @@ def change_own_password(
         )
 
     current_user.hashed_password = get_password_hash(request.new_password)
+    current_user.must_change_password = False
     current_user.updated_at = datetime.utcnow()
 
     db.commit()

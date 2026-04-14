@@ -55,6 +55,14 @@ def run_auto_migrations():
                 ON secflow_user_machine_token (project_id)
             """,
         },
+        {
+            "name": "add_user_must_change_password",
+            "check": lambda: _has_column(inspector, "secflow_user_users", "must_change_password"),
+            "sql": """
+                ALTER TABLE secflow_user_users
+                ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT FALSE
+            """,
+        },
     ]
 
     with engine.begin() as connection:

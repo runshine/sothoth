@@ -56,6 +56,7 @@ def _build_human_user_payload(user: User, db: Optional[Session] = None) -> Dict[
         "id": user.id,
         "username": user.username,
         "is_active": user.is_active,
+        "must_change_password": bool(getattr(user, "must_change_password", False)),
         "created_at": user.created_at.isoformat() if user.created_at else None,
         "updated_at": user.updated_at.isoformat() if user.updated_at else None,
         "role": [r.name for r in user.roles] if getattr(user, "roles", None) else [],

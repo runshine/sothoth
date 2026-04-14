@@ -1,7 +1,7 @@
 """认证依赖"""
 
 from typing import Optional
-from fastapi import HTTPException, status, Depends, Header
+from fastapi import HTTPException, status, Depends, Header, Request
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -16,7 +16,8 @@ TOKEN_TYPE_MACHINE = "machine"
 
 async def get_current_user(
         authorization: Optional[str] = Header(None),
-        db: Session = Depends(get_db)
+        db: Session = Depends(get_db),
+        request: Request = None,
 ) -> User:
     """
     获取当前用户（人机token认证）
@@ -77,6 +78,18 @@ async def get_current_user(
             detail="用户已被禁用",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    if getattr(user, "must_change_password", False):
+        allowed_paths = {
+            "/api/auth/validate-human-token",
+            "/api/auth/users/password/self",
+        }
+        request_path = request.url.path if request is not None else ""
+        if request_path not in allowed_paths:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="当前账号需要先修改初始密码后才能继续使用系统"
+            )
 
     return user
 

@@ -33,6 +33,7 @@ class UserResponse(UserBase):
     updated_at: datetime
     role: List[str] = []
     platform_role: str = "ordinary_user"
+    must_change_password: bool = False
     department_member_id: Optional[int] = None
     department_id: Optional[int] = None
     department_name: Optional[str] = None
@@ -51,6 +52,8 @@ class UserImportRequest(BaseModel):
     csv_content: Optional[str] = None
     file_content_base64: Optional[str] = None
     filename: Optional[str] = None
+    default_password: Optional[str] = None
+    force_password_change: bool = False
 
 
 class UserImportNormalizedRow(BaseModel):
@@ -62,6 +65,7 @@ class UserImportNormalizedRow(BaseModel):
     department_name: Optional[str] = None
     department_role: Optional[str] = None
     is_active: bool = True
+    force_password_change: bool = False
 
 
 class UserImportRowResult(BaseModel):
