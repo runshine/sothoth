@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl import load_workbook
 from sqlalchemy.orm import Session, selectinload
 
 from app.auth import cleanup_expired_sessions, get_password_hash, verify_password
@@ -47,7 +46,7 @@ from app.schema import (
 
 router = APIRouter(tags=["用户管理"], prefix="/users")
 
-USER_IMPORT_TEMPLATE_FILENAME = "secflow-user-import-template.xlsx"
+USER_IMPORT_TEMPLATE_FILENAME = "secflow-user-import-template.csv"
 USER_IMPORT_REQUIRED_HEADERS = {"username"}
 USER_IMPORT_ALLOWED_HEADERS = {
     "username",
@@ -232,11 +231,10 @@ def _load_import_payload_rows(request: UserImportRequest) -> Tuple[List[Tuple[in
     )
 
 
-def _build_user_import_template_workbook() -> bytes:
-    workbook = Workbook()
-    template_sheet = workbook.active
-    template_sheet.title = "用户导入模板"
-    template_sheet.append([
+def _build_user_import_template_csv() -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow([
         "username",
         "password",
         "platform_role",
@@ -245,7 +243,7 @@ def _build_user_import_template_workbook() -> bytes:
         "department_role",
         "is_active",
     ])
-    template_sheet.append([
+    writer.writerow([
         "zhangsan",
         "",
         "ordinary_user",
@@ -254,7 +252,7 @@ def _build_user_import_template_workbook() -> bytes:
         "member",
         "true",
     ])
-    template_sheet.append([
+    writer.writerow([
         "lisi",
         "TempPass123!",
         "ordinary_admin",
@@ -263,42 +261,7 @@ def _build_user_import_template_workbook() -> bytes:
         "leader",
         "true",
     ])
-    template_sheet.freeze_panes = "A2"
-    for column, width in {
-        "A": 20,
-        "B": 20,
-        "C": 18,
-        "D": 28,
-        "E": 22,
-        "F": 18,
-        "G": 14,
-    }.items():
-        template_sheet.column_dimensions[column].width = width
-    for cell in template_sheet[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(fill_type="solid", fgColor="2563EB")
-
-    guide_sheet = workbook.create_sheet("填写说明")
-    guide_sheet.column_dimensions["A"].width = 24
-    guide_sheet.column_dimensions["B"].width = 96
-    guide_sheet.append(["字段", "说明"])
-    guide_sheet.append(["username", "必填，填写要创建的用户名，系统内不能重复"])
-    guide_sheet.append(["password", "可选，留空则系统自动生成初始密码，并在导入结果里仅展示一次"])
-    guide_sheet.append(["platform_role", "可选，填写 ordinary_user 或 ordinary_admin；留空默认 ordinary_user"])
-    guide_sheet.append(["role_names", "可选，填写系统中已存在的普通角色名；多个角色可用逗号分隔"])
-    guide_sheet.append(["department_name", "可选，填写系统中已存在的部门名称"])
-    guide_sheet.append(["department_role", "可选，填写 member / vice_leader / leader；若填了部门但未填角色，默认 member"])
-    guide_sheet.append(["is_active", "可选，填写 true/false、1/0、yes/no；留空默认 true"])
-    guide_sheet.append(["统一初始密码", "在导入弹窗中可选填写；当某一行未填写 password 时优先使用统一初始密码"])
-    guide_sheet.append(["首次登录强制改密", "在导入弹窗中可勾选；启用后，用户登录后必须先修改密码，其他页面会被限制访问"])
-    guide_sheet.append(["填写建议", "通常只要填写 username，其余按需补充；先下载模板，再直接覆盖示例数据即可"])
-    for cell in guide_sheet[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(fill_type="solid", fgColor="0F766E")
-
-    output = io.BytesIO()
-    workbook.save(output)
-    return output.getvalue()
+    return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
 def _validate_import_row(
@@ -678,10 +641,10 @@ def download_user_import_template(
     current_user: User = Depends(get_current_super_admin)
 ):
     """下载用户导入 Excel 模板。"""
-    workbook_bytes = _build_user_import_template_workbook()
+    template_bytes = _build_user_import_template_csv()
     return Response(
-        content=workbook_bytes,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        content=template_bytes,
+        media_type="text/csv; charset=utf-8",
         headers={
             "Content-Disposition": (
                 f'attachment; filename="{USER_IMPORT_TEMPLATE_FILENAME}"; '

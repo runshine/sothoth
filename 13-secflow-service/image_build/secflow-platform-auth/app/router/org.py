@@ -8,8 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill
+from openpyxl import load_workbook
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
@@ -41,7 +40,7 @@ DEPARTMENT_MEMBER_IMPORT_REQUIRED_HEADERS = {"username"}
 DEPARTMENT_MEMBER_IMPORT_ALLOWED_HEADERS = {"username", "role"}
 DEPARTMENT_MEMBER_IMPORT_ALLOWED_ROLES = {"leader", "vice_leader", "member"}
 DEPARTMENT_MEMBER_IMPORT_ALLOWED_MODES = {"skip_existing", "update_role"}
-DEPARTMENT_MEMBER_IMPORT_TEMPLATE_FILENAME = "secflow-department-member-import-template.xlsx"
+DEPARTMENT_MEMBER_IMPORT_TEMPLATE_FILENAME = "secflow-department-member-import-template.csv"
 
 
 def log_access_denied(user: User, resource_type: str, resource_id: int, reason: str):
@@ -324,36 +323,13 @@ def load_department_member_import_rows(request: DepartmentMemberImportRequest) -
     )
 
 
-def build_department_member_import_template_workbook() -> bytes:
-    workbook = Workbook()
-    template_sheet = workbook.active
-    template_sheet.title = "成员导入模板"
-    template_sheet.append(["username", "role"])
-    template_sheet.append(["", ""])
-    template_sheet.append(["", ""])
-    template_sheet.freeze_panes = "A2"
-    template_sheet.column_dimensions["A"].width = 28
-    template_sheet.column_dimensions["B"].width = 18
-    for cell in template_sheet[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(fill_type="solid", fgColor="2563EB")
-
-    guide_sheet = workbook.create_sheet("填写说明")
-    guide_sheet.column_dimensions["A"].width = 22
-    guide_sheet.column_dimensions["B"].width = 90
-    guide_sheet.append(["项目", "说明"])
-    guide_sheet.append(["username", "必填，填写系统里已经存在的用户名，例如 zhangsan"])
-    guide_sheet.append(["role", "可选，可填写 member / vice_leader / leader；普通管理员只允许 member"])
-    guide_sheet.append(["目标部门", "不用填在文件里，系统会自动导入到你当前选中的部门"])
-    guide_sheet.append(["导入模式", "已存在则跳过；超级管理员还可以选择已存在则更新角色"])
-    guide_sheet.append(["注意事项", "每个部门同一时间只能有一个 leader；文件第一行必须是表头"])
-    for cell in guide_sheet[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill(fill_type="solid", fgColor="0F766E")
-
-    output = io.BytesIO()
-    workbook.save(output)
-    return output.getvalue()
+def build_department_member_import_template_csv() -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(["username", "role"])
+    writer.writerow(["zhangsan", "member"])
+    writer.writerow(["lisi", "vice_leader"])
+    return ("\ufeff" + output.getvalue()).encode("utf-8")
 
 
 def preview_department_member_import(
@@ -1014,8 +990,8 @@ def download_department_member_import_template(
             detail="当前用户无权导入部门成员"
         )
     return Response(
-        content=build_department_member_import_template_workbook(),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        content=build_department_member_import_template_csv(),
+        media_type="text/csv; charset=utf-8",
         headers={
             "Content-Disposition": (
                 f'attachment; filename="{DEPARTMENT_MEMBER_IMPORT_TEMPLATE_FILENAME}"; '
