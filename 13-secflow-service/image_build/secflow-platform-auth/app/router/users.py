@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.auth import cleanup_expired_sessions, get_password_hash, verify_password
 from app.database import get_db
@@ -307,6 +307,8 @@ def _validate_import_row(
     pending_leader_counts: Dict[int, int],
     department_cache: Dict[str, Department],
     role_cache: Dict[str, Role],
+    existing_usernames: Optional[set[str]] = None,
+    existing_leader_department_ids: Optional[set[int]] = None,
 ) -> UserImportRowResult:
     messages: List[str] = []
     username = (raw_row.get("username") or "").strip()
@@ -322,7 +324,9 @@ def _validate_import_row(
         messages.append("用户名长度不能超过100个字符")
     elif file_username_counts.get(username, 0) > 1:
         messages.append("CSV 文件内用户名重复")
-    elif db.query(User).filter(User.username == username).first():
+    elif existing_usernames is not None and username in existing_usernames:
+        messages.append("用户名已存在")
+    elif existing_usernames is None and db.query(User).filter(User.username == username).first():
         messages.append("用户名已存在")
 
     if password and len(password) < 6:
@@ -366,11 +370,15 @@ def _validate_import_row(
         messages.append("填写 department_role 时必须同时提供 department_name")
 
     if resolved_department and department_role == "leader":
-        existing_leader = db.query(DepartmentMember).filter(
-            DepartmentMember.department_id == resolved_department.id,
-            DepartmentMember.role == "leader"
-        ).first()
-        if existing_leader:
+        has_existing_leader = (
+            resolved_department.id in existing_leader_department_ids
+            if existing_leader_department_ids is not None
+            else db.query(DepartmentMember).filter(
+                DepartmentMember.department_id == resolved_department.id,
+                DepartmentMember.role == "leader"
+            ).first() is not None
+        )
+        if has_existing_leader:
             messages.append(f"部门已有组长: {department_name}")
         if pending_leader_counts.get(resolved_department.id, 0) > 1:
             messages.append(f"CSV 中部门组长重复: {department_name}")
@@ -408,6 +416,54 @@ def _preview_import_rows(db: Session, request: UserImportRequest) -> UserImportP
     department_cache: Dict[str, Department] = {}
     role_cache: Dict[str, Role] = {}
 
+    usernames = sorted({
+        (raw_row.get("username") or "").strip()
+        for _row_no, raw_row in rows
+        if (raw_row.get("username") or "").strip()
+    })
+    existing_usernames = {
+        username
+        for username, in db.query(User.username).filter(User.username.in_(usernames)).all()
+    }
+
+    department_names = sorted({
+        (raw_row.get("department_name") or "").strip()
+        for _row_no, raw_row in rows
+        if (raw_row.get("department_name") or "").strip()
+    })
+    if department_names:
+        department_cache.update({
+            department.name: department
+            for department in db.query(Department).filter(Department.name.in_(department_names)).all()
+        })
+
+    role_names = sorted({
+        role_name
+        for _row_no, raw_row in rows
+        for role_name in _split_role_names(raw_row.get("role_names") or "")
+    })
+    if role_names:
+        role_cache.update({
+            role.name: role
+            for role in db.query(Role).filter(Role.name.in_(role_names)).all()
+        })
+
+    leader_department_ids = [
+        department_cache[department_name].id
+        for _row_no, raw_row in rows
+        for department_name in [(raw_row.get("department_name") or "").strip()]
+        if department_name
+        and (raw_row.get("department_role") or "").strip().lower() == "leader"
+        and department_name in department_cache
+    ]
+    existing_leader_department_ids = {
+        department_id
+        for department_id, in db.query(DepartmentMember.department_id).filter(
+            DepartmentMember.department_id.in_(leader_department_ids),
+            DepartmentMember.role == "leader"
+        ).all()
+    }
+
     for _row_no, raw_row in rows:
         username = (raw_row.get("username") or "").strip()
         if username:
@@ -416,9 +472,8 @@ def _preview_import_rows(db: Session, request: UserImportRequest) -> UserImportP
         department_name = (raw_row.get("department_name") or "").strip()
         department_role = (raw_row.get("department_role") or "").strip().lower()
         if department_name and department_role == "leader":
-            department = db.query(Department).filter(Department.name == department_name).first()
+            department = department_cache.get(department_name)
             if department:
-                department_cache[department_name] = department
                 pending_leader_counts[department.id] = pending_leader_counts.get(department.id, 0) + 1
 
     results = [
@@ -430,6 +485,8 @@ def _preview_import_rows(db: Session, request: UserImportRequest) -> UserImportP
             pending_leader_counts=pending_leader_counts,
             department_cache=department_cache,
             role_cache=role_cache,
+            existing_usernames=existing_usernames,
+            existing_leader_department_ids=existing_leader_department_ids,
         )
         for row_no, raw_row in rows
     ]
@@ -453,10 +510,42 @@ def _get_primary_department_membership(db: Session, user_id: int) -> Optional[De
     ).order_by(DepartmentMember.id.asc()).first()
 
 
-def _build_user_response(db: Session, user: User) -> UserResponse:
-    membership = _get_primary_department_membership(db, user.id)
-    department = None
-    if membership:
+def _build_primary_membership_map(db: Session, user_ids: List[int]) -> Dict[int, DepartmentMember]:
+    unique_user_ids = [user_id for user_id in set(user_ids) if user_id is not None]
+    if not unique_user_ids:
+        return {}
+
+    memberships = db.query(DepartmentMember).filter(
+        DepartmentMember.user_id.in_(unique_user_ids)
+    ).order_by(
+        DepartmentMember.user_id.asc(),
+        DepartmentMember.id.asc()
+    ).all()
+
+    membership_map: Dict[int, DepartmentMember] = {}
+    for membership in memberships:
+        if membership.user_id not in membership_map:
+            membership_map[membership.user_id] = membership
+    return membership_map
+
+
+def _build_department_map(db: Session, department_ids: List[int]) -> Dict[int, Department]:
+    unique_department_ids = [department_id for department_id in set(department_ids) if department_id is not None]
+    if not unique_department_ids:
+        return {}
+    departments = db.query(Department).filter(Department.id.in_(unique_department_ids)).all()
+    return {department.id: department for department in departments}
+
+
+def _build_user_response(
+    db: Session,
+    user: User,
+    membership_map: Optional[Dict[int, DepartmentMember]] = None,
+    department_map: Optional[Dict[int, Department]] = None,
+) -> UserResponse:
+    membership = membership_map.get(user.id) if membership_map is not None else _get_primary_department_membership(db, user.id)
+    department = department_map.get(membership.department_id) if (membership and department_map is not None) else None
+    if membership and department is None and department_map is None:
         department = db.query(Department).filter(Department.id == membership.department_id).first()
 
     return UserResponse(
@@ -471,6 +560,23 @@ def _build_user_response(db: Session, user: User) -> UserResponse:
         department_id=membership.department_id if membership else None,
         department_name=department.name if department else None,
     )
+
+
+def _build_user_responses(db: Session, users: List[User]) -> List[UserResponse]:
+    membership_map = _build_primary_membership_map(db, [user.id for user in users])
+    department_map = _build_department_map(
+        db,
+        [membership.department_id for membership in membership_map.values()]
+    )
+    return [
+        _build_user_response(
+            db,
+            user,
+            membership_map=membership_map,
+            department_map=department_map,
+        )
+        for user in users
+    ]
 
 
 def _validate_role_ids_exist(db: Session, role_ids: List[int]) -> List[Role]:
@@ -490,8 +596,10 @@ def list_users(
 ):
     """获取用户列表。用户管理范围内的管理员可访问。"""
     ensure_platform_roles_seeded(db)
-    users = db.query(User).order_by(User.id.asc()).all()
-    return [_build_user_response(db, user) for user in users]
+    users = db.query(User).options(
+        selectinload(User.roles)
+    ).order_by(User.id.asc()).all()
+    return _build_user_responses(db, users)
 
 
 @router.get("/{user_id}", response_model=UserDetailResponse)
