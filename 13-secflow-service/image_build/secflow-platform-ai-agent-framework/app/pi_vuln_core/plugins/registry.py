@@ -38,8 +38,6 @@ class PluginRegistry:
         for plugin_cfg in plugins_config:
             pid = plugin_cfg["id"]
             module_path = plugin_cfg["module_path"]
-            if module_path.startswith("src."):
-                module_path = module_path.replace("src.", "app.pi_vuln_core.", 1)
             class_name = plugin_cfg["class_name"]
             config = plugin_cfg.get("config", {})
 

@@ -211,7 +211,8 @@ class ResultReviewExecutor:
                     advisor_id=advisor_def.instance_id,
                     cycle=cycle, passed=False, content=reason,
                     agent_id=advisor_def.agent_id,
-                    role_name=advisor_def.role_name)
+                    role_name=advisor_def.role_name,
+                    raw_content=response.content if response.content else "")
                 review_state.mark_result_failed(result_file, cycle, reason)
                 return False
 
@@ -226,7 +227,10 @@ class ResultReviewExecutor:
                 passed=parsed.passed,
                 content=parsed.feedback,
                 agent_id=advisor_def.agent_id,
-                role_name=advisor_def.role_name)
+                role_name=advisor_def.role_name,
+                scores=parsed.scores,
+                confidence=parsed.confidence,
+                raw_content=parsed.raw_content)
 
             if not parsed.passed:
                 # 当前结果不通过 → 放弃继续评审 (R6g)

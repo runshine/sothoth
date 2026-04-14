@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import time
 import traceback
-import inspect
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -56,7 +55,6 @@ class PluginChainExecutor:
         base_ctx: PluginContext,
         phase: str,  # "start" | "end"
         recorder: Optional[object] = None,
-        cancel_check=None,
     ) -> PluginChainResult:
         """
         串行执行插件链
@@ -73,17 +71,6 @@ class PluginChainExecutor:
         results: list[PluginResult] = []
 
         for i, plugin_id in enumerate(plugin_ids):
-            if cancel_check is not None:
-                maybe = cancel_check(
-                    checkpoint=f"plugin:{phase}:before",
-                    plugin_id=plugin_id,
-                    workflow_id=base_ctx.workflow_id,
-                    task_id=base_ctx.task_id,
-                    phase=phase,
-                    sequence=i + 1,
-                )
-                if inspect.isawaitable(maybe):
-                    await maybe
             plugin = self.registry.get(plugin_id)
             plugin_config = self.registry.get_config(plugin_id)
 
@@ -147,19 +134,6 @@ class PluginChainExecutor:
             # 更新共享状态
             if result.data:
                 base_ctx.shared_state.update(result.data)
-
-            if cancel_check is not None:
-                maybe = cancel_check(
-                    checkpoint=f"plugin:{phase}:after",
-                    plugin_id=plugin_id,
-                    workflow_id=base_ctx.workflow_id,
-                    task_id=base_ctx.task_id,
-                    phase=phase,
-                    sequence=i + 1,
-                    result_code=result.code.value,
-                )
-                if inspect.isawaitable(maybe):
-                    await maybe
 
             # ═══ 根据返回码决定下一步 ═══
             match result.code:

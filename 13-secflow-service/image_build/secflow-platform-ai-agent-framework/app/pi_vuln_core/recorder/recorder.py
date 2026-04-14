@@ -88,6 +88,8 @@ class ExecutionRecorder:
         agent_id: str = "",
         role_name: str = "",
         scores: Optional[dict] = None,
+        confidence: Optional[float] = None,
+        raw_content: str = "",
     ) -> None:
         """记录全局评审结果"""
         record = {
@@ -98,7 +100,9 @@ class ExecutionRecorder:
             "timestamp": _now_iso(),
             "passed": passed,
             "scores": scores or {},
+            "confidence": confidence,
             "feedback": content,
+            "raw_response": raw_content,
         }
 
         record_dir = Path(work_dir) / "reviews" / "global" / f"cycle_{cycle:03d}"
@@ -118,6 +122,9 @@ class ExecutionRecorder:
         content: str,
         agent_id: str = "",
         role_name: str = "",
+        scores: Optional[dict] = None,
+        confidence: Optional[float] = None,
+        raw_content: str = "",
     ) -> None:
         """记录结果评审（以每个结果为对象）(R6h)"""
         result_stem = Path(result_file).stem  # "result_001"
@@ -129,7 +136,10 @@ class ExecutionRecorder:
             "cycle": cycle,
             "timestamp": _now_iso(),
             "passed": passed,
+            "scores": scores or {},
+            "confidence": confidence,
             "feedback": content,
+            "raw_response": raw_content,
         }
 
         record_dir = (Path(work_dir) / "reviews" / "results" /

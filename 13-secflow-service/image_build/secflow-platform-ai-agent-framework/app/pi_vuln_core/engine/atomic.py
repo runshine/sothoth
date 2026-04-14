@@ -17,7 +17,6 @@ from app.pi_vuln_core.engine.models import (
     AtomicWorkflowState, AtomicWorkflowResult,
     WorkflowContext, TaskItem,
 )
-from app.pi_vuln_core.observer import ExecutionObserver, NullExecutionObserver
 from app.pi_vuln_core.engine.worker import WorkerExecutor
 from app.pi_vuln_core.plugins.base import PluginContext
 from app.pi_vuln_core.plugins.executor import PluginChainExecutor
@@ -43,7 +42,6 @@ class AtomicWorkflowEngine:
         workspace: WorkspaceManager,
         recorder: ExecutionRecorder,
         global_config: GlobalConfig,
-        observer: ExecutionObserver | None = None,
     ):
         self.wf = wf_def
         self.agents = agent_registry
@@ -51,7 +49,6 @@ class AtomicWorkflowEngine:
         self.workspace = workspace
         self.recorder = recorder
         self.global_cfg = global_config
-        self.observer = observer or NullExecutionObserver()
 
         self.worker_exec = WorkerExecutor(agent_registry, recorder)
         self.review_sched = ReviewScheduler(agent_registry, recorder)
@@ -82,12 +79,6 @@ class AtomicWorkflowEngine:
         for attempt in range(1, max_retry + 1):
             result = await self._execute_once(work_dir, input_task, task_id)
             if result.action == "restart_workflow":
-                await self.observer.on_workflow_restart(
-                    workflow_id=self.wf.id,
-                    task_id=task_id,
-                    working_dir=work_dir,
-                    attempt=attempt,
-                )
                 logger.warning("workflow_restart",
                                workflow_id=self.wf.id, attempt=attempt)
                 if attempt >= max_retry:
@@ -101,13 +92,6 @@ class AtomicWorkflowEngine:
         await self.recorder.record_workflow_result(
             work_dir=work_dir, status=result.status,
             detail={"cycles_used": result.cycles_used, "error": result.error})
-        if not result.success and result.error:
-            await self.observer.on_workflow_abnormal_exit(
-                workflow_id=self.wf.id,
-                task_id=task_id,
-                working_dir=work_dir,
-                error=result.error,
-            )
 
         if result.success:
             vlog.workflow_completed(result.cycles_used, len(result.next_tasks))
@@ -132,12 +116,6 @@ class AtomicWorkflowEngine:
         vlog.section("🔌", "启动插件链", f"{len(self.wf.start_plugins)} 个插件")
         await self.recorder.record_state_change(
             work_dir, "", AtomicWorkflowState.START_PLUGINS.value)
-        await self.observer.check_cancel(
-            "atomic:start_plugins",
-            workflow_id=self.wf.id,
-            task_id=task_id,
-            working_dir=work_dir,
-        )
 
         start_result = await self._run_plugins(self.wf.start_plugins, ctx, "start")
         if start_result.action == "restart_workflow":
@@ -154,19 +132,6 @@ class AtomicWorkflowEngine:
 
         for cycle in range(1, self.max_cycles + 1):
             ctx.cycle = cycle
-            await self.observer.check_cancel(
-                "atomic:cycle_start",
-                workflow_id=self.wf.id,
-                task_id=task_id,
-                working_dir=work_dir,
-                cycle=cycle,
-            )
-            await self.observer.on_cycle_started(
-                workflow_id=self.wf.id,
-                task_id=task_id,
-                working_dir=work_dir,
-                cycle=cycle,
-            )
             vlog.cycle_start(cycle, self.max_cycles)
 
             # ── 2. Worker 执行 ──
@@ -196,15 +161,6 @@ class AtomicWorkflowEngine:
             result_files = list_dir_files(results_dir, suffix=".md")
             vlog.summary_done(summary_path, len(result_files))
             await self.recorder.snapshot_summary(work_dir, cycle, "after_summary")
-            await self.observer.on_summary_completed(
-                workflow_id=self.wf.id,
-                task_id=task_id,
-                working_dir=work_dir,
-                cycle=cycle,
-                summary_file=summary_path,
-                results_dir=results_dir,
-                result_count=len(result_files),
-            )
 
             # ── 5. 全局评审 ──
             global_advisors = self.wf.roles.advisors.global_review
@@ -234,13 +190,6 @@ class AtomicWorkflowEngine:
                     passed_results=[], failed_results=[])
                 logger.info("global_review_failed_retry",
                              cycle=cycle, feedback=global_feedback[:200])
-                await self.observer.on_cycle_completed(
-                    workflow_id=self.wf.id,
-                    task_id=task_id,
-                    working_dir=work_dir,
-                    cycle=cycle,
-                    outcome="global_review_failed",
-                )
                 continue
 
             # ── 6. 结果评审 ──
@@ -293,24 +242,9 @@ class AtomicWorkflowEngine:
                 ctx.failed_result_items = failed_items
                 logger.info("result_review_failed_retry",
                              cycle=cycle, failed_count=len(failed_items))
-                await self.observer.on_cycle_completed(
-                    workflow_id=self.wf.id,
-                    task_id=task_id,
-                    working_dir=work_dir,
-                    cycle=cycle,
-                    outcome="result_review_failed",
-                    failed_count=len(failed_items),
-                )
                 continue
 
             logger.info("all_reviews_passed", cycle=cycle)
-            await self.observer.on_cycle_completed(
-                workflow_id=self.wf.id,
-                task_id=task_id,
-                working_dir=work_dir,
-                cycle=cycle,
-                outcome="passed",
-            )
             break
         else:
             await self.recorder.record_warning(
@@ -324,13 +258,6 @@ class AtomicWorkflowEngine:
         vlog.section("🔌", "结束插件链", f"{len(self.wf.end_plugins)} 个插件")
         await self.recorder.record_state_change(
             ctx.working_dir, "", AtomicWorkflowState.END_PLUGINS.value)
-        await self.observer.check_cancel(
-            "atomic:end_plugins",
-            workflow_id=ctx.workflow_id,
-            task_id=ctx.task_id,
-            working_dir=ctx.working_dir,
-            cycle=ctx.cycle,
-        )
 
         end_result = await self._run_plugins(self.wf.end_plugins, ctx, "end")
         if end_result.action == "restart_workflow":
@@ -361,12 +288,7 @@ class AtomicWorkflowEngine:
             review_records_dir=os.path.join(ctx.working_dir, "reviews"),
             agent_registry=self.agents)
         result = await self.plugin_exec.execute_chain(
-            plugin_ids,
-            base_ctx,
-            phase,
-            recorder=self.recorder,
-            cancel_check=self.observer.check_cancel,
-        )
+            plugin_ids, base_ctx, phase, recorder=self.recorder)
         # 可视化每个插件结果
         for pr in result.results:
             vlog.plugin_executed(

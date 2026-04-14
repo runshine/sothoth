@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 from datetime import datetime
@@ -57,6 +58,30 @@ class VisualLogger:
 
     def _c(self, color: str, text: str) -> str:
         return f"{self.COLORS.get(color, '')}{text}{self.COLORS['reset']}"
+
+    def _one_line(self, text: str, limit: int = 80) -> str:
+        cleaned = re.sub(r'\s+', ' ', (text or '')).strip()
+        if len(cleaned) > limit:
+            return cleaned[:limit - 3] + '...'
+        return cleaned
+
+    def _verdict_line(self, text: str, limit: int = 80) -> str:
+        """从可能很长的 feedback 中提取简洁 verdict 摘要"""
+        if not text:
+            return ""
+        import re as _re
+        # 尝试提取结构化 verdict
+        verdict_patterns = [
+            _re.compile(r'(?:评审结论|最终判定|裁决|verdict|final_verdict)[\s::：]+\**\s*(.+?)(?:\s*[(（].*?[)）])?\s*(?:\*|$)', _re.IGNORECASE),
+            _re.compile(r'(FALSE_POSITIVE|TRUE_POSITIVE|INSUFFICIENT_INFO|REJECT|ACCEPT|APPROVED|UNVERIFIED)', _re.IGNORECASE),
+        ]
+        for p in verdict_patterns:
+            m = p.search(text)
+            if m:
+                verdict = m.group(1).strip().strip('*').strip()
+                return verdict if len(verdict) <= limit else verdict[:limit - 3] + '...'
+        # 没找到就用首行
+        return self._one_line(text, limit)
 
     # ═══════════════════════════════════════
     # 顶层标记
@@ -123,7 +148,7 @@ class VisualLogger:
 
     def global_review_result(self, advisor_id: str, passed: bool, feedback_preview: str):
         icon = "✅" if passed else "❌"
-        fb = feedback_preview[:80].replace('\n', ' ')
+        fb = self._verdict_line(feedback_preview) or ("通过" if passed else "未通过")
         self._print(f"    {icon} {advisor_id}: {fb}")
 
     def result_review_start(self, cycle: int, total: int, pending: int):
@@ -131,7 +156,8 @@ class VisualLogger:
 
     def result_review_item(self, filename: str, passed: bool, reason_preview: str = ""):
         icon = "✅" if passed else "❌"
-        reason = f" — {reason_preview[:60]}" if reason_preview and not passed else ""
+        preview = self._verdict_line(reason_preview) if not passed else ""
+        reason = f" — {preview}" if preview else ""
         self._print(f"    {icon} {filename}{reason}")
 
     def result_review_summary(self, passed: int, failed: int):

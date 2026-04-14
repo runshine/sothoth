@@ -133,7 +133,8 @@ class GlobalReviewExecutor:
             # 记录 (R6h)
             await self._record(
                 work_dir, advisor_def, cycle,
-                parsed.passed, parsed.feedback)
+                parsed.passed, parsed.feedback,
+                parsed.scores, parsed.confidence, parsed.raw_content)
 
             review_state.global_review_history.append(
                 GlobalReviewRecord(
@@ -160,6 +161,9 @@ class GlobalReviewExecutor:
         cycle: int,
         passed: bool,
         feedback: str,
+        scores: dict | None = None,
+        confidence: float | None = None,
+        raw_content: str = "",
     ) -> None:
         await self.recorder.record_global_review(
             work_dir=work_dir,
@@ -169,4 +173,7 @@ class GlobalReviewExecutor:
             content=feedback,
             agent_id=advisor_def.agent_id,
             role_name=advisor_def.role_name,
+            scores=scores,
+            confidence=confidence,
+            raw_content=raw_content,
         )

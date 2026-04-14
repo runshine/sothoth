@@ -1,0 +1,21 @@
+{
+  "cycle": 3,
+  "timestamp": "2026-04-13T08:30:19.795455+00:00",
+  "global_review": {
+    "passed": true,
+    "feedback_preview": ""
+  },
+  "result_review": {
+    "total": 4,
+    "passed_count": 4,
+    "failed_count": 0,
+    "passed_files": [
+      "result_001.md",
+      "result_002.md",
+      "result_003.md",
+      "result_006.md"
+    ],
+    "failed_files": []
+  },
+  "outcome": "all_passed"
+}

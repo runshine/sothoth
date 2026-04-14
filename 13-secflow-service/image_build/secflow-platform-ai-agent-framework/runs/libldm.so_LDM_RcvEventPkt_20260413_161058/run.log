@@ -1,0 +1,262 @@
+
+======================================================================
+  Log started: 2026-04-13 16:10:58
+  PID: 358829
+======================================================================
+
+════════════════════════════════════════════════════════════
+  数据流驱动漏洞挖掘
+════════════════════════════════════════════════════════════
+  数据流文件: /home/qinghe/ai-workspace/dfa_run/archive_glm5/libldm.so_LDM_RcvEventPkt.md
+  源码目录:   /home/qinghe/ai-workspace/target
+  运行名称:   libldm.so_LDM_RcvEventPkt_20260413_161058
+  模型:       litellm/litellm/MiniMax/MiniMax-M2.5
+  评审轮次:   3
+  运行目录:   /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058
+  配置文件:   /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/config.json
+  任务文件:   /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/input/task.md
+  日志文件:   /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/run.log
+════════════════════════════════════════════════════════════
+{"component": "main", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/config.json", "event": "loading_configuration", "level": "info", "timestamp": "2026-04-13T08:10:59.058336Z"}
+{"component": "config", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/config.json", "event": "loading_config", "level": "info", "timestamp": "2026-04-13T08:10:59.058580Z"}
+{"component": "config", "agents": 2, "plugins": 6, "atomic_workflows": 1, "composite_workflows": 1, "event": "config_loaded", "level": "info", "timestamp": "2026-04-13T08:10:59.059460Z"}
+{"component": "main", "count": 2, "event": "initializing_agents", "level": "info", "timestamp": "2026-04-13T08:10:59.059626Z"}
+{"component": "agent_registry", "agent_id": "pi-worker", "agent_type": "pi_agent", "runtime": "PiAgentRuntime", "event": "agent_registered", "level": "info", "timestamp": "2026-04-13T08:10:59.059783Z"}
+{"component": "agent_registry", "agent_id": "pi-advisor", "agent_type": "pi_agent", "runtime": "PiAgentRuntime", "event": "agent_registered", "level": "info", "timestamp": "2026-04-13T08:10:59.059911Z"}
+{"component": "agent_registry", "agent_id": "pi-worker", "event": "initializing_agent", "level": "info", "timestamp": "2026-04-13T08:10:59.059991Z"}
+{"component": "runtime.pi_agent", "version": "0.66.1", "agent_id": "pi-worker", "platform": "Linux", "event": "pi_cli_available", "level": "info", "timestamp": "2026-04-13T08:11:00.036188Z"}
+{"component": "agent_registry", "agent_id": "pi-advisor", "event": "initializing_agent", "level": "info", "timestamp": "2026-04-13T08:11:00.036357Z"}
+{"component": "runtime.pi_agent", "version": "0.66.1", "agent_id": "pi-advisor", "platform": "Linux", "event": "pi_cli_available", "level": "info", "timestamp": "2026-04-13T08:11:00.981300Z"}
+{"component": "agent_registry", "count": 2, "event": "all_agents_initialized", "level": "info", "timestamp": "2026-04-13T08:11:00.981537Z"}
+{"component": "main", "count": 6, "event": "initializing_plugins", "level": "info", "timestamp": "2026-04-13T08:11:00.981589Z"}
+{"component": "plugin_registry", "plugin_id": "env_setup", "module": "src.plugins.builtin.env_setup", "cls": "EnvSetupPlugin", "event": "plugin_registered", "level": "info", "timestamp": "2026-04-13T08:11:00.982732Z"}
+{"component": "plugin_registry", "plugin_id": "workspace_init", "module": "src.plugins.builtin.workspace_init", "cls": "WorkspaceInitPlugin", "event": "plugin_registered", "level": "info", "timestamp": "2026-04-13T08:11:00.982876Z"}
+{"component": "plugin_registry", "plugin_id": "task_validator", "module": "src.plugins.builtin.task_validator", "cls": "TaskValidatorPlugin", "event": "plugin_registered", "level": "info", "timestamp": "2026-04-13T08:11:00.982923Z"}
+{"component": "plugin_registry", "plugin_id": "result_archiver", "module": "src.plugins.builtin.result_archiver", "cls": "ResultArchiverPlugin", "event": "plugin_registered", "level": "info", "timestamp": "2026-04-13T08:11:00.982974Z"}
+{"component": "plugin_registry", "plugin_id": "final_output_collector", "module": "src.plugins.builtin.final_output_collector", "cls": "FinalOutputCollectorPlugin", "event": "plugin_registered", "level": "info", "timestamp": "2026-04-13T08:11:00.983196Z"}
+{"component": "plugin_registry", "plugin_id": "next_task_generator", "module": "src.plugins.builtin.next_task_generator", "cls": "NextTaskGeneratorPlugin", "event": "plugin_registered", "level": "info", "timestamp": "2026-04-13T08:11:00.983246Z"}
+{"component": "workspace", "root": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace", "event": "workspace_initialized", "level": "info", "timestamp": "2026-04-13T08:11:00.983375Z"}
+{"component": "main", "entry": "vuln_scan_pipeline", "execution_id": "libldm.so_LDM_RcvEventPkt_20260413_161058_run_001", "input_task": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/input/task.md", "keep_workspace": true, "event": "starting_workflow", "level": "info", "timestamp": "2026-04-13T08:11:00.983465Z"}
+
+════════════════════════════════════════════════════════════
+  组合工作流: 漏洞挖掘流水线 (vuln_scan_pipeline)
+  2026-04-13 16:11:00
+════════════════════════════════════════════════════════════
+{"component": "composite_engine", "workflow_id": "vuln_scan_pipeline", "execution_id": "libldm.so_LDM_RcvEventPkt_20260413_161058_run_001", "stages": 1, "work_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001", "event": "composite_workflow_start", "level": "info", "timestamp": "2026-04-13T08:11:00.983698Z"}
+
+──────────────────────────────────────────────────
+  📦 阶段: stage_01_vuln_scan  任务数=1  [0s]
+──────────────────────────────────────────────────
+{"component": "composite_engine", "stage_id": "stage_01_vuln_scan", "stage_name": "数据流驱动漏洞挖掘", "task_count": 1, "event": "stage_start", "level": "info", "timestamp": "2026-04-13T08:11:00.983891Z"}
+{"component": "composite_engine", "stage_id": "stage_01_vuln_scan", "task_idx": 1, "task_id": "initial_001", "total_in_stage": 1, "event": "stage_task_start", "level": "info", "timestamp": "2026-04-13T08:11:00.983933Z"}
+
+──────────────────────────────────────────────────
+  🚀 原子工作流启动: vuln_scan  task=initial_001  [0s]
+──────────────────────────────────────────────────
+  📁 工作目录: /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001
+{"component": "atomic_engine", "workflow_id": "vuln_scan", "task_id": "initial_001", "work_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "event": "atomic_workflow_start", "level": "info", "timestamp": "2026-04-13T08:11:00.984803Z"}
+
+──────────────────────────────────────────────────
+  🔌 启动插件链  3 个插件  [0s]
+──────────────────────────────────────────────────
+{"component": "recorder", "plugin_id": "env_setup", "phase": "start", "code": "ok_next", "event": "plugin_recorded", "level": "info", "timestamp": "2026-04-13T08:11:00.985155Z"}
+{"component": "plugin_executor", "plugin_id": "env_setup", "phase": "start", "sequence": 1, "code": "ok_next", "duration_ms": 0, "message": "设置 0 个环境变量", "event": "plugin_executed", "level": "info", "timestamp": "2026-04-13T08:11:00.985214Z"}
+{"component": "recorder", "plugin_id": "workspace_init", "phase": "start", "code": "ok_next", "event": "plugin_recorded", "level": "info", "timestamp": "2026-04-13T08:11:00.985352Z"}
+{"component": "plugin_executor", "plugin_id": "workspace_init", "phase": "start", "sequence": 2, "code": "ok_next", "duration_ms": 0, "message": "初始化 5 个子目录", "event": "plugin_executed", "level": "info", "timestamp": "2026-04-13T08:11:00.985389Z"}
+{"component": "recorder", "plugin_id": "task_validator", "phase": "start", "code": "ok_next", "event": "plugin_recorded", "level": "info", "timestamp": "2026-04-13T08:11:00.985453Z"}
+{"component": "plugin_executor", "plugin_id": "task_validator", "phase": "start", "sequence": 3, "code": "ok_next", "duration_ms": 0, "message": "任务文件校验通过 (1068 bytes)", "event": "plugin_executed", "level": "info", "timestamp": "2026-04-13T08:11:00.985486Z"}
+    ✅ [start] : 设置 0 个环境变量 (ok_next)
+    ✅ [start] : 初始化 5 个子目录 (ok_next)
+    ✅ [start] : 任务文件校验通过 (1068 bytes) (ok_next)
+
+  ◆ Cycle 1/3
+
+──────────────────────────────────────────────────
+  🔨 Worker 执行  cycle=1  [0s]
+──────────────────────────────────────────────────
+{"component": "worker_executor", "workflow_id": "vuln_scan", "task_id": "initial_001", "cycle": 1, "session_id": "pi_cca73df5b18c", "event": "worker_execute_start", "level": "info", "timestamp": "2026-04-13T08:11:00.986192Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 3093, "sys_prompt_len": 1544, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:11:00.986734Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 834, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:13:34.375344Z"}
+{"component": "worker_executor", "workflow_id": "vuln_scan", "turns": 1, "finished": true, "event": "worker_execute_done", "level": "info", "timestamp": "2026-04-13T08:13:34.375643Z"}
+  ✅ Worker 完成 (turns=1) (2m33s)
+    🪞 反思 [1] reflect_completeness...
+{"component": "worker_executor", "round": 1, "prompt_id": "reflect_completeness", "workflow_id": "vuln_scan", "event": "reflection_start", "level": "info", "timestamp": "2026-04-13T08:13:34.376607Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 1259, "sys_prompt_len": 0, "has_system_prompt": false, "is_continuation": true, "session_turns": 1, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:13:34.377062Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 1625, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:15:11.999008Z"}
+{"component": "worker_executor", "round": 1, "prompt_id": "reflect_completeness", "event": "reflection_done", "level": "info", "timestamp": "2026-04-13T08:15:11.999778Z"}
+      ✅ 反思 [1] 完成 (4m11s)
+{"component": "worker_executor", "workflow_id": "vuln_scan", "event": "summary_start", "level": "info", "timestamp": "2026-04-13T08:15:12.001643Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 1471, "sys_prompt_len": 0, "has_system_prompt": false, "is_continuation": true, "session_turns": 2, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:15:12.007982Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 886, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:16:36.356098Z"}
+{"component": "worker_executor", "workflow_id": "vuln_scan", "summary_path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/summary.md", "results_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/results", "event": "summary_done", "level": "info", "timestamp": "2026-04-13T08:16:36.356411Z"}
+  📋 总结完成: 6 个结果文件 (5m35s)
+{"component": "recorder", "cycle": 1, "phase": "after_summary", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/_meta/summary_versions/cycle_001_after_summary.md", "event": "summary_snapshot", "level": "info", "timestamp": "2026-04-13T08:16:36.357061Z"}
+
+──────────────────────────────────────────────────
+  🔍 全局评审  cycle=1, advisors=1  [5m35s]
+──────────────────────────────────────────────────
+{"component": "global_review", "advisor": "global_quality", "cycle": 1, "event": "global_review_start", "level": "info", "timestamp": "2026-04-13T08:16:36.357996Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 6622, "sys_prompt_len": 2052, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_770ed6e730c3", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:16:36.358980Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 4910, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:17:48.275622Z"}
+{"component": "recorder", "advisor_id": "global_quality", "cycle": 1, "passed": true, "event": "global_review_recorded", "level": "info", "timestamp": "2026-04-13T08:17:48.278422Z"}
+{"component": "global_review", "advisor": "global_quality", "cycle": 1, "passed": true, "event": "global_review_result", "level": "info", "timestamp": "2026-04-13T08:17:48.279460Z"}
+    ✅ global: 通过
+
+──────────────────────────────────────────────────
+  🎯 结果评审  cycle=1, 待审=6/6  [6m47s]
+──────────────────────────────────────────────────
+{"component": "result_review", "total": 6, "pending": 6, "cycle": 1, "event": "result_review_start", "level": "info", "timestamp": "2026-04-13T08:17:48.285003Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 2524, "sys_prompt_len": 1662, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_e41bdc341474", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:17:48.286117Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 3324, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:18:36.283445Z"}
+{"component": "recorder", "result_file": "result_001.md", "advisor_id": "result_fp_check", "cycle": 1, "passed": true, "event": "result_review_recorded", "level": "info", "timestamp": "2026-04-13T08:18:36.284486Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 2596, "sys_prompt_len": 1662, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_97faa480986d", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:18:36.285425Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 4391, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:19:29.304126Z"}
+{"component": "recorder", "result_file": "result_002.md", "advisor_id": "result_fp_check", "cycle": 1, "passed": true, "event": "result_review_recorded", "level": "info", "timestamp": "2026-04-13T08:19:29.305833Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 2668, "sys_prompt_len": 1662, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_db1b63f252b3", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:19:29.307920Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 2333, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:20:10.762210Z"}
+{"component": "recorder", "result_file": "result_003.md", "advisor_id": "result_fp_check", "cycle": 1, "passed": true, "event": "result_review_recorded", "level": "info", "timestamp": "2026-04-13T08:20:10.763640Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 2892, "sys_prompt_len": 1662, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_a1208f3ab828", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:20:10.764215Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 2941, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:21:41.086013Z"}
+{"component": "recorder", "result_file": "result_004.md", "advisor_id": "result_fp_check", "cycle": 1, "passed": true, "event": "result_review_recorded", "level": "info", "timestamp": "2026-04-13T08:21:41.086986Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 2493, "sys_prompt_len": 1662, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_48f81cf55c14", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:21:41.087536Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 2106, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:22:38.362970Z"}
+{"component": "recorder", "result_file": "result_005.md", "advisor_id": "result_fp_check", "cycle": 1, "passed": false, "event": "result_review_recorded", "level": "info", "timestamp": "2026-04-13T08:22:38.364994Z"}
+{"component": "result_review", "result_file": "result_005.md", "advisor": "result_fp_check", "cycle": 1, "event": "result_review_failed", "level": "info", "timestamp": "2026-04-13T08:22:38.365146Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 2404, "sys_prompt_len": 1662, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_f2d32d81bd63", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:22:38.365631Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 3151, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:23:42.419439Z"}
+{"component": "recorder", "result_file": "result_006.md", "advisor_id": "result_fp_check", "cycle": 1, "passed": true, "event": "result_review_recorded", "level": "info", "timestamp": "2026-04-13T08:23:42.420858Z"}
+{"component": "result_review", "cycle": 1, "total_pending": 6, "passed": 5, "failed": 1, "event": "result_review_done", "level": "info", "timestamp": "2026-04-13T08:23:42.421091Z"}
+    ✅ result_001.md
+    ✅ result_002.md
+    ✅ result_003.md
+    ✅ result_004.md
+    ❌ result_005.md — REJECT
+    ✅ result_006.md
+  ⚠️  结果评审: 5 通过, 1 不通过 → 回到 Worker
+{"component": "recorder", "cycle": 1, "outcome": "results_failed", "passed": 5, "failed": 1, "event": "review_cycle_summary", "level": "info", "timestamp": "2026-04-13T08:23:42.422400Z"}
+{"component": "recorder", "cycle": 1, "phase": "after_review", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/_meta/summary_versions/cycle_001_after_review.md", "event": "summary_snapshot", "level": "info", "timestamp": "2026-04-13T08:23:42.422699Z"}
+{"component": "atomic_engine", "cycle": 1, "failed_count": 1, "event": "result_review_failed_retry", "level": "info", "timestamp": "2026-04-13T08:23:42.422951Z"}
+
+  ◆ Cycle 2/3
+
+──────────────────────────────────────────────────
+  🔨 Worker 执行  cycle=2  [12m41s]
+──────────────────────────────────────────────────
+{"component": "worker_executor", "workflow_id": "vuln_scan", "task_id": "initial_001", "cycle": 2, "session_id": "pi_cca73df5b18c", "event": "worker_execute_start", "level": "info", "timestamp": "2026-04-13T08:23:42.423725Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 3583, "sys_prompt_len": 1544, "has_system_prompt": false, "is_continuation": true, "session_turns": 3, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:23:42.423999Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 682, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:24:53.074449Z"}
+{"component": "worker_executor", "workflow_id": "vuln_scan", "turns": 4, "finished": true, "event": "worker_execute_done", "level": "info", "timestamp": "2026-04-13T08:24:53.074773Z"}
+  ✅ Worker 完成 (turns=1) (1m10s)
+    🪞 反思 [1] reflect_completeness...
+{"component": "worker_executor", "round": 1, "prompt_id": "reflect_completeness", "workflow_id": "vuln_scan", "event": "reflection_start", "level": "info", "timestamp": "2026-04-13T08:24:53.077098Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 1259, "sys_prompt_len": 0, "has_system_prompt": false, "is_continuation": true, "session_turns": 4, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:24:53.077508Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 791, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:25:39.665269Z"}
+{"component": "worker_executor", "round": 1, "prompt_id": "reflect_completeness", "event": "reflection_done", "level": "info", "timestamp": "2026-04-13T08:25:39.665957Z"}
+      ✅ 反思 [1] 完成 (1m57s)
+{"component": "worker_executor", "workflow_id": "vuln_scan", "event": "summary_start", "level": "info", "timestamp": "2026-04-13T08:25:39.666469Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 1471, "sys_prompt_len": 0, "has_system_prompt": false, "is_continuation": true, "session_turns": 5, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:25:39.666710Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 764, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:26:04.418778Z"}
+{"component": "worker_executor", "workflow_id": "vuln_scan", "summary_path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/summary.md", "results_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/results", "event": "summary_done", "level": "info", "timestamp": "2026-04-13T08:26:04.419168Z"}
+  📋 总结完成: 5 个结果文件 (2m21s)
+{"component": "recorder", "cycle": 2, "phase": "after_summary", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/_meta/summary_versions/cycle_002_after_summary.md", "event": "summary_snapshot", "level": "info", "timestamp": "2026-04-13T08:26:04.419629Z"}
+
+──────────────────────────────────────────────────
+  🔍 全局评审  cycle=2, advisors=1  [15m03s]
+──────────────────────────────────────────────────
+{"component": "global_review", "advisor": "global_quality", "cycle": 2, "event": "global_review_start", "level": "info", "timestamp": "2026-04-13T08:26:04.420483Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 6687, "sys_prompt_len": 2052, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_ecc5b0a13d87", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:26:04.421548Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 7761, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:27:09.166707Z"}
+{"component": "recorder", "advisor_id": "global_quality", "cycle": 2, "passed": false, "event": "global_review_recorded", "level": "info", "timestamp": "2026-04-13T08:27:09.168749Z"}
+{"component": "global_review", "advisor": "global_quality", "cycle": 2, "passed": false, "event": "global_review_result", "level": "info", "timestamp": "2026-04-13T08:27:09.168870Z"}
+    ❌ global: result_004 memcpy_s vulnerability is speculative - actual parameters not visi...
+{"component": "recorder", "cycle": 2, "outcome": "global_failed", "passed": 0, "failed": 0, "event": "review_cycle_summary", "level": "info", "timestamp": "2026-04-13T08:27:09.169234Z"}
+{"component": "atomic_engine", "cycle": 2, "feedback": "result_004 memcpy_s vulnerability is speculative - actual parameters not visible in decompiled code", "event": "global_review_failed_retry", "level": "info", "timestamp": "2026-04-13T08:27:09.169282Z"}
+
+  ◆ Cycle 3/3
+
+──────────────────────────────────────────────────
+  🔨 Worker 执行  cycle=3  [16m08s]
+──────────────────────────────────────────────────
+{"component": "worker_executor", "workflow_id": "vuln_scan", "task_id": "initial_001", "cycle": 3, "session_id": "pi_cca73df5b18c", "event": "worker_execute_start", "level": "info", "timestamp": "2026-04-13T08:27:09.174116Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 3732, "sys_prompt_len": 1544, "has_system_prompt": false, "is_continuation": true, "session_turns": 6, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:27:09.174501Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 473, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:28:18.903998Z"}
+{"component": "worker_executor", "workflow_id": "vuln_scan", "turns": 7, "finished": true, "event": "worker_execute_done", "level": "info", "timestamp": "2026-04-13T08:28:18.904384Z"}
+  ✅ Worker 完成 (turns=1) (1m09s)
+    🪞 反思 [1] reflect_completeness...
+{"component": "worker_executor", "round": 1, "prompt_id": "reflect_completeness", "workflow_id": "vuln_scan", "event": "reflection_start", "level": "info", "timestamp": "2026-04-13T08:28:18.905074Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 1259, "sys_prompt_len": 0, "has_system_prompt": false, "is_continuation": true, "session_turns": 7, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:28:18.905379Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 729, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:29:01.347202Z"}
+{"component": "worker_executor", "round": 1, "prompt_id": "reflect_completeness", "event": "reflection_done", "level": "info", "timestamp": "2026-04-13T08:29:01.348048Z"}
+      ✅ 反思 [1] 完成 (1m52s)
+{"component": "worker_executor", "workflow_id": "vuln_scan", "event": "summary_start", "level": "info", "timestamp": "2026-04-13T08:29:01.348614Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 1471, "sys_prompt_len": 0, "has_system_prompt": false, "is_continuation": true, "session_turns": 8, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_cca73df5b18c", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:29:01.348896Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-worker", "output_len": 799, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:29:21.756079Z"}
+{"component": "worker_executor", "workflow_id": "vuln_scan", "summary_path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/summary.md", "results_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/results", "event": "summary_done", "level": "info", "timestamp": "2026-04-13T08:29:21.756309Z"}
+  📋 总结完成: 4 个结果文件 (2m12s)
+{"component": "recorder", "cycle": 3, "phase": "after_summary", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/_meta/summary_versions/cycle_003_after_summary.md", "event": "summary_snapshot", "level": "info", "timestamp": "2026-04-13T08:29:21.756778Z"}
+
+──────────────────────────────────────────────────
+  🔍 全局评审  cycle=3, advisors=1  [18m20s]
+──────────────────────────────────────────────────
+{"component": "global_review", "advisor": "global_quality", "cycle": 3, "event": "global_review_start", "level": "info", "timestamp": "2026-04-13T08:29:21.760882Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "provider": "litellm", "model": "litellm/MiniMax/MiniMax-M2.5", "cwd": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001", "user_prompt_len": 6529, "sys_prompt_len": 2052, "has_system_prompt": true, "is_continuation": false, "session_turns": 0, "session_dir": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/sessions/pi_4c41fd031056", "event": "pi_execute", "level": "info", "timestamp": "2026-04-13T08:29:21.764223Z"}
+{"component": "runtime.pi_agent", "agent_id": "pi-advisor", "output_len": 3882, "return_code": 0, "event": "pi_execute_done", "level": "info", "timestamp": "2026-04-13T08:30:19.789744Z"}
+{"component": "recorder", "advisor_id": "global_quality", "cycle": 3, "passed": true, "event": "global_review_recorded", "level": "info", "timestamp": "2026-04-13T08:30:19.790841Z"}
+{"component": "global_review", "advisor": "global_quality", "cycle": 3, "passed": true, "event": "global_review_result", "level": "info", "timestamp": "2026-04-13T08:30:19.790908Z"}
+    ✅ global: 通过
+
+──────────────────────────────────────────────────
+  🎯 结果评审  cycle=3, 待审=0/4  [19m18s]
+──────────────────────────────────────────────────
+{"component": "result_review", "cycle": 3, "event": "all_results_already_passed", "level": "info", "timestamp": "2026-04-13T08:30:19.793540Z"}
+    ✅ result_001.md
+    ✅ result_002.md
+    ✅ result_003.md
+    ✅ result_006.md
+  ✅ 结果评审全部通过 (4/4) (2ms)
+{"component": "recorder", "cycle": 3, "outcome": "all_passed", "passed": 4, "failed": 0, "event": "review_cycle_summary", "level": "info", "timestamp": "2026-04-13T08:30:19.795998Z"}
+{"component": "recorder", "cycle": 3, "phase": "after_review", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/_meta/summary_versions/cycle_003_after_review.md", "event": "summary_snapshot", "level": "info", "timestamp": "2026-04-13T08:30:19.796316Z"}
+{"component": "atomic_engine", "cycle": 3, "event": "all_reviews_passed", "level": "info", "timestamp": "2026-04-13T08:30:19.796397Z"}
+
+──────────────────────────────────────────────────
+  🔌 结束插件链  3 个插件  [19m18s]
+──────────────────────────────────────────────────
+{"component": "recorder", "plugin_id": "result_archiver", "phase": "end", "code": "ok_next", "event": "plugin_recorded", "level": "info", "timestamp": "2026-04-13T08:30:19.802793Z"}
+{"component": "plugin_executor", "plugin_id": "result_archiver", "phase": "end", "sequence": 1, "code": "ok_next", "duration_ms": 5, "message": "结果已归档: /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/results_archive.tar.gz", "event": "plugin_executed", "level": "info", "timestamp": "2026-04-13T08:30:19.802951Z"}
+{"component": "recorder", "plugin_id": "final_output_collector", "phase": "end", "code": "ok_next", "event": "plugin_recorded", "level": "info", "timestamp": "2026-04-13T08:30:19.803937Z"}
+{"component": "plugin_executor", "plugin_id": "final_output_collector", "phase": "end", "sequence": 2, "code": "ok_next", "duration_ms": 0, "message": "收集 5 个最终产出到 final_output/", "event": "plugin_executed", "level": "info", "timestamp": "2026-04-13T08:30:19.804018Z"}
+{"component": "recorder", "plugin_id": "next_task_generator", "phase": "end", "code": "ok_next", "event": "plugin_recorded", "level": "info", "timestamp": "2026-04-13T08:30:19.805245Z"}
+{"component": "plugin_executor", "plugin_id": "next_task_generator", "phase": "end", "sequence": 3, "code": "ok_next", "duration_ms": 1, "message": "生成 4 个下阶段任务", "event": "plugin_executed", "level": "info", "timestamp": "2026-04-13T08:30:19.805322Z"}
+    ✅ [end] : 结果已归档: /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/results_archive.tar.gz (ok_next)
+    ✅ [end] : 收集 5 个最终产出到 final_output/ (ok_next)
+    ✅ [end] : 生成 4 个下阶段任务 (ok_next)
+
+════════════════════════════════════════════════════════════
+  ✅ 工作流完成  cycles=3  next_tasks=4  total=19m18s
+════════════════════════════════════════════════════════════
+{"component": "atomic_engine", "workflow_id": "vuln_scan", "status": "completed", "cycles": 3, "next_tasks": 4, "event": "atomic_workflow_done", "level": "info", "timestamp": "2026-04-13T08:30:19.806062Z"}
+{"component": "composite_engine", "task_id": "initial_001", "next_tasks": 4, "event": "stage_task_done", "level": "info", "timestamp": "2026-04-13T08:30:19.806113Z"}
+  ✅ 阶段 stage_01_vuln_scan 完成 → 4 个输出任务 (10ms)
+{"component": "composite_engine", "stage_id": "stage_01_vuln_scan", "output_tasks": 4, "errors": 0, "event": "stage_done", "level": "info", "timestamp": "2026-04-13T08:30:19.806179Z"}
+{"component": "composite_engine", "workflow_id": "vuln_scan_pipeline", "status": "completed", "stages_completed": 1, "final_tasks": 4, "event": "composite_workflow_done", "level": "info", "timestamp": "2026-04-13T08:30:19.806333Z"}
+{"component": "main", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/output/execution_summary.json", "event": "summary_written", "level": "info", "timestamp": "2026-04-13T08:30:19.806505Z"}
+{"component": "main", "final_tasks": 4, "workspace": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace", "event": "workflow_completed_successfully", "level": "info", "timestamp": "2026-04-13T08:30:19.806548Z"}
+{"component": "agent_registry", "event": "all_agents_shutdown", "level": "info", "timestamp": "2026-04-13T08:30:19.806597Z"}
+{"component": "main", "path": "/home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace", "event": "workspace_preserved", "level": "info", "timestamp": "2026-04-13T08:30:19.806628Z"}
+
+════════════════════════════════════════════════════════════
+  ✅ 漏洞挖掘完成
+════════════════════════════════════════════════════════════
+  执行总结: /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/output/execution_summary.json
+  最终产出: /home/qinghe/workflow-framework/runs/libldm.so_LDM_RcvEventPkt_20260413_161058/workspace/pipeline_libldm.so_LDM_RcvEventPkt_20260413_161058_run_001/stage_01_vuln_scan/vuln_scan_initial_001/final_output/
+    - summary.md (综合工作报告)
+    - results/ (4 个漏洞报告)
+        result_001.md
+        result_002.md
+        result_003.md
+        result_006.md
+════════════════════════════════════════════════════════════
+
+======================================================================
+  Log ended: 2026-04-13 16:30:19
+======================================================================

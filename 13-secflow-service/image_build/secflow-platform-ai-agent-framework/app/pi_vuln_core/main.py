@@ -24,7 +24,9 @@ from app.pi_vuln_core.plugins.executor import PluginChainExecutor
 from app.pi_vuln_core.workspace.manager import WorkspaceManager
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
 from app.pi_vuln_core.engine.composite import CompositeWorkflowEngine
-from app.pi_vuln_core.utils.logger import setup_logging, get_logger
+from app.pi_vuln_core.utils.logger import (
+    setup_logging, get_logger, attach_log_file, detach_log_file,
+)
 from app.pi_vuln_core.utils.file_ops import write_json
 
 
@@ -186,13 +188,28 @@ def cli_entry() -> None:
         default=False,
         help="执行完毕后删除工作目录 (生产模式，节省磁盘)")
 
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="同时将所有 stdout/stderr 输出记录到指定日志文件")
+
     args = parser.parse_args()
+
+    # 启动日志文件记录
+    if args.log_file:
+        actual_log = attach_log_file(args.log_file)
+        print(f"  日志文件: {actual_log}")
 
     # 初始化基础日志
     setup_logging("INFO")
 
     exit_code = asyncio.run(main(args.config,
                                   clean_workspace=args.clean_workspace))
+
+    # 停止日志文件记录
+    if args.log_file:
+        detach_log_file()
+
     sys.exit(exit_code)
 
 

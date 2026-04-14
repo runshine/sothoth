@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from typing import Any, Literal, Optional
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 # ══════════════════════════════════════════
@@ -139,8 +139,6 @@ class AtomicWorkflowDef(BaseModel):
     name: str
     type: Literal["atomic"] = "atomic"
     description: str = ""
-    input_task_type: Optional[str] = None
-    output_task_type: Optional[str] = None
     working_dir_template: str
     start_plugins: list[str] = Field(default_factory=list)
     end_plugins: list[str] = Field(default_factory=list)
@@ -243,147 +241,3 @@ class FrameworkConfig(BaseModel):
     execution: ExecutionConfig
 
     model_config = {"populate_by_name": True}
-
-    @property
-    def root_workflow_id(self) -> str:
-        return self.execution.entry_workflow
-
-    def atomic_by_id(self) -> dict[str, AtomicWorkflowDef]:
-        return {item.id: item for item in self.workflows.atomic}
-
-    def composite_by_id(self) -> dict[str, CompositeWorkflowDef]:
-        return {item.id: item for item in self.workflows.composite}
-
-    def resolve_entry_atomic_workflow(self) -> AtomicWorkflowDef:
-        composite_by_id = self.composite_by_id()
-        atomic_by_id = self.atomic_by_id()
-
-        def resolve(workflow_id: str, visiting: set[str]) -> AtomicWorkflowDef:
-            if workflow_id in visiting:
-                raise ValueError(f"workflow cycle detected while resolving entry workflow: {workflow_id}")
-            composite = composite_by_id.get(workflow_id)
-            if composite is None or not composite.stages:
-                raise ValueError(f"entry composite workflow has no stages: {workflow_id}")
-            visiting.add(workflow_id)
-            try:
-                first_stage = sorted(composite.stages, key=lambda item: item.sequence)[0]
-                if first_stage.workflow_type == "atomic":
-                    atomic = atomic_by_id.get(first_stage.workflow_ref)
-                    if atomic is None:
-                        raise ValueError(f"unknown atomic workflow in entry chain: {first_stage.workflow_ref}")
-                    return atomic
-                return resolve(first_stage.workflow_ref, visiting)
-            finally:
-                visiting.remove(workflow_id)
-
-        return resolve(self.execution.entry_workflow, set())
-
-    def resolve_final_atomic_workflow(self) -> AtomicWorkflowDef:
-        composite_by_id = self.composite_by_id()
-        atomic_by_id = self.atomic_by_id()
-
-        def resolve(workflow_id: str, visiting: set[str]) -> AtomicWorkflowDef:
-            if workflow_id in visiting:
-                raise ValueError(f"workflow cycle detected while resolving final workflow: {workflow_id}")
-            composite = composite_by_id.get(workflow_id)
-            if composite is None or not composite.stages:
-                raise ValueError(f"final composite workflow has no stages: {workflow_id}")
-            visiting.add(workflow_id)
-            try:
-                last_stage = sorted(composite.stages, key=lambda item: item.sequence)[-1]
-                if last_stage.workflow_type == "atomic":
-                    atomic = atomic_by_id.get(last_stage.workflow_ref)
-                    if atomic is None:
-                        raise ValueError(f"unknown atomic workflow in final chain: {last_stage.workflow_ref}")
-                    return atomic
-                return resolve(last_stage.workflow_ref, visiting)
-            finally:
-                visiting.remove(workflow_id)
-
-        return resolve(self.execution.entry_workflow, set())
-
-    def resolve_entry_input_task_type(self) -> str:
-        atomic = self.resolve_entry_atomic_workflow()
-        return atomic.input_task_type or f"atomic:{atomic.id}:input"
-
-    def resolve_final_output_task_type(self) -> str:
-        atomic = self.resolve_final_atomic_workflow()
-        return atomic.output_task_type or f"atomic:{atomic.id}:output"
-
-    @model_validator(mode="after")
-    def validate_references(self) -> "FrameworkConfig":
-        agent_ids = {item.id for item in self.agents}
-        plugin_ids = {item.id for item in self.plugins}
-        atomic_ids = {item.id for item in self.workflows.atomic}
-        composite_ids = {item.id for item in self.workflows.composite}
-
-        if len(agent_ids) != len(self.agents):
-            raise ValueError("duplicated agent ids detected")
-        if len(plugin_ids) != len(self.plugins):
-            raise ValueError("duplicated plugin ids detected")
-        if len(atomic_ids) != len(self.workflows.atomic):
-            raise ValueError("duplicated atomic workflow ids detected")
-        if len(composite_ids) != len(self.workflows.composite):
-            raise ValueError("duplicated composite workflow ids detected")
-        if atomic_ids & composite_ids:
-            raise ValueError("workflow ids must be unique across atomic/composite definitions")
-
-        for wf in self.workflows.atomic:
-            if wf.roles.worker.agent_id not in agent_ids:
-                raise ValueError(f"atomic workflow '{wf.id}' worker agent '{wf.roles.worker.agent_id}' not found")
-            for advisor in wf.roles.advisors.global_review + wf.roles.advisors.result_review:
-                if advisor.agent_id not in agent_ids:
-                    raise ValueError(
-                        f"atomic workflow '{wf.id}' advisor '{advisor.instance_id}' agent '{advisor.agent_id}' not found"
-                    )
-            for plugin_id in wf.start_plugins + wf.end_plugins:
-                if plugin_id not in plugin_ids:
-                    raise ValueError(f"atomic workflow '{wf.id}' plugin '{plugin_id}' not found")
-
-        all_workflow_ids = atomic_ids | composite_ids
-        for wf in self.workflows.composite:
-            if not wf.stages:
-                raise ValueError(f"composite workflow '{wf.id}' must have at least one stage")
-            for stage in wf.stages:
-                if stage.workflow_ref not in all_workflow_ids:
-                    raise ValueError(
-                        f"composite workflow '{wf.id}' stage '{stage.stage_id}' references unknown workflow '{stage.workflow_ref}'"
-                    )
-                if stage.workflow_type == "atomic" and stage.workflow_ref not in atomic_ids:
-                    raise ValueError(
-                        f"composite workflow '{wf.id}' stage '{stage.stage_id}' declares atomic but references '{stage.workflow_ref}'"
-                    )
-                if stage.workflow_type == "composite" and stage.workflow_ref not in composite_ids:
-                    raise ValueError(
-                        f"composite workflow '{wf.id}' stage '{stage.stage_id}' declares composite but references '{stage.workflow_ref}'"
-                    )
-
-        if self.execution.entry_workflow_type != "composite":
-            raise ValueError("execution.entry_workflow_type must be 'composite'")
-        if self.execution.entry_workflow not in composite_ids:
-            raise ValueError("execution.entry_workflow must reference a composite workflow")
-
-        graph = {
-            wf.id: {stage.workflow_ref for stage in wf.stages if stage.workflow_type == "composite"}
-            for wf in self.workflows.composite
-        }
-        visited: set[str] = set()
-        stack: set[str] = set()
-
-        def dfs(node: str) -> None:
-            if node in stack:
-                raise ValueError(f"detected composite workflow cycle at '{node}'")
-            if node in visited:
-                return
-            visited.add(node)
-            stack.add(node)
-            for next_node in graph.get(node, set()):
-                dfs(next_node)
-            stack.remove(node)
-
-        for workflow_id in composite_ids:
-            dfs(workflow_id)
-
-        self.resolve_entry_input_task_type()
-        self.resolve_final_output_task_type()
-        return self

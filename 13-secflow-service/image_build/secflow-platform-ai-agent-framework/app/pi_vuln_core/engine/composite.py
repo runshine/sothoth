@@ -21,7 +21,6 @@ from app.pi_vuln_core.engine.atomic import AtomicWorkflowEngine
 from app.pi_vuln_core.engine.models import (
     CompositeWorkflowResult, AtomicWorkflowResult, TaskItem,
 )
-from app.pi_vuln_core.observer import ExecutionObserver, NullExecutionObserver
 from app.pi_vuln_core.plugins.executor import PluginChainExecutor
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
 from app.pi_vuln_core.workspace.manager import WorkspaceManager
@@ -71,7 +70,6 @@ class CompositeWorkflowEngine:
         plugin_executor: PluginChainExecutor,
         workspace: WorkspaceManager,
         recorder: ExecutionRecorder,
-        observer: ExecutionObserver | None = None,
     ):
         self.config = config
         self.global_cfg = config.global_config
@@ -80,27 +78,11 @@ class CompositeWorkflowEngine:
         self.workspace = workspace
         self.recorder = recorder
         self.wf_registry = WorkflowRegistry(config)
-        self.observer = observer or NullExecutionObserver()
 
     async def run(
         self,
         workflow_id: str,
         input_task_file: str,
-        execution_id: str,
-        parent_dir: Optional[str] = None,
-    ) -> CompositeWorkflowResult:
-        initial_tasks = [TaskItem(id="initial_001", file=input_task_file, source_stage="input")]
-        return await self.run_tasks(
-            workflow_id=workflow_id,
-            tasks=initial_tasks,
-            execution_id=execution_id,
-            parent_dir=parent_dir,
-        )
-
-    async def run_tasks(
-        self,
-        workflow_id: str,
-        tasks: list[TaskItem],
         execution_id: str,
         parent_dir: Optional[str] = None,
     ) -> CompositeWorkflowResult:
@@ -128,29 +110,19 @@ class CompositeWorkflowEngine:
                      work_dir=work_dir)
 
         # 初始任务 = [input_task_file]
-        current_tasks = list(tasks)
+        current_tasks = [TaskItem(
+            id="initial_001",
+            file=input_task_file,
+            source_stage="input",
+        )]
 
         stages = sorted(wf_def.stages, key=lambda s: s.sequence)
         completed_stages: list[str] = []
         total_tasks = 0
 
         for stage in stages:
-            await self.observer.check_cancel(
-                "stage:before",
-                workflow_id=workflow_id,
-                stage_id=stage.stage_id,
-                execution_id=execution_id,
-            )
             stage_dir = self.workspace.create_stage_dir(
                 work_dir, stage.stage_id)
-            await self.observer.on_stage_started(
-                workflow_id=workflow_id,
-                stage_id=stage.stage_id,
-                stage_name=stage.name,
-                execution_id=execution_id,
-                task_count=len(current_tasks),
-                stage_dir=stage_dir,
-            )
 
             vlog.stage_start(stage.stage_id, len(current_tasks))
             logger.info("stage_start",
@@ -196,13 +168,6 @@ class CompositeWorkflowEngine:
                     stage, stage_errors, work_dir, execution_id)
 
                 if should_abort:
-                    await self.observer.on_stage_failed(
-                        workflow_id=workflow_id,
-                        stage_id=stage.stage_id,
-                        execution_id=execution_id,
-                        error_summary=error_summary,
-                        stage_dir=stage_dir,
-                    )
                     return CompositeWorkflowResult(
                         status="failed",
                         error=f"Stage {stage.stage_id} 失败, 策略={stage.on_error}",
@@ -219,14 +184,6 @@ class CompositeWorkflowEngine:
                          stage_id=stage.stage_id,
                          output_tasks=len(next_tasks),
                          errors=len(stage_errors))
-            await self.observer.on_stage_completed(
-                workflow_id=workflow_id,
-                stage_id=stage.stage_id,
-                execution_id=execution_id,
-                output_task_count=len(next_tasks),
-                error_count=len(stage_errors),
-                stage_dir=stage_dir,
-            )
 
             # 阶段间任务传递
             if not next_tasks:
@@ -276,7 +233,6 @@ class CompositeWorkflowEngine:
                 workspace=self.workspace,
                 recorder=self.recorder,
                 global_config=self.global_cfg,
-                observer=self.observer,
             )
             return await engine.run(
                 task_file=task_item.file,
