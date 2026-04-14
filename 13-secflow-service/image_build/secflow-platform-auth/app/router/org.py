@@ -1017,7 +1017,13 @@ def download_department_member_import_template(
         content=build_department_member_import_template_workbook(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": f'attachment; filename="{DEPARTMENT_MEMBER_IMPORT_TEMPLATE_FILENAME}"'
+            "Content-Disposition": (
+                f'attachment; filename="{DEPARTMENT_MEMBER_IMPORT_TEMPLATE_FILENAME}"; '
+                f"filename*=UTF-8''{DEPARTMENT_MEMBER_IMPORT_TEMPLATE_FILENAME}"
+            ),
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
         }
     )
 

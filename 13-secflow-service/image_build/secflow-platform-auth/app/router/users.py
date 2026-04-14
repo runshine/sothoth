@@ -683,7 +683,13 @@ def download_user_import_template(
         content=workbook_bytes,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": f'attachment; filename="{USER_IMPORT_TEMPLATE_FILENAME}"'
+            "Content-Disposition": (
+                f'attachment; filename="{USER_IMPORT_TEMPLATE_FILENAME}"; '
+                f"filename*=UTF-8''{USER_IMPORT_TEMPLATE_FILENAME}"
+            ),
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
         }
     )
 
