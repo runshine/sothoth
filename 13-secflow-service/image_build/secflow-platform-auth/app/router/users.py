@@ -557,9 +557,18 @@ def _build_user_responses(db: Session, users: List[User]) -> List[UserResponse]:
     ]
 
 
+def _user_query_with_roles(db: Session):
+    return db.query(User).options(selectinload(User.roles))
+
+
+def _get_user_with_roles(db: Session, user_id: int) -> Optional[User]:
+    return _user_query_with_roles(db).filter(User.id == user_id).first()
+
+
 def _validate_role_ids_exist(db: Session, role_ids: List[int]) -> List[Role]:
-    roles = db.query(Role).filter(Role.id.in_(role_ids)).all()
-    if len(roles) != len(role_ids):
+    unique_role_ids = list(dict.fromkeys(role_ids))
+    roles = db.query(Role).filter(Role.id.in_(unique_role_ids)).all()
+    if len(roles) != len(unique_role_ids):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="部分角色不存在"
@@ -574,9 +583,7 @@ def list_users(
 ):
     """获取用户列表。用户管理范围内的管理员可访问。"""
     ensure_platform_roles_seeded(db)
-    users = db.query(User).options(
-        selectinload(User.roles)
-    ).order_by(User.id.asc()).all()
+    users = _user_query_with_roles(db).order_by(User.id.asc()).all()
     return _build_user_responses(db, users)
 
 
@@ -587,7 +594,7 @@ def get_user(
     current_user: User = Depends(get_current_super_admin)
 ):
     """获取单个用户。仅超级管理员可访问。"""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -782,7 +789,7 @@ def update_user(
     current_user: User = Depends(get_current_super_admin)
 ):
     """更新用户基础信息。仅超级管理员可访问。"""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -828,7 +835,7 @@ def delete_user(
             detail="不能删除当前登录的超级管理员"
         )
 
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -848,7 +855,7 @@ def get_user_roles(
     current_user: User = Depends(get_current_super_admin)
 ):
     """获取用户的原始角色列表。仅超级管理员可访问。"""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -870,7 +877,7 @@ def bind_user_role(
     current_user: User = Depends(get_current_super_admin)
 ):
     """覆盖用户角色。保留接口兼容性，仅超级管理员可访问。"""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -909,7 +916,7 @@ def add_user_role(
     current_user: User = Depends(get_current_super_admin)
 ):
     """增量添加角色。仅超级管理员可访问。"""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -951,7 +958,7 @@ def remove_user_role(
     current_user: User = Depends(get_current_super_admin)
 ):
     """移除角色。至少保留一个平台角色。"""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -978,7 +985,7 @@ def get_user_platform_role(
     current_user: User = Depends(get_current_super_admin)
 ):
     """获取用户的平台角色。"""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1000,7 +1007,7 @@ def update_user_platform_role(
     current_user: User = Depends(get_current_super_admin)
 ):
     """仅允许超级管理员在普通管理员与普通用户之间切换。"""
-    user = db.query(User).filter(User.id == user_id).first()
+    user = _get_user_with_roles(db, user_id)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

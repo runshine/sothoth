@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
 from app.dependencies import get_current_super_admin
@@ -15,6 +15,10 @@ from app.schema import Message, RoleCreate, RoleResponse, RoleUpdate, RoleWithUs
 router = APIRouter(tags=["角色管理"])
 
 
+def _role_query_with_users(db: Session):
+    return db.query(Role).options(selectinload(Role.users))
+
+
 @router.get("/role_list", response_model=List[RoleResponse])
 def list_role(
     db: Session = Depends(get_db),
@@ -22,7 +26,7 @@ def list_role(
 ):
     """获取角色列表"""
     ensure_platform_roles_seeded(db)
-    roles = db.query(Role).all()
+    roles = db.query(Role).order_by(Role.id.asc()).all()
     return roles
 
 
@@ -33,7 +37,7 @@ def get_role(
     current_user: User = Depends(get_current_super_admin)
 ):
     """获取单个角色"""
-    role = db.query(Role).filter(Role.id == role_id).first()
+    role = _role_query_with_users(db).filter(Role.id == role_id).first()
     if not role:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
