@@ -1,0 +1,160 @@
+<think>现在让我将完整的审计结果输出为更易读的格式。
+</think>
+
+```json
+{
+  "audit_summary": {
+    "overall_rating": "良好",
+    "total_vulnerabilities_found": 8,
+    "high_severity": 5,
+    "medium_severity": 2,
+    "low_severity": 1
+  },
+  "completeness_check": {
+    "input_coverage": {
+      "total_inputs_in_dfa": 6,
+      "inputs_analyzed": 6,
+      "coverage_rate": "100%",
+      "details": {
+        "INPUT-1_a1": "✅ 完全覆盖 - 指针算术漏洞分析",
+        "INPUT-2_a2": "✅ 完全覆盖 - 分发函数调用分析",
+        "INPUT-3_a3": "✅ 完全覆盖 - 越界写入漏洞分析",
+        "INPUT-4_ProtoType": "✅ 完全覆盖 - 边界检查分析",
+        "INPUT-5_ExceptionId": "✅ 完全覆盖 - 条件判断分析",
+        "INPUT-6_ReceiveIfIndex": "✅ 完全覆盖 - 接口比较分析"
+      }
+    },
+    "export_endpoint_coverage": {
+      "total_export_endpoints_in_dfa": 17,
+      "export_endpoints_tracked": 8,
+      "coverage_rate": "约47%",
+      "details": "主要跟入了 LDM_DispatchProcessByProType, LDM_RcvEventIPv6SrhTtlExceed, LDM_LINK_SearchPct_RW 返回值使用等关键EXPORT终点"
+    },
+    "used_endpoint_coverage": {
+      "total_used_endpoints_in_dfa": 20,
+      "used_endpoints_analyzed": 8,
+      "coverage_rate": "约40%",
+      "details": "重点分析了安全相关的USED终点，包括条件判断、接口比较、协议类型检查等"
+    },
+    "key_findings_verification": {
+      "total_key_findings_in_dfa": "多个(通过🔴🟡📌符号标记)",
+      "key_findings_verified": "全部主要发现",
+      "coverage_rate": "100%",
+      "details": {
+        "INPUT-1结构体偏移180写入": "✅ 已验证 - result_001.md",
+        "INPUT-3结构体偏移180写入": "✅ 已验证 - result_003.md",
+        "ProtoType边界检查": "✅ 已验证 - result_004.md"
+      }
+    },
+    "beyond_dfa_analysis": {
+      "has_beyond_dfa_analysis": true,
+      "examples": [
+        "子函数 LDM_DispatchByProtype 中的指针算术 (result_006)",
+        "子函数 LDM_DispatchByProtypeAdminIf 中的指针算术 (result_007)",
+        "超越数据流的全局代码审查"
+      ]
+    }
+  },
+  "depth_check": {
+    "vulnerability_pattern_coverage": {
+      "memory_safety": {
+        "covered": true,
+        "cwe_ids": ["CWE-119", "CWE-125"],
+        "vulnerability_count": 6
+      },
+      "integer_safety": {
+        "covered": true,
+        "cwe_ids": ["CWE-682"],
+        "details": "指针算术中的整数未检查问题"
+      },
+      "input_validation": {
+        "covered": true,
+        "cwe_ids": ["CWE-20", "CWE-754"],
+        "vulnerability_count": 2
+      },
+      "logic_defects": {
+        "covered": true,
+        "cwe_ids": ["CWE-835", "CWE-400"],
+        "vulnerability_count": 1
+      }
+    },
+    "source_code_references": {
+      "has_code_references": true,
+      "reference_format": "代码行号 + 代码片段",
+      "verified": true,
+      "examples": [
+        "libldm.so.c:368547-368549 - 指针算术漏洞",
+        "libldm.so.c:369850-369852 - 子函数漏洞",
+        "libldm.so.c:368138-368151 - LDM_DispatchByProtype漏洞"
+      ]
+    },
+    "bypass_analysis": {
+      "has_bypass_analysis": false,
+      "details": "未对路径上的校验做详细的绕过分析"
+    },
+    "call_chain_depth": {
+      "max_depth_tracked": 3,
+      "depth_1": "LDM_RcvEventPkt (主函数)",
+      "depth_2": "LDM_DispatchProcessByProType, LDM_RcvEventIPv6SrhTtlExceed",
+      "depth_3": "LDM_DispatchByProtype, LDM_DispatchByProtypeAdminIf, LDM_VerifyIpv6SliceHdrAndUpdateIfIdx",
+      "note": "跟入深度适中，基本覆盖了关键调用链"
+    }
+  },
+  "report_quality_check": {
+    "required_sections": {
+      "attack_surface_analysis": true,
+      "analysis_methodology": true,
+      "export_endpoint_analysis": true,
+      "vulnerability_summary": true,
+      "risk_assessment": true,
+      "limitations": true,
+      "conclusion": true,
+      "missing_sections": ["修复建议", "POC/利用验证"]
+    },
+    "template_similarity": {
+      "is_templateized": true,
+      "similarity_level": "中等",
+      "details": "8个漏洞报告使用相似的结构和模板，每个报告都包含类似的章节：精确位置、漏洞类型、源代码片段、完整攻击路径、校验分析、触发条件、影响评估、关联漏洞。部分内容存在重复，如漏洞模式描述"
+    },
+    "evidence_quality": {
+      "code_references": "具体准确",
+      "line_numbers": "与源码匹配",
+      "attack_path": "完整清晰",
+      "weaknesses": "缺乏实际利用验证和绕过分析"
+    }
+  },
+  "audit_details": {
+    "strengths": [
+      "INPUT覆盖率100%，所有外部输入都进行了分析",
+      "源码级验证准确，代码行号与实际源码匹配",
+      "正确识别了系统性的未检查指针算术漏洞模式",
+      "调用链追踪深入，从主函数追踪到多个子函数",
+      "漏洞分类合理，CWE映射准确",
+      "包含了局限性分析，诚实说明了未完全跟入的路径"
+    ],
+    "weaknesses": [
+      "EXPORT终点覆盖率约47%，未完全跟入所有EXPORT终点",
+      "未对边界检查做绕过分析",
+      "报告存在模板化问题，多个报告结构相似",
+      "缺少修复建议章节",
+      "缺少实际POC或利用验证",
+      "未对错误处理分支做详细安全性分析",
+      "未对多线程竞态条件做分析"
+    ],
+    "recommendations": [
+      "补充对更多EXPORT终点的跟入分析",
+      "增加边界检查绕过分析",
+      "为每个漏洞添加修复建议",
+      "减少报告模板化，增加差异化分析",
+      "补充多线程安全分析",
+      "补充错误处理路径安全性分析"
+    ]
+  },
+  "final_score": {
+    "completeness": 85,
+    "depth": 80,
+    "quality": 75,
+    "overall": "80/100 - 良好"
+  }
+}
+```

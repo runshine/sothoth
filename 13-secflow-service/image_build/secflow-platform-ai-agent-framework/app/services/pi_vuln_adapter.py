@@ -194,9 +194,11 @@ class DbExecutionRecorder(ExecutionRecorder):
             payload_json={
                 "advisor_id": kwargs["advisor_id"],
                 "passed": kwargs["passed"],
+                "verdict": kwargs.get("verdict"),
                 "agent_id": kwargs.get("agent_id"),
                 "role_name": kwargs.get("role_name"),
                 "feedback": kwargs["content"],
+                "feedback_detail": kwargs.get("detail_feedback"),
             },
         )
 
@@ -212,9 +214,11 @@ class DbExecutionRecorder(ExecutionRecorder):
                 "advisor_id": kwargs["advisor_id"],
                 "result_file": kwargs["result_file"],
                 "passed": kwargs["passed"],
+                "verdict": kwargs.get("verdict"),
                 "agent_id": kwargs.get("agent_id"),
                 "role_name": kwargs.get("role_name"),
                 "feedback": kwargs["content"],
+                "feedback_detail": kwargs.get("detail_feedback"),
             },
         )
 

@@ -156,6 +156,14 @@ class AtomicWorkflowEngine:
                 work_dir, "", AtomicWorkflowState.SUMMARY.value)
             summary_path, results_dir = \
                 await self.worker_exec.execute_summary(self.wf, ctx)
+            # 如果 Worker 未生成 summary.md，创建占位文件，让全局评审正常进行（会判不通过并打回）
+            if not os.path.isfile(summary_path):
+                logger.warning("summary_not_found",
+                               summary_path=summary_path,
+                               msg="Worker 未生成 summary.md，创建占位文件")
+                os.makedirs(os.path.dirname(summary_path), exist_ok=True)
+                with open(summary_path, "w", encoding="utf-8") as f:
+                    f.write("# Summary\n\nWorker 未在本轮生成分析报告。\n")
             ctx.summary_file = summary_path
             ctx.results_dir = results_dir
             result_files = list_dir_files(results_dir, suffix=".md")
@@ -210,6 +218,7 @@ class AtomicWorkflowEngine:
                     work_dir=work_dir, cycle=cycle,
                     review_state=review_state,
                     parallel=self.global_cfg.parallel_result_review,
+                    concurrency_limit=self.global_cfg.parallel_result_review_limit,
                     advisor_sessions=ctx.advisor_sessions)
 
             # 打印每个结果的评审情况

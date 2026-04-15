@@ -63,6 +63,7 @@ python3 run_vuln_scan.py \
   --max-cycles 5 \                       # 评审循环次数（默认 3）
   --worker-timeout 1800 \                # Worker 超时/秒（默认 1800）
   --advisor-timeout 1800 \               # Advisor 超时/秒（默认 1800）
+  --result-review-concurrency 3 \        # 结果评审并发上限（默认 3）
   --clean                                # 执行后清理工作目录
 ```
 
@@ -93,6 +94,8 @@ python3 run_vuln_scan.py \
 | `timeout_seconds` | `agents[*].runtime_config.timeout_seconds` | 超时时间 |
 | `thinking` | `agents[*].runtime_config.sdk_specific.thinking` | 思考深度 |
 | `max_review_cycles` | `global` 或 `workflows.atomic[*].engine` | 评审循环次数 |
+| `parallel_result_review` | `global.parallel_result_review` | 是否开启结果评审并行 |
+| `parallel_result_review_limit` | `global.parallel_result_review_limit` | 结果评审并发上限（默认 3） |
 | `system_prompt_file` 等 | `workflows.atomic[*].roles.worker.prompts` | 自定义 Prompt 文件 |
 | `plugins` / `end_plugins` | 各处 | 插件链配置 |
 
@@ -259,6 +262,7 @@ python3 run_vuln_scan.py --data-flow <path> --source-dir <path> [选项]
 | `--max-cycles` | `3` | 最大评审循环次数 (未指定 `-c` 时生效) |
 | `--worker-timeout` | `1800` | Worker 超时秒数 (未指定 `-c` 时生效) |
 | `--advisor-timeout` | `1800` | Advisor 超时秒数 (未指定 `-c` 时生效) |
+| `--result-review-concurrency` | `3` | 结果评审并发上限 (未指定 `-c` 时生效) |
 | `--clean` | | 执行后删除工作目录 |
 
 启动器自动完成：生成 task.md → 生成 config.json → 启用日志文件 → 调用框架 → 展示结果路径。
@@ -398,9 +402,20 @@ vuln_scan_initial_001/
 │
 │  ════ 调试现场 ════
 │
-├── sessions/                       Agent 原始会话日志
-│   ├── pi_{session_id}/               每个 session 一个子目录
-│   │   └── *.jsonl                       完整对话记录 (prompt/response/tool_call)
+├── sessions/                       Agent 会话日志 + 统一调用 trace
+│   ├── {session_id}/                  每个 session 一个子目录（如 pi_*/cc_*/codex_*/oc_*）
+│   │   ├── *.jsonl                       运行时原生会话记录（仅部分 runtime 如 pi 提供）
+│   │   └── calls/                       统一的每次 send_message / execute 落盘现场
+│   │       └── 001_xxxxxxxx/
+│   │           ├── command.txt             实际执行的完整命令行
+│   │           ├── request.json            调用元数据 (runtime/model/provider/tools/路径/turn)
+│   │           ├── system_prompt.md        本次发送的 system prompt（若有）
+│   │           ├── user_prompt.md          本次发送的 user prompt
+│   │           ├── effective_prompt.md     实际传给 CLI 的合成 prompt（部分 runtime 如 codex/opencode）
+│   │           ├── stdout.txt              CLI 标准输出
+│   │           ├── stderr.txt              CLI 标准错误
+│   │           ├── response.txt            框架收到/解析后的响应文本
+│   │           └── response.json           return_code / duration / error 等结果
 │   └── ...
 │
 └── plugins/                        插件执行记录 (预留)
@@ -418,7 +433,8 @@ vuln_scan_initial_001/
 | 看某个漏洞为什么被驳回 | `reviews/results/result_NNN/cycle_NNN/result_fp_check.json` |
 | 看全局评审意见 | `reviews/global/cycle_NNN/global_quality.json` |
 | 看 Worker 怎么修改报告 | `_meta/summary_versions/cycle_NNN_*.md` (对比前后) |
-| 看 Agent 原始对话 | `sessions/pi_*/...jsonl` |
+| 看 Agent 原始对话 | `sessions/*/...jsonl`（若该 runtime 提供原生日志） |
+| 看某次调用的完整命令行与 prompt | `sessions/*/calls/*/command.txt` + `user_prompt.md` + `system_prompt.md` |
 | 看完整运行日志 | `runs/{run_name}/run.log` |
 
 ### reviews/ 目录说明
@@ -427,8 +443,10 @@ vuln_scan_initial_001/
 
 每个评审记录 JSON 包含：
 - `passed`：是否通过
-- `feedback`：完整评审意见
-- `raw_response`：评审员原始响应
+- `verdict`：框架归一化后的稳定判定标签（如 `PASS` / `REJECT` / `FALSE_POSITIVE` / `INSUFFICIENT_INFO`）
+- `feedback`：稳定的简明反馈摘要（用于日志/UI 展示，不再直接写入整段原文）
+- `feedback_detail`：详细评审理由（优先取结构化字段；供 Worker 二轮修正使用）
+- `raw_response`：评审员原始响应（未经解析、原样保存）
 - `scores`：各维度评分
 - `confidence`：置信度
 
@@ -534,7 +552,7 @@ class MyRuntime(BaseAgentRuntime):
 ### 结果评审
 
 - **评审对象**：`results/` 下每个 `.md` 文件
-- **执行方式**：结果间并行（可配置）× 结果内串行
+- **执行方式**：结果间并行（默认模板已开启，默认并发上限 3，可配置）× 结果内串行
 - **默认**：`re_review_on_cycle: false`（已通过不重审）
 
 ### 评审响应解析
@@ -543,6 +561,18 @@ class MyRuntime(BaseAgentRuntime):
 
 ```json
 {"passed": true, "feedback": "...", "scores": {...}, "confidence": 0.9}
+```
+
+并统一归一化为稳定字段：
+
+```json
+{
+  "passed": true,
+  "verdict": "PASS",
+  "feedback": "PASS（通过） - 简明摘要",
+  "feedback_detail": "详细评审理由",
+  "raw_response": "评审员原始输出"
+}
 ```
 
 也支持：

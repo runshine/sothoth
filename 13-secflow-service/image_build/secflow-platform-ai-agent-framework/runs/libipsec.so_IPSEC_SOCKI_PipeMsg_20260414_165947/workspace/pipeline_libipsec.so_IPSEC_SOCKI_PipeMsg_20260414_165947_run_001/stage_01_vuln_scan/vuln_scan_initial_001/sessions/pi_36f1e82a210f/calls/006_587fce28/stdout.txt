@@ -1,0 +1,75 @@
+<think>All 7 result files are in place. Let me provide a final summary of the complete output.
+</think>
+
+## 最终输出完整
+
+所有漏洞分析结果已整理完毕，通过全部验证。
+
+---
+
+### 📋 输出文件清单
+
+#### 综合报告: `summary.md`
+- ✅ 包含全部 8 个章节（1-8）
+- ✅ 攻击面分析
+- ✅ 分析覆盖度表
+- ✅ EXPORT 终点跟入汇总
+- ✅ 关键发现验证
+- ✅ 漏洞汇总表
+- ✅ 风险评估与修复建议
+- ✅ 局限性与未覆盖区域
+
+#### 漏洞报告: `results/`
+
+| 文件 | 类型 | CWE | 严重性 | 置信度 |
+|------|------|-----|--------|--------|
+| result_001.md | 漏洞 | CWE-346 | Medium | 中 |
+| result_002.md | 漏洞 | CWE-400 | Low | 高 |
+| result_003.md | 安全分析 | N/A | - | - |
+| result_005.md | 漏洞 | CWE-200 | Low | 中 |
+| result_006.md | 漏洞 | CWE-681 | Low | 中 |
+| result_007.md | 安全分析 | N/A | - | - |
+| result_008.md | 安全分析 | N/A | - | - |
+
+---
+
+### ✅ 自检验证清单
+
+| 检查项 | 状态 |
+|--------|------|
+| summary.md 包含全部 7+ 章节 | ✅ |
+| 数据流的每个 EXPORT 终点在覆盖度表中有记录 | ✅ |
+| 数据流的 ★ 关键发现全部有验证结论 | ✅ |
+| 每个漏洞报告有 ≥5 行代码片段 | ✅ |
+| 每个漏洞有从 INPUT 到危险操作的完整路径 | ✅ |
+| results/ 命名严格符合 result_NNN.md | ✅ |
+| summary.md 汇总表与 results/ 文件一一对应 | ✅ |
+
+---
+
+### 🎯 最终风险评估
+
+**整体安全风险: Low to Medium**
+
+| 风险等级 | 数量 | 说明 |
+|---------|------|------|
+| Medium | 1 | 管道ID验证机制绕过风险 (001) |
+| Low | 3 | DoS、信息泄露、类型混淆 (002, 005, 006) |
+| 安全分析 | 3 | 确认安全机制有效 (003, 007, 008) |
+
+---
+
+### 📁 文件路径
+
+```
+/home/qinghe/sothoth-v2.1/13-secflow-service/image_build/secflow-platform-ai-agent-framework/runs/libipsec.so_IPSEC_SOCKI_PipeMsg_20260414_165947/workspace/pipeline_libipsec.so_IPSEC_SOCKI_PipeMsg_20260414_165947_run_001/stage_01_vuln_scan/vuln_scan_initial_001/
+├── summary.md          # 综合报告 (8章节)
+└── results/
+    ├── result_001.md   # Medium - 管道ID验证绕过
+    ├── result_002.md   # Low - AVL3遍历DoS
+    ├── result_003.md   # 安全 - INPUT-3校验验证
+    ├── result_005.md   # Low - 调试日志信息泄露
+    ├── result_006.md   # Low - 整数类型混淆
+    ├── result_007.md   # 安全 - VRP_Assert分析
+    └── result_008.md   # 安全 - IPSEC_LIBI分析
+```

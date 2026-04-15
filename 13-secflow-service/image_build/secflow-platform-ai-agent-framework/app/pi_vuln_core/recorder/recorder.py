@@ -90,6 +90,8 @@ class ExecutionRecorder:
         scores: Optional[dict] = None,
         confidence: Optional[float] = None,
         raw_content: str = "",
+        verdict: str = "",
+        detail_feedback: str = "",
     ) -> None:
         """记录全局评审结果"""
         record = {
@@ -99,9 +101,11 @@ class ExecutionRecorder:
             "cycle": cycle,
             "timestamp": _now_iso(),
             "passed": passed,
+            "verdict": verdict,
             "scores": scores or {},
             "confidence": confidence,
             "feedback": content,
+            "feedback_detail": detail_feedback,
             "raw_response": raw_content,
         }
 
@@ -125,6 +129,8 @@ class ExecutionRecorder:
         scores: Optional[dict] = None,
         confidence: Optional[float] = None,
         raw_content: str = "",
+        verdict: str = "",
+        detail_feedback: str = "",
     ) -> None:
         """记录结果评审（以每个结果为对象）(R6h)"""
         result_stem = Path(result_file).stem  # "result_001"
@@ -136,9 +142,11 @@ class ExecutionRecorder:
             "cycle": cycle,
             "timestamp": _now_iso(),
             "passed": passed,
+            "verdict": verdict,
             "scores": scores or {},
             "confidence": confidence,
             "feedback": content,
+            "feedback_detail": detail_feedback,
             "raw_response": raw_content,
         }
 

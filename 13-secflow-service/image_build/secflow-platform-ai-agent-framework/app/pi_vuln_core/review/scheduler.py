@@ -68,6 +68,7 @@ class ReviewScheduler:
         cycle: int,
         review_state: ReviewState,
         parallel: bool = True,
+        concurrency_limit: int = 3,
         advisor_sessions: dict[str, str] | None = None,
     ) -> tuple[bool, list[FailedResultItem]]:
         """执行结果评审"""
@@ -86,5 +87,6 @@ class ReviewScheduler:
             cycle=cycle,
             review_state=review_state,
             parallel=parallel,
+            concurrency_limit=concurrency_limit,
             advisor_sessions=advisor_sessions,
         )

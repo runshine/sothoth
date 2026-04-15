@@ -161,10 +161,11 @@ def generate_config(
     run_name: str,
     model: str = "claude-sonnet-4-20250514",
     provider: str = "anthropic",
-    max_cycles: int = 3,
+    max_cycles: int = 10,
     worker_timeout: int = 1800,
     advisor_timeout: int = 1800,
     thinking: str = "high",
+    result_review_concurrency: int = 3,
 ) -> dict:
     """生成完整的配置字典"""
 
@@ -178,7 +179,8 @@ def generate_config(
             "max_workflow_retry": 1,
             "max_review_cycles": max_cycles,
             "default_context_reset": True,
-            "parallel_result_review": False,
+            "parallel_result_review": True,
+            "parallel_result_review_limit": result_review_concurrency,
             "env_vars": {},
         },
         "agents": [
@@ -216,14 +218,14 @@ def generate_config(
             {
                 "id": "env_setup",
                 "name": "环境变量设置",
-                "module_path": "src.plugins.builtin.env_setup",
+                "module_path": "app.pi_vuln_core.plugins.builtin.env_setup",
                 "class_name": "EnvSetupPlugin",
                 "config": {},
             },
             {
                 "id": "workspace_init",
                 "name": "工作目录初始化",
-                "module_path": "src.plugins.builtin.workspace_init",
+                "module_path": "app.pi_vuln_core.plugins.builtin.workspace_init",
                 "class_name": "WorkspaceInitPlugin",
                 "config": {
                     "create_subdirs": [
@@ -234,14 +236,14 @@ def generate_config(
             {
                 "id": "task_validator",
                 "name": "输入任务校验",
-                "module_path": "src.plugins.builtin.task_validator",
+                "module_path": "app.pi_vuln_core.plugins.builtin.task_validator",
                 "class_name": "TaskValidatorPlugin",
                 "config": {},
             },
             {
                 "id": "result_archiver",
                 "name": "结果归档",
-                "module_path": "src.plugins.builtin.result_archiver",
+                "module_path": "app.pi_vuln_core.plugins.builtin.result_archiver",
                 "class_name": "ResultArchiverPlugin",
                 "config": {"archive_format": "tar.gz"},
             },
@@ -249,14 +251,14 @@ def generate_config(
                 "id": "final_output_collector",
                 "name": "最终产出收集",
                 "module_path":
-                    "src.plugins.builtin.final_output_collector",
+                    "app.pi_vuln_core.plugins.builtin.final_output_collector",
                 "class_name": "FinalOutputCollectorPlugin",
                 "config": {"output_subdir": "final_output"},
             },
             {
                 "id": "next_task_generator",
                 "name": "下阶段任务生成器",
-                "module_path": "src.plugins.builtin.next_task_generator",
+                "module_path": "app.pi_vuln_core.plugins.builtin.next_task_generator",
                 "class_name": "NextTaskGeneratorPlugin",
                 "config": {"output_subdir": "output"},
             },
@@ -524,7 +526,7 @@ def main():
         choices=["off", "low", "medium", "high"],
         help="思考深度 (默认: high)")
     parser.add_argument(
-        "--max-cycles", type=int, default=3,
+        "--max-cycles", type=int, default=10,
         help="最大评审循环次数 (默认: 3)")
     parser.add_argument(
         "--worker-timeout", type=int, default=1800,
@@ -532,6 +534,9 @@ def main():
     parser.add_argument(
         "--advisor-timeout", type=int, default=1800,
         help="Advisor 超时时间/秒 (默认: 1800)")
+    parser.add_argument(
+        "--result-review-concurrency", type=int, default=3,
+        help="结果评审并发上限 (默认: 3，仅未指定 -c 时生效)")
     parser.add_argument(
         "--clean", action="store_true",
         help="执行完毕后删除工作目录")
@@ -553,6 +558,10 @@ def main():
 
     if not os.path.isdir(args.source_dir):
         print(f"❌ 源码目录不存在: {args.source_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.result_review_concurrency < 1:
+        print("❌ --result-review-concurrency 必须 >= 1", file=sys.stderr)
         sys.exit(1)
 
     # ═══ 生成运行名称 ═══
@@ -597,6 +606,7 @@ def main():
             worker_timeout=args.worker_timeout,
             advisor_timeout=args.advisor_timeout,
             thinking=args.thinking,
+            result_review_concurrency=args.result_review_concurrency,
         )
         config_source = "自动生成"
 

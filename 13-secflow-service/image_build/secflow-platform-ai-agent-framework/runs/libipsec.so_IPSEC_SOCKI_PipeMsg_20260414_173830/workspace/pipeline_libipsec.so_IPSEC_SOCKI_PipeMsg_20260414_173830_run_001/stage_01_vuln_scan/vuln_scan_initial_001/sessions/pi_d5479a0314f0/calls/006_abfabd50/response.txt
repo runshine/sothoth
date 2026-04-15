@@ -1,0 +1,34 @@
+All 7 checks pass. The deliverables are complete. Here is the final status:
+
+---
+
+## ✅ Self-Check Results
+
+| # | Check Item | Status |
+|---|-----------|--------|
+| 1 | summary.md contains all 7 sections (1.1–1.7) | ✅ All 7 present |
+| 2 | Every DFA EXPORT endpoint in coverage table | ✅ 15 EXPORT references across tables |
+| 3 | All ★ key findings have verification conclusions | ✅ 7 findings verified in §5 |
+| 4 | Each vulnerability report has ≥5 line code snippets | ✅ (31, 45, 26, 39 lines respectively) |
+| 5 | Each vulnerability has complete INPUT→danger path | ✅ All 4 have entry+path+trigger |
+| 6 | results/ naming follows result_NNN.md | ✅ result_007/009/012/020 |
+| 7 | Summary table ↔ results/ 1:1 correspondence | ✅ All 4 files referenced in summary |
+
+## Deliverables Summary
+
+**`summary.md`** — 171 lines, 7 sections:
+- §1 Attack surface (function role, 5 INPUTs + v95 MBUF)
+- §2 Coverage (16-row path table)
+- §3 EXPORT trace (13 endpoints, 10 fully traced)
+- §4 Vulnerability table (4 findings)
+- §5 Key finding verification (7 ★ items + 4 CLEANED items)
+- §6 Risk assessment + repair priorities (P1/P2/P3)
+- §7 Limitations (5 untraced EXPORT groups, future directions)
+
+**`results/`** — 4 vulnerability reports:
+| File | Function | CWE | Severity | Confidence | Finding |
+|------|----------|-----|----------|------------|---------|
+| result_007.md | IPSEC_SOCK_ProcPipeData | CWE-401 | Medium | High | MBUF leak: RecvMbufEx unexpected return |
+| result_009.md | IPSEC_SOCK_SendToSocket | CWE-476 | Medium | High | IPv6 protocol family mismatch |
+| result_012.md | IPSEC_SOCK_SendToSocket | CWE-617 | Low | Medium | NULL deref after VRP_Assert |
+| result_020.md | SendToPP6…+ProcPipeData | CWE-401 | Medium | High | MBUF leak: ControlInfo(0) NULL path |

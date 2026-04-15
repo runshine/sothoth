@@ -1,0 +1,11 @@
+{
+  "status": "completed",
+  "working_dir": "/home/qinghe/sothoth-v2.1/13-secflow-service/image_build/secflow-platform-ai-agent-framework/runs/libipsec.so_IPSEC_SOCKI_PipeMsg_20260414_165947/workspace/pipeline_libipsec.so_IPSEC_SOCKI_PipeMsg_20260414_165947_run_001",
+  "error": null,
+  "completed_stages": [
+    "stage_01_vuln_scan"
+  ],
+  "total_stages": 1,
+  "total_tasks_processed": 1,
+  "final_task_count": 7
+}

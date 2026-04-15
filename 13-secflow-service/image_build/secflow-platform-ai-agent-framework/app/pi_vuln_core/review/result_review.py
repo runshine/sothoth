@@ -51,14 +51,18 @@ class ResultReviewExecutor:
         cycle: int,
         review_state: ReviewState,
         parallel: bool = True,
+        concurrency_limit: int = 3,
         advisor_sessions: dict[str, str] | None = None,
     ) -> tuple[bool, list[FailedResultItem]]:
         """
         执行结果评审
 
         Args:
-            advisor_sessions: advisor_instance_id → session_id 映射。
-                              当 agent.reset_context=False 时用于跨 cycle 复用会话。
+            concurrency_limit: 结果评审并发上限。仅在 parallel=True 时生效。
+            advisor_sessions: 结果评审会话映射。
+                              key 使用 "result::<advisor_instance_id>::<result_file>"，
+                              这样即使并行评审，也能保证不同结果文件之间会话隔离；
+                              当 agent.reset_context=False 时，仅在“同一结果文件跨 cycle”场景复用会话。
 
         Returns:
             (all_passed: bool, failed_items: list[FailedResultItem])
@@ -84,22 +88,29 @@ class ResultReviewExecutor:
             logger.info("all_results_already_passed", cycle=cycle)
             return True, []
 
+        effective_limit = max(1, concurrency_limit)
+
         logger.info("result_review_start",
                      total=len(all_result_files),
                      pending=len(pending),
-                     cycle=cycle)
+                     cycle=cycle,
+                     parallel=parallel,
+                     concurrency_limit=effective_limit)
 
         task_content = read_file(task_file)
 
-        # 执行评审（并行/串行）
-        if parallel and len(pending) > 1:
-            tasks = [
-                self._review_single(
-                    advisors_cfg, task_content, results_dir,
-                    result_file, work_dir, cycle, review_state,
-                    advisor_sessions)
-                for result_file in pending
-            ]
+        # 执行评审（结果间并行，带并发上限；结果内仍串行）
+        if parallel and len(pending) > 1 and effective_limit > 1:
+            semaphore = asyncio.Semaphore(effective_limit)
+
+            async def _bounded_review(result_file: str):
+                async with semaphore:
+                    return await self._review_single(
+                        advisors_cfg, task_content, results_dir,
+                        result_file, work_dir, cycle, review_state,
+                        advisor_sessions)
+
+            tasks = [_bounded_review(result_file) for result_file in pending]
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         else:
             outcomes = []
@@ -186,15 +197,17 @@ class ResultReviewExecutor:
                 cycle=str(cycle),
             )
 
-            # 会话管理: 与 global_review 统一逻辑
+            # 会话管理（结果评审必须按“结果文件”隔离会话）
             # reset_context=True  → 每次新建 session (独立客观)
-            # reset_context=False → 复用已有 session (保留评审记忆)
-            session_id = advisor_sessions.get(advisor_def.instance_id)
+            # reset_context=False → 仅复用同一 result_file 的历史 session，
+            #                       避免不同结果文件之间相互污染，也避免并发复用同一 session
+            session_key = f"result::{advisor_def.instance_id}::{result_file}"
+            session_id = advisor_sessions.get(session_key)
             should_reset = agent.should_reset_context()
 
             if should_reset or session_id is None:
                 session_id = await agent.create_session()
-                advisor_sessions[advisor_def.instance_id] = session_id
+                advisor_sessions[session_key] = session_id
 
             response = await agent.send_message(
                 message=user_prompt,
@@ -212,7 +225,9 @@ class ResultReviewExecutor:
                     cycle=cycle, passed=False, content=reason,
                     agent_id=advisor_def.agent_id,
                     role_name=advisor_def.role_name,
-                    raw_content=response.content if response.content else "")
+                    raw_content=response.content if response.content else "",
+                    verdict="ERROR",
+                    detail_feedback=reason)
                 review_state.mark_result_failed(result_file, cycle, reason)
                 return False
 
@@ -230,12 +245,14 @@ class ResultReviewExecutor:
                 role_name=advisor_def.role_name,
                 scores=parsed.scores,
                 confidence=parsed.confidence,
-                raw_content=parsed.raw_content)
+                raw_content=parsed.raw_content,
+                verdict=parsed.verdict,
+                detail_feedback=parsed.feedback_detail)
 
             if not parsed.passed:
                 # 当前结果不通过 → 放弃继续评审 (R6g)
                 review_state.mark_result_failed(
-                    result_file, cycle, parsed.feedback)
+                    result_file, cycle, parsed.feedback_detail or parsed.feedback)
                 logger.info("result_review_failed",
                              result_file=result_file,
                              advisor=advisor_def.instance_id,

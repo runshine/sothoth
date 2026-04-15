@@ -5,9 +5,10 @@
     "workspace_root": "/workspace",
     "log_level": "INFO",
     "max_workflow_retry": 2,
-    "max_review_cycles": 3,
+    "max_review_cycles": 10,
     "default_context_reset": false,
     "parallel_result_review": true,
+    "parallel_result_review_limit": 3,
     "env_vars": {}
   },
 
@@ -42,7 +43,7 @@
     {
       "id": "env_setup",
       "name": "环境变量设置",
-      "module_path": "src.plugins.builtin.env_setup",
+      "module_path": "app.pi_vuln_core.plugins.builtin.env_setup",
       "class_name": "EnvSetupPlugin",
       "config": {
         "extra_vars": {}
@@ -51,7 +52,7 @@
     {
       "id": "workspace_init",
       "name": "工作目录初始化",
-      "module_path": "src.plugins.builtin.workspace_init",
+      "module_path": "app.pi_vuln_core.plugins.builtin.workspace_init",
       "class_name": "WorkspaceInitPlugin",
       "config": {
         "create_subdirs": ["input", "working", "results", "reviews", "output"]
@@ -60,14 +61,14 @@
     {
       "id": "task_validator",
       "name": "输入任务校验",
-      "module_path": "src.plugins.builtin.task_validator",
+      "module_path": "app.pi_vuln_core.plugins.builtin.task_validator",
       "class_name": "TaskValidatorPlugin",
       "config": {}
     },
     {
       "id": "result_archiver",
       "name": "结果归档",
-      "module_path": "src.plugins.builtin.result_archiver",
+      "module_path": "app.pi_vuln_core.plugins.builtin.result_archiver",
       "class_name": "ResultArchiverPlugin",
       "config": {
         "archive_format": "tar.gz"
@@ -76,7 +77,7 @@
     {
       "id": "next_task_generator",
       "name": "下阶段任务生成器",
-      "module_path": "src.plugins.builtin.next_task_generator",
+      "module_path": "app.pi_vuln_core.plugins.builtin.next_task_generator",
       "class_name": "NextTaskGeneratorPlugin",
       "config": {
         "agent_id": null,
@@ -97,7 +98,7 @@
         "start_plugins": ["env_setup", "workspace_init", "task_validator"],
         "end_plugins": ["result_archiver", "next_task_generator"],
         "engine": {
-          "max_review_cycles": 2,
+          "max_review_cycles": 10,
           "max_worker_turns_per_cycle": 5
         },
         "roles": {

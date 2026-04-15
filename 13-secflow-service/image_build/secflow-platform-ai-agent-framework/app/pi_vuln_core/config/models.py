@@ -25,9 +25,10 @@ class GlobalConfig(BaseModel):
     workspace_root: str = "/workspace"
     log_level: str = "INFO"
     max_workflow_retry: int = Field(default=3, ge=1)
-    max_review_cycles: int = Field(default=5, ge=1)
+    max_review_cycles: int = Field(default=10, ge=1)
     default_context_reset: bool = False
     parallel_result_review: bool = True
+    parallel_result_review_limit: int = Field(default=3, ge=1)
     env_vars: dict[str, str] = Field(default_factory=dict)
 
 

@@ -6,6 +6,7 @@
 - 兼容 JSON / Markdown / 混合格式
 - 兼容 verdict / decision / overall_verdict 等多种字段名
 - 兼容 confidence/scores 使用 HIGH/MEDIUM/LOW 等字符串枚举
+- 统一输出稳定字段：verdict / feedback / feedback_detail / raw_content
 - 解析失败时绝不抛异常，避免污染评审主流程
 """
 
@@ -21,7 +22,9 @@ from typing import Any, Optional
 class ParsedReviewResult:
     """解析后的评审结果"""
     passed: bool
+    verdict: str = ""
     feedback: str = ""
+    feedback_detail: str = ""
     scores: dict[str, float] = field(default_factory=dict)
     confidence: float = 0.0
     raw_content: str = ""
@@ -55,7 +58,7 @@ _FAIL_VERDICT_PATTERNS = [
     r"not[_ ]?pass(?:ed)?",
     r"false[_ ]alarm",
     r"证据不足",
-    r"误报",
+    r"(?<!无)误报",
     r"驳回",
     r"不通过",
     r"未通过",
@@ -78,6 +81,24 @@ _PASS_VERDICT_PATTERNS = [
     r"无误报",
 ]
 
+_PARTIAL_VERDICT_PATTERNS = [
+    r"partial",
+    r"部分",
+    r"caveat",
+    r"保留",
+    r"有条件",
+    r"不充分",
+]
+
+_LOW_SIGNAL_SUMMARY_PATTERNS = [
+    r"现在我.*生成.*json",
+    r"现在我.*输出.*json",
+    r"根据我.*分析.*现在我可以",
+    r"让我.*完成.*评估",
+    r"评审完成",
+    r"以下是.*评审结果",
+]
+
 
 def parse_review_response(content: str) -> ParsedReviewResult:
     """
@@ -97,10 +118,13 @@ def parse_review_response(content: str) -> ParsedReviewResult:
             return json_result
         return _parse_by_keywords(raw)
     except Exception:
-        # 解析器本身不应影响主流程
+        detail = f"[评审响应解析失败，默认通过] {_one_line(raw)[:300]}"
+        verdict = "PASS"
         return ParsedReviewResult(
             passed=True,
-            feedback=f"[评审响应解析失败，默认通过] {_one_line(raw)[:300]}",
+            verdict=verdict,
+            feedback=_build_normalized_feedback(verdict, detail, True),
+            feedback_detail=detail,
             raw_content=raw,
         )
 
@@ -112,12 +136,10 @@ def _try_parse_json(content: str) -> Optional[ParsedReviewResult]:
 
     candidates: list[str] = [content]
 
-    # 尝试提取 ```json ... ``` 代码块
     json_match = re.search(r'```json\s*\n?(.*?)\n?```', content, re.DOTALL)
     if json_match:
         candidates.append(json_match.group(1).strip())
 
-    # 尝试提取首个 { 到末个 } 的大对象
     first_brace = content.find("{")
     last_brace = content.rfind("}")
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
@@ -145,18 +167,21 @@ def _json_to_result(data: dict[str, Any], raw: str) -> ParsedReviewResult:
     if passed is None:
         passed = True
 
-    # feedback 存完整内容（用于持久化记录），日志截断由 visual_log 负责
-    feedback = _extract_feedback_from_json(data)
-    if not feedback:
-        verdict = _extract_verdict_text_from_json(data)
-        feedback = verdict if verdict else _one_line(raw)[:500]
+    detail_feedback = _extract_feedback_from_json(data)
+    verdict_hint = _extract_verdict_text_from_json(data) or detail_feedback
+    verdict = _normalize_verdict_label(verdict_hint, passed)
+
+    if not detail_feedback:
+        detail_feedback = verdict_hint if verdict_hint else raw
 
     scores = _extract_scores_from_json(data)
     confidence = _extract_confidence_from_json(data)
 
     return ParsedReviewResult(
         passed=bool(passed),
-        feedback=feedback,
+        verdict=verdict,
+        feedback=_build_normalized_feedback(verdict, detail_feedback, bool(passed)),
+        feedback_detail=detail_feedback,
         scores=scores,
         confidence=confidence,
         raw_content=raw,
@@ -164,39 +189,36 @@ def _json_to_result(data: dict[str, Any], raw: str) -> ParsedReviewResult:
 
 
 def _parse_by_keywords(content: str) -> ParsedReviewResult:
-    """通过 verdict/关键词判断评审结果。feedback 保留完整原文。"""
-    verdict = _extract_explicit_verdict(content)
-    if verdict:
-        passed = _classify_verdict_text(verdict)
-        if passed is not None:
-            return ParsedReviewResult(
-                passed=passed,
-                feedback=content,  # 完整保留
-                raw_content=content,
-            )
+    """通过 verdict/关键词判断评审结果，并统一生成稳定字段。"""
+    verdict_text = _extract_explicit_verdict(content)
+    passed = None
 
-    lower = content.lower()
+    if verdict_text:
+        passed = _classify_verdict_text(verdict_text)
 
-    for pattern in _FAIL_VERDICT_PATTERNS:
-        if re.search(pattern, lower, re.IGNORECASE):
-            return ParsedReviewResult(
-                passed=False,
-                feedback=content,
-                raw_content=content,
-            )
+    if passed is None:
+        lower = content.lower()
+        for pattern in _FAIL_VERDICT_PATTERNS:
+            if re.search(pattern, lower, re.IGNORECASE):
+                passed = False
+                break
 
-    for pattern in _PASS_VERDICT_PATTERNS:
-        if re.search(pattern, lower, re.IGNORECASE):
-            return ParsedReviewResult(
-                passed=True,
-                feedback=content,
-                raw_content=content,
-            )
+    if passed is None:
+        lower = content.lower()
+        for pattern in _PASS_VERDICT_PATTERNS:
+            if re.search(pattern, lower, re.IGNORECASE):
+                passed = True
+                break
 
-    # 默认通过（保守策略：避免误杀）
+    if passed is None:
+        passed = True
+
+    verdict = _normalize_verdict_label(verdict_text or content, passed)
     return ParsedReviewResult(
-        passed=True,
-        feedback=content,
+        passed=passed,
+        verdict=verdict,
+        feedback=_build_normalized_feedback(verdict, content, passed),
+        feedback_detail=content,
         raw_content=content,
     )
 
@@ -213,7 +235,6 @@ def _walk_values(obj: Any):
 
 
 def _extract_passed_from_json(data: dict[str, Any]) -> Optional[bool]:
-    # 1) 直接布尔字段
     for node in _walk_values(data):
         if isinstance(node, dict):
             for key in ("passed", "pass", "approved", "accepted"):
@@ -231,12 +252,10 @@ def _extract_passed_from_json(data: dict[str, Any]) -> Optional[bool]:
                         if low in ("false", "no", "n", "0"):
                             return False
 
-    # 2) verdict/decision 类字段
     verdict_text = _extract_verdict_text_from_json(data)
     if verdict_text:
         return _classify_verdict_text(verdict_text)
 
-    # 3) feedback/summary 文本中的强信号
     feedback = _extract_feedback_from_json(data)
     if feedback:
         return _classify_verdict_text(feedback)
@@ -245,17 +264,20 @@ def _extract_passed_from_json(data: dict[str, Any]) -> Optional[bool]:
 
 
 def _extract_feedback_from_json(data: dict[str, Any]) -> str:
-    """提取完整 feedback 文本（不截断，截断由展示层负责）"""
+    """提取尽量可读的详细反馈文本（稳定写入 feedback_detail）"""
     keys = (
         "feedback", "reason", "message", "summary", "conclusion",
-        "details", "description", "recommendation",
+        "details", "description", "recommendation", "overall_assessment",
+        "overall_verdict", "assessment", "verification_summary",
+        "verification_status",
     )
     for node in _walk_values(data):
         if isinstance(node, dict):
             for key in keys:
                 value = node.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
+                rendered = _stringify_feedback_candidate(value)
+                if rendered:
+                    return rendered
     return ""
 
 
@@ -263,7 +285,7 @@ def _extract_verdict_text_from_json(data: dict[str, Any]) -> str:
     keys = (
         "verdict", "decision", "final_decision", "final_verdict",
         "overall_verdict", "review_conclusion", "action", "status",
-        "recommendation",
+        "recommendation", "verification_status",
     )
     for node in _walk_values(data):
         if isinstance(node, dict):
@@ -305,7 +327,6 @@ def _normalize_to_float(value: Any) -> float:
             return 0.0
         if text in _CONFIDENCE_MAP:
             return _CONFIDENCE_MAP[text]
-        # 例如 "4/5"
         ratio = re.match(r'^(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)$', text)
         if ratio:
             num = float(ratio.group(1))
@@ -346,12 +367,154 @@ def _classify_verdict_text(text: str) -> Optional[bool]:
     return None
 
 
+def _normalize_verdict_label(text: str, passed: Optional[bool]) -> str:
+    compact = _one_line(text)
+    low = compact.lower()
+
+    if re.match(r'^false[_ ]positive\b', low) or (len(compact) <= 32 and compact.startswith("误报")):
+        return "FALSE_POSITIVE"
+    if re.match(r'^insufficient[_ ]info\b', low) or compact.startswith("证据不足"):
+        return "INSUFFICIENT_INFO"
+    if re.match(r'^unverified\b', low) or compact.startswith("未证实"):
+        return "UNVERIFIED"
+    if re.match(r'^reject(?:ed)?\b', low) or compact.startswith("驳回"):
+        return "REJECT"
+    if re.match(r'^invalid\b', low):
+        return "INVALID"
+    if re.match(r'^true[_ ]positive\b', low):
+        return "TRUE_POSITIVE"
+    if re.match(r'^confirmed\b', low):
+        return "CONFIRMED"
+    if re.match(r'^verified\b', low):
+        return "VERIFIED"
+    for pattern in _PARTIAL_VERDICT_PATTERNS:
+        if (
+            re.match(pattern, low, re.IGNORECASE)
+            or compact.startswith("部分")
+            or (len(compact) <= 80 and re.search(pattern, low, re.IGNORECASE))
+        ):
+            return "PARTIAL_PASS" if passed is not False else "PARTIAL_FAIL"
+    if re.match(r'^(approve|approved|accept|accepted|valid)\b', low) or compact.startswith(("通过", "合格", "成立")):
+        return "PASS"
+    if passed is False:
+        return "FAIL"
+    return "PASS"
+
+
+def _build_normalized_feedback(verdict: str, detail: str, passed: bool) -> str:
+    verdict_label = verdict or ("PASS" if passed else "FAIL")
+    verdict_summary = _format_verdict_summary(verdict_label) or verdict_label
+    detail_summary = _extract_feedback_summary(detail)
+    if not detail_summary:
+        return verdict_summary
+
+    stripped = re.sub(
+        rf'^{re.escape(verdict_label)}\s*[-:：]\s*',
+        '',
+        detail_summary,
+        flags=re.IGNORECASE,
+    ).strip()
+    if stripped != detail_summary and stripped:
+        return f"{verdict_summary} - {stripped}"[:300]
+    if detail_summary == verdict_summary:
+        return verdict_summary
+    if detail_summary.upper() == verdict_label:
+        return verdict_summary
+    return f"{verdict_summary} - {detail_summary}"[:300]
+
+
+def _extract_feedback_summary(text: str) -> str:
+    if not text:
+        return ""
+
+    explicit = _extract_explicit_verdict(text)
+    if explicit and len(_one_line(text)) < 120:
+        return _format_verdict_summary(explicit)
+
+    cleaned = _strip_think_blocks(text)
+    in_code_block = False
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if line.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+        candidate = re.sub(r'^[#>*\-\d.\s]+', '', line).strip()
+        if not candidate:
+            continue
+        if any(re.search(p, candidate, re.IGNORECASE) for p in _LOW_SIGNAL_SUMMARY_PATTERNS):
+            continue
+        if _looks_like_structural_line(candidate):
+            continue
+        return _one_line(candidate)[:220]
+
+    if explicit:
+        return _format_verdict_summary(explicit)
+    return ""
+
+
+def _strip_think_blocks(text: str) -> str:
+    text = re.sub(r'<think>.*?</think>', ' ', text, flags=re.IGNORECASE | re.DOTALL)
+    return text.strip()
+
+
+def _looks_like_structural_line(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if stripped in {"{", "}", "[", "]", "(", ")"}:
+        return True
+    if stripped.startswith(("{", "}", "[", "]")):
+        return True
+    if re.match(r'^["\'\[{].*[}\]",]$', stripped):
+        return True
+    if re.match(r'^[A-Za-z0-9_]+\s*[:=]\s*[\[{"\']', stripped):
+        return True
+    return False
+
+
+def _stringify_feedback_candidate(value: Any) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if isinstance(item, str) and str(item).strip()]
+        if items:
+            return "\n".join(items)
+    return ""
+
+
 def _format_verdict_summary(verdict: str) -> str:
     if not verdict:
         return ""
+    upper = verdict.strip().upper()
+    if upper == "FALSE_POSITIVE":
+        return "FALSE_POSITIVE（误报）"
+    if upper == "INSUFFICIENT_INFO":
+        return "INSUFFICIENT_INFO（证据不足）"
+    if upper == "UNVERIFIED":
+        return "UNVERIFIED（未证实）"
+    if upper == "REJECT":
+        return "REJECT（驳回）"
+    if upper == "INVALID":
+        return "INVALID（无效）"
+    if upper == "TRUE_POSITIVE":
+        return "TRUE_POSITIVE（有效发现）"
+    if upper == "CONFIRMED":
+        return "CONFIRMED（已确认）"
+    if upper == "VERIFIED":
+        return "VERIFIED（已验证）"
+    if upper == "PARTIAL_PASS":
+        return "PARTIAL_PASS（部分通过）"
+    if upper == "PARTIAL_FAIL":
+        return "PARTIAL_FAIL（部分不通过）"
+    if upper == "FAIL":
+        return "FAIL（未通过）"
+    if upper == "PASS":
+        return "PASS（通过）"
+
     v = verdict.strip()
     low = v.lower()
-
     if re.search(r'false[_ ]positive|误报', low):
         return "FALSE_POSITIVE（误报）"
     if re.search(r'insufficient[_ ]info|证据不足', low):
@@ -366,7 +529,6 @@ def _format_verdict_summary(verdict: str) -> str:
         return "TRUE_POSITIVE（有效发现）"
     if re.search(r'approve|accept|valid|verified|通过|合格|成立', low):
         return "PASS（通过）"
-
     return _one_line(v)[:200]
 
 

@@ -1,0 +1,13 @@
+{
+  "status": "completed",
+  "finished_at": "2026-04-14T10:47:56.293001+00:00",
+  "duration_ms": 280789,
+  "return_code": 0,
+  "output_len": 4153,
+  "stderr_len": 0,
+  "response_len": 4153,
+  "conversation_id": "pi_2d3eaa9b0c13",
+  "turn_count": 1,
+  "finished": true,
+  "error": null
+}

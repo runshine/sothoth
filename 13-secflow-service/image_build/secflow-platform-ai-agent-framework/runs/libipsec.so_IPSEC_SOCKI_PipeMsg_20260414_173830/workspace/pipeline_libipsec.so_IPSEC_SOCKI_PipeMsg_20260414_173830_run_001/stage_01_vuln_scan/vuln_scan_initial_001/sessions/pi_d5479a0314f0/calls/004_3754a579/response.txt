@@ -1,0 +1,38 @@
+All checks pass. Here is the final status summary:
+
+---
+
+## Completed Actions
+
+### Deleted (16 confirmed false positives)
+All 16 flagged results were confirmed as false positives based on reviewer feedback and source code re-verification:
+
+| Deleted File | Reason |
+|-------------|--------|
+| result_001.md | IDA decompiler artifact — void function, return value has no consumer |
+| result_002.md | `snprintf_truncated_s` guarantees safety; TOCTOU unrealistic |
+| result_003.md | v7/a5 only used for debug tracing, not data routing |
+| result_004.md | Standard batch processing pattern (10 max), not DoS |
+| result_005.md | VRP single-thread model eliminates TOCTOU |
+| result_006.md | Single-thread + upstream 1024 limit makes assertion unreachable |
+| result_008.md | IDA "possibly undefined" analysis artifacts |
+| result_010.md | Misidentified socket trace counter as SA sequence number |
+| result_011.md | Counters have periodic reset; only used for stats |
+| result_013.md | Debug buffer allocated as 256KB, matches copy limit exactly |
+| result_014.md | PLT direct call, not function pointer — decompiler syntax |
+| result_015.md | signed/unsigned == comparison identical at machine level |
+| result_016.md | IDA register reuse artifact, self-contradicting report |
+| result_017.md | Intentional design; input not attacker-controllable |
+| result_018.md | DFA annotation error, not code defect |
+| result_019.md | Audit recommendation, not vulnerability; CWE-676 misapplied |
+
+### Preserved (3 approved results — unchanged)
+- **result_007.md**: MBUF leak on `SOCK_RecvMbufEx_fl` unexpected return path
+- **result_009.md**: IPv6 protocol family mismatch in `SendToSocket`
+- **result_012.md**: NULL deref after `VRP_Assert` in `SendToSocket`
+
+### New Finding (1)
+- **result_020.md**: MBUF leak in `SendToPP6orPP4orLDMPipe` when `MBUF_GetControlInfo(a1, 0)` returns NULL — callee returns 19 without destroying MBUF, caller's else branch also skips destruction
+
+### Updated
+- **summary.md**: Completely rewritten with 7 required sections, reflecting 4 total findings

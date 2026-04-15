@@ -124,10 +124,13 @@ class ReviewState:
         # ═══ 全局评审反馈 ═══
         if self._global_feedbacks:
             fb = self._global_feedbacks[-1]  # 最近一次
+            feedback_text = fb["feedback"]
+            if len(feedback_text) > 2000:
+                feedback_text = feedback_text[:2000] + "\n\n...(全局评审反馈过长，已截断；完整内容请查看 reviews/global/)"
             sections.append(
                 f"## ❌ 全局评审反馈 (Cycle {fb['cycle']})\n\n"
                 f"评审员认为整体报告存在以下问题，请针对性改进：\n\n"
-                f"{fb['feedback']}"
+                f"{feedback_text}"
             )
 
         # ═══ 结果评审反馈（每个不通过项单独列出）═══

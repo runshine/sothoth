@@ -19,31 +19,25 @@ Pi Agent 运行时适配 (跨平台: Linux / Windows)
   - Linux: create_subprocess_exec (直接执行)
   - Windows: create_subprocess_shell (处理 .cmd 文件)
   - --session-dir 保存每次调用的会话记录到工作目录
+  - 统一 trace: 每次调用都在 sessions/<session_id>/calls/ 下落盘完整命令、prompt 与输出
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import platform
-import tempfile
+import time
 import uuid
 from typing import Optional
 
 from app.pi_vuln_core.agents.base import BaseAgentRuntime
 from app.pi_vuln_core.agents.models import AgentResponse
+from app.pi_vuln_core.agents.runtime_trace import RuntimeTraceContext, command_display, now_iso
 from app.pi_vuln_core.utils.logger import get_logger
 
 logger = get_logger("runtime.pi_agent")
 
 IS_WINDOWS = platform.system() == "Windows"
-
-
-def _tmp_path(prefix: str) -> str:
-    """生成临时文件路径"""
-    return os.path.join(
-        tempfile.gettempdir(),
-        f"{prefix}_{uuid.uuid4().hex[:8]}.md")
 
 
 class PiAgentRuntime(BaseAgentRuntime):
@@ -55,17 +49,22 @@ class PiAgentRuntime(BaseAgentRuntime):
                 proc = await asyncio.create_subprocess_shell(
                     "pi --version",
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE)
+                    stderr=asyncio.subprocess.PIPE,
+                )
             else:
                 proc = await asyncio.create_subprocess_exec(
-                    "pi", "--version",
+                    "pi",
+                    "--version",
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE)
+                    stderr=asyncio.subprocess.PIPE,
+                )
             stdout, _ = await proc.communicate()
-            logger.info("pi_cli_available",
-                        version=stdout.decode().strip(),
-                        agent_id=self.agent_id,
-                        platform=platform.system())
+            logger.info(
+                "pi_cli_available",
+                version=stdout.decode().strip(),
+                agent_id=self.agent_id,
+                platform=platform.system(),
+            )
         except FileNotFoundError:
             logger.warning("pi_cli_not_found", agent_id=self.agent_id)
         self._initialized = True
@@ -94,28 +93,19 @@ class PiAgentRuntime(BaseAgentRuntime):
         model = self.runtime_config.get("model", "gpt-5-mini")
 
         is_continuation = session["turns"] > 0
-
-        # ═══ 写 user message 到临时文件 (通过 @file 传入) ═══
-        user_file = _tmp_path("pi_user")
-        with open(user_file, "w", encoding="utf-8") as f:
-            f.write(message)
-
-        # ═══ 写 system prompt 到临时文件 (通过 --system-prompt @file 传入) ═══
-        # 仅首次调用需要: 续接时 session 已包含 system prompt
-        sys_file = None
-        if system_prompt and not is_continuation:
-            sys_file = _tmp_path("pi_sys")
-            with open(sys_file, "w", encoding="utf-8") as f:
-                f.write(system_prompt)
-
-        # ═══ Session 目录 ═══
-        session_dir = None
-        if working_dir:
-            session_dir = os.path.join(working_dir, "sessions", session_id)
-            os.makedirs(session_dir, exist_ok=True)
+        turn_number = session["turns"] + 1
+        trace_context = RuntimeTraceContext.create(
+            runtime="pi_agent",
+            agent_id=self.agent_id,
+            session_id=session_id,
+            turn_number=turn_number,
+            working_dir=working_dir,
+            user_prompt=message,
+            system_prompt=system_prompt,
+            write_system_prompt=not is_continuation,
+        )
 
         try:
-            # ═══ 构建命令 ═══
             cmd_args = [
                 "pi",
                 "--provider", provider,
@@ -125,102 +115,220 @@ class PiAgentRuntime(BaseAgentRuntime):
                 "--tools", tools,
             ]
 
-            # system prompt: 通过 pi 原生 --system-prompt 传入, 仅首次
-            if sys_file:
-                cmd_args.extend(["--system-prompt", f"@{sys_file}"])
+            if trace_context.system_prompt_file:
+                cmd_args.extend(["--system-prompt", f"@{trace_context.system_prompt_file}"])
 
-            # session 管理
-            if session_dir:
-                cmd_args.extend(["--session-dir", session_dir])
+            if trace_context.session_dir:
+                cmd_args.extend(["--session-dir", trace_context.session_dir])
                 if is_continuation:
                     cmd_args.append("--continue")
             else:
                 cmd_args.append("--no-session")
 
-            # user message: 通过 @file 传入
-            cmd_args.append(f"@{user_file}")
+            cmd_args.append(f"@{trace_context.user_prompt_file}")
 
-            logger.info("pi_execute",
-                        agent_id=self.agent_id,
-                        provider=provider, model=model,
-                        cwd=working_dir,
-                        user_prompt_len=len(message),
-                        sys_prompt_len=len(system_prompt) if system_prompt else 0,
-                        has_system_prompt=(sys_file is not None),
-                        is_continuation=is_continuation,
-                        session_turns=session["turns"],
-                        session_dir=session_dir)
+            cmd_display = command_display(cmd_args)
+            started_monotonic = time.monotonic()
 
-            # ═══ 跨平台 subprocess ═══
+            trace_context.write_request(
+                {
+                    "agent_id": self.agent_id,
+                    "runtime": "pi_agent",
+                    "session_id": session_id,
+                    "turn_number": turn_number,
+                    "started_at": now_iso(),
+                    "working_dir": trace_context.working_dir,
+                    "session_dir": trace_context.session_dir,
+                    "call_dir": trace_context.call_dir,
+                    "provider": provider,
+                    "model": model,
+                    "thinking": thinking,
+                    "tools": tools,
+                    "timeout_seconds": timeout,
+                    "is_continuation": is_continuation,
+                    "user_prompt_len": len(message),
+                    "sys_prompt_len": len(system_prompt) if system_prompt else 0,
+                    "has_system_prompt": trace_context.system_prompt_file is not None,
+                    "user_prompt_file": trace_context.user_prompt_file,
+                    "system_prompt_file": trace_context.system_prompt_file,
+                    "command_argv": cmd_args,
+                    "command_display": cmd_display,
+                }
+            )
+
+            logger.info(
+                "runtime_execute",
+                runtime="pi_agent",
+                agent_id=self.agent_id,
+                provider=provider,
+                model=model,
+                cwd=working_dir,
+                user_prompt_len=len(message),
+                sys_prompt_len=len(system_prompt) if system_prompt else 0,
+                has_system_prompt=(trace_context.system_prompt_file is not None),
+                is_continuation=is_continuation,
+                session_turns=session["turns"],
+                session_dir=trace_context.session_dir,
+                call_dir=trace_context.call_dir,
+                user_prompt_file=trace_context.user_prompt_file,
+                system_prompt_file=trace_context.system_prompt_file,
+                command=cmd_display,
+            )
+
             if IS_WINDOWS:
-                cmd_str = ' '.join(
-                    f'"{c}"' if (' ' in c or '@' in c or '\\' in c) else c
-                    for c in cmd_args)
                 proc = await asyncio.create_subprocess_shell(
-                    cmd_str,
+                    cmd_display,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=working_dir)
+                    cwd=working_dir,
+                )
             else:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd_args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=working_dir)
+                    cwd=working_dir,
+                )
 
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout)
-
-            output = stdout.decode("utf-8", errors="replace")
-            err_output = stderr.decode("utf-8", errors="replace")
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout_text = stdout.decode("utf-8", errors="replace")
+            stderr_text = stderr.decode("utf-8", errors="replace")
+            duration_ms = int((time.monotonic() - started_monotonic) * 1000)
 
             session["turns"] += 1
             self._sessions[session_id] = session
 
-            if proc.returncode != 0 and not output:
+            if proc.returncode != 0 and not stdout_text:
+                error = f"pi exit code={proc.returncode}: {stderr_text[:500]}"
+                trace_context.write_result(
+                    stdout_text=stdout_text,
+                    stderr_text=stderr_text,
+                    response_text="",
+                    payload={
+                        "status": "error",
+                        "finished_at": now_iso(),
+                        "duration_ms": duration_ms,
+                        "return_code": proc.returncode,
+                        "output_len": len(stdout_text),
+                        "stderr_len": len(stderr_text),
+                        "response_len": 0,
+                        "conversation_id": session_id,
+                        "turn_count": session["turns"],
+                        "finished": False,
+                        "error": error,
+                    },
+                )
                 return AgentResponse(
                     content="",
-                    error=f"pi exit code={proc.returncode}: {err_output[:500]}",
+                    error=error,
                     conversation_id=session_id,
-                    turn_count=session["turns"])
+                    turn_count=session["turns"],
+                )
 
-            logger.info("pi_execute_done",
-                        agent_id=self.agent_id,
-                        output_len=len(output),
-                        return_code=proc.returncode)
+            trace_context.write_result(
+                stdout_text=stdout_text,
+                stderr_text=stderr_text,
+                response_text=stdout_text,
+                payload={
+                    "status": "completed",
+                    "finished_at": now_iso(),
+                    "duration_ms": duration_ms,
+                    "return_code": proc.returncode,
+                    "output_len": len(stdout_text),
+                    "stderr_len": len(stderr_text),
+                    "response_len": len(stdout_text),
+                    "conversation_id": session_id,
+                    "turn_count": session["turns"],
+                    "finished": True,
+                    "error": None,
+                },
+            )
+
+            logger.info(
+                "runtime_execute_done",
+                runtime="pi_agent",
+                agent_id=self.agent_id,
+                output_len=len(stdout_text),
+                return_code=proc.returncode,
+                call_dir=trace_context.call_dir,
+                duration_ms=duration_ms,
+            )
 
             return AgentResponse(
-                content=output,
+                content=stdout_text,
                 conversation_id=session_id,
                 turn_count=session["turns"],
-                finished=True)
+                finished=True,
+                raw_response=stdout_text,
+            )
 
         except asyncio.TimeoutError:
+            trace_context.write_result(
+                stdout_text="",
+                stderr_text="",
+                response_text="",
+                payload={
+                    "status": "timeout",
+                    "finished_at": now_iso(),
+                    "duration_ms": None,
+                    "return_code": None,
+                    "output_len": 0,
+                    "stderr_len": 0,
+                    "response_len": 0,
+                    "conversation_id": session_id,
+                    "turn_count": session.get("turns", 0),
+                    "finished": False,
+                    "error": f"Pi Agent 超时 ({timeout}s)",
+                },
+            )
             return AgentResponse(
-                content="", error=f"Pi Agent 超时 ({timeout}s)",
-                conversation_id=session_id)
+                content="",
+                error=f"Pi Agent 超时 ({timeout}s)",
+                conversation_id=session_id,
+            )
         except FileNotFoundError:
+            trace_context.write_result(
+                stdout_text="",
+                stderr_text="",
+                response_text="",
+                payload={
+                    "status": "error",
+                    "finished_at": now_iso(),
+                    "duration_ms": None,
+                    "return_code": None,
+                    "output_len": 0,
+                    "stderr_len": 0,
+                    "response_len": 0,
+                    "conversation_id": session_id,
+                    "turn_count": session.get("turns", 0),
+                    "finished": False,
+                    "error": "pi CLI 未安装",
+                },
+            )
             return AgentResponse(
-                content="", error="pi CLI 未安装",
-                conversation_id=session_id)
+                content="",
+                error="pi CLI 未安装",
+                conversation_id=session_id,
+            )
         finally:
-            for f in [user_file, sys_file]:
-                if f:
-                    try:
-                        os.unlink(f)
-                    except OSError:
-                        pass
+            trace_context.cleanup()
 
     async def multi_turn_execute(
-        self, system_prompt: str, user_prompt: str,
-        working_dir: str, max_turns: int = 30,
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        working_dir: str,
+        max_turns: int = 30,
         session_id: Optional[str] = None,
     ) -> AgentResponse:
         if session_id is None:
             session_id = await self.create_session()
         return await self.send_message(
-            message=user_prompt, system_prompt=system_prompt,
-            session_id=session_id, working_dir=working_dir)
+            message=user_prompt,
+            system_prompt=system_prompt,
+            session_id=session_id,
+            working_dir=working_dir,
+        )
 
     async def close_session(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)

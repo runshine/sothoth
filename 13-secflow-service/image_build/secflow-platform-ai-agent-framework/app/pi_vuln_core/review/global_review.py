@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
@@ -66,7 +67,10 @@ class GlobalReviewExecutor:
             (passed: bool, feedback: str)
         """
         task_content = read_file(task_file)
-        summary_content = read_file(summary_file) if summary_file else ""
+        if summary_file and os.path.isfile(summary_file):
+            summary_content = read_file(summary_file)
+        else:
+            summary_content = "(Worker 未生成 summary.md)"
         results_list = list_dir_files(results_dir, suffix=".md")
         results_content = "\n".join(
             f"- {f}" for f in results_list
@@ -120,7 +124,12 @@ class GlobalReviewExecutor:
                              error=response.error)
                 # Agent 错误视为不通过
                 feedback = f"评审智能体错误: {response.error}"
-                await self._record(work_dir, advisor_def, cycle, False, feedback)
+                await self._record(
+                    work_dir, advisor_def, cycle, False, feedback,
+                    raw_content=response.content if response.content else "",
+                    verdict="ERROR",
+                    detail_feedback=feedback,
+                )
                 review_state.global_review_history.append(
                     GlobalReviewRecord(cycle=cycle,
                                        advisor_id=advisor_def.instance_id,
@@ -134,14 +143,15 @@ class GlobalReviewExecutor:
             await self._record(
                 work_dir, advisor_def, cycle,
                 parsed.passed, parsed.feedback,
-                parsed.scores, parsed.confidence, parsed.raw_content)
+                parsed.scores, parsed.confidence, parsed.raw_content,
+                parsed.verdict, parsed.feedback_detail)
 
             review_state.global_review_history.append(
                 GlobalReviewRecord(
                     cycle=cycle,
                     advisor_id=advisor_def.instance_id,
                     passed=parsed.passed,
-                    feedback=parsed.feedback))
+                    feedback=parsed.feedback_detail or parsed.feedback))
 
             logger.info("global_review_result",
                          advisor=advisor_def.instance_id,
@@ -150,7 +160,7 @@ class GlobalReviewExecutor:
 
             # 任何一个不通过 → 立即返回 (R6g)
             if not parsed.passed:
-                return False, parsed.feedback
+                return False, (parsed.feedback_detail or parsed.feedback)
 
         return True, ""
 
@@ -164,6 +174,8 @@ class GlobalReviewExecutor:
         scores: dict | None = None,
         confidence: float | None = None,
         raw_content: str = "",
+        verdict: str = "",
+        detail_feedback: str = "",
     ) -> None:
         await self.recorder.record_global_review(
             work_dir=work_dir,
@@ -176,4 +188,6 @@ class GlobalReviewExecutor:
             scores=scores,
             confidence=confidence,
             raw_content=raw_content,
+            verdict=verdict,
+            detail_feedback=detail_feedback,
         )
