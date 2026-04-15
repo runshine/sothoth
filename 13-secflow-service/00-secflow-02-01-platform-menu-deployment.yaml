@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-menu
-        image: ghcr.io/runshine/secflow-platform-menu:20260408  # 包含kubectl命令
+        image: runshine0819/secflow-platform-menu:20260408  # 包含kubectl命令
         imagePullPolicy: Always
         command: ["python", "app.py", "--config", "/app/config.yaml"]
         env:
