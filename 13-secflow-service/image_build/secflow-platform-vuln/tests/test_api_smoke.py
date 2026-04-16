@@ -280,7 +280,10 @@ def test_register_service_and_list(client: TestClient):
         "callback_mode": "push",
         "auth_mode": "machine_token",
         "version": "1.0.0",
-        "meta": {},
+        "meta": {
+            "module_role": "validator",
+            "bind_stage": "validation",
+        },
         "capabilities": [
             {
                 "capability_code": "analysis-default",
@@ -290,7 +293,9 @@ def test_register_service_and_list(client: TestClient):
                 "concurrency_limit": 2,
                 "input_schema_meta": {},
                 "output_schema_meta": {},
-                "meta": {},
+                "meta": {
+                    "bind_stage": "triage",
+                },
             }
         ],
     }
@@ -303,6 +308,10 @@ def test_register_service_and_list(client: TestClient):
     detail = client.get("/api/vuln/services/svc-analyzer-01")
     assert detail.status_code == 200
     assert detail.json()["service_id"] == "svc-analyzer-01"
+    assert detail.json()["meta"]["module_role"] == "validator"
+    assert detail.json()["healthcheck_url"] == "http://analyzer/health"
+    assert detail.json()["callback_mode"] == "push"
+    assert detail.json()["capabilities"][0]["meta"]["bind_stage"] == "triage"
 
     heartbeat = client.post("/api/vuln/services/heartbeat/svc-analyzer-01")
     assert heartbeat.status_code == 200

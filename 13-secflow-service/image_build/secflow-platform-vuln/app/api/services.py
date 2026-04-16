@@ -19,9 +19,13 @@ def _to_response(service: ServiceRegistry) -> dict:
         "service_name": service.service_name,
         "service_type": service.service_type,
         "endpoint": service.endpoint,
+        "healthcheck_url": service.healthcheck_url,
+        "callback_mode": service.callback_mode,
+        "auth_mode": service.auth_mode,
         "status": service.status,
         "version": service.version,
         "last_heartbeat_at": service.last_heartbeat_at,
+        "meta": json.loads(service.meta_json or "{}"),
         "capabilities": [
             {
                 "capability_code": item.capability_code,
@@ -31,6 +35,7 @@ def _to_response(service: ServiceRegistry) -> dict:
                 "concurrency_limit": item.concurrency_limit,
                 "input_schema_meta": json.loads(item.input_schema_meta_json or "{}"),
                 "output_schema_meta": json.loads(item.output_schema_meta_json or "{}"),
+                "meta": json.loads(item.meta_json or "{}"),
             }
             for item in service.capabilities
         ],
