@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Result, ServiceCapability, ServiceRegistry, StageHistory, WorkflowDefinition, WorkflowRun
 from app.schemas import ActionCallbackRequest, CaseCreateRequest, ManualTaskCreateRequest, RoutedActionDispatchRequest
+from app.services.service_registry import reconcile_service_statuses
 
 
 MAIN_STAGE_RECEIVE = "receive"
@@ -544,6 +545,7 @@ def dispatch_routed_actions(
 ) -> list[ActionExecution]:
     cfg = get_config()
     route_request = request or RoutedActionDispatchRequest()
+    reconcile_service_statuses(db, service_id=route_request.service_id)
     query = db.query(ServiceRegistry).filter(ServiceRegistry.status == "active")
     if route_request.service_id:
         query = query.filter(ServiceRegistry.service_id == route_request.service_id)
@@ -645,6 +647,7 @@ def recommend_actions(db: Session, case: Case) -> list[dict]:
     if not allowed_types:
         return []
 
+    reconcile_service_statuses(db)
     active_pairs = {
         (item.target_service_id, item.action_type)
         for item in db.query(ActionExecution).filter(

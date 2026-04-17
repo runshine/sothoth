@@ -5,31 +5,47 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ServiceCapabilityRegister(BaseModel):
-    capability_code: str
-    action_type: str
-    priority: int = 100
-    timeout_seconds: int = 300
-    concurrency_limit: int = 1
+    capability_code: str = Field(min_length=1, max_length=128)
+    action_type: str = Field(min_length=1, max_length=64)
+    priority: int = Field(default=100, ge=0, le=10000)
+    timeout_seconds: int = Field(default=300, ge=1, le=86400)
+    concurrency_limit: int = Field(default=1, ge=1, le=1000)
     input_schema_meta: dict[str, Any] = Field(default_factory=dict)
     output_schema_meta: dict[str, Any] = Field(default_factory=dict)
     meta: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("capability_code", "action_type")
+    @classmethod
+    def validate_non_empty_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value cannot be empty")
+        return value
+
 
 class ServiceRegisterRequest(BaseModel):
-    service_id: str
-    service_name: str
-    service_type: str
-    endpoint: str
+    service_id: str = Field(min_length=1, max_length=128)
+    service_name: str = Field(min_length=1, max_length=255)
+    service_type: str = Field(min_length=1, max_length=64)
+    endpoint: str = Field(min_length=1, max_length=512)
     healthcheck_url: Optional[str] = None
-    callback_mode: str = "push"
-    auth_mode: str = "machine_token"
+    callback_mode: Literal["push", "polling", "manual"] = "push"
+    auth_mode: Literal["machine_token", "none", "manual"] = "machine_token"
     version: Optional[str] = None
     meta: dict[str, Any] = Field(default_factory=dict)
     capabilities: list[ServiceCapabilityRegister] = Field(default_factory=list)
+
+    @field_validator("service_id", "service_name", "service_type", "endpoint")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("value cannot be empty")
+        return value
 
 
 class ServiceResponse(BaseModel):

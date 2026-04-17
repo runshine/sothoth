@@ -8,9 +8,19 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_subject
 from app.models.database import ServiceRegistry, get_db
 from app.schemas import ServiceRegisterRequest
-from app.services.service_registry import heartbeat_service, register_service
+from app.services.service_registry import heartbeat_service, reconcile_service_statuses, register_service, unregister_service
 
 router = APIRouter(prefix="/api/vuln/services", tags=["services"])
+
+
+def _safe_json_loads(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"_raw": raw, "_decode_error": True}
+    return value if isinstance(value, dict) else {"value": value}
 
 
 def _to_response(service: ServiceRegistry) -> dict:
@@ -25,7 +35,7 @@ def _to_response(service: ServiceRegistry) -> dict:
         "status": service.status,
         "version": service.version,
         "last_heartbeat_at": service.last_heartbeat_at,
-        "meta": json.loads(service.meta_json or "{}"),
+        "meta": _safe_json_loads(service.meta_json),
         "capabilities": [
             {
                 "capability_code": item.capability_code,
@@ -33,9 +43,9 @@ def _to_response(service: ServiceRegistry) -> dict:
                 "priority": item.priority,
                 "timeout_seconds": item.timeout_seconds,
                 "concurrency_limit": item.concurrency_limit,
-                "input_schema_meta": json.loads(item.input_schema_meta_json or "{}"),
-                "output_schema_meta": json.loads(item.output_schema_meta_json or "{}"),
-                "meta": json.loads(item.meta_json or "{}"),
+                "input_schema_meta": _safe_json_loads(item.input_schema_meta_json),
+                "output_schema_meta": _safe_json_loads(item.output_schema_meta_json),
+                "meta": _safe_json_loads(item.meta_json),
             }
             for item in service.capabilities
         ],
@@ -62,22 +72,22 @@ async def heartbeat(service_id: str, _: tuple[dict, str] = Depends(get_current_s
 
 @router.delete("/unregister/{service_id}")
 async def unregister(service_id: str, _: tuple[dict, str] = Depends(get_current_subject), db: Session = Depends(get_db)):
-    service = db.query(ServiceRegistry).filter(ServiceRegistry.service_id == service_id).first()
+    service = unregister_service(db, service_id)
     if service is None:
         raise HTTPException(status_code=404, detail="service not found")
-    db.delete(service)
-    db.commit()
-    return {"status": "ok", "service_id": service_id}
+    return {"status": "ok", "service_id": service_id, "service_status": service.status}
 
 
 @router.get("")
 async def list_services(_: tuple[dict, str] = Depends(get_current_subject), db: Session = Depends(get_db)):
+    reconcile_service_statuses(db)
     services = db.query(ServiceRegistry).order_by(ServiceRegistry.updated_at.desc()).all()
     return {"items": [_to_response(service) for service in services], "total": len(services)}
 
 
 @router.get("/{service_id}")
 async def get_service(service_id: str, _: tuple[dict, str] = Depends(get_current_subject), db: Session = Depends(get_db)):
+    reconcile_service_statuses(db, service_id=service_id)
     service = db.query(ServiceRegistry).filter(ServiceRegistry.service_id == service_id).first()
     if service is None:
         raise HTTPException(status_code=404, detail="service not found")
