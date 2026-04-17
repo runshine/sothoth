@@ -310,6 +310,11 @@ class ValidationResultRequest(BaseModel):
     summary: Optional[str] = None
 
 
+class ReceiveStatusUpdateRequest(BaseModel):
+    receive_status: Literal["intake_created", "files_collecting", "ready_for_triage"]
+    summary: Optional[str] = None
+
+
 class FinishCaseRequest(BaseModel):
     finished_reason: Literal["vulnerable", "non_vulnerable", "inconclusive", "non_issue", "observe", "manual_terminated"]
     summary: str

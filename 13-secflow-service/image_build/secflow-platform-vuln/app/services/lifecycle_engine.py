@@ -7,7 +7,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.config import get_config
-from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Result, ServiceRegistry, StageHistory, WorkflowDefinition, WorkflowRun
+from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Result, ServiceCapability, ServiceRegistry, StageHistory, WorkflowDefinition, WorkflowRun
 from app.schemas import ActionCallbackRequest, CaseCreateRequest, ManualTaskCreateRequest, RoutedActionDispatchRequest
 
 
@@ -53,7 +53,7 @@ STAGE_ACTION_CANDIDATES: dict[str, list[str]] = {
         "exp_generation",
         "proof_verification",
     ],
-    MAIN_STAGE_FINISHED: [],
+    MAIN_STAGE_FINISHED: ["proof_verification"],
 }
 
 SPECIAL_FILESERVER_SUBPROJECT_NAME = "__vuln_cases__"
@@ -238,6 +238,23 @@ def advance_case_stage(db: Session, case: Case, to_stage: str, reason: str, sour
 
 def apply_action_result(db: Session, case: Case, payload: ActionCallbackRequest) -> None:
     if case.current_stage == MAIN_STAGE_FINISHED:
+        db.add(CaseEvent(
+            id=uuid4().hex,
+            case_id=case.id,
+            event_type="finished_stage_result_received",
+            summary=payload.summary or payload.result_type,
+            payload_json=json.dumps(
+                {
+                    "result_type": payload.result_type,
+                    "status": payload.status,
+                    "confidence": payload.confidence,
+                    "source_service_id": payload.source_service_id,
+                    "suggested_stage": payload.suggested_stage,
+                    "suggested_decision": payload.suggested_decision,
+                },
+                ensure_ascii=False,
+            ),
+        ))
         return
 
     automation_notes: list[str] = []
@@ -488,7 +505,20 @@ def update_validation_result(case: Case, validation_result: str, *, stage_status
     case.current_status = lifecycle["stage_status"]
 
 
+def capability_bind_stage(service: ServiceRegistry, capability: ServiceCapability, default_stage: str) -> str:
+    capability_meta = json.loads(capability.meta_json or "{}")
+    service_meta = json.loads(service.meta_json or "{}")
+    return (
+        capability_meta.get("bind_stage")
+        or capability_meta.get("lifecycle_stage")
+        or service_meta.get("bind_stage")
+        or default_stage
+    )
+
+
 def _stage_from_action(action_type: str, current_stage: str) -> str:
+    if action_type == "proof_verification" and current_stage == MAIN_STAGE_FINISHED:
+        return MAIN_STAGE_FINISHED
     mapping = {
         "analysis": MAIN_STAGE_TRIAGE,
         "ai_analysis": MAIN_STAGE_TRIAGE,
@@ -521,14 +551,14 @@ def dispatch_routed_actions(
 
     actions: list[ActionExecution] = []
     stage = route_request.stage or case.current_stage
-    if stage == MAIN_STAGE_FINISHED:
-        return []
     allowed_types = STAGE_ACTION_CANDIDATES.get(stage, [])
     for service in services:
         for capability in service.capabilities:
             if capability.action_type not in allowed_types:
                 continue
             if route_request.action_type and capability.action_type != route_request.action_type:
+                continue
+            if capability_bind_stage(service, capability, stage) != stage:
                 continue
             action_stage = _stage_from_action(capability.action_type, stage)
             action = ActionExecution(
@@ -607,6 +637,8 @@ def recommend_actions(db: Session, case: Case) -> list[dict]:
     for service in services:
         for capability in service.capabilities:
             if capability.action_type not in allowed_types:
+                continue
+            if capability_bind_stage(service, capability, case.current_stage) != case.current_stage:
                 continue
             pair = (service.service_id, capability.action_type)
             recommendations.append({

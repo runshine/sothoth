@@ -18,6 +18,7 @@ from app.schemas import (
     FinishCaseRequest,
     ManualTaskCreateRequest,
     ManualTaskStatusUpdateRequest,
+    ReceiveStatusUpdateRequest,
     RoutedActionDispatchRequest,
     SuspicionSubmissionRequest,
     StageTransitionRequest,
@@ -33,6 +34,9 @@ from app.services.lifecycle_engine import (
     MAIN_STAGE_RECEIVE,
     MAIN_STAGE_TRIAGE,
     MAIN_STAGE_VALIDATION,
+    RECEIVE_STATUS_FILES_COLLECTING,
+    RECEIVE_STATUS_INTAKE_CREATED,
+    RECEIVE_STATUS_READY_FOR_TRIAGE,
     TRIAGE_DECISIONS,
     TRIAGE_GATES,
     TRIAGE_STATUS_AWAITING_MANUAL_GATE,
@@ -743,6 +747,42 @@ async def transition_case_stage(
     return {"status": "ok", "case": _case_payload(case)}
 
 
+@router.post("/{case_id}/receive/status")
+async def update_case_receive_status(
+    case_id: str,
+    request: ReceiveStatusUpdateRequest,
+    user_and_token: tuple[dict, str] = Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    user, token = user_and_token
+    case = db.query(Case).filter(Case.id == case_id).first()
+    if case is None:
+        raise HTTPException(status_code=404, detail="case not found")
+    await ensure_project_access(case.project_id, token)
+    if case.current_stage != MAIN_STAGE_RECEIVE:
+        raise HTTPException(status_code=400, detail="receive status is only allowed in receive stage")
+
+    lifecycle = get_lifecycle_state(case)
+    lifecycle["stage_status"] = request.receive_status
+    set_lifecycle_state(case, lifecycle)
+    case.current_status = lifecycle["stage_status"]
+    db.add(CaseEvent(
+        id=uuid4().hex,
+        case_id=case.id,
+        event_type="receive_status_updated",
+        summary=request.summary or request.receive_status,
+        payload_json=json.dumps(
+            {
+                "receive_status": request.receive_status,
+                "operator": user.get("username"),
+            },
+            ensure_ascii=False,
+        ),
+    ))
+    db.commit()
+    return {"status": "ok", "case": _case_payload(case)}
+
+
 @router.post("/{case_id}/finish")
 async def finish_case(
     case_id: str,
@@ -929,8 +969,8 @@ async def dispatch_case_actions(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
-    if case.current_stage == MAIN_STAGE_FINISHED:
-        raise HTTPException(status_code=400, detail="finished stage does not allow dispatch")
+    if case.current_stage == MAIN_STAGE_FINISHED and request.action_type != "proof_verification":
+        raise HTTPException(status_code=400, detail="finished stage only allows proof_verification dispatch")
     if request.stage and request.stage != case.current_stage:
         raise HTTPException(status_code=400, detail="stage override is not allowed; use stage-transition first")
     actions = dispatch_routed_actions(db, case, request)
@@ -963,8 +1003,6 @@ async def get_case_recommended_actions(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
-    if case.current_stage == MAIN_STAGE_FINISHED:
-        return {"items": [], "total": 0}
     items = recommend_actions(db, case)
     return {"items": items, "total": len(items)}
 
@@ -980,8 +1018,6 @@ async def auto_orchestrate_case_actions(
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     await ensure_project_access(case.project_id, token)
-    if case.current_stage == MAIN_STAGE_FINISHED:
-        raise HTTPException(status_code=400, detail="finished stage does not allow auto orchestration")
     actions = auto_orchestrate_case(db, case)
     db.commit()
     return {
