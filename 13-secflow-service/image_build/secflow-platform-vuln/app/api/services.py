@@ -8,7 +8,13 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_current_subject
 from app.models.database import ServiceRegistry, get_db
 from app.schemas import ServiceRegisterRequest
-from app.services.service_registry import heartbeat_service, reconcile_service_statuses, register_service, unregister_service
+from app.services.service_registry import (
+    build_repro_service_overview,
+    heartbeat_service,
+    reconcile_service_statuses,
+    register_service,
+    unregister_service,
+)
 
 router = APIRouter(prefix="/api/vuln/services", tags=["services"])
 
@@ -83,6 +89,11 @@ async def list_services(_: tuple[dict, str] = Depends(get_current_subject), db: 
     reconcile_service_statuses(db)
     services = db.query(ServiceRegistry).order_by(ServiceRegistry.updated_at.desc()).all()
     return {"items": [_to_response(service) for service in services], "total": len(services)}
+
+
+@router.get("/repro/overview")
+async def get_repro_service_overview(_: tuple[dict, str] = Depends(get_current_subject), db: Session = Depends(get_db)):
+    return build_repro_service_overview(db)
 
 
 @router.get("/{service_id}")
