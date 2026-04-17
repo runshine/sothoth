@@ -552,6 +552,8 @@ def dispatch_routed_actions(
     actions: list[ActionExecution] = []
     stage = route_request.stage or case.current_stage
     allowed_types = STAGE_ACTION_CANDIDATES.get(stage, [])
+    input_meta_json = json.dumps(route_request.input_meta, ensure_ascii=False, sort_keys=True)
+    input_artifact_refs_json = json.dumps(route_request.input_artifact_refs, ensure_ascii=False, sort_keys=True)
     for service in services:
         for capability in service.capabilities:
             if capability.action_type not in allowed_types:
@@ -559,6 +561,25 @@ def dispatch_routed_actions(
             if route_request.action_type and capability.action_type != route_request.action_type:
                 continue
             if capability_bind_stage(service, capability, stage) != stage:
+                continue
+            active_query = db.query(ActionExecution).filter(
+                ActionExecution.case_id == case.id,
+                ActionExecution.stage == stage,
+                ActionExecution.action_type == capability.action_type,
+                ActionExecution.target_service_id == service.service_id,
+                ActionExecution.execution_status.in_(["queued", "running"]),
+            )
+            active_count = active_query.count()
+            if active_count > 0:
+                duplicate = active_query.filter(
+                    ActionExecution.capability_code == capability.capability_code,
+                    ActionExecution.input_meta_json == input_meta_json,
+                    ActionExecution.input_artifact_refs_json == input_artifact_refs_json,
+                ).first()
+                if duplicate:
+                    continue
+            concurrency_limit = max(1, int(capability.concurrency_limit or 1))
+            if active_count >= concurrency_limit:
                 continue
             action_stage = _stage_from_action(capability.action_type, stage)
             action = ActionExecution(
@@ -571,8 +592,8 @@ def dispatch_routed_actions(
                 capability_code=capability.capability_code,
                 dispatch_status="dispatched",
                 execution_status="queued",
-                input_meta_json=json.dumps(route_request.input_meta, ensure_ascii=False),
-                input_artifact_refs_json=json.dumps(route_request.input_artifact_refs, ensure_ascii=False),
+                input_meta_json=input_meta_json,
+                input_artifact_refs_json=input_artifact_refs_json,
                 max_retry_count=cfg.engine.retry_default,
                 timeout_at=datetime.utcnow() + timedelta(seconds=capability.timeout_seconds or cfg.engine.action_timeout_default),
                 started_at=datetime.utcnow(),
