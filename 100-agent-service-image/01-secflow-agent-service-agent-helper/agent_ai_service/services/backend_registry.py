@@ -48,10 +48,16 @@ def _normalize_backend_args(backend_type: Any, args: Any) -> List[str]:
     backend = str(backend_type or '').strip().lower()
     # Codex CLI 默认参数：
     # - exec: 统一走非交互执行入口
-    # - --skip-git-repo-check / --yolo / --dangerously-bypass-approvals-and-sandbox:
-    #   作为 helper 侧默认运行参数
+    # - --skip-git-repo-check: 允许在非 git 目录执行
+    # - --dangerously-bypass-approvals-and-sandbox: helper 运行在外层受控环境时使用
+    #
+    # 说明：
+    # 当前 codex CLI 中 `--yolo` 与
+    # `--dangerously-bypass-approvals-and-sandbox` 存在语义重叠/冲突，
+    # 同时下发会触发 “cannot be used multiple times”。
+    # 因此 helper 侧仅保留显式的危险模式参数。
     if backend == 'codex':
-        required = ['exec', '--skip-git-repo-check', '--yolo']
+        required = ['exec', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox']
         if not normalized:
             return required
         seen = set()
@@ -71,7 +77,10 @@ def _normalize_backend_args(backend_type: Any, args: Any) -> List[str]:
             result.insert(0, 'exec')
             seen.add('exec')
         # 补齐默认参数（不重复）
-        for item in ('--skip-git-repo-check', '--yolo', '--dangerously-bypass-approvals-and-sandbox'):
+        filtered_result = [item for item in result if item != '--yolo']
+        seen = set(filtered_result)
+        result = filtered_result
+        for item in ('--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox'):
             if item not in seen:
                 result.append(item)
                 seen.add(item)
