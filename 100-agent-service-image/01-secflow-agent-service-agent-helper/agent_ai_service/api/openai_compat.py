@@ -7,7 +7,7 @@ from typing import Any, Dict, Generator, List
 
 from flask import Blueprint, Response, current_app, jsonify, request
 
-from agent_ai_service.api.backends import runtime
+from agent_ai_service.api.a2a_api import a2a
 
 bp = Blueprint('openai_compat', __name__)
 
@@ -112,7 +112,7 @@ def chat_completions(agent_name: str):
         return jsonify(_error_payload('messages must include textual content', 'empty_prompt')), 400
 
     try:
-        detail = runtime.get_backend(agent_name)
+        detail = a2a.backend_runtime.get_backend(agent_name)
     except KeyError:
         return jsonify(_error_payload(f'backend not found: {agent_name}', 'backend_not_found')), 404
 
@@ -120,25 +120,32 @@ def chat_completions(agent_name: str):
         return jsonify(_error_payload(f'backend is disabled: {agent_name}', 'backend_disabled')), 400
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    invoke_payload = {
+        'agent_id': agent_name,
+        'prompt': prompt,
+        'task': prompt,
+        'messages': messages,
+        'include_trace': bool(payload.get('include_trace', True)),
+    }
 
     if not stream:
         try:
-            result = runtime.invoke_backend(agent_name, prompt, messages)
+            response = a2a.invoke(invoke_payload)
         except Exception as exc:
             return jsonify(_error_payload(str(exc), 'invoke_failed', 'server_error')), 500
-        output = str(result.get('stdout') or result.get('stderr') or result.get('error') or '')
+        output = str(response.get('output_text') or response.get('error') or '')
+        success = str(response.get('status') or '') == 'completed'
         response = _to_chat_completion_response(
             completion_id=completion_id,
             model=agent_name,
             prompt=prompt,
             output=output,
-            success=bool(result.get('success', False)),
-            finish_reason='stop' if bool(result.get('success', False)) else 'error',
+            success=success,
+            finish_reason='stop' if success else 'error',
         )
         return jsonify(response)
 
     def _stream() -> Generator[str, None, None]:
-        aggregated_output: List[str] = []
         try:
             # First role chunk keeps compatibility with common OpenAI SSE parsers.
             first_chunk = {
@@ -156,14 +163,22 @@ def chat_completions(agent_name: str):
             }
             yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
-            done_event: Dict[str, Any] | None = None
-            for event in runtime.invoke_backend_stream(agent_name, prompt, messages):
+            for frame in a2a.invoke_sse(invoke_payload):
+                text = str(frame or '')
+                if not text.startswith('data:'):
+                    continue
+                raw_data = text[5:].strip()
+                if not raw_data or raw_data == '[DONE]':
+                    continue
+                try:
+                    event = json.loads(raw_data)
+                except Exception:
+                    continue
                 event_type = str(event.get('type') or '')
-                if event_type == 'chunk':
-                    text = str(event.get('text') or '')
-                    if not text:
+                if event_type == 'response.output_text.delta':
+                    delta = str(event.get('delta') or '')
+                    if not delta:
                         continue
-                    aggregated_output.append(text)
                     chunk_payload = {
                         'id': completion_id,
                         'object': 'chat.completion.chunk',
@@ -172,7 +187,7 @@ def chat_completions(agent_name: str):
                         'choices': [
                             {
                                 'index': 0,
-                                'delta': {'content': text},
+                                'delta': {'content': delta},
                                 'finish_reason': None,
                             }
                         ],
@@ -180,33 +195,38 @@ def chat_completions(agent_name: str):
                     yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
                     continue
 
-                if event_type == 'done':
-                    done_event = event
-                    break
-
-                if event_type == 'error':
-                    error_payload = _error_payload(str(event.get('error') or 'invoke_failed'), 'invoke_failed', 'server_error')
+                if event_type == 'response.failed':
+                    response_payload = event.get('response') if isinstance(event.get('response'), dict) else {}
+                    error_payload = _error_payload(
+                        str(event.get('error_message') or response_payload.get('error') or 'invoke_failed'),
+                        'invoke_failed',
+                        'server_error',
+                    )
                     yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
-
-            output = ''.join(aggregated_output)
-            if done_event and not output:
-                output = str(done_event.get('stdout') or done_event.get('stderr') or '')
-            final_chunk = {
-                'id': completion_id,
-                'object': 'chat.completion.chunk',
-                'created': int(time.time()),
-                'model': agent_name,
-                'choices': [
-                    {
-                        'index': 0,
-                        'delta': {},
-                        'finish_reason': 'stop' if bool(done_event and done_event.get('success')) else 'error',
+                if event_type == 'response.completed':
+                    response_payload = event.get('response') if isinstance(event.get('response'), dict) else {}
+                    success = str(response_payload.get('status') or '') == 'completed'
+                    final_chunk = {
+                        'id': completion_id,
+                        'object': 'chat.completion.chunk',
+                        'created': int(time.time()),
+                        'model': agent_name,
+                        'choices': [
+                            {
+                                'index': 0,
+                                'delta': {},
+                                'finish_reason': 'stop' if success else 'error',
+                            }
+                        ],
                     }
-                ],
-            }
-            yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                    yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+            fallback_error = _error_payload('stream ended without completion event', 'stream_incomplete', 'server_error')
+            yield f"data: {json.dumps(fallback_error, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as exc:
             error_payload = _error_payload(str(exc), 'stream_failed', 'server_error')

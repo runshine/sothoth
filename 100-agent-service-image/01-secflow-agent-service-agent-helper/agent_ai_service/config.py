@@ -20,6 +20,8 @@ class Settings:
     health_cache_ttl_sec: int = int(os.getenv('AGENT_HEALTH_CACHE_TTL_SEC', 3600))
     session_pty_quiet_window_ms: int = int(os.getenv('AGENT_SESSION_PTY_QUIET_WINDOW_MS', 450))
     session_pty_max_window_ms: int = int(os.getenv('AGENT_SESSION_PTY_MAX_WINDOW_MS', 10000))
+    agent_trace_max_events: int = int(os.getenv('AGENT_TRACE_MAX_EVENTS', 200))
+    agent_trace_max_bytes: int = int(os.getenv('AGENT_TRACE_MAX_BYTES', 131072))
 
     @property
     def allowed_commands(self) -> List[str]:

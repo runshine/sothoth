@@ -2534,6 +2534,20 @@ class WebAPIServer:
         session['messages'] = list(session.get('messages') or [])
         return session
 
+    @staticmethod
+    def _is_agent_response_success(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        status = str(payload.get('status') or '').strip().lower()
+        if status == 'failed':
+            return False
+        if status == 'completed':
+            return True
+        success_value = payload.get('success')
+        if isinstance(success_value, bool):
+            return success_value
+        return True
+
     def _upsert_ai_single_session(
         self,
         project_id: str,
@@ -2769,6 +2783,7 @@ class WebAPIServer:
             'vendor_last_error': _pick_vendor_value('vendor_last_error'),
             'claude_session_id': _pick_vendor_value('claude_session_id', 'vendor_session_id'),
             'claude_workdir': _pick_vendor_value('claude_workdir'),
+            'last_response': raw_payload.get('last_response') if isinstance(raw_payload.get('last_response'), dict) else None,
             'created_at': row.get('created_at'),
             'updated_at': row.get('updated_at'),
         }
@@ -7080,7 +7095,7 @@ class WebAPIServer:
                                                 event_payload = json.loads(joined)
                                             except Exception:
                                                 event_payload = None
-                                            if isinstance(event_payload, dict) and str(event_payload.get('type') or '') == 'done':
+                                            if isinstance(event_payload, dict) and str(event_payload.get('type') or '') in ('response.completed', 'response.failed'):
                                                 if isinstance(event_payload.get('session'), dict):
                                                     stream_capture['done_session'] = event_payload.get('session')
                                 except Exception:
@@ -7983,7 +7998,7 @@ class WebAPIServer:
                                             '/api/ai-agents/invoke',
                                             invoke_payload,
                                         )
-                                        ok = status_code < 300 and bool(data.get('success', True))
+                                        ok = status_code < 300 and self._is_agent_response_success(data)
                                         success_count += 1 if ok else 0
                                         self._upsert_ai_batch_item(
                                             batch_id,
@@ -8036,7 +8051,7 @@ class WebAPIServer:
                                         f"/api/ai-agents/sessions/{quote(helper_session_id, safe='')}/messages",
                                         {'role': role, 'content': content},
                                     )
-                                    ok = status_code < 300
+                                    ok = status_code < 300 and self._is_agent_response_success(data)
                                     success_count += 1 if ok else 0
                                     self._upsert_ai_batch_item(
                                         batch_id,
@@ -8145,7 +8160,7 @@ class WebAPIServer:
                                 '/api/ai-agents/invoke',
                                 invoke_payload,
                             )
-                            ok = status_code < 300 and bool(data.get('success', True))
+                            ok = status_code < 300 and self._is_agent_response_success(data)
                             success_count += 1 if ok else 0
                             self._upsert_ai_batch_item(
                                 batch_id,
@@ -8199,7 +8214,7 @@ class WebAPIServer:
                             f"/api/ai-agents/sessions/{quote(helper_session_id, safe='')}/messages",
                             {'role': role, 'content': content},
                         )
-                        ok = status_code < 300
+                        ok = status_code < 300 and self._is_agent_response_success(data)
                         success_count += 1 if ok else 0
                         self._upsert_ai_batch_item(
                             batch_id,

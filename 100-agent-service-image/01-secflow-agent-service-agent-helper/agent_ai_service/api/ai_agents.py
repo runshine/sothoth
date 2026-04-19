@@ -340,65 +340,8 @@ def invoke_ai_agent_once():
 def invoke_ai_agent_stream():
     payload = request.get_json(silent=True) or {}
     normalized = _normalize_invoke_payload(payload)
-
-    def _translate_stream():
-        try:
-            for chunk in a2a.invoke_sse(normalized):
-                text = str(chunk or '')
-                if not text:
-                    continue
-                parts = text.split('\n\n')
-                for part in parts:
-                    block = part.strip()
-                    if not block:
-                        continue
-                    event_name = ''
-                    data_lines = []
-                    for line in block.split('\n'):
-                        if line.startswith('event:'):
-                            event_name = line[6:].strip()
-                        elif line.startswith('data:'):
-                            data_lines.append(line[5:].strip())
-                    if not data_lines:
-                        continue
-                    raw_data = '\n'.join(data_lines).strip()
-                    if not raw_data:
-                        continue
-                    try:
-                        payload_obj = json.loads(raw_data)
-                    except Exception:
-                        payload_obj = {'text': raw_data}
-
-                    if event_name == 'meta':
-                        out = {
-                            'type': 'start',
-                            'agent_ids': payload_obj.get('agent_ids') if isinstance(payload_obj, dict) else [],
-                        }
-                    elif event_name == 'chunk':
-                        out = {
-                            'type': 'delta',
-                            'agent_id': payload_obj.get('agent_id') if isinstance(payload_obj, dict) else None,
-                            'delta': payload_obj.get('text') if isinstance(payload_obj, dict) else raw_data,
-                            'source': 'stdout',
-                        }
-                    elif event_name == 'done':
-                        out = {
-                            'type': 'done',
-                            'result': payload_obj,
-                        }
-                    else:
-                        out = {
-                            'type': 'delta',
-                            'delta': raw_data,
-                            'source': 'stdout',
-                        }
-                    yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
-        except Exception as exc:
-            err = {'type': 'error', 'error_message': str(exc)}
-            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
-
     return Response(
-        _translate_stream(),
+        a2a.invoke_sse(normalized),
         mimetype='text/event-stream',
         headers={
             'Cache-Control': 'no-cache',

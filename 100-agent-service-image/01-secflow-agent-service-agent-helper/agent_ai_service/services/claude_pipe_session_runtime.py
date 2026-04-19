@@ -9,6 +9,7 @@ from typing import Any, Dict, Generator
 from agent_ai_service.config import settings
 from agent_ai_service.models.agent_backend import BackendConfig
 from agent_ai_service.a2a.session_store import SessionStore
+from agent_ai_service.services.agent_response_protocol import trace_item
 
 
 class ClaudePipeSessionRuntime:
@@ -177,6 +178,69 @@ class ClaudePipeSessionRuntime:
 
         return fragments
 
+    @staticmethod
+    def _extract_reasoning_from_stream_json(payload: Any) -> list[str]:
+        fragments: list[str] = []
+        if not isinstance(payload, dict):
+            return fragments
+        message = payload.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("type") or "").strip().lower()
+                    if item_type == "thinking":
+                        thinking = item.get("thinking")
+                        if isinstance(thinking, str) and thinking.strip():
+                            fragments.append(thinking)
+        return fragments
+
+    @staticmethod
+    def _trace_items_from_stream_json(payload: Any) -> list[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return [trace_item('backend.stdout', 'raw backend output', {'raw': str(payload)})]
+        event_type = str(payload.get("type") or "").strip().lower()
+        subtype = str(payload.get("subtype") or "").strip().lower()
+        items: list[Dict[str, Any]] = []
+        if event_type == "system":
+            items.append(trace_item('agent.lifecycle', subtype or 'system event', payload))
+            return items
+        if event_type == "result":
+            category = 'backend.error' if bool(payload.get("is_error")) else 'agent.lifecycle'
+            severity = 'error' if category == 'backend.error' else 'info'
+            items.append(trace_item(category, subtype or 'result event', payload, severity=severity))
+            return items
+
+        message = payload.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("type") or "").strip().lower()
+                    if item_type == "thinking":
+                        items.append(trace_item('agent.reasoning', 'thinking delta', item))
+                    elif item_type in ('tool_use', 'tool_call'):
+                        items.append(trace_item('tool.call', 'tool invocation', item))
+                    elif item_type in ('tool_result', 'tool_output'):
+                        items.append(trace_item('tool.result', 'tool result', item))
+                    elif item_type in ('text', 'output_text', 'delta'):
+                        items.append(trace_item('agent.substep', 'assistant text delta', item))
+                    else:
+                        items.append(trace_item('agent.substep', item_type or 'assistant event', item))
+                if items:
+                    return items
+
+        if event_type == "content_block_delta":
+            items.append(trace_item('agent.substep', 'content block delta', payload))
+            return items
+
+        items.append(trace_item('agent.substep', event_type or 'assistant event', payload))
+        return items
+
     def _record_vendor_state(
         self,
         session_id: str,
@@ -255,12 +319,25 @@ class ClaudePipeSessionRuntime:
 
         def stream_with(resume_first: bool) -> Generator[Dict[str, Any], None, None]:
             initialized = bool(session.get("vendor_session_initialized"))
+            command_mode = "resume" if (resume_first and initialized) else "session-id"
             if resume_first and initialized:
                 cmd = self._build_base_args(config) + ["--verbose", "--output-format", "stream-json", "--resume", vendor_session_id, prompt]
             else:
                 cmd = self._build_base_args(config) + ["--verbose", "--output-format", "stream-json", "--session-id", vendor_session_id, prompt]
 
             self._record_vendor_state(session_id, command=cmd)
+            yield {
+                "type": "trace",
+                "item": trace_item(
+                    "agent.lifecycle",
+                    f"claude invoke via {command_mode}",
+                    {
+                        "command_mode": command_mode,
+                        "vendor_session_id": vendor_session_id,
+                    },
+                    source="claude",
+                ),
+            }
             env = dict(**os.environ)
             env.update(config.env or {})
             try:
@@ -273,6 +350,16 @@ class ClaudePipeSessionRuntime:
                     stderr=subprocess.PIPE,
                 )
             except FileNotFoundError:
+                yield {
+                    "type": "trace",
+                    "item": trace_item(
+                        "backend.error",
+                        f"backend command not found: {config.command}",
+                        {"command": config.command},
+                        severity="error",
+                        source="claude",
+                    ),
+                }
                 yield {
                     "type": "error",
                     "error": f"backend command not found: {config.command}",
@@ -296,6 +383,12 @@ class ClaudePipeSessionRuntime:
                     try:
                         payload = json.loads(stripped)
                         is_error = bool(payload.get("is_error")) or str(payload.get("subtype") or "") == "error_during_execution"
+                        for item in self._trace_items_from_stream_json(payload):
+                            yield {"type": "trace", "item": item}
+                        for fragment in self._extract_reasoning_from_stream_json(payload):
+                            yield {"type": "reasoning", "text": fragment}
+                        for fragment in self._extract_text_from_stream_json(payload):
+                            yield {"type": "output_text", "source": "stdout", "text": fragment}
                         if is_error:
                             err = self._error_text_from_payload(payload) or stripped
                             self._record_vendor_state(session_id, error=err)
@@ -303,22 +396,55 @@ class ClaudePipeSessionRuntime:
                                 proc.kill()
                             except Exception:
                                 pass
+                            yield {
+                                "type": "trace",
+                                "item": trace_item(
+                                    "backend.error",
+                                    err,
+                                    payload,
+                                    severity="error",
+                                    source="claude",
+                                ),
+                            }
                             yield {"type": "error", "error": err, "error_raw": payload, "returncode": proc.poll() if proc.poll() is not None else -1}
                             return
-                        fragments = self._extract_text_from_stream_json(payload)
-                        if fragments:
-                            for text in fragments:
-                                yield {"type": "chunk", "source": "stdout", "text": text}
-                        # JSON line parsed but produced no user-facing text; skip it.
                     except json.JSONDecodeError:
-                        yield {"type": "chunk", "source": "stdout", "text": raw_line}
+                        yield {"type": "output_text", "source": "stdout", "text": raw_line}
+                        yield {
+                            "type": "trace",
+                            "item": trace_item(
+                                "backend.stdout",
+                                "raw stdout",
+                                {"text": raw_line},
+                                source="stdout",
+                            ),
+                        }
 
                 stderr_text = proc.stderr.read() or ""
                 if stderr_text:
                     collected_stderr.append(stderr_text)
+                    yield {
+                        "type": "trace",
+                        "item": trace_item(
+                            "backend.stderr",
+                            "stderr output",
+                            {"text": stderr_text},
+                            source="stderr",
+                        ),
+                    }
                 returncode = proc.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                yield {
+                    "type": "trace",
+                    "item": trace_item(
+                        "backend.error",
+                        "backend invoke timeout",
+                        {"vendor_session_id": vendor_session_id},
+                        severity="error",
+                        source="claude",
+                    ),
+                }
                 yield {"type": "error", "error": "backend invoke timeout", "returncode": -124}
                 return
             except Exception as exc:
@@ -326,6 +452,16 @@ class ClaudePipeSessionRuntime:
                     proc.kill()
                 except Exception:
                     pass
+                yield {
+                    "type": "trace",
+                    "item": trace_item(
+                        "backend.error",
+                        str(exc),
+                        {"vendor_session_id": vendor_session_id},
+                        severity="error",
+                        source="claude",
+                    ),
+                }
                 yield {"type": "error", "error": str(exc), "returncode": -1}
                 return
 
@@ -334,6 +470,20 @@ class ClaudePipeSessionRuntime:
             if returncode != 0:
                 err = stderr_joined.strip() or stdout_joined.strip() or "backend invoke failed"
                 self._record_vendor_state(session_id, error=err)
+                yield {
+                    "type": "trace",
+                    "item": trace_item(
+                        "backend.error",
+                        err,
+                        {
+                            "returncode": returncode,
+                            "stdout": stdout_joined,
+                            "stderr": stderr_joined,
+                        },
+                        severity="error",
+                        source="claude",
+                    ),
+                }
                 yield {
                     "type": "error",
                     "error": err,
@@ -357,15 +507,133 @@ class ClaudePipeSessionRuntime:
         # resume first, then session-id fallback.
         emitted = False
         fallback_needed = False
+        fallback_reason: Dict[str, Any] | None = None
         for event in stream_with(resume_first=True):
             emitted = True
             if event.get("type") == "error":
                 fallback_needed = True
+                fallback_reason = event
                 continue
             yield event
             if event.get("type") == "done":
                 return
 
         if fallback_needed or not emitted:
+            if fallback_reason:
+                yield {
+                    "type": "trace",
+                    "item": trace_item(
+                        "backend.retry",
+                        "resume failed, retrying with session-id",
+                        fallback_reason,
+                        severity="warning",
+                        source="claude",
+                    ),
+                }
             for event in stream_with(resume_first=False):
                 yield event
+
+    def invoke_stateless_stream(
+        self,
+        config: BackendConfig,
+        content: str,
+    ) -> Generator[Dict[str, Any], None, None]:
+        prompt = str(content or "")
+        cmd = self._build_base_args(config) + ["--verbose", "--output-format", "stream-json", prompt]
+        env = dict(**os.environ)
+        env.update(config.env or {})
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=config.cwd or None,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            yield {
+                "type": "error",
+                "error": f"backend command not found: {config.command}",
+                "returncode": -127,
+            }
+            return
+
+        assert proc.stdout is not None
+        assert proc.stderr is not None
+        collected_stdout: list[str] = []
+        collected_stderr: list[str] = []
+        try:
+            for line in proc.stdout:
+                raw_line = str(line or "")
+                if not raw_line:
+                    continue
+                collected_stdout.append(raw_line)
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    payload = json.loads(stripped)
+                except json.JSONDecodeError:
+                    yield {"type": "output_text", "text": raw_line, "source": "stdout"}
+                    yield {"type": "trace", "item": trace_item('backend.stdout', 'raw stdout', {'text': raw_line}, source='stdout')}
+                    continue
+
+                for item in self._trace_items_from_stream_json(payload):
+                    yield {"type": "trace", "item": item}
+                for fragment in self._extract_reasoning_from_stream_json(payload):
+                    yield {"type": "reasoning", "text": fragment}
+                for fragment in self._extract_text_from_stream_json(payload):
+                    yield {"type": "output_text", "text": fragment, "source": "stdout"}
+
+                is_error = bool(payload.get("is_error")) or str(payload.get("subtype") or "") == "error_during_execution"
+                if is_error:
+                    err = self._error_text_from_payload(payload) or stripped
+                    yield {"type": "error", "error": err, "error_raw": payload, "returncode": proc.poll() if proc.poll() is not None else -1}
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    return
+
+            stderr_text = proc.stderr.read() or ""
+            if stderr_text:
+                collected_stderr.append(stderr_text)
+                yield {"type": "trace", "item": trace_item('backend.stderr', 'stderr output', {'text': stderr_text}, source='stderr')}
+            returncode = proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            yield {"type": "trace", "item": trace_item('backend.error', 'backend invoke timeout', {'command': cmd}, severity='error')}
+            yield {"type": "error", "error": "backend invoke timeout", "returncode": -124}
+            return
+        except Exception as exc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            yield {"type": "trace", "item": trace_item('backend.error', str(exc), {'command': cmd}, severity='error')}
+            yield {"type": "error", "error": str(exc), "returncode": -1}
+            return
+
+        stdout_joined = "".join(collected_stdout)
+        stderr_joined = "".join(collected_stderr)
+        if returncode != 0:
+            err = stderr_joined.strip() or stdout_joined.strip() or "backend invoke failed"
+            yield {"type": "trace", "item": trace_item('backend.error', err, {'stdout': stdout_joined, 'stderr': stderr_joined}, severity='error')}
+            yield {
+                "type": "error",
+                "error": err,
+                "returncode": returncode,
+                "stdout": stdout_joined,
+                "stderr": stderr_joined,
+            }
+            return
+        yield {
+            "type": "done",
+            "success": True,
+            "returncode": returncode,
+            "stdout": stdout_joined,
+            "stderr": stderr_joined,
+            "pid": None,
+            "timed_out": False,
+        }
