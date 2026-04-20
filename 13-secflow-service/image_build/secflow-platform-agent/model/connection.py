@@ -46,7 +46,10 @@ class ConnectionChecker:
         token = str(token or '').strip()
         if not token:
             return {}
-        return {'accessToken': token}
+        return {
+            'accessToken': token,
+            'Authorization': f'Bearer {token}',
+        }
 
     @staticmethod
     def check_database(db_config: Dict) -> Tuple[bool, str]:
@@ -81,19 +84,12 @@ class ConnectionChecker:
                 return True, "Nacos连接正常"
 
             if response.status_code in LEGACY_API_FALLBACK_STATUSES:
-                # 3.x 中服务列表属于范围型查询，需要走 admin API。
-                v3_url = f"{base_url}/nacos/v3/admin/ns/service/list"
-                v3_params = {
-                    'pageNo': 1,
-                    'pageSize': 10,
-                    'namespaceId': namespace,
-                    'groupName': 'DEFAULT_GROUP',
-                    'selector': json.dumps({"type": "none"}, separators=(",", ":")),
-                }
+                # 3.x 中 legacy API 可能已移除。启动检查只需要验证服务可达与鉴权可用，
+                # 不应依赖权限要求更高的 service list。
+                v3_url = f"{base_url}/nacos/v3/admin/core/state"
                 headers = ConnectionChecker._login_v3(base_url, username, password, timeout=10)
                 v3_response = requests.get(
                     v3_url,
-                    params=v3_params,
                     timeout=10,
                     auth=auth,
                     headers=headers or None,
@@ -103,7 +99,7 @@ class ConnectionChecker:
 
                 return False, (
                     f"Nacos legacy API返回 HTTP {response.status_code}，"
-                    f"且 v3 admin API连接失败: HTTP {v3_response.status_code}"
+                    f"且 v3 state API连接失败: HTTP {v3_response.status_code}"
                 )
 
             return False, f"Nacos连接失败: HTTP {response.status_code}"
