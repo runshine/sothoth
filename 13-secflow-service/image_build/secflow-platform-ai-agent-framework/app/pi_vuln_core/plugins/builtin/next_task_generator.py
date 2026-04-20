@@ -2,7 +2,8 @@
 
 import os
 from app.pi_vuln_core.plugins.base import BasePlugin, PluginContext, PluginResult, PluginResultCode
-from app.pi_vuln_core.utils.file_ops import read_file, write_file, write_json, list_dir_files
+from app.pi_vuln_core.utils.file_ops import read_file, write_file, write_json
+from app.pi_vuln_core.utils.result_docs import list_result_report_files
 from app.pi_vuln_core.utils.template import render_template
 from app.pi_vuln_core.utils.logger import get_logger
 
@@ -38,7 +39,7 @@ class NextTaskGeneratorPlugin(BasePlugin):
 
         results_list = []
         if ctx.results_dir and os.path.isdir(ctx.results_dir):
-            results_list = list_dir_files(ctx.results_dir, suffix=".md")
+            results_list = list_result_report_files(ctx.results_dir)
 
         # 如果有配置 agent_id + prompt，使用 AI 生成
         if agent_id and prompt_tpl and ctx.agent_registry:

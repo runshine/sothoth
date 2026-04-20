@@ -92,6 +92,9 @@ class ExecutionRecorder:
         raw_content: str = "",
         verdict: str = "",
         detail_feedback: str = "",
+        blocking_issues: Optional[list[dict]] = None,
+        resolved_issue_ids: Optional[list[str]] = None,
+        workflow_mode: str = "",
     ) -> None:
         """记录全局评审结果"""
         record = {
@@ -107,6 +110,9 @@ class ExecutionRecorder:
             "feedback": content,
             "feedback_detail": detail_feedback,
             "raw_response": raw_content,
+            "blocking_issues": blocking_issues or [],
+            "resolved_issue_ids": resolved_issue_ids or [],
+            "workflow_mode": workflow_mode,
         }
 
         record_dir = Path(work_dir) / "reviews" / "global" / f"cycle_{cycle:03d}"
@@ -169,9 +175,11 @@ class ExecutionRecorder:
         round_num: int,
         prompt_id: str,
         response: str,
+        cycle: int = 0,
     ) -> None:
         """记录Worker自我反思"""
         record = {
+            "cycle": cycle,
             "round": round_num,
             "prompt_id": prompt_id,
             "timestamp": _now_iso(),
@@ -179,7 +187,8 @@ class ExecutionRecorder:
         }
         record_dir = Path(work_dir) / "_meta" / "reflections"
         record_dir.mkdir(parents=True, exist_ok=True)
-        write_json(record_dir / f"reflect_{round_num:03d}_{prompt_id}.json", record)
+        prefix = f"cycle_{cycle:03d}_" if cycle > 0 else ""
+        write_json(record_dir / f"{prefix}reflect_{round_num:03d}_{prompt_id}.json", record)
 
     # ═══════════════════════════════════════
     # 状态与异常记录 (R10)
@@ -240,24 +249,69 @@ class ExecutionRecorder:
     # ═══════════════════════════════════════
 
     async def snapshot_summary(
-        self, work_dir: str, cycle: int, phase: str,
+        self, work_dir: str, cycle: int,
     ) -> None:
         """
-        对 summary.md 做版本快照
-        保存到: _meta/summary_versions/cycle_{N}_{phase}.md
+        对 summary.md 做版本快照。
+
+        保存到:
+        - _meta/summary_snapshots/cycle_{N}_after_summary.md
+        - 若存在 `previous_limitations.md`，同时保存到
+          _meta/previous_limitations_snapshots/cycle_{N}_previous_limitations.md
         """
         summary_path = os.path.join(work_dir, "summary.md")
         if not os.path.exists(summary_path):
             return
 
-        versions_dir = os.path.join(work_dir, "_meta", "summary_versions")
-        os.makedirs(versions_dir, exist_ok=True)
-        snapshot_name = f"cycle_{cycle:03d}_{phase}.md"
-        dst = os.path.join(versions_dir, snapshot_name)
+        snapshots_dir = os.path.join(work_dir, "_meta", "summary_snapshots")
+        os.makedirs(snapshots_dir, exist_ok=True)
+        snapshot_name = f"cycle_{cycle:03d}_after_summary.md"
+        dst = os.path.join(snapshots_dir, snapshot_name)
         shutil.copy2(summary_path, dst)
 
+        from app.pi_vuln_core.review.previous_limitations import (
+            extract_markdown_section,
+            is_substantive_limitations,
+        )
+
+        previous_limitations_dir = os.path.join(
+            work_dir,
+            "_meta",
+            "previous_limitations_snapshots",
+        )
+        os.makedirs(previous_limitations_dir, exist_ok=True)
+        previous_limitations_dst = os.path.join(
+            previous_limitations_dir,
+            f"cycle_{cycle:03d}_previous_limitations.md",
+        )
+
+        previous_limitations_path = os.path.join(work_dir, "previous_limitations.md")
+        if os.path.exists(previous_limitations_path):
+            previous_limitations_content = Path(previous_limitations_path).read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+            if is_substantive_limitations(previous_limitations_content):
+                shutil.copy2(previous_limitations_path, previous_limitations_dst)
+            else:
+                summary_content = Path(summary_path).read_text(encoding="utf-8", errors="replace")
+                section = extract_markdown_section(
+                    summary_content,
+                    ["局限性与未覆盖区域", "局限性"],
+                )
+                if is_substantive_limitations(section):
+                    Path(previous_limitations_dst).write_text(section.rstrip() + "\n", encoding="utf-8")
+        else:
+            summary_content = Path(summary_path).read_text(encoding="utf-8", errors="replace")
+            section = extract_markdown_section(
+                summary_content,
+                ["局限性与未覆盖区域", "局限性"],
+            )
+            if is_substantive_limitations(section):
+                Path(previous_limitations_dst).write_text(section.rstrip() + "\n", encoding="utf-8")
+
         logger.info("summary_snapshot",
-                     cycle=cycle, phase=phase, path=dst)
+                     cycle=cycle, phase="after_summary", path=dst)
 
     # ═══════════════════════════════════════
     # 评审轮次汇总记录 (任务3)
@@ -272,6 +326,9 @@ class ExecutionRecorder:
         total_results: int,
         passed_results: list[str],
         failed_results: list[dict],
+        workflow_mode: str = "",
+        open_blockers: list[dict] | None = None,
+        plateau_status: dict | None = None,
     ) -> None:
         """
         记录每轮评审汇总
@@ -280,9 +337,11 @@ class ExecutionRecorder:
         record = {
             "cycle": cycle,
             "timestamp": _now_iso(),
+            "workflow_mode": workflow_mode,
             "global_review": {
                 "passed": global_passed,
                 "feedback_preview": global_feedback[:500] if global_feedback else "",
+                "open_blockers": open_blockers or [],
             },
             "result_review": {
                 "total": total_results,
@@ -294,6 +353,7 @@ class ExecutionRecorder:
                     for f in failed_results
                 ],
             },
+            "plateau_status": plateau_status or {},
             "outcome": ("all_passed" if (global_passed and len(failed_results) == 0)
                         else "global_failed" if not global_passed
                         else "results_failed"),

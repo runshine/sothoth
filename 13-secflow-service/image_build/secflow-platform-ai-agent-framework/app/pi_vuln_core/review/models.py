@@ -28,6 +28,8 @@ class ParsedReviewResult:
     scores: dict[str, float] = field(default_factory=dict)
     confidence: float = 0.0
     raw_content: str = ""
+    blocking_issues: list[dict[str, Any]] = field(default_factory=list)
+    resolved_issue_ids: list[str] = field(default_factory=list)
 
 
 _CONFIDENCE_MAP = {
@@ -54,8 +56,13 @@ _FAIL_VERDICT_PATTERNS = [
     r"insufficient[_ ]info",
     r"unverified",
     r"reject(?:ed)?",
+    r"refut(?:e|ed)",
+    r"dismiss(?:ed)?",
     r"invalid",
     r"not[_ ]?pass(?:ed)?",
+    r"not[_ ]?(?:achievable|exploitable|valid)",
+    r"not a vulnerability",
+    r"\bfail(?:ed)?\b",
     r"false[_ ]alarm",
     r"证据不足",
     r"(?<!无)误报",
@@ -64,6 +71,9 @@ _FAIL_VERDICT_PATTERNS = [
     r"未通过",
     r"不合格",
     r"漏洞不存在",
+    r"不可利用",
+    r"不可达",
+    r"不成立",
     r"需要修改",
     r"需要重做",
 ]
@@ -75,6 +85,7 @@ _PASS_VERDICT_PATTERNS = [
     r"valid",
     r"confirmed",
     r"verified",
+    r"\bpass(?:ed)?\b",
     r"通过",
     r"合格",
     r"成立",
@@ -108,25 +119,21 @@ def parse_review_response(content: str) -> ParsedReviewResult:
     1. JSON 格式（含多种 verdict/feedback 字段）
     2. Markdown/纯文本格式（提取结论行）
     3. 关键词检测
-    4. 最终兜底：默认通过（保持原框架的保守行为）
+    4. 最终兜底：默认不通过（fail-close，避免误放行）
     """
-    raw = (content or "").strip()
+    original = content or ""
+    raw = original.strip()
 
     try:
-        json_result = _try_parse_json(raw)
+        if not raw:
+            return _default_fail_result(original, "评审智能体返回空响应，按不通过处理")
+        json_result = _try_parse_json(original)
         if json_result is not None:
             return json_result
-        return _parse_by_keywords(raw)
+        return _parse_by_keywords(original)
     except Exception:
-        detail = f"[评审响应解析失败，默认通过] {_one_line(raw)[:300]}"
-        verdict = "PASS"
-        return ParsedReviewResult(
-            passed=True,
-            verdict=verdict,
-            feedback=_build_normalized_feedback(verdict, detail, True),
-            feedback_detail=detail,
-            raw_content=raw,
-        )
+        detail = f"[评审响应解析失败，默认不通过] {_one_line(raw)[:300]}"
+        return _default_fail_result(original, detail)
 
 
 def _try_parse_json(content: str) -> Optional[ParsedReviewResult]:
@@ -164,11 +171,20 @@ def _try_parse_json(content: str) -> Optional[ParsedReviewResult]:
 def _json_to_result(data: dict[str, Any], raw: str) -> ParsedReviewResult:
     """将 JSON dict 转为 ParsedReviewResult"""
     passed = _extract_passed_from_json(data)
-    if passed is None:
-        passed = True
 
     detail_feedback = _extract_feedback_from_json(data)
     verdict_hint = _extract_verdict_text_from_json(data) or detail_feedback
+
+    classified = _classify_verdict_text(verdict_hint) if verdict_hint else None
+    if passed is None:
+        passed = classified
+    elif classified is not None and classified != passed:
+        passed = False
+
+    if passed is None:
+        detail = detail_feedback or verdict_hint or "评审 JSON 缺少明确 passed/verdict，按不通过处理"
+        return _default_fail_result(raw, detail)
+
     verdict = _normalize_verdict_label(verdict_hint, passed)
 
     if not detail_feedback:
@@ -176,6 +192,8 @@ def _json_to_result(data: dict[str, Any], raw: str) -> ParsedReviewResult:
 
     scores = _extract_scores_from_json(data)
     confidence = _extract_confidence_from_json(data)
+    blocking_issues = _extract_blocking_issues_from_json(data)
+    resolved_issue_ids = _extract_resolved_issue_ids_from_json(data)
 
     return ParsedReviewResult(
         passed=bool(passed),
@@ -185,6 +203,8 @@ def _json_to_result(data: dict[str, Any], raw: str) -> ParsedReviewResult:
         scores=scores,
         confidence=confidence,
         raw_content=raw,
+        blocking_issues=blocking_issues,
+        resolved_issue_ids=resolved_issue_ids,
     )
 
 
@@ -211,7 +231,10 @@ def _parse_by_keywords(content: str) -> ParsedReviewResult:
                 break
 
     if passed is None:
-        passed = True
+        return _default_fail_result(
+            content,
+            "评审响应未包含明确可判定的通过/不通过信号，按不通过处理",
+        )
 
     verdict = _normalize_verdict_label(verdict_text or content, passed)
     return ParsedReviewResult(
@@ -235,22 +258,21 @@ def _walk_values(obj: Any):
 
 
 def _extract_passed_from_json(data: dict[str, Any]) -> Optional[bool]:
-    for node in _walk_values(data):
-        if isinstance(node, dict):
-            for key in ("passed", "pass", "approved", "accepted"):
-                if key in node:
-                    value = node[key]
-                    if isinstance(value, bool):
-                        return value
-                    if isinstance(value, str):
-                        verdict = _classify_verdict_text(value)
-                        if verdict is not None:
-                            return verdict
-                        low = value.strip().lower()
-                        if low in ("true", "yes", "y", "1"):
-                            return True
-                        if low in ("false", "no", "n", "0"):
-                            return False
+    for key in ("passed", "pass", "approved", "accepted"):
+        if key not in data:
+            continue
+        value = data[key]
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            verdict = _classify_verdict_text(value)
+            if verdict is not None:
+                return verdict
+            low = value.strip().lower()
+            if low in ("true", "yes", "y", "1"):
+                return True
+            if low in ("false", "no", "n", "0"):
+                return False
 
     verdict_text = _extract_verdict_text_from_json(data)
     if verdict_text:
@@ -267,34 +289,52 @@ def _extract_feedback_from_json(data: dict[str, Any]) -> str:
     """提取尽量可读的详细反馈文本（稳定写入 feedback_detail）"""
     keys = (
         "feedback", "reason", "message", "summary", "conclusion",
-        "details", "description", "recommendation", "overall_assessment",
+        "details", "description", "overall_assessment",
         "overall_verdict", "assessment", "verification_summary",
         "verification_status",
     )
+    for key in keys:
+        rendered = _stringify_feedback_candidate(data.get(key))
+        if rendered:
+            return rendered
+
     for node in _walk_values(data):
-        if isinstance(node, dict):
-            for key in keys:
-                value = node.get(key)
-                rendered = _stringify_feedback_candidate(value)
-                if rendered:
-                    return rendered
+        if not isinstance(node, dict) or node is data:
+            continue
+        for key in keys:
+            value = node.get(key)
+            rendered = _stringify_feedback_candidate(value)
+            if rendered:
+                return rendered
     return ""
 
 
 def _extract_verdict_text_from_json(data: dict[str, Any]) -> str:
-    keys = (
+    top_level_keys = (
         "verdict", "decision", "final_decision", "final_verdict",
         "overall_verdict", "review_conclusion", "action", "status",
-        "recommendation", "verification_status",
+        "verification_status",
     )
+    nested_fallback_keys = (
+        "overall_verdict", "final_verdict", "verification_status",
+    )
+
+    for key in top_level_keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            classified = _classify_verdict_text(value)
+            if classified is not None:
+                return value.strip()
+
     for node in _walk_values(data):
-        if isinstance(node, dict):
-            for key in keys:
-                value = node.get(key)
-                if isinstance(value, str) and value.strip():
-                    classified = _classify_verdict_text(value)
-                    if classified is not None:
-                        return value.strip()
+        if not isinstance(node, dict) or node is data:
+            continue
+        for key in nested_fallback_keys:
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                classified = _classify_verdict_text(value)
+                if classified is not None:
+                    return value.strip()
     return ""
 
 
@@ -316,6 +356,119 @@ def _extract_confidence_from_json(data: dict[str, Any]) -> float:
                 if key in node:
                     return _normalize_to_float(node[key])
     return 0.0
+
+
+def _extract_blocking_issues_from_json(data: dict[str, Any]) -> list[dict[str, Any]]:
+    keys = (
+        "blocking_issues",
+        "blockingIssues",
+        "open_blockers",
+        "openBlockers",
+        "blockers",
+    )
+    for node in _walk_values(data):
+        if not isinstance(node, dict):
+            continue
+        for key in keys:
+            value = node.get(key)
+            if isinstance(value, list):
+                issues: list[dict[str, Any]] = []
+                for item in value:
+                    normalized = _normalize_blocking_issue(item)
+                    if normalized:
+                        issues.append(normalized)
+                if issues:
+                    return issues
+    return []
+
+
+def _extract_resolved_issue_ids_from_json(data: dict[str, Any]) -> list[str]:
+    keys = (
+        "resolved_issues",
+        "resolved_issue_ids",
+        "resolvedIssues",
+        "resolvedIssueIds",
+    )
+    for node in _walk_values(data):
+        if not isinstance(node, dict):
+            continue
+        for key in keys:
+            value = node.get(key)
+            if isinstance(value, list):
+                seen: list[str] = []
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        seen.append(item.strip())
+                    elif isinstance(item, dict):
+                        item_id = str(
+                            item.get("id")
+                            or item.get("issue_id")
+                            or item.get("blocker_id")
+                            or ""
+                        ).strip()
+                        if item_id:
+                            seen.append(item_id)
+                if seen:
+                    return seen
+    return []
+
+
+def _normalize_blocking_issue(item: Any) -> dict[str, Any]:
+    if isinstance(item, str):
+        text = item.strip()
+        if not text:
+            return {}
+        return {
+            "id": "",
+            "category": "global_review",
+            "target": "",
+            "severity": "high",
+            "required_action": text,
+            "detail": text,
+        }
+
+    if not isinstance(item, dict):
+        return {}
+
+    issue_id = str(
+        item.get("id")
+        or item.get("issue_id")
+        or item.get("blocker_id")
+        or item.get("key")
+        or ""
+    ).strip()
+    category = str(item.get("category") or item.get("type") or "").strip()
+    target = str(item.get("target") or item.get("path") or item.get("subject") or "").strip()
+    severity = str(item.get("severity") or item.get("priority") or "").strip()
+    required_action = str(
+        item.get("required_action")
+        or item.get("action")
+        or item.get("recommendation")
+        or item.get("summary")
+        or item.get("detail")
+        or item.get("description")
+        or ""
+    ).strip()
+    detail = str(
+        item.get("detail")
+        or item.get("description")
+        or item.get("summary")
+        or required_action
+    ).strip()
+    status = str(item.get("status") or "open").strip() or "open"
+
+    if not any([issue_id, category, target, required_action, detail]):
+        return {}
+
+    return {
+        "id": issue_id,
+        "category": category,
+        "target": target,
+        "severity": severity,
+        "required_action": required_action,
+        "detail": detail,
+        "status": status,
+    }
 
 
 def _normalize_to_float(value: Any) -> float:
@@ -344,7 +497,7 @@ def _extract_explicit_verdict(content: str) -> str:
         return ""
     patterns = [
         r'(?:评审结论|最终判定|裁决|结论|verdict|overall_verdict|final_verdict)\s*[:：]\s*\**\s*([A-Za-z_ -]+)',
-        r'\*\*\s*(FALSE_POSITIVE|TRUE_POSITIVE|INSUFFICIENT_INFO|REJECT|ACCEPT|APPROVED|UNVERIFIED|VALID|VERIFIED)\s*\*\*',
+        r'\*\*\s*(FALSE_POSITIVE|TRUE_POSITIVE|INSUFFICIENT_INFO|REJECT|REJECTED|REFUTED|DISMISS|DISMISSED|ACCEPT|APPROVED|UNVERIFIED|VALID|VERIFIED|CONFIRMED)\s*\*\*',
     ]
     for pattern in patterns:
         m = re.search(pattern, content, re.IGNORECASE)
@@ -379,6 +532,10 @@ def _normalize_verdict_label(text: str, passed: Optional[bool]) -> str:
         return "UNVERIFIED"
     if re.match(r'^reject(?:ed)?\b', low) or compact.startswith("驳回"):
         return "REJECT"
+    if re.match(r'^refut(?:e|ed)\b', low):
+        return "REFUTED"
+    if re.match(r'^dismiss(?:ed)?\b', low):
+        return "DISMISS"
     if re.match(r'^invalid\b', low):
         return "INVALID"
     if re.match(r'^true[_ ]positive\b', low):
@@ -421,6 +578,17 @@ def _build_normalized_feedback(verdict: str, detail: str, passed: bool) -> str:
     if detail_summary.upper() == verdict_label:
         return verdict_summary
     return f"{verdict_summary} - {detail_summary}"[:300]
+
+
+def _default_fail_result(raw: str, detail: str) -> ParsedReviewResult:
+    verdict = "FAIL"
+    return ParsedReviewResult(
+        passed=False,
+        verdict=verdict,
+        feedback=_build_normalized_feedback(verdict, detail, False),
+        feedback_detail=detail,
+        raw_content=raw,
+    )
 
 
 def _extract_feedback_summary(text: str) -> str:
@@ -498,6 +666,10 @@ def _format_verdict_summary(verdict: str) -> str:
         return "REJECT（驳回）"
     if upper == "INVALID":
         return "INVALID（无效）"
+    if upper == "REFUTED":
+        return "REFUTED（已证伪）"
+    if upper == "DISMISS":
+        return "DISMISS（应驳回）"
     if upper == "TRUE_POSITIVE":
         return "TRUE_POSITIVE（有效发现）"
     if upper == "CONFIRMED":
@@ -523,6 +695,10 @@ def _format_verdict_summary(verdict: str) -> str:
         return "UNVERIFIED（未证实）"
     if re.search(r'reject|驳回', low):
         return "REJECT（驳回）"
+    if re.search(r'refut(?:e|ed)', low):
+        return "REFUTED（已证伪）"
+    if re.search(r'dismiss(?:ed)?', low):
+        return "DISMISS（应驳回）"
     if re.search(r'invalid', low):
         return "INVALID（无效）"
     if re.search(r'true[_ ]positive', low):

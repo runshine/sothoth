@@ -31,8 +31,8 @@
 ### 前置条件
 
 ```bash
-cd workflow-framework
-pip install pydantic structlog jsonschema aiofiles jinja2
+cd secflow-platform-ai-agent-framework
+pip install -r requirements.txt
 # 确保 pi CLI 已安装（用于调用 AI 智能体）
 pi --version
 ```
@@ -73,7 +73,7 @@ python3 run_vuln_scan.py \
 
 ```bash
 # 1. 复制默认配置
-cp config/vuln_scan_default.json my_config.json
+cp config.vuln_scan_default.json my_config.json
 
 # 2. 编辑 my_config.json，修改你关心的字段（模型/超时/评审轮次 等）
 #    执行路径类字段 (workspace_root, task_file 等) 无需修改，启动器会自动覆盖
@@ -92,7 +92,7 @@ python3 run_vuln_scan.py \
 | `model` | `agents[*].runtime_config.model` | AI 模型名称 |
 | `provider` | `agents[*].runtime_config.sdk_specific.provider` | 模型提供商 |
 | `timeout_seconds` | `agents[*].runtime_config.timeout_seconds` | 超时时间 |
-| `thinking` | `agents[*].runtime_config.sdk_specific.thinking` | 思考深度 |
+| `thinking` | `agents[*].runtime_config.sdk_specific.thinking` | 思考深度，可设为 `off` / `low` / `medium` / `high` / `xhigh` |
 | `max_review_cycles` | `global` 或 `workflows.atomic[*].engine` | 评审循环次数 |
 | `parallel_result_review` | `global.parallel_result_review` | 是否开启结果评审并行 |
 | `parallel_result_review_limit` | `global.parallel_result_review_limit` | 结果评审并发上限（默认 3） |
@@ -254,11 +254,11 @@ python3 run_vuln_scan.py --data-flow <path> --source-dir <path> [选项]
 |------|--------|------|
 | `--data-flow, -d` | *(必须)* | 数据流分析文件 (.md) |
 | `--source-dir, -s` | *(必须)* | 源码目录 |
-| `--config, -c` | | 自定义配置文件 (复制 `config/vuln_scan_default.json` 后修改) |
+| `--config, -c` | | 自定义配置文件 (复制 `config.vuln_scan_default.json` 后修改) |
 | `--run-name, -n` | 自动生成 | 运行名称 |
 | `--model, -m` | `claude-sonnet-4-20250514` | AI 模型 (未指定 `-c` 时生效) |
 | `--provider` | 自动推断 | 模型提供商 (未指定 `-c` 时生效) |
-| `--thinking` | `high` | 思考深度 (未指定 `-c` 时生效) |
+| `--thinking` | `high` | 思考深度 (可选: `off` / `low` / `medium` / `high` / `xhigh`，未指定 `-c` 时生效) |
 | `--max-cycles` | `3` | 最大评审循环次数 (未指定 `-c` 时生效) |
 | `--worker-timeout` | `1800` | Worker 超时秒数 (未指定 `-c` 时生效) |
 | `--advisor-timeout` | `1800` | Advisor 超时秒数 (未指定 `-c` 时生效) |
@@ -359,10 +359,10 @@ vuln_scan_initial_001/
 │   │   ├── cycle_001.json                第1轮: 全局是否通过/哪些结果失败
 │   │   ├── cycle_002.json                第2轮
 │   │   └── cycle_003.json                第3轮
-│   └── summary_versions/              summary.md 各版本快照
+│   └── summary_snapshots/             summary.md 各轮快照
 │       ├── cycle_001_after_summary.md    第1轮 Worker 写完的版本
-│       ├── cycle_001_after_review.md     第1轮评审时的版本
 │       ├── cycle_002_after_summary.md    第2轮修改后版本
+│       ├── cycle_003_after_summary.md    第3轮修改后版本
 │       └── ...
 │
 │  ════ 输入 / 工作区 / 产出 ════
@@ -432,7 +432,7 @@ vuln_scan_initial_001/
 | 看执行是否成功 | `_meta/workflow_result.json` |
 | 看某个漏洞为什么被驳回 | `reviews/results/result_NNN/cycle_NNN/result_fp_check.json` |
 | 看全局评审意见 | `reviews/global/cycle_NNN/global_quality.json` |
-| 看 Worker 怎么修改报告 | `_meta/summary_versions/cycle_NNN_*.md` (对比前后) |
+| 看 Worker 怎么修改报告 | `_meta/summary_snapshots/cycle_NNN_after_summary.md`（对比不同轮次） |
 | 看 Agent 原始对话 | `sessions/*/...jsonl`（若该 runtime 提供原生日志） |
 | 看某次调用的完整命令行与 prompt | `sessions/*/calls/*/command.txt` + `user_prompt.md` + `system_prompt.md` |
 | 看完整运行日志 | `runs/{run_name}/run.log` |
@@ -595,22 +595,138 @@ python -m pytest tests/unit/test_review_models.py -v
 
 ---
 
-## Docker & K8S 部署 (未完成)
+## Docker & K8S 部署
+
+### Docker 镜像说明
+
+仓库根目录已经提供可直接构建的 `Dockerfile`，镜像默认入口是 `run_vuln_scan.py`，适合把本框架移植给其他人直接做漏洞扫描。
+
+镜像内默认包含：
+- Python 运行环境与项目依赖
+- `run_vuln_scan.py`
+- 框架核心代码、prompts、默认配置模板
+- `pi` CLI（默认构建时安装，可通过 build arg 关闭）
+
+### 1. 构建镜像
 
 ```bash
-# 构建
-docker build -t workflow-framework .
-
-# 本地运行
-docker run --rm \
-  -v $(pwd)/config:/config \
-  -v $(pwd)/input:/input \
-  -v $(pwd)/output:/output \
-  workflow-framework --config /config/workflow.json
-
-# K8S Job
-kubectl apply -f k8s/job.yaml
+docker build -t secflow-ai-agent-framework .
 ```
+
+可选构建参数：
+
+```bash
+# 如需关闭 pi CLI 安装（仅做纯框架/调试镜像）
+docker build \
+  --build-arg INSTALL_PI_CLI=0 \
+  -t secflow-ai-agent-framework .
+```
+
+### 2. 准备宿主机输入目录
+
+建议在宿主机准备如下目录：
+
+```text
+docker/input/
+├── data_flow.md      # 数据流分析 markdown 文件
+└── source/           # 源码目录（.c/.h/.asm 等）
+```
+
+### 3. 直接运行漏洞扫描
+
+```bash
+docker run --rm \
+  -v "$(pwd)/docker/input:/data:ro" \
+  -v "$(pwd)/runs:/app/runs" \
+  -v "$HOME/.pi:/root/.pi" \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  secflow-ai-agent-framework \
+  --data-flow /data/data_flow.md \
+  --source-dir /data/source \
+  --run-name demo_scan \
+  --model claude-sonnet-4-20250514 \
+  --provider anthropic \
+  --max-cycles 10
+```
+
+说明：
+- `docker/input` 挂到容器内 `/data`
+- `runs` 挂到容器内 `/app/runs`，用于持久化运行结果
+- `$HOME/.pi:/root/.pi` 用于复用宿主机已有的 `pi` CLI 登录态/配置
+- 若你使用 API Key 方式接入 provider，也可以只传环境变量，不挂载 `/root/.pi`
+
+### 4. 继续已有 run
+
+```bash
+docker run --rm \
+  -v "$(pwd)/runs:/app/runs" \
+  -v "$HOME/.pi:/root/.pi" \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  secflow-ai-agent-framework \
+  --resume-run-dir runs/demo_scan \
+  --extra-cycles 5
+```
+
+### 5. 使用自定义配置运行通用框架
+
+镜像默认入口是 `run_vuln_scan.py`。如果你想直接运行底层框架 JSON 配置，请使用内置分发命令 `framework-run`：
+
+```bash
+docker run --rm \
+  -v "$(pwd)/my-config:/config:ro" \
+  -v "$(pwd)/workspace:/workspace" \
+  -v "$HOME/.pi:/root/.pi" \
+  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  secflow-ai-agent-framework \
+  framework-run \
+  --config /config/workflow.json \
+  --keep-workspace
+```
+
+### 6. 启动 REST 服务
+
+如果你需要启动服务模式：
+
+```bash
+docker run --rm -p 8000:8000 secflow-ai-agent-framework serve
+```
+
+### 7. 使用 `docker compose`
+
+仓库根目录已提供 `docker-compose.yml` 和 `.env.example`：
+
+```bash
+cp .env.example .env
+# 按需修改 .env 中的 HOST_PI_HOME / MODEL / PROVIDER / RUN_NAME 等
+
+docker compose build
+docker compose run --rm vuln-scan
+```
+
+默认 compose 约定：
+- 宿主机输入目录：`./docker/input`
+- 宿主机结果目录：`./runs`
+- 宿主机 `pi` 配置目录：`.env` 中的 `HOST_PI_HOME`
+
+### 8. 容器内可用入口
+
+```bash
+# 默认：漏洞扫描入口
+docker run --rm secflow-ai-agent-framework --help
+
+# 底层框架 JSON 运行
+docker run --rm secflow-ai-agent-framework framework-run --help
+
+# 服务模式
+docker run --rm secflow-ai-agent-framework serve
+
+# 进入 shell 调试
+docker run --rm -it --entrypoint bash secflow-ai-agent-framework
+```
+
+### 9. K8S
+
+当前仓库仍保留旧的 `k8s/job.yaml` 示例，但推荐先以 Docker/Compose 方式验证镜像、输入挂载、`pi` 登录态和 provider 凭据都工作正常，再迁移到 Kubernetes。
 
 ---
 

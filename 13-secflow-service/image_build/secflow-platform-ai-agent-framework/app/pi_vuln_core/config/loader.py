@@ -22,6 +22,8 @@ from app.pi_vuln_core.config.models import (
 )
 from app.pi_vuln_core.utils.logger import get_logger
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 logger = get_logger("config")
 
 
@@ -61,6 +63,9 @@ class ConfigLoader:
         except json.JSONDecodeError as e:
             raise ConfigValidationError([f"JSON 解析失败: {e}"])
 
+        # 3.1 解析相对 prompt 路径（相对于配置文件目录）
+        ConfigLoader._resolve_prompt_paths(raw_data, base_dir=path.parent)
+
         # 4. Pydantic 模型校验
         try:
             config = FrameworkConfig.model_validate(raw_data)
@@ -89,6 +94,27 @@ class ConfigLoader:
                 return match.group(0)  # 保留原样
             return value
         return re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}', _replace, text)
+
+    @staticmethod
+    def _resolve_prompt_paths(obj: Any, *, base_dir: Path) -> None:
+        prompt_keys = {
+            "system_prompt_file", "user_prompt_file",
+            "user_prompt_template", "prompt_file",
+        }
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in prompt_keys and isinstance(value, str) and not os.path.isabs(value):
+                    config_relative = (base_dir / value).resolve()
+                    project_relative = (PROJECT_ROOT / value).resolve()
+                    if config_relative.exists() or not project_relative.exists():
+                        obj[key] = str(config_relative)
+                    else:
+                        obj[key] = str(project_relative)
+                else:
+                    ConfigLoader._resolve_prompt_paths(value, base_dir=base_dir)
+        elif isinstance(obj, list):
+            for item in obj:
+                ConfigLoader._resolve_prompt_paths(item, base_dir=base_dir)
 
     @staticmethod
     def _validate_references(config: FrameworkConfig) -> None:

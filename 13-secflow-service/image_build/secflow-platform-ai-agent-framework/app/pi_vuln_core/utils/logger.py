@@ -61,6 +61,7 @@ class TeeStream:
 _active_log_file: Optional[io.TextIOBase] = None
 _original_stdout: Optional[io.TextIOBase] = None
 _original_stderr: Optional[io.TextIOBase] = None
+_current_log_level: str = "INFO"
 
 
 def attach_log_file(log_path: str) -> str:
@@ -96,6 +97,7 @@ def attach_log_file(log_path: str) -> str:
 
     sys.stdout = TeeStream(sys.stdout, log_file)
     sys.stderr = TeeStream(sys.stderr, log_file)
+    setup_logging(_current_log_level)
 
     return str(path.resolve())
 
@@ -120,6 +122,7 @@ def detach_log_file() -> None:
         except Exception:
             pass
         _active_log_file = None
+    setup_logging(_current_log_level)
 
 
 def get_log_file_path() -> Optional[str]:
@@ -135,7 +138,14 @@ def get_log_file_path() -> Optional[str]:
 
 def setup_logging(level: str = "INFO") -> None:
     """初始化 structlog, 输出 JSON 到 stdout"""
-    log_level = getattr(logging, level.upper(), logging.INFO)
+    global _current_log_level
+    _current_log_level = level.upper()
+    log_level = getattr(logging, _current_log_level, logging.INFO)
+
+    try:
+        structlog.reset_defaults()
+    except Exception:
+        pass
 
     structlog.configure(
         processors=[
@@ -148,8 +158,8 @@ def setup_logging(level: str = "INFO") -> None:
         ],
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
-        cache_logger_on_first_use=True,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=False,
     )
 
 

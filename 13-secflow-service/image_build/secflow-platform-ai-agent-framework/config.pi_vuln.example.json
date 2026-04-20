@@ -108,18 +108,18 @@
             "reset_context_override": null,
             "prompts": {
               "work": {
-                "system_prompt_file": "prompts/worker_system.md",
-                "user_prompt_file": "prompts/worker_user.md"
+                "system_prompt_file": "prompts/vuln_scan/worker_system.md",
+                "user_prompt_file": "prompts/vuln_scan/worker_user.md"
               },
               "reflection": [
                 {
                   "id": "reflect_completeness",
-                  "prompt_file": "prompts/reflect_completeness.md",
+                  "prompt_file": "prompts/vuln_scan/reflect_completeness.md",
                   "description": "检查是否遗漏了常见漏洞类型"
                 }
               ],
               "summary": {
-                "prompt_file": "prompts/summary.md",
+                "prompt_file": "prompts/vuln_scan/summary.md",
                 "output_summary_filename": "summary.md",
                 "output_results_dir": "results"
               }
@@ -132,8 +132,8 @@
                 "agent_id": "mock-advisor",
                 "role_name": "全面性评审员",
                 "re_review_on_cycle": true,
-                "system_prompt_file": "prompts/global_review_sys.md",
-                "user_prompt_template": "prompts/global_review_user.md"
+                "system_prompt_file": "prompts/vuln_scan/global_review_sys.md",
+                "user_prompt_template": "prompts/vuln_scan/global_review_user.md"
               }
             ],
             "result_review": [
@@ -142,8 +142,8 @@
                 "agent_id": "mock-advisor",
                 "role_name": "误报检测员",
                 "re_review_on_cycle": false,
-                "system_prompt_file": "prompts/result_review_sys.md",
-                "user_prompt_template": "prompts/result_review_user.md"
+                "system_prompt_file": "prompts/vuln_scan/result_review_sys.md",
+                "user_prompt_template": "prompts/vuln_scan/result_review_user.md"
               }
             ]
           }

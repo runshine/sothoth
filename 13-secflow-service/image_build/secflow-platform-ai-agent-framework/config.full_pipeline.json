@@ -1,0 +1,474 @@
+{
+  "_说明": "全流水线自动化漏洞挖掘配置模板。包含 6 个原子工作流（5 个 Docker 集成 + 1 个 AI 漏洞挖掘）。",
+  "_说明2": "前 5 个 Docker 阶段的 Prompt 中包含 TODO 占位符，需替换为实际的 Docker 镜像名称和命令。",
+  "_说明3": "执行路径类字段标记为 __AUTO__，由启动脚本自动填充。",
+
+  "version": "1.0",
+
+  "global": {
+    "workspace_root": "__AUTO__",
+    "log_level": "INFO",
+    "max_workflow_retry": 1,
+    "max_review_cycles": 10,
+    "default_context_reset": true,
+    "parallel_result_review": true,
+    "parallel_result_review_limit": 3,
+    "env_vars": {}
+  },
+
+  "agents": [
+    {
+      "id": "docker-runner",
+      "name": "Docker 容器执行器",
+      "type": "pi_agent",
+      "reset_context": true,
+      "runtime_config": {
+        "model": "claude-sonnet-4-20250514",
+        "timeout_seconds": 3600,
+        "sdk_specific": {
+          "provider": "anthropic",
+          "thinking": "low",
+          "tools": "bash,read,write"
+        }
+      }
+    },
+    {
+      "id": "pi-worker",
+      "name": "Pi Agent Worker",
+      "type": "pi_agent",
+      "reset_context": false,
+      "runtime_config": {
+        "model": "claude-sonnet-4-20250514",
+        "timeout_seconds": 1800,
+        "sdk_specific": {
+          "provider": "anthropic",
+          "thinking": "high"
+        }
+      }
+    },
+    {
+      "id": "pi-advisor",
+      "name": "Pi Agent Advisor",
+      "type": "pi_agent",
+      "reset_context": true,
+      "runtime_config": {
+        "model": "claude-sonnet-4-20250514",
+        "timeout_seconds": 1800,
+        "sdk_specific": {
+          "provider": "anthropic",
+          "thinking": "high",
+          "tools": "read,bash"
+        }
+      }
+    }
+  ],
+
+  "plugins": [
+    {
+      "id": "env_setup",
+      "name": "环境变量设置",
+      "module_path": "app.pi_vuln_core.plugins.builtin.env_setup",
+      "class_name": "EnvSetupPlugin",
+      "config": {}
+    },
+    {
+      "id": "workspace_init",
+      "name": "工作目录初始化",
+      "module_path": "app.pi_vuln_core.plugins.builtin.workspace_init",
+      "class_name": "WorkspaceInitPlugin",
+      "config": {
+        "create_subdirs": ["input", "working", "results", "reviews", "output"]
+      }
+    },
+    {
+      "id": "workspace_init_docker",
+      "name": "Docker 工作目录初始化",
+      "module_path": "app.pi_vuln_core.plugins.builtin.workspace_init",
+      "class_name": "WorkspaceInitPlugin",
+      "config": {
+        "create_subdirs": ["input", "working", "results", "output", "docker_output"]
+      }
+    },
+    {
+      "id": "task_validator",
+      "name": "输入任务校验",
+      "module_path": "app.pi_vuln_core.plugins.builtin.task_validator",
+      "class_name": "TaskValidatorPlugin",
+      "config": {}
+    },
+    {
+      "id": "result_archiver",
+      "name": "结果归档",
+      "module_path": "app.pi_vuln_core.plugins.builtin.result_archiver",
+      "class_name": "ResultArchiverPlugin",
+      "config": {
+        "archive_format": "tar.gz"
+      }
+    },
+    {
+      "id": "final_output_collector",
+      "name": "最终产出收集",
+      "module_path": "app.pi_vuln_core.plugins.builtin.final_output_collector",
+      "class_name": "FinalOutputCollectorPlugin",
+      "config": {
+        "output_subdir": "final_output"
+      }
+    },
+    {
+      "id": "next_task_generator",
+      "name": "下阶段任务生成器",
+      "module_path": "app.pi_vuln_core.plugins.builtin.next_task_generator",
+      "class_name": "NextTaskGeneratorPlugin",
+      "config": {
+        "output_subdir": "output"
+      }
+    }
+  ],
+
+  "workflows": {
+    "atomic": [
+
+      {
+        "id": "unpack_analysis",
+        "name": "解包分析",
+        "type": "atomic",
+        "description": "调用 Docker 容器对产品软件包进行解包，输出完整的文件和文件夹内容",
+        "working_dir_template": "unpack_{task_id}",
+        "start_plugins": ["env_setup", "workspace_init_docker", "task_validator"],
+        "end_plugins": ["next_task_generator"],
+        "engine": {
+          "max_review_cycles": 1,
+          "max_worker_turns_per_cycle": 10
+        },
+        "roles": {
+          "worker": {
+            "agent_id": "docker-runner",
+            "new_session": true,
+            "prompts": {
+              "work": {
+                "system_prompt_file": "prompts/pipeline/docker_system.md",
+                "user_prompt_file": "prompts/pipeline/unpack_analysis/worker_user.md"
+              },
+              "reflection": [],
+              "summary": {
+                "prompt_file": "prompts/pipeline/unpack_analysis/summary.md",
+                "output_summary_filename": "summary.md",
+                "output_results_dir": "results"
+              }
+            }
+          },
+          "advisors": {
+            "global_review": [],
+            "result_review": []
+          }
+        }
+      },
+
+      {
+        "id": "system_analysis",
+        "name": "系统分析",
+        "type": "atomic",
+        "description": "调用 Docker 容器分析解包后的系统，识别高危模块并分别输出到独立子文件夹",
+        "working_dir_template": "sysanalysis_{task_id}",
+        "start_plugins": ["env_setup", "workspace_init_docker", "task_validator"],
+        "end_plugins": ["next_task_generator"],
+        "engine": {
+          "max_review_cycles": 1,
+          "max_worker_turns_per_cycle": 10
+        },
+        "roles": {
+          "worker": {
+            "agent_id": "docker-runner",
+            "new_session": true,
+            "prompts": {
+              "work": {
+                "system_prompt_file": "prompts/pipeline/docker_system.md",
+                "user_prompt_file": "prompts/pipeline/system_analysis/worker_user.md"
+              },
+              "reflection": [],
+              "summary": {
+                "prompt_file": "prompts/pipeline/system_analysis/summary.md",
+                "output_summary_filename": "summary.md",
+                "output_results_dir": "results"
+              }
+            }
+          },
+          "advisors": {
+            "global_review": [],
+            "result_review": []
+          }
+        }
+      },
+
+      {
+        "id": "decompile_optimize",
+        "name": "反编译优化",
+        "type": "atomic",
+        "description": "调用 Docker 容器对单个高危模块进行反编译和优化，输出可读的反编译源码",
+        "working_dir_template": "decompile_{task_id}",
+        "start_plugins": ["env_setup", "workspace_init_docker", "task_validator"],
+        "end_plugins": ["next_task_generator"],
+        "engine": {
+          "max_review_cycles": 1,
+          "max_worker_turns_per_cycle": 10
+        },
+        "roles": {
+          "worker": {
+            "agent_id": "docker-runner",
+            "new_session": true,
+            "prompts": {
+              "work": {
+                "system_prompt_file": "prompts/pipeline/docker_system.md",
+                "user_prompt_file": "prompts/pipeline/decompile_optimize/worker_user.md"
+              },
+              "reflection": [],
+              "summary": {
+                "prompt_file": "prompts/pipeline/decompile_optimize/summary.md",
+                "output_summary_filename": "summary.md",
+                "output_results_dir": "results"
+              }
+            }
+          },
+          "advisors": {
+            "global_review": [],
+            "result_review": []
+          }
+        }
+      },
+
+      {
+        "id": "external_entry_analysis",
+        "name": "外部数据入口分析",
+        "type": "atomic",
+        "description": "调用 Docker 容器分析反编译源码中的外部消息处理函数入口，输出函数入口报告列表",
+        "working_dir_template": "entryanalysis_{task_id}",
+        "start_plugins": ["env_setup", "workspace_init_docker", "task_validator"],
+        "end_plugins": ["next_task_generator"],
+        "engine": {
+          "max_review_cycles": 1,
+          "max_worker_turns_per_cycle": 10
+        },
+        "roles": {
+          "worker": {
+            "agent_id": "docker-runner",
+            "new_session": true,
+            "prompts": {
+              "work": {
+                "system_prompt_file": "prompts/pipeline/docker_system.md",
+                "user_prompt_file": "prompts/pipeline/external_entry_analysis/worker_user.md"
+              },
+              "reflection": [],
+              "summary": {
+                "prompt_file": "prompts/pipeline/external_entry_analysis/summary.md",
+                "output_summary_filename": "summary.md",
+                "output_results_dir": "results"
+              }
+            }
+          },
+          "advisors": {
+            "global_review": [],
+            "result_review": []
+          }
+        }
+      },
+
+      {
+        "id": "data_flow_analysis",
+        "name": "数据流分析",
+        "type": "atomic",
+        "description": "调用 Docker 容器对单个外部消息处理函数入口进行数据流分析，输出数据流追踪结果",
+        "working_dir_template": "dataflow_{task_id}",
+        "start_plugins": ["env_setup", "workspace_init_docker", "task_validator"],
+        "end_plugins": ["next_task_generator"],
+        "engine": {
+          "max_review_cycles": 1,
+          "max_worker_turns_per_cycle": 10
+        },
+        "roles": {
+          "worker": {
+            "agent_id": "docker-runner",
+            "new_session": true,
+            "prompts": {
+              "work": {
+                "system_prompt_file": "prompts/pipeline/docker_system.md",
+                "user_prompt_file": "prompts/pipeline/data_flow_analysis/worker_user.md"
+              },
+              "reflection": [],
+              "summary": {
+                "prompt_file": "prompts/pipeline/data_flow_analysis/summary.md",
+                "output_summary_filename": "summary.md",
+                "output_results_dir": "results"
+              }
+            }
+          },
+          "advisors": {
+            "global_review": [],
+            "result_review": []
+          }
+        }
+      },
+
+      {
+        "id": "vuln_scan",
+        "name": "数据流驱动漏洞挖掘",
+        "type": "atomic",
+        "description": "基于数据流分析结果和源代码进行深度安全漏洞挖掘（AI 评审闭环）",
+        "working_dir_template": "vuln_scan_{task_id}",
+        "start_plugins": ["env_setup", "workspace_init", "task_validator"],
+        "end_plugins": ["result_archiver", "final_output_collector", "next_task_generator"],
+        "engine": {
+          "max_review_cycles": 10,
+          "max_worker_turns_per_cycle": 1
+        },
+        "roles": {
+          "worker": {
+            "agent_id": "pi-worker",
+            "new_session": false,
+            "prompts": {
+              "work": {
+                "system_prompt_file": "prompts/vuln_scan/worker_system.md",
+                "user_prompt_file": "prompts/vuln_scan/worker_user.md"
+              },
+              "reflection": [
+                {
+                  "id": "reflect_completeness",
+                  "prompt_file": "prompts/vuln_scan/reflect_completeness.md",
+                  "description": "检查数据流覆盖度和分析深度"
+                }
+              ],
+              "summary": {
+                "prompt_file": "prompts/vuln_scan/summary.md",
+                "output_summary_filename": "summary.md",
+                "output_results_dir": "results"
+              }
+            }
+          },
+          "advisors": {
+            "global_review": [
+              {
+                "instance_id": "global_quality",
+                "agent_id": "pi-advisor",
+                "role_name": "全面性与质量评审",
+                "re_review_on_cycle": true,
+                "system_prompt_file": "prompts/vuln_scan/global_review_sys.md",
+                "user_prompt_template": "prompts/vuln_scan/global_review_user.md"
+              }
+            ],
+            "result_review": [
+              {
+                "instance_id": "result_fp_check",
+                "agent_id": "pi-advisor",
+                "role_name": "误报检测",
+                "re_review_on_cycle": false,
+                "system_prompt_file": "prompts/vuln_scan/result_review_sys.md",
+                "user_prompt_template": "prompts/vuln_scan/result_review_user.md"
+              }
+            ]
+          }
+        }
+      }
+    ],
+
+    "composite": [
+      {
+        "id": "vuln_scan_pipeline",
+        "name": "漏洞挖掘流水线（仅漏洞挖掘阶段）",
+        "type": "composite",
+        "description": "单阶段漏洞挖掘组合工作流，与原有配置兼容",
+        "working_dir_template": "pipeline_{execution_id}",
+        "stages": [
+          {
+            "stage_id": "stage_01_vuln_scan",
+            "name": "数据流驱动漏洞挖掘",
+            "sequence": 1,
+            "workflow_ref": "vuln_scan",
+            "workflow_type": "atomic",
+            "on_error": "abort"
+          }
+        ]
+      },
+
+      {
+        "id": "full_vuln_pipeline",
+        "name": "全流水线自动化漏洞挖掘",
+        "type": "composite",
+        "description": "6 阶段完整流水线：解包→系统分析→反编译→入口分析→数据流→漏洞挖掘",
+        "working_dir_template": "full_pipeline_{execution_id}",
+        "stages": [
+          {
+            "stage_id": "stage_01_unpack",
+            "name": "解包分析",
+            "sequence": 1,
+            "workflow_ref": "unpack_analysis",
+            "workflow_type": "atomic",
+            "on_error": "abort",
+            "description": "对产品软件包进行解包，输出完整的文件系统内容"
+          },
+          {
+            "stage_id": "stage_02_system_analysis",
+            "name": "系统分析",
+            "sequence": 2,
+            "workflow_ref": "system_analysis",
+            "workflow_type": "atomic",
+            "on_error": "abort",
+            "description": "分析解包后的系统，识别高危模块（1→N 扇出）"
+          },
+          {
+            "stage_id": "stage_03_decompile",
+            "name": "反编译优化",
+            "sequence": 3,
+            "workflow_ref": "decompile_optimize",
+            "workflow_type": "atomic",
+            "on_error": "abort",
+            "description": "对每个高危模块进行反编译和优化（N 个任务并行）"
+          },
+          {
+            "stage_id": "stage_04_entry_analysis",
+            "name": "外部数据入口分析",
+            "sequence": 4,
+            "workflow_ref": "external_entry_analysis",
+            "workflow_type": "atomic",
+            "on_error": "abort",
+            "description": "分析每个模块的外部消息处理函数入口（N→M 扇出）"
+          },
+          {
+            "stage_id": "stage_05_data_flow",
+            "name": "数据流分析",
+            "sequence": 5,
+            "workflow_ref": "data_flow_analysis",
+            "workflow_type": "atomic",
+            "on_error": "abort",
+            "description": "对每个函数入口进行数据流追踪分析（M 个任务并行）"
+          },
+          {
+            "stage_id": "stage_06_vuln_scan",
+            "name": "漏洞挖掘",
+            "sequence": 6,
+            "workflow_ref": "vuln_scan",
+            "workflow_type": "atomic",
+            "on_error": "abort",
+            "description": "基于数据流和源码进行深度漏洞挖掘（M 个任务，AI 评审闭环）"
+          }
+        ]
+      }
+    ]
+  },
+
+  "execution": {
+    "entry_workflow": "full_vuln_pipeline",
+    "entry_workflow_type": "composite",
+    "input_task": {
+      "task_file": "__AUTO__",
+      "task_id": "__AUTO__"
+    },
+    "output_dir": "__AUTO__",
+    "execution_id": "__AUTO__",
+    "runtime_mode": "local",
+    "on_completion": {
+      "exit_code_on_success": 0,
+      "exit_code_on_failure": 1,
+      "write_summary": true,
+      "summary_file": "__AUTO__"
+    }
+  }
+}

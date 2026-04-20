@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -143,3 +144,64 @@ async def test_pi_agent_runtime_records_continuation_without_resending_system_pr
     assert "--continue" in second_request["command_argv"]
     assert not (call_dirs[1] / "system_prompt.md").exists()
     assert (call_dirs[1] / "user_prompt.md").read_text(encoding="utf-8") == "second user prompt"
+
+
+@pytest.mark.asyncio
+async def test_pi_agent_runtime_restores_existing_session_from_disk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": False,
+            "runtime_config": {
+                "model": "claude-test",
+                "timeout_seconds": 30,
+                "sdk_specific": {
+                    "provider": "anthropic",
+                    "thinking": "high",
+                },
+            },
+        }
+    )
+
+    session_id = "pi_existing_session"
+    calls_root = tmp_path / "sessions" / session_id / "calls"
+    for idx in (1, 2):
+        (calls_root / f"{idx:03d}_existing").mkdir(parents=True, exist_ok=True)
+
+    captured: dict[str, object] = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = list(args)
+        captured["cwd"] = kwargs.get("cwd")
+        return _FakeProc(stdout=b"resumed output", stderr=b"", returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    response = await runtime.send_message(
+        message="resume prompt",
+        system_prompt="system prompt should not be resent",
+        session_id=session_id,
+        working_dir=str(tmp_path),
+    )
+
+    assert response.success is True
+    assert response.content == "resumed output"
+
+    call_dirs = sorted((tmp_path / "sessions" / session_id / "calls").iterdir())
+    assert len(call_dirs) == 3
+    resumed_call_dir = call_dirs[-1]
+
+    request_payload = json.loads((resumed_call_dir / "request.json").read_text(encoding="utf-8"))
+    response_payload = json.loads((resumed_call_dir / "response.json").read_text(encoding="utf-8"))
+
+    assert request_payload["has_system_prompt"] is False
+    assert request_payload["system_prompt_file"] is None
+    assert "--continue" in request_payload["command_argv"]
+    assert not (resumed_call_dir / "system_prompt.md").exists()
+    assert os.path.basename(str(resumed_call_dir)).startswith("003_")
+    assert response_payload["turn_count"] == 3

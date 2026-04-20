@@ -242,3 +242,55 @@ class FrameworkConfig(BaseModel):
     execution: ExecutionConfig
 
     model_config = {"populate_by_name": True}
+
+    @property
+    def root_workflow_id(self) -> str:
+        """兼容服务层：根工作流 ID 即 execution.entry_workflow"""
+        return self.execution.entry_workflow
+
+    def _resolve_leaf_atomic_workflow_id(
+        self,
+        workflow_id: str,
+        workflow_type: str,
+        edge: Literal["first", "last"],
+    ) -> str:
+        """
+        解析入口/出口对应的叶子原子工作流 ID。
+
+        - entry_input_task_type 取入口 composite 的第一个 stage 对应的叶子 atomic
+        - final_output_task_type 取入口 composite 的最后一个 stage 对应的叶子 atomic
+        - 支持嵌套 composite
+        """
+        if workflow_type == "atomic":
+            return workflow_id
+
+        composite_map = {w.id: w for w in self.workflows.composite}
+        wf = composite_map.get(workflow_id)
+        if wf is None:
+            raise ValueError(f"组合工作流不存在: {workflow_id}")
+        if not wf.stages:
+            raise ValueError(f"组合工作流没有 stage: {workflow_id}")
+
+        stages = sorted(wf.stages, key=lambda s: s.sequence)
+        stage = stages[0] if edge == "first" else stages[-1]
+        return self._resolve_leaf_atomic_workflow_id(
+            workflow_id=stage.workflow_ref,
+            workflow_type=stage.workflow_type,
+            edge=edge,
+        )
+
+    def resolve_entry_input_task_type(self) -> str:
+        atomic_id = self._resolve_leaf_atomic_workflow_id(
+            workflow_id=self.execution.entry_workflow,
+            workflow_type=self.execution.entry_workflow_type,
+            edge="first",
+        )
+        return f"atomic:{atomic_id}:input"
+
+    def resolve_final_output_task_type(self) -> str:
+        atomic_id = self._resolve_leaf_atomic_workflow_id(
+            workflow_id=self.execution.entry_workflow,
+            workflow_type=self.execution.entry_workflow_type,
+            edge="last",
+        )
+        return f"atomic:{atomic_id}:output"

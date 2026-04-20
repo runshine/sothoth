@@ -3,13 +3,13 @@
 漏洞挖掘便捷启动器
 
 用法:
-  python run_vuln_scan.py \\
-    --data-flow /path/to/data_flow_analysis.md \\
-    --source-dir /path/to/source_code/ \\
-    [--run-name my_scan] \\
-    [--model claude-sonnet-4-20250514] \\
-    [--provider anthropic] \\
-    [--max-cycles 3] \\
+  python run_vuln_scan.py \
+    --data-flow /path/to/data_flow_analysis.md \
+    --source-dir /path/to/source_code/ \
+    [--run-name my_scan] \
+    [--model claude-sonnet-4-20250514] \
+    [--provider anthropic] \
+    [--max-cycles 3] \
     [--clean]
 
 功能:
@@ -31,7 +31,7 @@ from pathlib import Path
 # 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROMPTS_DIR = PROJECT_ROOT / "prompts" / "vuln_scan"
-DEFAULT_CONFIG = PROJECT_ROOT / "config" / "vuln_scan_default.json"
+DEFAULT_CONFIG = PROJECT_ROOT / "config.vuln_scan_default.json"
 
 
 def generate_task_md(data_flow_file: str, source_dir: str) -> str:
@@ -457,6 +457,270 @@ def _resolve_prompt_paths(config: dict) -> None:
 
     _walk_and_resolve(config)
 
+
+def _format_model_display(provider: str | None, model: str | None) -> str:
+    provider = (provider or "").strip()
+    model = (model or "").strip()
+    if not provider:
+        return model
+    if model.startswith(f"{provider}/"):
+        return model
+    return f"{provider}/{model}" if model else provider
+
+
+def _extract_worker_runtime(config_obj) -> tuple[str, str, str]:
+    for agent in getattr(config_obj, "agents", []):
+        if getattr(agent, "id", "") != "pi-worker":
+            continue
+        runtime_cfg = agent.runtime_config
+        sdk_cfg = runtime_cfg.get("sdk_specific", {})
+        return (
+            sdk_cfg.get("provider", ""),
+            runtime_cfg.get("model", ""),
+            sdk_cfg.get("thinking", ""),
+        )
+    return "", "", ""
+
+
+def _load_latest_cycle_record(records_dir: str | Path) -> tuple[int, dict]:
+    base = Path(records_dir)
+    if not base.is_dir():
+        return 0, {}
+
+    latest_cycle = 0
+    latest_path: Path | None = None
+    for path in sorted(base.glob("cycle_*.json")):
+        stem = path.stem
+        parts = stem.split("_")
+        if len(parts) != 2 or not parts[1].isdigit():
+            continue
+        cycle = int(parts[1])
+        if cycle >= latest_cycle:
+            latest_cycle = cycle
+            latest_path = path
+
+    if latest_path is None:
+        return 0, {}
+
+    try:
+        return latest_cycle, json.loads(latest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return latest_cycle, {}
+
+
+def _collect_resume_diagnostics(
+    atomic_work_dir: str,
+    review_state=None,
+) -> dict:
+    atomic_dir = Path(atomic_work_dir)
+    meta_dir = atomic_dir / "_meta"
+
+    summary_cycle, summary_data = _load_latest_cycle_record(meta_dir / "review_summaries")
+    metrics_cycle, metrics_data = _load_latest_cycle_record(meta_dir / "cycle_metrics")
+    blockers_cycle, blockers_data = _load_latest_cycle_record(meta_dir / "blockers")
+
+    latest_cycle = max(summary_cycle, metrics_cycle, blockers_cycle)
+    plateau_status = (metrics_data.get("plateau_status") or {}) if isinstance(metrics_data, dict) else {}
+
+    workflow_mode = ""
+    for candidate in (
+        summary_data.get("workflow_mode") if isinstance(summary_data, dict) else "",
+        plateau_status.get("workflow_mode"),
+        metrics_data.get("workflow_mode") if isinstance(metrics_data, dict) else "",
+        getattr(review_state, "workflow_mode", "") if review_state is not None else "",
+    ):
+        candidate = str(candidate or "").strip()
+        if candidate:
+            workflow_mode = candidate
+            break
+
+    plateau_reason = str(
+        plateau_status.get("reason")
+        or getattr(review_state, "closure_reason", "") if review_state is not None else ""
+    ).strip()
+
+    open_blockers = []
+    if isinstance(blockers_data, dict) and isinstance(blockers_data.get("blockers"), list):
+        open_blockers = list(blockers_data.get("blockers") or [])
+    elif isinstance(summary_data, dict):
+        open_blockers = list(
+            ((summary_data.get("global_review") or {}).get("open_blockers") or [])
+        )
+    elif review_state is not None and hasattr(review_state, "serialize_open_blockers"):
+        open_blockers = list(review_state.serialize_open_blockers(limit=5))
+
+    passed_results = []
+    failed_results = []
+    if review_state is not None:
+        if hasattr(review_state, "get_passed_result_filenames"):
+            passed_results = list(review_state.get_passed_result_filenames())
+        if hasattr(review_state, "get_failed_results"):
+            failed_results = list(review_state.get_failed_results())
+
+    passed_count = len(passed_results)
+    failed_count = len(failed_results)
+    if passed_count == 0 and isinstance(summary_data, dict):
+        passed_count = int(((summary_data.get("result_review") or {}).get("passed_count") or 0))
+    if failed_count == 0 and isinstance(summary_data, dict):
+        failed_count = int(((summary_data.get("result_review") or {}).get("failed_count") or 0))
+
+    scores = {}
+    if isinstance(metrics_data, dict):
+        scores = dict(metrics_data.get("scores") or {})
+    elif review_state is not None:
+        scores = dict(getattr(review_state, "last_global_scores", {}) or {})
+
+    blockers_preview = []
+    for item in open_blockers[:3]:
+        if not isinstance(item, dict):
+            blockers_preview.append(str(item))
+            continue
+        blocker_id = str(item.get("id") or "").strip() or "(no-id)"
+        target = str(item.get("target") or "").strip()
+        action = str(item.get("required_action") or item.get("detail") or "").strip()
+        preview = f"[{blocker_id}]"
+        if target:
+            preview += f" {target}"
+        if action:
+            preview += f" | {action}"
+        blockers_preview.append(preview)
+
+    return {
+        "latest_cycle": latest_cycle,
+        "latest_outcome": str(summary_data.get("outcome") or "").strip() if isinstance(summary_data, dict) else "",
+        "workflow_mode": workflow_mode or "discovery",
+        "passed_count": passed_count,
+        "failed_count": failed_count,
+        "open_blocker_count": len(open_blockers),
+        "blockers_preview": blockers_preview,
+        "plateau_status": {
+            "stagnant": bool(plateau_status.get("stagnant", False)),
+            "streak": int(plateau_status.get("streak") or 0),
+            "abort": bool(plateau_status.get("abort", False)),
+            "switched_to_closure": bool(plateau_status.get("switched_to_closure", False)),
+        },
+        "plateau_reason": plateau_reason,
+        "scores": scores,
+    }
+
+
+def _format_resume_diagnostic_lines(diagnostics: dict, *, completed_cycles: int, extra_cycles: int) -> list[str]:
+    total_cycle_limit = completed_cycles + extra_cycles
+    lines = [
+        f"  轮次窗口:   {completed_cycles} -> {total_cycle_limit}",
+        f"  当前模式:   {diagnostics.get('workflow_mode') or 'discovery'}",
+    ]
+
+    latest_cycle = int(diagnostics.get("latest_cycle") or 0)
+    latest_outcome = str(diagnostics.get("latest_outcome") or "").strip()
+    if latest_cycle > 0:
+        lines.append(
+            f"  最近评审:   Cycle {latest_cycle} / {latest_outcome or 'unknown'}"
+        )
+
+    lines.append(f"  已通过结果: {int(diagnostics.get('passed_count') or 0)}")
+    lines.append(f"  待修结果:   {int(diagnostics.get('failed_count') or 0)}")
+    lines.append(f"  OpenBlockers: {int(diagnostics.get('open_blocker_count') or 0)}")
+
+    scores = diagnostics.get("scores") or {}
+    if scores:
+        score_pairs = []
+        for key in sorted(scores.keys()):
+            try:
+                score_pairs.append(f"{key}={float(scores[key]):.2f}")
+            except (TypeError, ValueError):
+                continue
+        if score_pairs:
+            lines.append(f"  最近评分:   {', '.join(score_pairs)}")
+
+    plateau_status = diagnostics.get("plateau_status") or {}
+    if plateau_status:
+        stagnant = "yes" if plateau_status.get("stagnant") else "no"
+        abort = "yes" if plateau_status.get("abort") else "no"
+        switched = "yes" if plateau_status.get("switched_to_closure") else "no"
+        streak = int(plateau_status.get("streak") or 0)
+        lines.append(
+            f"  Plateau:    stagnant={stagnant}, streak={streak}, closure_switch={switched}, abort={abort}"
+        )
+
+    plateau_reason = str(diagnostics.get("plateau_reason") or "").strip()
+    if plateau_reason:
+        lines.append(f"  Plateau原因: {plateau_reason}")
+
+    blockers_preview = diagnostics.get("blockers_preview") or []
+    if blockers_preview:
+        lines.append("  主要Blocker:")
+        for item in blockers_preview:
+            lines.append(f"    - {item}")
+
+    return lines
+
+
+def _write_resume_preview_file(
+    *,
+    run_dir: str,
+    atomic_work_dir: str,
+    current_status: str,
+    completed_cycles: int,
+    extra_cycles: int,
+    worker_session_id: str,
+    model_display: str,
+    thinking: str,
+    task_file: str,
+    diagnostics: dict,
+) -> str:
+    preview_path = Path(atomic_work_dir) / "_meta" / "resume_preview.json"
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at": datetime.now().isoformat(),
+        "run_dir": run_dir,
+        "atomic_work_dir": atomic_work_dir,
+        "current_status": current_status,
+        "completed_cycles": completed_cycles,
+        "extra_cycles_requested": extra_cycles,
+        "resume_total_cycle_limit": completed_cycles + extra_cycles,
+        "worker_session_id": worker_session_id,
+        "model": model_display,
+        "thinking": thinking,
+        "task_file": task_file,
+        "diagnostics": diagnostics,
+    }
+    preview_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return str(preview_path)
+
+
+def _print_run_outputs(run_dir: str, success: bool, exit_code: int) -> None:
+    if success:
+        print("\n" + "═" * 60)
+        print("  ✅ 漏洞挖掘完成")
+        print("═" * 60)
+        print(f"  执行总结: {os.path.join(run_dir, 'output', 'execution_summary.json')}")
+        workspace = os.path.join(run_dir, "workspace")
+        if os.path.isdir(workspace):
+            for root, dirs, files in os.walk(workspace):
+                final_out = os.path.join(root, "final_output")
+                if os.path.isdir(final_out):
+                    print(f"  最终产出: {final_out}/")
+                    if os.path.isfile(os.path.join(final_out, "summary.md")):
+                        print("    - summary.md (综合工作报告)")
+                    fr_dir = os.path.join(final_out, "results")
+                    if os.path.isdir(fr_dir):
+                        result_files = sorted(
+                            f for f in os.listdir(fr_dir)
+                            if f.endswith(".md"))
+                        if result_files:
+                            print(f"    - results/ ({len(result_files)} 个漏洞报告)")
+                            for rf in result_files:
+                                print(f"        {rf}")
+                    break
+        print("═" * 60)
+    else:
+        print(f"\n❌ 漏洞挖掘失败 (exit_code={exit_code})", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="数据流驱动漏洞挖掘启动器",
@@ -464,50 +728,72 @@ def main():
         epilog="""
 示例:
   # 基本用法
-  python run_vuln_scan.py \\
-    --data-flow /path/to/data_flow.md \\
+  python run_vuln_scan.py \
+    --data-flow /path/to/data_flow.md \
     --source-dir /path/to/source/
 
+  # 继续已有 run 的当前进度，再追加 5 轮评审
+  python run_vuln_scan.py \
+    --resume-run-dir runs/my_previous_run \
+    --extra-cycles 5
+
+  # 仅查看当前 run 的收敛状态，不真正继续执行
+  python run_vuln_scan.py \
+    --resume-run-dir runs/my_previous_run \
+    --extra-cycles 2 \
+    --dry-run-resume
+
   # 使用自定义配置文件 (复制 config.vuln_scan_default.json 后修改)
-  python run_vuln_scan.py \\
-    --data-flow /path/to/data_flow.md \\
-    --source-dir /path/to/source/ \\
+  python run_vuln_scan.py \
+    --data-flow /path/to/data_flow.md \
+    --source-dir /path/to/source/ \
     -c my_config.json
 
   # 指定模型和运行名称
-  python run_vuln_scan.py \\
-    --data-flow /path/to/data_flow.md \\
-    --source-dir /path/to/source/ \\
-    --run-name my_scan \\
-    --model claude-sonnet-4-20250514 \\
+  python run_vuln_scan.py \
+    --data-flow /path/to/data_flow.md \
+    --source-dir /path/to/source/ \
+    --run-name my_scan \
+    --model claude-sonnet-4-20250514 \
     --provider anthropic
 
   # 使用 litellm 的其他模型
-  python run_vuln_scan.py \\
-    --data-flow /path/to/data_flow.md \\
-    --source-dir /path/to/source/ \\
-    --model MiniMax/MiniMax-M2.5 \\
+  python run_vuln_scan.py \
+    --data-flow /path/to/data_flow.md \
+    --source-dir /path/to/source/ \
+    --model MiniMax/MiniMax-M2.5 \
     --provider litellm
 
   # 增加评审轮次
-  python run_vuln_scan.py \\
-    --data-flow /path/to/data_flow.md \\
-    --source-dir /path/to/source/ \\
+  python run_vuln_scan.py \
+    --data-flow /path/to/data_flow.md \
+    --source-dir /path/to/source/ \
     --max-cycles 5
 
   # 执行后清理工作目录
-  python run_vuln_scan.py \\
-    --data-flow /path/to/data_flow.md \\
-    --source-dir /path/to/source/ \\
+  python run_vuln_scan.py \
+    --data-flow /path/to/data_flow.md \
+    --source-dir /path/to/source/ \
     --clean
 """)
 
     parser.add_argument(
-        "--data-flow", "-d", required=True,
+        "--data-flow", "-d", default=None,
         help="数据流分析结果文件路径 (.md)")
     parser.add_argument(
-        "--source-dir", "-s", required=True,
+        "--source-dir", "-s", default=None,
         help="源码目录路径（包含 .c, .h, .asm 文件）")
+    parser.add_argument(
+        "--resume-run-dir", default=None,
+        help="继续已有 runs/<name> 目录的当前进度")
+    parser.add_argument(
+        "--extra-cycles", type=int, default=5,
+        help="resume 模式下额外追加的评审轮次 (默认: 5)")
+    parser.add_argument(
+        "--dry-run-resume", "--explain-resume",
+        dest="dry_run_resume",
+        action="store_true",
+        help="仅分析当前 run 的收敛状态并输出 resume 预览，不真正继续执行")
     parser.add_argument(
         "--config", "-c", default=None,
         help="自定义配置文件路径 (复制 config.vuln_scan_default.json 后修改; "
@@ -516,18 +802,18 @@ def main():
         "--run-name", "-n", default=None,
         help="运行名称（默认: 根据数据流文件名自动生成）")
     parser.add_argument(
-        "--model", "-m", default="claude-sonnet-4-20250514",
-        help="AI 模型 (默认: claude-sonnet-4-20250514)")
+        "--model", "-m", default=None,
+        help="AI 模型")
     parser.add_argument(
         "--provider", default=None,
         help="模型提供商 (默认: 从 --model 自动推断，如 github-copilot/gpt-5.4 → github-copilot)")
     parser.add_argument(
-        "--thinking", default="high",
-        choices=["off", "low", "medium", "high"],
-        help="思考深度 (默认: high)")
+        "--thinking", default=None,
+        choices=["off", "low", "medium", "high", "xhigh"],
+        help="思考深度 (可选: off/low/medium/high/xhigh)")
     parser.add_argument(
         "--max-cycles", type=int, default=10,
-        help="最大评审循环次数 (默认: 3)")
+        help="最大评审循环次数 (默认: 10)")
     parser.add_argument(
         "--worker-timeout", type=int, default=1800,
         help="Worker 超时时间/秒 (默认: 1800)")
@@ -543,15 +829,134 @@ def main():
 
     args = parser.parse_args()
 
-    # ═══ 自动推断 provider ═══
+    if args.dry_run_resume and not args.resume_run_dir:
+        parser.error("--dry-run-resume/--explain-resume 必须与 --resume-run-dir 一起使用")
+
+    from app.pi_vuln_core.utils.logger import attach_log_file, detach_log_file
+
+    if args.resume_run_dir:
+        if args.extra_cycles < 1:
+            print("❌ --extra-cycles 必须 >= 1", file=sys.stderr)
+            sys.exit(1)
+
+        resume_run_dir = Path(args.resume_run_dir)
+        if not resume_run_dir.is_absolute():
+            resume_run_dir = PROJECT_ROOT / resume_run_dir
+        run_dir = str(resume_run_dir.resolve())
+        if not os.path.isdir(run_dir):
+            print(f"❌ run 目录不存在: {run_dir}", file=sys.stderr)
+            sys.exit(1)
+
+        if args.model and args.provider is None and "/" in args.model:
+            args.provider = args.model.split("/")[0]
+
+        from app.pi_vuln_core.resume import (
+            build_resume_plan,
+            rebuild_review_state,
+            resume_run,
+        )
+
+        try:
+            config_obj, plan = build_resume_plan(run_dir)
+            review_state = rebuild_review_state(plan.atomic_work_dir)
+            resume_diagnostics = _collect_resume_diagnostics(
+                plan.atomic_work_dir,
+                review_state=review_state,
+            )
+        except Exception as e:
+            print(f"❌ 无法恢复该 run: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        current_provider, current_model, current_thinking = _extract_worker_runtime(config_obj)
+        display_provider = args.provider or current_provider
+        display_model = args.model or current_model
+        display_thinking = args.thinking or current_thinking
+        model_display = _format_model_display(display_provider, display_model)
+
+        preview_path = _write_resume_preview_file(
+            run_dir=run_dir,
+            atomic_work_dir=plan.atomic_work_dir,
+            current_status=plan.current_status or "unknown",
+            completed_cycles=plan.completed_cycles,
+            extra_cycles=args.extra_cycles,
+            worker_session_id=plan.worker_session_id,
+            model_display=model_display,
+            thinking=display_thinking,
+            task_file=plan.task_file,
+            diagnostics=resume_diagnostics,
+        )
+
+        print("═" * 60)
+        print("  继续已有漏洞挖掘进度")
+        print("═" * 60)
+        print(f"  运行目录:   {run_dir}")
+        print(f"  工作目录:   {plan.atomic_work_dir}")
+        print(f"  当前状态:   {plan.current_status or 'unknown'}")
+        print(f"  已完成轮次: {plan.completed_cycles}")
+        print(f"  追加轮次:   {args.extra_cycles}")
+        for line in _format_resume_diagnostic_lines(
+            resume_diagnostics,
+            completed_cycles=plan.completed_cycles,
+            extra_cycles=args.extra_cycles,
+        ):
+            print(line)
+        print(f"  Worker会话: {plan.worker_session_id}")
+        print(f"  模型:       {model_display}")
+        if display_thinking:
+            print(f"  Thinking:   {display_thinking}")
+        print(f"  任务文件:   {plan.task_file}")
+        print(f"  预览文件:   {preview_path}")
+        print("═" * 60)
+
+        if plan.current_status == "completed":
+            print(f"✅ 该 run 已完成，无需继续: {run_dir}")
+            sys.exit(0)
+
+        if args.dry_run_resume:
+            print("ℹ️ dry-run-resume: 已生成 resume 预览，未实际继续执行。")
+            sys.exit(0)
+
+        log_file = os.path.join(run_dir, "run.log")
+        actual_log_path = attach_log_file(log_file)
+        print(f"  日志文件:   {actual_log_path}")
+
+        exit_code = 1
+        try:
+            artifacts = asyncio.run(
+                resume_run(
+                    run_dir=run_dir,
+                    extra_cycles=args.extra_cycles,
+                    model=args.model,
+                    provider=args.provider,
+                    thinking=args.thinking,
+                    clean_workspace=args.clean,
+                )
+            )
+            exit_code = (
+                artifacts.config.execution.on_completion.exit_code_on_success
+                if artifacts.result.success
+                else artifacts.config.execution.on_completion.exit_code_on_failure
+            )
+            _print_run_outputs(run_dir, artifacts.result.success, exit_code)
+        finally:
+            detach_log_file()
+            print(f"  完整日志: {actual_log_path}")
+
+        sys.exit(exit_code)
+
+    if not args.data_flow or not args.source_dir:
+        parser.error("正常运行模式必须同时提供 --data-flow 和 --source-dir")
+
+    if args.model is None:
+        args.model = "claude-sonnet-4-20250514"
+    if args.thinking is None:
+        args.thinking = "high"
     if args.provider is None:
         if "/" in args.model:
-            # 模型格式为 "provider/model"，如 github-copilot/gpt-5.4
             args.provider = args.model.split("/")[0]
         else:
             args.provider = "anthropic"
 
-    # ═══ 校验输入 ═══
     if not os.path.isfile(args.data_flow):
         print(f"❌ 数据流文件不存在: {args.data_flow}", file=sys.stderr)
         sys.exit(1)
@@ -564,26 +969,21 @@ def main():
         print("❌ --result-review-concurrency 必须 >= 1", file=sys.stderr)
         sys.exit(1)
 
-    # ═══ 生成运行名称 ═══
     if args.run_name is None:
         stem = Path(args.data_flow).stem
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.run_name = f"{stem}_{timestamp}"
 
-    # ═══ 创建运行目录 ═══
     run_dir = str(PROJECT_ROOT / "runs" / args.run_name)
     os.makedirs(os.path.join(run_dir, "input"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "output"), exist_ok=True)
 
-    # ═══ 生成 task.md ═══
     task_content = generate_task_md(args.data_flow, args.source_dir)
     task_file = os.path.join(run_dir, "input", "task.md")
     with open(task_file, "w", encoding="utf-8") as f:
         f.write(task_content)
 
-    # ═══ 生成或加载 config.json ═══
     if args.config:
-        # 用户指定了自定义配置
         if not os.path.isfile(args.config):
             print(f"❌ 配置文件不存在: {args.config}", file=sys.stderr)
             sys.exit(1)
@@ -595,7 +995,6 @@ def main():
         )
         config_source = os.path.abspath(args.config)
     else:
-        # 从 CLI 参数自动生成
         config = generate_config(
             run_dir=run_dir,
             task_file=task_file,
@@ -614,19 +1013,17 @@ def main():
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
-    # ═══ 启动日志文件记录 ═══
     log_file = os.path.join(run_dir, "run.log")
-    from app.pi_vuln_core.utils.logger import attach_log_file, detach_log_file
     actual_log_path = attach_log_file(log_file)
 
-    # ═══ 打印信息 ═══
     print("═" * 60)
     print("  数据流驱动漏洞挖掘")
     print("═" * 60)
     print(f"  数据流文件: {os.path.abspath(args.data_flow)}")
     print(f"  源码目录:   {os.path.abspath(args.source_dir)}")
     print(f"  运行名称:   {args.run_name}")
-    print(f"  模型:       {args.provider}/{args.model}")
+    print(f"  模型:       {_format_model_display(args.provider, args.model)}")
+    print(f"  Thinking:   {args.thinking}")
     print(f"  评审轮次:   {args.max_cycles}")
     print(f"  运行目录:   {run_dir}")
     print(f"  配置文件:   {config_file}")
@@ -635,47 +1032,18 @@ def main():
     print(f"  日志文件:   {actual_log_path}")
     print("═" * 60)
 
-    # ═══ 启动框架 ═══
     from app.pi_vuln_core.main import main as framework_main
     from app.pi_vuln_core.utils.logger import setup_logging
 
     setup_logging("INFO")
-    exit_code = asyncio.run(
-        framework_main(config_file, clean_workspace=args.clean))
-
-    # ═══ 打印结果位置 ═══
-    if exit_code == 0:
-        print("\n" + "═" * 60)
-        print("  ✅ 漏洞挖掘完成")
-        print("═" * 60)
-        print(f"  执行总结: {os.path.join(run_dir, 'output', 'execution_summary.json')}")
-        # 查找工作目录中的结果
-        workspace = os.path.join(run_dir, "workspace")
-        if os.path.isdir(workspace):
-            for root, dirs, files in os.walk(workspace):
-                # 优先找 final_output
-                final_out = os.path.join(root, "final_output")
-                if os.path.isdir(final_out):
-                    print(f"  最终产出: {final_out}/")
-                    if os.path.isfile(os.path.join(final_out, "summary.md")):
-                        print(f"    - summary.md (综合工作报告)")
-                    fr_dir = os.path.join(final_out, "results")
-                    if os.path.isdir(fr_dir):
-                        result_files = sorted(
-                            f for f in os.listdir(fr_dir)
-                            if f.endswith(".md"))
-                        if result_files:
-                            print(f"    - results/ ({len(result_files)} 个漏洞报告)")
-                            for rf in result_files:
-                                print(f"        {rf}")
-                    break
-        print("═" * 60)
-    else:
-        print(f"\n❌ 漏洞挖掘失败 (exit_code={exit_code})", file=sys.stderr)
-
-    # ═══ 停止日志文件记录 ═══
-    detach_log_file()
-    print(f"  完整日志: {actual_log_path}")
+    exit_code = 1
+    try:
+        exit_code = asyncio.run(
+            framework_main(config_file, clean_workspace=args.clean))
+        _print_run_outputs(run_dir, exit_code == 0, exit_code)
+    finally:
+        detach_log_file()
+        print(f"  完整日志: {actual_log_path}")
 
     sys.exit(exit_code)
 

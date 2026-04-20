@@ -95,5 +95,21 @@ class WorkflowContext:
     summary_file: Optional[str] = None
     results_dir: Optional[str] = None
 
+    # 返工轮的结果文件保护状态
+    pre_cycle_result_files: list[str] = field(default_factory=list)
+    protected_result_files: list[str] = field(default_factory=list)
+    protected_result_snapshots: dict[str, str] = field(default_factory=dict)
+    historical_max_result_number: int = 0
+    next_result_number: int = 1
+
+    # 收敛模式 / 停滞检测
+    review_mode: str = "discovery"         # discovery | closure
+    plateau_streak: int = 0
+    plateau_reason: str = ""
+
+    # 上一轮未通过结果评审的结果文件快照（供删除备份）
+    failed_result_snapshots: dict[str, str] = field(default_factory=dict)
+    failed_result_reasons: dict[str, str] = field(default_factory=dict)
+
     # 评审失败的结果项（传给下一轮 Worker）
     failed_result_items: list = field(default_factory=list)

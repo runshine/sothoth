@@ -1,0 +1,37 @@
+# VCS
+.git
+.gitignore
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+.env
+.env.*
+
+# Large/generated artifacts
+runs/
+output/
+workspace/
+results_archive.tar.gz
+*.tar.gz
+
+# Tests and local tooling
+.pytest_cache/
+tests/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker local inputs (mounted at runtime)
+docker/input/

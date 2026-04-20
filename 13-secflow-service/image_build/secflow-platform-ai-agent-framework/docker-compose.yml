@@ -1,0 +1,40 @@
+services:
+  vuln-scan:
+    image: ${IMAGE_NAME:-secflow-ai-agent-framework:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        INSTALL_PI_CLI: ${INSTALL_PI_CLI:-1}
+        PI_NPM_PACKAGE: ${PI_NPM_PACKAGE:-@mariozechner/pi-coding-agent}
+    working_dir: /app
+    environment:
+      HOME: /root
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    volumes:
+      - ${HOST_RUNS_DIR:-./runs}:/app/runs
+      - ${HOST_INPUT_DIR:-./docker/input}:/data:ro
+      - ${HOST_PI_HOME:-./.docker-pi-home}:/root/.pi
+    command:
+      - --data-flow
+      - /data/${DATA_FLOW_FILENAME:-data_flow.md}
+      - --source-dir
+      - /data/${SOURCE_DIRNAME:-source}
+      - --run-name
+      - ${RUN_NAME:-docker_scan}
+      - --model
+      - ${MODEL:-claude-sonnet-4-20250514}
+      - --provider
+      - ${PROVIDER:-anthropic}
+      - --thinking
+      - ${THINKING:-high}
+      - --max-cycles
+      - "${MAX_CYCLES:-10}"
+      - --worker-timeout
+      - "${WORKER_TIMEOUT:-1800}"
+      - --advisor-timeout
+      - "${ADVISOR_TIMEOUT:-1800}"
+      - --result-review-concurrency
+      - "${RESULT_REVIEW_CONCURRENCY:-3}"

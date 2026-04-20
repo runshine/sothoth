@@ -28,6 +28,7 @@ import asyncio
 import platform
 import time
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from app.pi_vuln_core.agents.base import BaseAgentRuntime
@@ -74,6 +75,33 @@ class PiAgentRuntime(BaseAgentRuntime):
         self._sessions[session_id] = {"turns": 0}
         return session_id
 
+    def _restore_session_from_disk(
+        self,
+        session_id: str,
+        working_dir: Optional[str],
+    ) -> dict:
+        session = self._sessions.get(session_id)
+        if session is not None:
+            return session
+
+        turns = 0
+        if working_dir:
+            calls_dir = Path(working_dir).resolve() / "sessions" / session_id / "calls"
+            if calls_dir.is_dir():
+                turns = len([p for p in calls_dir.iterdir() if p.is_dir()])
+                if turns > 0:
+                    logger.info(
+                        "pi_session_restored_from_disk",
+                        agent_id=self.agent_id,
+                        session_id=session_id,
+                        turns=turns,
+                        calls_dir=str(calls_dir),
+                    )
+
+        session = {"turns": turns}
+        self._sessions[session_id] = session
+        return session
+
     async def send_message(
         self,
         message: str,
@@ -84,7 +112,7 @@ class PiAgentRuntime(BaseAgentRuntime):
         if session_id is None:
             session_id = await self.create_session()
 
-        session = self._sessions.get(session_id, {"turns": 0})
+        session = self._restore_session_from_disk(session_id, working_dir)
         timeout = self.runtime_config.get("timeout_seconds", 600)
         sdk_cfg = self.runtime_config.get("sdk_specific", {})
         provider = sdk_cfg.get("provider", "github-copilot")
@@ -198,12 +226,13 @@ class PiAgentRuntime(BaseAgentRuntime):
             session["turns"] += 1
             self._sessions[session_id] = session
 
-            if proc.returncode != 0 and not stdout_text:
-                error = f"pi exit code={proc.returncode}: {stderr_text[:500]}"
+            if proc.returncode != 0:
+                error_body = (stderr_text or stdout_text or "").strip()
+                error = f"pi exit code={proc.returncode}: {error_body[:500]}"
                 trace_context.write_result(
                     stdout_text=stdout_text,
                     stderr_text=stderr_text,
-                    response_text="",
+                    response_text=stdout_text,
                     payload={
                         "status": "error",
                         "finished_at": now_iso(),
@@ -211,7 +240,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                         "return_code": proc.returncode,
                         "output_len": len(stdout_text),
                         "stderr_len": len(stderr_text),
-                        "response_len": 0,
+                        "response_len": len(stdout_text),
                         "conversation_id": session_id,
                         "turn_count": session["turns"],
                         "finished": False,
@@ -219,10 +248,11 @@ class PiAgentRuntime(BaseAgentRuntime):
                     },
                 )
                 return AgentResponse(
-                    content="",
+                    content=stdout_text,
                     error=error,
                     conversation_id=session_id,
                     turn_count=session["turns"],
+                    raw_response=stdout_text,
                 )
 
             trace_context.write_result(

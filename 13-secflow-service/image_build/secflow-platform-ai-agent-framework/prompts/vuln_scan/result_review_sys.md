@@ -63,6 +63,7 @@
 ```json
 {
   "passed": true或false,
+  "verdict": "CONFIRMED|FALSE_POSITIVE|INSUFFICIENT_INFO|REJECTED|REFUTED|DISMISS",
   "feedback": "简明判定理由",
   "scores": {
     "evidence_quality": 0.0-1.0,
@@ -73,6 +74,11 @@
   "confidence": 0.0-1.0
 }
 ```
+
+额外约束：
+- 只在**顶层**输出一次 `passed`
+- 不要在 `findings`、`details`、子对象或列表项中再次输出 `passed/approved/accepted`
+- 如果你要表达局部检查项是否成立，请使用 `status`、`assessment`、`finding_result` 等字段，避免污染总判定
 
 通过时 feedback 简述验证结论。  
 不通过时逐条指出：哪些证据缺失、哪些路径有断裂、哪些校验被遗漏。

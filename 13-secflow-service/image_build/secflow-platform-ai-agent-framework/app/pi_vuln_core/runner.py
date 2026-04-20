@@ -20,6 +20,7 @@ from app.pi_vuln_core.utils.logger import get_logger, setup_logging
 from app.pi_vuln_core.workspace.manager import WorkspaceManager
 
 logger = get_logger("pi_vuln_runner")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
@@ -31,6 +32,22 @@ class RunnerArtifacts:
 
 def load_framework_config_from_path(config_path: str | Path) -> FrameworkConfig:
     return ConfigLoader.load(config_path)
+
+
+def _resolve_prompt_paths_inplace(obj, *, base_dir: Path) -> None:
+    prompt_keys = {
+        "system_prompt_file", "user_prompt_file",
+        "user_prompt_template", "prompt_file",
+    }
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in prompt_keys and isinstance(value, str) and not os.path.isabs(value):
+                obj[key] = str(base_dir / value)
+            else:
+                _resolve_prompt_paths_inplace(value, base_dir=base_dir)
+    elif isinstance(obj, list):
+        for item in obj:
+            _resolve_prompt_paths_inplace(item, base_dir=base_dir)
 
 
 def build_runtime_framework_config(
@@ -45,6 +62,7 @@ def build_runtime_framework_config(
     runtime_mode: str = "rest_service",
 ) -> FrameworkConfig:
     payload = copy.deepcopy(definition_json)
+    _resolve_prompt_paths_inplace(payload, base_dir=PROJECT_ROOT)
     payload.setdefault("execution", {})
     payload.setdefault("global", {})
     payload["global"]["workspace_root"] = workspace_root

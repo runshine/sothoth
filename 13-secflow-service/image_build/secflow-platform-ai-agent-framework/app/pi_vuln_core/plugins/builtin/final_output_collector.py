@@ -7,7 +7,8 @@
 import os
 import shutil
 from app.pi_vuln_core.plugins.base import BasePlugin, PluginContext, PluginResult, PluginResultCode
-from app.pi_vuln_core.utils.file_ops import list_dir_files, write_json
+from app.pi_vuln_core.utils.file_ops import write_json
+from app.pi_vuln_core.utils.result_docs import list_result_report_files, list_supporting_markdown_files
 from app.pi_vuln_core.utils.logger import get_logger
 
 logger = get_logger("plugin.final_output")
@@ -48,14 +49,36 @@ class FinalOutputCollectorPlugin(BasePlugin):
         if os.path.isdir(results_dir):
             final_results_dir = os.path.join(final_dir, "results")
             os.makedirs(final_results_dir, exist_ok=True)
-            for f in sorted(os.listdir(results_dir)):
-                if f.endswith(".md"):
-                    src = os.path.join(results_dir, f)
-                    dst = os.path.join(final_results_dir, f)
-                    shutil.copy2(src, dst)
-                    collected.append(f"results/{f}")
+            for f in list_result_report_files(results_dir):
+                src = os.path.join(results_dir, f)
+                dst = os.path.join(final_results_dir, f)
+                shutil.copy2(src, dst)
+                collected.append(f"results/{f}")
 
-        # 3. 写入索引
+        # 3. 复制 supporting_docs/（若有）
+        supporting_docs_dir = os.path.join(ctx.working_dir, "supporting_docs")
+        if os.path.isdir(supporting_docs_dir):
+            final_supporting_dir = os.path.join(final_dir, "supporting_docs")
+            os.makedirs(final_supporting_dir, exist_ok=True)
+            for f in list_supporting_markdown_files(supporting_docs_dir):
+                src = os.path.join(supporting_docs_dir, f)
+                dst = os.path.join(final_supporting_dir, f)
+                shutil.copy2(src, dst)
+                collected.append(f"supporting_docs/{f}")
+
+        # 4. 复制被删除/淘汰的漏洞报告备份（若有）
+        removed_results_dir = os.path.join(ctx.working_dir, "removed_results")
+        if os.path.isdir(removed_results_dir):
+            final_removed_dir = os.path.join(final_dir, "removed_results")
+            if os.path.isdir(final_removed_dir):
+                shutil.rmtree(final_removed_dir)
+            shutil.copytree(removed_results_dir, final_removed_dir)
+            for root, _, files in os.walk(final_removed_dir):
+                rel_root = os.path.relpath(root, final_dir)
+                for name in sorted(files):
+                    collected.append(os.path.join(rel_root, name))
+
+        # 5. 写入索引
         write_json(os.path.join(final_dir, "index.json"), {
             "description": "最终漏洞挖掘产出",
             "files": collected,

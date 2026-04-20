@@ -19,8 +19,13 @@ from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
 from app.pi_vuln_core.config.models import AdvisorInstanceDef
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
 from app.pi_vuln_core.review.models import parse_review_response
-from app.pi_vuln_core.review.state import ReviewState, FailedResultItem
+from app.pi_vuln_core.review.state import (
+    ReviewState,
+    FailedResultItem,
+    calculate_result_fingerprints,
+)
 from app.pi_vuln_core.utils.file_ops import read_file
+from app.pi_vuln_core.utils.result_docs import list_result_report_files
 from app.pi_vuln_core.utils.template import render_string
 from app.pi_vuln_core.utils.logger import get_logger
 
@@ -70,19 +75,17 @@ class ResultReviewExecutor:
         if advisor_sessions is None:
             advisor_sessions = {}
         # 列出所有结果文件
-        all_result_files = sorted(
-            f for f in os.listdir(results_dir)
-            if f.endswith(".md") and f != "summary.md"
-        ) if os.path.isdir(results_dir) else []
+        all_result_files = list_result_report_files(results_dir) if os.path.isdir(results_dir) else []
 
         if not all_result_files:
             logger.info("no_result_files", results_dir=results_dir)
             return True, []
 
-        # 过滤: 跳过已通过的结果 (R6g)
+        # 过滤: 跳过已通过且文件内容未变化的结果 (R6g)
         advisors_dicts = [a.model_dump() for a in advisors_cfg]
+        current_fingerprints = calculate_result_fingerprints(results_dir)
         pending = review_state.get_pending_results(
-            all_result_files, advisors_dicts)
+            all_result_files, advisors_dicts, current_fingerprints)
 
         if not pending:
             logger.info("all_results_already_passed", cycle=cycle)
@@ -108,7 +111,8 @@ class ResultReviewExecutor:
                     return await self._review_single(
                         advisors_cfg, task_content, results_dir,
                         result_file, work_dir, cycle, review_state,
-                        advisor_sessions)
+                        advisor_sessions,
+                        current_fingerprints.get(result_file))
 
             tasks = [_bounded_review(result_file) for result_file in pending]
             outcomes = await asyncio.gather(*tasks, return_exceptions=True)
@@ -119,7 +123,8 @@ class ResultReviewExecutor:
                     outcome = await self._review_single(
                         advisors_cfg, task_content, results_dir,
                         result_file, work_dir, cycle, review_state,
-                        advisor_sessions)
+                        advisor_sessions,
+                        current_fingerprints.get(result_file))
                     outcomes.append(outcome)
                 except Exception as e:
                     outcomes.append(e)
@@ -143,7 +148,11 @@ class ResultReviewExecutor:
                     ).failure_reason
                 ))
             else:
-                review_state.mark_result_passed(result_file, cycle)
+                review_state.mark_result_passed(
+                    result_file,
+                    cycle,
+                    current_fingerprints.get(result_file, ""),
+                )
 
         all_passed = len(failed_items) == 0
 
@@ -165,6 +174,7 @@ class ResultReviewExecutor:
         cycle: int,
         review_state: ReviewState,
         advisor_sessions: dict[str, str] | None = None,
+        current_fingerprint: str | None = None,
     ) -> bool:
         """
         评审单个结果文件 (R6f: 结果内串行)
@@ -181,7 +191,8 @@ class ResultReviewExecutor:
             # 检查该 advisor 是否需要重审已通过项
             if (cycle > 1
                     and not advisor_def.re_review_on_cycle
-                    and review_state.is_result_passed(result_file)):
+                    and review_state.is_result_passed(
+                        result_file, current_fingerprint)):
                 continue
 
             agent = self.agents.get(advisor_def.agent_id)

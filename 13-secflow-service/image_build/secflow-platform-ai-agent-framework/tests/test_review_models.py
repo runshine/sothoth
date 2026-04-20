@@ -75,11 +75,71 @@ def test_parse_simple_pass_json():
     assert result.confidence == 0.92
 
 
-def test_parse_json_without_structured_feedback_generates_stable_feedback_fields():
+def test_parse_json_without_clear_pass_fail_signal_defaults_to_fail_close():
     content = '{"report_id":"result_002","overall_verdict":"MEDIUM_CONFIDENTION","details":{"a":1}}'
     result = parse_review_response(content)
-    assert result.passed is True
-    assert result.verdict == "PASS"
-    assert result.feedback == "PASS（通过） - MEDIUM_CONFIDENTION"
+    assert result.passed is False
+    assert result.verdict == "FAIL"
+    assert result.feedback == "FAIL（未通过） - MEDIUM_CONFIDENTION"
     assert result.feedback_detail == "MEDIUM_CONFIDENTION"
     assert result.raw_content == content
+
+
+def test_parse_global_review_json_with_blockers_and_resolved_ids():
+    content = '''
+    {
+      "passed": false,
+      "feedback": "EXPORT 跟入仍不足",
+      "scores": {
+        "export_followthrough": 0.72,
+        "report_completeness": 0.88
+      },
+      "blocking_issues": [
+        {
+          "id": "export-followthrough:send-socket",
+          "category": "export_followthrough",
+          "target": "IPSEC_SOCK_SendToSocket",
+          "severity": "high",
+          "required_action": "继续跟入至少两层并给出安全/漏洞结论"
+        }
+      ],
+      "resolved_issues": ["input-coverage:manual-sa"]
+    }
+    '''
+    result = parse_review_response(content)
+    assert result.passed is False
+    assert result.blocking_issues[0]["id"] == "export-followthrough:send-socket"
+    assert result.blocking_issues[0]["target"] == "IPSEC_SOCK_SendToSocket"
+    assert result.resolved_issue_ids == ["input-coverage:manual-sa"]
+    assert result.scores["export_followthrough"] == 0.72
+
+
+def test_parse_result_review_json_prefers_top_level_verdict_over_nested_pass_flags():
+    content = '''
+    {
+      "verdict": "REJECTED",
+      "summary": "攻击前提不成立",
+      "findings": [
+        {"category": "code_evidence", "passed": true},
+        {"category": "trigger_conditions", "passed": false}
+      ]
+    }
+    '''
+    result = parse_review_response(content)
+    assert result.passed is False
+    assert result.verdict == "REJECT"
+    assert "攻击前提不成立" in result.feedback
+
+
+def test_parse_result_review_json_marks_refuted_and_dismiss_as_failure():
+    content = '''
+    {
+      "verdict": "REFUTED",
+      "summary": "该问题已被证伪",
+      "recommendation": "DISMISS"
+    }
+    '''
+    result = parse_review_response(content)
+    assert result.passed is False
+    assert result.verdict == "REFUTED"
+    assert result.feedback == "REFUTED（已证伪） - 该问题已被证伪"
