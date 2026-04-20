@@ -1,14 +1,52 @@
-import requests
+import json
+from typing import Dict, Tuple
+
 import redis
+import requests
 
 from .db import DatabaseConnection
 
-from typing import Dict, List, Any, Optional, Tuple, Union
+
+LEGACY_API_FALLBACK_STATUSES = {401, 404, 410, 501}
 
 # ===================== 连接检查工具 =====================
 
 class ConnectionChecker:
     """连接检查器"""
+
+    @staticmethod
+    def _login_v3(
+        nacos_url: str,
+        username: str = None,
+        password: str = None,
+        timeout: int = 10,
+    ) -> Dict[str, str]:
+        """登录 Nacos 3.x，获取 access token。"""
+        if not username or not password:
+            return {}
+
+        login_url = f"{nacos_url.rstrip('/')}/nacos/v3/auth/user/login"
+        response = requests.post(
+            login_url,
+            data={
+                'username': username,
+                'password': password,
+            },
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            return {}
+
+        payload = response.json() if response.content else {}
+        token = (
+            payload.get('accessToken')
+            or payload.get('data', {}).get('accessToken')
+            or payload.get('data')
+        )
+        token = str(token or '').strip()
+        if not token:
+            return {}
+        return {'accessToken': token}
 
     @staticmethod
     def check_database(db_config: Dict) -> Tuple[bool, str]:
@@ -25,33 +63,50 @@ class ConnectionChecker:
     @staticmethod
     def check_nacos(nacos_url: str, namespace: str = 'public',
                     username: str = None, password: str = None) -> Tuple[bool, str]:
-        """检查Nacos连接（支持v3 API认证）"""
+        """检查Nacos连接，兼容 legacy/v3 API。"""
         try:
-            url = f"{nacos_url.rstrip('/')}/nacos/v1/ns/service/list"
-            params = {
-                'pageNo': 1,
-                'pageSize': 10,
-                'namespaceId': namespace
-            }
-
-            # 准备认证信息
+            base_url = nacos_url.rstrip('/')
             auth = None
             if username and password:
                 auth = (username, password)
 
-            response = requests.get(url, params=params, timeout=10, auth=auth)
+            legacy_url = f"{base_url}/nacos/v1/ns/service/list"
+            params = {
+                'pageNo': 1,
+                'pageSize': 10,
+                'namespaceId': namespace,
+            }
+            response = requests.get(legacy_url, params=params, timeout=10, auth=auth)
             if response.status_code == 200:
                 return True, "Nacos连接正常"
-            elif response.status_code == 401:
-                # 尝试使用v3 API
-                v3_url = f"{nacos_url.rstrip('/')}/nacos/v3/ns/service/list"
-                v3_response = requests.get(v3_url, params=params, timeout=10, auth=auth)
+
+            if response.status_code in LEGACY_API_FALLBACK_STATUSES:
+                # 3.x 中服务列表属于范围型查询，需要走 admin API。
+                v3_url = f"{base_url}/nacos/v3/admin/ns/service/list"
+                v3_params = {
+                    'pageNo': 1,
+                    'pageSize': 10,
+                    'namespaceId': namespace,
+                    'groupName': 'DEFAULT_GROUP',
+                    'selector': json.dumps({"type": "none"}, separators=(",", ":")),
+                }
+                headers = ConnectionChecker._login_v3(base_url, username, password, timeout=10)
+                v3_response = requests.get(
+                    v3_url,
+                    params=v3_params,
+                    timeout=10,
+                    auth=auth,
+                    headers=headers or None,
+                )
                 if v3_response.status_code == 200:
                     return True, "Nacos v3 API连接正常"
-                else:
-                    return False, f"Nacos v3 API连接失败: HTTP {v3_response.status_code}"
-            else:
-                return False, f"Nacos连接失败: HTTP {response.status_code}"
+
+                return False, (
+                    f"Nacos legacy API返回 HTTP {response.status_code}，"
+                    f"且 v3 admin API连接失败: HTTP {v3_response.status_code}"
+                )
+
+            return False, f"Nacos连接失败: HTTP {response.status_code}"
 
         except requests.exceptions.ConnectionError as e:
             return False, f"Nacos连接失败: {str(e)}"

@@ -25,7 +25,7 @@ import base64
 
 from .db import DatabaseManager
 from .redis_manager import RedisManager
-from .connection import ConnectionChecker
+from .connection import ConnectionChecker, LEGACY_API_FALLBACK_STATUSES
 from .model import AgentInfo, TaskInfo, ProjectInfo
 import shutil
 from pathlib import Path
@@ -69,6 +69,7 @@ class AgentManager:
         self.nacos_auth = None
         if self.nacos_username and self.nacos_password:
             self.nacos_auth = (self.nacos_username, self.nacos_password)
+        self.nacos_v3_headers = {}
 
         # 设置超时配置
         self.timeouts = agent_api_timeouts or {
@@ -127,7 +128,12 @@ class AgentManager:
     def _test_nacos_connection(self) -> bool:
         """测试Nacos连接"""
         try:
-            result, message = ConnectionChecker.check_nacos(self.nacos_url, self.nacos_namespace)
+            result, message = ConnectionChecker.check_nacos(
+                self.nacos_url,
+                self.nacos_namespace,
+                self.nacos_username,
+                self.nacos_password,
+            )
             if result:
                 self.logger.info("Nacos连接测试通过")
                 return True
@@ -137,6 +143,157 @@ class AgentManager:
         except Exception as e:
             self.logger.error(f"Nacos连接测试异常: {str(e)}")
             return False
+
+    def _get_nacos_v3_headers(self, timeout: int = 5) -> Dict[str, str]:
+        """按需登录 Nacos 3.x 并缓存 access token。"""
+        if self.nacos_v3_headers:
+            return self.nacos_v3_headers
+
+        try:
+            headers = ConnectionChecker._login_v3(
+                self.nacos_url,
+                self.nacos_username,
+                self.nacos_password,
+                timeout=timeout,
+            )
+            if headers:
+                self.nacos_v3_headers = headers
+        except Exception as e:
+            self.logger.debug(f"获取Nacos v3 token失败: {str(e)}")
+        return self.nacos_v3_headers
+
+    def _extract_hosts_from_nacos_payload(self, payload: Any) -> List[Dict]:
+        """兼容多种 Nacos v1/v3 响应结构，递归提取实例列表。"""
+        if isinstance(payload, dict):
+            hosts = payload.get('hosts')
+            if isinstance(hosts, list):
+                return [item for item in hosts if isinstance(item, dict)]
+
+            data = payload.get('data')
+            if isinstance(data, dict):
+                nested_hosts = data.get('hosts')
+                if isinstance(nested_hosts, list):
+                    return [item for item in nested_hosts if isinstance(item, dict)]
+                items = data.get('list') or data.get('pageItems') or data.get('items')
+                if isinstance(items, list) and items and all(isinstance(item, dict) for item in items):
+                    if any('ip' in item or 'metadata' in item for item in items):
+                        return items
+                    for item in items:
+                        nested = self._extract_hosts_from_nacos_payload(item)
+                        if nested:
+                            return nested
+
+            service = payload.get('service')
+            if isinstance(service, dict):
+                nested = self._extract_hosts_from_nacos_payload(service)
+                if nested:
+                    return nested
+
+            for value in payload.values():
+                nested = self._extract_hosts_from_nacos_payload(value)
+                if nested:
+                    return nested
+
+        if isinstance(payload, list):
+            for item in payload:
+                nested = self._extract_hosts_from_nacos_payload(item)
+                if nested:
+                    return nested
+
+        return []
+
+    def _extract_service_names_from_v3_payload(self, payload: Dict) -> List[str]:
+        """兼容 v3 admin 服务列表的不同返回结构。"""
+        candidates = []
+        if isinstance(payload, dict):
+            data = payload.get('data')
+            if isinstance(data, dict):
+                candidates.extend(data.get('pageItems') or [])
+                candidates.extend(data.get('list') or [])
+                candidates.extend(data.get('items') or [])
+            candidates.extend(payload.get('pageItems') or [])
+            candidates.extend(payload.get('list') or [])
+            candidates.extend(payload.get('items') or [])
+
+        names = []
+        for item in candidates:
+            if isinstance(item, dict):
+                name = str(item.get('name') or item.get('serviceName') or '').strip()
+                if name:
+                    names.append(name)
+            elif isinstance(item, str):
+                item = item.strip()
+                if item:
+                    names.append(item)
+        return names
+
+    def _fetch_nacos_instances(self, service_name: str, cluster_name: str = 'nacos-client') -> List[Dict]:
+        """获取指定服务的实例列表，兼容 legacy/v3 API。"""
+        params_v1 = {
+            'serviceName': service_name,
+            'groupName': 'DEFAULT_GROUP',
+            'namespaceId': self.nacos_namespace,
+            'clusters': cluster_name,
+        }
+
+        try:
+            url_v1 = f"{self.nacos_url}/nacos/v1/ns/instance/list"
+            response = requests.get(url_v1, params=params_v1, timeout=5, auth=self.nacos_auth)
+            if response.status_code == 200:
+                return self._extract_hosts_from_nacos_payload(response.json() if response.content else {})
+
+            if response.status_code not in LEGACY_API_FALLBACK_STATUSES:
+                self.logger.debug(
+                    f"legacy实例列表查询失败: service={service_name}, status={response.status_code}"
+                )
+                return []
+
+            headers = self._get_nacos_v3_headers(timeout=5)
+            v3_candidates = [
+                (
+                    f"{self.nacos_url}/nacos/v3/client/ns/instance/list",
+                    {
+                        'serviceName': service_name,
+                        'groupName': 'DEFAULT_GROUP',
+                        'namespaceId': self.nacos_namespace,
+                        'clusterName': cluster_name,
+                    },
+                ),
+                (
+                    f"{self.nacos_url}/nacos/v3/admin/ns/instance/list",
+                    {
+                        'serviceName': service_name,
+                        'groupName': 'DEFAULT_GROUP',
+                        'namespaceId': self.nacos_namespace,
+                        'clusterName': cluster_name,
+                    },
+                ),
+            ]
+
+            for url, params in v3_candidates:
+                v3_response = requests.get(
+                    url,
+                    params=params,
+                    timeout=5,
+                    auth=self.nacos_auth,
+                    headers=headers or None,
+                )
+                if v3_response.status_code != 200:
+                    self.logger.debug(
+                        f"v3实例列表查询失败: url={url}, service={service_name}, status={v3_response.status_code}"
+                    )
+                    continue
+
+                hosts = self._extract_hosts_from_nacos_payload(
+                    v3_response.json() if v3_response.content else {}
+                )
+                if hosts:
+                    return hosts
+
+        except Exception as e:
+            self.logger.debug(f"获取Nacos实例列表异常: service={service_name}, err={e}")
+
+        return []
 
     def _load_agents_from_db(self):
         try:
@@ -324,7 +481,13 @@ class AgentManager:
                 }
 
                 # 使用认证信息
-                response = requests.get(url, params=params, timeout=5, auth=self.nacos_auth)
+                response = requests.get(
+                    url,
+                    params=params,
+                    timeout=5,
+                    auth=self.nacos_auth,
+                    headers=self._get_nacos_v3_headers(timeout=5) or None,
+                )
 
                 if response.status_code == 200:
                     service_data = response.json()
@@ -357,38 +520,22 @@ class AgentManager:
             # 方法2: 尝试使用实例列表API（指定集群名称）
             try:
                 # 实例列表API，可以指定集群名称
-                url = f"{self.nacos_url}/nacos/v1/ns/instance/list"
-                params = {
-                    'serviceName': service_name,
-                    'groupName': 'DEFAULT_GROUP',
-                    'namespaceId': self.nacos_namespace,
-                    'clusters': 'nacos-client'  # 指定集群名称
-                }
+                hosts = self._fetch_nacos_instances(service_name, cluster_name='nacos-client')
+                if hosts:
+                    uuid_value = _select_uuid_from_hosts(hosts, expected_ip=ip_address)
+                    if uuid_value:
+                        # 更新缓存
+                        self.nacos_client_uuid_cache[cache_key] = uuid_value
+                        self.nacos_client_cache_time = current_time
 
-                # 使用认证信息
-                response = requests.get(url, params=params, timeout=5, auth=self.nacos_auth)
+                        self.logger.debug(
+                            f"从服务 {service_name} 的nacos-client实例按expected_ip={ip_address}获取uuid: {uuid_value}"
+                        )
+                        return uuid_value
 
-                if response.status_code == 200:
-                    instances_data = response.json()
-
-                    # 查找实例的metadata
-                    if 'hosts' in instances_data and instances_data['hosts']:
-                        uuid_value = _select_uuid_from_hosts(instances_data['hosts'], expected_ip=ip_address)
-                        if uuid_value:
-                            # 更新缓存
-                            self.nacos_client_uuid_cache[cache_key] = uuid_value
-                            self.nacos_client_cache_time = current_time
-
-                            self.logger.debug(
-                                f"从服务 {service_name} 的nacos-client实例按expected_ip={ip_address}获取uuid: {uuid_value}"
-                            )
-                            return uuid_value
-
-                        self.logger.debug(f"服务 {service_name} 的nacos-client集群实例中没有找到uuid")
-                    else:
-                        self.logger.debug(f"服务 {service_name} 没有nacos-client集群的实例")
+                    self.logger.debug(f"服务 {service_name} 的nacos-client集群实例中没有找到uuid")
                 else:
-                    self.logger.debug(f"获取服务 {service_name} 的实例列表失败: HTTP {response.status_code}")
+                    self.logger.debug(f"服务 {service_name} 没有nacos-client集群的实例")
 
             except Exception as e:
                 self.logger.debug(f"使用实例列表API获取服务 {service_name} 失败: {str(e)}")
@@ -516,26 +663,40 @@ class AgentManager:
             if response.status_code == 200:
                 data = response.json()
                 return data.get('doms', [])
-            elif response.status_code == 401:
-                # 尝试v3 API
-                v3_url = f"{self.nacos_url}/nacos/v3/ns/service/list"
-                v3_response = requests.get(v3_url, params=params, timeout=10, auth=self.nacos_auth)
-                if v3_response.status_code == 200:
-                    v3_data = v3_response.json()
-                    # 解析v3 API返回格式
-                    if 'data' in v3_data and 'list' in v3_data['data']:
-                        return [service['name'] for service in v3_data['data']['list']]
-                    elif 'list' in v3_data:
-                        return [service['name'] for service in v3_data['list']]
-                    else:
-                        self.logger.error(f"Nacos v3 API返回格式异常: {v3_data}")
-                        return []
-                else:
-                    self.logger.error(f"获取Nacos服务列表失败 (v3): {v3_response.status_code}")
-                    return []
-            else:
+
+            if response.status_code not in LEGACY_API_FALLBACK_STATUSES:
                 self.logger.error(f"获取Nacos服务列表失败: {response.status_code}")
                 return []
+
+            # 3.x 中范围型服务查询走 admin API。
+            v3_url = f"{self.nacos_url}/nacos/v3/admin/ns/service/list"
+            v3_params = {
+                'pageNo': 1,
+                'pageSize': 1000000,
+                'namespaceId': self.nacos_namespace,
+                'groupName': 'DEFAULT_GROUP',
+                'selector': json.dumps({"type": "none"}, separators=(",", ":")),
+            }
+            v3_response = requests.get(
+                v3_url,
+                params=v3_params,
+                timeout=10,
+                auth=self.nacos_auth,
+                headers=self._get_nacos_v3_headers(timeout=10) or None,
+            )
+            if v3_response.status_code != 200:
+                self.logger.error(
+                    f"获取Nacos服务列表失败: legacy={response.status_code}, v3={v3_response.status_code}"
+                )
+                return []
+
+            v3_data = v3_response.json() if v3_response.content else {}
+            names = self._extract_service_names_from_v3_payload(v3_data)
+            if names:
+                return names
+
+            self.logger.error(f"Nacos v3 API返回格式异常: {v3_data}")
+            return []
 
         except requests.exceptions.ConnectionError as e:
             self.logger.error(f"Nacos连接失败: {str(e)}")
@@ -550,21 +711,13 @@ class AgentManager:
     def _has_healthy_nacos_client_instance(self, service_name: str, expected_ip: str = None) -> bool:
         """检查服务在 nacos-client 集群下是否仍有健康实例，避免残留 service name 重新带回失效 Agent。"""
         try:
-            url = f"{self.nacos_url}/nacos/v1/ns/instance/list"
-            params = {
-                'serviceName': service_name,
-                'groupName': 'DEFAULT_GROUP',
-                'namespaceId': self.nacos_namespace,
-                'clusters': 'nacos-client'
-            }
-            response = requests.get(url, params=params, timeout=5, auth=self.nacos_auth)
-            if response.status_code != 200:
-                self.logger.debug(f"检查Nacos健康实例失败: service={service_name}, status={response.status_code}")
+            hosts = self._fetch_nacos_instances(service_name, cluster_name='nacos-client')
+            if not hosts:
+                self.logger.debug(f"检查Nacos健康实例失败: service={service_name}, no hosts returned")
                 return False
 
-            payload = response.json() if response.content else {}
             healthy_hosts = []
-            for host in payload.get('hosts') or []:
+            for host in hosts:
                 if host.get('healthy') is False:
                     continue
                 if host.get('enabled') is False:
