@@ -231,10 +231,9 @@ class WebAPIServer:
         # 检查Nacos连接
         nacos_success, nacos_message = results.get('nacos', (False, 'Nacos检查失败'))
         if not nacos_success:
-            self.logger.error(f"Nacos连接失败: {nacos_message}")
-            raise ConnectionError(f"Nacos连接失败: {nacos_message}")
-
-        self.logger.info(f"✓ {nacos_message}")
+            self.logger.warning(f"Nacos连接失败，进入降级模式继续启动: {nacos_message}")
+        else:
+            self.logger.info(f"✓ {nacos_message}")
 
         # 检查Auth连接与机机Token
         auth_url = (self.config.get('auth_service_url') or 'http://secflow-platform-auth').rstrip('/')
