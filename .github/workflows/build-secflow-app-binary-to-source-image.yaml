@@ -1,4 +1,4 @@
-name: build-secflow-app-binary-to-source-image.
+name: build-secflow-app-binary-to-source-image
 on:
   push:
     branches:
@@ -6,6 +6,8 @@ on:
     paths:
       - .github/workflows/build-secflow-app-binary-to-source-image.yaml
       - 13-secflow-service/image_build/secflow-app-binary-to-source/**
+      - 13-secflow-service/00-secflow-102-**
+      - 13-secflow-service/00-secflow-00-02-platform-ingress.yaml
 
 jobs:
   prepare:

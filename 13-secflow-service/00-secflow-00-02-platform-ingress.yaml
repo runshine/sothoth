@@ -148,6 +148,13 @@ spec:
                 name: secflow-app-code-server
                 port:
                   number: 80
+          - path: /api/app/binary-to-source
+            pathType: Prefix
+            backend:
+              service:
+                name: secflow-app-binary-to-source-manager
+                port:
+                  number: 80
   tls:
     - hosts:
         - secflow.ai.icsl.huawei.com

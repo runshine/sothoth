@@ -1,0 +1,45 @@
+database:
+  host: "mysql.sothothv2-ns.svc.cluster.local"
+  port: 3306
+  username: "secflow"
+  password: "Huawei12#$"
+  name: "secflow"
+  pool_size: 10
+  max_overflow: 20
+
+auth_service:
+  host: "secflow-platform-auth"
+  port: 80
+  validate_token_path: "/api/auth/validate-token"
+  timeout: 10
+  token_cache_enabled: true
+  token_cache_ttl_minutes: 15
+
+project_service:
+  host: "secflow-platform-project"
+  port: 80
+  get_project_path: "/api/project"
+  timeout: 10
+
+pi_re_agent:
+  base_url: "http://secflow-pi-re-agent:8000"
+  api_key: null
+  timeout: 30
+  batch_size: 8192
+  max_retries: 3
+  engine: "hybrid"
+  concurrency: 4
+  model: null
+
+storage:
+  project_root_template: "/data/files/{project_id}"
+  output_root_name: "binary-to-source-outputs"
+  require_input_exists: true
+
+app:
+  host: "0.0.0.0"
+  port: 8080
+  debug: false
+
+logging:
+  level: "INFO"
