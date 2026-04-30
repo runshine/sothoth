@@ -44,7 +44,7 @@ project_service:
 registry:
   enabled: true
   menu_service_url: "http://secflow-platform-menu"
-  service_id: "secflow-app-binary-to-source"
+  service_id: "secflow-app-binary-to-source-manager"
   service_name: "ELF源码还原服务"
   host: "secflow-app-binary-to-source-manager"
   port: 80

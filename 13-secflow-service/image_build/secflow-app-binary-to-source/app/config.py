@@ -83,7 +83,7 @@ class RegistryMenuConfig(BaseModel):
 class RegistryConfig(BaseModel):
     enabled: bool = True
     menu_service_url: str = "http://secflow-platform-menu"
-    service_id: str = "secflow-app-binary-to-source"
+    service_id: str = "secflow-app-binary-to-source-manager"
     service_name: str = "ELF源码还原服务"
     host: str = "secflow-app-binary-to-source-manager"
     port: int = 80
