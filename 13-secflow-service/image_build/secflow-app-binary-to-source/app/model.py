@@ -67,11 +67,11 @@ class B2STaskItem(Base):
         self.generated_files_json = json.dumps(value or [], ensure_ascii=False)
 
     @property
-    def metadata(self) -> dict[str, Any]:
+    def extra_metadata(self) -> dict[str, Any]:
         return _loads(self.metadata_json, {})
 
-    @metadata.setter
-    def metadata(self, value: dict[str, Any] | None) -> None:
+    @extra_metadata.setter
+    def extra_metadata(self, value: dict[str, Any] | None) -> None:
         self.metadata_json = json.dumps(value or {}, ensure_ascii=False)
 
 

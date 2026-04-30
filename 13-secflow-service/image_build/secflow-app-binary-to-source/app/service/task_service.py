@@ -53,7 +53,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             output_dir=str(safe_output_dir(project_id, task.id, idx, elf.output_subdir)),
             status="pending",
         )
-        item.metadata = {**(elf.metadata or {}), "file_list": elf.file_list or []}
+        item.extra_metadata = {**(elf.metadata or {}), "file_list": elf.file_list or []}
         db.add(item)
         db.flush()
 
@@ -147,7 +147,7 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
             "batch_size": pi_cfg.batch_size,
             "max_retries": pi_cfg.max_retries,
             "model": pi_cfg.model,
-            "functions": (item.metadata or {}).get("file_list") or None,
+            "functions": (item.extra_metadata or {}).get("file_list") or None,
             "clean": True,
             "engine": pi_cfg.engine,
             "concurrency": pi_cfg.concurrency,
