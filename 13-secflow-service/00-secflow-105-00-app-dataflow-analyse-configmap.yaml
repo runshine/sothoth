@@ -64,10 +64,10 @@ data:
     database:
       host: "mysql.sothothv2-ns.svc.cluster.local"
       port: 3306
-      username: "secflow"
+      username: "secflow_dfa"
       password: "Huawei12#$"
-      name: "secflow"
-      table_prefix: "secflow_"
+      name: "secflow_dfa"
+      table_prefix: "app_dfa_"
       pool_size: 10
       max_overflow: 20
 

@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: secflow-app-system-analyse-ingress
+  namespace: secflow-ns
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "512m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: secflow.ai.icsl.huawei.com
+    http:
+      paths:
+      - path: /api/app/system-analyse
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-system-analyse
+            port:
+              number: 80
+  tls:
+  - hosts:
+    - secflow.ai.icsl.huawei.com
+    secretName: wildcard-secflow-tls
