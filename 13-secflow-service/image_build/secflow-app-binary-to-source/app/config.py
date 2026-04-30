@@ -48,6 +48,12 @@ class ProjectServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}"
 
 
+class ConfigCenterServiceConfig(BaseModel):
+    enabled: bool = True
+    base_url: str = "http://secflow-platform-configcenter/api/configcenter"
+    timeout: int = 30
+
+
 class PiReAgentConfig(BaseModel):
     base_url: str = "http://secflow-pi-re-agent:8000"
     api_key: Optional[str] = None
@@ -57,6 +63,8 @@ class PiReAgentConfig(BaseModel):
     engine: Literal["agent", "hybrid"] = "hybrid"
     concurrency: int = 4
     model: Optional[str] = None
+    llm_provider_key: Optional[str] = "share_codex"
+    agent_config_dir: str = "/data/pi-re-agent-config"
 
 
 class StorageConfig(BaseModel):
@@ -107,6 +115,7 @@ class Config(BaseModel):
     database: DatabaseConfig
     auth_service: AuthServiceConfig
     project_service: ProjectServiceConfig
+    configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
     pi_re_agent: PiReAgentConfig = Field(default_factory=PiReAgentConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)

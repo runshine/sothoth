@@ -17,6 +17,7 @@ from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
+from app.service.llm_provider import materialize_llm_provider
 from app.service.registry import get_registry_service
 
 
@@ -79,6 +80,7 @@ async def lifespan(_: FastAPI):
         with get_engine().connect() as conn:
             conn.exec_driver_sql("SELECT 1")
         verify_auth_service_or_exit()
+        await materialize_llm_provider()
         await get_registry_service().start()
     except Exception as exc:
         logger.exception("B2S服务启动失败: %s", exc)

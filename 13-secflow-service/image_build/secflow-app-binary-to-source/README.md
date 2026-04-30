@@ -8,6 +8,7 @@ SecFlow B2S 后端适配服务，用于保持前端现有 `/api/app/binary-to-so
 - 启动时使用服务机机 Token 校验 Auth 服务，完成微服务间认证自检。
 - 运行时通过 Auth 服务校验用户 Bearer Token。
 - 通过 Project 服务校验用户是否可访问当前 `project_id`。
+- 通过 ConfigCenter 拉取 LLM Provider，并物化为 pi-re-agent 可读取的模型配置。
 - 启动后向 `secflow-platform-menu` 注册服务和菜单，并定时发送心跳。
 - 按项目根目录校验 `elf_path` 与 `output_dir`，避免跨项目路径访问。
 - 维护 B2S Task / Item 与 pi-re-agent Job 的映射。
@@ -41,6 +42,15 @@ project_service:
   port: 80
   get_project_path: "/api/project"
 
+configcenter_service:
+  enabled: true
+  base_url: "http://secflow-platform-configcenter/api/configcenter"
+  timeout: 30
+
+pi_re_agent:
+  llm_provider_key: "share_codex"
+  agent_config_dir: "/data/pi-re-agent-config"
+
 registry:
   enabled: true
   menu_service_url: "http://secflow-platform-menu"
@@ -55,9 +65,11 @@ registry:
 
 1. 初始化数据库表。
 2. 使用 `auth_service.service_machine_token` 或环境变量 `SECFLOW_SERVICE_MACHINE_TOKEN` 调用 Auth `/api/auth/validate-token`，确认 token 类型为 `machine`。
-3. 向 Menu 注册中心调用 `/api/menu/register` 注册服务和菜单。
-4. 后台每 30 秒调用 `/api/menu/heartbeat/{service_id}` 发送心跳。
-5. 停止时调用 `/api/menu/unregister/{service_id}` 注销服务。
+3. 使用同一个机机 Token 调用 ConfigCenter `/api/configcenter/service/llm/providers/{llm_provider_key}` 拉取 LLM Provider。
+4. 将 Provider 转换为 pi-re-agent 可读取的 `/data/pi-re-agent-config/models.json`、`settings.json`、`auth.json`。
+5. 向 Menu 注册中心调用 `/api/menu/register` 注册服务和菜单。
+6. 后台每 30 秒调用 `/api/menu/heartbeat/{service_id}` 发送心跳。
+7. 停止时调用 `/api/menu/unregister/{service_id}` 注销服务。
 
 项目管理：
 
@@ -98,7 +110,7 @@ PI_RE_ALLOWED_DIRS=/data/files
   "output_dir": "/data/files/<project_id>/binary-to-source-outputs/<task_id>/1",
   "batch_size": 8192,
   "max_retries": 3,
-  "model": null,
+  "model": "share_codex/gpt-5.4",
   "functions": null,
   "clean": false,
   "engine": "hybrid",
@@ -139,3 +151,12 @@ Ingress 路径：
 ```
 
 注意：`secflow-pi-re-agent` 镜像默认写为 `ghcr.io/skiyer/pi-re-agent:main`，部署前请确认该镜像包含当前所需的 `pi-re-server` REST API；如使用自建镜像，请按实际镜像仓库修改清单。
+
+`secflow-pi-re-agent` 会将同一份 fileserver PVC 的 `pi-re-agent-config` 子目录挂载到 `/root/.pi/agent`，并设置：
+
+```text
+PI_MODELS_JSON=/root/.pi/agent/models.json
+PI_CODING_AGENT_DIR=/root/.pi/agent
+```
+
+B2S adapter 启动时从 ConfigCenter 物化 LLM Provider 到该目录，因此 pi-re-agent 和 pi CLI 能读取统一的模型与 API Key 配置。

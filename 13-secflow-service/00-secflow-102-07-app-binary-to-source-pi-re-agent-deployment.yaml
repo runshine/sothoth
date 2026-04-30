@@ -26,11 +26,18 @@ spec:
         env:
         - name: PI_RE_ALLOWED_DIRS
           value: "/data/files"
+        - name: PI_MODELS_JSON
+          value: "/root/.pi/agent/models.json"
+        - name: PI_CODING_AGENT_DIR
+          value: "/root/.pi/agent"
         - name: QT_QPA_PLATFORM
           value: "offscreen"
         volumeMounts:
         - name: secflow-platform-fileserver-data
           mountPath: /data
+        - name: secflow-platform-fileserver-data
+          mountPath: /root/.pi/agent
+          subPath: pi-re-agent-config
         resources:
           requests:
             memory: "2Gi"

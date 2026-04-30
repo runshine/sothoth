@@ -22,6 +22,11 @@ project_service:
   get_project_path: "/api/project"
   timeout: 10
 
+configcenter_service:
+  enabled: true
+  base_url: "http://secflow-platform-configcenter/api/configcenter"
+  timeout: 30
+
 pi_re_agent:
   base_url: "http://secflow-pi-re-agent:8000"
   api_key: null
@@ -31,6 +36,8 @@ pi_re_agent:
   engine: "hybrid"
   concurrency: 4
   model: null
+  llm_provider_key: "share_codex"
+  agent_config_dir: "/data/pi-re-agent-config"
 
 storage:
   project_root_template: "/data/files/{project_id}"

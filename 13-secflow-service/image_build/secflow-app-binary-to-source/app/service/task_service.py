@@ -11,6 +11,7 @@ from app.config import get_config
 from app.exception import ConflictError, NotFoundError, ValidationError
 from app.model import B2STask, B2STaskItem
 from app.schemas import TaskCreate, TaskDetailResponse, TaskItemResponse, TaskResponse
+from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import ensure_path_in_project, safe_output_dir
 
@@ -42,6 +43,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     db.flush()
 
     pi_cfg = get_config().pi_re_agent
+    job_model = await resolve_job_model()
     client = get_pi_client()
     for idx, elf in enumerate(req.elf_tasks, start=1):
         item = B2STaskItem(
@@ -63,7 +65,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
                 "output_dir": item.output_dir,
                 "batch_size": pi_cfg.batch_size,
                 "max_retries": pi_cfg.max_retries,
-                "model": pi_cfg.model,
+                "model": job_model,
                 "functions": elf.file_list or None,
                 "clean": False,
                 "engine": pi_cfg.engine,
@@ -133,6 +135,7 @@ async def terminate_task(db: Session, task: B2STask) -> None:
 
 async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = None) -> None:
     pi_cfg = get_config().pi_re_agent
+    job_model = await resolve_job_model()
     client = get_pi_client()
     items = query_items(db, task.id)
     selected = [i for i in items if item_ids is None or i.id in item_ids]
@@ -146,7 +149,7 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
             "output_dir": item.output_dir,
             "batch_size": pi_cfg.batch_size,
             "max_retries": pi_cfg.max_retries,
-            "model": pi_cfg.model,
+            "model": job_model,
             "functions": (item.extra_metadata or {}).get("file_list") or None,
             "clean": True,
             "engine": pi_cfg.engine,
