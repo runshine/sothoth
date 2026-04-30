@@ -96,4 +96,4 @@ Ingress 路径：
 /api/app/binary-to-source -> secflow-app-binary-to-source-manager:80
 ```
 
-注意：`secflow-pi-re-agent` 镜像默认写为 `runshine0819/pi-re-agent:latest`，部署前请确认该镜像已构建并推送，或按实际镜像仓库修改清单。
+注意：`secflow-pi-re-agent` 镜像默认写为 `ghcr.io/skiyer/pi-re-agent:main`，部署前请确认该镜像包含当前所需的 `pi-re-server` REST API；如使用自建镜像，请按实际镜像仓库修改清单。

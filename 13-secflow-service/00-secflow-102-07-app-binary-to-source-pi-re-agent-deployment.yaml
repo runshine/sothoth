@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-pi-re-agent
-        image: runshine0819/pi-re-agent:latest
+        image: ghcr.io/skiyer/pi-re-agent:main
         imagePullPolicy: IfNotPresent
         command: ["pi-re-server"]
         args: ["--host", "0.0.0.0", "--port", "8000"]
