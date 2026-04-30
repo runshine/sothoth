@@ -33,12 +33,48 @@ class RetryRequest(BaseModel):
     item_ids: Optional[list[str]] = None
 
 
+class B2SProgress(BaseModel):
+    phase: Optional[str] = None
+    raw_phase: Optional[str] = None
+    phase_label: Optional[str] = None
+    message: Optional[str] = None
+    total_functions: Optional[int] = None
+    completed_functions: Optional[int] = None
+    total_bytes: Optional[int] = None
+    completed_bytes: Optional[int] = None
+    total_batches: Optional[int] = None
+    completed_batches: Optional[int] = None
+    current_batch: Optional[int] = None
+    current_attempt: Optional[int] = None
+    current_function: Optional[str] = None
+    percent: Optional[float] = None
+    bytes_percent: Optional[float] = None
+    batches_percent: Optional[float] = None
+
+
+class B2SOverallProgress(BaseModel):
+    total_items: int = 0
+    completed_items: int = 0
+    total_functions: Optional[int] = None
+    completed_functions: Optional[int] = None
+    total_bytes: Optional[int] = None
+    completed_bytes: Optional[int] = None
+    total_batches: Optional[int] = None
+    completed_batches: Optional[int] = None
+    percent: Optional[float] = None
+    phase_summary: dict[str, int] = Field(default_factory=dict)
+
+
 class TaskItemResponse(BaseModel):
     id: str
     sequence_no: int
     elf_path: str
     output_dir: str
     status: str
+    phase: Optional[str] = None
+    phase_label: Optional[str] = None
+    phase_message: Optional[str] = None
+    progress: Optional[B2SProgress] = None
     failure_type: Optional[str] = None
     error_reason: Optional[str] = None
     generated_files: list[str] = Field(default_factory=list)
@@ -64,6 +100,7 @@ class TaskResponse(BaseModel):
 
 
 class TaskDetailResponse(TaskResponse):
+    overall_progress: Optional[B2SOverallProgress] = None
     items: list[TaskItemResponse] = Field(default_factory=list)
 
 

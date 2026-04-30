@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from uuid import uuid4
 
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, ValidationError
 from app.model import B2STask, B2STaskItem
-from app.schemas import TaskCreate, TaskDetailResponse, TaskItemResponse, TaskResponse
+from app.schemas import B2SOverallProgress, TaskCreate, TaskDetailResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import ensure_path_in_project, safe_output_dir
@@ -22,6 +23,25 @@ PI_STATUS_MAP = {
     "completed": "success",
     "failed": "failed",
     "cancelled": "cancelled",
+}
+
+PI_PHASE_MAP = {
+    "analyzing": "ida",
+    "batching": "batching",
+    "processing": "body",
+    "merging": "merge",
+}
+
+PHASE_LABELS = {
+    "queued": "排队中",
+    "ida": "IDA 分析",
+    "batching": "函数分批",
+    "header": "头文件恢复",
+    "body": "函数体恢复",
+    "merge": "结果合并",
+    "completed": "已完成",
+    "failed": "失败",
+    "cancelled": "已取消",
 }
 
 
@@ -56,6 +76,8 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             status="pending",
         )
         item.extra_metadata = {**(elf.metadata or {}), "file_list": elf.file_list or []}
+        item.phase = "queued"
+        item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
         db.add(item)
         db.flush()
 
@@ -73,8 +95,12 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             })
             item.pi_job_id = job.get("id")
             item.status = map_pi_status(job.get("status"))
+            item.phase = map_pi_phase(job.get("phase"), job.get("status"))
+            item.progress = build_item_progress(item, job)
         except Exception as exc:
             item.status = "failed"
+            item.phase = "failed"
+            item.progress = build_item_progress(item, {"status": "failed", "phase": "failed", "progress": {}, "error": str(exc)})
             item.failure_type = "pi-re-agent"
             item.error_reason = str(exc)
             item.finished_at = datetime.utcnow()
@@ -100,8 +126,16 @@ async def sync_task(db: Session, task: B2STask) -> None:
             changed = True
             continue
         new_status = map_pi_status(job.get("status"))
+        new_phase = map_pi_phase(job.get("phase"), job.get("status"))
+        new_progress = build_item_progress(item, job)
         if item.status != new_status:
             item.status = new_status
+            changed = True
+        if item.phase != new_phase:
+            item.phase = new_phase
+            changed = True
+        if item.progress != new_progress:
+            item.progress = new_progress
             changed = True
         if new_status == "running" and item.started_at is None:
             item.started_at = datetime.utcnow()
@@ -111,6 +145,7 @@ async def sync_task(db: Session, task: B2STask) -> None:
             output = job.get("output") or {}
             item.generated_files = [p for p in [output.get("c"), output.get("h"), output.get("asm")] if p]
         if new_status == "failed":
+            item.phase = "failed"
             item.failure_type = "pi-re-agent"
             item.error_reason = job.get("error")
         changed = True
@@ -128,6 +163,8 @@ async def terminate_task(db: Session, task: B2STask) -> None:
         if item.pi_job_id:
             await client.cancel_job(item.pi_job_id)
         item.status = "cancelled"
+        item.phase = "cancelled"
+        item.progress = build_item_progress(item, {"status": "cancelled", "phase": "cancelled", "progress": item.progress})
         item.finished_at = datetime.utcnow()
     recompute_task_status(db, task)
     db.commit()
@@ -157,6 +194,8 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         })
         item.pi_job_id = job.get("id")
         item.status = map_pi_status(job.get("status"))
+        item.phase = map_pi_phase(job.get("phase"), job.get("status"))
+        item.progress = build_item_progress(item, job)
         item.failure_type = None
         item.error_reason = None
         item.generated_files = []
@@ -179,6 +218,72 @@ def query_items(db: Session, task_id: str) -> list[B2STaskItem]:
 
 def map_pi_status(status: str | None) -> str:
     return PI_STATUS_MAP.get(status or "queued", status or "queued")
+
+
+def map_pi_phase(raw_phase: str | None, status: str | None = None) -> str:
+    mapped_status = map_pi_status(status)
+    if mapped_status in {"success", "failed", "cancelled"}:
+        return {"success": "completed", "failed": "failed", "cancelled": "cancelled"}[mapped_status]
+    if mapped_status == "queued":
+        return "queued"
+    return PI_PHASE_MAP.get(raw_phase or "", "body" if mapped_status == "running" else "queued")
+
+
+def phase_label(phase: str | None) -> str:
+    return PHASE_LABELS.get(phase or "", phase or "-")
+
+
+def _safe_percent(done: int | float | None, total: int | float | None) -> float | None:
+    if total in (None, 0) or done is None:
+        return None
+    return round(max(0.0, min(100.0, float(done) * 100.0 / float(total))), 2)
+
+
+def _file_size(path: str | None) -> int | None:
+    try:
+        if path and os.path.isfile(path):
+            return os.path.getsize(path)
+    except OSError:
+        return None
+    return None
+
+
+def build_item_progress(item: B2STaskItem, job: dict) -> dict:
+    raw_progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+    raw_phase = job.get("phase")
+    phase = map_pi_phase(raw_phase, job.get("status"))
+    total_batches = raw_progress.get("total_batches")
+    completed_batches = raw_progress.get("completed_batches") or 0
+    total_functions = raw_progress.get("total_functions")
+    completed_functions = raw_progress.get("completed_functions")
+    if completed_functions is None and total_functions and total_batches:
+        completed_functions = int(float(total_functions) * float(completed_batches) / float(total_batches))
+    total_bytes = raw_progress.get("total_bytes") or raw_progress.get("total_binary_bytes") or _file_size(item.elf_path)
+    completed_bytes = raw_progress.get("completed_bytes")
+    batch_percent = _safe_percent(completed_batches, total_batches)
+    if completed_bytes is None and total_bytes and batch_percent is not None:
+        completed_bytes = int(float(total_bytes) * batch_percent / 100.0)
+    percent = _safe_percent(completed_functions, total_functions) or batch_percent or _safe_percent(completed_bytes, total_bytes)
+    message = raw_progress.get("message") or job.get("error") or phase_label(phase)
+    return {
+        "phase": phase,
+        "raw_phase": raw_phase,
+        "phase_label": phase_label(phase),
+        "message": message,
+        "total_functions": total_functions,
+        "completed_functions": completed_functions,
+        "total_bytes": total_bytes,
+        "completed_bytes": completed_bytes,
+        "total_batches": total_batches,
+        "completed_batches": completed_batches,
+        "current_batch": raw_progress.get("current_batch"),
+        "current_attempt": raw_progress.get("current_attempt"),
+        "current_function": raw_progress.get("current_function"),
+        "percent": percent,
+        "bytes_percent": _safe_percent(completed_bytes, total_bytes),
+        "batches_percent": batch_percent,
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
 
 
 def recompute_task_status(db: Session, task: B2STask) -> None:
@@ -235,6 +340,7 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
 
 def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
     base = build_task_response(db, task).model_dump()
+    raw_items = query_items(db, task.id)
     items = [
         TaskItemResponse(
             id=i.id,
@@ -242,12 +348,64 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
             elf_path=i.elf_path,
             output_dir=i.output_dir,
             status=i.status,
+            phase=i.phase,
+            phase_label=phase_label(i.phase),
+            phase_message=(i.progress or {}).get("message"),
+            progress=i.progress or None,
             failure_type=i.failure_type,
             error_reason=i.error_reason,
             generated_files=i.generated_files,
             started_at=i.started_at,
             finished_at=i.finished_at,
         )
-        for i in query_items(db, task.id)
+        for i in raw_items
     ]
-    return TaskDetailResponse(**base, items=items)
+    return TaskDetailResponse(**base, overall_progress=build_overall_progress(raw_items), items=items)
+
+
+def build_overall_progress(items: list[B2STaskItem]) -> B2SOverallProgress:
+    total_items = len(items)
+    completed_items = sum(1 for item in items if item.status in TERMINAL)
+    phase_summary: dict[str, int] = {}
+    total_functions = 0
+    completed_functions = 0
+    total_bytes = 0
+    completed_bytes = 0
+    total_batches = 0
+    completed_batches = 0
+    has_functions = has_bytes = has_batches = False
+    for item in items:
+        phase = item.phase or (item.progress or {}).get("phase") or item.status
+        phase_summary[phase] = phase_summary.get(phase, 0) + 1
+        progress = item.progress or {}
+        if progress.get("total_functions") is not None:
+            has_functions = True
+            total_functions += int(progress.get("total_functions") or 0)
+            completed_functions += int(progress.get("completed_functions") or 0)
+        if progress.get("total_bytes") is not None:
+            has_bytes = True
+            total_bytes += int(progress.get("total_bytes") or 0)
+            completed_bytes += int(progress.get("completed_bytes") or 0)
+        if progress.get("total_batches") is not None:
+            has_batches = True
+            total_batches += int(progress.get("total_batches") or 0)
+            completed_batches += int(progress.get("completed_batches") or 0)
+    percent = _safe_percent(completed_functions, total_functions) if has_functions else None
+    if percent is None and has_batches:
+        percent = _safe_percent(completed_batches, total_batches)
+    if percent is None and has_bytes:
+        percent = _safe_percent(completed_bytes, total_bytes)
+    if percent is None:
+        percent = _safe_percent(completed_items, total_items)
+    return B2SOverallProgress(
+        total_items=total_items,
+        completed_items=completed_items,
+        total_functions=total_functions if has_functions else None,
+        completed_functions=completed_functions if has_functions else None,
+        total_bytes=total_bytes if has_bytes else None,
+        completed_bytes=completed_bytes if has_bytes else None,
+        total_batches=total_batches if has_batches else None,
+        completed_batches=completed_batches if has_batches else None,
+        percent=percent,
+        phase_summary=phase_summary,
+    )

@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
@@ -49,6 +49,8 @@ class B2STaskItem(Base):
     output_dir = Column(Text, nullable=False)
     pi_job_id = Column(String(64), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
+    phase = Column(String(32), nullable=True)
+    progress_json = Column(Text, nullable=True)
     failure_type = Column(String(64), nullable=True)
     error_reason = Column(Text, nullable=True)
     generated_files_json = Column(Text, nullable=True)
@@ -73,6 +75,14 @@ class B2STaskItem(Base):
     @extra_metadata.setter
     def extra_metadata(self, value: dict[str, Any] | None) -> None:
         self.metadata_json = json.dumps(value or {}, ensure_ascii=False)
+
+    @property
+    def progress(self) -> dict[str, Any]:
+        return _loads(self.progress_json, {})
+
+    @progress.setter
+    def progress(self, value: dict[str, Any] | None) -> None:
+        self.progress_json = json.dumps(value or {}, ensure_ascii=False)
 
 
 def _loads(raw: Optional[str], default: Any) -> Any:
@@ -109,7 +119,29 @@ def get_session_factory():
 
 
 def init_database() -> None:
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _ensure_task_item_progress_columns(engine)
+
+
+def _ensure_task_item_progress_columns(engine) -> None:
+    """Add progress columns for existing deployments.
+
+    ``create_all`` does not alter already existing tables, while this service is
+    deployed incrementally.  Keep the migration intentionally small and safe.
+    """
+    table_name = B2STaskItem.__tablename__
+    columns = {column["name"] for column in inspect(engine).get_columns(table_name)}
+    statements: list[str] = []
+    if "phase" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN phase VARCHAR(32) NULL")
+    if "progress_json" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN progress_json TEXT NULL")
+    if not statements:
+        return
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.exec_driver_sql(statement)
 
 
 def get_db():
