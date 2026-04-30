@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
+from app.api.config import router as config_router
 from app.api.overview import router as overview_router
 from app.api.prompts import router as prompts_router
 from app.api.reports import router as reports_router
@@ -12,4 +13,5 @@ router.include_router(overview_router)
 router.include_router(prompts_router)
 router.include_router(tasks_router)
 router.include_router(reports_router)
+router.include_router(config_router)
 

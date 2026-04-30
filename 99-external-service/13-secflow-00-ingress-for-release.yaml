@@ -139,6 +139,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/app/system-analyse
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-system-analyse
+            port:
+              number: 80
+
       - path: /api/app/code-server
         pathType: Prefix
         backend:

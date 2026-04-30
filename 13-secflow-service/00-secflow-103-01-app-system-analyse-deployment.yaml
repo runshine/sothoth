@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-system-analyse
+  namespace: secflow-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: secflow-app-system-analyse
+  template:
+    metadata:
+      labels:
+        name: secflow-app-system-analyse
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: secflow-app-system-analyse
+        image: 172.31.30.52:5000/secflow-app-system-analyse:latest
+        imagePullPolicy: Always
+        env:
+        - name: PORT
+          value: "8080"
+        - name: SERVICE_CONFIG
+          value: /app/config.json
+        - name: OUTPUT_DIR
+          value: /data/output
+        - name: RESULT_DIR
+          value: /data/output
+        - name: ARCHIVE_DIR
+          value: /data/output
+        - name: SESSION_DIR
+          value: /data/sessions
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: secflow-app-system-analyse-config
+          mountPath: /app/config.json
+          subPath: config.json
+        - name: secflow-app-system-analyse-config
+          mountPath: /app/service.yaml
+          subPath: service.yaml
+        - name: secflow-app-system-analyse-config
+          mountPath: /data/config/models.json
+          subPath: models.json
+        - name: secflow-app-system-analyse-output
+          mountPath: /data/output
+        - name: secflow-app-system-analyse-sessions
+          mountPath: /data/sessions
+        - name: secflow-platform-fileserver-data-nfs-pvc
+          mountPath: /data/fileserver
+          readOnly: true
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /api/app/system-analyse/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /api/app/system-analyse/health
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 15
+      volumes:
+      - name: secflow-app-system-analyse-config
+        configMap:
+          name: secflow-app-system-analyse-config
+          items:
+            - key: config.json
+              path: config.json
+            - key: service.yaml
+              path: service.yaml
+            - key: models.json
+              path: models.json
+      - name: secflow-app-system-analyse-output
+        emptyDir: {}
+      - name: secflow-app-system-analyse-sessions
+        emptyDir: {}
+      - name: secflow-platform-fileserver-data-nfs-pvc
+        persistentVolumeClaim:
+          claimName: secflow-platform-fileserver-data-nfs-pvc

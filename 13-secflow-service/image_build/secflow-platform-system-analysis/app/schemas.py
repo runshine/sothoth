@@ -275,3 +275,56 @@ class AnalysisOverviewResponse(BaseModel):
     risk_summary: OverviewRiskSummary
     recent_findings: List[RecentFindingItem] = Field(default_factory=list)
 
+
+# ── Config schemas ─────────────────────────────────────────────────────────────
+
+class StageLoopConfigSchema(BaseModel):
+    min_rounds: int = 2
+    max_rounds: int = 5
+    pass_mode: Literal['majority', 'all'] = 'majority'
+
+
+class AgentInstanceConfigSchema(BaseModel):
+    model: str
+    tools: Optional[List[str]] = None
+    thinking_level: Optional[str] = None
+
+
+class RoleConfigSchema(BaseModel):
+    default_tools: Optional[List[str]] = None
+    system_prompt_dir: str = ''
+    default_thinking_level: str = 'off'
+    agents: Optional[List[AgentInstanceConfigSchema]] = None
+    stage_models: Optional[Dict[str, str]] = None
+
+
+class StagesConfigSchema(BaseModel):
+    classify: StageLoopConfigSchema = Field(default_factory=lambda: StageLoopConfigSchema(min_rounds=2, max_rounds=5))
+    refine: StageLoopConfigSchema = Field(default_factory=lambda: StageLoopConfigSchema(min_rounds=2, max_rounds=3))
+    analyse: StageLoopConfigSchema = Field(default_factory=lambda: StageLoopConfigSchema(min_rounds=2, max_rounds=5))
+    final_check: StageLoopConfigSchema = Field(default_factory=lambda: StageLoopConfigSchema(min_rounds=1, max_rounds=1, pass_mode='all'))
+
+
+class AnalysisServiceConfigRequest(BaseModel):
+    project_id: str
+    analyse_targets: List[str] = Field(default_factory=lambda: ['all'])
+    binary_arch: List[str] = Field(default_factory=lambda: ['all'])
+    parallel_modules: int = 1
+    parallel_sub_workers: int = 1
+    agent_max_retries: int = 100
+    agent_retry_delay: float = 30
+    pi_max_retries: int = -1
+    pi_retry_delay: float = 10
+    stages: StagesConfigSchema = Field(default_factory=StagesConfigSchema)
+    workers: RoleConfigSchema = Field(default_factory=lambda: RoleConfigSchema(system_prompt_dir='./prompts/workers'))
+    judges: RoleConfigSchema = Field(default_factory=lambda: RoleConfigSchema(system_prompt_dir='./prompts/judges'))
+    output_dir: str = '/data/output'
+    archive_dir: str = '/data/output'
+    result_dir: str = '/data/output'
+    start_stage: int = 1
+    resume_workspace: str = ''
+
+
+class AnalysisServiceConfigResponse(AnalysisServiceConfigRequest):
+    updated_at: Optional[datetime] = None
+

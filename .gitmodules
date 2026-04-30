@@ -11,3 +11,12 @@
 	path = 13-secflow-service/image_build/secflow-frontend
 	url = https://github.com/runshine/SecFlowFrontend.git
 	branch = local
+[submodule "13-secflow-service/image_build/secflow-app-system-analyse"]
+	path = 13-secflow-service/image_build/secflow-app-system-analyse
+	url = https://github.com/ict-bin/system_analyse
+[submodule "13-secflow-service/image_build/secflow-app-entry-analyse"]
+	path = 13-secflow-service/image_build/secflow-app-entry-analyse
+	url = https://github.com/ict-bin/entry_analyse
+[submodule "13-secflow-service/image_build/secflow-app-dataflow-analyse"]
+	path = 13-secflow-service/image_build/secflow-app-dataflow-analyse
+	url = https://github.com/ict-bin/data_flow_analyse

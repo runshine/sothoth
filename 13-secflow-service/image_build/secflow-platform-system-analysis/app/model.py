@@ -136,6 +136,16 @@ class SystemAnalysisAuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), index=True)
 
 
+class SystemAnalysisProjectConfig(Base):
+    __tablename__ = "secflow_system_analysis_project_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 _engine = None
 _SessionFactory = None
 
