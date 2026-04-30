@@ -18,6 +18,7 @@ data:
       host: "secflow-platform-auth"
       port: 80
       validate_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
       timeout: 10
       token_cache_enabled: true
       token_cache_ttl_minutes: 15
@@ -42,6 +43,31 @@ data:
       project_root_template: "/data/files/{project_id}"
       output_root_name: "binary-to-source-outputs"
       require_input_exists: true
+
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu"
+      service_id: "secflow-app-binary-to-source"
+      service_name: "ELF源码还原服务"
+      host: "secflow-app-binary-to-source-manager"
+      port: 80
+      maturity: "开发中"
+      description: "项目隔离的ELF到源码还原适配服务，后端对接pi-re-agent"
+      api_prefix: "/api/app/binary-to-source"
+      menu:
+        id: "secflow-app-binary-to-source"
+        path: "/binary-to-source"
+        icon: "cpu"
+        order: 20
+        level1:
+          name: "开发工具"
+          name_en: "DevTools"
+        level2:
+          name: "逆向分析"
+          name_en: "Reverse"
+        level3:
+          name: "ELF源码还原"
+          name_en: "Binary To Source"
 
     app:
       host: "0.0.0.0"

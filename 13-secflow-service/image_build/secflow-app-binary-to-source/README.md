@@ -5,8 +5,10 @@ SecFlow B2S 后端适配服务，用于保持前端现有 `/api/app/binary-to-so
 ## 主要能力
 
 - 兼容前端 B2S API：任务列表、创建、详情、终止、重试。
-- 通过 Auth 服务校验 Bearer Token。
+- 启动时使用服务机机 Token 校验 Auth 服务，完成微服务间认证自检。
+- 运行时通过 Auth 服务校验用户 Bearer Token。
 - 通过 Project 服务校验用户是否可访问当前 `project_id`。
+- 启动后向 `secflow-platform-menu` 注册服务和菜单，并定时发送心跳。
 - 按项目根目录校验 `elf_path` 与 `output_dir`，避免跨项目路径访问。
 - 维护 B2S Task / Item 与 pi-re-agent Job 的映射。
 - 将 pi-re-agent 的 `queued/running/completed/failed/cancelled` 映射为前端使用的任务状态。
@@ -22,6 +24,46 @@ GET  /api/app/binary-to-source/projects/{project_id}/tasks/{task_id}
 POST /api/app/binary-to-source/projects/{project_id}/tasks/{task_id}/terminate
 POST /api/app/binary-to-source/projects/{project_id}/tasks/{task_id}/retry
 ```
+
+## 注册中心与微服务认证
+
+配置结构对齐 `secflow-platform-fileserver/config.yaml`：
+
+```yaml
+auth_service:
+  host: "secflow-platform-auth"
+  port: 80
+  validate_token_path: "/api/auth/validate-token"
+  service_machine_token: "..."
+
+project_service:
+  host: "secflow-platform-project"
+  port: 80
+  get_project_path: "/api/project"
+
+registry:
+  enabled: true
+  menu_service_url: "http://secflow-platform-menu"
+  service_id: "secflow-app-binary-to-source"
+  service_name: "ELF源码还原服务"
+  host: "secflow-app-binary-to-source-manager"
+  port: 80
+  api_prefix: "/api/app/binary-to-source"
+```
+
+启动流程：
+
+1. 初始化数据库表。
+2. 使用 `auth_service.service_machine_token` 或环境变量 `SECFLOW_SERVICE_MACHINE_TOKEN` 调用 Auth `/api/auth/validate-token`，确认 token 类型为 `machine`。
+3. 向 Menu 注册中心调用 `/api/menu/register` 注册服务和菜单。
+4. 后台每 30 秒调用 `/api/menu/heartbeat/{service_id}` 发送心跳。
+5. 停止时调用 `/api/menu/unregister/{service_id}` 注销服务。
+
+项目管理：
+
+- 所有项目级接口均要求 `Authorization: Bearer <user-token>`。
+- 每次请求都会调用 Project 服务 `GET /api/project/{project_id}` 校验当前用户是否有项目访问权限。
+- `project_id` 经过白名单格式校验，并用于限制 `/data/files/{project_id}` 下的输入/输出路径。
 
 ## 路径隔离
 

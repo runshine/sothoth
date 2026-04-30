@@ -27,6 +27,7 @@ class AuthServiceConfig(BaseModel):
     host: str
     port: int
     validate_token_path: str = "/api/auth/validate-token"
+    service_machine_token: Optional[str] = None
     timeout: int = 10
     token_cache_enabled: bool = True
     token_cache_ttl_minutes: int = 15
@@ -64,6 +65,34 @@ class StorageConfig(BaseModel):
     require_input_exists: bool = True
 
 
+class RegistryMenuLevelConfig(BaseModel):
+    name: Optional[str] = None
+    name_en: Optional[str] = None
+
+
+class RegistryMenuConfig(BaseModel):
+    id: str
+    path: str
+    icon: Optional[str] = None
+    order: int = 0
+    level1: Optional[RegistryMenuLevelConfig] = None
+    level2: Optional[RegistryMenuLevelConfig] = None
+    level3: Optional[RegistryMenuLevelConfig] = None
+
+
+class RegistryConfig(BaseModel):
+    enabled: bool = True
+    menu_service_url: str = "http://secflow-platform-menu"
+    service_id: str = "secflow-app-binary-to-source"
+    service_name: str = "ELF源码还原服务"
+    host: str = "secflow-app-binary-to-source-manager"
+    port: int = 80
+    maturity: str = "开发中"
+    description: str = "项目隔离的ELF到源码还原适配服务"
+    api_prefix: str = "/api/app/binary-to-source"
+    menu: Optional[RegistryMenuConfig] = None
+
+
 class AppConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
@@ -80,6 +109,7 @@ class Config(BaseModel):
     project_service: ProjectServiceConfig
     pi_re_agent: PiReAgentConfig = Field(default_factory=PiReAgentConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    registry: RegistryConfig = Field(default_factory=RegistryConfig)
     app: AppConfig = Field(default_factory=AppConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
