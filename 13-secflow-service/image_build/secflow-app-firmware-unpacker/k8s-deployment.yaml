@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-firmware-unpacker
+  namespace: secflow-ns
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      name: secflow-app-firmware-unpacker
+  template:
+    metadata:
+      labels:
+        name: secflow-app-firmware-unpacker
+    spec:
+      serviceAccountName: secflow-app-firmware-unpacker-serviceaccount
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: secflow-app-firmware-unpacker
+          image: ghcr.io/runshine/secflow-app-firmware-unpacker:latest
+          imagePullPolicy: Always
+          env:
+            - name: CONFIG_PATH
+              value: /app/config.yaml
+            - name: FIRMWARE_UNPACKER_CONFIG
+              value: /app/config.yaml
+            - name: UNPACKER_AGENT_DIR
+              value: /app/app/agent
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: secflow-app-firmware-unpacker-config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /api/app/firmware-unpacker/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/app/firmware-unpacker/ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 15
+      volumes:
+        - name: secflow-app-firmware-unpacker-config
+          configMap:
+            name: secflow-app-firmware-unpacker-config
+            items:
+              - key: config.yaml
+                path: config.yaml

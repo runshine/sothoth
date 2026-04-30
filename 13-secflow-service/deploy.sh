@@ -12,7 +12,7 @@ for file in ./*;
 do
   if [[ "$file" =~ \.yaml$ ]];then
     echo "$(date): start apply: ${file}"
-    if grep -q '\${SECFLOW_PLATFORM_RESOURCE_IMAGE}\|\${SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE}' "${file}"; then
+    if grep -q '\${SECFLOW_PLATFORM_RESOURCE_IMAGE}\|\${SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE}\|\${SECFLOW_APP_FIRMWARE_UNPACKER_IMAGE}' "${file}"; then
       if command -v envsubst >/dev/null 2>&1; then
         envsubst < "${file}" | kubectl apply -f -
       else

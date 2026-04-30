@@ -160,6 +160,11 @@ spec:
             backend:
               service:
                 name: secflow-app-dataflow-analyse
+          - path: /api/app/firmware-unpacker
+            pathType: Prefix
+            backend:
+              service:
+                name: secflow-app-firmware-unpacker
                 port:
                   number: 80
   tls:
