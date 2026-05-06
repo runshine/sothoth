@@ -15,10 +15,10 @@ from app.schemas import (
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityTaskCreate,
+    BinarySecurityUploadCompletePayload,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskListResponse,
     BinarySecurityTaskPrepareResponse,
-    BinarySecurityTaskResponse,
     BinarySecurityTimelineResponse,
     TokenUser,
 )
@@ -73,7 +73,7 @@ async def prepare_task(
     return BinarySecurityTaskPrepareResponse(task_id=task_id)
 
 
-@router.post("/projects/{project_id}/tasks", response_model=BinarySecurityTaskResponse)
+@router.post("/projects/{project_id}/tasks", response_model=BinarySecurityTaskDetailResponse)
 async def create_task(
     project_id: str,
     payload: BinarySecurityTaskCreate,
@@ -90,6 +90,37 @@ async def create_task(
         created_by=created_by,
         authorization_token=token,
     )
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/uploads/complete", response_model=BinarySecurityTaskDetailResponse)
+async def complete_uploads(
+    project_id: str,
+    task_id: str,
+    payload: BinarySecurityUploadCompletePayload,
+    user: TokenUser = Depends(get_current_context),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    token = authorization.split()[1] if authorization else ""
+    updated_by = user.username or user.user_id or "unknown"
+    return await get_task_manager().complete_uploads(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        payload=payload,
+        updated_by=updated_by,
+        authorization_token=token,
+    )
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/start", response_model=BinarySecurityTaskDetailResponse)
+async def start_task(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().start_task(db, project_id=project_id, task_id=task_id)
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}", response_model=BinarySecurityTaskDetailResponse)

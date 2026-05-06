@@ -16,10 +16,11 @@ class TokenUser(BaseModel):
     token_type: Optional[str] = None
 
 
-class PathRef(BaseModel):
-    source: str = Field(default="project_filesystem")
-    path: str = Field(..., min_length=1)
-    filename: Optional[str] = None
+class BinarySecurityInputFile(BaseModel):
+    filename: str = Field(..., min_length=1)
+    size: Optional[int] = Field(default=None, ge=0)
+    content_type: Optional[str] = None
+    relative_path: Optional[str] = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -31,16 +32,21 @@ class TaskPolicyOverrides(BaseModel):
     max_stage_parallelism: Optional[int] = Field(default=None, ge=1, le=32)
     max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
     continue_on_item_failure: Optional[bool] = None
+    stage_parallelism: dict[str, int] = Field(default_factory=dict)
 
 
 class BinarySecurityTaskCreate(BaseModel):
     task_id: Optional[str] = None
     name: str = Field(..., min_length=1)
     description: Optional[str] = None
-    firmware_input: PathRef
+    input_files: list[BinarySecurityInputFile] = Field(default_factory=list)
     output_root: Optional[str] = None
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)
     policy_overrides: TaskPolicyOverrides = Field(default_factory=TaskPolicyOverrides)
+
+
+class BinarySecurityUploadCompletePayload(BaseModel):
+    files: list[BinarySecurityInputFile] = Field(default_factory=list)
 
 
 class BinarySecurityTaskPrepareResponse(BaseModel):
@@ -77,6 +83,9 @@ class BinarySecurityTaskResponse(BaseModel):
     high_risk_module_count: int = 0
     entry_count: int = 0
     vuln_result_count: int = 0
+    firmware_item_count: int = 0
+    unpacked_firmware_count: int = 0
+    failed_firmware_count: int = 0
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
 
 
@@ -155,6 +164,9 @@ class BinarySecurityProjectConfigPayload(BaseModel):
     max_stage_parallelism: int = Field(default=4, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
     continue_on_item_failure: bool = True
+    stage_parallelism: dict[str, int] = Field(
+        default_factory=lambda: {stage: 4 for stage in STAGE_SEQUENCE}
+    )
     stage_options: dict[str, StageOptions] = Field(
         default_factory=lambda: {stage: StageOptions(enabled=True) for stage in STAGE_SEQUENCE}
     )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import shutil
 import uuid
@@ -27,16 +26,18 @@ from app.model import (
 )
 from app.schemas import (
     BinarySecurityArtifactsResponse,
+    BinarySecurityInputFile,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
+    BinarySecurityStageItemResponse,
+    BinarySecurityStageSummary,
     BinarySecurityTaskCreate,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskEventResponse,
     BinarySecurityTaskListResponse,
     BinarySecurityTaskResponse,
     BinarySecurityTimelineResponse,
-    BinarySecurityStageSummary,
-    BinarySecurityStageItemResponse,
+    BinarySecurityUploadCompletePayload,
 )
 from app.service.binary_to_source import get_binary_to_source_client
 from app.service.dataflow_analyse import get_dataflow_analyse_client
@@ -44,7 +45,7 @@ from app.service.dataflow_vuln_scanner import get_dataflow_vuln_scanner_client
 from app.service.entry_analyse import get_entry_analyse_client
 from app.service.fileserver import get_fileserver_client
 from app.service.firmware_unpacker import get_firmware_unpacker_client
-from app.service.security import app_task_root, ensure_dir, ensure_path_in_project, validate_task_id
+from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.system_analyse import get_system_analyse_client
 
 
@@ -125,54 +126,139 @@ class TaskManager:
         payload: BinarySecurityTaskCreate,
         created_by: str,
         authorization_token: str,
-    ) -> BinarySecurityTaskResponse:
+    ) -> BinarySecurityTaskDetailResponse:
         task_id = validate_task_id(payload.task_id) if payload.task_id else self.prepare_task_id(db, project_id)
         if db.query(BinarySecurityTask.id).filter(
             BinarySecurityTask.project_id == project_id,
             BinarySecurityTask.id == task_id,
         ).first():
             raise ValidationError("任务 ID 已存在")
-
-        firmware_path = self._resolve_firmware_input(project_id, payload.firmware_input.source, payload.firmware_input.path)
+        input_files = self._normalize_input_files(payload.input_files)
         workspace_root = app_task_root(project_id, task_id)
-        output_root = self._resolve_output_root(project_id, task_id, payload.output_root)
+        output_root = self._resolve_output_root(workspace_root, payload.output_root)
+        input_dir = workspace_root / "input"
+        run_dir = workspace_root / "run"
         self._init_workspace(workspace_root)
-
-        subproject = await get_fileserver_client().ensure_subproject(project_id, authorization_token, created_by)
+        await self._ensure_task_directories(project_id, task_id, authorization_token)
+        metadata_path = input_dir / "task-metadata.json"
         policy = self._merge_policy(db, project_id, payload.policy_overrides.model_dump(exclude_none=True), payload.stage_options)
+
         task = BinarySecurityTask(
             id=task_id,
             project_id=project_id,
             name=payload.name,
             description=payload.description,
             created_by=created_by,
-            status="pending",
-            current_stage=STAGE_SEQUENCE[0],
-            firmware_name=Path(firmware_path).name,
-            firmware_source=payload.firmware_input.source,
-            firmware_path=str(firmware_path),
+            status="pending_upload",
+            current_stage=None,
+            firmware_name=f"{len(input_files)} files",
+            firmware_source="project_filesystem",
+            firmware_path=self._fileserver_task_path(task_id, "input"),
             output_root=str(output_root),
             workspace_root=str(workspace_root),
-            fileserver_subproject_id=subproject.get("id"),
-            fileserver_subproject_name=subproject.get("name"),
         )
         task.policy = policy
         task.summary = {
-            "fileserver_project_path": f"/{subproject.get('name')}/{task_id}" if subproject.get("name") else f"/{task_id}",
+            "fileserver_project_path": self._fileserver_task_path(task_id),
+            "task_root_path": str(workspace_root),
+            "input_dir": self._fileserver_task_path(task_id, "input"),
+            "output_dir": self._fileserver_task_path(task_id, "output"),
+            "run_dir": self._fileserver_task_path(task_id, "run"),
+            "input_manifest_path": f"{self._fileserver_task_path(task_id, 'input')}/task-metadata.json",
+            "input_files": input_files,
             "downstream_task_ids": {},
         }
         task.metrics = {
             "high_risk_module_count": 0,
             "entry_count": 0,
             "vuln_result_count": 0,
+            "input_file_count": len(input_files),
+            "uploaded_file_count": 0,
+            "input_total_bytes": int(sum(int(item.get("size") or 0) for item in input_files)),
+            "firmware_item_count": len(input_files),
+            "unpacked_firmware_count": 0,
+            "failed_firmware_count": 0,
         }
         task.stage_summary = {}
         db.add(task)
         db.commit()
-        self._record_event(db, task, "task_created", f"创建任务 {task.id}", payload={"firmware_path": str(firmware_path)})
+        self._write_task_metadata(task, metadata_path, status="pending_upload")
+        self._record_event(db, task, "task_created", f"创建任务 {task.id}", payload={"input_files": input_files})
+        self._record_event(db, task, "task_upload_pending", "任务创建完成，等待上传文件")
         db.commit()
-        db.refresh(task)
-        return self._task_response(db, task)
+        return self.get_task_detail(db, project_id=project_id, task_id=task.id)
+
+    async def complete_uploads(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        payload: BinarySecurityUploadCompletePayload,
+        updated_by: str,
+        authorization_token: str,
+    ) -> BinarySecurityTaskDetailResponse:
+        del updated_by, authorization_token
+        task = self._task_or_404(db, project_id, task_id)
+        if task.status not in {"pending_upload", "uploading", "ready_to_start"}:
+            raise ValidationError(f"当前状态不允许确认上传完成: {task.status}")
+        input_dir = Path(task.workspace_root) / "input"
+        declared = self._normalize_input_files(payload.files or [BinarySecurityInputFile(**item) for item in task.summary.get("input_files") or []])
+        self._record_event(db, task, "task_upload_started", "开始校验上传文件")
+        actual_files = []
+        total_bytes = 0
+        for file_info in declared:
+            filename = str(file_info["filename"])
+            local_path = input_dir / filename
+            if not local_path.is_file():
+                raise ValidationError(f"上传文件缺失: {filename}")
+            stat = local_path.stat()
+            total_bytes += stat.st_size
+            actual_files.append(
+                {
+                    **file_info,
+                    "size": stat.st_size,
+                    "uploaded": True,
+                    "path": f"{task.summary.get('input_dir')}/{filename}",
+                }
+            )
+        task.status = "ready_to_start"
+        task.summary = {
+            **task.summary,
+            "input_files": actual_files,
+        }
+        task.metrics = {
+            **task.metrics,
+            "input_file_count": len(actual_files),
+            "uploaded_file_count": len(actual_files),
+            "input_total_bytes": total_bytes,
+            "firmware_item_count": len(actual_files),
+        }
+        self._write_task_metadata(task, input_dir / "task-metadata.json", status="ready_to_start")
+        self._record_event(db, task, "task_upload_completed", "输入文件上传完成", payload={"uploaded_files": len(actual_files)})
+        self._record_event(db, task, "task_ready_to_start", "任务已就绪，准备自动启动")
+        db.commit()
+        return self.start_task(db, project_id=project_id, task_id=task_id)
+
+    def start_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        if task.status not in {"ready_to_start", "failed", "partial_success"}:
+            if task.status in {"pending", "running"}:
+                return self.get_task_detail(db, project_id=project_id, task_id=task_id)
+            raise ValidationError(f"当前状态不允许启动任务: {task.status}")
+        input_files = task.summary.get("input_files") or []
+        if not input_files:
+            raise ValidationError("没有可用的输入文件")
+        task.status = "pending"
+        task.current_stage = STAGE_SEQUENCE[0]
+        task.last_error = None
+        task.started_at = None
+        task.finished_at = None
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
+        self._record_event(db, task, "task_start_requested", "任务已进入调度队列")
+        self._record_event(db, task, "firmware_items_initialized", f"已初始化 {len(input_files)} 个固件输入")
+        db.commit()
+        return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def list_tasks(self, db: Session, *, project_id: str, status: str | None = None) -> BinarySecurityTaskListResponse:
         query = db.query(BinarySecurityTask).filter(BinarySecurityTask.project_id == project_id)
@@ -250,22 +336,19 @@ class TaskManager:
         for item in running_items:
             item.status = "cancelled"
             item.finished_at = _now()
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
         db.commit()
         token = self._service_token()
         await asyncio.gather(
             *(self._cancel_downstream(item, token) for item in running_items if item.downstream_task_id),
             return_exceptions=True,
         )
-        for item in db.query(BinarySecurityStageItem).filter(
-            BinarySecurityStageItem.task_id == task.id,
-            BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
-        ):
-            item.status = "cancelled"
-            item.finished_at = item.finished_at or _now()
-        db.commit()
 
     def retry_task(self, db: Session, *, project_id: str, task_id: str) -> None:
         task = self._task_or_404(db, project_id, task_id)
+        if task.status in {"pending_upload", "uploading"}:
+            return
+        input_files = task.summary.get("input_files") or []
         task.status = "pending"
         task.current_stage = STAGE_SEQUENCE[0]
         task.last_error = None
@@ -274,25 +357,39 @@ class TaskManager:
         task.summary = {
             **task.summary,
             "downstream_task_ids": {},
+            "firmware_unpack_results": [],
+            "high_risk_modules": [],
+            "entry_results": [],
+            "dataflow_results": [],
+            "vuln_results": [],
         }
         task.metrics = {
+            **task.metrics,
             "high_risk_module_count": 0,
             "entry_count": 0,
             "vuln_result_count": 0,
+            "firmware_item_count": len(input_files),
+            "unpacked_firmware_count": 0,
+            "failed_firmware_count": 0,
         }
         db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).delete(synchronize_session=False)
         db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).delete(synchronize_session=False)
-        self._record_event(db, task, "task_retried", "任务已重新排队")
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
+        self._record_event(db, task, "task_retried", "任务已重置并重新进入调度队列")
         db.commit()
 
     def resume_task(self, db: Session, *, project_id: str, task_id: str) -> None:
         task = self._task_or_404(db, project_id, task_id)
+        if task.status == "ready_to_start":
+            self.start_task(db, project_id=project_id, task_id=task_id)
+            return
         if task.status not in {"failed", "partial_success", "cancelled"}:
             return
         task.current_stage = self._next_incomplete_stage(db, task.id) or STAGE_SEQUENCE[0]
         task.status = "pending"
         task.last_error = None
         task.finished_at = None
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(db, task, "task_resumed", f"任务从阶段 {task.current_stage} 继续")
         db.commit()
 
@@ -412,7 +509,13 @@ class TaskManager:
                     },
                 }
                 task.current_stage = stage_name
-                if stage_name == "system_analysis":
+                if stage_name == "firmware_unpack":
+                    task.metrics = {
+                        **task.metrics,
+                        "unpacked_firmware_count": int(summary.get("success_count", 0)),
+                        "failed_firmware_count": int(summary.get("failed_count", 0)),
+                    }
+                elif stage_name == "system_analysis":
                     task.metrics = {**task.metrics, "high_risk_module_count": int(summary.get("module_count", 0))}
                 elif stage_name == "entry_analysis":
                     task.metrics = {**task.metrics, "entry_count": int(summary.get("entry_count", 0))}
@@ -427,6 +530,7 @@ class TaskManager:
                     db.commit()
                     return
             self._finalize_task(db, task)
+            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             db.commit()
         finally:
             db.close()
@@ -442,7 +546,7 @@ class TaskManager:
         if non_skipped and all(status == "success" for status in non_skipped):
             task.status = "success"
         elif vuln_run and vuln_run.status in {"success", "partial_success"}:
-            task.status = "partial_success"
+            task.status = "partial_success" if any(status in {"failed", "partial_success"} for status in statuses) else "success"
         elif any(status in {"failed", "partial_success"} for status in statuses):
             task.status = "partial_success" if any(status == "success" for status in non_skipped) else "failed"
         else:
@@ -450,47 +554,87 @@ class TaskManager:
         task.finished_at = _now()
         self._record_event(db, task, "task_finished", f"任务结束: {task.status}")
 
-    def _resolve_firmware_input(self, project_id: str, source: str, path: str) -> Path:
-        if source in {"project_filesystem", "project_path", "project"}:
-            return ensure_path_in_project(project_id, path, must_be_file=True)
-        if source in {"absolute", "absolute_path"}:
-            candidate = Path(path).resolve()
-            if not candidate.is_file():
-                raise ValidationError(f"固件文件不存在: {path}")
-            return candidate
-        raise ValidationError(f"不支持的 firmware_input.source: {source}")
-
-    def _resolve_output_root(self, project_id: str, task_id: str, custom_output_root: str | None) -> Path:
-        default_root = app_task_root(project_id, task_id) / "summary"
-        if not custom_output_root:
-            return default_root
-        if custom_output_root.startswith("/"):
+    def _resolve_output_root(self, workspace_root: Path, custom_output_root: str | None) -> Path:
+        if custom_output_root:
             candidate = Path(custom_output_root).resolve()
-        else:
-            candidate = ensure_path_in_project(project_id, custom_output_root)
-        ensure_dir(candidate)
-        return candidate
+            return ensure_dir(candidate)
+        return ensure_dir(workspace_root / "output")
 
     def _init_workspace(self, root: Path) -> None:
-        for rel in [
-            "input",
-            "runtime",
-            "artifacts/unpack",
-            "artifacts/system-analysis",
-            "artifacts/b2s",
-            "artifacts/entry",
-            "artifacts/dataflow",
-            "artifacts/vuln",
-            "summary",
-            "logs",
-        ]:
+        for rel in ["input", "output", "run", "logs"]:
             ensure_dir(root / rel)
 
+    async def _ensure_task_directories(self, project_id: str, task_id: str, authorization_token: str) -> None:
+        client = get_fileserver_client()
+        await client.ensure_project_directory(project_id, "app", authorization_token)
+        await client.ensure_project_directory(project_id, "app/secflow-app-binary-security", authorization_token)
+        await client.ensure_project_directory(project_id, f"app/secflow-app-binary-security/{task_id}", authorization_token)
+        for name in ("input", "output", "run"):
+            await client.ensure_project_directory(project_id, f"app/secflow-app-binary-security/{task_id}/{name}", authorization_token)
+
+    def _write_task_metadata(self, task: BinarySecurityTask, metadata_path: Path, *, status: str) -> None:
+        _write_json(
+            metadata_path,
+            {
+                "task_id": task.id,
+                "project_id": task.project_id,
+                "name": task.name,
+                "description": task.description,
+                "created_by": task.created_by,
+                "created_at": task.created_at.isoformat() if task.created_at else None,
+                "status": status,
+                "input_files": task.summary.get("input_files", []),
+                "policy": task.policy,
+                "stage_options": task.policy.get("stage_options", {}),
+                "paths": {
+                    "task_root": task.summary.get("task_root_path"),
+                    "input_dir": task.summary.get("input_dir"),
+                    "output_dir": task.summary.get("output_dir"),
+                    "run_dir": task.summary.get("run_dir"),
+                },
+            },
+        )
+
+    def _normalize_input_files(self, files: list[BinarySecurityInputFile | dict[str, Any]]) -> list[dict[str, Any]]:
+        rows = []
+        seen_names: set[str] = set()
+        seen_keys: set[str] = set()
+        for index, raw in enumerate(files):
+            item = raw.model_dump(mode="json") if isinstance(raw, BinarySecurityInputFile) else dict(raw)
+            filename = str(item.get("filename") or "").strip()
+            if not filename:
+                raise ValidationError("上传文件名不能为空")
+            if "/" in filename or "\\" in filename:
+                raise ValidationError(f"文件名不合法: {filename}")
+            if filename in seen_names:
+                raise ValidationError(f"存在重复文件名: {filename}")
+            seen_names.add(filename)
+            firmware_key = _slug(filename)
+            if firmware_key in seen_keys:
+                firmware_key = _slug(f"{index + 1}-{filename}")
+            seen_keys.add(firmware_key)
+            rows.append(
+                {
+                    "filename": filename,
+                    "size": int(item.get("size") or 0),
+                    "content_type": item.get("content_type"),
+                    "relative_path": item.get("relative_path"),
+                    "metadata": item.get("metadata") or {},
+                    "firmware_key": firmware_key,
+                    "firmware_name": Path(filename).stem or filename,
+                }
+            )
+        if not rows:
+            raise ValidationError("至少需要上传一个输入文件")
+        return rows
+
     def _merge_policy(self, db: Session, project_id: str, overrides: dict[str, Any], stage_options: dict[str, Any]) -> dict[str, Any]:
+        stage_parallelism = {stage: self.cfg.runtime_policy.max_stage_parallelism for stage in STAGE_SEQUENCE}
         base = BinarySecurityProjectConfigPayload(
             max_stage_parallelism=self.cfg.runtime_policy.max_stage_parallelism,
             max_retries_per_item=self.cfg.runtime_policy.max_retries_per_item,
             continue_on_item_failure=self.cfg.runtime_policy.continue_on_item_failure,
+            stage_parallelism=stage_parallelism,
         ).model_dump(mode="json")
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
         if row:
@@ -500,7 +644,20 @@ class TaskManager:
                 **base.get("stage_options", {}),
                 **{key: value.model_dump(mode="json") for key, value in stage_options.items()},
             }
-        base.update({key: value for key, value in overrides.items() if value is not None})
+        if overrides.get("max_stage_parallelism") is not None:
+            stage_value = int(overrides["max_stage_parallelism"])
+            base["max_stage_parallelism"] = stage_value
+            base["stage_parallelism"] = {stage: stage_value for stage in STAGE_SEQUENCE}
+        if overrides.get("stage_parallelism"):
+            merged = {**base.get("stage_parallelism", {})}
+            for stage_name, value in (overrides.get("stage_parallelism") or {}).items():
+                if stage_name in STAGE_SEQUENCE and value is not None:
+                    merged[stage_name] = int(value)
+            base["stage_parallelism"] = merged
+        if overrides.get("max_retries_per_item") is not None:
+            base["max_retries_per_item"] = int(overrides["max_retries_per_item"])
+        if overrides.get("continue_on_item_failure") is not None:
+            base["continue_on_item_failure"] = bool(overrides["continue_on_item_failure"])
         return base
 
     def _service_token(self) -> str | None:
@@ -513,6 +670,13 @@ class TaskManager:
         if option is None:
             return True
         return bool(option.get("enabled", True))
+
+    def _stage_parallelism(self, task: BinarySecurityTask, stage_name: str) -> int:
+        policy = task.policy or {}
+        stage_parallelism = policy.get("stage_parallelism") or {}
+        if stage_name in stage_parallelism:
+            return max(1, int(stage_parallelism[stage_name]))
+        return max(1, int(policy.get("max_stage_parallelism") or 1))
 
     def _task_or_404(self, db: Session, project_id: str, task_id: str) -> BinarySecurityTask:
         task = db.query(BinarySecurityTask).filter(
@@ -586,6 +750,7 @@ class TaskManager:
 
     def _task_response(self, db: Session, task: BinarySecurityTask) -> BinarySecurityTaskResponse:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).order_by(BinarySecurityStageRun.sequence_no.asc()).all()
+        metrics = task.metrics or {}
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -598,9 +763,12 @@ class TaskManager:
             updated_at=task.updated_at,
             started_at=task.started_at,
             finished_at=task.finished_at,
-            high_risk_module_count=int((task.metrics or {}).get("high_risk_module_count", 0)),
-            entry_count=int((task.metrics or {}).get("entry_count", 0)),
-            vuln_result_count=int((task.metrics or {}).get("vuln_result_count", 0)),
+            high_risk_module_count=int(metrics.get("high_risk_module_count", 0)),
+            entry_count=int(metrics.get("entry_count", 0)),
+            vuln_result_count=int(metrics.get("vuln_result_count", 0)),
+            firmware_item_count=int(metrics.get("firmware_item_count", 0)),
+            unpacked_firmware_count=int(metrics.get("unpacked_firmware_count", 0)),
+            failed_firmware_count=int(metrics.get("failed_firmware_count", 0)),
             stage_summaries=[
                 BinarySecurityStageSummary(
                     stage_name=run.stage_name,
@@ -674,7 +842,7 @@ class TaskManager:
         except Exception:
             pass
 
-    async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, stage_name: str, item: BinarySecurityStageItem | None = None):
+    async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
         while True:
             payload = await fetcher()
             status = str(payload.get("status") or "").lower()
@@ -697,110 +865,169 @@ class TaskManager:
             session.close()
 
     async def _stage_firmware_unpack(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
-        unpack_dir = Path(task.workspace_root) / "artifacts" / "unpack" / "output"
-        ensure_dir(unpack_dir)
-        item = BinarySecurityStageItem(
-            id=f"si_{uuid.uuid4().hex[:20]}",
-            task_id=task.id,
-            project_id=task.project_id,
-            stage_run_id=stage_run.id,
-            stage_name=stage_run.stage_name,
-            item_key="firmware",
-            item_name=task.firmware_name,
-            status="queued",
-            downstream_service="firmware_unpacker",
+        input_files = list(task.summary.get("input_files") or [])
+        if not input_files:
+            return "failed", {"error": "缺少输入文件"}
+        results = await self._run_stage_pool(
+            task,
+            input_files,
+            self._stage_parallelism(task, stage_run.stage_name),
+            lambda input_file: self._run_firmware_item(task, stage_run, input_file, token),
+            retries=int(task.policy.get("max_retries_per_item") or 0),
         )
-        item.input_ref = {"firmware_path": task.firmware_path}
-        item.output_ref = {"output_path": str(unpack_dir)}
-        db.add(item)
-        db.commit()
-        created = await get_firmware_unpacker_client().create_task(task.project_id, task.firmware_path, str(unpack_dir), token or "")
-        item.status = "running"
-        item.downstream_task_id = created.get("task_id")
-        item.started_at = _now()
-        item.result = {"project_id": task.project_id}
-        db.commit()
-        status, payload = await self._poll_until_terminal(
-            lambda: get_firmware_unpacker_client().get_task(task.project_id, item.downstream_task_id, token or ""),
-            success_statuses={"success"},
-            failure_statuses={"failed", "cancelled"},
-            task=task,
-            stage_name=stage_run.stage_name,
-            item=item,
-        )
-        item.finished_at = _now()
-        item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
-        item.result = {
-            "downstream": payload,
-            "unpacked_root": str(unpack_dir),
-        }
-        task.summary = {**task.summary, "unpacked_root": str(unpack_dir), "downstream_task_ids": {**task.summary.get("downstream_task_ids", {}), "firmware_unpack": item.downstream_task_id}}
-        db.commit()
-        return item.status, {"unpacked_root": str(unpack_dir), "downstream_task_id": item.downstream_task_id, "error": payload.get("error_message")}
+        status, summary = self._aggregate_stage_items(db, task, results, "firmware_unpack_results")
+        return status, summary
 
-    async def _stage_system_analysis(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
-        unpacked_root = str(task.summary.get("unpacked_root") or "")
-        if not unpacked_root:
-            return "failed", {"error": "缺少解包目录"}
-        created = await get_system_analyse_client().create_task(task.project_id, f"{task.name}-system-analysis", unpacked_root)
-        stage_item = BinarySecurityStageItem(
-            id=f"si_{uuid.uuid4().hex[:20]}",
-            task_id=task.id,
-            project_id=task.project_id,
-            stage_run_id=stage_run.id,
-            stage_name=stage_run.stage_name,
-            item_key="system-analysis",
-            item_name="system-analysis",
-            status="running",
-            downstream_service="system_analyse",
-            downstream_task_id=created.get("task_id"),
-            started_at=_now(),
-        )
-        stage_item.input_ref = {"input_path": unpacked_root}
-        db.add(stage_item)
-        db.commit()
-        status, payload = await self._poll_until_terminal(
-            lambda: get_system_analyse_client().get_task(stage_item.downstream_task_id),
-            success_statuses={"passed", "success"},
-            failure_statuses={"failed", "error", "cancelled"},
-            task=task,
-            stage_name=stage_run.stage_name,
-            item=stage_item,
-        )
-        stage_item.finished_at = _now()
-        artifact_root = self._materialize_stage_artifact(task, "system-analysis", stage_item.downstream_task_id, payload)
-        modules = self._parse_system_analysis_modules(artifact_root)
-        stage_item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
-        stage_item.result = {"downstream": payload, "artifact_root": str(artifact_root), "modules": modules}
-        task.summary = {
-            **task.summary,
-            "system_analysis_root": str(artifact_root),
-            "high_risk_modules": modules,
-            "downstream_task_ids": {**task.summary.get("downstream_task_ids", {}), "system_analysis": stage_item.downstream_task_id},
-        }
-        for module in modules:
-            child = BinarySecurityStageItem(
+    async def _run_firmware_item(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, input_file: dict[str, Any], token: str | None) -> dict[str, Any]:
+        session = get_session_factory()()
+        try:
+            firmware_key = input_file["firmware_key"]
+            input_path = Path(task.workspace_root) / "input" / input_file["filename"]
+            output_dir = Path(task.output_root) / firmware_key / "unpack"
+            ensure_dir(output_dir)
+            item = BinarySecurityStageItem(
                 id=f"si_{uuid.uuid4().hex[:20]}",
                 task_id=task.id,
                 project_id=task.project_id,
                 stage_run_id=stage_run.id,
                 stage_name=stage_run.stage_name,
-                item_key=module["module_key"],
-                item_name=module["module_name"],
-                parent_key="system-analysis",
-                status="success",
+                item_key=firmware_key,
+                item_name=input_file["filename"],
+                parent_key=firmware_key,
+                status="queued",
+                downstream_service="firmware_unpacker",
             )
-            child.input_ref = {"module_dir": module["module_dir"]}
-            child.result = module
-            db.add(child)
-        db.commit()
-        if status != "success":
-            return "failed", {"error": payload.get("error") or payload.get("error_message"), "artifact_root": str(artifact_root), "module_count": len(modules)}
-        if not modules:
-            return "failed", {"error": "系统分析未识别出高危模块", "artifact_root": str(artifact_root), "module_count": 0}
-        return "success", {"artifact_root": str(artifact_root), "module_count": len(modules)}
+            item.input_ref = {"filename": input_file["filename"], "path": str(input_path)}
+            item.output_ref = {"output_path": str(output_dir)}
+            session.add(item)
+            session.commit()
+            created = await get_firmware_unpacker_client().create_task(task.project_id, str(input_path), str(output_dir), token or "")
+            item.status = "running"
+            item.downstream_task_id = created.get("task_id")
+            item.started_at = _now()
+            item.result = {"project_id": task.project_id}
+            session.commit()
+            status, payload = await self._poll_until_terminal(
+                lambda: get_firmware_unpacker_client().get_task(task.project_id, item.downstream_task_id, token or ""),
+                success_statuses={"success"},
+                failure_statuses={"failed", "cancelled"},
+                task=task,
+                item=item,
+            )
+            item.finished_at = _now()
+            item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            result = {
+                **input_file,
+                "input_path": str(input_path),
+                "unpacked_root": str(output_dir),
+                "downstream": payload,
+            }
+            item.result = result
+            item.output_ref = {"unpacked_root": str(output_dir)}
+            session.commit()
+            return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
+        except Exception as exc:
+            if "item" in locals():
+                item.status = "failed"
+                item.error_message = str(exc)
+                item.finished_at = _now()
+                session.commit()
+            return {"status": "failed", "error": str(exc), "item": input_file}
+        finally:
+            session.close()
 
-    def _parse_system_analysis_modules(self, root: Path) -> list[dict[str, Any]]:
+    async def _stage_system_analysis(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
+        del token
+        firmware_items = list(task.summary.get("firmware_unpack_results") or [])
+        if not firmware_items:
+            return "failed", {"error": "缺少成功解包的固件结果"}
+        results = await self._run_stage_pool(
+            task,
+            firmware_items,
+            self._stage_parallelism(task, stage_run.stage_name),
+            lambda firmware: self._run_system_analysis_item(task, stage_run, firmware),
+            retries=int(task.policy.get("max_retries_per_item") or 0),
+        )
+        success = [result["item"] for result in results if result.get("status") == "success"]
+        failed = [result for result in results if result.get("status") == "failed"]
+        all_modules = []
+        for result in success:
+            all_modules.extend(result.get("modules", []))
+        task.summary = {
+            **task.summary,
+            "system_analysis_results": success,
+            "high_risk_modules": all_modules,
+        }
+        db.commit()
+        status = "success"
+        if failed and success:
+            status = "partial_success"
+        elif failed:
+            status = "failed"
+        return status, {
+            "items": success,
+            "failed_items": failed,
+            "success_count": len(success),
+            "failed_count": len(failed),
+            "module_count": len(all_modules),
+            "error": failed[0].get("error") if failed else None,
+        }
+
+    async def _run_system_analysis_item(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, firmware: dict[str, Any]) -> dict[str, Any]:
+        session = get_session_factory()()
+        try:
+            item = BinarySecurityStageItem(
+                id=f"si_{uuid.uuid4().hex[:20]}",
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_run_id=stage_run.id,
+                stage_name=stage_run.stage_name,
+                item_key=firmware["firmware_key"],
+                item_name=firmware["filename"],
+                parent_key=firmware["firmware_key"],
+                status="running",
+                downstream_service="system_analyse",
+                started_at=_now(),
+            )
+            item.input_ref = {"input_path": firmware["unpacked_root"], "firmware_key": firmware["firmware_key"]}
+            session.add(item)
+            session.commit()
+            created = await get_system_analyse_client().create_task(task.project_id, f"{task.name}-{firmware['firmware_name']}-system-analysis", firmware["unpacked_root"])
+            item.downstream_task_id = created.get("task_id")
+            session.commit()
+            status, payload = await self._poll_until_terminal(
+                lambda: get_system_analyse_client().get_task(item.downstream_task_id),
+                success_statuses={"passed", "success"},
+                failure_statuses={"failed", "error", "cancelled"},
+                task=task,
+                item=item,
+            )
+            artifact_root = Path(task.output_root) / firmware["firmware_key"] / "system-analysis"
+            materialized = self._materialize_stage_artifact(artifact_root, item.downstream_task_id, payload)
+            modules = self._parse_system_analysis_modules(materialized, firmware)
+            item.finished_at = _now()
+            item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            result = {
+                **firmware,
+                "artifact_root": str(materialized),
+                "modules": modules,
+                "downstream": payload,
+            }
+            item.result = result
+            item.output_ref = {"artifact_root": str(materialized)}
+            session.commit()
+            return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
+        except Exception as exc:
+            if "item" in locals():
+                item.status = "failed"
+                item.error_message = str(exc)
+                item.finished_at = _now()
+                session.commit()
+            return {"status": "failed", "error": str(exc), "item": firmware}
+        finally:
+            session.close()
+
+    def _parse_system_analysis_modules(self, root: Path, firmware: dict[str, Any]) -> list[dict[str, Any]]:
         modules_list = root / "modules.list"
         modules_dir = root / "modules"
         items: list[dict[str, Any]] = []
@@ -809,9 +1036,14 @@ class TaskManager:
             names = [path.name for path in sorted(p for p in modules_dir.iterdir() if p.is_dir())]
         for name in names:
             module_dir = modules_dir / name
+            module_key = _slug(f"{firmware['firmware_key']}-{name}")
             items.append(
                 {
-                    "module_key": _slug(name),
+                    "firmware_key": firmware["firmware_key"],
+                    "firmware_name": firmware["firmware_name"],
+                    "filename": firmware["filename"],
+                    "unpacked_root": firmware["unpacked_root"],
+                    "module_key": module_key,
                     "module_name": name,
                     "module_dir": str(module_dir),
                     "module_report": str(module_dir / "module_report.md"),
@@ -821,18 +1053,18 @@ class TaskManager:
         _write_json(root / "high_risk_modules.json", {"items": items})
         return items
 
-    def _materialize_stage_artifact(self, task: BinarySecurityTask, stage_dir: str, downstream_task_id: str | None, payload: dict[str, Any]) -> Path:
-        artifact_root = Path(task.workspace_root) / "artifacts" / stage_dir / (downstream_task_id or "unknown")
+    def _materialize_stage_artifact(self, artifact_root: Path, downstream_task_id: str | None, payload: dict[str, Any]) -> Path:
         ensure_dir(artifact_root)
         candidates: list[Path] = []
         for key in ("artifact_root", "result_root", "workspace_root", "output_path"):
             value = payload.get(key)
-            if value:
-                raw = Path(str(value))
-                if key == "output_path" and downstream_task_id and raw.exists() and raw.is_dir() and not (raw / downstream_task_id).exists():
-                    candidates.append(raw)
-                else:
-                    candidates.append(raw / downstream_task_id if key == "output_path" and downstream_task_id else raw)
+            if not value:
+                continue
+            raw = Path(str(value))
+            if key == "output_path" and downstream_task_id and raw.exists() and (raw / downstream_task_id).exists():
+                candidates.append(raw / downstream_task_id)
+            else:
+                candidates.append(raw)
         for candidate in candidates:
             if candidate.exists():
                 _copytree(candidate, artifact_root)
@@ -845,31 +1077,25 @@ class TaskManager:
         results = await self._run_stage_pool(
             task,
             modules,
-            int(task.policy.get("max_stage_parallelism") or 1),
+            self._stage_parallelism(task, stage_run.stage_name),
             lambda module: self._run_b2s_item(task, stage_run, module, token),
             retries=int(task.policy.get("max_retries_per_item") or 0),
         )
-        return self._aggregate_stage_items(db, task, stage_run, results, "b2s_results")
+        return self._aggregate_stage_items(db, task, results, "b2s_results")
 
     async def _stage_entry_analysis(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
-        b2s_success = [
-            item.result
-            for item in db.query(BinarySecurityStageItem)
-            .filter(BinarySecurityStageItem.task_id == task.id, BinarySecurityStageItem.stage_name == "binary_to_source", BinarySecurityStageItem.status == "success")
-            .all()
-        ]
+        b2s_success = list(task.summary.get("b2s_results") or [])
         if not b2s_success:
             return "failed", {"error": "没有可用于入口分析的反编译结果"}
         results = await self._run_stage_pool(
             task,
             b2s_success,
-            int(task.policy.get("max_stage_parallelism") or 1),
+            self._stage_parallelism(task, stage_run.stage_name),
             lambda module: self._run_entry_item(task, stage_run, module, token),
             retries=int(task.policy.get("max_retries_per_item") or 0),
         )
-        status, summary = self._aggregate_stage_items(db, task, stage_run, results, "entry_results")
-        if summary.get("items"):
-            task.summary = {**task.summary, "entry_results": summary["items"]}
+        status, summary = self._aggregate_stage_items(db, task, results, "entry_results")
+        summary["entry_count"] = sum(len(item.get("entries") or []) for item in summary.get("items", []))
         return status, summary
 
     async def _stage_dataflow_analysis(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
@@ -882,14 +1108,11 @@ class TaskManager:
         results = await self._run_stage_pool(
             task,
             entries,
-            int(task.policy.get("max_stage_parallelism") or 1),
+            self._stage_parallelism(task, stage_run.stage_name),
             lambda entry: self._run_dataflow_item(task, stage_run, entry, token),
             retries=int(task.policy.get("max_retries_per_item") or 0),
         )
-        status, summary = self._aggregate_stage_items(db, task, stage_run, results, "dataflow_results")
-        if summary.get("items"):
-            task.summary = {**task.summary, "dataflow_results": summary["items"]}
-        return status, summary
+        return self._aggregate_stage_items(db, task, results, "dataflow_results")
 
     async def _stage_vuln_scan(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
         dataflow_results = list(task.summary.get("dataflow_results") or [])
@@ -898,11 +1121,13 @@ class TaskManager:
         results = await self._run_stage_pool(
             task,
             dataflow_results,
-            int(task.policy.get("max_stage_parallelism") or 1),
+            self._stage_parallelism(task, stage_run.stage_name),
             lambda result: self._run_vuln_item(task, stage_run, result, token),
             retries=int(task.policy.get("max_retries_per_item") or 0),
         )
-        return self._aggregate_stage_items(db, task, stage_run, results, "vuln_results")
+        status, summary = self._aggregate_stage_items(db, task, results, "vuln_results")
+        summary["vuln_result_count"] = len(summary.get("items", []))
+        return status, summary
 
     async def _run_stage_pool(self, task: BinarySecurityTask, items: list[dict[str, Any]], concurrency: int, runner, retries: int = 0):
         semaphore = asyncio.Semaphore(max(1, concurrency))
@@ -932,7 +1157,7 @@ class TaskManager:
                 stage_name=stage_run.stage_name,
                 item_key=module["module_key"],
                 item_name=module["module_name"],
-                parent_key=module["module_key"],
+                parent_key=module["firmware_key"],
                 status="running",
                 downstream_service="binary_to_source",
                 started_at=_now(),
@@ -950,14 +1175,12 @@ class TaskManager:
                 success_statuses={"success", "partial_success"},
                 failure_statuses={"failed", "cancelled"},
                 task=task,
-                stage_name=stage_run.stage_name,
                 item=item,
             )
-            detail = payload
-            artifact_root = Path(task.workspace_root) / "artifacts" / "b2s" / module["module_key"]
+            artifact_root = Path(task.output_root) / module["firmware_key"] / "b2s" / module["module_key"]
             ensure_dir(artifact_root)
             generated_files = []
-            for child in detail.get("items", []):
+            for child in payload.get("items", []):
                 for file_path in child.get("generated_files") or []:
                     src = Path(file_path)
                     if src.exists():
@@ -965,18 +1188,17 @@ class TaskManager:
                         _copytree(src, target)
                         generated_files.append(str(target))
             result = {
-                "module_key": module["module_key"],
-                "module_name": module["module_name"],
+                **module,
                 "source_dir": str(artifact_root),
                 "generated_files": generated_files,
-                "downstream": detail,
+                "downstream": payload,
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
             item.result = result
             item.output_ref = {"source_dir": str(artifact_root)}
             session.commit()
-            return {"status": item.status, "item": result}
+            return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"
@@ -990,8 +1212,7 @@ class TaskManager:
     def _choose_module_binary(self, module: dict[str, Any]) -> str:
         files = [line.strip() for line in _read_text(Path(module["files_list"])).splitlines() if line.strip()]
         module_dir = Path(module["module_dir"])
-        unpacked_hint = module.get("unpacked_root")
-        unpacked_root = Path(str(unpacked_hint)) if unpacked_hint else (module_dir.parents[1] if len(module_dir.parents) > 1 else module_dir.parent)
+        unpacked_root = Path(str(module["unpacked_root"]))
         for rel in files:
             candidate = Path(rel)
             candidates = []
@@ -1011,6 +1232,7 @@ class TaskManager:
         raise ValidationError(f"模块 {module['module_name']} 未找到可反编译文件")
 
     async def _run_entry_item(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, module: dict[str, Any], token: str | None) -> dict[str, Any]:
+        del token
         session = get_session_factory()()
         try:
             item = BinarySecurityStageItem(
@@ -1021,7 +1243,7 @@ class TaskManager:
                 stage_name=stage_run.stage_name,
                 item_key=module["module_key"],
                 item_name=module["module_name"],
-                parent_key=module["module_key"],
+                parent_key=module["firmware_key"],
                 status="running",
                 downstream_service="entry_analyse",
                 started_at=_now(),
@@ -1037,27 +1259,24 @@ class TaskManager:
                 success_statuses={"passed", "success"},
                 failure_statuses={"failed", "error", "cancelled"},
                 task=task,
-                stage_name=stage_run.stage_name,
                 item=item,
             )
-            artifact_root = Path(task.workspace_root) / "artifacts" / "entry" / module["module_key"]
-            _copytree(self._materialize_stage_artifact(task, "entry", item.downstream_task_id, payload), artifact_root)
-            entries = self._parse_entries(artifact_root, module)
+            artifact_root = Path(task.output_root) / module["firmware_key"] / "entry" / module["module_key"]
+            materialized = self._materialize_stage_artifact(artifact_root, item.downstream_task_id, payload)
+            entries = self._parse_entries(materialized, module)
             result = {
-                "module_key": module["module_key"],
-                "module_name": module["module_name"],
-                "artifact_root": str(artifact_root),
+                **module,
+                "artifact_root": str(materialized),
                 "entries": entries,
                 "source_dir": module["source_dir"],
                 "downstream": payload,
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
-            item.retry_count = max(item.retry_count, 0)
             item.result = result
-            item.output_ref = {"artifact_root": str(artifact_root)}
+            item.output_ref = {"artifact_root": str(materialized)}
             session.commit()
-            return {"status": item.status, "item": result}
+            return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"
@@ -1087,6 +1306,8 @@ class TaskManager:
                     rows.append(
                         {
                             "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
+                            "firmware_key": module["firmware_key"],
+                            "firmware_name": module["firmware_name"],
                             "module_key": module["module_key"],
                             "module_name": module["module_name"],
                             "file_name": file_name,
@@ -1111,6 +1332,8 @@ class TaskManager:
                     rows.append(
                         {
                             "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
+                            "firmware_key": module["firmware_key"],
+                            "firmware_name": module["firmware_name"],
                             "module_key": module["module_key"],
                             "module_name": module["module_name"],
                             "file_name": file_name,
@@ -1123,6 +1346,7 @@ class TaskManager:
         return rows
 
     async def _run_dataflow_item(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, entry: dict[str, Any], token: str | None) -> dict[str, Any]:
+        del token
         session = get_session_factory()()
         try:
             item = BinarySecurityStageItem(
@@ -1150,25 +1374,23 @@ class TaskManager:
                 success_statuses={"passed", "success"},
                 failure_statuses={"failed", "error", "cancelled"},
                 task=task,
-                stage_name=stage_run.stage_name,
                 item=item,
             )
-            artifact_root = Path(task.workspace_root) / "artifacts" / "dataflow" / entry["entry_key"]
-            _copytree(self._materialize_stage_artifact(task, "dataflow", item.downstream_task_id, payload), artifact_root)
-            data_flow_file = self._find_first(artifact_root, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
+            artifact_root = Path(task.output_root) / entry["firmware_key"] / "dataflow" / entry["entry_key"]
+            materialized = self._materialize_stage_artifact(artifact_root, item.downstream_task_id, payload)
+            data_flow_file = self._find_first(materialized, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             result = {
                 **entry,
-                "artifact_root": str(artifact_root),
+                "artifact_root": str(materialized),
                 "data_flow_file": str(data_flow_file) if data_flow_file else "",
                 "downstream": payload,
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
-            item.retry_count = max(item.retry_count, 0)
             item.result = result
-            item.output_ref = {"artifact_root": str(artifact_root), "data_flow_file": result["data_flow_file"]}
+            item.output_ref = {"artifact_root": str(materialized), "data_flow_file": result["data_flow_file"]}
             session.commit()
-            return {"status": item.status, "item": result}
+            return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"
@@ -1198,7 +1420,7 @@ class TaskManager:
             item.input_ref = dataflow_result
             session.add(item)
             session.commit()
-            vuln_workspace = Path(task.workspace_root) / "artifacts" / "vuln" / dataflow_result["entry_key"] / "workspace"
+            vuln_workspace = Path(task.output_root) / dataflow_result["firmware_key"] / "vuln" / dataflow_result["entry_key"] / "workspace"
             vuln_output = vuln_workspace / "output"
             ensure_dir(vuln_output)
             created = await get_dataflow_vuln_scanner_client().create_task(
@@ -1217,7 +1439,6 @@ class TaskManager:
                 success_statuses={"success", "succeeded", "completed"},
                 failure_statuses={"failed", "cancelled"},
                 task=task,
-                stage_name=stage_run.stage_name,
                 item=item,
             )
             artifacts = await get_dataflow_vuln_scanner_client().get_artifacts(item.downstream_task_id, token or "")
@@ -1230,11 +1451,10 @@ class TaskManager:
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
-            item.retry_count = max(item.retry_count, 0)
             item.result = result
             item.output_ref = {"workspace_root": artifacts.get("workspace_root")}
             session.commit()
-            return {"status": item.status, "item": result}
+            return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"
@@ -1254,7 +1474,7 @@ class TaskManager:
                     return path
         return None
 
-    def _aggregate_stage_items(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, results: list[dict[str, Any]], summary_key: str) -> tuple[str, dict[str, Any]]:
+    def _aggregate_stage_items(self, db: Session, task: BinarySecurityTask, results: list[dict[str, Any]], summary_key: str) -> tuple[str, dict[str, Any]]:
         success = [result["item"] for result in results if result.get("status") == "success"]
         failed = [result for result in results if result.get("status") == "failed"]
         cancelled = [result for result in results if result.get("status") == "cancelled"]
@@ -1272,13 +1492,19 @@ class TaskManager:
             "cancelled_items": cancelled,
             "success_count": len(success),
             "failed_count": len(failed),
-            "entry_count": len(success) if summary_key == "entry_results" else 0,
-            "vuln_result_count": len(success) if summary_key == "vuln_results" else 0,
+            "entry_count": 0,
+            "vuln_result_count": 0,
             "error": failed[0].get("error") if failed else cancelled[0].get("error") if cancelled else None,
         }
         task.summary = {**task.summary, summary_key: success}
         db.commit()
         return status, summary
+
+    def _fileserver_task_path(self, task_id: str, suffix: str | None = None) -> str:
+        base = f"/app/secflow-app-binary-security/{task_id}"
+        if suffix:
+            return f"{base}/{suffix.strip('/')}"
+        return base
 
 
 _task_manager: Optional[TaskManager] = None

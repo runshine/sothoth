@@ -29,8 +29,14 @@ class FileserverClient:
             Path(self.config.data_mount_path)
             / self.config.project_files_dirname
             / project_id
-            / self.config.subproject_name
         )
+
+    def project_files_root(self, project_id: str) -> Path:
+        return self._fallback_root(project_id)
+
+    def project_relative_path(self, *parts: str) -> str:
+        cleaned = [str(part).strip("/").replace("\\", "/") for part in parts if str(part).strip("/")]
+        return "/" + "/".join(cleaned)
 
     async def ensure_subproject(self, project_id: str, authorization_token: str | None, created_by: str) -> dict[str, Any]:
         headers = self._headers(authorization_token)
@@ -76,6 +82,33 @@ class FileserverClient:
             "root_dir": str(self._fallback_root(project_id)),
             "mode": "filesystem-fallback",
         }
+
+    async def ensure_project_directory(self, project_id: str, path: str, authorization_token: str | None) -> str:
+        normalized = self.project_relative_path(path)
+        if normalized == "/":
+            return normalized
+        local_path = self.project_files_root(project_id) / normalized.lstrip("/")
+        if local_path.is_dir():
+            return normalized
+        headers = self._headers(authorization_token)
+        current = ""
+        try:
+            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+                for part in [item for item in normalized.strip("/").split("/") if item]:
+                    current = self.project_relative_path(current, part)
+                    resp = await client.post(
+                        f"{self.config.base_url.rstrip('/')}/project-filesystem/directories",
+                        json={"project_id": project_id, "path": current},
+                        headers=headers,
+                    )
+                    if resp.status_code in (200, 201, 409):
+                        continue
+                    if resp.status_code == 404:
+                        raise UpstreamError(f"父目录不存在: {current}")
+                    resp.raise_for_status()
+        except Exception:
+            ensure_dir(local_path)
+        return normalized
 
 
 _fileserver_client: Optional[FileserverClient] = None
