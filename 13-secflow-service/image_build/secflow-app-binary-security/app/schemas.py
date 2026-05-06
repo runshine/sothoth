@@ -1,0 +1,165 @@
+"""Pydantic schemas for Binary Security APIs."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any, Optional
+
+from pydantic import BaseModel, Field
+
+from app.model import STAGE_SEQUENCE
+
+
+class TokenUser(BaseModel):
+    user_id: Optional[str] = None
+    username: Optional[str] = None
+    token_type: Optional[str] = None
+
+
+class PathRef(BaseModel):
+    source: str = Field(default="project_filesystem")
+    path: str = Field(..., min_length=1)
+    filename: Optional[str] = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class StageOptions(BaseModel):
+    enabled: bool = True
+
+
+class TaskPolicyOverrides(BaseModel):
+    max_stage_parallelism: Optional[int] = Field(default=None, ge=1, le=32)
+    max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
+    continue_on_item_failure: Optional[bool] = None
+
+
+class BinarySecurityTaskCreate(BaseModel):
+    task_id: Optional[str] = None
+    name: str = Field(..., min_length=1)
+    description: Optional[str] = None
+    firmware_input: PathRef
+    output_root: Optional[str] = None
+    stage_options: dict[str, StageOptions] = Field(default_factory=dict)
+    policy_overrides: TaskPolicyOverrides = Field(default_factory=TaskPolicyOverrides)
+
+
+class BinarySecurityTaskPrepareResponse(BaseModel):
+    task_id: str
+
+
+class BinarySecurityStageSummary(BaseModel):
+    stage_name: str
+    sequence_no: int
+    status: str
+    retry_count: int = 0
+    total_items: int = 0
+    success_items: int = 0
+    failed_items: int = 0
+    skipped_items: int = 0
+    running_items: int = 0
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+
+
+class BinarySecurityTaskResponse(BaseModel):
+    id: str
+    project_id: str
+    name: str
+    status: str
+    current_stage: Optional[str] = None
+    firmware_path: str
+    created_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    high_risk_module_count: int = 0
+    entry_count: int = 0
+    vuln_result_count: int = 0
+    stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
+
+
+class BinarySecurityTaskListResponse(BaseModel):
+    total: int
+    items: list[BinarySecurityTaskResponse] = Field(default_factory=list)
+
+
+class BinarySecurityStageItemResponse(BaseModel):
+    id: str
+    stage_name: str
+    item_key: str
+    item_name: Optional[str] = None
+    parent_key: Optional[str] = None
+    status: str
+    retry_count: int = 0
+    downstream_service: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    input_ref: dict[str, Any] = Field(default_factory=dict)
+    output_ref: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+    error_message: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
+    description: Optional[str] = None
+    output_root: str
+    workspace_root: str
+    fileserver_subproject_name: Optional[str] = None
+    policy: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    item_stats: dict[str, dict[str, int]] = Field(default_factory=dict)
+    stage_items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
+
+
+class BinarySecurityTaskEventResponse(BaseModel):
+    id: str
+    stage_name: Optional[str] = None
+    item_id: Optional[str] = None
+    item_key: Optional[str] = None
+    level: str
+    event_type: str
+    message: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
+class BinarySecurityTimelineResponse(BaseModel):
+    task_id: str
+    events: list[BinarySecurityTaskEventResponse] = Field(default_factory=list)
+
+
+class BinarySecurityArtifactEntry(BaseModel):
+    path: str
+    size: int
+
+
+class BinarySecurityArtifactsResponse(BaseModel):
+    task_id: str
+    workspace_root: str
+    output_root: str
+    fileserver_path: Optional[str] = None
+    files: list[BinarySecurityArtifactEntry] = Field(default_factory=list)
+
+
+class BinarySecurityActionResponse(BaseModel):
+    status: str = "ok"
+    task_id: str
+    message: str
+
+
+class BinarySecurityProjectConfigPayload(BaseModel):
+    max_stage_parallelism: int = Field(default=4, ge=1, le=32)
+    max_retries_per_item: int = Field(default=2, ge=0, le=20)
+    continue_on_item_failure: bool = True
+    stage_options: dict[str, StageOptions] = Field(
+        default_factory=lambda: {stage: StageOptions(enabled=True) for stage in STAGE_SEQUENCE}
+    )
+
+
+class BinarySecurityProjectConfigResponse(BaseModel):
+    project_id: str
+    config: BinarySecurityProjectConfigPayload
