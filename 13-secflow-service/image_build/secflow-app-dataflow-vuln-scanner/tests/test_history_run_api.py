@@ -8,6 +8,7 @@ import yaml
 
 from app.config import get_config, reset_config
 from app.main import create_app
+from app.models.database import HistoryRun, get_db_session
 from app.services.execution_service import get_execution_service
 from app.services.scheduler import SchedulerService
 
@@ -48,7 +49,11 @@ def _write_json(path: Path, data: dict) -> None:
 def _create_legacy_run(run_root: Path) -> None:
     atomic = run_root / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
     _write_json(run_root / "config.json", {
-        "global": {"max_review_cycles": 3, "parallel_result_review": True},
+        "global": {
+            "max_review_cycles": 3,
+            "parallel_result_review": True,
+            "workspace_root": f"/home/mock/secflow/runs/{run_root.name}/workspace",
+        },
         "agents": [{
             "id": "pi-worker",
             "runtime_config": {
@@ -66,6 +71,8 @@ def _create_legacy_run(run_root: Path) -> None:
         "finished_at": "2026-04-28T01:12:03",
         "status": "completed",
     })
+    _write_json(run_root / "workspace" / "pipeline_demo_run_001" / "_meta" / "pipeline_state.json", {"status": "completed"})
+    _write_json(run_root / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "_meta" / "stage_state.json", {"status": "completed"})
     _write_json(atomic / "_meta" / "state.json", {"current_state": "completed", "timestamp": "2026-04-28T01:12:03Z"})
     _write_json(atomic / "_meta" / "workflow_result.json", {"status": "completed", "timestamp": "2026-04-28T01:12:03Z", "detail": {"cycles_used": 1}})
     _write_json(atomic / "_meta" / "review_summaries" / "cycle_001.json", {
@@ -203,6 +210,8 @@ def test_history_runs_api_lists_legacy_and_execution_runs_and_resolves_legacy_li
 
     legacy_detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{legacy_summary['history_run_id']}")
     assert legacy_detail.status_code == 200
+    assert legacy_detail.json()["atomic_work_path"].endswith("vuln_scan_initial_001")
+    assert legacy_detail.json()["cycles"]
     assert any(item["path"] == "results/result_001.md" for item in legacy_detail.json()["files"])
 
     file_payload = client.get(
@@ -244,6 +253,39 @@ def test_history_run_refreshes_after_legacy_directory_changes(service_config_pat
     assert any(item["path"] == "supporting_docs/new_note.md" for item in detail_after.json()["files"])
 
 
+def test_history_run_reparses_when_atomic_work_path_was_stale(service_config_path):
+    config = get_config()
+    project_root = Path(config.fileserver_service.data_mount_path) / "files" / "default"
+    legacy_run = project_root / "dataflow-vuln-scanner" / "runs" / "legacy_atomic_refresh_20260429_020304"
+    _create_legacy_run(legacy_run)
+
+    app = create_app()
+    client = TestClient(app)
+    list_response = client.get("/api/dataflow-vuln-scanner/history-runs", params={"project_id": "default"})
+    assert list_response.status_code == 200
+    history_run_id = next(item["history_run_id"] for item in list_response.json() if item["name"] == legacy_run.name)
+
+    db = get_db_session()
+    try:
+        row = db.get(HistoryRun, history_run_id)
+        assert row is not None
+        row.atomic_work_path = ""
+        row.cycles_used = 0
+        row.result_count = 0
+        row.manifests_json = {}
+        db.add(row)
+        db.commit()
+    finally:
+        db.close()
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{history_run_id}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["atomic_work_path"].endswith("vuln_scan_initial_001")
+    assert payload["cycles"]
+    assert payload["results"]
+
+
 def test_history_runs_can_pin_legacy_project_root(service_config_path):
     config_payload = yaml.safe_load(service_config_path.read_text(encoding="utf-8")) or {}
     config_payload["history_runs"] = {
@@ -277,3 +319,45 @@ def test_history_runs_can_pin_legacy_project_root(service_config_path):
     )
     assert resolve.status_code == 200
     assert resolve.json()["history_run_id"] == summary["history_run_id"]
+
+
+def test_history_runs_rebind_existing_legacy_index_to_requested_project(service_config_path):
+    config_payload = yaml.safe_load(service_config_path.read_text(encoding="utf-8")) or {}
+    config_payload["history_runs"] = {
+        "enabled": True,
+        "fixed_project_id": "44f9029d00650a10",
+        "legacy_root_candidates": [
+            "{data_mount_path}/{project_files_dirname}/{project_id}/dataflow-vuln-scanner/runs",
+            "{data_mount_path}/{project_files_dirname}/{project_id}/DATAFLOW_VULN_SCANNER/runs",
+        ],
+    }
+    service_config_path.write_text(yaml.safe_dump(config_payload, allow_unicode=True), encoding="utf-8")
+    reset_config()
+
+    config = get_config()
+    fixed_project_id = str(config.history_runs.fixed_project_id)
+    project_root = Path(config.fileserver_service.data_mount_path) / "files" / fixed_project_id
+    legacy_run = project_root / "dataflow-vuln-scanner" / "runs" / "legacy_rebind_project_20260506_020304"
+    _create_legacy_run(legacy_run)
+
+    app = create_app()
+    client = TestClient(app)
+
+    first_list = client.get("/api/dataflow-vuln-scanner/history-runs", params={"project_id": "default"})
+    assert first_list.status_code == 200
+    summary = next(item for item in first_list.json() if item["name"] == legacy_run.name)
+
+    db = get_db_session()
+    try:
+        row = db.get(HistoryRun, summary["history_run_id"])
+        assert row is not None
+        row.project_id = "stale-project"
+        db.add(row)
+        db.commit()
+    finally:
+        db.close()
+
+    rebound_list = client.get("/api/dataflow-vuln-scanner/history-runs", params={"project_id": "default"})
+    assert rebound_list.status_code == 200
+    rebound_summary = next(item for item in rebound_list.json() if item["name"] == legacy_run.name)
+    assert rebound_summary["project_id"] == "default"

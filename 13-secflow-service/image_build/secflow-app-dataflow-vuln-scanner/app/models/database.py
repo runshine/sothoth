@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, inspect, text
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.config import get_config
@@ -11,6 +12,11 @@ from app.config import get_config
 Base = declarative_base()
 _engine = None
 _SessionFactory = None
+
+MYSQL_INDEX_LENGTHS = {
+    "ix_dfvs_hr_source_key": {"source_key": 512},
+    "ix_dfvs_hrf_run_path": {"path": 512},
+}
 
 
 def now_utc() -> datetime:
@@ -155,7 +161,7 @@ class HistoryRun(Base):
     manifests_json = Column(JSON, nullable=False, default=dict)
     latest_issues_json = Column(JSON, nullable=False, default=list)
     raw_summary_json = Column(JSON, nullable=False, default=dict)
-    log_tail_text = Column(Text)
+    log_tail_text = Column(Text().with_variant(MEDIUMTEXT(), "mysql"))
     log_size_bytes = Column(Integer, nullable=False, default=0)
     source_mtime = Column(Float, nullable=False, default=0)
     last_synced_at = Column(DateTime, default=now_utc)
@@ -391,16 +397,38 @@ INDEX_DEFINITIONS = [
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_status", "CREATE INDEX ix_dfvs_worker_status ON {table} (status)"),
 ]
 
+
+def _index_column_names(sql_template: str) -> list[str]:
+    columns_sql = sql_template.split("(", 1)[1].rsplit(")", 1)[0]
+    return [column.strip() for column in columns_sql.split(",")]
+
+
+def _render_index_sql(table_name: str, index_name: str, sql_template: str, dialect: str) -> str:
+    if dialect != "mysql" or index_name not in MYSQL_INDEX_LENGTHS:
+        return sql_template.format(table=table_name)
+    prefix_lengths = MYSQL_INDEX_LENGTHS[index_name]
+    rendered_columns = []
+    for column_name in _index_column_names(sql_template):
+        prefix_length = prefix_lengths.get(column_name)
+        if prefix_length:
+            rendered_columns.append(f"{column_name}({prefix_length})")
+        else:
+            rendered_columns.append(column_name)
+    unique_sql = "UNIQUE " if sql_template.startswith("CREATE UNIQUE INDEX") else ""
+    return f"CREATE {unique_sql}INDEX {index_name} ON {table_name} ({', '.join(rendered_columns)})"
+
 for table_name, index_name, sql_template in INDEX_DEFINITIONS:
     table = next(
         cls.__table__
         for cls in MODEL_CLASSES
         if cls.__tablename__ == table_name
     )
-    columns_sql = sql_template.split("(", 1)[1].rsplit(")", 1)[0]
-    column_names = [column.strip() for column in columns_sql.split(",")]
+    column_names = _index_column_names(sql_template)
     columns = [getattr(table.c, column_name) for column_name in column_names]
-    Index(index_name, *columns, unique=sql_template.startswith("CREATE UNIQUE INDEX"))
+    index_kwargs = {}
+    if index_name in MYSQL_INDEX_LENGTHS:
+        index_kwargs["mysql_length"] = MYSQL_INDEX_LENGTHS[index_name]
+    Index(index_name, *columns, unique=sql_template.startswith("CREATE UNIQUE INDEX"), **index_kwargs)
 
 
 def get_engine():
@@ -429,6 +457,13 @@ def get_session_factory():
 
 def _column_exists(inspector, table_name: str, column_name: str) -> bool:
     return column_name in {column["name"] for column in inspector.get_columns(table_name)}
+
+
+def _column_type_name(inspector, table_name: str, column_name: str) -> str:
+    for column in inspector.get_columns(table_name):
+        if column["name"] == column_name:
+            return str(column.get("type") or "").upper()
+    return ""
 
 
 def _index_exists(inspector, table_name: str, index_name: str) -> bool:
@@ -468,7 +503,7 @@ def run_auto_migrations() -> None:
         (tables["workflow_execution"], "recovery_reason", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN recovery_reason VARCHAR(255) NULL"),
     ]
     index_migrations = [
-        (table_name, index_name, sql_template.format(table=table_name))
+        (table_name, index_name, _render_index_sql(table_name, index_name, sql_template, dialect))
         for table_name, index_name, sql_template in INDEX_DEFINITIONS
     ]
 
@@ -540,6 +575,15 @@ def run_auto_migrations() -> None:
                     f"UPDATE {tables['workflow_execution']} "
                     "SET attempt_no = 1 WHERE attempt_no IS NULL OR attempt_no = 0"
                 ))
+
+        if dialect == "mysql" and HistoryRun.__tablename__ in inspector.get_table_names():
+            if _column_exists(inspector, HistoryRun.__tablename__, "log_tail_text"):
+                if _column_type_name(inspector, HistoryRun.__tablename__, "log_tail_text") != "MEDIUMTEXT":
+                    connection.execute(text(
+                        f"ALTER TABLE {HistoryRun.__tablename__} "
+                        "MODIFY COLUMN log_tail_text MEDIUMTEXT NULL"
+                    ))
+                    inspector = inspect(connection)
 
         inspector = inspect(connection)
         for table_name, index_name, sql in index_migrations:

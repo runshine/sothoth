@@ -146,26 +146,86 @@ def _sorted_json_files(directory: Path, pattern: str = "cycle_*.json") -> list[P
     return sorted(directory.glob(pattern))
 
 
-def _find_atomic_work_dir(run_dir: Path) -> Path | None:
-    config = _read_json(run_dir / "config.json")
+def _atomic_candidate_search_roots(run_dir: Path, config: dict[str, Any]) -> list[Path]:
     workspace_candidates: list[Path] = []
-    workspace_root = str((config.get("global") or {}).get("workspace_root") or "")
+    workspace_root = str((config.get("global") or {}).get("workspace_root") or "").strip()
     if workspace_root:
         workspace_candidates.append(Path(from_msys_path(workspace_root) or workspace_root))
-    workspace_candidates.extend([run_dir, run_dir / "workspace", run_dir / "ws"])
+        workspace_name = Path(workspace_root).name
+        if workspace_name:
+            workspace_candidates.append(run_dir / workspace_name)
+    workspace_candidates.extend([run_dir / "workspace", run_dir / "ws", run_dir])
 
-    for workspace in dict.fromkeys(workspace_candidates):
-        if not workspace.is_dir():
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in workspace_candidates:
+        key = str(candidate)
+        if key in seen:
             continue
-        for pipeline_dir in sorted(workspace.iterdir()):
-            if not pipeline_dir.is_dir():
+        seen.add(key)
+        if candidate.is_dir():
+            unique.append(candidate)
+    return unique
+
+
+def _atomic_candidate_score(candidate: Path) -> tuple[int, int]:
+    score = 0
+    evidence = 0
+
+    def mark(points: int, condition: bool) -> None:
+        nonlocal score, evidence
+        if condition:
+            score += points
+            evidence += 1
+
+    mark(12, (candidate / "input" / "task.md").is_file())
+    mark(10, (candidate / "results").is_dir() or (candidate / "final_output" / "results").is_dir())
+    mark(8, (candidate / "reviews").is_dir())
+    mark(7, (candidate / "sessions").is_dir())
+    mark(6, (candidate / "removed_results").is_dir() or (candidate / "final_output" / "removed_results").is_dir())
+    mark(5, (candidate / "supporting_docs").is_dir() or (candidate / "final_output" / "supporting_docs").is_dir())
+    mark(4, (candidate / "output").is_dir() or (candidate / "working").is_dir() or (candidate / "summary.md").is_file())
+    mark(4, (candidate / "_meta" / "workflow_result.json").is_file())
+    mark(3, (candidate / "_meta" / "state.json").is_file())
+    mark(3, (candidate / "_meta" / "review_summaries").is_dir())
+    mark(2, (candidate / "_meta" / "cycle_metrics").is_dir())
+    mark(2, (candidate / "_meta" / "review_feedback").is_dir())
+
+    return score, evidence
+
+
+def _find_atomic_work_dir(run_dir: Path) -> Path | None:
+    config = _read_json(run_dir / "config.json")
+    candidates: list[tuple[int, int, int, Path]] = []
+    fallback_candidates: list[tuple[int, Path]] = []
+    seen: set[str] = set()
+
+    for search_root in _atomic_candidate_search_roots(run_dir, config):
+        meta_dirs: list[Path] = []
+        if (search_root / "_meta").is_dir():
+            meta_dirs.append(search_root / "_meta")
+        meta_dirs.extend(path for path in search_root.rglob("_meta") if path.is_dir())
+        for meta_dir in meta_dirs:
+            candidate = meta_dir.parent
+            key = str(candidate.resolve())
+            if key in seen:
                 continue
-            for stage_dir in sorted(pipeline_dir.iterdir()):
-                if not stage_dir.is_dir():
-                    continue
-                for atomic_dir in sorted(stage_dir.iterdir()):
-                    if (atomic_dir / "_meta").is_dir():
-                        return atomic_dir
+            seen.add(key)
+            score, evidence = _atomic_candidate_score(candidate)
+            try:
+                depth = len(candidate.relative_to(run_dir).parts)
+            except ValueError:
+                depth = len(candidate.parts)
+            if score > 0 and evidence >= 2:
+                candidates.append((score, evidence, depth, candidate))
+            fallback_candidates.append((depth, candidate))
+
+    if candidates:
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], len(str(item[3]))), reverse=True)
+        return candidates[0][3]
+    if fallback_candidates:
+        fallback_candidates.sort(key=lambda item: (item[0], len(str(item[1]))), reverse=True)
+        return fallback_candidates[0][1]
     return None
 
 
@@ -500,6 +560,7 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
             "removed_results": [],
             "latest_issues": [],
             "manifests": {},
+            "atomic_work_path": "",
             "atomic_work_dir": "",
         }
 
@@ -561,6 +622,7 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
         "removed_results": _collect_removed_results(atomic),
         "manifests": _load_manifest_summary(atomic),
         "latest_issues": latest_issues,
+        "atomic_work_path": str(atomic),
         "atomic_work_dir": str(atomic),
     }
 

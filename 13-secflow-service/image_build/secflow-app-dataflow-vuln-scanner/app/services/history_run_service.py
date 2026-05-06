@@ -34,6 +34,8 @@ from app.services.run_inspector import (
     inspect_sessions,
 )
 
+HISTORY_RUN_LOG_SUMMARY_MAX_CHARS = 32768
+
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:20]}"
@@ -77,6 +79,13 @@ def _read_text_file(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
+
+
+def _truncate_log_summary(content: str, max_chars: int = HISTORY_RUN_LOG_SUMMARY_MAX_CHARS) -> str:
+    text = str(content or "")
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[-max_chars:]
 
 
 def _compute_source_mtime(path: Path) -> float:
@@ -141,6 +150,20 @@ def _parent_root(path: str) -> str:
         return str(Path(path).parent)
 
 
+def _detail_atomic_work_path(detail: dict[str, Any]) -> str:
+    return str(detail.get("atomic_work_path") or detail.get("atomic_work_dir") or "").strip()
+
+
+def _history_run_needs_parser_resync(record: HistoryRun) -> bool:
+    atomic_work_path = str(record.atomic_work_path or "").strip()
+    if not atomic_work_path:
+        return True
+    try:
+        return not Path(atomic_work_path).is_dir()
+    except Exception:
+        return True
+
+
 def _effective_legacy_project_id(project_id: str) -> str:
     config = get_config()
     fixed_project_id = str(config.history_runs.fixed_project_id or "").strip()
@@ -180,6 +203,29 @@ def _normalize_legacy_request_root(project_id: str, root_path: str) -> Path:
 
 
 class HistoryRunService:
+    def _refresh_record_bindings(
+        self,
+        record: HistoryRun,
+        *,
+        project_id: str,
+        source_type: str,
+        linked_execution: WorkflowExecution | None,
+        linked_task: TriggerTask | None,
+        profile_id: str | None,
+    ) -> None:
+        record.project_id = project_id
+        record.source_type = source_type
+        if linked_execution is not None:
+            record.linked_execution_id = linked_execution.id
+        if linked_task is not None:
+            record.linked_task_id = linked_task.id
+        elif linked_execution is not None and linked_execution.trigger_task_id:
+            record.linked_task_id = linked_execution.trigger_task_id
+        if profile_id:
+            record.profile_id = profile_id
+        elif linked_task is not None and linked_task.profile_id:
+            record.profile_id = linked_task.profile_id
+
     def _history_run_or_404(self, db: Session, history_run_id: str) -> HistoryRun:
         record = db.get(HistoryRun, history_run_id)
         if record is None:
@@ -248,7 +294,7 @@ class HistoryRunService:
 
         for cycle in detail.get("cycles") or []:
             cycle_no = int(cycle.get("cycle") or 0)
-            cycle_detail = inspect_cycle_detail(detail["path"], cycle_no) if detail.get("atomic_work_path") else {
+            cycle_detail = inspect_cycle_detail(detail["path"], cycle_no) if _detail_atomic_work_path(detail) else {
                 "cycle": cycle_no,
                 "global_reviews": [],
                 "result_reviews": [],
@@ -415,7 +461,17 @@ class HistoryRunService:
         source_key = str(run_root)
         source_mtime = _compute_source_mtime(run_root)
         record = db.query(HistoryRun).filter(HistoryRun.source_key == source_key).first()
-        if record is not None and record.source_mtime >= source_mtime:
+        if record is not None and record.source_mtime >= source_mtime and not _history_run_needs_parser_resync(record):
+            self._refresh_record_bindings(
+                record,
+                project_id=project_id,
+                source_type=source_type,
+                linked_execution=linked_execution,
+                linked_task=linked_task,
+                profile_id=profile_id,
+            )
+            db.add(record)
+            db.flush()
             return record
 
         summary = inspect_run_summary(run_root)
@@ -432,24 +488,28 @@ class HistoryRunService:
             if started_at and duration > 0:
                 finished_at = started_at + timedelta(seconds=duration)
         log_path = run_root / "run.log"
+        atomic_work_path = _detail_atomic_work_path(detail)
         raw_summary = {
             "start_time": str(summary.get("start_time") or ""),
-            "summary_markdown": _summary_markdown_for_run(run_root, detail.get("atomic_work_path")),
+            "summary_markdown": _summary_markdown_for_run(run_root, atomic_work_path),
             "task_markdown": _task_markdown_for_run(run_root),
         }
 
         if record is None:
             record = HistoryRun(id=_new_id("hr"))
 
-        record.project_id = project_id
-        record.source_type = source_type
+        self._refresh_record_bindings(
+            record,
+            project_id=project_id,
+            source_type=source_type,
+            linked_execution=linked_execution,
+            linked_task=linked_task,
+            profile_id=profile_id,
+        )
         record.source_key = source_key
         record.run_name = str(summary.get("name") or run_root.name)
         record.run_root_path = str(run_root)
-        record.atomic_work_path = str(detail.get("atomic_work_path") or "")
-        record.linked_task_id = linked_task.id if linked_task else (linked_execution.trigger_task_id if linked_execution else None)
-        record.linked_execution_id = linked_execution.id if linked_execution else None
-        record.profile_id = profile_id or (linked_task.profile_id if linked_task else None)
+        record.atomic_work_path = atomic_work_path
         record.status = str(summary.get("status") or "pending")
         record.started_at = started_at
         record.finished_at = finished_at
@@ -469,7 +529,7 @@ class HistoryRunService:
         record.manifests_json = dict(detail.get("manifests") or {})
         record.latest_issues_json = list(detail.get("latest_issues") or [])
         record.raw_summary_json = raw_summary
-        record.log_tail_text = run_log
+        record.log_tail_text = _truncate_log_summary(run_log)
         record.log_size_bytes = log_path.stat().st_size if log_path.is_file() else 0
         record.source_mtime = source_mtime
         record.last_synced_at = datetime.utcnow()
@@ -525,7 +585,7 @@ class HistoryRunService:
         if not run_root.is_dir():
             return history_run
         current_mtime = _compute_source_mtime(run_root)
-        if current_mtime <= float(history_run.source_mtime or 0):
+        if current_mtime <= float(history_run.source_mtime or 0) and not _history_run_needs_parser_resync(history_run):
             return history_run
         linked_execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
         linked_task = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
