@@ -90,6 +90,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     pi_cfg = get_config().pi_re_agent
     llm_provider_key = (req.llm_provider_key or "").strip() or None
     job_model = await resolve_job_model(llm_provider_key)
+    job_concurrency = req.concurrency if req.concurrency and req.concurrency > 0 else pi_cfg.concurrency
     client = get_pi_client()
     for idx, elf in enumerate(req.elf_tasks, start=1):
         source_elf_path = ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)
@@ -108,6 +109,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "file_list": elf.file_list or [],
             "source_elf_path": str(source_elf_path),
             "llm_provider_key": llm_provider_key,
+            "concurrency": job_concurrency,
         }
         item.phase = "queued"
         item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
@@ -124,7 +126,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
                 "functions": elf.file_list or None,
                 "clean": False,
                 "engine": pi_cfg.engine,
-                "concurrency": pi_cfg.concurrency,
+                "concurrency": job_concurrency,
             })
             item.pi_job_id = job.get("id")
             item.status = map_pi_status(job.get("status"))
@@ -219,6 +221,7 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
     for item in selected:
         if item.status not in {"failed", "cancelled"}:
             continue
+        item_concurrency = int((item.extra_metadata or {}).get("concurrency") or pi_cfg.concurrency)
         job = await client.create_job({
             "target": item.elf_path,
             "output_dir": item.output_dir,
@@ -228,7 +231,7 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
             "functions": (item.extra_metadata or {}).get("file_list") or None,
             "clean": True,
             "engine": pi_cfg.engine,
-            "concurrency": pi_cfg.concurrency,
+            "concurrency": item_concurrency,
         })
         item.pi_job_id = job.get("id")
         item.status = map_pi_status(job.get("status"))

@@ -28,6 +28,7 @@ class TaskCreate(BaseModel):
     priority: int = 5
     tags: list[str] = Field(default_factory=list)
     llm_provider_key: Optional[str] = None
+    concurrency: Optional[int] = None
     elf_tasks: list[ElfTaskInput]
 
 
