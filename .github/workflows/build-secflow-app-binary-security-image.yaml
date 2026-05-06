@@ -125,22 +125,22 @@ jobs:
 
       - name: Create and push multi-arch manifest (latest)
         run: |
-          docker manifest create runshine0819/secflow-app-binary-security:latest \
-            --amend runshine0819/secflow-app-binary-security:amd64-latest \
-            --amend runshine0819/secflow-app-binary-security:arm64-latest
           docker manifest create ghcr.io/runshine/secflow-app-binary-security:latest \
             --amend ghcr.io/runshine/secflow-app-binary-security:amd64-latest \
             --amend ghcr.io/runshine/secflow-app-binary-security:arm64-latest
-          docker manifest push runshine0819/secflow-app-binary-security:latest
           docker manifest push ghcr.io/runshine/secflow-app-binary-security:latest
+          docker manifest create runshine0819/secflow-app-binary-security:latest \
+            --amend runshine0819/secflow-app-binary-security:amd64-latest \
+            --amend runshine0819/secflow-app-binary-security:arm64-latest || true
+          docker manifest push runshine0819/secflow-app-binary-security:latest || true
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
-          docker manifest create runshine0819/secflow-app-binary-security:${{ needs.prepare.outputs.date_tag }} \
-            --amend runshine0819/secflow-app-binary-security:amd64-${{ needs.prepare.outputs.date_tag }} \
-            --amend runshine0819/secflow-app-binary-security:arm64-${{ needs.prepare.outputs.date_tag }}
           docker manifest create ghcr.io/runshine/secflow-app-binary-security:${{ needs.prepare.outputs.date_tag }} \
             --amend ghcr.io/runshine/secflow-app-binary-security:amd64-${{ needs.prepare.outputs.date_tag }} \
             --amend ghcr.io/runshine/secflow-app-binary-security:arm64-${{ needs.prepare.outputs.date_tag }}
-          docker manifest push runshine0819/secflow-app-binary-security:${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-binary-security:${{ needs.prepare.outputs.date_tag }}
+          docker manifest create runshine0819/secflow-app-binary-security:${{ needs.prepare.outputs.date_tag }} \
+            --amend runshine0819/secflow-app-binary-security:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend runshine0819/secflow-app-binary-security:arm64-${{ needs.prepare.outputs.date_tag }} || true
+          docker manifest push runshine0819/secflow-app-binary-security:${{ needs.prepare.outputs.date_tag }} || true
