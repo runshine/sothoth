@@ -22,7 +22,11 @@ def test_dashboard_observability_api(monkeypatch, tmp_path):
     atomic = run / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
 
     _write_json(run / "config.json", {
-        "global": {"max_review_cycles": 3, "parallel_result_review": True},
+        "global": {
+            "max_review_cycles": 3,
+            "parallel_result_review": True,
+            "workspace_root": f"/home/mock/secflow/runs/{run.name}/workspace",
+        },
         "agents": [{
             "id": "pi-worker",
             "runtime_config": {
@@ -43,6 +47,8 @@ def test_dashboard_observability_api(monkeypatch, tmp_path):
 
     _write_json(atomic / "_meta" / "state.json", {"current_state": "completed", "timestamp": "2026-04-28T01:12:03Z"})
     _write_json(atomic / "_meta" / "workflow_result.json", {"status": "completed", "timestamp": "2026-04-28T01:12:03Z", "detail": {"cycles_used": 1}})
+    _write_json(run / "workspace" / "pipeline_demo_run_001" / "_meta" / "pipeline_state.json", {"status": "completed"})
+    _write_json(run / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "_meta" / "stage_state.json", {"status": "completed"})
     _write_json(atomic / "_meta" / "review_summaries" / "cycle_001.json", {
         "cycle": 1,
         "timestamp": "now",
@@ -152,6 +158,7 @@ def test_dashboard_observability_api(monkeypatch, tmp_path):
 
     detail = client.get(f"/api/runs/{run.name}").json()
     assert detail["duration_seconds"] == 600
+    assert detail["atomic_work_path"].endswith("vuln_scan_initial_001")
     assert detail["cycles"][0]["scores"]["input_coverage"] == 0.95
     assert detail["cycles"][0]["historical_removed_result_count"] == 1
     assert detail["manifests"]["taskable_result_count"] == 1

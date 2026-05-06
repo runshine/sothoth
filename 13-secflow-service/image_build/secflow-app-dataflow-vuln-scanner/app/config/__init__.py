@@ -75,6 +75,17 @@ class FileserverServiceConfig(BaseModel):
     aiwf_subproject_name: str = "DATAFLOW_VULN_SCANNER"
 
 
+class HistoryRunsConfig(BaseModel):
+    enabled: bool = True
+    fixed_project_id: Optional[str] = None
+    legacy_root_candidates: list[str] = Field(
+        default_factory=lambda: [
+            "{data_mount_path}/{project_files_dirname}/{project_id}/dataflow-vuln-scanner/runs",
+            "{data_mount_path}/{project_files_dirname}/{project_id}/DATAFLOW_VULN_SCANNER/runs",
+        ]
+    )
+
+
 class MenuConfig(BaseModel):
     id: str = "dataflow-vuln-scanner"
     path: str = "/dataflow-vuln-scanner"
@@ -135,6 +146,7 @@ class Config(BaseModel):
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     fileserver_service: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
+    history_runs: HistoryRunsConfig = Field(default_factory=HistoryRunsConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

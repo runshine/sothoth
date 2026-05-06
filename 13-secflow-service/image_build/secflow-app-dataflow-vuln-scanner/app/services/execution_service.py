@@ -40,21 +40,12 @@ from app.schemas import (
     WorkflowExecutionResponse,
 )
 from app.services.fileserver_client import get_fileserver_client
+from app.services.history_run_service import get_history_run_service
 from app.services.pi_vuln_adapter import (
     DbExecutionObserver,
     DbExecutionRecorder,
     build_core_tasks,
     write_final_task_manifest,
-)
-from app.services.run_inspector import (
-    inspect_cycle_detail,
-    inspect_file,
-    inspect_files,
-    inspect_log,
-    inspect_run_detail,
-    inspect_run_summary,
-    inspect_session_file,
-    inspect_sessions,
 )
 from app.services.workflow_service import get_workflow_service
 
@@ -171,7 +162,11 @@ class ExecutionService:
                 if isinstance(item, dict):
                     artifact_refs.append(ArtifactRef.model_validate(item))
             runtime_overrides = dict(task_metadata.get("runtime_overrides") or {})
-        attempts = [self._attempt_response(item) for item in self._list_executions_for_trigger(db, trigger.id)]
+        attempts = []
+        history_service = get_history_run_service()
+        for item in self._list_executions_for_trigger(db, trigger.id):
+            history_run = history_service.get_history_run_by_execution(db, item) if item.workspace_root else None
+            attempts.append(self._attempt_response(item, history_run_id=history_run.id if history_run else None))
         return ScanTaskDetailResponse(
             **response.model_dump(),
             title=title,
@@ -182,12 +177,13 @@ class ExecutionService:
             attempts=attempts,
         )
 
-    def _attempt_response(self, execution: WorkflowExecution) -> ScanTaskAttemptResponse:
+    def _attempt_response(self, execution: WorkflowExecution, history_run_id: str | None = None) -> ScanTaskAttemptResponse:
         return ScanTaskAttemptResponse(
             execution_id=execution.id,
             task_id=execution.trigger_task_id,
             attempt_no=execution.attempt_no,
             status=execution.status,
+            history_run_id=history_run_id,
             owner_pod_id=execution.owner_pod_id,
             lease_expires_at=execution.lease_expires_at,
             started_at=execution.started_at,
@@ -314,6 +310,48 @@ class ExecutionService:
         ensure_dir(target_path)
         shutil.copytree(source_path, target_path, dirs_exist_ok=True)
 
+    def _resolve_custom_execution_paths(
+        self,
+        *,
+        project_id: str,
+        metadata: Dict[str, Any],
+        execution_id: str,
+    ) -> tuple[Path | None, Path | None]:
+        request = metadata.get("dataflow_scan_request")
+        if not isinstance(request, dict):
+            return None, None
+
+        workspace_ref = request.get("workspace_dir")
+        output_ref = request.get("output_dir")
+        if workspace_ref is None and output_ref is None:
+            return None, None
+        if not isinstance(workspace_ref, dict) or not isinstance(output_ref, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="workspace_dir and output_dir must be valid directory refs",
+            )
+
+        workspace_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=workspace_ref, expected="workspace_dir")
+        output_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=output_ref, expected="output_dir")
+        if not workspace_base.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {workspace_base}")
+        if not output_base.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {output_base}")
+
+        workspace_base = workspace_base.resolve()
+        output_base = output_base.resolve()
+        try:
+            output_relative = output_base.relative_to(workspace_base)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="output_dir must be inside workspace_dir",
+            ) from exc
+
+        workspace_root = ensure_dir(workspace_base / sanitize_name(execution_id))
+        output_dir = ensure_dir(workspace_root / output_relative)
+        return workspace_root, output_dir
+
     def _materialize_dataflow_scan_inputs(self, *, task_input_dir: Path, metadata: Dict[str, Any]) -> tuple[str | None, Dict[str, Any]]:
         request = metadata.get("dataflow_scan_request")
         if not isinstance(request, dict):
@@ -321,11 +359,29 @@ class ExecutionService:
         project_id = str(request.get("project_id") or "").strip()
         data_flow_ref = request.get("data_flow")
         source_dir_ref = request.get("source_dir")
+        workspace_ref = request.get("workspace_dir")
+        output_ref = request.get("output_dir")
         if not project_id or not isinstance(data_flow_ref, dict) or not isinstance(source_dir_ref, dict):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="dataflow scan request is incomplete")
 
         source_data_flow = self._resolve_dataflow_input_ref(project_id=project_id, ref=data_flow_ref, expected="data_flow")
         source_source_dir = self._resolve_dataflow_input_ref(project_id=project_id, ref=source_dir_ref, expected="source_dir")
+        workspace_base = None
+        output_base = None
+        if workspace_ref is not None:
+            if not isinstance(workspace_ref, dict):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="workspace_dir ref is invalid")
+            workspace_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=workspace_ref, expected="workspace_dir")
+            if not workspace_base.is_dir():
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {workspace_base}")
+        if output_ref is not None:
+            if not isinstance(output_ref, dict):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="output_dir ref is invalid")
+            output_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=output_ref, expected="output_dir")
+            if not output_base.is_dir():
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {output_base}")
+        if workspace_base is not None and output_base is not None:
+            self._ensure_path_within(path=output_base, root=workspace_base, label="output_dir")
         scan_input_dir = ensure_dir(task_input_dir / "dataflow_scan")
         data_flow_name = sanitize_name(str(data_flow_ref.get("filename") or source_data_flow.name or "data_flow.md"))
         data_flow_target = scan_input_dir / "data_flow" / data_flow_name
@@ -343,6 +399,12 @@ class ExecutionService:
             "original_source_dir": source_dir_ref,
             "options": request.get("options") or {},
         }
+        if workspace_base is not None:
+            materialized["workspace_dir"] = abs_path(workspace_base)
+            materialized["original_workspace_dir"] = workspace_ref
+        if output_base is not None:
+            materialized["output_dir"] = abs_path(output_base)
+            materialized["original_output_dir"] = output_ref
         write_json(scan_input_dir / "input_manifest.json", materialized)
         return generated_markdown, materialized
 
@@ -509,16 +571,24 @@ class ExecutionService:
             .count()
         ) + 1
         execution_id = _new_id("exec")
-        workspace_root = self._build_project_workspace_root(
-            definition=definition,
-            trigger_id=trigger.id,
-            execution_id=execution_id,
-            authorization_token=authorization_token,
-            created_by=actor,
-        )
         manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        raw_input_tasks = self._input_tasks_from_manifest(manifest)
+        primary_metadata = dict(raw_input_tasks[0].metadata or {}) if raw_input_tasks else {}
+        workspace_root, _ = self._resolve_custom_execution_paths(
+            project_id=definition.project_id,
+            metadata=primary_metadata,
+            execution_id=execution_id,
+        )
+        if workspace_root is None:
+            workspace_root = self._build_project_workspace_root(
+                definition=definition,
+                trigger_id=trigger.id,
+                execution_id=execution_id,
+                authorization_token=authorization_token,
+                created_by=actor,
+            )
         normalized_tasks = self._normalize_trigger_tasks(
-            input_tasks=self._input_tasks_from_manifest(manifest),
+            input_tasks=raw_input_tasks,
             workspace_root=workspace_root,
             entry_input_task_type=validated_definition.resolve_entry_input_task_type(),
         )
@@ -630,7 +700,7 @@ class ExecutionService:
         self._ensure_project_access(principal, payload.project_id)
         workflow_service = get_workflow_service()
         definition = (
-            workflow_service.get_default_profile_model(db, payload.project_id, principal)
+            workflow_service.get_or_create_default_profile_model(db, payload.project_id, principal)
             if not payload.profile_id
             else workflow_service._get_definition_or_404(db, payload.profile_id)
         )
@@ -663,8 +733,10 @@ class ExecutionService:
         if payload.data_flow and payload.source_dir:
             metadata["dataflow_scan_request"] = {
                 "project_id": payload.project_id,
+                "workspace_dir": payload.workspace_dir.model_dump(mode="json") if payload.workspace_dir else None,
                 "data_flow": payload.data_flow.model_dump(mode="json"),
                 "source_dir": payload.source_dir.model_dump(mode="json"),
+                "output_dir": payload.output_dir.model_dump(mode="json") if payload.output_dir else None,
                 "model": payload.model,
                 "provider": payload.provider,
                 "thinking": payload.thinking,
@@ -736,7 +808,12 @@ class ExecutionService:
     def list_scan_task_attempts(self, db: Session, task_id: str, principal: dict) -> List[ScanTaskAttemptResponse]:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
-        return [self._attempt_response(item) for item in self._list_executions_for_trigger(db, task_id)]
+        history_service = get_history_run_service()
+        responses: list[ScanTaskAttemptResponse] = []
+        for item in self._list_executions_for_trigger(db, task_id):
+            history_run = history_service.get_history_run_by_execution(db, item) if item.workspace_root else None
+            responses.append(self._attempt_response(item, history_run_id=history_run.id if history_run else None))
+        return responses
 
     def list_scan_task_events(self, db: Session, task_id: str, principal: dict) -> List[ScanTaskEventResponse]:
         trigger = self._trigger_or_404(db, task_id)
@@ -798,55 +875,115 @@ class ExecutionService:
     def list_scan_task_runs(self, db: Session, task_id: str, principal: dict) -> list[dict[str, Any]]:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
+        history_service = get_history_run_service()
         runs: list[dict[str, Any]] = []
         for execution in self._list_executions_for_trigger(db, task_id):
-            summary = inspect_run_summary(execution.workspace_root) if execution.workspace_root else {}
-            attempt = self._attempt_response(execution).model_dump(mode="json")
+            history_run = history_service.get_history_run_by_execution(db, execution) if execution.workspace_root else None
+            summary = history_service.get_history_run_summary(db, history_run) if history_run else {}
+            attempt = self._attempt_response(execution, history_run_id=history_run.id if history_run else None).model_dump(mode="json")
             runs.append({**attempt, "run_summary": summary})
         return runs
 
     def get_scan_task_run(self, db: Session, task_id: str, execution_id: str, principal: dict) -> dict[str, Any]:
         execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
+        history_service = get_history_run_service()
+        history_run = history_service.get_history_run_by_execution(db, execution) if execution.workspace_root else None
         if not execution.workspace_root:
-            return {"execution": self._attempt_response(execution).model_dump(mode="json"), "detail": None}
+            return {"execution": self._attempt_response(execution, history_run_id=history_run.id if history_run else None).model_dump(mode="json"), "detail": None}
         return {
-            "execution": self._attempt_response(execution).model_dump(mode="json"),
-            "detail": inspect_run_detail(execution.workspace_root),
+            "execution": self._attempt_response(execution, history_run_id=history_run.id if history_run else None).model_dump(mode="json"),
+            "detail": history_service.get_history_run_detail(db, history_run) if history_run else None,
         }
 
     def get_scan_task_run_cycle(self, db: Session, task_id: str, execution_id: str, cycle: int, principal: dict) -> dict[str, Any]:
         execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        if not execution.workspace_root:
+        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+        if history_run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run workspace not found")
-        return inspect_cycle_detail(execution.workspace_root, cycle)
+        return get_history_run_service().get_history_run_cycle(db, history_run, cycle)
 
     def list_scan_task_run_sessions(self, db: Session, task_id: str, execution_id: str, principal: dict) -> list[dict[str, Any]]:
         execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        return inspect_sessions(execution.workspace_root) if execution.workspace_root else []
+        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+        return get_history_run_service().list_history_run_sessions(db, history_run) if history_run else []
 
     def list_scan_task_run_files(self, db: Session, task_id: str, execution_id: str, principal: dict, limit: int = 1200) -> list[dict[str, Any]]:
         execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        if not execution.workspace_root:
+        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+        if history_run is None:
             return []
-        return inspect_files(execution.workspace_root, limit=limit)
+        return get_history_run_service().list_history_run_files(db, history_run, limit=limit)
 
     def get_scan_task_run_file(self, db: Session, task_id: str, execution_id: str, principal: dict, path: str) -> dict[str, Any]:
         execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        if not execution.workspace_root:
+        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+        if history_run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run workspace not found")
-        return inspect_file(execution.workspace_root, path)
+        return get_history_run_service().get_history_run_file(db, history_run, path)
 
     def get_scan_task_run_session_file(self, db: Session, task_id: str, execution_id: str, principal: dict, path: str) -> dict[str, Any]:
         execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        if not execution.workspace_root:
+        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+        if history_run is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run workspace not found")
-        return inspect_session_file(execution.workspace_root, path)
+        return get_history_run_service().get_history_run_session_file(db, history_run, path)
 
     def get_scan_task_run_log(self, db: Session, task_id: str, execution_id: str, principal: dict, lines: int = 300) -> dict[str, Any]:
         execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        if not execution.workspace_root:
+        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+        if history_run is None:
             return {"content": "(no workspace)"}
-        return inspect_log(execution.workspace_root, lines=lines)
+        return get_history_run_service().get_history_run_log(db, history_run, lines=lines)
+
+    def _history_run_or_404(self, db: Session, history_run_id: str, principal: dict) -> Any:
+        history_run = get_history_run_service()._history_run_or_404(db, history_run_id)
+        self._ensure_project_access(principal, history_run.project_id)
+        return history_run
+
+    def list_history_runs(self, db: Session, principal: dict, *, project_id: str) -> list[dict[str, Any]]:
+        self._ensure_project_access(principal, project_id)
+        return get_history_run_service().list_history_runs(db, project_id)
+
+    def resolve_history_run(self, db: Session, principal: dict, *, project_id: str, run_name: str, root_path: str) -> dict[str, Any]:
+        self._ensure_project_access(principal, project_id)
+        history_run = get_history_run_service().resolve_history_run(db, project_id=project_id, run_name=run_name, root_path=root_path)
+        return {
+            "history_run_id": history_run.id,
+            "project_id": history_run.project_id,
+            "run_name": history_run.run_name,
+            "root_path": str(Path(history_run.run_root_path).resolve().parent),
+            "source_type": history_run.source_type,
+            "linked_task_id": history_run.linked_task_id,
+            "linked_execution_id": history_run.linked_execution_id,
+        }
+
+    def get_history_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        return get_history_run_service().get_history_run_detail(db, history_run)
+
+    def get_history_run_cycle(self, db: Session, history_run_id: str, cycle: int, principal: dict) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        return get_history_run_service().get_history_run_cycle(db, history_run, cycle)
+
+    def list_history_run_sessions(self, db: Session, history_run_id: str, principal: dict) -> list[dict[str, Any]]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        return get_history_run_service().list_history_run_sessions(db, history_run)
+
+    def list_history_run_files(self, db: Session, history_run_id: str, principal: dict, limit: int = 1200) -> list[dict[str, Any]]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        return get_history_run_service().list_history_run_files(db, history_run, limit=limit)
+
+    def get_history_run_file(self, db: Session, history_run_id: str, principal: dict, path: str) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        return get_history_run_service().get_history_run_file(db, history_run, path)
+
+    def get_history_run_session_file(self, db: Session, history_run_id: str, principal: dict, path: str) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        return get_history_run_service().get_history_run_session_file(db, history_run, path)
+
+    def get_history_run_log(self, db: Session, history_run_id: str, principal: dict, lines: int = 300) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        return get_history_run_service().get_history_run_log(db, history_run, lines=lines)
 
     def cancel_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)
@@ -1175,14 +1312,25 @@ class ExecutionService:
                 payload_json={"workspace_root": str(workspace_root), "owner_pod_id": execution.owner_pod_id},
             )
             service_manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+            task_metadata = dict(service_manifest.tasks[0].metadata or {}) if service_manifest.tasks else {}
+            custom_workspace_root, custom_output_dir = self._resolve_custom_execution_paths(
+                project_id=definition.project_id,
+                metadata=task_metadata,
+                execution_id=execution.id,
+            )
+            if custom_workspace_root is not None:
+                workspace_root = custom_workspace_root
+                execution.workspace_root = abs_path(workspace_root)
+                db.add(execution)
+                db.commit()
             runtime_config = build_runtime_framework_config(
                 compiled_config,
                 workspace_root=abs_path(workspace_root),
                 execution_id=execution.id,
                 input_task_file=service_manifest.tasks[0].task_md_path,
                 input_task_id=service_manifest.tasks[0].task_id,
-                output_dir=abs_path(workspace_root / "output"),
-                summary_file=abs_path(workspace_root / "output" / "execution_summary.json"),
+                output_dir=abs_path(custom_output_dir or (workspace_root / "output")),
+                summary_file=abs_path((custom_output_dir or (workspace_root / "output")) / "execution_summary.json"),
                 runtime_mode="rest_service",
             )
             write_json(workspace_root / "config.json", runtime_config.model_dump(mode="json"))
@@ -1195,6 +1343,8 @@ class ExecutionService:
                     "last_updated_at": datetime.utcnow().isoformat(),
                 },
             )
+            get_history_run_service().sync_execution_run(db, execution)
+            db.commit()
             observer = DbExecutionObserver(execution.id)
             recorder = DbExecutionRecorder(abs_path(workspace_root), execution.id)
             ensure_event_loop_policy()
@@ -1235,6 +1385,8 @@ class ExecutionService:
                     "last_updated_at": datetime.utcnow().isoformat(),
                 },
             )
+            get_history_run_service().sync_execution_run(db, execution)
+            db.commit()
             self.record_event(
                 db,
                 execution_id=execution.id,
@@ -1269,6 +1421,8 @@ class ExecutionService:
                             "last_updated_at": datetime.utcnow().isoformat(),
                         },
                     )
+                    get_history_run_service().sync_execution_run(db, execution)
+                    db.commit()
                 self.record_event(
                     db,
                     execution_id=execution.id,
@@ -1296,6 +1450,8 @@ class ExecutionService:
                         "last_updated_at": datetime.utcnow().isoformat(),
                     },
                 )
+                get_history_run_service().sync_execution_run(db, execution)
+                db.commit()
             self.record_event(
                 db,
                 execution_id=execution.id,

@@ -104,7 +104,8 @@ RUN set -eux; \
     test -x /usr/local/bin/codex; \
     test -x /usr/local/bin/opencode; \
     echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; \
-    curl -fsSL https://openclaw.ai/install.sh | bash
+    OPENCLAW_NO_PROMPT=1 OPENCLAW_NO_ONBOARD=1 \
+    curl -fsSL https://openclaw.ai/install.sh | bash -s -- --install-method npm --no-prompt --no-onboard
 
 # 创建 code-server 配置目录
 RUN mkdir -p /root/.config/code-server && \

@@ -69,6 +69,7 @@ class PiReAgentConfig(BaseModel):
 
 class StorageConfig(BaseModel):
     project_root_template: str = "/data/files/{project_id}"
+    app_root_name: str = "app/secflow-app-binary-to-source"
     output_root_name: str = "binary-to-source-outputs"
     require_input_exists: bool = True
 

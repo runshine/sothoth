@@ -7,4 +7,6 @@ __pycache__/
 /output/
 /workspace/
 .docker-pi-home/
+.docker-runtime-home/*
+!.docker-runtime-home/.gitkeep
 pi-session-*.html

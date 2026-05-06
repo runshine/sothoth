@@ -22,10 +22,12 @@ class ElfTaskInput(BaseModel):
 
 
 class TaskCreate(BaseModel):
+    task_id: Optional[str] = None
     name: str
     description: Optional[str] = None
     priority: int = 5
     tags: list[str] = Field(default_factory=list)
+    llm_provider_key: Optional[str] = None
     elf_tasks: list[ElfTaskInput]
 
 
@@ -107,6 +109,25 @@ class TaskDetailResponse(TaskResponse):
 class TaskListResponse(BaseModel):
     total: int
     items: list[TaskResponse]
+
+
+class LlmProviderSummary(BaseModel):
+    provider_key: str
+    display_name: Optional[str] = None
+    provider_type: Optional[str] = None
+    enabled: bool = True
+    is_default: bool = False
+    model: Optional[str] = None
+
+
+class LlmProviderListResponse(BaseModel):
+    items: list[LlmProviderSummary] = Field(default_factory=list)
+    total: int = 0
+    default_provider_key: Optional[str] = None
+
+
+class TaskPrepareResponse(BaseModel):
+    task_id: str
 
 
 class ActionResponse(BaseModel):

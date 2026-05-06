@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, create_engine, inspect, text
+from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, inspect, text
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.config import get_config
@@ -11,6 +12,11 @@ from app.config import get_config
 Base = declarative_base()
 _engine = None
 _SessionFactory = None
+
+MYSQL_INDEX_LENGTHS = {
+    "ix_dfvs_hr_source_key": {"source_key": 512},
+    "ix_dfvs_hrf_run_path": {"path": 512},
+}
 
 
 def now_utc() -> datetime:
@@ -123,6 +129,198 @@ class WorkflowExecutionEvent(Base):
     created_at = Column(DateTime, default=now_utc)
 
 
+class HistoryRun(Base):
+    __tablename__ = _prefix("history_run")
+
+    id = Column(String(64), primary_key=True)
+    project_id = Column(String(64), nullable=False)
+    source_type = Column(String(64), nullable=False)
+    source_key = Column(String(1024), nullable=False)
+    run_name = Column(String(255), nullable=False)
+    run_root_path = Column(String(1024), nullable=False)
+    atomic_work_path = Column(String(1024))
+    linked_task_id = Column(String(64))
+    linked_execution_id = Column(String(64))
+    profile_id = Column(String(64))
+    status = Column(String(32), nullable=False, default="pending")
+    started_at = Column(DateTime)
+    finished_at = Column(DateTime)
+    duration_seconds = Column(Integer, nullable=False, default=0)
+    last_activity_at = Column(DateTime)
+    model = Column(String(255), nullable=False, default="")
+    provider = Column(String(255), nullable=False, default="")
+    thinking = Column(String(64), nullable=False, default="")
+    max_cycles = Column(Integer, nullable=False, default=0)
+    cycles_used = Column(Integer, nullable=False, default=0)
+    result_count = Column(Integer, nullable=False, default=0)
+    passed_count = Column(Integer, nullable=False, default=0)
+    failed_count = Column(Integer, nullable=False, default=0)
+    workflow_mode = Column(String(128), nullable=False, default="")
+    error = Column(Text)
+    config_json = Column(JSON, nullable=False, default=dict)
+    manifests_json = Column(JSON, nullable=False, default=dict)
+    latest_issues_json = Column(JSON, nullable=False, default=list)
+    raw_summary_json = Column(JSON, nullable=False, default=dict)
+    log_tail_text = Column(Text().with_variant(MEDIUMTEXT(), "mysql"))
+    log_size_bytes = Column(Integer, nullable=False, default=0)
+    source_mtime = Column(Float, nullable=False, default=0)
+    last_synced_at = Column(DateTime, default=now_utc)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class HistoryRunCycle(Base):
+    __tablename__ = _prefix("history_run_cycle")
+
+    id = Column(String(64), primary_key=True)
+    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    cycle = Column(Integer, nullable=False)
+    timestamp = Column(String(128), nullable=False, default="")
+    outcome = Column(String(64), nullable=False, default="")
+    workflow_mode = Column(String(128), nullable=False, default="")
+    global_passed = Column(Boolean, nullable=False, default=False)
+    failed_advisor_id = Column(String(255), nullable=False, default="")
+    failed_role_name = Column(String(255), nullable=False, default="")
+    result_total = Column(Integer, nullable=False, default=0)
+    result_passed = Column(Integer, nullable=False, default=0)
+    result_failed = Column(Integer, nullable=False, default=0)
+    scores_json = Column(JSON, nullable=False, default=dict)
+    metrics_json = Column(JSON, nullable=False, default=dict)
+    issues_json = Column(JSON, nullable=False, default=list)
+    plateau_status_json = Column(JSON, nullable=False, default=dict)
+    summary_snapshot_text = Column(Text)
+    raw_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class HistoryRunGlobalReview(Base):
+    __tablename__ = _prefix("history_run_global_review")
+
+    id = Column(String(64), primary_key=True)
+    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    cycle = Column(Integer, nullable=False)
+    advisor_id = Column(String(255), nullable=False, default="")
+    path = Column(String(1024), nullable=False, default="")
+    role_name = Column(String(255), nullable=False, default="")
+    passed = Column(Boolean, nullable=False, default=False)
+    verdict = Column(String(128), nullable=False, default="")
+    confidence = Column(Float, nullable=False, default=0)
+    scores_json = Column(JSON, nullable=False, default=dict)
+    feedback = Column(Text)
+    feedback_detail = Column(Text)
+    schema_valid = Column(Boolean)
+    parser_mode = Column(String(64), nullable=False, default="")
+    repair_attempts = Column(Integer, nullable=False, default=0)
+    issues_json = Column(JSON, nullable=False, default=list)
+    resolved_issue_ids_json = Column(JSON, nullable=False, default=list)
+    raw_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class HistoryRunResult(Base):
+    __tablename__ = _prefix("history_run_result")
+
+    id = Column(String(64), primary_key=True)
+    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    filename = Column(String(255), nullable=False)
+    path = Column(String(1024), nullable=False, default="")
+    title = Column(String(512), nullable=False, default="")
+    size = Column(Integer, nullable=False, default=0)
+    passed = Column(Boolean)
+    verdict = Column(String(128), nullable=False, default="")
+    confidence = Column(Float, nullable=False, default=0)
+    review_cycle = Column(Integer, nullable=False, default=0)
+    feedback = Column(Text)
+    feedback_detail = Column(Text)
+    schema_valid = Column(Boolean)
+    parser_mode = Column(String(64), nullable=False, default="")
+    review_path = Column(String(1024), nullable=False, default="")
+    role = Column(String(255), nullable=False, default="")
+    lifecycle_status = Column(String(64), nullable=False, default="")
+    active = Column(Boolean, nullable=False, default=True)
+    taskable = Column(Boolean, nullable=False, default=True)
+    delivery_bucket = Column(String(64), nullable=False, default="")
+    multi_finding = Column(Boolean, nullable=False, default=False)
+    vulnerability_headings_json = Column(JSON, nullable=False, default=list)
+    related_to = Column(String(1024), nullable=False, default="")
+    raw_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class HistoryRunResultReview(Base):
+    __tablename__ = _prefix("history_run_result_review")
+
+    id = Column(String(64), primary_key=True)
+    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    cycle = Column(Integer, nullable=False)
+    result_file = Column(String(255), nullable=False, default="")
+    path = Column(String(1024), nullable=False, default="")
+    advisor_id = Column(String(255), nullable=False, default="")
+    passed = Column(Boolean, nullable=False, default=False)
+    verdict = Column(String(128), nullable=False, default="")
+    confidence = Column(Float, nullable=False, default=0)
+    feedback = Column(Text)
+    feedback_detail = Column(Text)
+    schema_valid = Column(Boolean)
+    parser_mode = Column(String(64), nullable=False, default="")
+    repair_attempts = Column(Integer, nullable=False, default=0)
+    raw_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class HistoryRunRemovedResult(Base):
+    __tablename__ = _prefix("history_run_removed_result")
+
+    id = Column(String(64), primary_key=True)
+    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    filename = Column(String(255), nullable=False, default="")
+    path = Column(String(1024), nullable=False, default="")
+    meta_path = Column(String(1024), nullable=False, default="")
+    cycle = Column(Integer, nullable=False, default=0)
+    lifecycle_status = Column(String(64), nullable=False, default="")
+    reason = Column(Text)
+    signals_json = Column(JSON, nullable=False, default=list)
+    raw_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class HistoryRunSession(Base):
+    __tablename__ = _prefix("history_run_session")
+
+    id = Column(String(64), primary_key=True)
+    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    session_id = Column(String(255), nullable=False)
+    format = Column(String(32), nullable=False, default="")
+    worker_id = Column(String(255), nullable=False, default="")
+    jsonl_path = Column(String(1024), nullable=False, default="")
+    size = Column(Integer, nullable=False, default=0)
+    mtime = Column(Float, nullable=False, default=0)
+    calls_json = Column(JSON, nullable=False, default=list)
+    raw_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+class HistoryRunFile(Base):
+    __tablename__ = _prefix("history_run_file")
+
+    id = Column(String(64), primary_key=True)
+    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    category = Column(String(255), nullable=False, default="")
+    path = Column(String(1024), nullable=False)
+    name = Column(String(255), nullable=False)
+    size = Column(Integer, nullable=False, default=0)
+    mtime = Column(Float, nullable=False, default=0)
+    type = Column(String(32), nullable=False, default="")
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
 class SchedulerWorker(Base):
     __tablename__ = _prefix("scheduler_worker")
 
@@ -135,6 +333,24 @@ class SchedulerWorker(Base):
     metadata_json = Column(JSON)
     created_at = Column(DateTime, default=now_utc)
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
+MODEL_CLASSES = [
+    WorkflowDefinition,
+    WorkflowDefinitionVersion,
+    TriggerTask,
+    WorkflowExecution,
+    WorkflowExecutionEvent,
+    HistoryRun,
+    HistoryRunCycle,
+    HistoryRunGlobalReview,
+    HistoryRunResult,
+    HistoryRunResultReview,
+    HistoryRunRemovedResult,
+    HistoryRunSession,
+    HistoryRunFile,
+    SchedulerWorker,
+]
 
 
 INDEX_DEFINITIONS = [
@@ -161,20 +377,58 @@ INDEX_DEFINITIONS = [
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_exec", "CREATE INDEX ix_dfvs_event_exec ON {table} (execution_id)"),
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_type", "CREATE INDEX ix_dfvs_event_type ON {table} (event_type)"),
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_created", "CREATE INDEX ix_dfvs_event_created ON {table} (created_at)"),
+    (HistoryRun.__tablename__, "ix_dfvs_hr_project", "CREATE INDEX ix_dfvs_hr_project ON {table} (project_id)"),
+    (HistoryRun.__tablename__, "ix_dfvs_hr_status", "CREATE INDEX ix_dfvs_hr_status ON {table} (status)"),
+    (HistoryRun.__tablename__, "ix_dfvs_hr_source_key", "CREATE UNIQUE INDEX ix_dfvs_hr_source_key ON {table} (source_key)"),
+    (HistoryRun.__tablename__, "ix_dfvs_hr_execution", "CREATE INDEX ix_dfvs_hr_execution ON {table} (linked_execution_id)"),
+    (HistoryRun.__tablename__, "ix_dfvs_hr_task", "CREATE INDEX ix_dfvs_hr_task ON {table} (linked_task_id)"),
+    (HistoryRun.__tablename__, "ix_dfvs_hr_project_started", "CREATE INDEX ix_dfvs_hr_project_started ON {table} (project_id, started_at)"),
+    (HistoryRunCycle.__tablename__, "ix_dfvs_hrc_run", "CREATE INDEX ix_dfvs_hrc_run ON {table} (history_run_id)"),
+    (HistoryRunCycle.__tablename__, "ix_dfvs_hrc_run_cycle", "CREATE UNIQUE INDEX ix_dfvs_hrc_run_cycle ON {table} (history_run_id, cycle)"),
+    (HistoryRunGlobalReview.__tablename__, "ix_dfvs_hrgr_run_cycle", "CREATE INDEX ix_dfvs_hrgr_run_cycle ON {table} (history_run_id, cycle)"),
+    (HistoryRunResult.__tablename__, "ix_dfvs_hrr_run", "CREATE INDEX ix_dfvs_hrr_run ON {table} (history_run_id)"),
+    (HistoryRunResult.__tablename__, "ix_dfvs_hrr_run_filename", "CREATE INDEX ix_dfvs_hrr_run_filename ON {table} (history_run_id, filename)"),
+    (HistoryRunResultReview.__tablename__, "ix_dfvs_hrrr_run_cycle", "CREATE INDEX ix_dfvs_hrrr_run_cycle ON {table} (history_run_id, cycle)"),
+    (HistoryRunRemovedResult.__tablename__, "ix_dfvs_hrrm_run", "CREATE INDEX ix_dfvs_hrrm_run ON {table} (history_run_id)"),
+    (HistoryRunSession.__tablename__, "ix_dfvs_hrs_run", "CREATE INDEX ix_dfvs_hrs_run ON {table} (history_run_id)"),
+    (HistoryRunFile.__tablename__, "ix_dfvs_hrf_run", "CREATE INDEX ix_dfvs_hrf_run ON {table} (history_run_id)"),
+    (HistoryRunFile.__tablename__, "ix_dfvs_hrf_run_path", "CREATE INDEX ix_dfvs_hrf_run_path ON {table} (history_run_id, path)"),
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_heartbeat", "CREATE INDEX ix_dfvs_worker_heartbeat ON {table} (last_heartbeat_at)"),
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_status", "CREATE INDEX ix_dfvs_worker_status ON {table} (status)"),
 ]
 
+
+def _index_column_names(sql_template: str) -> list[str]:
+    columns_sql = sql_template.split("(", 1)[1].rsplit(")", 1)[0]
+    return [column.strip() for column in columns_sql.split(",")]
+
+
+def _render_index_sql(table_name: str, index_name: str, sql_template: str, dialect: str) -> str:
+    if dialect != "mysql" or index_name not in MYSQL_INDEX_LENGTHS:
+        return sql_template.format(table=table_name)
+    prefix_lengths = MYSQL_INDEX_LENGTHS[index_name]
+    rendered_columns = []
+    for column_name in _index_column_names(sql_template):
+        prefix_length = prefix_lengths.get(column_name)
+        if prefix_length:
+            rendered_columns.append(f"{column_name}({prefix_length})")
+        else:
+            rendered_columns.append(column_name)
+    unique_sql = "UNIQUE " if sql_template.startswith("CREATE UNIQUE INDEX") else ""
+    return f"CREATE {unique_sql}INDEX {index_name} ON {table_name} ({', '.join(rendered_columns)})"
+
 for table_name, index_name, sql_template in INDEX_DEFINITIONS:
     table = next(
         cls.__table__
-        for cls in [WorkflowDefinition, WorkflowDefinitionVersion, TriggerTask, WorkflowExecution, WorkflowExecutionEvent, SchedulerWorker]
+        for cls in MODEL_CLASSES
         if cls.__tablename__ == table_name
     )
-    columns_sql = sql_template.split("(", 1)[1].rsplit(")", 1)[0]
-    column_names = [column.strip() for column in columns_sql.split(",")]
+    column_names = _index_column_names(sql_template)
     columns = [getattr(table.c, column_name) for column_name in column_names]
-    Index(index_name, *columns, unique=sql_template.startswith("CREATE UNIQUE INDEX"))
+    index_kwargs = {}
+    if index_name in MYSQL_INDEX_LENGTHS:
+        index_kwargs["mysql_length"] = MYSQL_INDEX_LENGTHS[index_name]
+    Index(index_name, *columns, unique=sql_template.startswith("CREATE UNIQUE INDEX"), **index_kwargs)
 
 
 def get_engine():
@@ -203,6 +457,13 @@ def get_session_factory():
 
 def _column_exists(inspector, table_name: str, column_name: str) -> bool:
     return column_name in {column["name"] for column in inspector.get_columns(table_name)}
+
+
+def _column_type_name(inspector, table_name: str, column_name: str) -> str:
+    for column in inspector.get_columns(table_name):
+        if column["name"] == column_name:
+            return str(column.get("type") or "").upper()
+    return ""
 
 
 def _index_exists(inspector, table_name: str, index_name: str) -> bool:
@@ -242,7 +503,7 @@ def run_auto_migrations() -> None:
         (tables["workflow_execution"], "recovery_reason", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN recovery_reason VARCHAR(255) NULL"),
     ]
     index_migrations = [
-        (table_name, index_name, sql_template.format(table=table_name))
+        (table_name, index_name, _render_index_sql(table_name, index_name, sql_template, dialect))
         for table_name, index_name, sql_template in INDEX_DEFINITIONS
     ]
 
@@ -314,6 +575,15 @@ def run_auto_migrations() -> None:
                     f"UPDATE {tables['workflow_execution']} "
                     "SET attempt_no = 1 WHERE attempt_no IS NULL OR attempt_no = 0"
                 ))
+
+        if dialect == "mysql" and HistoryRun.__tablename__ in inspector.get_table_names():
+            if _column_exists(inspector, HistoryRun.__tablename__, "log_tail_text"):
+                if _column_type_name(inspector, HistoryRun.__tablename__, "log_tail_text") != "MEDIUMTEXT":
+                    connection.execute(text(
+                        f"ALTER TABLE {HistoryRun.__tablename__} "
+                        "MODIFY COLUMN log_tail_text MEDIUMTEXT NULL"
+                    ))
+                    inspector = inspect(connection)
 
         inspector = inspect(connection)
         for table_name, index_name, sql in index_migrations:

@@ -7,6 +7,7 @@ from fastapi import HTTPException, status
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
+from app.config import get_config
 from app.models.database import WorkflowDefinition, WorkflowDefinitionVersion
 from app.pi_vuln_core.config.models import FrameworkConfig
 from app.schemas import (
@@ -205,6 +206,49 @@ class WorkflowService:
             updated_at=definition.updated_at,
         )
 
+    def _create_bootstrap_profile(self, db: Session, *, project_id: str, actor: str) -> WorkflowDefinition:
+        config = get_config()
+        template_kind = config.service.default_profile_template_kind or "vuln_scan_default"
+        normalized_payload, compiled_config = get_profile_template_service().compile_profile(
+            template_kind=template_kind,
+            config_payload=None,
+        )
+        validated = self.validate_definition_payload(compiled_config)
+        definition = WorkflowDefinition(
+            id=_new_id("wfd"),
+            name="默认数据流漏洞挖掘模板",
+            description="系统自动创建的默认扫描 Profile",
+            project_id=project_id,
+            template_kind=template_kind,
+            config_payload_json=normalized_payload,
+            definition_json=compiled_config,
+            root_workflow_id=validated.root_workflow_id,
+            trigger_type="manual",
+            trigger_enabled=False,
+            is_active=True,
+            is_default=True,
+            enabled=True,
+            max_concurrency=1,
+            priority_default=100,
+            max_retry_count=config.service.trigger_retry_limit,
+            workspace_base_dir=None,
+            execution_timeout_seconds=config.service.default_execution_timeout_seconds,
+            created_by=actor,
+            updated_by=actor,
+        )
+        db.add(definition)
+        self._ensure_single_default(db, definition)
+        self._create_version_snapshot(
+            db,
+            definition=definition,
+            created_by=actor,
+            config_payload=normalized_payload,
+            compiled_config=compiled_config,
+        )
+        db.commit()
+        db.refresh(definition)
+        return definition
+
     def create_profile(self, db: Session, payload: ScanProfileCreateRequest, principal: dict) -> ScanProfileResponse:
         self._ensure_project_access(principal, payload.project_id)
         actor = _principal_id(principal)
@@ -369,6 +413,15 @@ class WorkflowService:
         if item is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no scan profile configured for project")
         return item
+
+    def get_or_create_default_profile_model(self, db: Session, project_id: str, principal: dict) -> WorkflowDefinition:
+        try:
+            return self.get_default_profile_model(db, project_id, principal)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND or exc.detail != "no scan profile configured for project":
+                raise
+        actor = _principal_id(principal)
+        return self._create_bootstrap_profile(db, project_id=project_id, actor=actor)
 
     def get_profile_version_model(self, db: Session, profile_id: str, version_no: int | None = None) -> WorkflowDefinitionVersion:
         if version_no is None:

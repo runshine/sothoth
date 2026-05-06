@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-app-binary-security-config
+  namespace: secflow-ns
+data:
+  config.yaml: |
+    database:
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+      pool_size: 10
+      max_overflow: 20
+
+    auth_service:
+      host: "secflow-platform-auth"
+      port: 80
+      validate_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+      timeout: 10
+      token_cache_enabled: true
+      token_cache_ttl_minutes: 15
+
+    project_service:
+      host: "secflow-platform-project"
+      port: 80
+      get_project_path: "/api/project"
+      timeout: 10
+
+    storage:
+      project_root_template: "/data/files/{project_id}"
+      app_root_name: "app/secflow-app-binary-security"
+      fileserver_subproject_name: "__binary_security__"
+      require_input_exists: true
+
+    scheduler:
+      poll_interval_seconds: 5
+      task_concurrency: 2
+      stage_poll_interval_seconds: 5
+      shutdown_grace_seconds: 10
+
+    runtime_policy:
+      max_stage_parallelism: 4
+      max_retries_per_item: 2
+      continue_on_item_failure: true
+
+    services:
+      firmware_unpacker:
+        base_url: "http://secflow-app-firmware-unpacker"
+        timeout: 60
+      system_analyse:
+        base_url: "http://secflow-app-system-analyse/api/app/system-analyse"
+        timeout: 60
+      binary_to_source:
+        base_url: "http://secflow-app-binary-to-source/api/app/binary-to-source"
+        timeout: 60
+      entry_analyse:
+        base_url: "http://secflow-app-entry-analyse/api/app/entry-analyse"
+        timeout: 60
+      dataflow_analyse:
+        base_url: "http://secflow-app-dataflow-analyse/api/app/dataflow-analyse"
+        timeout: 60
+      dataflow_vuln_scanner:
+        base_url: "http://secflow-app-dataflow-vuln-scanner"
+        timeout: 120
+      fileserver:
+        base_url: "http://secflow-platform-fileserver/api/fileserver"
+        timeout: 30
+        data_mount_path: "/data"
+        project_files_dirname: "files"
+        subproject_name: "__binary_security__"
+
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu"
+      service_id: "secflow-app-binary-security"
+      service_name: "二进制安全编排服务"
+      host: "secflow-app-binary-security"
+      port: 80
+      maturity: "开发中"
+      description: "统一串联固件解包、系统分析、反编译、入口分析、数据流分析和漏洞扫描"
+      api_prefix: "/api/app/binary-security"
+      menu:
+        id: "secflow-app-binary-security"
+        path: "/binary-security"
+        icon: "shield"
+        order: 26
+        level1:
+          name: "安全执行"
+          name_en: "Execution"
+        level2:
+          name: "二进制安全"
+          name_en: "BinarySecurity"
+        level3:
+          name: "统一编排"
+          name_en: "Orchestration"
+
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+
+    logging:
+      level: "INFO"

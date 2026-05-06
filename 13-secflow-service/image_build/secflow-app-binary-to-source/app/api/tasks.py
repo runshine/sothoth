@@ -9,8 +9,9 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskResponse, TokenUser
+from app.schemas import ActionResponse, LlmProviderListResponse, LlmProviderSummary, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
 from app.service.auth import get_auth_service
+from app.service.configcenter import get_configcenter_client
 from app.service.project import get_project_service
 from app.service.security import validate_project_id
 from app.service.task_service import (
@@ -20,6 +21,7 @@ from app.service.task_service import (
     get_task_or_404,
     retry_task,
     sync_task,
+    generate_task_id,
     terminate_task,
 )
 
@@ -49,6 +51,21 @@ async def get_current_context(project_id: str, authorization: Optional[str] = He
     return TokenUser(**user)
 
 
+@router.get("/projects/{project_id}/llm-providers", response_model=LlmProviderListResponse)
+async def list_llm_providers(
+    project_id: str,
+    _: TokenUser = Depends(get_current_context),
+):
+    payload = await get_configcenter_client().list_llm_providers()
+    raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items = [LlmProviderSummary(**item) for item in raw_items if isinstance(item, dict) and item.get("enabled", True)]
+    return LlmProviderListResponse(
+        items=items,
+        total=len(items),
+        default_provider_key=payload.get("default_provider_key"),
+    )
+
+
 @router.get("/projects/{project_id}/tasks", response_model=TaskListResponse)
 async def list_tasks(
     project_id: str,
@@ -64,6 +81,15 @@ async def list_tasks(
         tasks = [task for task in tasks if task.status == status]
     items = [build_task_response(db, task) for task in tasks]
     return TaskListResponse(total=len(items), items=items)
+
+
+@router.post("/projects/{project_id}/tasks/prepare", response_model=TaskPrepareResponse)
+async def prepare_b2s_task(
+    project_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return TaskPrepareResponse(task_id=generate_task_id(db, project_id))
 
 
 @router.post("/projects/{project_id}/tasks", response_model=TaskResponse)

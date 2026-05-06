@@ -869,6 +869,16 @@ class MenuManager:
 # 创建Flask应用
 app = Flask(__name__)
 
+
+@app.after_request
+def add_cors_headers(response):
+    """Allow browser clients to call menu APIs without cross-origin blocking."""
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, Accept, Origin, X-Requested-With"
+    response.headers["Access-Control-Max-Age"] = "86400"
+    return response
+
 # 创建蓝图
 menu_bp = Blueprint('menu', __name__, url_prefix='/api/menu')
 

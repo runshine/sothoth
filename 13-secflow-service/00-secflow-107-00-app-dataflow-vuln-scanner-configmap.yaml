@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-app-dataflow-vuln-scanner-config
+  namespace: secflow-ns
+data:
+  config.yaml: |
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false
+
+    database:
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+      table_prefix: "secflow_dataflow_vuln_scanner_"
+      pool_size: 10
+      max_overflow: 20
+
+    auth_service:
+      enabled: true
+      host: "secflow-platform-auth"
+      port: 80
+      validate_human_token_path: "/api/auth/validate-human-token"
+      validate_machine_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+      timeout: 10
+
+    project_service:
+      enabled: true
+      host: "secflow-platform-project"
+      port: 80
+      get_project_path: "/api/project"
+      health_path: "/api/project/health"
+      timeout: 10
+
+    fileserver_service:
+      enabled: true
+      base_url: "http://secflow-platform-fileserver/api/fileserver"
+      timeout: 10
+      data_mount_path: "/data"
+      project_files_dirname: "files"
+      aiwf_subproject_name: "DATAFLOW_VULN_SCANNER"
+
+    history_runs:
+      enabled: true
+      fixed_project_id: "44f9029d00650a10"
+      legacy_root_candidates:
+        - "{data_mount_path}/{project_files_dirname}/{project_id}/dataflow-vuln-scanner/runs"
+        - "{data_mount_path}/{project_files_dirname}/{project_id}/DATAFLOW_VULN_SCANNER/runs"
+
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu:80"
+      service_id: "secflow-app-dataflow-vuln-scanner"
+      service_name: "数据流漏洞挖掘服务"
+      host: "secflow-app-dataflow-vuln-scanner"
+      port: 80
+      maturity: "开发中"
+      description: "提供数据流漏洞挖掘任务下发、Profile配置、调度执行与状态查询能力"
+      api_prefix: "/api/dataflow-vuln-scanner"
+      unregister_on_shutdown: false
+      heartbeat_interval_seconds: 30
+      menu:
+        id: "dataflow-vuln-scanner"
+        path: "/dataflow-vuln-scanner"
+        icon: "scan-search"
+        order: 36
+        level1_name: "执行"
+        level2_name: "二进制安全测试"
+        level3_name: "数据流漏洞挖掘"
+
+    service:
+      workspace_base_dir: "/data/files"
+      default_execution_timeout_seconds: 7200
+      execution_cancel_check_interval_seconds: 1
+      trigger_retry_limit: 3
+      public_api_prefix: "/api/dataflow-vuln-scanner"
+      legacy_api_prefix: "/api/ai-agent-framework"
+      default_entry_task_type: "package_list"
+      default_artifact_subdir: "assets"
+      default_profile_template_kind: "vuln_scan_default"
+
+    scheduler:
+      enabled: true
+      worker_capacity: 2
+      poll_interval_seconds: 2
+      heartbeat_interval_seconds: 5
+      worker_timeout_seconds: 20
+      lease_duration_seconds: 30
+      cleanup_interval_seconds: 10
+
+    logging:
+      level: "INFO"
+      format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

@@ -41,6 +41,7 @@ pi_re_agent:
 
 storage:
   project_root_template: "/data/files/{project_id}"
+  app_root_name: "app/secflow-app-binary-to-source"
   output_root_name: "binary-to-source-outputs"
   require_input_exists: true
 
