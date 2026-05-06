@@ -38,7 +38,20 @@ def _normalize_project_id(project_id: Optional[str]) -> Optional[str]:
     return value or None
 
 
+def _normalize_runtime_path(path: str) -> str:
+    value = str(path or "").strip()
+    legacy_prefix = "/data/fileserver/files"
+    runtime_prefix = "/data/files"
+    if value == legacy_prefix:
+        return runtime_prefix
+    if value.startswith(f"{legacy_prefix}/"):
+        return f"{runtime_prefix}{value[len(legacy_prefix):]}"
+    return value
+
+
 def _ensure_valid_request_payload(request: UnpackRequest) -> None:
+    request.firmware_path = _normalize_runtime_path(request.firmware_path)
+    request.output_path = _normalize_runtime_path(request.output_path)
     if not request.firmware_path.strip():
         raise ValidationError("firmware_path 不能为空")
     if not request.output_path.strip():

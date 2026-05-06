@@ -45,7 +45,12 @@ RUN ARCH=$(dpkg --print-architecture) \
     && ln -sf "/usr/local/lib/nodejs/node-${NODE_VERSION}-linux-${NODE_ARCH}/bin/npx" /usr/local/bin/npx \
     && rm /tmp/node.tar.xz
 
-RUN npm install -g @mariozechner/pi-coding-agent
+RUN npm install -g @mariozechner/pi-coding-agent \
+    && ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "amd64" ]; then NODE_ARCH="x64"; \
+       elif [ "$ARCH" = "arm64" ]; then NODE_ARCH="arm64"; \
+       else NODE_ARCH="x64"; fi \
+    && ln -sf "/usr/local/lib/nodejs/node-${NODE_VERSION}-linux-${NODE_ARCH}/bin/pi" /usr/local/bin/pi
 
 RUN mkdir -p /root/.pi/agent && cat > /root/.pi/agent/settings.json <<'PICONF'
 {

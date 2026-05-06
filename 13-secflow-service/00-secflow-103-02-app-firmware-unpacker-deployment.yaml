@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-firmware-unpacker
   namespace: secflow-ns
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       name: secflow-app-firmware-unpacker
@@ -17,7 +17,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: secflow-app-firmware-unpacker
-          image: ${SECFLOW_APP_FIRMWARE_UNPACKER_IMAGE}
+          image: ghcr.io/runshine/secflow-app-firmware-unpacker:amd64-latest
           imagePullPolicy: Always
           env:
             - name: CONFIG_PATH
@@ -36,6 +36,8 @@ spec:
             - name: secflow-app-firmware-unpacker-config
               mountPath: /app/config.yaml
               subPath: config.yaml
+            - name: secflow-platform-fileserver-data-nfs-pvc
+              mountPath: /data
           resources:
             requests:
               memory: "256Mi"
@@ -62,3 +64,6 @@ spec:
             items:
               - key: config.yaml
                 path: config.yaml
+        - name: secflow-platform-fileserver-data-nfs-pvc
+          persistentVolumeClaim:
+            claimName: secflow-platform-fileserver-data-nfs-pvc
