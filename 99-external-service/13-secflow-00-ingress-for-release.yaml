@@ -28,6 +28,14 @@ spec:
   - host: secflow.ai.icsl.huawei.com
     http:
       paths:
+      - path: /gaiasec
+        pathType: Prefix
+        backend:
+          service:
+            name: gaiasec-api-gateway
+            port:
+              number: 80
+
       - path: /
         pathType: Prefix
         backend:
@@ -147,6 +155,30 @@ spec:
             port:
               number: 80
 
+      - path: /api/app/entry-analyse
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-entry-analyse
+            port:
+              number: 80
+
+      - path: /api/app/dataflow-analyse
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-dataflow-analyse
+            port:
+              number: 80
+
+      - path: /api/app/firmware-unpacker
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-firmware-unpacker
+            port:
+              number: 80
+
       - path: /api/app/code-server
         pathType: Prefix
         backend:
@@ -168,5 +200,13 @@ spec:
         backend:
           service:
             name: secflow-app-binary-security
+            port:
+              number: 80
+
+      - path: /api/ai-agent-framework
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-platform-ai-agent-framework
             port:
               number: 80

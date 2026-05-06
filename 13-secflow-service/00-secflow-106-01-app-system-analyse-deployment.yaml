@@ -49,7 +49,6 @@ spec:
           mountPath: /data/sessions
         - name: secflow-platform-fileserver-data-nfs-pvc
           mountPath: /data/fileserver
-          readOnly: true
         resources:
           requests:
             memory: "256Mi"
