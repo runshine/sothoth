@@ -14,6 +14,7 @@ from app.service.configcenter import get_configcenter_client
 
 logger = logging.getLogger(__name__)
 _cached_provider: Optional[dict[str, Any]] = None
+_cached_providers: dict[str, dict[str, Any]] = {}
 
 
 def _provider_api(provider_type: str) -> str:
@@ -103,17 +104,28 @@ def _write_file_bindings(config_dir: Path, provider: dict[str, Any]) -> None:
     _write_json(safe_root / "manifest.json", {"items": manifest})
 
 
-async def materialize_llm_provider() -> dict[str, Any] | None:
-    """Fetch ConfigCenter LLM Provider and write pi-re-agent config files."""
+async def materialize_llm_provider(provider_key: str | None = None) -> dict[str, Any] | None:
+    """Fetch ConfigCenter LLM Provider and write pi-re-agent config files.
+
+    The selected provider can be supplied per task.  This makes provider
+    switching dynamic: B2S no longer needs a ConfigMap update or Pod restart to
+    use a different ConfigCenter provider.
+    """
     global _cached_provider
     cfg = get_config()
     if not cfg.configcenter_service.enabled:
         logger.info("配置中心未启用，跳过LLM Provider物化")
         return None
 
-    client = get_configcenter_client()
-    provider_key = (cfg.pi_re_agent.llm_provider_key or "").strip()
-    provider = await client.get_llm_provider(provider_key) if provider_key else await client.get_default_llm_provider()
+    requested_key = (provider_key or cfg.pi_re_agent.llm_provider_key or "").strip()
+    if requested_key and requested_key in _cached_providers:
+        provider = _cached_providers[requested_key]
+    else:
+        client = get_configcenter_client()
+        provider = await client.get_llm_provider(requested_key) if requested_key else await client.get_default_llm_provider()
+        resolved_key = str(provider.get("provider_key") or "").strip()
+        if resolved_key:
+            _cached_providers[resolved_key] = provider
 
     config_dir = Path(cfg.pi_re_agent.agent_config_dir).resolve()
     _write_json(config_dir / "models.json", _build_models_json(provider))
@@ -143,10 +155,14 @@ def get_cached_provider_model() -> str | None:
     return None
 
 
-async def resolve_job_model() -> str | None:
+async def resolve_job_model(provider_key: str | None = None) -> str | None:
     cfg = get_config()
     if cfg.pi_re_agent.model:
         return cfg.pi_re_agent.model
+    requested_key = (provider_key or "").strip()
+    if requested_key:
+        provider = await materialize_llm_provider(requested_key)
+        return _provider_model_name(provider) if provider else None
     if _cached_provider is None and cfg.configcenter_service.enabled:
         await materialize_llm_provider()
     if _cached_provider:

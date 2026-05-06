@@ -9,8 +9,9 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
+from app.schemas import ActionResponse, LlmProviderListResponse, LlmProviderSummary, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
 from app.service.auth import get_auth_service
+from app.service.configcenter import get_configcenter_client
 from app.service.project import get_project_service
 from app.service.security import validate_project_id
 from app.service.task_service import (
@@ -48,6 +49,21 @@ async def get_current_context(project_id: str, authorization: Optional[str] = He
     user = await get_auth_service().validate_token(token)
     await get_project_service().require_access(token, project_id)
     return TokenUser(**user)
+
+
+@router.get("/projects/{project_id}/llm-providers", response_model=LlmProviderListResponse)
+async def list_llm_providers(
+    project_id: str,
+    _: TokenUser = Depends(get_current_context),
+):
+    payload = await get_configcenter_client().list_llm_providers()
+    raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items = [LlmProviderSummary(**item) for item in raw_items if isinstance(item, dict) and item.get("enabled", True)]
+    return LlmProviderListResponse(
+        items=items,
+        total=len(items),
+        default_provider_key=payload.get("default_provider_key"),
+    )
 
 
 @router.get("/projects/{project_id}/tasks", response_model=TaskListResponse)

@@ -88,7 +88,8 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     db.flush()
 
     pi_cfg = get_config().pi_re_agent
-    job_model = await resolve_job_model()
+    llm_provider_key = (req.llm_provider_key or "").strip() or None
+    job_model = await resolve_job_model(llm_provider_key)
     client = get_pi_client()
     for idx, elf in enumerate(req.elf_tasks, start=1):
         source_elf_path = ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)
@@ -106,6 +107,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             **(elf.metadata or {}),
             "file_list": elf.file_list or [],
             "source_elf_path": str(source_elf_path),
+            "llm_provider_key": llm_provider_key,
         }
         item.phase = "queued"
         item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
@@ -203,10 +205,15 @@ async def terminate_task(db: Session, task: B2STask) -> None:
 
 async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = None) -> None:
     pi_cfg = get_config().pi_re_agent
-    job_model = await resolve_job_model()
     client = get_pi_client()
     items = query_items(db, task.id)
     selected = [i for i in items if item_ids is None or i.id in item_ids]
+    selected_provider_keys = [
+        str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
+        for i in selected
+        if str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
+    ]
+    job_model = await resolve_job_model(selected_provider_keys[0] if selected_provider_keys else None)
     if not selected:
         raise NotFoundError("未找到可重试的任务项")
     for item in selected:
