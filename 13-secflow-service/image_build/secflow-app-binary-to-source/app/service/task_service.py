@@ -251,19 +251,33 @@ def _file_size(path: str | None) -> int | None:
 def build_item_progress(item: B2STaskItem, job: dict) -> dict:
     raw_progress = job.get("progress") if isinstance(job.get("progress"), dict) else {}
     raw_phase = job.get("phase")
+    status = map_pi_status(job.get("status"))
     phase = map_pi_phase(raw_phase, job.get("status"))
     total_batches = raw_progress.get("total_batches")
     completed_batches = raw_progress.get("completed_batches") or 0
     total_functions = raw_progress.get("total_functions")
     completed_functions = raw_progress.get("completed_functions")
+    total_bytes = raw_progress.get("total_bytes") or raw_progress.get("total_binary_bytes") or _file_size(item.elf_path)
+
+    if status == "success":
+        if total_batches is not None:
+            completed_batches = total_batches
+        elif completed_batches == 0:
+            completed_batches = 1
+        if total_functions is not None:
+            completed_functions = total_functions
+
     if completed_functions is None and total_functions and total_batches:
         completed_functions = int(float(total_functions) * float(completed_batches) / float(total_batches))
-    total_bytes = raw_progress.get("total_bytes") or raw_progress.get("total_binary_bytes") or _file_size(item.elf_path)
     completed_bytes = raw_progress.get("completed_bytes")
     batch_percent = _safe_percent(completed_batches, total_batches)
-    if completed_bytes is None and total_bytes and batch_percent is not None:
+    if status == "success" and total_bytes is not None:
+        completed_bytes = total_bytes
+    elif completed_bytes is None and total_bytes and batch_percent is not None:
         completed_bytes = int(float(total_bytes) * batch_percent / 100.0)
     percent = _safe_percent(completed_functions, total_functions) or batch_percent or _safe_percent(completed_bytes, total_bytes)
+    if status == "success":
+        percent = 100.0
     message = raw_progress.get("message") or job.get("error") or phase_label(phase)
     return {
         "phase": phase,
