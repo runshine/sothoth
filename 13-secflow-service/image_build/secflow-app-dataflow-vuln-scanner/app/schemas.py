@@ -153,6 +153,7 @@ class ScanTaskAttemptResponse(BaseModel):
     task_id: str
     attempt_no: int
     status: str
+    history_run_id: Optional[str] = None
     owner_pod_id: Optional[str]
     lease_expires_at: Optional[datetime]
     started_at: Optional[datetime]
@@ -358,3 +359,93 @@ class HealthResponse(BaseModel):
     pod_id: str
     database: str
     scheduler: str
+
+
+class HistoryRunSummaryResponse(BaseModel):
+    history_run_id: str
+    project_id: str
+    source_type: str
+    source_key: str
+    linked_task_id: Optional[str] = None
+    linked_execution_id: Optional[str] = None
+    profile_id: Optional[str] = None
+    name: str
+    path: str
+    root_path: str
+    status: str
+    start_time: str = ""
+    start_epoch: int = 0
+    duration_seconds: int = 0
+    last_activity: str = ""
+    model: str = ""
+    provider: str = ""
+    thinking: str = ""
+    max_cycles: int = 0
+    cycles_used: int = 0
+    result_count: int = 0
+    passed_count: int = 0
+    failed_count: int = 0
+    workflow_mode: str = ""
+    updated_at: Optional[str] = None
+
+
+class HistoryRunFileResponse(BaseModel):
+    category: str
+    path: str
+    name: str
+    size: int
+    mtime: float
+    type: str
+
+
+class HistoryRunSessionResponse(BaseModel):
+    session_id: str
+    format: str
+    worker_id: str = ""
+    jsonl_path: str = ""
+    size: int = 0
+    mtime: float = 0
+    calls: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class HistoryRunDetailResponse(HistoryRunSummaryResponse):
+    config: Dict[str, Any] = Field(default_factory=dict)
+    error: Optional[str] = None
+    cycles: List[Dict[str, Any]] = Field(default_factory=list)
+    results: List[Dict[str, Any]] = Field(default_factory=list)
+    removed_results: List[Dict[str, Any]] = Field(default_factory=list)
+    manifests: Dict[str, Any] = Field(default_factory=dict)
+    latest_issues: List[Dict[str, Any]] = Field(default_factory=list)
+    atomic_work_path: str = ""
+    files: List[HistoryRunFileResponse] = Field(default_factory=list)
+    sessions: List[HistoryRunSessionResponse] = Field(default_factory=list)
+    run_log: str = ""
+    raw: Dict[str, Any] = Field(default_factory=dict)
+
+
+class HistoryRunCycleResponse(BaseModel):
+    cycle: int
+    global_reviews: List[Dict[str, Any]] = Field(default_factory=list)
+    result_reviews: List[Dict[str, Any]] = Field(default_factory=list)
+    summary_snapshot: str = ""
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+
+
+class HistoryRunFileContentResponse(BaseModel):
+    path: str
+    type: str
+    content: str
+
+
+class HistoryRunLogResponse(BaseModel):
+    content: str
+
+
+class HistoryRunResolveResponse(BaseModel):
+    history_run_id: str
+    project_id: str
+    run_name: str
+    root_path: str
+    source_type: str
+    linked_task_id: Optional[str] = None
+    linked_execution_id: Optional[str] = None

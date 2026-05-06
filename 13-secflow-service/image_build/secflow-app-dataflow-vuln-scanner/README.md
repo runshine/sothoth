@@ -646,6 +646,25 @@ python -m pytest tests/unit/test_review_models.py -v
 docker build -t secflow-app-dataflow-vuln-scanner .
 ```
 
+### 1.1 构建时注入本机 `pi` / `copilot` 配置（可选）
+
+如果你明确要在**当前这台机器本地构建**时，就把本机 `~/.pi` 与 `~/.copilot` 一起打进镜像，可先执行：
+
+```bash
+cd 13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner
+./scripts/stage_local_agent_home.sh
+docker build -t secflow-app-dataflow-vuln-scanner:local-with-agent-home .
+```
+
+说明：
+
+- 脚本会把本机 `~/.pi` / `~/.copilot` 复制到构建上下文中的 `.docker-runtime-home/`
+- `~/.pi/agent/bin`、`~/.pi/agent/sessions` 等大文件/运行时目录会被排除，避免把无关内容打进镜像
+- `.docker-runtime-home/` 已加入 `.gitignore`，不会默认提交到仓库
+- 构建完成后，如不再需要本地副本，可执行 `rm -rf .docker-runtime-home/root`
+- 这种方式只适合**本地私有镜像**；如果镜像会推送到远端仓库，更推荐使用下面的 K8S Secret 方式
+- GitHub Actions 构建机无法读取你本机的 `~/.pi`，因此工作流构建默认不会带入这些本地认证文件
+
 可选构建参数：
 
 ```bash
@@ -829,7 +848,28 @@ docker run --rm -it --entrypoint bash secflow-app-dataflow-vuln-scanner:latest
 
 ### 9. K8S
 
-平台集成清单位于 `13-secflow-service/00-secflow-103-*`：
+推荐做法是把本机 Agent 配置同步成 Secret，再由 Pod 启动时自动恢复到 `/root/.pi` 与 `/root/.copilot`。仓库里已经接好了对应挂载和恢复逻辑。
+
+```bash
+cd 13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner
+./scripts/sync_local_agent_home_secret.sh
+```
+
+该脚本会：
+
+- 打包当前机器的 `~/.pi`（排除 `agent/bin`、`agent/sessions` 等运行时目录）
+- 如存在 `~/.copilot`，一并打包
+- 更新 `secflow-ns` 命名空间中的 Secret `secflow-app-dataflow-vuln-scanner-runtime-home`
+- 自动执行 `kubectl rollout restart deployment/secflow-app-dataflow-vuln-scanner`
+
+当前平台集成清单可参考：
+
+- `13-secflow-service/00-secflow-107-00-app-dataflow-vuln-scanner-configmap.yaml`
+- `13-secflow-service/00-secflow-107-01-app-dataflow-vuln-scanner-deployment.yaml`
+- `13-secflow-service/00-secflow-107-02-app-dataflow-vuln-scanner-service.yaml`
+- `13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner/k8s-deployment.yaml`
+
+历史清单文件也可能仍保留在 `00-secflow-103-*`：
 
 - `00-secflow-103-00-app-dataflow-vuln-scanner-configmap.yaml`
 - `00-secflow-103-01-app-dataflow-vuln-scanner-deployment.yaml`

@@ -18,6 +18,7 @@ RUN apt-get update \
         nodejs \
         npm \
         ripgrep \
+        tar \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
@@ -40,10 +41,14 @@ COPY config.pi_vuln.example.json ./config.pi_vuln.example.json
 COPY config.vuln_scan_default.json ./config.vuln_scan_default.json
 COPY config.full_pipeline.json ./config.full_pipeline.json
 COPY config.yaml ./config.yaml
+COPY .docker-runtime-home/ /opt/runtime-home/
 COPY docker/entrypoint.sh /usr/local/bin/secflow-entrypoint
 
 RUN chmod +x /usr/local/bin/secflow-entrypoint \
-    && mkdir -p /app/runs /data
+    && mkdir -p /app/runs /data /root \
+    && if [ -d /opt/runtime-home/root/.pi ]; then cp -a /opt/runtime-home/root/.pi /root/.pi; fi \
+    && if [ -d /opt/runtime-home/root/.copilot ]; then cp -a /opt/runtime-home/root/.copilot /root/.copilot; fi \
+    && rm -rf /opt/runtime-home
 
 EXPOSE 8080
 
