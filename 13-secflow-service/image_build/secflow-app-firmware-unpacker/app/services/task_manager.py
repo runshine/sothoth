@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, Optional
 
 from app.config import get_config
@@ -19,6 +22,8 @@ _dispatcher_thread: Optional[threading.Thread] = None
 _dispatcher_stop = threading.Event()
 _futures: Dict[str, Future] = {}
 _futures_lock = threading.Lock()
+PROJECT_FILES_ROOT = Path(os.environ.get("PROJECT_FILES_ROOT", "/data/files"))
+TASK_WORKSPACE_ROOT = Path("app/secflow-app-firmware-unpacker")
 
 
 def _executor_capacity() -> int:
@@ -69,23 +74,113 @@ def _active_future_count() -> int:
         return sum(1 for future in _futures.values() if not future.done())
 
 
+def build_task_workspace(project_id: str, task_id: str) -> dict[str, Path]:
+    base_dir = PROJECT_FILES_ROOT / project_id / TASK_WORKSPACE_ROOT / task_id
+    return {
+        "base_dir": base_dir,
+        "input_dir": base_dir / "input",
+        "output_dir": base_dir / "output",
+        "run_dir": base_dir / "run",
+    }
+
+
+def _copied_firmware_path(source_firmware_path: str, input_dir: Path) -> Path:
+    source_name = Path(source_firmware_path).name.strip()
+    if not source_name:
+        raise ValueError("firmware_path 无法解析文件名")
+    return input_dir / source_name
+
+
+def prepare_task_workspace(
+    project_id: str,
+    task_id: str,
+    source_firmware_path: str,
+) -> dict[str, str]:
+    workspace = build_task_workspace(project_id, task_id)
+    for directory in workspace.values():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    source_path = Path(source_firmware_path)
+    if not source_path.exists() or not source_path.is_file():
+        raise FileNotFoundError(f"固件文件不存在: {source_firmware_path}")
+
+    copied_input = _copied_firmware_path(source_firmware_path, workspace["input_dir"])
+    shutil.copy2(source_path, copied_input)
+    return {
+        "base_dir": str(workspace["base_dir"]),
+        "input_path": str(copied_input),
+        "input_dir": str(workspace["input_dir"]),
+        "output_path": str(workspace["output_dir"]),
+        "run_path": str(workspace["run_dir"]),
+    }
+
+
+def remove_task_workspace(task_id: str, project_id: Optional[str]) -> None:
+    normalized_project_id = str(project_id or "").strip()
+    if not normalized_project_id:
+        return
+
+    workspace = build_task_workspace(normalized_project_id, task_id)
+    base_dir = workspace["base_dir"]
+    if not base_dir.exists():
+        return
+
+    shutil.rmtree(base_dir)
+    logger.info("task workspace removed: %s", base_dir)
+
+
+def resolve_task_runtime_paths(
+    task_id: str,
+    project_id: Optional[str],
+    source_firmware_path: str,
+    output_path: str,
+) -> dict[str, str]:
+    normalized_project_id = str(project_id or "").strip()
+    if normalized_project_id:
+        workspace = build_task_workspace(normalized_project_id, task_id)
+        copied_input = _copied_firmware_path(source_firmware_path, workspace["input_dir"])
+        if copied_input.exists():
+            return {
+                "input_path": str(copied_input),
+                "output_path": str(workspace["output_dir"]),
+                "run_path": str(workspace["run_dir"]),
+            }
+        return {
+            "input_path": source_firmware_path,
+            "output_path": output_path,
+            "run_path": str(workspace["run_dir"]) if Path(output_path).name == "output" else "",
+        }
+
+    derived_run_path = str(Path(output_path).parent / "run") if Path(output_path).name == "output" else ""
+    return {
+        "input_path": source_firmware_path,
+        "output_path": output_path,
+        "run_path": derived_run_path,
+    }
+
+
 def submit_unpack_task(
     firmware_path: str,
-    output_path: str,
+    output_path: Optional[str] = None,
     project_id: Optional[str] = None,
-) -> str:
+) -> dict[str, str]:
     """Insert a pending task into the shared database."""
     from app.model import TaskStatus, UnpackTask, generate_id, get_db_session
 
+    normalized_project_id = str(project_id or "").strip()
+    if not normalized_project_id:
+        raise ValueError("project_id 不能为空")
+
     task_id = generate_id()
+    prepared = prepare_task_workspace(normalized_project_id, task_id, firmware_path)
     db = get_db_session()
     try:
         db.add(
             UnpackTask(
                 id=task_id,
-                project_id=project_id,
+                project_id=normalized_project_id,
                 firmware_path=firmware_path,
-                output_path=output_path,
+                output_path=prepared["output_path"],
                 status=TaskStatus.PENDING.value,
             )
         )
@@ -94,7 +189,12 @@ def submit_unpack_task(
         db.close()
 
     logger.info("task queued: %s", task_id)
-    return task_id
+    return {
+        "task_id": task_id,
+        "input_path": prepared["input_path"],
+        "output_path": prepared["output_path"],
+        "run_path": prepared["run_path"],
+    }
 
 
 def cancel_task(task_id: str) -> tuple[bool, str]:
@@ -133,12 +233,11 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
             TaskStatus.CANCELLED.value,
         ):
             return False, None, "仅支持重试失败或已取消的任务"
-        new_task_id = submit_unpack_task(
+        new_task = submit_unpack_task(
             firmware_path=task.firmware_path,
-            output_path=task.output_path,
             project_id=task.project_id,
         )
-        return True, new_task_id, "重试任务已创建"
+        return True, new_task["task_id"], "重试任务已创建"
     finally:
         db.close()
 
@@ -148,6 +247,7 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
 
     deleted_count = 0
     skipped_ids: list[str] = []
+    deleted_workspaces: list[tuple[str, Optional[str]]] = []
     db = get_db_session()
     try:
         for task_id in task_ids:
@@ -172,7 +272,17 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
                 skipped_ids.append(task_id)
                 continue
             deleted_count += 1
+            deleted_workspaces.append((task_id, task.project_id))
         db.commit()
+        for task_id, project_id in deleted_workspaces:
+            try:
+                remove_task_workspace(task_id, project_id)
+            except Exception as exc:
+                logger.warning(
+                    "failed to remove workspace for deleted task %s: %s",
+                    task_id,
+                    exc,
+                )
         return deleted_count, skipped_ids
     finally:
         db.close()
@@ -289,8 +399,6 @@ def _schedule_pending_tasks() -> None:
 
 
 def _run_claimed_task(task_id: str) -> None:
-    import os
-
     from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id, update_worker_active_tasks
     from app.unpacker_engine import run_unpack
@@ -302,8 +410,12 @@ def _run_claimed_task(task_id: str) -> None:
             return
         if task.worker_id != get_worker_id():
             return
-        firmware_path = task.firmware_path
-        output_path = task.output_path
+        runtime_paths = resolve_task_runtime_paths(
+            task_id=task.id,
+            project_id=task.project_id,
+            source_firmware_path=task.firmware_path,
+            output_path=task.output_path,
+        )
     finally:
         db.close()
 
@@ -313,10 +425,10 @@ def _run_claimed_task(task_id: str) -> None:
             _mark_task_cancelled(task_id)
             return
 
-        os.makedirs(output_path, exist_ok=True)
+        os.makedirs(runtime_paths["output_path"], exist_ok=True)
         result = run_unpack(
-            firmware_path,
-            output_path,
+            runtime_paths["input_path"],
+            runtime_paths["output_path"],
             cancel_check=lambda: _should_cancel(task_id),
         )
         _update_task_result(task_id, result)

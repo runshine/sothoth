@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 class UnpackRequest(BaseModel):
     firmware_path: str
-    output_path: str
+    output_path: Optional[str] = None
     project_id: Optional[str] = None
 
 
@@ -17,6 +17,9 @@ class TaskSubmitResponse(BaseModel):
     task_id: str
     status: str
     message: str
+    input_path: Optional[str] = None
+    output_path: Optional[str] = None
+    run_path: Optional[str] = None
 
 
 class ActionResponse(BaseModel):

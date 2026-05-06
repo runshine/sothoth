@@ -51,13 +51,14 @@ def _normalize_runtime_path(path: str) -> str:
 
 def _ensure_valid_request_payload(request: UnpackRequest) -> None:
     request.firmware_path = _normalize_runtime_path(request.firmware_path)
-    request.output_path = _normalize_runtime_path(request.output_path)
+    if request.output_path is not None:
+        request.output_path = _normalize_runtime_path(request.output_path)
     if not request.firmware_path.strip():
         raise ValidationError("firmware_path 不能为空")
-    if not request.output_path.strip():
-        raise ValidationError("output_path 不能为空")
     if not os.path.exists(request.firmware_path):
         raise NotFoundError("固件文件", request.firmware_path)
+    if not _normalize_project_id(request.project_id):
+        raise ValidationError("project_id 不能为空")
 
 
 def _infer_value_type(value: str) -> str:
@@ -89,16 +90,20 @@ async def _get_task_with_access(task_id: str, token: str) -> dict:
 
 
 def _submit_task(project_id: Optional[str], request: UnpackRequest) -> dict:
+    if project_id and not _normalize_project_id(request.project_id):
+        request.project_id = project_id
     _ensure_valid_request_payload(request)
-    task_id = submit_unpack_task(
+    result = submit_unpack_task(
         firmware_path=request.firmware_path,
-        output_path=request.output_path,
         project_id=project_id,
     )
     return {
-        "task_id": task_id,
+        "task_id": result["task_id"],
         "status": "pending",
         "message": "任务已提交，请轮询任务状态接口获取进度。",
+        "input_path": result.get("input_path"),
+        "output_path": result.get("output_path"),
+        "run_path": result.get("run_path"),
     }
 
 

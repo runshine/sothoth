@@ -25,12 +25,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     python3-dev \
     xz-utils \
+    binwalk \
+    squashfs-tools \
+    mtd-utils \
+    unyaffs \
+    fusecram \
+    cpio \
+    p7zip-full \
+    cabextract \
+    lzop \
+    lzma \
+    gzip \
+    bzip2 \
+    zstd \
+    unrar \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
+
+RUN pip3 install --no-cache-dir --break-system-packages \
+    jefferson \
+    ubi_reader
 
 RUN ARCH=$(dpkg --print-architecture) \
     && if [ "$ARCH" = "amd64" ]; then NODE_ARCH="x64"; \
