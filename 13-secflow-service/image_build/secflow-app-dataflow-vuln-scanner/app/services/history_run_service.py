@@ -35,6 +35,7 @@ from app.services.run_inspector import (
 )
 
 HISTORY_RUN_LOG_SUMMARY_MAX_CHARS = 32768
+_ACTIVE_HISTORY_RUN_STATUSES = {"running", "pending", "queued", "cancel_requested"}
 
 
 def _new_id(prefix: str) -> str:
@@ -104,6 +105,53 @@ def _compute_source_mtime(path: Path) -> float:
     return latest
 
 
+def _compute_source_mtime_hint(run_root: Path, atomic_work_path: str | None = None) -> float:
+    candidates: list[Path] = [
+        run_root,
+        run_root / "_meta",
+        run_root / "input",
+        run_root / "output",
+        run_root / "workspace",
+        run_root / "ws",
+        run_root / "config.json",
+        run_root / "run.log",
+    ]
+    atomic_text = str(atomic_work_path or "").strip()
+    if atomic_text:
+        atomic = Path(atomic_text)
+        candidates.extend([
+            atomic,
+            atomic / "_meta",
+            atomic / "_meta" / "review_summaries",
+            atomic / "_meta" / "review_feedback",
+            atomic / "_meta" / "cycle_metrics",
+            atomic / "_meta" / "summary_snapshots",
+            atomic / "results",
+            atomic / "final_output",
+            atomic / "final_output" / "results",
+            atomic / "reviews",
+            atomic / "sessions",
+            atomic / "supporting_docs",
+            atomic / "removed_results",
+            atomic / "output",
+            atomic / "working",
+            atomic / "input",
+        ])
+    latest = 0.0
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if candidate.exists():
+                latest = max(latest, candidate.stat().st_mtime)
+        except OSError:
+            continue
+    return latest
+
+
 def _task_markdown_for_run(run_root: Path) -> str:
     input_manifest = run_root / "input" / "tasks.json"
     payload = _read_json_file(input_manifest)
@@ -162,6 +210,10 @@ def _history_run_needs_parser_resync(record: HistoryRun) -> bool:
         return not Path(atomic_work_path).is_dir()
     except Exception:
         return True
+
+
+def _history_run_is_active(record: HistoryRun) -> bool:
+    return str(record.status or "").strip().lower() in _ACTIVE_HISTORY_RUN_STATUSES
 
 
 def _effective_legacy_project_id(project_id: str) -> str:
@@ -459,8 +511,22 @@ class HistoryRunService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"run root not found: {run_root}")
 
         source_key = str(run_root)
-        source_mtime = _compute_source_mtime(run_root)
         record = db.query(HistoryRun).filter(HistoryRun.source_key == source_key).first()
+        if record is not None and not _history_run_is_active(record) and not _history_run_needs_parser_resync(record):
+            hint_mtime = _compute_source_mtime_hint(run_root, record.atomic_work_path)
+            if hint_mtime <= float(record.source_mtime or 0):
+                self._refresh_record_bindings(
+                    record,
+                    project_id=project_id,
+                    source_type=source_type,
+                    linked_execution=linked_execution,
+                    linked_task=linked_task,
+                    profile_id=profile_id,
+                )
+                db.add(record)
+                db.flush()
+                return record
+        source_mtime = _compute_source_mtime(run_root)
         if record is not None and record.source_mtime >= source_mtime and not _history_run_needs_parser_resync(record):
             self._refresh_record_bindings(
                 record,
@@ -584,6 +650,10 @@ class HistoryRunService:
         run_root = Path(history_run.run_root_path)
         if not run_root.is_dir():
             return history_run
+        if not _history_run_is_active(history_run) and not _history_run_needs_parser_resync(history_run):
+            hint_mtime = _compute_source_mtime_hint(run_root, history_run.atomic_work_path)
+            if hint_mtime <= float(history_run.source_mtime or 0):
+                return history_run
         current_mtime = _compute_source_mtime(run_root)
         if current_mtime <= float(history_run.source_mtime or 0) and not _history_run_needs_parser_resync(history_run):
             return history_run
@@ -754,6 +824,9 @@ class HistoryRunService:
 
     def list_history_run_sessions(self, db: Session, history_run: HistoryRun) -> list[dict[str, Any]]:
         history_run = self.refresh_history_run(db, history_run)
+        return self._list_history_run_sessions_rows(db, history_run)
+
+    def _list_history_run_sessions_rows(self, db: Session, history_run: HistoryRun) -> list[dict[str, Any]]:
         sessions = (
             db.query(HistoryRunSession)
             .filter(HistoryRunSession.history_run_id == history_run.id)
@@ -775,6 +848,9 @@ class HistoryRunService:
 
     def list_history_run_files(self, db: Session, history_run: HistoryRun, limit: int = 1200) -> list[dict[str, Any]]:
         history_run = self.refresh_history_run(db, history_run)
+        return self._list_history_run_files_rows(db, history_run, limit=limit)
+
+    def _list_history_run_files_rows(self, db: Session, history_run: HistoryRun, limit: int = 1200) -> list[dict[str, Any]]:
         files = (
             db.query(HistoryRunFile)
             .filter(HistoryRunFile.history_run_id == history_run.id)
@@ -807,8 +883,8 @@ class HistoryRunService:
                 "manifests": dict(history_run.manifests_json or {}),
                 "latest_issues": list(history_run.latest_issues_json or []),
                 "atomic_work_path": history_run.atomic_work_path or "",
-                "files": self.list_history_run_files(db, history_run, limit=20000),
-                "sessions": self.list_history_run_sessions(db, history_run),
+                "files": self._list_history_run_files_rows(db, history_run, limit=20000),
+                "sessions": self._list_history_run_sessions_rows(db, history_run),
                 "run_log": history_run.log_tail_text or "",
                 "raw": dict(history_run.raw_summary_json or {}),
             }
