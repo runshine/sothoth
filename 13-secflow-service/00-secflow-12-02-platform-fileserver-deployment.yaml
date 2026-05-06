@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-fileserver
-        image: runshine0819/secflow-platform-fileserver:latest
+        image: runshine0819/secflow-platform-fileserver:20260506
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
