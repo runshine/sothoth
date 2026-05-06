@@ -29,13 +29,6 @@ spec:
                 name: gaiasec-api-gateway
                 port:
                   number: 80
-          - path: /gaiasec/
-            pathType: Prefix
-            backend:
-              service:
-                name: gaiasec-api-gateway
-                port:
-                  number: 80
           - path: /
             pathType: Prefix
             backend:
