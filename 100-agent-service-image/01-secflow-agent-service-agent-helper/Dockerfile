@@ -103,7 +103,8 @@ RUN set -eux; \
     test -x /usr/local/bin/claude-a2a; \
     test -x /usr/local/bin/codex; \
     test -x /usr/local/bin/opencode; \
-    echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; 
+    echo 'export PATH=/root/.local/bin:$PATH' >> /root/.bashrc; \
+    curl -fsSL https://openclaw.ai/install.sh | bash
 
 # 创建 code-server 配置目录
 RUN mkdir -p /root/.config/code-server && \

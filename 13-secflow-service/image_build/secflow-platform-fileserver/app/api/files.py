@@ -1085,6 +1085,7 @@ async def create_project_filesystem_directory(
 async def upload_project_filesystem_file(
     project_id: str = Form(...),
     path: str = Form("/"),
+    overwrite: bool = Form(False),
     file: UploadFile = File(...),
     current_user: TokenUser = Depends(get_current_user),
     authorization: Optional[str] = Header(None),
@@ -1098,7 +1099,10 @@ async def upload_project_filesystem_file(
     filename = sanitize_name(file.filename or "upload.bin")
     destination_path = os.path.join(target_directory_path, filename)
     if os.path.lexists(destination_path):
-        raise ConflictError(f"目录下已存在同名文件: {filename}")
+        if os.path.isdir(destination_path):
+            raise ConflictError(f"目标路径已存在目录，无法覆盖: {filename}")
+        if not overwrite:
+            raise ConflictError(f"目录下已存在同名文件: {filename}")
 
     config = get_config()
     temp_path, _, _ = await persist_upload(file, config.storage.temp_dir)
