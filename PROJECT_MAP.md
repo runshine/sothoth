@@ -64,7 +64,6 @@
 - `secflow-platform-agent`: Agent 平台服务
 - `secflow-platform-static-binary`: 静态二进制管理服务
 - `secflow-app-code-server`: code-server 管理应用
-- `secflow-app-secmate-ng`: secmate-ng 集成应用
 - `secflow-platform-skill-shop`: 当前目录存在，但本轮未看到明确代码主体
 
 ## 5. 技术栈总览
@@ -97,7 +96,6 @@
 - `secflow-platform-workflow`
 - `secflow-platform-workflow-status`
 - `secflow-app-code-server`
-- `secflow-app-secmate-ng`
 
 已确认使用 Flask 的模块：
 
@@ -281,13 +279,11 @@
 目录：
 
 - [secflow-app-code-server](/home/runshine/CLionProjects/sothoth/13-secflow-service/image_build/secflow-app-code-server)
-- [secflow-app-secmate-ng](/home/runshine/CLionProjects/sothoth/13-secflow-service/image_build/secflow-app-secmate-ng)
 
 职责：
 
 - 这类模块更像平台集成应用，不是纯平台基础服务
 - `code-server` 模块用于在线 VSCode Web 实例创建、销毁、重建和日志管理
-- `secmate-ng` 模块用于接入 secmate-ng 能力
 
 ## 8. 常见联调入口
 
