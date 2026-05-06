@@ -141,6 +141,13 @@ spec:
                 name: secflow-app-dataflow-vuln-scanner
                 port:
                   number: 80
+          - path: /api/app/binary-to-source
+            pathType: Prefix
+            backend:
+              service:
+                name: secflow-app-binary-to-source-manager
+                port:
+                  number: 80
           - path: /api/app/code-server
             pathType: Prefix
             backend:
