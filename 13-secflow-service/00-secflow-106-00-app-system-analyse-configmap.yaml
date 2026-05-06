@@ -124,7 +124,7 @@ data:
         id: "app-system-analyse"
         path: "/app/system-analyse"
         icon: "scan-search"
-        order: 103
+        order: 106
         level1:
           name: "应用工具"
           name_en: "App Tools"
