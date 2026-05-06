@@ -17,15 +17,15 @@ venv/
 .env.*
 
 # Large/generated artifacts
-runs/
-output/
-workspace/
+/runs/
+/output/
+/workspace/
 results_archive.tar.gz
 *.tar.gz
 
 # Tests and local tooling
 .pytest_cache/
-tests/
+/tests/
 
 # Editor files
 .vscode/
@@ -34,4 +34,4 @@ tests/
 *.swo
 
 # Docker local inputs (mounted at runtime)
-docker/input/
+/docker/input/

@@ -1,10 +1,10 @@
-.venv/
-.pytest_cache/
+/.venv/
+/.pytest_cache/
 __pycache__/
 *.pyc
 .env
-runs/
-output/
-workspace/
+/runs/
+/output/
+/workspace/
 .docker-pi-home/
 pi-session-*.html
