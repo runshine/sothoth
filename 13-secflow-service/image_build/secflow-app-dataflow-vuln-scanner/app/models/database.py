@@ -27,7 +27,7 @@ class WorkflowDefinition(Base):
     id = Column(String(64), primary_key=True)
     name = Column(String(128), nullable=False)
     description = Column(Text)
-    project_id = Column(String(64), nullable=False, index=True)
+    project_id = Column(String(64), nullable=False)
     template_kind = Column(String(64), nullable=False, default="vuln_scan_default")
     config_payload_json = Column(JSON, nullable=False, default=dict)
     definition_json = Column(JSON, nullable=False)
@@ -52,7 +52,7 @@ class WorkflowDefinitionVersion(Base):
     __tablename__ = _prefix("workflow_definition_version")
 
     id = Column(String(64), primary_key=True)
-    workflow_definition_id = Column(String(64), ForeignKey(f"{WorkflowDefinition.__tablename__}.id"), nullable=False, index=True)
+    workflow_definition_id = Column(String(64), ForeignKey(f"{WorkflowDefinition.__tablename__}.id"), nullable=False)
     version_no = Column(Integer, nullable=False)
     config_payload_json = Column(JSON, nullable=False, default=dict)
     compiled_config_json = Column(JSON, nullable=False, default=dict)
@@ -65,18 +65,18 @@ class TriggerTask(Base):
     __tablename__ = _prefix("trigger_task")
 
     id = Column(String(64), primary_key=True)
-    workflow_definition_id = Column(String(64), ForeignKey(f"{WorkflowDefinition.__tablename__}.id"), nullable=False, index=True)
-    workflow_definition_version_id = Column(String(64), ForeignKey(f"{WorkflowDefinitionVersion.__tablename__}.id"), nullable=True, index=True)
-    profile_id = Column(String(64), nullable=True, index=True)
-    project_id = Column(String(64), nullable=False, index=True)
+    workflow_definition_id = Column(String(64), ForeignKey(f"{WorkflowDefinition.__tablename__}.id"), nullable=False)
+    workflow_definition_version_id = Column(String(64), ForeignKey(f"{WorkflowDefinitionVersion.__tablename__}.id"), nullable=True)
+    profile_id = Column(String(64), nullable=True)
+    project_id = Column(String(64), nullable=False)
     trigger_type = Column(String(16), nullable=False, default="manual")
     input_tasks_json = Column(JSON, nullable=False)
     priority = Column(Integer, nullable=False, default=100)
-    status = Column(String(32), nullable=False, default="pending", index=True)
+    status = Column(String(32), nullable=False, default="pending")
     submitted_by = Column(String(128), nullable=False)
     retry_count = Column(Integer, nullable=False, default=0)
     max_retry_count = Column(Integer, nullable=False, default=3)
-    latest_execution_id = Column(String(64), nullable=True, index=True)
+    latest_execution_id = Column(String(64), nullable=True)
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     message = Column(Text)
@@ -88,20 +88,20 @@ class WorkflowExecution(Base):
     __tablename__ = _prefix("workflow_execution")
 
     id = Column(String(64), primary_key=True)
-    trigger_task_id = Column(String(64), ForeignKey(f"{TriggerTask.__tablename__}.id"), nullable=False, index=True)
-    workflow_definition_id = Column(String(64), ForeignKey(f"{WorkflowDefinition.__tablename__}.id"), nullable=False, index=True)
-    workflow_definition_version_id = Column(String(64), ForeignKey(f"{WorkflowDefinitionVersion.__tablename__}.id"), nullable=True, index=True)
-    project_id = Column(String(64), nullable=False, index=True)
+    trigger_task_id = Column(String(64), ForeignKey(f"{TriggerTask.__tablename__}.id"), nullable=False)
+    workflow_definition_id = Column(String(64), ForeignKey(f"{WorkflowDefinition.__tablename__}.id"), nullable=False)
+    workflow_definition_version_id = Column(String(64), ForeignKey(f"{WorkflowDefinitionVersion.__tablename__}.id"), nullable=True)
+    project_id = Column(String(64), nullable=False)
     attempt_no = Column(Integer, nullable=False, default=1)
-    status = Column(String(32), nullable=False, default="pending", index=True)
+    status = Column(String(32), nullable=False, default="pending")
     recovery_reason = Column(String(255))
     workspace_root = Column(String(1024))
     output_manifest_path = Column(String(1024))
     output_task_count = Column(Integer, nullable=False, default=0)
     current_stage_id = Column(String(128))
-    owner_pod_id = Column(String(128), index=True)
+    owner_pod_id = Column(String(128))
     lease_token = Column(String(128))
-    lease_expires_at = Column(DateTime, index=True)
+    lease_expires_at = Column(DateTime)
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     message = Column(Text)
@@ -113,14 +113,14 @@ class WorkflowExecutionEvent(Base):
     __tablename__ = _prefix("workflow_execution_event")
 
     id = Column(String(64), primary_key=True)
-    execution_id = Column(String(64), ForeignKey(f"{WorkflowExecution.__tablename__}.id"), nullable=False, index=True)
-    event_type = Column(String(64), nullable=False, index=True)
+    execution_id = Column(String(64), ForeignKey(f"{WorkflowExecution.__tablename__}.id"), nullable=False)
+    event_type = Column(String(64), nullable=False)
     stage_id = Column(String(128))
     round_no = Column(Integer)
     level = Column(String(16), nullable=False, default="info")
     message = Column(Text, nullable=False)
     payload_json = Column(JSON)
-    created_at = Column(DateTime, default=now_utc, index=True)
+    created_at = Column(DateTime, default=now_utc)
 
 
 class SchedulerWorker(Base):
@@ -130,18 +130,51 @@ class SchedulerWorker(Base):
     host_name = Column(String(256), nullable=False)
     capacity = Column(Integer, nullable=False, default=1)
     running_count = Column(Integer, nullable=False, default=0)
-    last_heartbeat_at = Column(DateTime, default=now_utc, index=True)
-    status = Column(String(16), nullable=False, default="active", index=True)
+    last_heartbeat_at = Column(DateTime, default=now_utc)
+    status = Column(String(16), nullable=False, default="active")
     metadata_json = Column(JSON)
     created_at = Column(DateTime, default=now_utc)
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
-Index(f"ix_{WorkflowExecution.__tablename__}_definition_status", WorkflowExecution.workflow_definition_id, WorkflowExecution.status)
-Index(f"ix_{WorkflowExecution.__tablename__}_trigger_attempt", WorkflowExecution.trigger_task_id, WorkflowExecution.attempt_no, unique=True)
-Index(f"ix_{TriggerTask.__tablename__}_definition_status", TriggerTask.workflow_definition_id, TriggerTask.status)
-Index(f"ix_{WorkflowDefinition.__tablename__}_project_default", WorkflowDefinition.project_id, WorkflowDefinition.is_default)
-Index(f"ix_{WorkflowDefinitionVersion.__tablename__}_definition_version", WorkflowDefinitionVersion.workflow_definition_id, WorkflowDefinitionVersion.version_no, unique=True)
+INDEX_DEFINITIONS = [
+    (WorkflowDefinition.__tablename__, "ix_dfvs_wfd_project", "CREATE INDEX ix_dfvs_wfd_project ON {table} (project_id)"),
+    (WorkflowDefinition.__tablename__, "ix_dfvs_wfd_project_default", "CREATE INDEX ix_dfvs_wfd_project_default ON {table} (project_id, is_default)"),
+    (WorkflowDefinitionVersion.__tablename__, "ix_dfvs_wfdv_def", "CREATE INDEX ix_dfvs_wfdv_def ON {table} (workflow_definition_id)"),
+    (WorkflowDefinitionVersion.__tablename__, "ux_dfvs_wfdv_def_ver", "CREATE UNIQUE INDEX ux_dfvs_wfdv_def_ver ON {table} (workflow_definition_id, version_no)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_def", "CREATE INDEX ix_dfvs_task_def ON {table} (workflow_definition_id)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_defver", "CREATE INDEX ix_dfvs_task_defver ON {table} (workflow_definition_version_id)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_profile", "CREATE INDEX ix_dfvs_task_profile ON {table} (profile_id)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_project", "CREATE INDEX ix_dfvs_task_project ON {table} (project_id)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_status", "CREATE INDEX ix_dfvs_task_status ON {table} (status)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_latest_exec", "CREATE INDEX ix_dfvs_task_latest_exec ON {table} (latest_execution_id)"),
+    (TriggerTask.__tablename__, "ix_dfvs_task_def_status", "CREATE INDEX ix_dfvs_task_def_status ON {table} (workflow_definition_id, status)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_task", "CREATE INDEX ix_dfvs_exec_task ON {table} (trigger_task_id)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_def", "CREATE INDEX ix_dfvs_exec_def ON {table} (workflow_definition_id)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_defver", "CREATE INDEX ix_dfvs_exec_defver ON {table} (workflow_definition_version_id)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_project", "CREATE INDEX ix_dfvs_exec_project ON {table} (project_id)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_status", "CREATE INDEX ix_dfvs_exec_status ON {table} (status)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_owner", "CREATE INDEX ix_dfvs_exec_owner ON {table} (owner_pod_id)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_lease", "CREATE INDEX ix_dfvs_exec_lease ON {table} (lease_expires_at)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_def_status", "CREATE INDEX ix_dfvs_exec_def_status ON {table} (workflow_definition_id, status)"),
+    (WorkflowExecution.__tablename__, "ux_dfvs_exec_task_attempt", "CREATE UNIQUE INDEX ux_dfvs_exec_task_attempt ON {table} (trigger_task_id, attempt_no)"),
+    (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_exec", "CREATE INDEX ix_dfvs_event_exec ON {table} (execution_id)"),
+    (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_type", "CREATE INDEX ix_dfvs_event_type ON {table} (event_type)"),
+    (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_created", "CREATE INDEX ix_dfvs_event_created ON {table} (created_at)"),
+    (SchedulerWorker.__tablename__, "ix_dfvs_worker_heartbeat", "CREATE INDEX ix_dfvs_worker_heartbeat ON {table} (last_heartbeat_at)"),
+    (SchedulerWorker.__tablename__, "ix_dfvs_worker_status", "CREATE INDEX ix_dfvs_worker_status ON {table} (status)"),
+]
+
+for table_name, index_name, sql_template in INDEX_DEFINITIONS:
+    table = next(
+        cls.__table__
+        for cls in [WorkflowDefinition, WorkflowDefinitionVersion, TriggerTask, WorkflowExecution, WorkflowExecutionEvent, SchedulerWorker]
+        if cls.__tablename__ == table_name
+    )
+    columns_sql = sql_template.split("(", 1)[1].rsplit(")", 1)[0]
+    column_names = [column.strip() for column in columns_sql.split(",")]
+    columns = [getattr(table.c, column_name) for column_name in column_names]
+    Index(index_name, *columns, unique=sql_template.startswith("CREATE UNIQUE INDEX"))
 
 
 def get_engine():
@@ -209,9 +242,8 @@ def run_auto_migrations() -> None:
         (tables["workflow_execution"], "recovery_reason", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN recovery_reason VARCHAR(255) NULL"),
     ]
     index_migrations = [
-        (tables["workflow_definition"], f"ix_{WorkflowDefinition.__tablename__}_project_default", f"CREATE INDEX ix_{WorkflowDefinition.__tablename__}_project_default ON {tables['workflow_definition']} (project_id, is_default)"),
-        (tables["workflow_definition_version"], f"ix_{WorkflowDefinitionVersion.__tablename__}_definition_version", f"CREATE UNIQUE INDEX ix_{WorkflowDefinitionVersion.__tablename__}_definition_version ON {tables['workflow_definition_version']} (workflow_definition_id, version_no)"),
-        (tables["workflow_execution"], f"ix_{WorkflowExecution.__tablename__}_trigger_attempt", f"CREATE UNIQUE INDEX ix_{WorkflowExecution.__tablename__}_trigger_attempt ON {tables['workflow_execution']} (trigger_task_id, attempt_no)"),
+        (table_name, index_name, sql_template.format(table=table_name))
+        for table_name, index_name, sql_template in INDEX_DEFINITIONS
     ]
 
     with engine.begin() as connection:
