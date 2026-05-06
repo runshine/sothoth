@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskResponse, TokenUser
+from app.schemas import ActionResponse, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
 from app.service.auth import get_auth_service
 from app.service.project import get_project_service
 from app.service.security import validate_project_id
@@ -20,6 +20,7 @@ from app.service.task_service import (
     get_task_or_404,
     retry_task,
     sync_task,
+    generate_task_id,
     terminate_task,
 )
 
@@ -64,6 +65,15 @@ async def list_tasks(
         tasks = [task for task in tasks if task.status == status]
     items = [build_task_response(db, task) for task in tasks]
     return TaskListResponse(total=len(items), items=items)
+
+
+@router.post("/projects/{project_id}/tasks/prepare", response_model=TaskPrepareResponse)
+async def prepare_b2s_task(
+    project_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return TaskPrepareResponse(task_id=generate_task_id(db, project_id))
 
 
 @router.post("/projects/{project_id}/tasks", response_model=TaskResponse)

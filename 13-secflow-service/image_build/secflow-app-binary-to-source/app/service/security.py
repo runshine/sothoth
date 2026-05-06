@@ -10,12 +10,19 @@ from app.config import get_config
 from app.exception import ValidationError
 
 PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+TASK_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
 def validate_project_id(project_id: str) -> str:
     if not PROJECT_ID_RE.fullmatch(project_id or ""):
         raise ValidationError("project_id格式不合法")
     return project_id
+
+
+def validate_task_id(task_id: str) -> str:
+    if not TASK_ID_RE.fullmatch(task_id or ""):
+        raise ValidationError("task_id格式不合法")
+    return task_id
 
 
 def project_root(project_id: str) -> Path:
@@ -33,16 +40,34 @@ def ensure_path_in_project(project_id: str, path: str, *, must_be_file: bool = F
     return resolved
 
 
-def safe_output_dir(project_id: str, task_id: str, sequence_no: int, output_subdir: str | None = None) -> Path:
+def app_task_item_root(project_id: str, task_id: str, sequence_no: int) -> Path:
+    validate_task_id(task_id)
+    if sequence_no < 1:
+        raise ValidationError("sequence_no必须大于0")
     root = project_root(project_id)
-    parts = [get_config().storage.output_root_name, task_id]
+    cfg = get_config().storage
+    app_root_parts = _clean_relative(cfg.app_root_name).split("/") if cfg.app_root_name else []
+    out = root.joinpath(*app_root_parts, task_id, str(sequence_no)).resolve()
+    if not out.is_relative_to(root):
+        raise ValidationError("B2S任务目录不合法")
+    return out
+
+
+def safe_input_dir(project_id: str, task_id: str, sequence_no: int) -> Path:
+    out = app_task_item_root(project_id, task_id, sequence_no).joinpath("input").resolve()
+    if not out.is_relative_to(project_root(project_id)):
+        raise ValidationError("输入目录不合法")
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def safe_output_dir(project_id: str, task_id: str, sequence_no: int, output_subdir: str | None = None) -> Path:
+    out = app_task_item_root(project_id, task_id, sequence_no).joinpath("output").resolve()
     if output_subdir:
         cleaned = _clean_relative(output_subdir)
         if cleaned:
-            parts.extend(cleaned.split("/"))
-    parts.append(str(sequence_no))
-    out = root.joinpath(*parts).resolve()
-    if not out.is_relative_to(root):
+            out = out.joinpath(*cleaned.split("/")).resolve()
+    if not out.is_relative_to(project_root(project_id)):
         raise ValidationError("输出目录不合法")
     os.makedirs(out, exist_ok=True)
     return out

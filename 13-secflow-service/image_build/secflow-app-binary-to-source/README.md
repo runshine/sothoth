@@ -84,14 +84,16 @@ registry:
 ```yaml
 storage:
   project_root_template: "/data/files/{project_id}"
+  app_root_name: "app/secflow-app-binary-to-source"
   output_root_name: "binary-to-source-outputs"
 ```
 
 服务会要求：
 
 ```text
-elf_path 必须在 /data/files/{project_id} 下
-output_dir 自动创建在 /data/files/{project_id}/binary-to-source-outputs/{task_id}/{sequence_no}
+请求中的 elf_path 必须在 /data/files/{project_id} 下
+B2S 会把输入 ELF 复制到 /data/files/{project_id}/app/secflow-app-binary-to-source/{task_id}/{sequence_no}/input
+output_dir 自动创建在 /data/files/{project_id}/app/secflow-app-binary-to-source/{task_id}/{sequence_no}/output
 ```
 
 因此 pi-re-agent 建议挂载同一份 `/data` 存储，并设置：
@@ -106,8 +108,8 @@ PI_RE_ALLOWED_DIRS=/data/files
 
 ```json
 {
-  "target": "/data/files/<project_id>/.../demo.elf",
-  "output_dir": "/data/files/<project_id>/binary-to-source-outputs/<task_id>/1",
+  "target": "/data/files/<project_id>/app/secflow-app-binary-to-source/<task_id>/1/input/demo.elf",
+  "output_dir": "/data/files/<project_id>/app/secflow-app-binary-to-source/<task_id>/1/output",
   "batch_size": 8192,
   "max_retries": 3,
   "model": "share_codex/gpt-5.4",

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
@@ -14,7 +16,7 @@ from app.model import B2STask, B2STaskItem
 from app.schemas import B2SOverallProgress, TaskCreate, TaskDetailResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
-from app.service.security import ensure_path_in_project, safe_output_dir
+from app.service.security import ensure_path_in_project, safe_input_dir, safe_output_dir, validate_task_id
 
 TERMINAL = {"success", "failed", "cancelled"}
 PI_STATUS_MAP = {
@@ -45,12 +47,35 @@ PHASE_LABELS = {
 }
 
 
+def generate_task_id(db: Session, project_id: str) -> str:
+    for _ in range(10):
+        task_id = uuid4().hex[:16]
+        exists = db.query(B2STask.id).filter(B2STask.project_id == project_id, B2STask.id == task_id).first()
+        if not exists:
+            return task_id
+    raise ConflictError("无法生成唯一B2S任务ID，请重试")
+
+
+def prepare_input_file(project_id: str, task_id: str, sequence_no: int, source_path: Path) -> Path:
+    input_dir = safe_input_dir(project_id, task_id, sequence_no)
+    target_path = input_dir.joinpath(source_path.name).resolve()
+    if not target_path.is_relative_to(input_dir):
+        raise ValidationError("输入文件路径不合法")
+    if source_path.resolve() != target_path:
+        shutil.copy2(source_path, target_path)
+    return target_path
+
+
 async def create_task(db: Session, project_id: str, req: TaskCreate, created_by: str | None) -> TaskResponse:
     if not req.elf_tasks:
         raise ValidationError("elf_tasks不能为空")
 
+    task_id = validate_task_id(req.task_id) if req.task_id else generate_task_id(db, project_id)
+    if db.query(B2STask).filter(B2STask.project_id == project_id, B2STask.id == task_id).first():
+        raise ConflictError("B2S任务ID已存在")
+
     task = B2STask(
-        id=uuid4().hex[:16],
+        id=task_id,
         project_id=project_id,
         name=req.name,
         description=req.description,
@@ -66,16 +91,22 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     job_model = await resolve_job_model()
     client = get_pi_client()
     for idx, elf in enumerate(req.elf_tasks, start=1):
+        source_elf_path = ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)
+        input_elf_path = prepare_input_file(project_id, task.id, idx, source_elf_path)
         item = B2STaskItem(
             id=uuid4().hex[:16],
             task_id=task.id,
             project_id=project_id,
             sequence_no=idx,
-            elf_path=str(ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)),
+            elf_path=str(input_elf_path),
             output_dir=str(safe_output_dir(project_id, task.id, idx, elf.output_subdir)),
             status="pending",
         )
-        item.extra_metadata = {**(elf.metadata or {}), "file_list": elf.file_list or []}
+        item.extra_metadata = {
+            **(elf.metadata or {}),
+            "file_list": elf.file_list or [],
+            "source_elf_path": str(source_elf_path),
+        }
         item.phase = "queued"
         item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
         db.add(item)

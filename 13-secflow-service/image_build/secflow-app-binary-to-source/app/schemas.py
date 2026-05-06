@@ -22,6 +22,7 @@ class ElfTaskInput(BaseModel):
 
 
 class TaskCreate(BaseModel):
+    task_id: Optional[str] = None
     name: str
     description: Optional[str] = None
     priority: int = 5
@@ -107,6 +108,10 @@ class TaskDetailResponse(TaskResponse):
 class TaskListResponse(BaseModel):
     total: int
     items: list[TaskResponse]
+
+
+class TaskPrepareResponse(BaseModel):
+    task_id: str
 
 
 class ActionResponse(BaseModel):
