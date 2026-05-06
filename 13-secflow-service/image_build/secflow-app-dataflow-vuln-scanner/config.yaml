@@ -1,0 +1,75 @@
+app:
+  host: 0.0.0.0
+  port: 8080
+  debug: false
+
+database:
+  host: 127.0.0.1
+  port: 3306
+  username: secflow
+  password: secflow
+  name: secflow
+  table_prefix: secflow_dataflow_vuln_scanner_
+
+auth_service:
+  enabled: false
+  host: secflow-platform-auth
+  port: 80
+  validate_human_token_path: /api/auth/validate-human-token
+  validate_machine_token_path: /api/auth/validate-token
+  timeout: 10
+
+project_service:
+  enabled: false
+  host: secflow-platform-project
+  port: 80
+  get_project_path: /api/project
+  health_path: /api/project/health
+  timeout: 10
+
+fileserver_service:
+  enabled: true
+  base_url: http://secflow-platform-fileserver/api/fileserver
+  timeout: 10
+  data_mount_path: /data
+  project_files_dirname: files
+  aiwf_subproject_name: DATAFLOW_VULN_SCANNER
+
+registry:
+  enabled: false
+  menu_service_url: http://secflow-platform-menu
+  service_id: secflow-app-dataflow-vuln-scanner
+  service_name: 数据流漏洞挖掘服务
+  host: secflow-app-dataflow-vuln-scanner
+  port: 80
+  maturity: 开发中
+  description: 提供数据流漏洞挖掘任务下发、Profile配置、调度执行与状态查询能力
+  api_prefix: /api/dataflow-vuln-scanner
+  menu:
+    id: dataflow-vuln-scanner
+    path: /dataflow-vuln-scanner
+    icon: scan-search
+    order: 36
+    level1_name: 执行
+    level2_name: 二进制安全测试
+    level3_name: 数据流漏洞挖掘
+
+service:
+  workspace_base_dir: /data/files
+  default_execution_timeout_seconds: 7200
+  execution_cancel_check_interval_seconds: 1
+  trigger_retry_limit: 3
+  public_api_prefix: /api/dataflow-vuln-scanner
+  legacy_api_prefix: /api/ai-agent-framework
+  default_entry_task_type: package_list
+  default_artifact_subdir: assets
+  default_profile_template_kind: vuln_scan_default
+
+scheduler:
+  enabled: true
+  worker_capacity: 2
+  poll_interval_seconds: 1
+  heartbeat_interval_seconds: 2
+  worker_timeout_seconds: 10
+  lease_duration_seconds: 15
+  cleanup_interval_seconds: 5
