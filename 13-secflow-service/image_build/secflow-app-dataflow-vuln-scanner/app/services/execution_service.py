@@ -314,6 +314,48 @@ class ExecutionService:
         ensure_dir(target_path)
         shutil.copytree(source_path, target_path, dirs_exist_ok=True)
 
+    def _resolve_custom_execution_paths(
+        self,
+        *,
+        project_id: str,
+        metadata: Dict[str, Any],
+        execution_id: str,
+    ) -> tuple[Path | None, Path | None]:
+        request = metadata.get("dataflow_scan_request")
+        if not isinstance(request, dict):
+            return None, None
+
+        workspace_ref = request.get("workspace_dir")
+        output_ref = request.get("output_dir")
+        if workspace_ref is None and output_ref is None:
+            return None, None
+        if not isinstance(workspace_ref, dict) or not isinstance(output_ref, dict):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="workspace_dir and output_dir must be valid directory refs",
+            )
+
+        workspace_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=workspace_ref, expected="workspace_dir")
+        output_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=output_ref, expected="output_dir")
+        if not workspace_base.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {workspace_base}")
+        if not output_base.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {output_base}")
+
+        workspace_base = workspace_base.resolve()
+        output_base = output_base.resolve()
+        try:
+            output_relative = output_base.relative_to(workspace_base)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="output_dir must be inside workspace_dir",
+            ) from exc
+
+        workspace_root = ensure_dir(workspace_base / sanitize_name(execution_id))
+        output_dir = ensure_dir(workspace_root / output_relative)
+        return workspace_root, output_dir
+
     def _materialize_dataflow_scan_inputs(self, *, task_input_dir: Path, metadata: Dict[str, Any]) -> tuple[str | None, Dict[str, Any]]:
         request = metadata.get("dataflow_scan_request")
         if not isinstance(request, dict):
@@ -321,11 +363,29 @@ class ExecutionService:
         project_id = str(request.get("project_id") or "").strip()
         data_flow_ref = request.get("data_flow")
         source_dir_ref = request.get("source_dir")
+        workspace_ref = request.get("workspace_dir")
+        output_ref = request.get("output_dir")
         if not project_id or not isinstance(data_flow_ref, dict) or not isinstance(source_dir_ref, dict):
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="dataflow scan request is incomplete")
 
         source_data_flow = self._resolve_dataflow_input_ref(project_id=project_id, ref=data_flow_ref, expected="data_flow")
         source_source_dir = self._resolve_dataflow_input_ref(project_id=project_id, ref=source_dir_ref, expected="source_dir")
+        workspace_base = None
+        output_base = None
+        if workspace_ref is not None:
+            if not isinstance(workspace_ref, dict):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="workspace_dir ref is invalid")
+            workspace_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=workspace_ref, expected="workspace_dir")
+            if not workspace_base.is_dir():
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {workspace_base}")
+        if output_ref is not None:
+            if not isinstance(output_ref, dict):
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="output_dir ref is invalid")
+            output_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=output_ref, expected="output_dir")
+            if not output_base.is_dir():
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {output_base}")
+        if workspace_base is not None and output_base is not None:
+            self._ensure_path_within(path=output_base, root=workspace_base, label="output_dir")
         scan_input_dir = ensure_dir(task_input_dir / "dataflow_scan")
         data_flow_name = sanitize_name(str(data_flow_ref.get("filename") or source_data_flow.name or "data_flow.md"))
         data_flow_target = scan_input_dir / "data_flow" / data_flow_name
@@ -343,6 +403,12 @@ class ExecutionService:
             "original_source_dir": source_dir_ref,
             "options": request.get("options") or {},
         }
+        if workspace_base is not None:
+            materialized["workspace_dir"] = abs_path(workspace_base)
+            materialized["original_workspace_dir"] = workspace_ref
+        if output_base is not None:
+            materialized["output_dir"] = abs_path(output_base)
+            materialized["original_output_dir"] = output_ref
         write_json(scan_input_dir / "input_manifest.json", materialized)
         return generated_markdown, materialized
 
@@ -509,16 +575,24 @@ class ExecutionService:
             .count()
         ) + 1
         execution_id = _new_id("exec")
-        workspace_root = self._build_project_workspace_root(
-            definition=definition,
-            trigger_id=trigger.id,
-            execution_id=execution_id,
-            authorization_token=authorization_token,
-            created_by=actor,
-        )
         manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        raw_input_tasks = self._input_tasks_from_manifest(manifest)
+        primary_metadata = dict(raw_input_tasks[0].metadata or {}) if raw_input_tasks else {}
+        workspace_root, _ = self._resolve_custom_execution_paths(
+            project_id=definition.project_id,
+            metadata=primary_metadata,
+            execution_id=execution_id,
+        )
+        if workspace_root is None:
+            workspace_root = self._build_project_workspace_root(
+                definition=definition,
+                trigger_id=trigger.id,
+                execution_id=execution_id,
+                authorization_token=authorization_token,
+                created_by=actor,
+            )
         normalized_tasks = self._normalize_trigger_tasks(
-            input_tasks=self._input_tasks_from_manifest(manifest),
+            input_tasks=raw_input_tasks,
             workspace_root=workspace_root,
             entry_input_task_type=validated_definition.resolve_entry_input_task_type(),
         )
@@ -630,7 +704,7 @@ class ExecutionService:
         self._ensure_project_access(principal, payload.project_id)
         workflow_service = get_workflow_service()
         definition = (
-            workflow_service.get_default_profile_model(db, payload.project_id, principal)
+            workflow_service.get_or_create_default_profile_model(db, payload.project_id, principal)
             if not payload.profile_id
             else workflow_service._get_definition_or_404(db, payload.profile_id)
         )
@@ -663,8 +737,10 @@ class ExecutionService:
         if payload.data_flow and payload.source_dir:
             metadata["dataflow_scan_request"] = {
                 "project_id": payload.project_id,
+                "workspace_dir": payload.workspace_dir.model_dump(mode="json") if payload.workspace_dir else None,
                 "data_flow": payload.data_flow.model_dump(mode="json"),
                 "source_dir": payload.source_dir.model_dump(mode="json"),
+                "output_dir": payload.output_dir.model_dump(mode="json") if payload.output_dir else None,
                 "model": payload.model,
                 "provider": payload.provider,
                 "thinking": payload.thinking,
@@ -1175,14 +1251,25 @@ class ExecutionService:
                 payload_json={"workspace_root": str(workspace_root), "owner_pod_id": execution.owner_pod_id},
             )
             service_manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+            task_metadata = dict(service_manifest.tasks[0].metadata or {}) if service_manifest.tasks else {}
+            custom_workspace_root, custom_output_dir = self._resolve_custom_execution_paths(
+                project_id=definition.project_id,
+                metadata=task_metadata,
+                execution_id=execution.id,
+            )
+            if custom_workspace_root is not None:
+                workspace_root = custom_workspace_root
+                execution.workspace_root = abs_path(workspace_root)
+                db.add(execution)
+                db.commit()
             runtime_config = build_runtime_framework_config(
                 compiled_config,
                 workspace_root=abs_path(workspace_root),
                 execution_id=execution.id,
                 input_task_file=service_manifest.tasks[0].task_md_path,
                 input_task_id=service_manifest.tasks[0].task_id,
-                output_dir=abs_path(workspace_root / "output"),
-                summary_file=abs_path(workspace_root / "output" / "execution_summary.json"),
+                output_dir=abs_path(custom_output_dir or (workspace_root / "output")),
+                summary_file=abs_path((custom_output_dir or (workspace_root / "output")) / "execution_summary.json"),
                 runtime_mode="rest_service",
             )
             write_json(workspace_root / "config.json", runtime_config.model_dump(mode="json"))

@@ -98,8 +98,10 @@ class ScanTaskCreateRequest(BaseModel):
     profile_id: Optional[str] = None
     title: str = Field(..., min_length=1)
     task_markdown: Optional[str] = Field(default=None, min_length=1)
+    workspace_dir: Optional[DataflowInputRef] = None
     data_flow: Optional[DataflowInputRef] = None
     source_dir: Optional[DataflowInputRef] = None
+    output_dir: Optional[DataflowInputRef] = None
     model: Optional[str] = Field(default=None, min_length=1)
     provider: Optional[str] = None
     thinking: Optional[str] = Field(default=None, min_length=1)
@@ -115,6 +117,8 @@ class ScanTaskCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_task_input(self) -> "ScanTaskCreateRequest":
+        if bool(self.workspace_dir) != bool(self.output_dir):
+            raise ValueError("workspace_dir and output_dir must be provided together")
         if self.task_markdown:
             return self
         if self.data_flow and self.source_dir:
