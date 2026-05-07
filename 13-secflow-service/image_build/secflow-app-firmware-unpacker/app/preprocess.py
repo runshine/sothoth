@@ -47,6 +47,20 @@ def detect_format(firmware_path: str) -> dict:
             fmt = "bzip2"
         elif magic[:4] == b"\xfd7zX":
             fmt = "xz"
+        elif magic[:4] == b"\x28\xb5\x2f\xfd":
+            fmt = "zstd"
+        elif magic[:9] == b"\x89LZO\x00\x0d\x0a\x1a\x0a":
+            fmt = "lzop"
+        elif magic[:4] == b"MSCF":
+            fmt = "cab"
+        elif magic[:8] == b"-rom1fs-":
+            fmt = "romfs"
+        elif magic[:4] in (b"\x45\x3d\xcd\x28", b"\x28\xcd\x3d\x45"):
+            fmt = "cramfs"
+        elif magic[:2] in (b"\x85\x19", b"\x19\x85"):
+            fmt = "jffs2"
+        elif magic[:4] == b"UBI#":
+            fmt = "ubi"
         elif magic[:4] == b"\x7fELF":
             fmt = "elf"
         elif magic[:2] == b"MZ":
@@ -67,12 +81,32 @@ def detect_format(firmware_path: str) -> dict:
             fmt = "bzip2"
         elif ext == ".xz":
             fmt = "xz"
+        elif ext in (".zst", ".zstd"):
+            fmt = "zstd"
+        elif ext in (".lzo", ".lzop"):
+            fmt = "lzop"
+        elif ext == ".lzma":
+            fmt = "lzma"
         elif ext in (".squashfs", ".sqfs", ".sfs"):
             fmt = "squashfs"
+        elif ext in (".cramfs", ".crm"):
+            fmt = "cramfs"
+        elif ext in (".romfs", ".rom"):
+            fmt = "romfs"
+        elif ext in (".jffs2", ".jffs"):
+            fmt = "jffs2"
+        elif ext in (".ubi", ".ubiimg"):
+            fmt = "ubi"
+        elif ext in (".ubifs",):
+            fmt = "ubifs"
+        elif ext in (".yaffs", ".yaffs2"):
+            fmt = "yaffs"
         elif ext == ".cpio":
             fmt = "cpio"
         elif ext == ".7z":
             fmt = "7zip"
+        elif ext == ".cab":
+            fmt = "cab"
 
     if fmt in ("gzip", "bzip2", "xz") and ext2 in (".tar.gz", ".tar.bz2", ".tar.xz"):
         fmt = "tar"
@@ -148,6 +182,36 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
         stage_entries.append({"step": "result", "success": True, "method": method})
         _write_stage_log(log_dir, stage_entries)
         return result
+
+    def _stream_decompress(tool: str, shell_cmd: str) -> dict | None:
+        log_event(
+            log,
+            logging.DEBUG,
+            f"[Stage1] trying: {tool}",
+            event="preprocess_try_tool",
+            tool=tool,
+            firmware=firmware_name,
+        )
+        out = os.path.join(output_path, Path(firmware_path).stem)
+        proc = _run(["sh", "-c", shell_cmd.format(src=firmware_path, out=out)])
+        if proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            _record(
+                tool,
+                proc,
+                success=True,
+                extra={"output_file": out, "size": os.path.getsize(out)},
+            )
+            return _success(tool)
+        _record(tool, proc)
+        log_event(
+            log,
+            logging.DEBUG,
+            f"[Stage1] {tool} failed",
+            event="preprocess_tool_fail",
+            tool=tool,
+            returncode=proc.returncode,
+        )
+        return None
 
     if fmt == "tar":
         log_event(
@@ -226,93 +290,34 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
         )
 
     if fmt == "gzip":
-        log_event(
-            log,
-            logging.DEBUG,
-            "[Stage1] trying: gzip -dc",
-            event="preprocess_try_tool",
-            tool="gzip -dc",
-            firmware=firmware_name,
-        )
-        out = os.path.join(output_path, Path(firmware_path).stem)
-        proc = _run(["sh", "-c", f"gzip -dc '{firmware_path}' > '{out}'"])
-        if proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-            _record(
-                "gzip -dc",
-                proc,
-                success=True,
-                extra={"output_file": out, "size": os.path.getsize(out)},
-            )
-            log_event(
-                log,
-                logging.INFO,
-                "[Stage1] gzip -dc succeeded",
-                event="preprocess_tool_success",
-                tool="gzip -dc",
-                output_file=out,
-                size=os.path.getsize(out),
-            )
-            result = {"success": True, "method": "gzip -dc"}
-            stage_entries.append({"step": "result", "success": True, "method": "gzip -dc"})
-            _write_stage_log(log_dir, stage_entries)
+        result = _stream_decompress("gzip -dc", "gzip -dc '{src}' > '{out}'")
+        if result:
             return result
-        _record("gzip -dc", proc)
-        log_event(
-            log,
-            logging.DEBUG,
-            "[Stage1] gzip -dc failed",
-            event="preprocess_tool_fail",
-            tool="gzip -dc",
-            returncode=proc.returncode,
-        )
 
     if fmt == "bzip2":
-        log_event(
-            log,
-            logging.DEBUG,
-            "[Stage1] trying: bzip2 -dc",
-            event="preprocess_try_tool",
-            tool="bzip2 -dc",
-            firmware=firmware_name,
-        )
-        out = os.path.join(output_path, Path(firmware_path).stem)
-        proc = _run(["sh", "-c", f"bzip2 -dc '{firmware_path}' > '{out}'"])
-        if proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-            _record("bzip2 -dc", proc, success=True)
-            return _success("bzip2 -dc")
-        _record("bzip2 -dc", proc)
-        log_event(
-            log,
-            logging.DEBUG,
-            "[Stage1] bzip2 -dc failed",
-            event="preprocess_tool_fail",
-            tool="bzip2 -dc",
-            returncode=proc.returncode,
-        )
+        result = _stream_decompress("bzip2 -dc", "bzip2 -dc '{src}' > '{out}'")
+        if result:
+            return result
 
     if fmt == "xz":
-        log_event(
-            log,
-            logging.DEBUG,
-            "[Stage1] trying: xz -dc",
-            event="preprocess_try_tool",
-            tool="xz -dc",
-            firmware=firmware_name,
-        )
-        out = os.path.join(output_path, Path(firmware_path).stem)
-        proc = _run(["sh", "-c", f"xz -dc '{firmware_path}' > '{out}'"])
-        if proc.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-            _record("xz -dc", proc, success=True)
-            return _success("xz -dc")
-        _record("xz -dc", proc)
-        log_event(
-            log,
-            logging.DEBUG,
-            "[Stage1] xz -dc failed",
-            event="preprocess_tool_fail",
-            tool="xz -dc",
-            returncode=proc.returncode,
-        )
+        result = _stream_decompress("xz -dc", "xz -dc '{src}' > '{out}'")
+        if result:
+            return result
+
+    if fmt == "zstd":
+        result = _stream_decompress("zstd -dc", "zstd -dc '{src}' > '{out}'")
+        if result:
+            return result
+
+    if fmt == "lzop":
+        result = _stream_decompress("lzop -dc", "lzop -dc '{src}' > '{out}'")
+        if result:
+            return result
+
+    if fmt == "lzma":
+        result = _stream_decompress("lzma -dc", "lzma -dc '{src}' > '{out}'")
+        if result:
+            return result
 
     if fmt == "cpio":
         log_event(
@@ -361,6 +366,104 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
             returncode=proc.returncode,
             stderr=proc.stderr[:200],
         )
+
+    if fmt == "cab":
+        log_event(
+            log,
+            logging.DEBUG,
+            "[Stage1] trying: cabextract",
+            event="preprocess_try_tool",
+            tool="cabextract",
+            firmware=firmware_name,
+        )
+        proc = _run(["cabextract", "-d", output_path, firmware_path])
+        if proc.returncode == 0:
+            _record("cabextract", proc, success=True)
+            return _success("cabextract")
+        _record("cabextract", proc)
+
+    if fmt == "jffs2":
+        log_event(
+            log,
+            logging.DEBUG,
+            "[Stage1] trying: jefferson",
+            event="preprocess_try_tool",
+            tool="jefferson",
+            firmware=firmware_name,
+        )
+        proc = _run(["jefferson", "--dest", output_path, firmware_path])
+        if proc.returncode == 0:
+            _record("jefferson", proc, success=True)
+            return _success("jefferson")
+        _record("jefferson", proc)
+
+    if fmt in ("ubi", "ubifs"):
+        for tool_cmd, method in (
+            (["ubireader_extract_images", "-o", output_path, firmware_path], "ubireader_extract_images"),
+            (["ubireader_extract_files", "-o", output_path, firmware_path], "ubireader_extract_files"),
+        ):
+            log_event(
+                log,
+                logging.DEBUG,
+                f"[Stage1] trying: {method}",
+                event="preprocess_try_tool",
+                tool=method,
+                firmware=firmware_name,
+            )
+            proc = _run(tool_cmd)
+            if proc.returncode == 0:
+                _record(method, proc, success=True)
+                return _success(method)
+            _record(method, proc)
+
+    if fmt == "yaffs":
+        log_event(
+            log,
+            logging.DEBUG,
+            "[Stage1] trying: unyaffs",
+            event="preprocess_try_tool",
+            tool="unyaffs",
+            firmware=firmware_name,
+        )
+        proc = _run(["sh", "-c", f"cd '{output_path}' && unyaffs '{firmware_path}'"])
+        if proc.returncode == 0:
+            _record("unyaffs", proc, success=True)
+            return _success("unyaffs")
+        _record("unyaffs", proc)
+
+    if fmt in ("cramfs", "romfs"):
+        for tool_cmd, method in (
+            (["7z", "x", firmware_path, f"-o{output_path}", "-y"], "7z x"),
+            (["binwalk", "-eM", "--directory", output_path, firmware_path], "binwalk -eM"),
+        ):
+            log_event(
+                log,
+                logging.DEBUG,
+                f"[Stage1] trying: {method}",
+                event="preprocess_try_tool",
+                tool=method,
+                firmware=firmware_name,
+            )
+            proc = _run(tool_cmd)
+            if proc.returncode == 0:
+                _record(method, proc, success=True)
+                return _success(method)
+            _record(method, proc)
+
+    if fmt in ("jffs2", "ubi", "ubifs", "yaffs"):
+        log_event(
+            log,
+            logging.DEBUG,
+            "[Stage1] trying: binwalk -eM",
+            event="preprocess_try_tool",
+            tool="binwalk -eM",
+            firmware=firmware_name,
+        )
+        proc = _run(["binwalk", "-eM", "--directory", output_path, firmware_path])
+        if proc.returncode == 0:
+            _record("binwalk -eM", proc, success=True)
+            return _success("binwalk -eM")
+        _record("binwalk -eM", proc)
 
     log_event(
         log,
