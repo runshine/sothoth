@@ -141,6 +141,11 @@ data:
       port: 8080
       debug: false
 
+    # Config Center Service Configuration
+    configcenter_service:
+      base_url: "http://secflow-platform-configcenter/api/configcenter"
+      timeout: 30
+
     # Logging Configuration
     logging:
       level: "INFO"
