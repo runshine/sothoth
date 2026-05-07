@@ -1,6 +1,7 @@
 name: build-secflow-app-system-analyse-image
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'v2.*'
