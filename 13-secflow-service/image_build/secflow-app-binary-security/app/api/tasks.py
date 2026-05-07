@@ -14,6 +14,8 @@ from app.schemas import (
     BinarySecurityArtifactsResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
+    BinarySecurityServiceConfigPayload,
+    BinarySecurityServiceConfigResponse,
     BinarySecurityTaskCreate,
     BinarySecurityUploadCompletePayload,
     BinarySecurityTaskDetailResponse,
@@ -40,6 +42,17 @@ async def get_current_context(project_id: str, authorization: Optional[str] = He
     token = parts[1]
     user = await get_auth_service().validate_token(token)
     await get_project_service().require_access(token, project_id)
+    return TokenUser(**user)
+
+
+async def get_current_user(authorization: Optional[str] = Header(None)) -> TokenUser:
+    if not authorization:
+        raise UnauthorizedError("缺少 Authorization 头")
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise UnauthorizedError("Authorization 格式错误，应为 Bearer <token>")
+    token = parts[1]
+    user = await get_auth_service().validate_token(token)
     return TokenUser(**user)
 
 
@@ -203,3 +216,20 @@ async def put_project_config(
     db: Session = Depends(get_db),
 ):
     return get_task_manager().save_project_config(db, project_id, payload)
+
+
+@router.get("/service/config", response_model=BinarySecurityServiceConfigResponse)
+async def get_service_config(
+    _: TokenUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_service_config(db)
+
+
+@router.put("/service/config", response_model=BinarySecurityServiceConfigResponse)
+async def put_service_config(
+    payload: BinarySecurityServiceConfigPayload,
+    _: TokenUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().save_service_config(db, payload)

@@ -6,7 +6,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
@@ -61,6 +61,8 @@ class BinarySecurityTask(Base, JsonMixin):
     metrics_json = Column(Text, nullable=True)
     stage_summary_json = Column(Text, nullable=True)
     last_error = Column(Text, nullable=True)
+    dispatcher_instance_id = Column(String(128), nullable=True, index=True)
+    dispatch_started_at = Column(DateTime, nullable=True, index=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -251,6 +253,23 @@ class BinarySecurityProjectConfig(Base, JsonMixin):
         self.config_json = self._dump_json(value or {})
 
 
+class BinarySecurityServiceConfig(Base, JsonMixin):
+    __tablename__ = "secflow_binary_security_service_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    config_key = Column(String(64), nullable=False, unique=True, index=True)
+    config_json = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    @property
+    def config(self) -> dict[str, Any]:
+        return self._load_json(self.config_json, {})
+
+    @config.setter
+    def config(self, value: dict[str, Any] | None) -> None:
+        self.config_json = self._dump_json(value or {})
+
+
 _engine = None
 _SessionFactory = None
 
@@ -276,7 +295,28 @@ def get_session_factory():
 
 
 def init_database() -> None:
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    _ensure_compat_columns(engine)
+
+
+def _ensure_compat_columns(engine) -> None:
+    inspector = inspect(engine)
+    task_table = BinarySecurityTask.__tablename__
+    if inspector.has_table(task_table):
+        columns = {column["name"] for column in inspector.get_columns(task_table)}
+        statements = []
+        if "dispatcher_instance_id" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN dispatcher_instance_id VARCHAR(128) NULL"
+            )
+        if "dispatch_started_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN dispatch_started_at DATETIME NULL"
+            )
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
 
 
 def get_db():

@@ -75,6 +75,9 @@ class BinarySecurityTaskResponse(BaseModel):
     status: str
     current_stage: Optional[str] = None
     firmware_path: str
+    is_queued: bool = False
+    queue_position: Optional[int] = None
+    dispatcher_instance_id: Optional[str] = None
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -91,6 +94,9 @@ class BinarySecurityTaskResponse(BaseModel):
 
 class BinarySecurityTaskListResponse(BaseModel):
     total: int
+    running_count: int = 0
+    queued_count: int = 0
+    max_concurrent_tasks: int = 50
     items: list[BinarySecurityTaskResponse] = Field(default_factory=list)
 
 
@@ -175,3 +181,12 @@ class BinarySecurityProjectConfigPayload(BaseModel):
 class BinarySecurityProjectConfigResponse(BaseModel):
     project_id: str
     config: BinarySecurityProjectConfigPayload
+
+
+class BinarySecurityServiceConfigPayload(BaseModel):
+    max_concurrent_tasks: int = Field(default=50, ge=1, le=200)
+    dispatch_timeout_seconds: int = Field(default=60, ge=10, le=600)
+
+
+class BinarySecurityServiceConfigResponse(BaseModel):
+    config: BinarySecurityServiceConfigPayload

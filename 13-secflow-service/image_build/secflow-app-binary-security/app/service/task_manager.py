@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import uuid
@@ -11,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.config import get_config
@@ -19,6 +21,7 @@ from app.model import (
     STAGE_SEQUENCE,
     BinarySecurityEvent,
     BinarySecurityProjectConfig,
+    BinarySecurityServiceConfig,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityTask,
@@ -29,6 +32,8 @@ from app.schemas import (
     BinarySecurityInputFile,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
+    BinarySecurityServiceConfigPayload,
+    BinarySecurityServiceConfigResponse,
     BinarySecurityStageItemResponse,
     BinarySecurityStageSummary,
     BinarySecurityTaskCreate,
@@ -82,6 +87,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
 class TaskManager:
     def __init__(self) -> None:
         self.cfg = get_config()
+        self.instance_id = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or f"binary-security-{uuid.uuid4().hex[:12]}"
         self._running = False
         self._loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
@@ -223,6 +229,8 @@ class TaskManager:
                 }
             )
         task.status = "ready_to_start"
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
         task.summary = {
             **task.summary,
             "input_files": actual_files,
@@ -252,6 +260,8 @@ class TaskManager:
         task.status = "pending"
         task.current_stage = STAGE_SEQUENCE[0]
         task.last_error = None
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
         task.started_at = None
         task.finished_at = None
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
@@ -265,14 +275,23 @@ class TaskManager:
         if status:
             query = query.filter(BinarySecurityTask.status == status)
         tasks = query.order_by(BinarySecurityTask.created_at.desc()).all()
-        return BinarySecurityTaskListResponse(total=len(tasks), items=[self._task_response(db, task) for task in tasks])
+        queue_info = self._build_queue_info(db, project_id=project_id)
+        service_config = self._load_service_config(db)
+        return BinarySecurityTaskListResponse(
+            total=len(tasks),
+            running_count=queue_info["running_count"],
+            queued_count=queue_info["queued_count"],
+            max_concurrent_tasks=service_config.max_concurrent_tasks,
+            items=[self._task_response(db, task, queue_info=queue_info) for task in tasks],
+        )
 
     def get_task_detail(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
         task = self._task_or_404(db, project_id, task_id)
         items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).order_by(
             BinarySecurityStageItem.created_at.asc()
         ).all()
-        base = self._task_response(db, task).model_dump()
+        queue_info = self._build_queue_info(db, project_id=project_id)
+        base = self._task_response(db, task, queue_info=queue_info).model_dump()
         return BinarySecurityTaskDetailResponse(
             **base,
             description=task.description,
@@ -327,6 +346,8 @@ class TaskManager:
         if task.status == "cancelled":
             return
         task.status = "cancelled"
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
         task.finished_at = _now()
         self._record_event(db, task, "task_cancelled", "任务已取消")
         running_items = db.query(BinarySecurityStageItem).filter(
@@ -352,6 +373,8 @@ class TaskManager:
         task.status = "pending"
         task.current_stage = STAGE_SEQUENCE[0]
         task.last_error = None
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
         task.started_at = None
         task.finished_at = None
         task.summary = {
@@ -388,6 +411,8 @@ class TaskManager:
         task.current_stage = self._next_incomplete_stage(db, task.id) or STAGE_SEQUENCE[0]
         task.status = "pending"
         task.last_error = None
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
         task.finished_at = None
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(db, task, "task_resumed", f"任务从阶段 {task.current_stage} 继续")
@@ -407,38 +432,75 @@ class TaskManager:
         db.commit()
         return BinarySecurityProjectConfigResponse(project_id=project_id, config=payload)
 
+    def get_service_config(self, db: Session) -> BinarySecurityServiceConfigResponse:
+        return BinarySecurityServiceConfigResponse(config=self._load_service_config(db))
+
+    def save_service_config(self, db: Session, payload: BinarySecurityServiceConfigPayload) -> BinarySecurityServiceConfigResponse:
+        row = db.query(BinarySecurityServiceConfig).filter(BinarySecurityServiceConfig.config_key == "global").first()
+        if row is None:
+            row = BinarySecurityServiceConfig(config_key="global")
+            db.add(row)
+        row.config = payload.model_dump(mode="json")
+        db.commit()
+        return BinarySecurityServiceConfigResponse(config=payload)
+
     async def _dispatch_loop(self) -> None:
         session_factory = get_session_factory()
         while self._running:
             db = session_factory()
             try:
-                pending = (
-                    db.query(BinarySecurityTask)
-                    .filter(BinarySecurityTask.status == "pending")
-                    .order_by(BinarySecurityTask.created_at.asc())
-                    .all()
-                )
-                async with self._worker_lock:
-                    active_count = len([task for task in self._workers.values() if not task.done()])
-                    slots = max(0, self.cfg.scheduler.task_concurrency - active_count)
-                    for task in pending[:slots]:
-                        if task.id in self._workers and not self._workers[task.id].done():
-                            continue
-                        self._workers[task.id] = asyncio.create_task(self._run_task(task.id), name=f"binary-security-{task.id}")
+                claimed_ids = self._dispatch_once(db)
+                if claimed_ids:
+                    async with self._worker_lock:
+                        for task_id in claimed_ids:
+                            if task_id in self._workers and not self._workers[task_id].done():
+                                continue
+                            self._workers[task_id] = asyncio.create_task(self._run_task(task_id), name=f"binary-security-{task_id}")
             finally:
                 db.close()
             await asyncio.sleep(self.cfg.scheduler.poll_interval_seconds)
+
+    def _dispatch_once(self, db: Session) -> list[str]:
+        lock_name = "secflow_binary_security_dispatch_lock"
+        locked = bool(db.execute(text("SELECT GET_LOCK(:name, :timeout)"), {"name": lock_name, "timeout": 1}).scalar())
+        if not locked:
+            db.rollback()
+            return []
+        try:
+            stale_reclaimed = self._reclaim_stale_dispatching_locked(db)
+            service_config = self._load_service_config(db)
+            active_count = self._active_dispatch_count(db)
+            slots = max(0, service_config.max_concurrent_tasks - active_count)
+            claimed_ids = self._claim_pending_tasks(db, slots)
+            if stale_reclaimed and not claimed_ids:
+                db.commit()
+            return claimed_ids
+        finally:
+            db.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+            db.commit()
 
     async def _run_task(self, task_id: str) -> None:
         session_factory = get_session_factory()
         db = session_factory()
         try:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
-            if task is None or task.status != "pending":
+            if (
+                task is None
+                or task.status != "dispatching"
+                or task.dispatcher_instance_id != self.instance_id
+            ):
                 return
             if task.started_at is None:
                 task.started_at = _now()
+            task.dispatch_started_at = task.dispatch_started_at or _now()
             task.status = "running"
+            self._record_event(
+                db,
+                task,
+                "task_dispatched",
+                f"任务由实例 {self.instance_id} 启动执行",
+                payload={"dispatcher_instance_id": self.instance_id},
+            )
             db.commit()
             await self._execute_task(task_id)
         except Exception as exc:
@@ -446,10 +508,14 @@ class TaskManager:
             if task:
                 task.status = "failed"
                 task.last_error = str(exc)
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
                 task.finished_at = _now()
                 self._record_event(db, task, "task_failed", f"任务执行失败: {exc}", level="error")
                 db.commit()
         finally:
+            async with self._worker_lock:
+                self._workers.pop(task_id, None)
             db.close()
 
     async def _execute_task(self, task_id: str) -> None:
@@ -535,8 +601,122 @@ class TaskManager:
         finally:
             db.close()
 
+    def _load_service_config(self, db: Session) -> BinarySecurityServiceConfigPayload:
+        row = db.query(BinarySecurityServiceConfig).filter(BinarySecurityServiceConfig.config_key == "global").first()
+        raw = row.config if row else {}
+        return BinarySecurityServiceConfigPayload(**raw)
+
+    def _active_dispatch_count(self, db: Session) -> int:
+        return int(
+            db.query(func.count(BinarySecurityTask.id))
+            .filter(BinarySecurityTask.status.in_(["dispatching", "running"]))
+            .scalar()
+            or 0
+        )
+
+    def _claim_pending_tasks(self, db: Session, slots: int) -> list[str]:
+        if slots <= 0:
+            return []
+        candidates = (
+            db.query(BinarySecurityTask.id)
+            .filter(BinarySecurityTask.status == "pending")
+            .order_by(BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
+            .limit(slots)
+            .all()
+        )
+        claimed: list[str] = []
+        dispatch_started_at = _now()
+        for row in candidates:
+            task_id = row[0]
+            updated = (
+                db.query(BinarySecurityTask)
+                .filter(
+                    BinarySecurityTask.id == task_id,
+                    BinarySecurityTask.status == "pending",
+                )
+                .update(
+                    {
+                        BinarySecurityTask.status: "dispatching",
+                        BinarySecurityTask.dispatcher_instance_id: self.instance_id,
+                        BinarySecurityTask.dispatch_started_at: dispatch_started_at,
+                        BinarySecurityTask.updated_at: dispatch_started_at,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated:
+                claimed.append(task_id)
+        if claimed:
+            db.flush()
+        return claimed
+
+    def _reclaim_stale_dispatching_locked(self, db: Session) -> bool:
+        service_config = self._load_service_config(db)
+        cutoff = _now().timestamp() - service_config.dispatch_timeout_seconds
+        stale_rows = (
+            db.query(BinarySecurityTask)
+            .filter(
+                BinarySecurityTask.status == "dispatching",
+                BinarySecurityTask.dispatch_started_at.isnot(None),
+            )
+            .all()
+        )
+        if not stale_rows:
+            return False
+        local_workers = {
+            task_id for task_id, worker in self._workers.items()
+            if not worker.done()
+        }
+        reclaimed = False
+        for task in stale_rows:
+            if task.id in local_workers:
+                continue
+            if not task.dispatch_started_at or task.dispatch_started_at.timestamp() >= cutoff:
+                continue
+            task.status = "pending"
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.last_error = None
+            self._record_event(
+                db,
+                task,
+                "dispatch_reclaimed",
+                "调度超时，任务已回收并重新进入队列",
+                level="warning",
+            )
+            reclaimed = True
+        if reclaimed:
+            db.flush()
+        return reclaimed
+
+    def _build_queue_info(self, db: Session, *, project_id: str) -> dict[str, Any]:
+        running_count = int(
+            db.query(func.count(BinarySecurityTask.id))
+            .filter(
+                BinarySecurityTask.status.in_(["dispatching", "running"]),
+            )
+            .scalar()
+            or 0
+        )
+        queued_rows = (
+            db.query(BinarySecurityTask.id)
+            .filter(
+                BinarySecurityTask.status == "pending",
+            )
+            .order_by(BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
+            .all()
+        )
+        pending_positions = {row[0]: index + 1 for index, row in enumerate(queued_rows)}
+        return {
+            "running_count": running_count,
+            "queued_count": len(queued_rows),
+            "pending_positions": pending_positions,
+        }
+
     def _finalize_task(self, db: Session, task: BinarySecurityTask) -> None:
         if task.status == "cancelled":
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
             task.finished_at = _now()
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
@@ -551,6 +731,8 @@ class TaskManager:
             task.status = "partial_success" if any(status == "success" for status in non_skipped) else "failed"
         else:
             task.status = "success"
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
         task.finished_at = _now()
         self._record_event(db, task, "task_finished", f"任务结束: {task.status}")
 
@@ -748,9 +930,11 @@ class TaskManager:
                 counts[key] += 1
         return counts
 
-    def _task_response(self, db: Session, task: BinarySecurityTask) -> BinarySecurityTaskResponse:
+    def _task_response(self, db: Session, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> BinarySecurityTaskResponse:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).order_by(BinarySecurityStageRun.sequence_no.asc()).all()
         metrics = task.metrics or {}
+        queue_info = queue_info or {"pending_positions": {}}
+        queue_position = queue_info.get("pending_positions", {}).get(task.id)
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -758,6 +942,9 @@ class TaskManager:
             status=task.status,
             current_stage=task.current_stage,
             firmware_path=task.firmware_path,
+            is_queued=task.status == "pending",
+            queue_position=queue_position,
+            dispatcher_instance_id=task.dispatcher_instance_id,
             created_by=task.created_by,
             created_at=task.created_at,
             updated_at=task.updated_at,
