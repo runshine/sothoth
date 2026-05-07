@@ -219,7 +219,7 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.finished_at = datetime.utcnow()
         if new_status == "success":
             output = job.get("output") or {}
-            item.generated_files = [p for p in [output.get("c"), output.get("h"), output.get("asm")] if p]
+            item.generated_files = build_generated_files(item, output)
         if new_status == "failed":
             item.phase = "failed"
             item.failure_type = "pi-re-agent"
@@ -435,6 +435,58 @@ def phase_label(phase: str | None) -> str:
     return PHASE_LABELS.get(phase or "", phase or "-")
 
 
+def _safe_existing_file(path: Path, root: Path) -> str | None:
+    try:
+        resolved = path.resolve()
+        resolved_root = root.resolve()
+    except Exception:
+        return None
+    if not resolved.is_relative_to(resolved_root):
+        return None
+    if not resolved.is_file():
+        return None
+    return str(resolved)
+
+
+def ida_decompiled_c_path(item: B2STaskItem, reference_path: str | None = None) -> str | None:
+    """Return IDA's direct decompiled C output for an item if present."""
+    output_root = Path(item.output_dir)
+    stems: list[str] = []
+    if reference_path:
+        stems.append(Path(reference_path).stem)
+    if item.elf_path:
+        stems.append(Path(item.elf_path).stem)
+    seen: set[str] = set()
+    for stem in stems:
+        if not stem or stem in seen:
+            continue
+        seen.add(stem)
+        candidate = output_root / f".re_work_{stem}" / "ida_cache" / "ida_export" / "decompiled.c"
+        existing = _safe_existing_file(candidate, output_root)
+        if existing:
+            return existing
+    return None
+
+
+def build_generated_files(item: B2STaskItem, output: dict | None) -> list[str]:
+    output = output or {}
+    ida_c = output.get("ida_c") or ida_decompiled_c_path(item, output.get("c"))
+    return [p for p in [output.get("c"), output.get("h"), ida_c] if p]
+
+
+def normalize_generated_files(item: B2STaskItem) -> list[str]:
+    """Replace legacy .asm entries with IDA's direct decompiled.c for responses."""
+    normalized: list[str] = []
+    for path in item.generated_files:
+        if Path(path).suffix.lower() == ".asm":
+            ida_c = ida_decompiled_c_path(item, path)
+            if ida_c:
+                normalized.append(ida_c)
+            continue
+        normalized.append(path)
+    return normalized
+
+
 def _safe_percent(done: int | float | None, total: int | float | None) -> float | None:
     if total in (None, 0) or done is None:
         return None
@@ -570,7 +622,7 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
             progress=i.progress or None,
             failure_type=i.failure_type,
             error_reason=i.error_reason,
-            generated_files=i.generated_files,
+            generated_files=normalize_generated_files(i),
             started_at=i.started_at,
             finished_at=i.finished_at,
         )
