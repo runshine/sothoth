@@ -17,7 +17,7 @@ from app.model import B2STask, B2STaskItem
 from app.schemas import B2SOverallProgress, TaskCreate, TaskDetailResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
-from app.service.security import ensure_path_in_project, safe_input_dir, safe_output_dir, validate_task_id
+from app.service.security import app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
 
 TERMINAL = {"success", "failed", "cancelled"}
 PI_STATUS_MAP = {
@@ -242,6 +242,38 @@ async def terminate_task(db: Session, task: B2STask) -> None:
         item.progress = build_item_progress(item, {"status": "cancelled", "phase": "cancelled", "progress": item.progress})
         item.finished_at = datetime.utcnow()
     recompute_task_status(db, task)
+    db.commit()
+
+
+async def delete_task(db: Session, task: B2STask) -> None:
+    """Delete a B2S task record and its complete task-id filesystem tree.
+
+    Files are stored under ``<project_root>/<app_root_name>/<task_id>``.  Only
+    that directory is removed; source files selected from elsewhere in the
+    project are intentionally preserved.
+    """
+    items = query_items(db, task.id)
+    for item in items:
+        if item.pi_job_id and item.status not in TERMINAL:
+            try:
+                await get_pi_client(item_pi_worker_url(item)).cancel_job(item.pi_job_id)
+            except Exception:
+                # Deletion should not be blocked by a stale/unreachable upstream
+                # job.  DB rows and the task workspace are still removed below.
+                pass
+
+    task_dir = app_task_root(task.project_id, task.id)
+    root = project_root(task.project_id)
+    if not task_dir.is_relative_to(root):
+        raise ValidationError("B2S任务目录不合法")
+    if task_dir.exists():
+        if not task_dir.is_dir():
+            raise ValidationError("B2S任务路径不是目录，拒绝删除")
+        shutil.rmtree(task_dir)
+
+    for item in items:
+        db.delete(item)
+    db.delete(task)
     db.commit()
 
 

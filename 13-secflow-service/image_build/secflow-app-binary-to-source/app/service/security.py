@@ -40,17 +40,21 @@ def ensure_path_in_project(project_id: str, path: str, *, must_be_file: bool = F
     return resolved
 
 
-def app_task_item_root(project_id: str, task_id: str, sequence_no: int) -> Path:
+def app_task_root(project_id: str, task_id: str) -> Path:
     validate_task_id(task_id)
-    if sequence_no < 1:
-        raise ValidationError("sequence_no必须大于0")
     root = project_root(project_id)
     cfg = get_config().storage
     app_root_parts = _clean_relative(cfg.app_root_name).split("/") if cfg.app_root_name else []
-    out = root.joinpath(*app_root_parts, task_id, str(sequence_no)).resolve()
+    out = root.joinpath(*app_root_parts, task_id).resolve()
     if not out.is_relative_to(root):
         raise ValidationError("B2S任务目录不合法")
     return out
+
+
+def app_task_item_root(project_id: str, task_id: str, sequence_no: int) -> Path:
+    if sequence_no < 1:
+        raise ValidationError("sequence_no必须大于0")
+    return app_task_root(project_id, task_id).joinpath(str(sequence_no)).resolve()
 
 
 def safe_input_dir(project_id: str, task_id: str, sequence_no: int) -> Path:

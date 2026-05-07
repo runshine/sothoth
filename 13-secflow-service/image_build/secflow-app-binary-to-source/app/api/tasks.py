@@ -18,6 +18,7 @@ from app.service.task_service import (
     build_task_detail,
     build_task_response,
     create_task,
+    delete_task,
     get_task_or_404,
     retry_task,
     sync_task,
@@ -125,6 +126,18 @@ async def terminate_b2s_task(
     task = get_task_or_404(db, project_id, task_id)
     await terminate_task(db, task)
     return ActionResponse(status="ok", task_id=task_id, message="任务已取消")
+
+
+@router.delete("/projects/{project_id}/tasks/{task_id}", response_model=ActionResponse)
+async def delete_b2s_task(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await delete_task(db, task)
+    return ActionResponse(status="ok", task_id=task_id, message="任务及文件已删除")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/retry", response_model=ActionResponse)
