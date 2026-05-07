@@ -165,16 +165,19 @@ def reclaim_orphaned_tasks() -> None:
 
 def cleanup_finished_tasks() -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.task_manager import remove_task_workspace
 
     retention_days = _runtime_cleanup_days()
     if retention_days <= 0:
         return
 
     cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    expired_tasks: list[tuple[str, Optional[str]]] = []
     db = get_db_session()
     try:
-        (
-            db.query(UnpackTask)
+        expired_tasks = [
+            (task.id, task.project_id)
+            for task in db.query(UnpackTask)
             .filter(
                 UnpackTask.status.in_(
                     [
@@ -186,11 +189,32 @@ def cleanup_finished_tasks() -> None:
                 UnpackTask.completed_at.isnot(None),
                 UnpackTask.completed_at < cutoff,
             )
+            .all()
+        ]
+        if not expired_tasks:
+            return
+
+        task_ids = [task_id for task_id, _ in expired_tasks]
+        (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.id.in_(task_ids),
+            )
             .delete(synchronize_session=False)
         )
         db.commit()
     finally:
         db.close()
+
+    for task_id, project_id in expired_tasks:
+        try:
+            remove_task_workspace(task_id, project_id)
+        except Exception as exc:
+            logger.warning(
+                "failed to remove workspace for cleaned task %s: %s",
+                task_id,
+                exc,
+            )
 
 
 def get_cluster_snapshot() -> dict:

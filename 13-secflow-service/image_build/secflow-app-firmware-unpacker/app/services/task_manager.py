@@ -121,9 +121,16 @@ def remove_task_workspace(task_id: str, project_id: Optional[str]) -> None:
         return
 
     workspace = build_task_workspace(normalized_project_id, task_id)
-    base_dir = workspace["base_dir"]
+    base_dir = workspace["base_dir"].resolve()
+    project_workspace_root = (
+        PROJECT_FILES_ROOT / normalized_project_id / TASK_WORKSPACE_ROOT
+    ).resolve()
     if not base_dir.exists():
         return
+    if base_dir == project_workspace_root or project_workspace_root not in base_dir.parents:
+        raise ValueError(
+            f"refuse to remove non-task workspace path: {base_dir}"
+        )
 
     shutil.rmtree(base_dir)
     logger.info("task workspace removed: %s", base_dir)
