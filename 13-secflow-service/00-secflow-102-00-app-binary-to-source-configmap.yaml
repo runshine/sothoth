@@ -37,9 +37,9 @@ data:
     pi_re_agent:
       base_url: "http://secflow-pi-re-agent:8000"
       worker_urls:
-        - "http://10.42.2.25:8000"
-        - "http://10.42.2.58:8000"
-        - "http://10.42.2.59:8000"
+        - "http://10.42.2.113:8000"
+        - "http://10.42.2.114:8000"
+        - "http://10.42.2.115:8000"
       api_key: null
       timeout: 30
       batch_size: 8192
