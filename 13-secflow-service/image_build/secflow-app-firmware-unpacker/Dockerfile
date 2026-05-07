@@ -9,6 +9,8 @@ ENV NODE_VERSION=v25.8.1
 ENV CONFIG_PATH=/app/config.yaml
 ENV FIRMWARE_UNPACKER_CONFIG=/app/config.yaml
 ENV UNPACKER_AGENT_DIR=/app/app/agent
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
@@ -43,10 +45,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
 
-COPY requirements.txt /app/
-RUN pip3 install --no-cache-dir --break-system-packages -r /app/requirements.txt
+RUN python3 -m venv "${VIRTUAL_ENV}"
 
-RUN pip3 install --no-cache-dir --break-system-packages \
+COPY requirements.txt /app/
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+RUN pip3 install --no-cache-dir \
     jefferson \
     ubi_reader
 
