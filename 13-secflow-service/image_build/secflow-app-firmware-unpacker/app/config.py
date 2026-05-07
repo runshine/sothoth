@@ -91,9 +91,7 @@ class WorkerConfig(BaseModel):
 class AgentFlowConfig(BaseModel):
     """AgentFlow engine configuration."""
 
-    enabled: bool = False
-    engine_mode: str = "legacy"
-    fallback_to_legacy: bool = True
+    enabled: bool = True
     runs_dir: str = "/data/files/.agentflow/runs"
     max_concurrent_runs: int = 2
     node_timeout_seconds: int = 1800
@@ -214,19 +212,11 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _apply_env_overrides(cfg: Config) -> Config:
-    cfg.agentflow.engine_mode = os.environ.get(
-        "UNPACKER_ENGINE_MODE",
-        cfg.agentflow.engine_mode,
-    ).strip().lower()
-    cfg.agentflow.enabled = _env_bool("AGENTFLOW_ENABLED", cfg.agentflow.enabled)
+    cfg.agentflow.enabled = True
     cfg.agentflow.runs_dir = os.environ.get("AGENTFLOW_RUNS_DIR", cfg.agentflow.runs_dir)
     cfg.agentflow.max_concurrent_runs = _env_int(
         "AGENTFLOW_MAX_CONCURRENT_RUNS",
         cfg.agentflow.max_concurrent_runs,
-    )
-    cfg.agentflow.fallback_to_legacy = _env_bool(
-        "AGENTFLOW_FALLBACK_TO_LEGACY",
-        cfg.agentflow.fallback_to_legacy,
     )
     return cfg
 

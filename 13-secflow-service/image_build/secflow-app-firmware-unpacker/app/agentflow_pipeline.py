@@ -93,9 +93,9 @@ def _feature_match_code(ctx: dict[str, Any]) -> str:
 def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
     """Build the first-pass firmware unpacking graph.
 
-    The graph is intentionally linear so the runner can preserve the legacy
-    execution semantics while AgentFlow owns the lifecycle, artifacts, and
-    cancellation plumbing.
+    The graph is intentionally linear so AgentFlow owns the lifecycle,
+    artifacts, and cancellation plumbing without introducing output directory
+    write conflicts.
     """
 
     base_dir = ctx["base_dir"]
@@ -215,7 +215,6 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
                 {
                     "output_file": ctx["final_result_file"],
                     "data": {
-                        "engine_mode": "agentflow",
                         "firmware_path": ctx["firmware_path"],
                         "output_path": ctx["output_path"],
                     },

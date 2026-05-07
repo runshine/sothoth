@@ -1,42 +1,47 @@
 import os
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from app.agentflow_pipeline import build_firmware_unpack_pipeline
 from app.config import reload_config
-from app.unpacker_engine import run_unpack, run_unpack_legacy
+from app.unpacker_engine import run_unpack
 
 
 class AgentFlowConfigTests(unittest.TestCase):
-    def test_defaults_keep_legacy_engine(self):
+    def test_defaults_use_agentflow(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yaml"
             config_path.write_text("app:\n  port: 9999\n", encoding="utf-8")
             with patch.dict(os.environ, {"CONFIG_PATH": str(config_path)}, clear=False):
                 cfg = reload_config(str(config_path))
-            self.assertEqual("legacy", cfg.agentflow.engine_mode)
-            self.assertFalse(cfg.agentflow.enabled)
-            self.assertTrue(cfg.agentflow.fallback_to_legacy)
+            self.assertTrue(cfg.agentflow.enabled)
+            self.assertEqual(
+                {
+                    "enabled",
+                    "runs_dir",
+                    "max_concurrent_runs",
+                    "node_timeout_seconds",
+                    "use_worktree",
+                    "cleanup_runs_retention_days",
+                },
+                set(cfg.agentflow.model_dump()),
+            )
 
     def test_env_overrides_agentflow_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yaml"
-            config_path.write_text("agentflow:\n  engine_mode: legacy\n", encoding="utf-8")
+            config_path.write_text("agentflow:\n  enabled: false\n", encoding="utf-8")
             env = {
-                "UNPACKER_ENGINE_MODE": "agentflow",
                 "AGENTFLOW_RUNS_DIR": "/tmp/agentflow-runs",
                 "AGENTFLOW_MAX_CONCURRENT_RUNS": "7",
-                "AGENTFLOW_FALLBACK_TO_LEGACY": "false",
             }
             with patch.dict(os.environ, env, clear=False):
                 cfg = reload_config(str(config_path))
-            self.assertEqual("agentflow", cfg.agentflow.engine_mode)
+            self.assertTrue(cfg.agentflow.enabled)
             self.assertEqual("/tmp/agentflow-runs", cfg.agentflow.runs_dir)
             self.assertEqual(7, cfg.agentflow.max_concurrent_runs)
-            self.assertFalse(cfg.agentflow.fallback_to_legacy)
 
 
 class AgentFlowPipelineTests(unittest.TestCase):
@@ -88,34 +93,21 @@ class AgentFlowPipelineTests(unittest.TestCase):
 
 
 class EngineDispatchTests(unittest.TestCase):
-    def test_legacy_mode_dispatches_to_legacy_engine(self):
-        with patch("app.unpacker_engine._get_unpack_engine_mode", return_value="legacy"):
-            with patch("app.unpacker_engine.run_unpack_legacy", return_value={"status": "success"}) as legacy:
-                self.assertEqual({"status": "success"}, run_unpack("/tmp/fw.bin", "/tmp/out"))
-                legacy.assert_called_once()
+    def test_run_unpack_dispatches_to_agentflow(self):
+        with patch("app.agentflow_runner.run_unpack_agentflow", return_value={"status": "success"}) as agentflow:
+            self.assertEqual({"status": "success"}, run_unpack("/tmp/fw.bin", "/tmp/out", task_id="t1", project_id="p1"))
+            agentflow.assert_called_once_with(
+                "/tmp/fw.bin",
+                "/tmp/out",
+                cancel_check=None,
+                task_id="t1",
+                project_id="p1",
+            )
 
-    def test_agentflow_failure_falls_back_when_enabled(self):
-        with patch("app.unpacker_engine._get_unpack_engine_mode", return_value="agentflow"):
-            with patch("app.unpacker_engine._agentflow_fallback_enabled", return_value=True):
-                with patch("app.agentflow_runner.run_unpack_agentflow", side_effect=RuntimeError("boom")):
-                    with patch("app.unpacker_engine.run_unpack_legacy", return_value={"status": "success"}) as legacy:
-                        self.assertEqual({"status": "success"}, run_unpack("/tmp/fw.bin", "/tmp/out"))
-                        legacy.assert_called_once()
-
-    def test_legacy_preprocess_success_result_shape(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            firmware = root / "fw.zip"
-            with zipfile.ZipFile(firmware, "w") as archive:
-                archive.writestr("etc/version.txt", "1.0")
-            output = root / "output"
-
-            result = run_unpack_legacy(str(firmware), str(output))
-
-            self.assertEqual("success", result["status"])
-            self.assertEqual(0, result["rounds"])
-            self.assertIn("quick pre-process", result["message"])
-            self.assertTrue((output / "etc" / "version.txt").is_file())
+    def test_agentflow_failure_is_not_fallbacked(self):
+        with patch("app.agentflow_runner.run_unpack_agentflow", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                run_unpack("/tmp/fw.bin", "/tmp/out")
 
 
 if __name__ == "__main__":

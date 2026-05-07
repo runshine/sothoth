@@ -133,7 +133,6 @@ def _get_task_agentflow_status(task_id: str) -> dict:
                 run_json = None
     return {
         "task_id": task_id,
-        "engine_mode": task.get("engine_mode"),
         "agentflow_run_id": run_id,
         "run_path": run_path or None,
         "status": run_json.get("status") if isinstance(run_json, dict) else None,

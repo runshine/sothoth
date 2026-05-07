@@ -50,11 +50,9 @@ worker:
   claim_interval_seconds: 2
   claim_batch_size: 8
 
-# AgentFlow 解包引擎配置。默认保留 legacy，便于灰度和回滚。
+# AgentFlow 解包引擎配置。服务仅保留 AgentFlow 运行模式。
 agentflow:
-  enabled: false
-  engine_mode: "legacy"
-  fallback_to_legacy: true
+  enabled: true
   runs_dir: "/data/files/.agentflow/runs"
   max_concurrent_runs: 2
   node_timeout_seconds: 1800

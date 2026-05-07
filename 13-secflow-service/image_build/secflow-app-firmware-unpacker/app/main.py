@@ -99,8 +99,7 @@ async def lifespan(app: FastAPI):
         start_task_dispatcher()
         await get_registry_service().start()
         logger.info(
-            "secflow-app-firmware-unpacker started engine_mode=%s agentflow_enabled=%s",
-            config.agentflow.engine_mode,
+            "secflow-app-firmware-unpacker started agentflow_enabled=%s",
             config.agentflow.enabled,
         )
     except Exception as exc:

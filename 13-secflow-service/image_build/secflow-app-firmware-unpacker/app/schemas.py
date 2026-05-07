@@ -64,7 +64,6 @@ class TaskResponse(BaseModel):
     generated_skill_status: Optional[str] = None
     promotion_success_count: Optional[int] = None
     agentflow_run_id: Optional[str] = None
-    engine_mode: Optional[str] = None
     engine_error: Optional[str] = None
     run_path: Optional[str] = None
     created_at: Optional[str] = None

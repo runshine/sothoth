@@ -50,9 +50,7 @@ data:
       claim_batch_size: 8
 
     agentflow:
-      enabled: false
-      engine_mode: "legacy"
-      fallback_to_legacy: true
+      enabled: true
       runs_dir: "/data/files/.agentflow/runs"
       max_concurrent_runs: 2
       node_timeout_seconds: 1800

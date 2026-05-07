@@ -1,6 +1,48 @@
 # SecFlow Firmware Unpacker AgentFlow 迁移计划
 
 编写日期：2026-05-07
+更新日期：2026-05-07
+
+## 0. 当前进度摘要
+
+当前迁移已经完成主干代码接入，整体进度约 75%-85%。服务只保留 AgentFlow 解包模式；代码层面已具备 AgentFlow 入口、pipeline builder、runner、DB/API 可观测字段和基础测试。剩余重点是补齐 AgentFlow runner 的 mock 测试、容器内真实运行 smoke test、固定固件样本验证和生产切换。
+
+状态标记：
+
+- `[DONE]`：代码已落地，并有基础测试或静态检查支撑。
+- `[PARTIAL]`：代码已落地，但真实运行、边界行为或验收证据不足。
+- `[TODO]`：尚未落地或尚未执行。
+
+阶段完成度：
+
+| 阶段 | 状态 | 当前说明 |
+|---|---|---|
+| 阶段 0：准备与基线 | `[PARTIAL]` | AgentFlow 配置和入口有测试；skill 成功、skill fallback、max retry、cancel 的结果形状还缺少覆盖。 |
+| 阶段 1：安装并验证 AgentFlow 运行时 | `[DONE]` | `Dockerfile` 已复制并 editable install `agentflow/`，构建层包含 `import agentflow` 和 `pi --version` 校验。 |
+| 阶段 2：新增 AgentFlow 配置 | `[DONE]` | `app/config.py`、`config.yaml`、`k8s-configmap.yaml` 已加入 `agentflow` 配置和环境变量覆盖。 |
+| 阶段 3：AgentFlow 单入口 | `[DONE]` | `run_unpack()` 已固定调用 `run_unpack_agentflow()`，不再保留运行时引擎切换。 |
+| 阶段 4：新增 AgentFlow pipeline builder | `[DONE]` | `app/agentflow_pipeline.py` 已生成完整节点图，单测覆盖节点和依赖关系。 |
+| 阶段 5：新增 AgentFlow runner | `[PARTIAL]` | `app/agentflow_runner.py` 已实现提交、等待、取消、结果适配；缺少成功/失败/取消的 mock runner 单测和真实 run 验证。 |
+| 阶段 6：迁移最小可用图 | `[PARTIAL]` | 图中已包含 preprocess、generic executor/reviewer、cleanup、finalize；尚未跑通真实 AgentFlow 样本任务。 |
+| 阶段 7：迁移 skill 匹配和 skill 执行 | `[PARTIAL]` | `feature_match`、`skill_executor`、`skill_reviewer`、promotion count 逻辑已接入；尚缺命中 skill 的集成验证。 |
+| 阶段 8：迁移 skill author | `[PARTIAL]` | `skill_author` 节点和 `save_candidate_skill()` 适配已接入；尚缺成功生成候选 skill 的集成验证。 |
+| 阶段 9：日志、可观测性和管理接口增强 | `[DONE]` | DB、schema、任务详情、AgentFlow run 状态接口已加入；token summary 目前仍是占位。 |
+| 阶段 10：生产灰度与切换 | `[TODO]` | 尚未看到测试环境默认 agentflow、样本集对比或生产灰度记录。 |
+
+当前测试结果：
+
+```text
+pytest -q
+12 passed in 0.21s
+```
+
+下一轮最小验收目标：
+
+1. 为 `run_unpack_agentflow()` 增加 mock Orchestrator/RunStore 单测，覆盖 success、failed、cancelled。
+2. 构建或进入镜像，确认 `python -c "import agentflow"` 和 `pi --version` 在容器内通过。
+3. 使用一个小 zip 固件样本跑服务级 smoke，确认 DB、`run/final_result.json`、`run/agentflow/runs/<run_id>/run.json` 均正确。
+4. 补一条命中 skill 的样本或 mock，验证 skill success 时不执行 generic，skill failed 时 fallback generic。
+5. 测试环境灰度开启 agentflow，收集成功率、耗时、输出目录完整性和 reviewer 通过率。
 
 ## 1. 背景与目标
 
@@ -10,9 +52,9 @@
 
 - API、数据库模型、Worker 调度、Kubernetes Service/Deployment 继续沿用现有实现。
 - `task_manager` 仍负责从 DB 领取任务，并调用 `run_unpack()`。
-- `run_unpack()` 变成兼容入口，根据配置选择 legacy engine 或 AgentFlow engine。
+- `run_unpack()` 固定为 AgentFlow 入口。
 - AgentFlow 负责编排预处理、技能匹配、技能执行、通用 agent 解包、评审循环、技能沉淀、清理和汇总。
-- 迁移过程支持灰度开关和回滚，不影响现有 API 调用方。
+- 迁移过程不再保留旧运行时路径，不影响现有 API 调用方。
 
 ## 2. 当前架构梳理
 
@@ -58,7 +100,7 @@
 - 执行流程是串行 Python 逻辑，不容易观察每个阶段的状态、耗时、输出和失败原因。
 - 通用解包和评审循环由 for-loop 实现，难以扩展成更复杂的 DAG。
 - 后续如果要引入多个 agent 并行评审、批量候选策略、远程执行、图优化，现有结构需要继续堆业务代码。
-- AgentFlow 已在仓库中存在，但当前 Docker 镜像和服务代码尚未安装或调用它。
+- AgentFlow 已在仓库中存在，并已接入 Docker 镜像和服务代码；当前剩余风险主要是真实 AgentFlow/pi 链路和灰度运行尚未完成验收。
 
 ## 3. 目标架构
 
@@ -76,20 +118,18 @@ FastAPI API
   -> _update_task_result()
 ```
 
-建议保留 legacy 链路：
+当前固定链路：
 
 ```text
 run_unpack()
-  -> if UNPACKER_ENGINE_MODE=legacy: run_unpack_legacy()
-  -> if UNPACKER_ENGINE_MODE=agentflow: run_unpack_agentflow()
+  -> run_unpack_agentflow()
 ```
 
 这样可以做到：
 
-- 开发阶段默认 legacy。
-- 单任务或单环境灰度 agentflow。
-- AgentFlow 失败时可配置 fallback 到 legacy。
-- 若线上出现问题，只需修改配置回滚。
+- 服务代码只有一个执行入口，减少分支和状态字段。
+- API、DB 任务状态和输出目录仍保持兼容。
+- 若线上出现问题，通过修复 AgentFlow 链路或回滚镜像处理。
 
 ## 4. AgentFlow Pipeline 设计
 
@@ -185,28 +225,34 @@ generic_reviewer >> skill_author
 
 ## 5. 代码改造计划
 
-### 阶段 0：准备与基线
+### 阶段 0：准备与基线 `[PARTIAL]`
 
 目标：保证迁移前有明确基线和可回归路径。
 
 任务：
 
-- 记录当前 legacy 路径的关键行为：
+- 记录 AgentFlow result adapter 的关键行为：
   - preprocess 成功返回字段。
   - skill 命中成功返回字段。
   - skill 失败 fallback 返回字段。
   - max retries 返回字段。
   - cancel 返回字段。
-- 给 `run_unpack()` 增加最小覆盖测试，至少验证返回 dict 字段兼容。
+- 给 `run_unpack()` 和 `run_unpack_agentflow()` 增加覆盖测试，至少验证返回 dict 字段兼容。
 - 准备一个小固件样本或 mock 样本，用于 smoke test。
 
 验收：
 
 - `pytest` 当前测试通过。
-- legacy engine 行为有测试或手工记录。
-- 明确可回滚配置：`UNPACKER_ENGINE_MODE=legacy`。
+- AgentFlow result adapter 行为有测试或手工记录。
+- 明确镜像级回滚方案。
 
-### 阶段 1：安装并验证 AgentFlow 运行时
+当前状态：
+
+- 已有 `tests/test_agentflow_migration.py` 覆盖默认 AgentFlow、env override、pipeline 构造、`run_unpack()` 调用 AgentFlow。
+- 尚需补充 AgentFlow skill success、skill fallback、max retries、cancel 的结果形状测试或手工记录。
+- 小 zip 固件样本已在测试中用于 preprocess success；服务级 AgentFlow smoke 样本尚未执行。
+
+### 阶段 1：安装并验证 AgentFlow 运行时 `[DONE]`
 
 目标：让服务镜像内可以 import 和运行 AgentFlow。
 
@@ -240,9 +286,15 @@ pi --version
 - 容器内 `import agentflow` 成功。
 - 容器内 `pi` 命令可用。
 
-### 阶段 2：新增 AgentFlow 配置
+当前状态：
 
-目标：通过配置控制引擎模式、run 目录、并发和 fallback。
+- `Dockerfile` 已复制 `agentflow/` 并执行 `pip3 install --no-cache-dir -e /app/agentflow`。
+- 构建层已加入 `python3 -c "import agentflow; print(agentflow.__file__)"` 和 `pi --version`。
+- 仍建议在目标 CI 或实际构建节点保留一次完整镜像构建记录。
+
+### 阶段 2：新增 AgentFlow 配置 `[DONE]`
+
+目标：通过配置控制 run 目录、并发和节点超时。
 
 改动文件：
 
@@ -255,9 +307,7 @@ pi --version
 
 ```yaml
 agentflow:
-  enabled: false
-  engine_mode: "legacy"       # legacy | agentflow
-  fallback_to_legacy: true
+  enabled: true
   runs_dir: "/data/files/.agentflow/runs"
   max_concurrent_runs: 2
   node_timeout_seconds: 1800
@@ -267,52 +317,52 @@ agentflow:
 
 环境变量覆盖建议：
 
-- `UNPACKER_ENGINE_MODE`
 - `AGENTFLOW_RUNS_DIR`
 - `AGENTFLOW_MAX_CONCURRENT_RUNS`
-- `AGENTFLOW_FALLBACK_TO_LEGACY`
 
 验收：
 
-- 服务启动时打印当前 engine mode。
-- 默认行为仍为 legacy。
+- 服务启动时打印 AgentFlow enabled 状态。
+- 默认行为为 AgentFlow。
 - 配置缺失时不影响现有部署。
 
-### 阶段 3：抽出 legacy engine
+当前状态：
 
-目标：为双轨运行做代码结构准备。
+- `AgentFlowConfig` 已加入 `app/config.py`。
+- `config.yaml` 与 `k8s-configmap.yaml` 已加入 `agentflow` 配置段，默认 `enabled: true`。
+- 已支持 `AGENTFLOW_RUNS_DIR`、`AGENTFLOW_MAX_CONCURRENT_RUNS` 环境变量覆盖。
+- 服务启动日志已打印 `agentflow_enabled`。
+
+### 阶段 3：AgentFlow 单入口 `[DONE]`
+
+目标：让服务运行入口固定为 AgentFlow，移除运行时引擎切换。
 
 改动文件：
 
 - `app/unpacker_engine.py`
-- 新增 `app/unpacker_legacy_engine.py` 或在原文件内先保留 `run_unpack_legacy()`
 
 建议改动：
 
-- 将当前 `run_unpack()` 主体重命名为 `run_unpack_legacy()`。
-- 新的 `run_unpack()` 只负责选择 engine：
+- `run_unpack()` 只调用 `run_unpack_agentflow()`：
 
 ```python
 def run_unpack(firmware_path: str, output_path: str, cancel_check=None) -> dict:
-    mode = get_unpack_engine_mode()
-    if mode == "agentflow":
-        try:
-            return run_unpack_agentflow(firmware_path, output_path, cancel_check=cancel_check)
-        except Exception:
-            if agentflow_fallback_enabled():
-                log.exception("agentflow engine failed, falling back to legacy")
-                return run_unpack_legacy(firmware_path, output_path, cancel_check=cancel_check)
-            raise
-    return run_unpack_legacy(firmware_path, output_path, cancel_check=cancel_check)
+    return run_unpack_agentflow(firmware_path, output_path, cancel_check=cancel_check)
 ```
 
 验收：
 
-- 默认 legacy 路径行为不变。
-- 原有测试不需要大规模修改。
+- `run_unpack()` 只会进入 AgentFlow。
+- AgentFlow 异常向外抛出，由任务管理器标记失败。
 - `task_manager` 调用点无需改变。
 
-### 阶段 4：新增 AgentFlow pipeline builder
+当前状态：
+
+- `run_unpack()` 已固定调用 `run_unpack_agentflow()`。
+- 已移除运行时引擎模式配置。
+- `task_manager` 已继续调用 `run_unpack()`，并传入 `task_id/project_id`。
+
+### 阶段 4：新增 AgentFlow pipeline builder `[DONE]`
 
 目标：用代码生成固件解包 AgentFlow 图。
 
@@ -395,7 +445,15 @@ def build_firmware_unpack_pipeline(ctx: dict):
 - `PipelineSpec.model_validate()` 通过。
 - 生成 JSON 中包含预期节点和依赖。
 
-### 阶段 5：新增 AgentFlow runner
+当前状态：
+
+- `app/agentflow_pipeline.py` 已新增。
+- 当前图已包含 `preprocess`、`feature_match`、`skill_executor`、`skill_reviewer`、`generic_executor`、`generic_reviewer`、`skill_author`、`cleanup`、`finalize`。
+- reviewer success criteria 当前使用 `AGENTFLOW_REVIEW_(SUCCESS|SKIPPED)` marker。
+- 单测已覆盖节点集合、关键依赖、reviewer success criteria。
+- 与原 `app/agent/prompt/*.md` 的复用还不完全，当前更多依赖 marker 协议 prompt；后续可逐步收敛。
+
+### 阶段 5：新增 AgentFlow runner `[PARTIAL]`
 
 目标：在服务进程内运行 AgentFlow pipeline，并把结果转换成现有 result dict。
 
@@ -458,7 +516,15 @@ def run_unpack_agentflow(
 - 成功/失败/取消均能转换成现有 result dict。
 - `task_manager._update_task_result()` 不需要改或只做少量字段增强。
 
-### 阶段 6：迁移最小可用图
+当前状态：
+
+- `app/agentflow_runner.py` 已新增，负责构建 pipeline、创建 `RunStore`/`Orchestrator`、等待 run、处理取消、读取节点输出并转换 result dict。
+- 已写入 `agentflow_run_id.txt`、`final_result.json`、stage 日志和 `tokens_summary.json`。
+- 取消逻辑已在等待循环中调用 `orchestrator.cancel(run_id)`。
+- 尚缺 runner 层 mock 单测，尤其是 success、failed、cancelled、preprocess success、skill success、generic success 的结果适配覆盖。
+- `tokens_summary.json` 目前为占位结构，还没有聚合 AgentFlow/pi token。
+
+### 阶段 6：迁移最小可用图 `[PARTIAL]`
 
 目标：先跑通 AgentFlow 最小链路，不迁移 skill 逻辑。
 
@@ -477,12 +543,18 @@ preprocess -> generic_executor -> generic_reviewer -> cleanup -> finalize
 
 验收：
 
-- `UNPACKER_ENGINE_MODE=agentflow` 时，任务可完成。
-- 输出目录结构与 legacy 基本一致。
+- AgentFlow 单模式下任务可完成。
+- 输出目录结构与现有任务目录约定基本一致。
 - DB 中 `status/result_status/result_message/rounds` 正确。
 - 失败任务能看到 AgentFlow run 目录和 node 输出。
 
-### 阶段 7：迁移 skill 匹配和 skill 执行
+当前状态：
+
+- 最小链路已包含在当前完整图中。
+- preprocess 成功、skill 成功等条件跳过通过节点 prompt 中的 `SKIPPED` marker 实现。
+- 尚未记录真实 AgentFlow 服务级 smoke 结果；该项是下一轮最优先验收。
+
+### 阶段 7：迁移 skill 匹配和 skill 执行 `[PARTIAL]`
 
 目标：恢复现有 fast mode 和 skill 复用能力。
 
@@ -505,9 +577,16 @@ feature_match -> skill_executor -> skill_reviewer
 - 命中 skill 且 review 成功时，不再执行 generic 解包。
 - skill 成功后 promotion count 正确增加。
 - skill 失败时 fallback 到 generic。
-- `matched_skill/matched_skill_version/matched_skill_score/fallback_to_llm` 字段与 legacy 兼容。
+- `matched_skill/matched_skill_version/matched_skill_score/fallback_to_llm` 字段与现有 DB/API 兼容。
 
-### 阶段 8：迁移 skill author
+当前状态：
+
+- `feature_match` 节点已调用 `extract_firmware_features()`、`compute_family_id()`、`match_skill()`。
+- runner 已在 skill review success 后调用 `register_skill_success()`。
+- runner 已返回 `matched_skill`、`matched_skill_version`、`matched_skill_score`、`fallback_to_llm`。
+- 尚缺命中 skill 成功、skill 失败 fallback generic 的集成或 mock 验证。
+
+### 阶段 8：迁移 skill author `[PARTIAL]`
 
 目标：恢复成功解包后的候选 skill 生成能力。
 
@@ -535,7 +614,14 @@ skill_author
 - DB 中 `generated_skill_path/generated_skill_status/promotion_success_count` 正确。
 - 生成失败不影响主任务成功。
 
-### 阶段 9：日志、可观测性和管理接口增强
+当前状态：
+
+- `skill_author` 节点已加入图。
+- runner 已在 generic success 且 author 输出非 `SKIPPED` 时调用 `save_candidate_skill()`。
+- runner 已返回 `generated_skill_path`、`generated_skill_status`、`promotion_success_count`。
+- 尚缺真实成功解包后候选 skill 生成验证；生成失败不影响主任务成功的异常路径也需要测试。
+
+### 阶段 9：日志、可观测性和管理接口增强 `[DONE]`
 
 目标：让 AgentFlow 运行结果能被 API 和运维定位。
 
@@ -543,12 +629,10 @@ skill_author
 
 - DB 增加字段：
   - `agentflow_run_id`
-  - `engine_mode`
   - `engine_error`
 - `TaskResponse` 增加：
   - `agentflow_run_id`
   - `run_path`
-  - `engine_mode`
 - 任务详情接口可返回 AgentFlow run id。
 - 可选新增接口：
   - `GET /api/app/firmware-unpacker/tasks/{task_id}/agentflow`
@@ -560,30 +644,41 @@ skill_author
 - 失败节点的 output 和 error 可查。
 - 旧客户端不受新增字段影响。
 
-### 阶段 10：生产灰度与切换
+当前状态：
 
-目标：安全切换默认 engine。
+- `app/model.py` 已新增 `agentflow_run_id`、`engine_error`、`run_path` 字段，并有自动补列逻辑。
+- `app/schemas.py` 已在 `TaskResponse` 暴露新增字段。
+- `app/services/task_manager.py` 已将 AgentFlow result 字段写回 DB。
+- `app/api/firmware.py` 已新增 project-scoped 和旧版任务路径的 AgentFlow 状态接口。
+- 旧客户端兼容性通过 optional 字段保持。
+
+### 阶段 10：生产灰度与切换 `[TODO]`
+
+目标：安全切换到 AgentFlow 单入口镜像。
 
 建议流程：
 
-1. 部署包含 AgentFlow 的镜像，但配置仍为 legacy。
-2. 在测试环境开启 `UNPACKER_ENGINE_MODE=agentflow`。
-3. 跑固定样本集，对比 legacy 与 agentflow：
+1. 部署包含 AgentFlow 单入口的镜像。
+2. 在测试环境跑固定样本集：
    - 成功率。
    - 平均耗时。
    - token 消耗。
    - 输出目录完整性。
    - reviewer 通过率。
-4. 在生产中按单 Pod 或单命名空间灰度。
-5. 观察任务失败率和资源使用。
-6. 默认切换到 agentflow。
-7. 保留 legacy fallback 至少一个版本周期。
+3. 在生产中按单 Pod 或单命名空间滚动。
+4. 观察任务失败率和资源使用。
+5. 完成生产切换。
 
 验收：
 
-- AgentFlow 默认启用后，任务成功率不低于 legacy。
+- AgentFlow 单入口任务成功率达到上线要求。
 - 平均耗时和资源占用在可接受范围内。
 - 回滚只需要改配置，不需要重新构建镜像。
+
+当前状态：
+
+- 尚未执行测试环境固定样本集。
+- 尚未进入生产单 Pod 或命名空间灰度。
 
 ## 6. 文件级改动清单
 
@@ -592,49 +687,62 @@ skill_author
 - `Dockerfile`
   - 拷贝并安装 `agentflow/`。
   - 确认容器内 `agentflow` 和 `pi` 均可用。
+  - 状态：`[DONE]`
 
 - `requirements.txt`
   - 补充 AgentFlow 运行依赖，或依赖 `pip install -e /app/agentflow` 自动解析。
+  - 状态：`[DONE]`，当前通过 Dockerfile editable install 本地 `agentflow/`。
 
 - `app/config.py`
   - 增加 `AgentFlowConfig`。
   - 支持 env override。
+  - 状态：`[DONE]`
 
 - `config.yaml`
   - 增加 `agentflow` 配置段。
+  - 状态：`[DONE]`
 
 - `app/unpacker_engine.py`
-  - 抽出 `run_unpack_legacy()`。
-  - 新 `run_unpack()` 根据配置分发。
+  - `run_unpack()` 固定调用 AgentFlow runner。
+  - 状态：`[DONE]`
 
 - `app/agentflow_pipeline.py`
   - 新增 pipeline 构建逻辑。
+  - 状态：`[DONE]`
 
 - `app/agentflow_runner.py`
   - 新增运行、等待、取消、结果适配逻辑。
+  - 状态：`[PARTIAL]`，代码已落地，缺少 runner mock 测试和真实 run smoke。
 
 ### 建议改
 
 - `app/model.py`
-  - 增加 `agentflow_run_id`、`engine_mode` 等字段。
+  - 增加 `agentflow_run_id`、`engine_error`、`run_path` 等字段。
+  - 状态：`[DONE]`
 
 - `app/schemas.py`
-  - 在任务响应中暴露 engine/run 信息。
+  - 在任务响应中暴露 run 信息。
+  - 状态：`[DONE]`
 
 - `app/api/firmware.py`
   - 可选新增 AgentFlow run 状态接口。
+  - 状态：`[DONE]`
 
 - `app/services/task_manager.py`
   - 可选将 `task_id/project_id` 传入 `run_unpack()`，便于 runner 保存 run 映射。
+  - 状态：`[DONE]`
 
 - `README.md`
-  - 补充 AgentFlow engine 配置和运行说明。
+  - 补充 AgentFlow 配置和运行说明。
+  - 状态：`[TODO]`
 
 - `k8s-configmap.yaml`
   - 增加 agentflow 配置。
+  - 状态：`[DONE]`
 
 - `k8s-deployment.yaml`
   - 增加 AgentFlow runs 目录挂载或环境变量。
+  - 状态：`[TODO]`，需确认当前 `/data/files` 挂载是否已覆盖 `run/agentflow` 和全局 `runs_dir` 需求。
 
 ## 7. 兼容性要求
 
@@ -652,7 +760,7 @@ skill_author
 
 ### 7.2 Result dict 兼容
 
-AgentFlow engine 最终必须返回当前 `_update_task_result()` 可处理的字段：
+AgentFlow 最终必须返回当前 `_update_task_result()` 可处理的字段：
 
 ```python
 {
@@ -688,7 +796,7 @@ AgentFlow traces 可以放在 `run/agentflow/` 下，不能污染 `output/`。
 
 - API 将任务状态改为 `CANCELLING`。
 - `task_manager` 通过 `cancel_check()` 让 `run_unpack()` 感知取消。
-- legacy engine 关闭当前 `PiRpcClient`。
+- AgentFlow runner 取消当前 run。
 
 AgentFlow 迁移后：
 
@@ -782,12 +890,17 @@ run/final_result.json
 
 应对：
 
-- 默认 legacy。
-- 支持 `fallback_to_legacy=true`。
-- 分环境、分 Pod 灰度。
-- 至少保留一个版本周期的 legacy fallback。
+- 固定样本集先在测试环境跑通。
+- 分环境、分 Pod 滚动。
+- 通过镜像回滚处理严重问题。
 
 ## 11. 测试计划
+
+当前测试基线：
+
+- 已执行 `pytest -q`，结果为 `12 passed in 0.21s`。
+- 已覆盖配置默认值、环境变量覆盖、pipeline 节点和依赖、`run_unpack()` AgentFlow 分发。
+- 尚未覆盖 AgentFlow runner 的真实状态适配，也未完成容器/服务级 AgentFlow smoke。
 
 ### 单元测试
 
@@ -795,15 +908,22 @@ run/final_result.json
   - 节点 ID 完整。
   - 依赖关系正确。
   - `PipelineSpec` 校验通过。
+  - 状态：`[DONE]`
 - result adapter 测试：
   - preprocess success。
   - skill success。
   - skill failed fallback generic success。
   - max retries reached。
   - cancelled。
+  - 状态：`[TODO]`
 - config 测试：
-  - 默认 legacy。
+  - 默认 AgentFlow。
   - env override 生效。
+  - 状态：`[DONE]`
+- 入口分发测试：
+  - `run_unpack()` 调用 AgentFlow。
+  - AgentFlow 抛错时不 fallback。
+  - 状态：`[DONE]`
 
 ### 集成测试
 
@@ -814,6 +934,8 @@ python -c "import agentflow"
 pi --version
 ```
 
+状态：`[TODO]`，Dockerfile 已包含构建层校验，但还需要在目标构建环境记录一次实际结果。
+
 - 服务级 smoke：
 
 ```bash
@@ -821,16 +943,29 @@ POST /api/app/firmware-unpacker/projects/{project_id}/tasks
 GET  /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}
 ```
 
+状态：`[TODO]`
+
 - AgentFlow run 检查：
   - run id 已写入 run 目录。
   - node outputs 可查。
   - final_result.json 存在。
 
+状态：`[TODO]`
+
+- AgentFlow 小样本 smoke：
+
+```bash
+pytest -q tests/test_agentflow_migration.py
+```
+
+状态：`[TODO]`，需要补测试或脚本，当前测试没有真实执行 AgentFlow/pi 节点。
+
 ### 回归测试
 
-- legacy mode 下原有测试全部通过。
 - agentflow mode 下核心任务测试通过。
-- fallback 开启时，模拟 AgentFlow 抛错后任务仍可由 legacy 完成。
+  - 状态：`[TODO]`
+- 模拟 AgentFlow 抛错后任务被标记失败。
+  - 状态：`[DONE]`
 
 ## 12. 里程碑
 
@@ -840,15 +975,18 @@ GET  /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}
 
 - Docker 镜像内 AgentFlow 可 import。
 - 配置中存在 agentflow 段。
-- 默认 legacy 不变。
+- 默认 AgentFlow。
 
-### M2：双轨入口
+状态：`[DONE]`
+
+### M2：AgentFlow 单入口
 
 交付物：
 
-- `run_unpack_legacy()` 保留原行为。
-- `run_unpack()` 支持 engine mode 分发。
-- fallback 可配置。
+- `run_unpack()` 固定调用 AgentFlow runner。
+- 不再暴露引擎模式配置。
+
+状态：`[DONE]`
 
 ### M3：最小 AgentFlow 解包链路
 
@@ -858,6 +996,8 @@ GET  /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}
 - DB 状态正确。
 - AgentFlow run 日志可查。
 
+状态：`[PARTIAL]`，代码已落地，真实 AgentFlow/pi smoke 未完成。
+
 ### M4：完整 skill 链路
 
 交付物：
@@ -865,12 +1005,16 @@ GET  /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}
 - skill match、skill executor、skill reviewer、promotion count 迁移完成。
 - skill fallback generic 正常。
 
+状态：`[PARTIAL]`，代码已接入，缺少命中 skill 和 fallback 的集成验证。
+
 ### M5：skill author 与观测完善
 
 交付物：
 
 - candidate skill 生成迁移完成。
-- run id、engine mode、节点状态可观测。
+- run id 和节点状态可观测。
+
+状态：`[PARTIAL]`，观测字段和接口已完成，candidate skill 生成仍缺真实验证。
 
 ### M6：灰度上线
 
@@ -878,37 +1022,32 @@ GET  /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}
 
 - 测试环境默认 agentflow。
 - 生产灰度完成。
-- 默认 engine 可切到 agentflow。
+- 默认入口为 AgentFlow。
+
+状态：`[TODO]`
 
 ## 13. 建议实施顺序
 
-建议严格按以下顺序实施：
+建议按以下顺序继续实施。前 1-3 项已完成，当前应从第 4 项继续：
 
-1. 新增配置和 Docker AgentFlow 安装。
-2. 抽出 legacy，保持默认行为不变。
-3. 新增 AgentFlow runner 和 pipeline builder。
-4. 跑通最小 AgentFlow pipeline。
-5. 接入 engine mode 灰度开关。
-6. 迁移 skill match 和 skill executor。
-7. 迁移 skill author。
-8. 增加 run id 可观测字段和接口。
-9. 测试环境启用 agentflow。
-10. 生产灰度。
+1. `[DONE]` 新增配置和 Docker AgentFlow 安装。
+2. `[DONE]` 固定 AgentFlow 单入口。
+3. `[DONE]` 新增 AgentFlow runner 和 pipeline builder。
+4. `[NEXT]` 补 AgentFlow runner mock 测试，覆盖 result adapter 和取消。
+5. `[NEXT]` 跑通最小 AgentFlow pipeline 的真实 smoke。
+6. `[NEXT]` 验证 AgentFlow 异常时任务失败状态和 run 日志。
+7. `[NEXT]` 验证 skill match、skill executor、skill fallback。
+8. `[NEXT]` 验证 skill author 候选 skill 生成。
+9. `[NEXT]` 补 README 和 k8s deployment 挂载/环境变量说明。
+10. `[TODO]` 测试环境启用 agentflow。
+11. `[TODO]` 生产灰度。
 
 ## 14. 回滚方案
 
 最快回滚：
 
-```yaml
-agentflow:
-  engine_mode: "legacy"
-```
-
-或环境变量：
-
-```bash
-UNPACKER_ENGINE_MODE=legacy
-```
+- 回滚到上一版镜像。
+- 或临时构建不包含当前 AgentFlow 单入口改动的镜像。
 
 如果 AgentFlow 安装导致镜像启动失败：
 
@@ -917,9 +1056,8 @@ UNPACKER_ENGINE_MODE=legacy
 
 如果单个任务失败：
 
-- 开启 `fallback_to_legacy=true`。
-- AgentFlow 抛错后自动进入 legacy。
 - DB 中保留失败前的 AgentFlow run id 供排查。
+- 通过任务重试机制重新运行。
 
 ## 15. 后续增强方向
 
@@ -932,4 +1070,3 @@ UNPACKER_ENGINE_MODE=legacy
 - 使用 scratchboard 保存跨节点分析结论。
 - 为常见固件族构建 tuned agent。
 - 将 AgentFlow web UI 暴露为内部调试页面。
-

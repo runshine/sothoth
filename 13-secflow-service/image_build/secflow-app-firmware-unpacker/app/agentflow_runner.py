@@ -263,7 +263,6 @@ def run_unpack_agentflow(
                     if promotion_success_count is not None
                     else generated_skill.get("promotion_success_count") if generated_skill else None
                 ),
-                "engine_mode": "agentflow",
                 "agentflow_run_id": current.id,
                 "run_path": str(log_dir) if log_dir else None,
             }
