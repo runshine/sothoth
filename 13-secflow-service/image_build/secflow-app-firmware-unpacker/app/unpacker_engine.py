@@ -7,11 +7,21 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from app.logging_utils import log_event
 from app.preprocess import detect_format, run_preprocess
+from app.skill_store import (
+    DEFAULT_PROMOTION_THRESHOLD,
+    compute_family_id,
+    list_skills,
+    match_skill,
+    parse_skill_metadata,
+    register_skill_success,
+    save_candidate_skill,
+)
 
 log = logging.getLogger("unpacker.engine")
 debug_mode = True
@@ -26,13 +36,15 @@ AGENT_DIR = Path(
 EXEC_AGENT_DEF = str(AGENT_DIR / "firmware-unpacker.md")
 VAL_AGENT_DEF = str(AGENT_DIR / "firmware-unpack-reviewer.md")
 CLEAN_AGENT_DEF = str(AGENT_DIR / "firmware-extract-cleanup.md")
+AUTHOR_AGENT_DEF = str(AGENT_DIR / "firmware-skill-author.md")
 
 EXEC_FIRST_TMPL = AGENT_DIR / "prompt" / "unpack-firmware.md"
 EXEC_RETRY_TMPL = AGENT_DIR / "prompt" / "retry-firmware-unpack.md"
 VAL_PROMPT_TMPL = AGENT_DIR / "prompt" / "review-firmware-unpack.md"
 CLEAN_PROMPT_TMPL = AGENT_DIR / "prompt" / "cleanup-firmware.md"
+AUTHOR_PROMPT_TMPL = AGENT_DIR / "prompt" / "author-firmware-skill.md"
 
-TOOLS_DIR = Path(os.environ.get("UNPACKER_TOOLS_DIR", "/app/tools"))
+TOOLS_DIR = Path(os.environ.get("UNPACKER_TOOLS_DIR", "/data/tools"))
 LOG_OUTPUT_DIR = Path(os.environ.get("UNPACKER_LOG_DIR", "/workspace/log_output"))
 
 
@@ -81,6 +93,13 @@ def render_prompt(template_path: Path, firmware_path: str, output_path: str) -> 
     text = template_path.read_text()
     text = text.replace("$input", firmware_path)
     text = text.replace("$output", output_path)
+    return text
+
+
+def render_template(template_path: Path, replacements: dict[str, str]) -> str:
+    text = template_path.read_text()
+    for key, value in replacements.items():
+        text = text.replace(key, value)
     return text
 
 
@@ -421,137 +440,233 @@ def extract_firmware_features(firmware_path: str) -> dict:
     return features
 
 
-def parse_tool_metadata(tool_path: Path) -> dict:
-    meta = {
-        "path": str(tool_path),
-        "format_id": tool_path.stem,
-        "description": "",
-        "extensions": [],
-        "magic_hex": "",
-        "keywords": [],
-        "binwalk_sigs": [],
-    }
+def _is_review_success(review_text: str) -> bool:
+    lowered = str(review_text or "").strip().lower()
+    return '"result":"success"' in lowered or '"result": "success"' in lowered
+
+
+def _write_json_log(log_dir: Path | None, name: str, payload: dict[str, Any]) -> None:
+    if log_dir is None:
+        return
+    (log_dir / name).write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _run_reviewer(
+    firmware_path: str,
+    output_path: str,
+    log_dir: Path | None,
+    suffix: str,
+    val_def: dict[str, Any],
+    val_sp: str,
+) -> tuple[bool, str]:
+    validator = PiRpcClient(
+        system_prompt_file=val_sp,
+        model=val_def["model"],
+        tools=val_def["tools"],
+    )
+    verify_result = validator.prompt(render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path))
+    _save_agent_log(validator, log_dir, f"verifier_{suffix}")
+    validator.close()
+    return _is_review_success(verify_result), verify_result
+
+
+def _write_system_prompt(content: str, prefix: str) -> str:
+    temp_file = tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        prefix=prefix,
+        suffix=".md",
+        delete=False,
+    )
+    temp_file.write(content)
+    temp_file.flush()
+    temp_file.close()
+    return temp_file.name
+
+
+def _run_skill_unpack(
+    skill_meta: dict[str, Any],
+    firmware_path: str,
+    output_path: str,
+    log_dir: Path | None,
+    val_def: dict[str, Any],
+    val_sp: str,
+) -> dict[str, Any]:
+    skill_sp = _write_system_prompt(str(skill_meta.get("system_prompt") or ""), "firmware-skill-")
+    executor = PiRpcClient(
+        system_prompt_file=skill_sp,
+        model=skill_meta.get("model"),
+        tools=skill_meta.get("tools"),
+    )
     try:
-        in_meta = False
-        for line in tool_path.read_text().splitlines():
-            stripped = line.strip()
-            if stripped == "# TOOL_META_START":
-                in_meta = True
-                continue
-            if stripped == "# TOOL_META_END":
-                break
-            if in_meta and stripped.startswith("#"):
-                kv = stripped[1:].strip()
-                if ":" not in kv:
-                    continue
-                key, _, value = kv.partition(":")
-                key = key.strip()
-                value = value.strip()
-                if key == "format_id":
-                    meta["format_id"] = value
-                elif key == "description":
-                    meta["description"] = value
-                elif key == "extensions":
-                    meta["extensions"] = [
-                        item.strip().lower() for item in value.split(",") if item.strip()
-                    ]
-                elif key == "magic_hex":
-                    meta["magic_hex"] = value.lower().replace(" ", "")
-                elif key == "keywords":
-                    meta["keywords"] = [
-                        item.strip().lower() for item in value.split(",") if item.strip()
-                    ]
-                elif key == "binwalk_sigs":
-                    meta["binwalk_sigs"] = [
-                        item.strip().lower() for item in value.split(",") if item.strip()
-                    ]
-    except Exception:
-        pass
-    return meta
-
-
-def find_matching_tool(features: dict):
-    TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-    tools = list(TOOLS_DIR.glob("*.py"))
-    if not tools:
-        return None, {}
-
-    feat_ext = features.get("ext", "")
-    feat_ext2 = features.get("ext2", "")
-    feat_magic = features.get("magic_hex", "")[:8]
-    feat_fname = features.get("filename", "").lower()
-    feat_sigs = features.get("binwalk_sigs", [])
-    search_text = feat_fname + " " + " ".join(feat_sigs)
-
-    best_tool = None
-    best_meta = {}
-    best_score = 0
-
-    for tool_path in tools:
-        meta = parse_tool_metadata(tool_path)
-        score = 0
-        if meta["magic_hex"] and feat_magic:
-            magic = meta["magic_hex"]
-            if feat_magic.startswith(magic) or magic.startswith(feat_magic[: len(magic)]):
-                score += 50
-        for ext in meta["extensions"]:
-            if ext and (feat_ext == ext or feat_ext2 == ext or feat_ext2.endswith(ext)):
-                score += 30
-                break
-        for keyword in meta["keywords"]:
-            if keyword in search_text:
-                score += 10
-        for signature in meta["binwalk_sigs"]:
-            for feature_sig in feat_sigs:
-                if signature in feature_sig:
-                    score += 15
-                    break
-        if score > best_score:
-            best_score = score
-            best_tool = tool_path
-            best_meta = meta
-
-    return (best_tool, best_meta) if best_score >= 30 else (None, {})
-
-
-def run_tool(tool_path: Path, firmware_path: str, output_path: str, log_dir=None) -> dict:
-    try:
-        proc = subprocess.run(
-            ["python3", str(tool_path), firmware_path, output_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=600,
+        exec_result = executor.prompt(render_prompt(EXEC_FIRST_TMPL, firmware_path, output_path))
+        _save_agent_log(executor, log_dir, "skill_executor")
+        passed, review_result = _run_reviewer(
+            firmware_path,
+            output_path,
+            log_dir,
+            "skill",
+            val_def,
+            val_sp,
         )
         result = {
-            "success": proc.returncode == 0,
-            "method": f"tool:{tool_path.name}",
-            "stdout": proc.stdout[-2000:],
-            "stderr": proc.stderr[-500:],
-            "returncode": proc.returncode,
+            "success": passed,
+            "method": f"skill:{skill_meta.get('filename')}",
+            "response": exec_result,
+            "review": review_result,
         }
-        if log_dir is not None:
-            (log_dir / f"stage2_tool_{tool_path.stem}.json").write_text(
-                json.dumps(
-                    {
-                        "tool": tool_path.name,
-                        "firmware": Path(firmware_path).name,
-                        "returncode": proc.returncode,
-                        "success": proc.returncode == 0,
-                        "stdout": proc.stdout[-2000:] if proc.stdout else "",
-                        "stderr": proc.stderr[-500:] if proc.stderr else "",
-                    },
-                    indent=2,
-                )
-            )
+        _write_json_log(
+            log_dir,
+            "stage3_skill_exec.json",
+            {
+                "skill": skill_meta.get("path"),
+                "family_id": skill_meta.get("family_id"),
+                "skill_version": skill_meta.get("skill_version"),
+                "success": passed,
+                "response_preview": _preview_text(exec_result),
+                "review_preview": _preview_text(review_result),
+            },
+        )
         return result
+    finally:
+        executor.close()
+        try:
+            Path(skill_sp).unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _run_generic_unpack(
+    firmware_path: str,
+    output_path: str,
+    log_dir: Path | None,
+    cancel_check: Callable[[PiRpcClient | None], None],
+    exec_def: dict[str, Any],
+    val_def: dict[str, Any],
+    exec_sp: str,
+    val_sp: str,
+) -> tuple[bool, int, str]:
+    max_retries = _get_max_retries()
+    executor = PiRpcClient(
+        system_prompt_file=exec_sp,
+        model=exec_def["model"],
+        tools=exec_def["tools"],
+    )
+    passed = False
+    final_round = 0
+    last_reason = ""
+    try:
+        for attempt in range(1, max_retries + 1):
+            cancel_check(executor)
+            final_round = attempt
+            exec_msg = render_prompt(
+                EXEC_FIRST_TMPL if attempt == 1 else EXEC_RETRY_TMPL,
+                firmware_path,
+                output_path,
+            )
+            exec_result = executor.prompt(exec_msg)
+            _save_agent_log(executor, log_dir, f"executor_round_{attempt}")
+            passed, verify_result = _run_reviewer(
+                firmware_path,
+                output_path,
+                log_dir,
+                f"round_{attempt}",
+                val_def,
+                val_sp,
+            )
+            log_event(
+                log,
+                logging.INFO,
+                "executor attempt completed",
+                event="executor_attempt_complete",
+                attempt=attempt,
+                response_preview=_preview_text(exec_result),
+            )
+            log_event(
+                log,
+                logging.INFO,
+                "verifier attempt completed",
+                event="verifier_attempt_complete",
+                attempt=attempt,
+                response_preview=_preview_text(verify_result),
+            )
+            if passed:
+                break
+            last_reason = verify_result
+        return passed, final_round, last_reason
+    finally:
+        executor.close()
+
+
+def _extract_markdown_document(text: str) -> str:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", raw)
+        raw = re.sub(r"\n```$", "", raw)
+    return raw.strip()
+
+
+def _generate_candidate_skill(
+    firmware_path: str,
+    output_path: str,
+    features: dict[str, Any],
+    review_result: str,
+    log_dir: Path | None,
+) -> dict[str, Any] | None:
+    try:
+        author_def = load_agent_def(AUTHOR_AGENT_DEF)
+        summary_path = Path(output_path) / "summary.txt"
+        summary_text = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
+        prompt = render_template(
+            AUTHOR_PROMPT_TMPL,
+            {
+                "$input": firmware_path,
+                "$output": output_path,
+                "$summary": summary_text,
+                "$features": json.dumps(features, ensure_ascii=False, indent=2),
+                "$review_result": review_result,
+                "$family_id": compute_family_id(features),
+                "$promotion_threshold": str(DEFAULT_PROMOTION_THRESHOLD),
+            },
+        )
+        author_sp = _write_system_prompt(author_def["system_prompt"], "firmware-skill-author-")
+        author = PiRpcClient(
+            system_prompt_file=author_sp,
+            model=author_def["model"],
+            tools=author_def["tools"],
+        )
+        try:
+            raw_doc = author.prompt(prompt)
+            _save_agent_log(author, log_dir, "skill_author")
+        finally:
+            author.close()
+            try:
+                Path(author_sp).unlink()
+            except FileNotFoundError:
+                pass
+        saved = save_candidate_skill(
+            TOOLS_DIR,
+            _extract_markdown_document(raw_doc),
+            {"family_id": compute_family_id(features)},
+        )
+        _write_json_log(
+            log_dir,
+            "stage5_skill_generate.json",
+            {
+                "generated_skill_path": saved.get("path"),
+                "family_id": saved.get("family_id"),
+                "skill_version": saved.get("skill_version"),
+                "skill_status": saved.get("skill_status"),
+            },
+        )
+        return saved
     except Exception as exc:
-        result = {"success": False, "method": f"tool:{tool_path.name}", "error": str(exc)}
-        if log_dir is not None:
-            (log_dir / f"stage2_tool_{tool_path.stem}.json").write_text(
-                json.dumps({"tool": tool_path.name, "error": str(exc)}, indent=2)
-            )
-        return result
+        _write_json_log(
+            log_dir,
+            "stage5_skill_generate.json",
+            {"error": str(exc), "family_id": compute_family_id(features)},
+        )
+        return None
 
 
 def _run_cleaner(output_path: str, log_dir: Path | None = None) -> str:
@@ -622,9 +737,12 @@ def run_unpack(
 
     try:
         features = extract_firmware_features(firmware_path)
-        tool_path, _tool_meta = find_matching_tool(features)
+        features["family_id"] = compute_family_id(features)
+        skill_meta, skill_score, skill_match = match_skill(features, TOOLS_DIR)
     except Exception as exc:
-        tool_path = None
+        skill_meta = None
+        skill_score = 0
+        skill_match = {"matched_status": None, "reasons": []}
         log_event(
             log,
             logging.WARNING,
@@ -633,15 +751,18 @@ def run_unpack(
             error=str(exc),
         )
 
-    if tool_path:
-        _check_cancel()
-        tool_result = run_tool(tool_path, firmware_path, output_path, log_dir=log_dir)
-        if tool_result.get("success"):
-            return {
-                "status": "success",
-                "message": f"Extracted by tool: {tool_path.name}",
-                "rounds": 0,
-            }
+    _write_json_log(
+        log_dir,
+        "stage2_skill_match.json",
+        {
+            "features": features if "features" in locals() else {},
+            "matched_skill": skill_meta.get("path") if skill_meta else None,
+            "matched_skill_version": skill_meta.get("skill_version") if skill_meta else None,
+            "matched_skill_score": skill_score,
+            "matched_status": skill_match.get("matched_status"),
+            "reasons": skill_match.get("reasons"),
+        },
+    )
 
     _check_cancel()
 
@@ -660,64 +781,65 @@ def run_unpack(
     Path(exec_sp).write_text(exec_def["system_prompt"])
     Path(val_sp).write_text(val_def["system_prompt"])
 
-    max_retries = _get_max_retries()
-    executor = PiRpcClient(
-        system_prompt_file=exec_sp,
-        model=exec_def["model"],
-        tools=exec_def["tools"],
-    )
-
     passed = False
     final_round = 0
     last_reason = ""
+    fallback_to_llm = False
+    generated_skill = None
+    matched_skill = skill_meta
+    promotion_success_count = None
 
     try:
-        for attempt in range(1, max_retries + 1):
-            _check_cancel(executor)
-            final_round = attempt
-
-            exec_msg = render_prompt(
-                EXEC_FIRST_TMPL if attempt == 1 else EXEC_RETRY_TMPL,
+        if skill_meta:
+            _check_cancel()
+            skill_result = _run_skill_unpack(
+                skill_meta,
                 firmware_path,
                 output_path,
+                log_dir,
+                val_def,
+                val_sp,
             )
-            exec_result = executor.prompt(exec_msg)
-            _save_agent_log(executor, log_dir, f"executor_round_{attempt}")
-
-            validator = PiRpcClient(
-                system_prompt_file=val_sp,
-                model=val_def["model"],
-                tools=val_def["tools"],
-            )
-            verify_result = validator.prompt(
-                render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path)
-            )
-            _save_agent_log(validator, log_dir, f"verifier_round_{attempt}")
-            validator.close()
-
-            log_event(
-                log,
-                logging.INFO,
-                "executor attempt completed",
-                event="executor_attempt_complete",
-                attempt=attempt,
-                response_preview=_preview_text(exec_result),
-            )
-            log_event(
-                log,
-                logging.INFO,
-                "verifier attempt completed",
-                event="verifier_attempt_complete",
-                attempt=attempt,
-                response_preview=_preview_text(verify_result),
-            )
-
-            if "success" in verify_result.lower().strip():
+            if skill_result.get("success"):
                 passed = True
-                break
-            last_reason = verify_result
+                final_round = 0
+                updated_skill = register_skill_success(TOOLS_DIR, str(skill_meta.get("path")))
+                promotion_success_count = updated_skill.get("promotion_success_count")
+                matched_skill = updated_skill
+            else:
+                fallback_to_llm = True
+                last_reason = str(skill_result.get("review") or skill_result.get("response") or "")
+                _write_json_log(
+                    log_dir,
+                    "stage4_llm_fallback.json",
+                    {
+                        "matched_skill": skill_meta.get("path"),
+                        "reason": _preview_text(last_reason, 400),
+                    },
+                )
 
-        _check_cancel(executor)
+        if not passed:
+            generic_passed, final_round, last_reason = _run_generic_unpack(
+                firmware_path,
+                output_path,
+                log_dir,
+                _check_cancel,
+                exec_def,
+                val_def,
+                exec_sp,
+                val_sp,
+            )
+            passed = generic_passed
+            if passed:
+                generated_skill = _generate_candidate_skill(
+                    firmware_path,
+                    output_path,
+                    features,
+                    last_reason or '{"result":"success"}',
+                    log_dir,
+                )
+
+        _check_cancel()
         _run_cleaner(output_path, log_dir=log_dir)
         _write_token_summary(log_dir)
 
@@ -729,8 +851,6 @@ def run_unpack(
                 "rounds": final_round,
             }
         raise
-    finally:
-        executor.close()
 
     return {
         "status": "success" if passed else "max_retries_reached",
@@ -740,4 +860,15 @@ def run_unpack(
             else f"Max retries reached. Last reason: {last_reason}"
         ),
         "rounds": final_round,
+        "matched_skill": matched_skill.get("path") if matched_skill else None,
+        "matched_skill_version": matched_skill.get("skill_version") if matched_skill else None,
+        "matched_skill_score": skill_score if matched_skill else None,
+        "fallback_to_llm": fallback_to_llm,
+        "generated_skill_path": generated_skill.get("path") if generated_skill else None,
+        "generated_skill_status": generated_skill.get("skill_status") if generated_skill else None,
+        "promotion_success_count": (
+            promotion_success_count
+            if promotion_success_count is not None
+            else generated_skill.get("promotion_success_count") if generated_skill else None
+        ),
     }

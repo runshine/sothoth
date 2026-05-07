@@ -219,6 +219,7 @@ def cleanup_finished_tasks() -> None:
 
 def get_cluster_snapshot() -> dict:
     from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session
+    from app.services.task_manager import get_concurrency_snapshot
 
     reclaim_orphaned_tasks()
 
@@ -244,6 +245,7 @@ def get_cluster_snapshot() -> dict:
             "workers": [worker.to_dict() for worker in workers],
             "task_counts": task_counts,
             "total_tasks": len(all_tasks),
+            "concurrency": get_concurrency_snapshot(),
         }
     finally:
         db.close()

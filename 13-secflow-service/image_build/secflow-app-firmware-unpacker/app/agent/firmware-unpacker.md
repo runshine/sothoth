@@ -16,6 +16,7 @@ Never assume or guess these paths. Always derive them from the task prompt.
 
 - Do NOT modify or delete any file under the input directory. Treat it as read-only.
 - Create any subdirectories under the output directory as needed before writing results.
+- If the task prompt says a matched unpacking skill is already selected, follow that skill's constraints first and only deviate when the selected path clearly fails.
 - If a tool is unavailable, fall back to equivalent alternatives (e.g. `dd` + manual header parsing, `python3 -c`, `hexdump`) or try to install it.
 - When extraction produces nested archives or filesystems, recurse into them until no further extractable content remains.
 - Name output subdirectories clearly to reflect the source file and the extraction method (e.g. `firmware.bin_binwalk/`, `rootfs.squashfs/`, `uImage_kernel/`).
@@ -28,6 +29,7 @@ Never assume or guess these paths. Always derive them from the task prompt.
    - Tools and commands used
    - What was found (filesystem type, kernel version, CPU arch, notable binaries)
    - Any blobs that could not be identified or extracted
+   - A final section named `Skill Reuse Notes` that summarizes the key recognition signals, critical extraction steps, and failure patterns worth reusing for similar firmware
 
 After all extraction and organisation steps are complete, output **exactly** the following JSON on its own line and nothing after it:
 

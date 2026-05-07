@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
-import shutil
 import threading
+from math import floor
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -30,15 +31,122 @@ def _executor_capacity() -> int:
     return max(1, int(get_config().service.max_background_workers))
 
 
-def _runtime_max_concurrent() -> int:
+def _runtime_config_int(key: str, default: int) -> int:
     from app.model import get_config_value, get_db_session
 
     db = get_db_session()
     try:
-        value = get_config_value(db, "max_concurrent", default=_executor_capacity())
-        return max(1, min(_executor_capacity(), int(value)))
+        value = get_config_value(db, key, default=default)
+        return int(value)
     finally:
         db.close()
+
+
+def _runtime_config_str(key: str, default: str) -> str:
+    from app.model import get_config_value, get_db_session
+
+    db = get_db_session()
+    try:
+        value = get_config_value(db, key, default=default)
+        return str(value or default).strip()
+    finally:
+        db.close()
+
+
+def _safe_positive(value: int, fallback: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return fallback
+    return parsed if parsed > 0 else fallback
+
+
+def _runtime_concurrency_mode() -> str:
+    value = _runtime_config_str("concurrency_mode", "auto").lower()
+    return value if value in {"auto", "manual"} else "auto"
+
+
+def _pod_resource_int(env_name: str) -> Optional[int]:
+    raw = str(os.environ.get(env_name, "")).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("invalid pod resource env %s=%s", env_name, raw)
+        return None
+    return value if value > 0 else None
+
+
+def get_concurrency_snapshot() -> dict[str, int | str | bool | None]:
+    executor_capacity = _executor_capacity()
+    mode = _runtime_concurrency_mode()
+    manual_default = _runtime_config_int("max_concurrent", default=executor_capacity)
+    manual_limit = _safe_positive(
+        _runtime_config_int("manual_max_concurrent", default=manual_default),
+        manual_default,
+    )
+    cpu_per_task = _safe_positive(_runtime_config_int("cpu_millis_per_task", 250), 250)
+    memory_per_task = _safe_positive(_runtime_config_int("memory_mb_per_task", 512), 512)
+    reserved_cpu = max(0, _runtime_config_int("reserved_cpu_millis", 100))
+    reserved_memory = max(0, _runtime_config_int("reserved_memory_mb", 256))
+
+    pod_cpu_limit = _pod_resource_int("POD_CPU_LIMIT_MILLICORES")
+    pod_memory_limit = _pod_resource_int("POD_MEMORY_LIMIT_MIB")
+    pod_cpu_request = _pod_resource_int("POD_CPU_REQUEST_MILLICORES")
+    pod_memory_request = _pod_resource_int("POD_MEMORY_REQUEST_MIB")
+
+    resource_based = False
+    auto_limit = executor_capacity
+    cpu_based_limit: Optional[int] = None
+    memory_based_limit: Optional[int] = None
+
+    if pod_cpu_limit and pod_memory_limit:
+        usable_cpu = max(0, pod_cpu_limit - reserved_cpu)
+        usable_memory = max(0, pod_memory_limit - reserved_memory)
+        cpu_based_limit = max(1, floor(usable_cpu / cpu_per_task)) if cpu_per_task > 0 else executor_capacity
+        memory_based_limit = max(1, floor(usable_memory / memory_per_task)) if memory_per_task > 0 else executor_capacity
+        auto_limit = min(cpu_based_limit, memory_based_limit, executor_capacity)
+        auto_limit = max(1, auto_limit)
+        resource_based = True
+
+    effective_max = manual_limit if mode == "manual" else auto_limit
+    effective_max = max(1, min(executor_capacity, effective_max))
+
+    return {
+        "mode": mode,
+        "resource_based": resource_based,
+        "effective_max_concurrent": effective_max,
+        "executor_capacity": executor_capacity,
+        "manual_max_concurrent": max(1, min(executor_capacity, manual_limit)),
+        "auto_max_concurrent": auto_limit,
+        "cpu_based_limit": cpu_based_limit,
+        "memory_based_limit": memory_based_limit,
+        "cpu_millis_per_task": cpu_per_task,
+        "memory_mb_per_task": memory_per_task,
+        "reserved_cpu_millis": reserved_cpu,
+        "reserved_memory_mb": reserved_memory,
+        "pod_cpu_limit_millicores": pod_cpu_limit,
+        "pod_memory_limit_mib": pod_memory_limit,
+        "pod_cpu_request_millicores": pod_cpu_request,
+        "pod_memory_request_mib": pod_memory_request,
+    }
+
+
+def _runtime_max_concurrent() -> int:
+    snapshot = get_concurrency_snapshot()
+    return int(snapshot["effective_max_concurrent"])
+
+
+def _runtime_max_concurrent_for_logs() -> str:
+    snapshot = get_concurrency_snapshot()
+    source = "resource" if snapshot["resource_based"] else "fallback"
+    return (
+        f"mode={snapshot['mode']} "
+        f"effective={snapshot['effective_max_concurrent']} "
+        f"executor={snapshot['executor_capacity']} "
+        f"source={source}"
+    )
 
 
 def _dispatch_interval_seconds() -> int:
@@ -84,11 +192,25 @@ def build_task_workspace(project_id: str, task_id: str) -> dict[str, Path]:
     }
 
 
-def _copied_firmware_path(source_firmware_path: str, input_dir: Path) -> Path:
-    source_name = Path(source_firmware_path).name.strip()
-    if not source_name:
-        raise ValueError("firmware_path 无法解析文件名")
-    return input_dir / source_name
+def _manifest_path(input_dir: Path) -> Path:
+    return input_dir / "task.json"
+
+
+def _write_task_manifest(input_dir: Path, source_firmware_path: str, output_path: str, run_path: str) -> Path:
+    manifest_path = _manifest_path(input_dir)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "input_path": source_firmware_path,
+                "output_path": output_path,
+                "log_path": run_path,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return manifest_path
 
 
 def prepare_task_workspace(
@@ -104,14 +226,19 @@ def prepare_task_workspace(
     if not source_path.exists() or not source_path.is_file():
         raise FileNotFoundError(f"固件文件不存在: {source_firmware_path}")
 
-    copied_input = _copied_firmware_path(source_firmware_path, workspace["input_dir"])
-    shutil.copy2(source_path, copied_input)
+    manifest_path = _write_task_manifest(
+        workspace["input_dir"],
+        source_firmware_path,
+        str(workspace["output_dir"]),
+        str(workspace["run_dir"]),
+    )
     return {
         "base_dir": str(workspace["base_dir"]),
-        "input_path": str(copied_input),
+        "input_path": source_firmware_path,
         "input_dir": str(workspace["input_dir"]),
         "output_path": str(workspace["output_dir"]),
         "run_path": str(workspace["run_dir"]),
+        "manifest_path": str(manifest_path),
     }
 
 
@@ -132,6 +259,8 @@ def remove_task_workspace(task_id: str, project_id: Optional[str]) -> None:
             f"refuse to remove non-task workspace path: {base_dir}"
         )
 
+    import shutil
+
     shutil.rmtree(base_dir)
     logger.info("task workspace removed: %s", base_dir)
 
@@ -145,10 +274,15 @@ def resolve_task_runtime_paths(
     normalized_project_id = str(project_id or "").strip()
     if normalized_project_id:
         workspace = build_task_workspace(normalized_project_id, task_id)
-        copied_input = _copied_firmware_path(source_firmware_path, workspace["input_dir"])
-        if copied_input.exists():
+        if workspace["base_dir"].exists():
+            _write_task_manifest(
+                workspace["input_dir"],
+                source_firmware_path,
+                str(workspace["output_dir"]),
+                str(workspace["run_dir"]),
+            )
             return {
-                "input_path": str(copied_input),
+                "input_path": source_firmware_path,
                 "output_path": str(workspace["output_dir"]),
                 "run_path": str(workspace["run_dir"]),
             }
@@ -485,6 +619,13 @@ def _update_task_result(task_id: str, result: dict) -> None:
         task.result_status = result.get("status")
         task.result_message = result.get("message")
         task.rounds = result.get("rounds")
+        task.matched_skill = result.get("matched_skill")
+        task.matched_skill_version = result.get("matched_skill_version")
+        task.matched_skill_score = result.get("matched_skill_score")
+        task.fallback_to_llm = bool(result.get("fallback_to_llm"))
+        task.generated_skill_path = result.get("generated_skill_path")
+        task.generated_skill_status = result.get("generated_skill_status")
+        task.promotion_success_count = result.get("promotion_success_count")
         task.completed_at = datetime.utcnow()
         db.commit()
     finally:
@@ -522,6 +663,7 @@ def start() -> None:
         return
 
     get_executor()
+    logger.info("task dispatcher concurrency: %s", _runtime_max_concurrent_for_logs())
     _dispatcher_stop.clear()
     _dispatcher_thread = threading.Thread(
         target=_dispatch_loop,

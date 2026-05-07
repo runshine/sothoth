@@ -30,6 +30,30 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: POD_CPU_LIMIT_MILLICORES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: secflow-app-firmware-unpacker
+                  resource: limits.cpu
+                  divisor: 1m
+            - name: POD_MEMORY_LIMIT_MIB
+              valueFrom:
+                resourceFieldRef:
+                  containerName: secflow-app-firmware-unpacker
+                  resource: limits.memory
+                  divisor: 1Mi
+            - name: POD_CPU_REQUEST_MILLICORES
+              valueFrom:
+                resourceFieldRef:
+                  containerName: secflow-app-firmware-unpacker
+                  resource: requests.cpu
+                  divisor: 1m
+            - name: POD_MEMORY_REQUEST_MIB
+              valueFrom:
+                resourceFieldRef:
+                  containerName: secflow-app-firmware-unpacker
+                  resource: requests.memory
+                  divisor: 1Mi
           ports:
             - containerPort: 8080
           volumeMounts:

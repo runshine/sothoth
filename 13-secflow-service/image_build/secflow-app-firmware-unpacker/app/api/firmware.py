@@ -22,12 +22,17 @@ from app.schemas import (
     HealthResponse,
     ReadyResponse,
     TaskListResponse,
+    TaskResourceUsageResponse,
     TaskResponse,
     TaskSubmitResponse,
+    ToolListResponse,
     UnpackRequest,
 )
+from app.services.pod_metrics import get_pod_resource_usage
 from app.services.task_manager import cancel_task, delete_tasks, retry_task, submit_unpack_task
 from app.services.worker import get_cluster_snapshot, get_worker_id
+from app.skill_store import list_skills
+from app.unpacker_engine import TOOLS_DIR
 
 
 router = APIRouter(tags=["Firmware Unpacker"])
@@ -79,6 +84,37 @@ def _get_task_or_404(task_id: str) -> dict:
         return task.to_dict()
     finally:
         db.close()
+
+
+def _get_task_resource_usage(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    worker_id = str(task.get("worker_id") or "").strip() or None
+    if not worker_id:
+        return {
+            "task_id": task_id,
+            "worker_id": None,
+            "available": False,
+            "message": "任务当前未绑定运行中的 Worker，无法获取资源使用情况",
+            "containers": [],
+        }
+
+    metrics = get_pod_resource_usage(worker_id)
+    if not metrics:
+        return {
+            "task_id": task_id,
+            "worker_id": worker_id,
+            "available": False,
+            "pod_name": worker_id,
+            "message": "未获取到任务所在 Worker Pod 的资源指标",
+            "containers": [],
+        }
+
+    return {
+        "task_id": task_id,
+        "worker_id": worker_id,
+        "available": True,
+        **metrics,
+    }
 
 
 async def _get_task_with_access(task_id: str, token: str) -> dict:
@@ -202,6 +238,30 @@ def _batch_update_config_entries(items: list[ConfigBatchUpdateItem]) -> dict:
     return {"total": len(updated), "items": updated}
 
 
+def _list_tools() -> dict:
+    items: list[dict] = []
+    for meta in list_skills(TOOLS_DIR):
+        items.append(
+            {
+                "filename": str(meta.get("filename") or ""),
+                "path": str(meta.get("path") or ""),
+                "name": str(meta.get("name") or ""),
+                "format_id": str(meta.get("format_id") or ""),
+                "description": str(meta.get("description") or ""),
+                "extensions": list(meta.get("extensions") or []),
+                "magic_hex": str(meta.get("magic_hex") or ""),
+                "keywords": list(meta.get("keywords") or []),
+                "binwalk_sigs": list(meta.get("binwalk_sigs") or []),
+                "skill_status": str(meta.get("skill_status") or ""),
+                "skill_version": int(meta.get("skill_version") or 1),
+                "family_id": str(meta.get("family_id") or ""),
+                "promotion_success_count": int(meta.get("promotion_success_count") or 0),
+                "promotion_threshold": int(meta.get("promotion_threshold") or 5),
+            }
+        )
+    return {"total": len(items), "items": items}
+
+
 @router.get("/health", response_model=HealthResponse)
 @router.get("/api/app/firmware-unpacker/health", response_model=HealthResponse)
 async def health_check():
@@ -226,6 +286,13 @@ async def get_runtime_config(
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
     return _get_config_entries()
+
+
+@router.get("/api/app/firmware-unpacker/tools", response_model=ToolListResponse)
+async def get_unpacker_tools(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _list_tools()
 
 
 @router.put(
@@ -373,6 +440,19 @@ async def get_task_legacy(
 ):
     _, token = subject_and_token
     return await _get_task_with_access(task_id, token)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/resource-usage",
+    response_model=TaskResourceUsageResponse,
+)
+async def get_task_resource_usage_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_resource_usage(task_id)
 
 
 @router.delete("/api/app/firmware-unpacker/tasks/{task_id}", response_model=ActionResponse)

@@ -56,12 +56,42 @@ class TaskResponse(BaseModel):
     result_message: Optional[str] = None
     rounds: Optional[int] = None
     error_message: Optional[str] = None
+    matched_skill: Optional[str] = None
+    matched_skill_version: Optional[int] = None
+    matched_skill_score: Optional[int] = None
+    fallback_to_llm: bool = False
+    generated_skill_path: Optional[str] = None
+    generated_skill_status: Optional[str] = None
+    promotion_success_count: Optional[int] = None
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+class TaskResourceContainerResponse(BaseModel):
+    name: Optional[str] = None
+    cpu_millicores: int
+    memory_mib: int
+
+
+class TaskResourceUsageResponse(BaseModel):
+    task_id: str
+    worker_id: Optional[str] = None
+    available: bool
+    pod_name: Optional[str] = None
+    namespace: Optional[str] = None
+    phase: Optional[str] = None
+    timestamp: Optional[str] = None
+    window: Optional[str] = None
+    cpu_millicores: Optional[int] = None
+    memory_mib: Optional[int] = None
+    pod_cpu_limit_millicores: Optional[int] = None
+    pod_memory_limit_mib: Optional[int] = None
+    containers: List[TaskResourceContainerResponse] = []
+    message: Optional[str] = None
 
 
 class TaskListResponse(BaseModel):
@@ -81,6 +111,25 @@ class WorkerInstanceResponse(BaseModel):
     active_tasks: int
 
 
+class ConcurrencyInfoResponse(BaseModel):
+    mode: str
+    resource_based: bool
+    effective_max_concurrent: int
+    executor_capacity: int
+    manual_max_concurrent: int
+    auto_max_concurrent: int
+    cpu_based_limit: Optional[int] = None
+    memory_based_limit: Optional[int] = None
+    cpu_millis_per_task: int
+    memory_mb_per_task: int
+    reserved_cpu_millis: int
+    reserved_memory_mb: int
+    pod_cpu_limit_millicores: Optional[int] = None
+    pod_memory_limit_mib: Optional[int] = None
+    pod_cpu_request_millicores: Optional[int] = None
+    pod_memory_request_mib: Optional[int] = None
+
+
 class ClusterInfoResponse(BaseModel):
     this_worker: str
     total_workers: int
@@ -88,6 +137,7 @@ class ClusterInfoResponse(BaseModel):
     workers: List[WorkerInstanceResponse]
     task_counts: dict[str, int]
     total_tasks: int
+    concurrency: ConcurrencyInfoResponse
 
 
 class ConfigEntryResponse(BaseModel):
@@ -101,6 +151,28 @@ class ConfigEntryResponse(BaseModel):
 class ConfigListResponse(BaseModel):
     total: int
     items: List[ConfigEntryResponse]
+
+
+class ToolEntryResponse(BaseModel):
+    filename: str
+    path: str
+    name: str
+    format_id: str
+    description: str
+    extensions: List[str]
+    magic_hex: str
+    keywords: List[str]
+    binwalk_sigs: List[str]
+    skill_status: str
+    skill_version: int
+    family_id: str
+    promotion_success_count: int
+    promotion_threshold: int
+
+
+class ToolListResponse(BaseModel):
+    total: int
+    items: List[ToolEntryResponse]
 
 
 class HealthResponse(BaseModel):

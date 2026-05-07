@@ -9,7 +9,7 @@ import socket
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_engine, inspect, text
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.config import get_config
@@ -56,6 +56,13 @@ class UnpackTask(Base):
     result_message = Column(Text, nullable=True)
     rounds = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
+    matched_skill = Column(String(512), nullable=True)
+    matched_skill_version = Column(Integer, nullable=True)
+    matched_skill_score = Column(Integer, nullable=True)
+    fallback_to_llm = Column(Boolean, nullable=False, default=False)
+    generated_skill_path = Column(String(512), nullable=True)
+    generated_skill_status = Column(String(32), nullable=True)
+    promotion_success_count = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
@@ -72,6 +79,13 @@ class UnpackTask(Base):
             "result_message": self.result_message,
             "rounds": self.rounds,
             "error_message": self.error_message,
+            "matched_skill": self.matched_skill,
+            "matched_skill_version": self.matched_skill_version,
+            "matched_skill_score": self.matched_skill_score,
+            "fallback_to_llm": self.fallback_to_llm,
+            "generated_skill_path": self.generated_skill_path,
+            "generated_skill_status": self.generated_skill_status,
+            "promotion_success_count": self.promotion_success_count,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -121,7 +135,13 @@ class ServiceConfig(Base):
 
 
 DEFAULT_CONFIGS = [
-    ("max_concurrent", "3", "int", "每个 Worker 最大并发解包任务数"),
+    ("concurrency_mode", "auto", "string", "并发控制模式：auto=按 Pod CPU/内存自动计算，manual=手动指定"),
+    ("manual_max_concurrent", "3", "int", "手动模式下单个 Pod 最大并发解包任务数"),
+    ("cpu_millis_per_task", "250", "int", "自动模式下单个解包任务预估占用 CPU(millicores)"),
+    ("memory_mb_per_task", "512", "int", "自动模式下单个解包任务预估占用内存(MiB)"),
+    ("reserved_cpu_millis", "100", "int", "自动模式下为 Pod 自身保留的 CPU(millicores)"),
+    ("reserved_memory_mb", "256", "int", "自动模式下为 Pod 自身保留的内存(MiB)"),
+    ("max_concurrent", "3", "int", "兼容旧版本：单个 Worker 最大并发解包任务数"),
     ("max_retries", "5", "int", "pi agent 最大重试轮数"),
     ("dead_threshold", "90", "int", "Worker 心跳超时秒数"),
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
@@ -184,7 +204,33 @@ def apply_table_prefix_if_needed() -> None:
 def init_database() -> None:
     apply_table_prefix_if_needed()
     Base.metadata.create_all(bind=get_engine())
+    _ensure_unpack_task_columns()
     _seed_default_configs()
+
+
+def _ensure_unpack_task_columns() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns(UnpackTask.__table__.name)}
+    except Exception:
+        return
+
+    statements = {
+        "matched_skill": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill VARCHAR(512)",
+        "matched_skill_version": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill_version INTEGER",
+        "matched_skill_score": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill_score INTEGER",
+        "fallback_to_llm": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN fallback_to_llm BOOLEAN DEFAULT 0",
+        "generated_skill_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_path VARCHAR(512)",
+        "generated_skill_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_status VARCHAR(32)",
+        "promotion_success_count": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN promotion_success_count INTEGER",
+    }
+
+    with engine.begin() as conn:
+        for column_name, statement in statements.items():
+            if column_name in columns:
+                continue
+            conn.execute(text(statement))
 
 
 def _seed_default_configs() -> None:
