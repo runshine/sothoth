@@ -274,8 +274,10 @@ def _read_run_timestamps(run_dir: Path) -> dict[str, Any]:
 def _normalize_run_status(raw_status: str, run_meta: dict[str, Any] | None = None) -> str:
     run_meta = run_meta or {}
     text = str(raw_status or "").strip().lower()
+    meta_status = str(run_meta.get("status") or "").strip().lower()
+    if not run_meta.get("finished_at") and meta_status in _RUNNING_WORKFLOW_STATES:
+        return "running" if meta_status == "in_progress" else meta_status
     if run_meta.get("finished_at"):
-        meta_status = str(run_meta.get("status") or "").strip().lower()
         if meta_status in _TERMINAL_STATUSES:
             return meta_status
     if text in _TERMINAL_STATUSES:

@@ -10,7 +10,7 @@ from app.models.contracts import TaskItem
 
 class ProfileConfigPayload(BaseModel):
     model: str = Field(..., min_length=1)
-    thinking: str = Field(default="high", min_length=1)
+    thinking: Optional[str] = None
     review_profile: str = Field(default="balanced", min_length=1)
     max_review_cycles: int = Field(default=6, ge=1)
     worker_timeout: int = Field(default=3600, ge=1)
@@ -156,6 +156,11 @@ class ScanTaskAttemptResponse(BaseModel):
     history_run_id: Optional[str] = None
     owner_pod_id: Optional[str]
     lease_expires_at: Optional[datetime]
+    process_pid: Optional[int] = None
+    process_host: Optional[str] = None
+    process_status: Optional[str] = None
+    process_started_at: Optional[datetime] = None
+    process_finished_at: Optional[datetime] = None
     started_at: Optional[datetime]
     finished_at: Optional[datetime]
     recovery_reason: Optional[str]
@@ -165,32 +170,6 @@ class ScanTaskAttemptResponse(BaseModel):
     output_task_count: int
     created_at: datetime
     updated_at: datetime
-
-
-class ScanTaskEventResponse(BaseModel):
-    event_id: str
-    execution_id: str
-    attempt_no: int
-    event_type: str
-    stage_id: Optional[str]
-    round_no: Optional[int]
-    level: str
-    message: str
-    payload_json: Optional[Dict[str, Any]]
-    created_at: datetime
-
-
-class ScanTaskArtifactFileResponse(BaseModel):
-    path: str
-    size: int
-
-
-class ScanTaskArtifactsResponse(BaseModel):
-    task_id: str
-    execution_id: Optional[str]
-    workspace_root: Optional[str]
-    output_manifest_path: Optional[str]
-    files: List[ScanTaskArtifactFileResponse] = Field(default_factory=list)
 
 
 class ScanTaskDetailResponse(ScanTaskResponse):
@@ -247,71 +226,6 @@ class ProjectFilesystemChildrenResponse(BaseModel):
     files: List[ProjectFilesystemEntryResponse] = Field(default_factory=list)
 
 
-class WorkflowDefinitionCreate(BaseModel):
-    name: str = Field(..., min_length=1, max_length=128)
-    description: Optional[str] = None
-    project_id: str
-    definition_json: Dict[str, Any]
-    trigger_type: str = "manual"
-    trigger_enabled: bool = False
-    is_active: bool = False
-    enabled: bool = True
-    max_concurrency: int = Field(default=1, ge=1)
-    priority_default: int = 100
-    workspace_base_dir: Optional[str] = None
-    execution_timeout_seconds: int = Field(default=7200, ge=1)
-
-
-class WorkflowDefinitionUpdate(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
-    description: Optional[str] = None
-    definition_json: Optional[Dict[str, Any]] = None
-    trigger_type: Optional[str] = None
-    trigger_enabled: Optional[bool] = None
-    is_active: Optional[bool] = None
-    enabled: Optional[bool] = None
-    max_concurrency: Optional[int] = Field(default=None, ge=1)
-    priority_default: Optional[int] = None
-    workspace_base_dir: Optional[str] = None
-    execution_timeout_seconds: Optional[int] = Field(default=None, ge=1)
-
-
-class WorkflowDefinitionResponse(BaseModel):
-    id: str
-    name: str
-    description: Optional[str]
-    project_id: str
-    root_workflow_id: str
-    trigger_type: str
-    trigger_enabled: bool
-    is_active: bool
-    enabled: bool
-    max_concurrency: int
-    priority_default: int
-    workspace_base_dir: Optional[str]
-    execution_timeout_seconds: int
-    entry_input_task_type: str
-    final_output_task_type: str
-    created_by: str
-    updated_by: str
-    created_at: datetime
-    updated_at: datetime
-
-
-class WorkflowDefinitionVersionResponse(BaseModel):
-    id: str
-    workflow_definition_id: str
-    version_no: int
-    created_by: str
-    created_at: datetime
-    definition_json: Dict[str, Any]
-
-
-class TriggerTaskCreate(BaseModel):
-    input_tasks: List["TriggerTaskInputTask"]
-    priority: Optional[int] = None
-
-
 class TriggerTaskInputTask(BaseModel):
     task_id: Optional[str] = None
     task_type: Optional[str] = None
@@ -324,52 +238,6 @@ class TriggerTaskInputTask(BaseModel):
 
 class TriggerTaskInputPreview(TaskItem):
     task_input_dir: Optional[str] = None
-
-
-class TriggerTaskResponse(BaseModel):
-    id: str
-    workflow_definition_id: str
-    project_id: str
-    trigger_type: str
-    priority: int
-    status: str
-    submitted_by: str
-    started_at: Optional[datetime]
-    finished_at: Optional[datetime]
-    message: Optional[str]
-    created_at: datetime
-    updated_at: datetime
-
-
-class WorkflowExecutionResponse(BaseModel):
-    id: str
-    trigger_task_id: str
-    workflow_definition_id: str
-    project_id: str
-    status: str
-    workspace_root: Optional[str]
-    output_manifest_path: Optional[str]
-    output_task_count: int
-    current_stage_id: Optional[str]
-    owner_pod_id: Optional[str]
-    lease_expires_at: Optional[datetime]
-    started_at: Optional[datetime]
-    finished_at: Optional[datetime]
-    message: Optional[str]
-    created_at: datetime
-    updated_at: datetime
-
-
-class WorkflowExecutionEventResponse(BaseModel):
-    id: str
-    execution_id: str
-    event_type: str
-    stage_id: Optional[str]
-    round_no: Optional[int]
-    level: str
-    message: str
-    payload_json: Optional[Dict[str, Any]]
-    created_at: datetime
 
 
 class SchedulerWorkerResponse(BaseModel):
@@ -385,6 +253,27 @@ class SchedulerWorkerResponse(BaseModel):
 class SuccessResponse(BaseModel):
     success: bool = True
     message: str
+
+
+class HistoryRunRetryRequest(BaseModel):
+    extra_cycles: int = Field(default=5, ge=1)
+    model: Optional[str] = Field(default=None, min_length=1)
+    provider: Optional[str] = None
+    thinking: Optional[str] = Field(default=None, min_length=1)
+    clean_workspace: bool = False
+
+
+class HistoryRunMutationResponse(BaseModel):
+    success: bool = True
+    history_run_id: str
+    project_id: str
+    status: str
+    message: str
+    linked_task_id: Optional[str] = None
+    linked_execution_id: Optional[str] = None
+    process_pid: Optional[int] = None
+    process_host: Optional[str] = None
+    process_signal: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -453,6 +342,8 @@ class HistoryRunDetailResponse(HistoryRunSummaryResponse):
     files: List[HistoryRunFileResponse] = Field(default_factory=list)
     sessions: List[HistoryRunSessionResponse] = Field(default_factory=list)
     run_log: str = ""
+    command: List[str] = Field(default_factory=list)
+    command_display: str = ""
     raw: Dict[str, Any] = Field(default_factory=dict)
 
 

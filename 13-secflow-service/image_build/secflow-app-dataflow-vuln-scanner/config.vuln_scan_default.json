@@ -21,7 +21,7 @@
       "runtime_config": {
         "model": "icsl/zai-org/GLM-5",
         "sdk_specific": {
-          "thinking": "high"
+          "thinking": "medium"
         },
         "api_max_retries": -1,
         "api_retry_delay": 10,
@@ -43,7 +43,7 @@
       "runtime_config": {
         "model": "icsl/zai-org/GLM-5",
         "sdk_specific": {
-          "thinking": "high",
+          "thinking": "medium",
           "tools": "read,bash"
         },
         "api_max_retries": -1,
@@ -139,9 +139,13 @@
         "engine": {
           "max_review_cycles": 6,
           "review_profile": "balanced",
+          "review_enabled": true,
           "max_worker_turns_per_cycle": 70,
           "reflection_passes_per_cycle": 1,
           "min_discovery_cycles_before_pass": 1,
+          "progress_required_after_cycle": 0,
+          "progress_no_signal_closure_streak": 2,
+          "progress_no_signal_abort_streak": 3,
           "reset_worker_session_per_cycle": true,
           "plateau_closure_streak": 2,
           "plateau_abort_streak": 3,

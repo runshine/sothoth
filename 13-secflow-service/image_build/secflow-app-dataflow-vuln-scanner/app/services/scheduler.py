@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List
@@ -27,7 +28,7 @@ class SchedulerService:
     def __init__(self) -> None:
         self._started = False
         self._tasks: List[asyncio.Task] = []
-        self._running_tasks: Dict[str, asyncio.Task] = {}
+        self._running_tasks: Dict[str, Any] = {}
         self._worker_status = "active"
 
     @property
@@ -216,7 +217,7 @@ class SchedulerService:
                             WorkflowExecution.lease_token: lease_token,
                             WorkflowExecution.lease_expires_at: lease_expires_at,
                             WorkflowExecution.started_at: now,
-                            WorkflowExecution.message: f"claimed by {self.pod_id}",
+                            WorkflowExecution.message: f"started by {self.pod_id}",
                         },
                         synchronize_session=False,
                     )
@@ -231,7 +232,7 @@ class SchedulerService:
                         {
                             TriggerTask.status: "running",
                             TriggerTask.started_at: now,
-                            TriggerTask.message: f"claimed by {self.pod_id}",
+                            TriggerTask.message: f"started by {self.pod_id}",
                         },
                         synchronize_session=False,
                     )
@@ -240,11 +241,87 @@ class SchedulerService:
                     db.rollback()
                     continue
                 db.commit()
-                logger.info("claimed execution %s on pod %s", execution.id, self.pod_id)
+                logger.info("started execution %s on pod %s", execution.id, self.pod_id)
                 return execution.id
             return None
         finally:
             db.close()
+
+    def _claim_execution_now(self, execution_id: str) -> str | None:
+        db = get_db_session()
+        try:
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is None or execution.status != "pending" or execution.owner_pod_id is not None:
+                return None
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            if trigger is None or trigger.status != "pending":
+                return None
+            definition = db.get(WorkflowDefinition, execution.workflow_definition_id)
+            if definition is None or not definition.enabled or definition.max_concurrency <= 0:
+                return None
+            running_same_definition = (
+                db.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.workflow_definition_id == definition.id,
+                    WorkflowExecution.status == "running",
+                )
+                .count()
+            )
+            if running_same_definition >= definition.max_concurrency:
+                return None
+            now = datetime.utcnow()
+            lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)
+            lease_token = uuid.uuid4().hex
+            updated_execution = (
+                db.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.id == execution_id,
+                    WorkflowExecution.status == "pending",
+                    WorkflowExecution.owner_pod_id.is_(None),
+                )
+                .update(
+                    {
+                        WorkflowExecution.status: "running",
+                        WorkflowExecution.owner_pod_id: self.pod_id,
+                        WorkflowExecution.lease_token: lease_token,
+                        WorkflowExecution.lease_expires_at: lease_expires_at,
+                        WorkflowExecution.started_at: now,
+                        WorkflowExecution.message: f"started immediately by {self.pod_id}",
+                    },
+                    synchronize_session=False,
+                )
+            )
+            updated_trigger = (
+                db.query(TriggerTask)
+                .filter(TriggerTask.id == trigger.id, TriggerTask.status == "pending")
+                .update(
+                    {
+                        TriggerTask.status: "running",
+                        TriggerTask.started_at: now,
+                        TriggerTask.message: f"started immediately by {self.pod_id}",
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated_execution != 1 or updated_trigger != 1:
+                db.rollback()
+                return None
+            db.commit()
+            logger.info("immediately started execution %s on pod %s", execution_id, self.pod_id)
+            return execution_id
+        finally:
+            db.close()
+
+    def start_execution_now(self, execution_id: str | None) -> bool:
+        if not execution_id or execution_id in self._running_tasks:
+            return False
+        if self._worker_status != "active" or self.local_running_count() >= self.capacity:
+            return False
+        claimed_execution_id = self._claim_execution_now(execution_id)
+        if not claimed_execution_id:
+            return False
+        self._schedule_execution_thread(claimed_execution_id)
+        return True
 
     def _schedule_execution(self, execution_id: str) -> None:
         if execution_id in self._running_tasks:
@@ -261,6 +338,23 @@ class SchedulerService:
 
         task = asyncio.create_task(runner(), name=f"execution-{execution_id}")
         self._running_tasks[execution_id] = task
+
+    def _schedule_execution_thread(self, execution_id: str) -> None:
+        if execution_id in self._running_tasks:
+            return
+
+        def runner() -> None:
+            try:
+                get_execution_service().run_claimed_execution(execution_id)
+            except Exception:
+                logger.exception("execution %s failed", execution_id)
+            finally:
+                self._running_tasks.pop(execution_id, None)
+                self._heartbeat_once()
+
+        thread = threading.Thread(target=runner, name=f"execution-{execution_id}", daemon=True)
+        self._running_tasks[execution_id] = thread
+        thread.start()
 
     async def _lease_loop(self) -> None:
         interval = max(1, get_config().scheduler.lease_duration_seconds // 3)

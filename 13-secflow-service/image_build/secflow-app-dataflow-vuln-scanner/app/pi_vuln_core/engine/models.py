@@ -106,7 +106,7 @@ class WorkflowContext:
 
     # 收敛模式 / 停滞检测
     review_mode: str = "discovery"         # discovery | closure
-    review_profile: str = "balanced"       # fast | balanced | strict | audit
+    review_profile: str = "balanced"       # fast | balanced | audit (strict maps to audit)
     plateau_streak: int = 0
     plateau_reason: str = ""
     issue_ledger_status: dict[str, Any] = field(default_factory=dict)

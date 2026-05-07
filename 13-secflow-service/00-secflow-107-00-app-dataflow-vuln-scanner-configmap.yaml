@@ -43,7 +43,7 @@ data:
       timeout: 10
       data_mount_path: "/data"
       project_files_dirname: "files"
-      aiwf_subproject_name: "DATAFLOW_VULN_SCANNER"
+      dataflow_subproject_name: "DATAFLOW_VULN_SCANNER"
 
     history_runs:
       enabled: true
@@ -78,7 +78,6 @@ data:
       execution_cancel_check_interval_seconds: 1
       trigger_retry_limit: 3
       public_api_prefix: "/api/dataflow-vuln-scanner"
-      legacy_api_prefix: "/api/ai-agent-framework"
       default_entry_task_type: "package_list"
       default_artifact_subdir: "assets"
       default_profile_template_kind: "vuln_scan_default"

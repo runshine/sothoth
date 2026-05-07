@@ -29,8 +29,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.pi_vuln_core.review.profile import (
+    apply_profile_thinking_to_config,
     get_review_profile_policy,
     get_review_score_threshold_policy,
+    normalize_review_profile,
+    resolve_profile_thinking,
 )
 from app.pi_vuln_core.utils.win_compat import IS_WINDOWS, ensure_event_loop_policy, from_msys_path
 
@@ -74,6 +77,8 @@ def _mark_run_started(run_dir: str | Path, *, mode: str) -> None:
         "started_at": started_at,
         "status": "running",
         "last_mode": mode,
+        "finished_at": None,
+        "exit_code": None,
     }
     if mode == "resume":
         updates["resumed_at"] = _now_iso()
@@ -230,7 +235,7 @@ def generate_config(
     max_cycles: int | None = 6,
     worker_timeout: int | None = None,  # deprecated; RPC mode does not use framework watchdogs
     advisor_timeout: int | None = None,  # deprecated; kept for external callers/tests
-    thinking: str = "high",
+    thinking: str = "high",  # deprecated: resolved from model + review_profile
     result_review_concurrency: int = 3,
     review_profile: str = "balanced",
 ) -> dict:
@@ -238,13 +243,15 @@ def generate_config(
 
     prompts_dir = str(PROMPTS_DIR)
     model = _normalize_model_name(model, provider)
-    profile_policy = get_review_profile_policy(review_profile)
+    normalized_review_profile = normalize_review_profile(review_profile)
+    profile_policy = get_review_profile_policy(normalized_review_profile)
+    resolved_thinking = resolve_profile_thinking(model, profile_policy.name)
     completeness_score_policy = get_review_score_threshold_policy(
-        review_profile,
+        profile_policy.name,
         "global_completeness",
     )
     depth_score_policy = get_review_score_threshold_policy(
-        review_profile,
+        profile_policy.name,
         "global_depth",
     )
     effective_max_cycles = (
@@ -252,7 +259,13 @@ def generate_config(
         if max_cycles is not None else
         profile_policy.default_max_review_cycles
     )
+    if not profile_policy.review_enabled:
+        effective_max_cycles = 1
     execution_id, task_id = _windows_short_ids(run_name) if IS_WINDOWS else (f"{run_name}_run_001", run_name)
+    worker_sdk_specific = {"thinking": resolved_thinking} if resolved_thinking else {}
+    advisor_sdk_specific = {"tools": "read,bash"}
+    if resolved_thinking:
+        advisor_sdk_specific["thinking"] = resolved_thinking
 
     return {
         "version": "1.0",
@@ -285,9 +298,7 @@ def generate_config(
                     "max_retry_wall_seconds": profile_policy.worker_max_wall_seconds,
                     "rpc_stdout_trace_bytes": profile_policy.worker_rpc_stdout_trace_bytes,
                     "rpc_stdout_abort_bytes": profile_policy.worker_rpc_stdout_abort_bytes,
-                    "sdk_specific": {
-                        "thinking": thinking,
-                    },
+                    "sdk_specific": worker_sdk_specific,
                 },
             },
             {
@@ -309,10 +320,7 @@ def generate_config(
                     "max_retry_wall_seconds": profile_policy.advisor_max_wall_seconds,
                     "rpc_stdout_trace_bytes": profile_policy.advisor_rpc_stdout_trace_bytes,
                     "rpc_stdout_abort_bytes": profile_policy.advisor_rpc_stdout_abort_bytes,
-                    "sdk_specific": {
-                        "thinking": thinking,
-                        "tools": "read,bash",
-                    },
+                    "sdk_specific": advisor_sdk_specific,
                 },
             },
         ],
@@ -383,7 +391,8 @@ def generate_config(
                     ],
                     "engine": {
                         "max_review_cycles": effective_max_cycles,
-                        "review_profile": review_profile,
+                        "review_profile": profile_policy.name,
+                        "review_enabled": profile_policy.review_enabled,
                         "max_worker_turns_per_cycle": profile_policy.max_worker_turns_per_cycle,
                         "reflection_passes_per_cycle": profile_policy.reflection_passes_per_cycle,
                         "reflection_max_internal_turns": profile_policy.reflection_max_internal_turns,
@@ -392,11 +401,14 @@ def generate_config(
                         "reflection_rpc_stdout_trace_bytes": profile_policy.reflection_rpc_stdout_trace_bytes,
                         "reflection_rpc_stdout_abort_bytes": profile_policy.reflection_rpc_stdout_abort_bytes,
                         "min_discovery_cycles_before_pass": profile_policy.min_discovery_cycles_before_pass,
+                        "progress_required_after_cycle": profile_policy.progress_required_after_cycle,
+                        "progress_no_signal_closure_streak": profile_policy.progress_no_signal_closure_streak,
+                        "progress_no_signal_abort_streak": profile_policy.progress_no_signal_abort_streak,
                         "min_evidence_artifacts": profile_policy.min_evidence_artifacts,
                         "required_pattern_families": list(profile_policy.required_pattern_families),
                         "reset_worker_session_per_cycle": True,
-                        "plateau_closure_streak": 2,
-                        "plateau_abort_streak": 3,
+                        "plateau_closure_streak": profile_policy.progress_no_signal_closure_streak,
+                        "plateau_abort_streak": profile_policy.progress_no_signal_abort_streak,
                         "same_issue_stagnation_threshold": 2,
                         "same_issue_abort_threshold": 3,
                         "per_issue_attempt_budget": 2,
@@ -571,7 +583,48 @@ def load_user_config(
     for key in [k for k in config if k.startswith("_")]:
         del config[key]
 
+    _apply_profile_resolution_to_config(config)
     return config
+
+
+def _iter_atomic_workflows(config: dict):
+    for workflow in ((config.get("workflows") or {}).get("atomic") or []):
+        if isinstance(workflow, dict):
+            yield workflow
+
+
+def _extract_review_profile_from_config(config: dict) -> str:
+    for workflow in _iter_atomic_workflows(config):
+        engine = workflow.get("engine")
+        if isinstance(engine, dict) and (engine.get("review_profile") or workflow.get("id") == "vuln_scan"):
+            return normalize_review_profile(engine.get("review_profile"))
+    return "balanced"
+
+
+def _apply_profile_resolution_to_config(config: dict) -> None:
+    profile_policy = get_review_profile_policy(_extract_review_profile_from_config(config))
+    if not profile_policy.review_enabled:
+        config.setdefault("global", {})["max_review_cycles"] = 1
+    for workflow in _iter_atomic_workflows(config):
+        engine = workflow.setdefault("engine", {})
+        if "review_profile" in engine or workflow.get("id") == "vuln_scan":
+            engine["review_profile"] = profile_policy.name
+            engine["review_enabled"] = profile_policy.review_enabled
+            if not profile_policy.review_enabled:
+                engine["max_review_cycles"] = 1
+            engine.setdefault(
+                "progress_required_after_cycle",
+                profile_policy.progress_required_after_cycle,
+            )
+            engine.setdefault(
+                "progress_no_signal_closure_streak",
+                profile_policy.progress_no_signal_closure_streak,
+            )
+            engine.setdefault(
+                "progress_no_signal_abort_streak",
+                profile_policy.progress_no_signal_abort_streak,
+            )
+    apply_profile_thinking_to_config(config, profile_policy.name)
 
 
 def _resolve_prompt_paths(config: dict) -> None:
@@ -626,6 +679,26 @@ def _extract_worker_runtime(config_obj) -> tuple[str, str]:
         model = runtime_cfg.get("model", "")
         legacy_provider = sdk_cfg.get("provider", "")
         return _normalize_model_name(model, legacy_provider), sdk_cfg.get("thinking", "")
+    return "", ""
+
+
+def _extract_review_profile_from_config_obj(config_obj) -> str:
+    for workflow in getattr(getattr(config_obj, "workflows", None), "atomic", []) or []:
+        engine = getattr(workflow, "engine", None)
+        if engine is not None:
+            return normalize_review_profile(getattr(engine, "review_profile", "balanced"))
+    return "balanced"
+
+
+def _extract_worker_runtime_from_config_dict(config: dict) -> tuple[str, str]:
+    for agent in config.get("agents") or []:
+        if not isinstance(agent, dict) or agent.get("id") != "pi-worker":
+            continue
+        runtime_cfg = agent.get("runtime_config") or {}
+        sdk_cfg = runtime_cfg.get("sdk_specific") or {}
+        model = runtime_cfg.get("model", "")
+        legacy_provider = sdk_cfg.get("provider", "")
+        return _normalize_model_name(model, legacy_provider), str(sdk_cfg.get("thinking") or "")
     return "", ""
 
 
@@ -995,10 +1068,10 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--thinking", default=None,
         choices=["off", "low", "medium", "high", "xhigh"],
-        help="思考深度 (可选: off/low/medium/high/xhigh)")
+        help="兼容旧参数；最终 thinking 由后端按 model + review-profile 自动解析")
     parser.add_argument(
         "--max-cycles", type=int, default=None,
-        help="最大评审循环次数 (默认随 --review-profile: fast=3, balanced=6, strict=8, audit=10)")
+        help="最大评审循环次数 (默认随 --review-profile: fast=1, balanced=6, audit=10；strict 映射 audit)")
     parser.add_argument(
         "--result-review-concurrency", type=int, default=3,
         help="结果评审并发上限 (默认: 3，仅未指定 -c 时生效)")
@@ -1006,7 +1079,7 @@ def main(argv: list[str] | None = None):
         "--review-profile",
         choices=["fast", "balanced", "strict", "audit"],
         default="balanced",
-        help="评审强度档位: fast/balanced/strict/audit (默认: balanced，仅未指定 -c 时生效)")
+        help="评审强度档位: fast/balanced/audit；strict 兼容映射为 audit (默认: balanced，仅未指定 -c 时生效)")
     parser.add_argument(
         "--clean", action="store_true",
         help="执行完毕后删除工作目录")
@@ -1059,7 +1132,10 @@ def main(argv: list[str] | None = None):
 
         current_model, current_thinking = _extract_worker_runtime(config_obj)
         display_model = _normalize_model_name(args.model, args.provider) if args.model else current_model
-        display_thinking = args.thinking or current_thinking
+        display_thinking = resolve_profile_thinking(
+            display_model,
+            _extract_review_profile_from_config_obj(config_obj),
+        ) or current_thinking
         model_display = _format_model_display(display_model)
 
         preview_path = _write_resume_preview_file(
@@ -1139,7 +1215,7 @@ def main(argv: list[str] | None = None):
                     extra_cycles=args.extra_cycles,
                     model=_normalize_model_name(args.model, args.provider) if args.model else None,
                     provider=None,
-                    thinking=args.thinking,
+                    thinking=None,
                     clean_workspace=args.clean,
                 )
             )
@@ -1170,8 +1246,6 @@ def main(argv: list[str] | None = None):
         args.model = "anthropic/claude-sonnet-4-20250514"
     else:
         args.model = _normalize_model_name(args.model, args.provider)
-    if args.thinking is None:
-        args.thinking = "high"
 
     if not os.path.isfile(args.data_flow):
         print(f"❌ 数据流文件不存在: {args.data_flow}", file=sys.stderr)
@@ -1196,6 +1270,8 @@ def main(argv: list[str] | None = None):
         if args.max_cycles is not None else
         profile_policy.default_max_review_cycles
     )
+    if not profile_policy.review_enabled:
+        effective_max_cycles = 1
 
     runs_root = Path(args.runs_root).resolve() if args.runs_root else PROJECT_ROOT / "runs"
     run_dir = str(runs_root / args.run_name)
@@ -1232,6 +1308,9 @@ def main(argv: list[str] | None = None):
         )
         config_source = "自动生成"
 
+    model_display, resolved_thinking_display = _extract_worker_runtime_from_config_dict(config)
+    resolved_review_profile_display = _extract_review_profile_from_config(config)
+
     config_file = os.path.join(run_dir, "config.json")
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
@@ -1246,10 +1325,10 @@ def main(argv: list[str] | None = None):
     print(f"  数据流文件: {os.path.abspath(args.data_flow)}")
     print(f"  源码目录:   {os.path.abspath(args.source_dir)}")
     print(f"  运行名称:   {args.run_name}")
-    print(f"  模型:       {_format_model_display(args.model)}")
-    print(f"  Thinking:   {args.thinking}")
-    print(f"  评审轮次:   {effective_max_cycles}")
-    print(f"  评审档位:   {args.review_profile if not args.config else '配置文件指定'}")
+    print(f"  模型:       {model_display or _format_model_display(args.model)}")
+    print(f"  Thinking:   {resolved_thinking_display or '不支持/未启用'}")
+    print(f"  评审轮次:   {((config.get('global') or {}).get('max_review_cycles') or effective_max_cycles)}")
+    print(f"  评审档位:   {resolved_review_profile_display if not args.config else f'配置文件指定({resolved_review_profile_display})'}")
     print(f"  运行目录:   {run_dir}")
     print(f"  配置文件:   {config_file}")
     print(f"  配置来源:   {config_source}")

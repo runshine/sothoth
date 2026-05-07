@@ -184,6 +184,43 @@ async def test_pi_agent_runtime_records_command_and_prompts(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+async def test_pi_agent_runtime_omits_thinking_argument_when_unresolved(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": False,
+            "runtime_config": {
+                "model": "mock/no-thinking",
+                "timeout_seconds": 30,
+                "sdk_specific": {"tools": "read,bash"},
+            },
+        }
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = list(args)
+        return _FakeProc(stdout=b"assistant output", stderr=b"", returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    response = await runtime.send_message(
+        message="user prompt body",
+        system_prompt="system prompt body",
+        session_id="pi_test_session",
+        working_dir=str(tmp_path),
+    )
+
+    assert response.success is True
+    assert "--thinking" not in captured["args"]
+
+
+@pytest.mark.asyncio
 async def test_pi_agent_runtime_records_continuation_without_resending_system_prompt(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

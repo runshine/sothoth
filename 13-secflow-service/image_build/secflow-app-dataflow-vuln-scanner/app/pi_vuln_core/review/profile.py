@@ -3,13 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-ReviewProfileName = Literal["fast", "balanced", "strict", "audit"]
+ReviewProfileName = Literal["fast", "balanced", "audit"]
+ThinkingLevel = Literal["low", "medium", "high", "xhigh"]
 
 
 @dataclass(frozen=True)
 class ReviewProfilePolicy:
     name: ReviewProfileName
     description: str
+    review_enabled: bool
     enforce_coverage_gate: bool
     require_dataflow_extraction: bool
     required_risks: tuple[str, ...]
@@ -25,6 +27,9 @@ class ReviewProfilePolicy:
     reflection_rpc_stdout_trace_bytes: int
     reflection_rpc_stdout_abort_bytes: int
     min_discovery_cycles_before_pass: int
+    progress_required_after_cycle: int
+    progress_no_signal_closure_streak: int
+    progress_no_signal_abort_streak: int
     min_evidence_artifacts: int
     required_pattern_families: tuple[str, ...]
     max_open_obligations_in_worker_prompt: int
@@ -50,17 +55,30 @@ class ReviewScoreThresholdPolicy:
     score_threshold_ramp_cycles: int
 
 
+_THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = ("low", "medium", "high", "xhigh")
+
+_MODEL_THINKING_LEVELS: dict[str, tuple[ThinkingLevel, ...]] = {
+    "icsl/zai-org/glm-5": ("low", "medium", "high"),
+}
+
+_MODEL_PREFIX_THINKING_LEVELS: tuple[tuple[str, tuple[ThinkingLevel, ...]], ...] = (
+    ("openai/gpt-", ("low", "medium", "high", "xhigh")),
+    ("anthropic/", ("low", "medium", "high", "xhigh")),
+)
+
+
 _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
     "fast": ReviewProfilePolicy(
         name="fast",
-        description="快速筛选：冻结已确认结果，不用端点级 coverage gate 阻断。",
+        description="快速筛选：单轮 Worker 分析与 summary 输出，不启动评审闭环。",
+        review_enabled=False,
         enforce_coverage_gate=False,
         require_dataflow_extraction=False,
         required_risks=(),
         required_kinds=(),
         min_declared_extraction_ratio=0.0,
         allow_summary_only_evidence=True,
-        default_max_review_cycles=3,
+        default_max_review_cycles=1,
         max_worker_turns_per_cycle=35,
         reflection_passes_per_cycle=0,
         reflection_max_internal_turns=4,
@@ -69,6 +87,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         reflection_rpc_stdout_trace_bytes=512 * 1024,
         reflection_rpc_stdout_abort_bytes=16 * 1024 * 1024,
         min_discovery_cycles_before_pass=1,
+        progress_required_after_cycle=0,
+        progress_no_signal_closure_streak=1,
+        progress_no_signal_abort_streak=1,
         min_evidence_artifacts=0,
         required_pattern_families=(),
         max_open_obligations_in_worker_prompt=8,
@@ -81,8 +102,8 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         advisor_max_wall_seconds=300,
         advisor_rpc_stdout_trace_bytes=1 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=64 * 1024 * 1024,
-        execution_goal="快速确认显性漏洞；不为低风险端点做强制穷尽。",
-        closure_policy="result review 通过即可快速收敛；coverage ledger 仅作提示。",
+        execution_goal="快速确认显性漏洞并生成 summary.md；不做评审返工或低风险穷尽。",
+        closure_policy="fast 不进入评审 closure；summary.md 必须由 Worker 真实生成。",
         depth_lanes=(
             "沿数据流主路径核对显性内存安全/整数安全问题",
             "优先验证 STAR 与最直接 USED 终点",
@@ -90,7 +111,8 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
     ),
     "balanced": ReviewProfilePolicy(
         name="balanced",
-        description="默认平衡档：STAR 和高风险端点必须闭环，低风险端点可 residual/外部阻塞。",
+        description="平衡档：面向中高危与关键路径，目标是挖到大部分主要漏洞。",
+        review_enabled=True,
         enforce_coverage_gate=True,
         require_dataflow_extraction=True,
         required_risks=("critical", "high"),
@@ -106,6 +128,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         reflection_rpc_stdout_trace_bytes=1 * 1024 * 1024,
         reflection_rpc_stdout_abort_bytes=64 * 1024 * 1024,
         min_discovery_cycles_before_pass=1,
+        progress_required_after_cycle=0,
+        progress_no_signal_closure_streak=2,
+        progress_no_signal_abort_streak=3,
         min_evidence_artifacts=1,
         required_pattern_families=(
             "memory_safety",
@@ -122,7 +147,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         advisor_max_wall_seconds=900,
         advisor_rpc_stdout_trace_bytes=4 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=128 * 1024 * 1024,
-        execution_goal="覆盖 STAR 与高风险端点，对主要 EXPORT/USED 给出源码级正/负证据。",
+        execution_goal="覆盖 STAR、高风险端点和关键 EXPORT/USED，优先挖出大部分中高危漏洞。",
         closure_policy="closure 只验证 active backlog、STAR 和高风险 open obligations，不重新无限发散。",
         depth_lanes=(
             "主入口到 packet/mbuf 解析链的输入可控性复核",
@@ -131,59 +156,14 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
             "对未立项的高风险端点记录 source_closed 或 accepted_residual",
         ),
     ),
-    "strict": ReviewProfilePolicy(
-        name="strict",
-        description="正式报告档：STAR、高/中风险端点必须闭环，summary 不能单独作为强证据。",
+    "audit": ReviewProfilePolicy(
+        name="audit",
+        description="审计档：深度漏洞挖掘，追求最多、最深且可复核的漏洞证据。",
+        review_enabled=True,
         enforce_coverage_gate=True,
         require_dataflow_extraction=True,
         required_risks=("critical", "high", "medium"),
-        required_kinds=("star",),
-        min_declared_extraction_ratio=0.80,
-        allow_summary_only_evidence=False,
-        default_max_review_cycles=8,
-        max_worker_turns_per_cycle=100,
-        reflection_passes_per_cycle=2,
-        reflection_max_internal_turns=18,
-        reflection_no_progress_timeout_seconds=180,
-        reflection_max_wall_seconds=720,
-        reflection_rpc_stdout_trace_bytes=1 * 1024 * 1024,
-        reflection_rpc_stdout_abort_bytes=96 * 1024 * 1024,
-        min_discovery_cycles_before_pass=2,
-        min_evidence_artifacts=3,
-        required_pattern_families=(
-            "memory_safety",
-            "integer_safety",
-            "input_validation",
-            "logic_state",
-            "resource_lifetime",
-        ),
-        max_open_obligations_in_worker_prompt=40,
-        worker_no_progress_timeout_seconds=900,
-        worker_max_wall_seconds=2700,
-        worker_rpc_stdout_trace_bytes=6 * 1024 * 1024,
-        worker_rpc_stdout_abort_bytes=384 * 1024 * 1024,
-        advisor_max_internal_turns=36,
-        advisor_no_progress_timeout_seconds=360,
-        advisor_max_wall_seconds=1200,
-        advisor_rpc_stdout_trace_bytes=6 * 1024 * 1024,
-        advisor_rpc_stdout_abort_bytes=192 * 1024 * 1024,
-        execution_goal="在 balanced 基础上追加中风险端点、多漏洞模式交叉验证和更深调用链跟入。",
-        closure_policy="closure 允许收敛，但高/中风险 open obligations 不得靠笼统 summary 自证放行。",
-        depth_lanes=(
-            "balanced 全部路线",
-            "中风险 EXPORT/USED/CLEANED 端点补扫",
-            "IPv4/IPv6、AH/ESP、入/出方向对称路径差异比对",
-            "整数截断/回绕结果是否进入内存长度或协议长度字段",
-            "错误路径、资源释放、状态机和外部回调副作用审计",
-        ),
-    ),
-    "audit": ReviewProfilePolicy(
-        name="audit",
-        description="审计档：所有 INPUT/EXPORT/USED/CLEANED/STAR obligations 必须闭环。",
-        enforce_coverage_gate=True,
-        require_dataflow_extraction=True,
-        required_risks=("critical", "high", "medium", "low"),
-        required_kinds=("input", "export", "used", "cleaned", "star"),
+        required_kinds=("star", "export", "used"),
         min_declared_extraction_ratio=1.00,
         allow_summary_only_evidence=False,
         default_max_review_cycles=10,
@@ -195,6 +175,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         reflection_rpc_stdout_trace_bytes=2 * 1024 * 1024,
         reflection_rpc_stdout_abort_bytes=128 * 1024 * 1024,
         min_discovery_cycles_before_pass=3,
+        progress_required_after_cycle=3,
+        progress_no_signal_closure_streak=1,
+        progress_no_signal_abort_streak=2,
         min_evidence_artifacts=5,
         required_pattern_families=(
             "memory_safety",
@@ -214,11 +197,11 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         advisor_max_wall_seconds=1800,
         advisor_rpc_stdout_trace_bytes=8 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=256 * 1024 * 1024,
-        execution_goal="审计级全账本闭环；逐项处置 INPUT/EXPORT/USED/CLEANED/STAR 并保留负面证据。",
-        closure_policy="closure 只接受全账本闭环；external_blocked 必须作为最终限制显式保留。",
+        execution_goal="深度审计关键数据流、变体和跨路径副作用；尽量挖出最多且最深的漏洞。",
+        closure_policy="closure 优先验证 active backlog 与关键 obligations；无有效进展时收敛，external_blocked 必须显式保留。",
         depth_lanes=(
-            "strict 全部路线",
-            "全量 INPUT/EXPORT/USED/CLEANED/STAR obligation 闭环",
+            "balanced 全部路线",
+            "STAR/EXPORT/USED obligation 深度闭环，并对 INPUT/CLEANED 保留可复核边界",
             "跨函数、跨协议族、跨方向的漏洞变体搜索",
             "未立项端点的可复核负证据矩阵",
             "可利用性前提、攻击者能力、配置依赖和 residual 边界审计",
@@ -306,38 +289,6 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
             score_threshold_ramp_cycles=5,
         ),
     },
-    "strict": {
-        "global_completeness": ReviewScoreThresholdPolicy(
-            score_fields=_COMPLETENESS_SCORE_FIELDS,
-            score_thresholds_start={
-                "input_coverage": 0.85,
-                "export_followthrough": 0.75,
-                "used_coverage": 0.75,
-                "limitations_honesty": 0.80,
-                "report_completeness": 0.75,
-            },
-            score_thresholds={
-                "input_coverage": 1.00,
-                "export_followthrough": 0.97,
-                "used_coverage": 0.97,
-                "limitations_honesty": 0.97,
-                "report_completeness": 0.93,
-            },
-            score_threshold_ramp_cycles=6,
-        ),
-        "global_depth": ReviewScoreThresholdPolicy(
-            score_fields=_DEPTH_SCORE_FIELDS,
-            score_thresholds_start={
-                "vuln_pattern_breadth": 0.65,
-                "code_evidence_depth": 0.65,
-            },
-            score_thresholds={
-                "vuln_pattern_breadth": 0.90,
-                "code_evidence_depth": 0.90,
-            },
-            score_threshold_ramp_cycles=6,
-        ),
-    },
     "audit": {
         "global_completeness": ReviewScoreThresholdPolicy(
             score_fields=_COMPLETENESS_SCORE_FIELDS,
@@ -375,6 +326,8 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
 
 def normalize_review_profile(value: str | None) -> ReviewProfileName:
     name = str(value or "balanced").strip().lower()
+    if name == "strict":
+        return "audit"
     if name not in _PROFILE_POLICIES:
         return "balanced"
     return name  # type: ignore[return-value]
@@ -382,6 +335,58 @@ def normalize_review_profile(value: str | None) -> ReviewProfileName:
 
 def get_review_profile_policy(value: str | None) -> ReviewProfilePolicy:
     return _PROFILE_POLICIES[normalize_review_profile(value)]
+
+
+def supported_thinking_levels_for_model(model: str | None) -> tuple[ThinkingLevel, ...]:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return ()
+    if normalized in _MODEL_THINKING_LEVELS:
+        return _MODEL_THINKING_LEVELS[normalized]
+    for prefix, levels in _MODEL_PREFIX_THINKING_LEVELS:
+        if normalized.startswith(prefix):
+            return levels
+    return ()
+
+
+def resolve_profile_thinking(model: str | None, review_profile: str | None) -> str:
+    supported = set(supported_thinking_levels_for_model(model))
+    levels = [level for level in _THINKING_LEVEL_ORDER if level in supported]
+    if not levels:
+        return ""
+
+    profile = normalize_review_profile(review_profile)
+    if len(levels) >= 4:
+        profile_index = {"fast": -3, "balanced": -2, "audit": -1}[profile]
+    elif len(levels) >= 3:
+        profile_index = {"fast": -3, "balanced": -2, "audit": -1}[profile]
+    elif len(levels) == 2:
+        profile_index = {"fast": 0, "balanced": 1, "audit": 1}[profile]
+    else:
+        profile_index = 0
+    return levels[profile_index]
+
+
+def apply_profile_thinking_to_runtime_config(
+    runtime_config: dict,
+    review_profile: str | None,
+) -> str:
+    thinking = resolve_profile_thinking(runtime_config.get("model"), review_profile)
+    sdk_specific = runtime_config.setdefault("sdk_specific", {})
+    if thinking:
+        sdk_specific["thinking"] = thinking
+    else:
+        sdk_specific.pop("thinking", None)
+    return thinking
+
+
+def apply_profile_thinking_to_config(config: dict, review_profile: str | None) -> None:
+    for agent in config.get("agents") or []:
+        if not isinstance(agent, dict):
+            continue
+        runtime_config = agent.get("runtime_config")
+        if isinstance(runtime_config, dict):
+            apply_profile_thinking_to_runtime_config(runtime_config, review_profile)
 
 
 def get_review_score_threshold_policy(
@@ -440,13 +445,15 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
         return "\n".join([
             "## Review Profile",
             (
-                f"- `{policy.name}`: gate={gate}; required_risks={required}; "
+                f"- `{policy.name}`: review={'on' if policy.review_enabled else 'off'}; "
+                f"gate={gate}; required_risks={required}; "
                 f"required_kinds={kinds}; dataflow>={policy.min_declared_extraction_ratio:.0%}; "
                 f"summary_only={summary_only}; cycles={policy.default_max_review_cycles}; "
                 f"internal_turns={policy.max_worker_turns_per_cycle}; "
                 f"reflection_turns={policy.reflection_max_internal_turns}; "
                 f"advisor_turns={policy.advisor_max_internal_turns}; "
                 f"min_discovery={policy.min_discovery_cycles_before_pass}; "
+                f"progress_after={policy.progress_required_after_cycle}; "
                 f"min_evidence_artifacts={policy.min_evidence_artifacts}; "
                 f"required_patterns={len(policy.required_pattern_families)}; "
                 f"worker_wall={policy.worker_max_wall_seconds}s; "
@@ -458,6 +465,7 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
         "## Review Profile",
         f"- profile: `{policy.name}`",
         f"- 定位: {policy.description}",
+        f"- review loop: {'enabled' if policy.review_enabled else 'disabled'}",
         f"- coverage gate: {'enabled' if policy.enforce_coverage_gate else 'disabled'}",
         f"- 必须闭环 risk: {required}",
         f"- 必须闭环 kind: {kinds}",
@@ -479,6 +487,12 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
         f"- 单次反思无进展超时: {policy.reflection_no_progress_timeout_seconds}s",
         f"- 单次反思最大墙钟: {policy.reflection_max_wall_seconds}s",
         f"- 最少探索轮次: {policy.min_discovery_cycles_before_pass}",
+        f"- 有效进展检测起始轮: {policy.progress_required_after_cycle or 'disabled'}",
+        (
+            f"- 无有效进展收敛/终止阈值: "
+            f"{policy.progress_no_signal_closure_streak}/"
+            f"{policy.progress_no_signal_abort_streak}"
+        ),
         f"- 最少证据产物数: {policy.min_evidence_artifacts}",
         f"- 必须覆盖漏洞模式族: {_format_pattern_families(policy.required_pattern_families)}",
         f"- 挖掘目标: {policy.execution_goal}",

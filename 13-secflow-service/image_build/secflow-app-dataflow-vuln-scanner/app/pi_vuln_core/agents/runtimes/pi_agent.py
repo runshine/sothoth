@@ -1494,7 +1494,7 @@ class PiAgentRuntime(BaseAgentRuntime):
             logger.warning("unknown_pi_transport_fallback_json", agent_id=self.agent_id, transport=transport)
             transport = "json"
         sdk_cfg = self.runtime_config.get("sdk_specific", {})
-        thinking = sdk_cfg.get("thinking", "high")
+        thinking = str(sdk_cfg.get("thinking") or "").strip()
         tools = sdk_cfg.get("tools", "read,bash,edit,write")
         effective_model, raw_model, _legacy_provider = self._effective_model()
         api_max_retries = int(self.runtime_config.get("api_max_retries", self.runtime_config.get("max_retries", -1)))
@@ -1568,9 +1568,10 @@ class PiAgentRuntime(BaseAgentRuntime):
             "pi",
             "--mode", transport,
             "--model", effective_model,
-            "--thinking", thinking,
-            "--tools", tools,
         ]
+        if thinking:
+            cmd_args.extend(["--thinking", thinking])
+        cmd_args.extend(["--tools", tools])
         if transport == "json":
             cmd_args.append("-p")
 

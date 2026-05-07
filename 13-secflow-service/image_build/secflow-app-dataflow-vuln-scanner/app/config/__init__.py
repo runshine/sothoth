@@ -72,7 +72,7 @@ class FileserverServiceConfig(BaseModel):
     timeout: int = 10
     data_mount_path: str = "/data"
     project_files_dirname: str = "files"
-    aiwf_subproject_name: str = "DATAFLOW_VULN_SCANNER"
+    dataflow_subproject_name: str = "DATAFLOW_VULN_SCANNER"
 
 
 class HistoryRunsConfig(BaseModel):
@@ -116,7 +116,6 @@ class ServiceConfig(BaseModel):
     execution_cancel_check_interval_seconds: int = 1
     trigger_retry_limit: int = 3
     public_api_prefix: str = "/api/dataflow-vuln-scanner"
-    legacy_api_prefix: str = "/api/ai-agent-framework"
     default_entry_task_type: str = "package_list"
     default_artifact_subdir: str = "assets"
     default_profile_template_kind: str = "vuln_scan_default"

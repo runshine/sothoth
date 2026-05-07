@@ -16,10 +16,6 @@ from app.schemas import (
     ScanProfileResponse,
     ScanProfileUpdateRequest,
     ScanProfileVersionResponse,
-    WorkflowDefinitionCreate,
-    WorkflowDefinitionResponse,
-    WorkflowDefinitionUpdate,
-    WorkflowDefinitionVersionResponse,
 )
 from app.services.profile_templates import get_profile_template_service
 
@@ -173,31 +169,6 @@ class WorkflowService:
         )
         db.add(version)
         return version
-
-    def _definition_response(self, definition: WorkflowDefinition, validated: FrameworkConfig | None = None) -> WorkflowDefinitionResponse:
-        config = validated or self.validate_definition_payload(definition.definition_json)
-        payload = {
-            "id": definition.id,
-            "name": definition.name,
-            "description": definition.description,
-            "project_id": definition.project_id,
-            "root_workflow_id": config.root_workflow_id,
-            "trigger_type": definition.trigger_type,
-            "trigger_enabled": definition.trigger_enabled,
-            "is_active": definition.is_active,
-            "enabled": definition.enabled,
-            "max_concurrency": definition.max_concurrency,
-            "priority_default": definition.priority_default,
-            "workspace_base_dir": definition.workspace_base_dir,
-            "execution_timeout_seconds": definition.execution_timeout_seconds,
-            "entry_input_task_type": config.resolve_entry_input_task_type(),
-            "final_output_task_type": config.resolve_final_output_task_type(),
-            "created_by": definition.created_by,
-            "updated_by": definition.updated_by,
-            "created_at": definition.created_at,
-            "updated_at": definition.updated_at,
-        }
-        return WorkflowDefinitionResponse.model_validate(payload)
 
     def _profile_response(self, db: Session, definition: WorkflowDefinition) -> ScanProfileResponse:
         version = self._latest_definition_config_version(db, definition)
@@ -460,10 +431,15 @@ class WorkflowService:
         runtime_overrides: dict | None = None,
         config_payload_overrides: dict | None = None,
     ) -> WorkflowDefinitionVersion:
-        latest = self.get_profile_version_model(db, definition.id)
-        if not runtime_overrides and not config_payload_overrides:
-            return latest
         actor = _principal_id(principal)
+        try:
+            latest = self.get_profile_version_model(db, definition.id)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_404_NOT_FOUND:
+                raise
+            latest = None
+        if latest is not None and not runtime_overrides and not config_payload_overrides:
+            return latest
         base_payload = definition.config_payload_json or self._extract_config_payload(definition.definition_json)
         merged_payload = dict(base_payload)
         if config_payload_overrides:
@@ -502,165 +478,6 @@ class WorkflowService:
                 },
             },
         }
-
-    # Legacy compatibility methods.
-    def create_definition(self, db: Session, payload: WorkflowDefinitionCreate, principal: dict) -> WorkflowDefinitionResponse:
-        self._ensure_project_access(principal, payload.project_id)
-        validated = self.validate_definition_payload(payload.definition_json)
-        actor = _principal_id(principal)
-        definition = WorkflowDefinition(
-            id=_new_id("wfd"),
-            name=payload.name,
-            description=payload.description,
-            project_id=payload.project_id,
-            template_kind=self._infer_template_kind(payload.definition_json),
-            config_payload_json=self._extract_config_payload(payload.definition_json),
-            definition_json=payload.definition_json,
-            root_workflow_id=validated.root_workflow_id,
-            trigger_type=payload.trigger_type,
-            trigger_enabled=payload.trigger_enabled,
-            is_active=payload.is_active,
-            enabled=payload.enabled,
-            max_concurrency=payload.max_concurrency,
-            priority_default=payload.priority_default,
-            max_retry_count=3,
-            workspace_base_dir=payload.workspace_base_dir,
-            execution_timeout_seconds=payload.execution_timeout_seconds,
-            created_by=actor,
-            updated_by=actor,
-        )
-        db.add(definition)
-        self._ensure_single_default(db, definition)
-        self._create_version_snapshot(
-            db,
-            definition=definition,
-            created_by=actor,
-            config_payload=definition.config_payload_json or {},
-            compiled_config=payload.definition_json,
-        )
-        db.commit()
-        db.refresh(definition)
-        return self._definition_response(definition, validated)
-
-    def list_definitions(self, db: Session, principal: dict) -> List[WorkflowDefinitionResponse]:
-        project_ids = _project_ids(principal)
-        query = db.query(WorkflowDefinition).order_by(WorkflowDefinition.created_at.desc())
-        if project_ids:
-            query = query.filter(WorkflowDefinition.project_id.in_(project_ids))
-        return [self._definition_response(item) for item in query.all()]
-
-    def get_definition(self, db: Session, definition_id: str, principal: dict) -> WorkflowDefinitionResponse:
-        definition = self._get_definition_or_404(db, definition_id)
-        self._ensure_project_access(principal, definition.project_id)
-        return self._definition_response(definition)
-
-    def update_definition(
-        self,
-        db: Session,
-        definition_id: str,
-        payload: WorkflowDefinitionUpdate,
-        principal: dict,
-    ) -> WorkflowDefinitionResponse:
-        definition = self._get_definition_or_404(db, definition_id)
-        self._ensure_project_access(principal, definition.project_id)
-        actor = _principal_id(principal)
-        updates = payload.model_dump(exclude_unset=True)
-        compiled_config = definition.definition_json
-        if "definition_json" in updates:
-            compiled_config = updates["definition_json"]
-            validated = self.validate_definition_payload(compiled_config)
-            definition.definition_json = compiled_config
-            definition.root_workflow_id = validated.root_workflow_id
-            definition.template_kind = self._infer_template_kind(compiled_config)
-            definition.config_payload_json = self._extract_config_payload(compiled_config)
-        else:
-            validated = None
-        for field in [
-            "name",
-            "description",
-            "trigger_type",
-            "trigger_enabled",
-            "is_active",
-            "enabled",
-            "max_concurrency",
-            "priority_default",
-            "workspace_base_dir",
-            "execution_timeout_seconds",
-        ]:
-            if field in updates:
-                setattr(definition, field, updates[field])
-        definition.updated_by = actor
-        self._create_version_snapshot(
-            db,
-            definition=definition,
-            created_by=actor,
-            config_payload=definition.config_payload_json or self._extract_config_payload(definition.definition_json),
-            compiled_config=definition.definition_json,
-        )
-        db.add(definition)
-        db.commit()
-        db.refresh(definition)
-        return self._definition_response(definition, validated)
-
-    def delete_definition(self, db: Session, definition_id: str, principal: dict) -> None:
-        definition = self._get_definition_or_404(db, definition_id)
-        self._ensure_project_access(principal, definition.project_id)
-        db.query(WorkflowDefinitionVersion).filter(
-            WorkflowDefinitionVersion.workflow_definition_id == definition.id
-        ).delete(synchronize_session=False)
-        db.delete(definition)
-        db.commit()
-
-    def list_definition_versions(self, db: Session, definition_id: str, principal: dict) -> List[WorkflowDefinitionVersionResponse]:
-        definition = self._get_definition_or_404(db, definition_id)
-        self._ensure_project_access(principal, definition.project_id)
-        versions = (
-            db.query(WorkflowDefinitionVersion)
-            .filter(WorkflowDefinitionVersion.workflow_definition_id == definition_id)
-            .order_by(WorkflowDefinitionVersion.version_no.desc())
-            .all()
-        )
-        return [
-            WorkflowDefinitionVersionResponse(
-                id=item.id,
-                workflow_definition_id=item.workflow_definition_id,
-                version_no=item.version_no,
-                created_by=item.created_by,
-                created_at=item.created_at,
-                definition_json=item.compiled_config_json or item.definition_json or {},
-            )
-            for item in versions
-        ]
-
-    def get_definition_version(
-        self,
-        db: Session,
-        definition_id: str,
-        version_no: int,
-        principal: dict,
-    ) -> WorkflowDefinitionVersionResponse:
-        definition = self._get_definition_or_404(db, definition_id)
-        self._ensure_project_access(principal, definition.project_id)
-        version = self._get_version_or_404(db, definition_id, version_no)
-        return WorkflowDefinitionVersionResponse(
-            id=version.id,
-            workflow_definition_id=version.workflow_definition_id,
-            version_no=version.version_no,
-            created_by=version.created_by,
-            created_at=version.created_at,
-            definition_json=version.compiled_config_json or version.definition_json or {},
-        )
-
-    def set_definition_active(self, db: Session, definition_id: str, principal: dict, active: bool) -> WorkflowDefinitionResponse:
-        definition = self._get_definition_or_404(db, definition_id)
-        self._ensure_project_access(principal, definition.project_id)
-        definition.is_active = active
-        definition.updated_by = _principal_id(principal)
-        db.add(definition)
-        db.commit()
-        db.refresh(definition)
-        return self._definition_response(definition)
-
 
 _workflow_service: WorkflowService | None = None
 
