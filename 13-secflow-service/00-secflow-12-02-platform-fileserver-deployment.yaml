@@ -21,6 +21,8 @@ spec:
         ports:
         - containerPort: 8080
         env:
+          - name: TZ
+            value: Asia/Shanghai
         - name: DATA_PVC_NAME
           value: secflow-platform-fileserver-data-nfs-pvc
         volumeMounts:

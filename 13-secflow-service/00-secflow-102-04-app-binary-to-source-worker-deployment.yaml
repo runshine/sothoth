@@ -32,6 +32,8 @@ spec:
         image: runshine0819/secflow-app-binary-to-source:latest
         imagePullPolicy: Always
         env:
+          - name: TZ
+            value: Asia/Shanghai
         - name: ROLE
           value: "worker"
         - name: WORKER_CONCURRENCY

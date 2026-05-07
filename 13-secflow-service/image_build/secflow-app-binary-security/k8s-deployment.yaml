@@ -19,6 +19,8 @@ spec:
           image: ghcr.io/runshine/secflow-app-binary-security:latest
           imagePullPolicy: Always
           env:
+            - name: TZ
+              value: Asia/Shanghai
             - name: SECFLOW_BINARY_SECURITY_CONFIG
               value: /app/config.yaml
             - name: CONFIG_PATH

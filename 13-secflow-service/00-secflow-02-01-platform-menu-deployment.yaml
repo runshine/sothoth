@@ -20,6 +20,8 @@ spec:
         imagePullPolicy: Always
         command: ["python", "app.py", "--config", "/app/config.yaml"]
         env:
+          - name: TZ
+            value: Asia/Shanghai
         - name: POD_NAME
           valueFrom:
             fieldRef:

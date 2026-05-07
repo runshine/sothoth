@@ -91,5 +91,7 @@ spec:
 
               echo "secflow_dfa 数据库初始化完成"
           env:
+            - name: TZ
+              value: Asia/Shanghai
             - name: MYSQL_PWD
               value: "Huawei12#$"

@@ -16,9 +16,11 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-entry-analyse
-        image: 172.31.30.52:5000/secflow-app-entry-analyse:latest
+        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
         imagePullPolicy: Always
         env:
+          - name: TZ
+            value: Asia/Shanghai
         - name: PORT
           value: "8080"
         - name: SERVICE_CONFIG

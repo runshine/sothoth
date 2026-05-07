@@ -21,6 +21,8 @@ spec:
         ports:
         - containerPort: 8080
         env:
+          - name: TZ
+            value: Asia/Shanghai
           - name: MYSQL_SERVER_ADDRESS
             value: mysql+pymysql://secflow:Huawei12%23%24@mysql.sothothv2-ns.svc.cluster.local/secflow?ssl=false
           - name: PACKAGE_ROOT_DIR
@@ -54,6 +56,9 @@ spec:
       - name: nginx
         image: nginx:latest
         imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
         ports:
           - containerPort: 80
         volumeMounts:

@@ -19,6 +19,9 @@ spec:
       - name: secflow-app-code-server
         image: runshine0819/secflow-app-code-server:latest  # 包含kubectl命令
         imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
         ports:
         - containerPort: 8080
         volumeMounts:
