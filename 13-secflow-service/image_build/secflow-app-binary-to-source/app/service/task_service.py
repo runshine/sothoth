@@ -12,7 +12,7 @@ from uuid import uuid4
 from sqlalchemy.orm import Session
 
 from app.config import get_config
-from app.exception import ConflictError, NotFoundError, ValidationError
+from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
 from app.schemas import B2SOverallProgress, TaskCreate, TaskDetailResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
@@ -193,7 +193,21 @@ async def sync_task(db: Session, task: B2STask) -> None:
     for item in items:
         if not item.pi_job_id or item.status in TERMINAL:
             continue
-        job = await get_pi_client(item_pi_worker_url(item)).get_job(item.pi_job_id)
+        try:
+            job = await get_pi_client(item_pi_worker_url(item)).get_job(item.pi_job_id)
+        except UpstreamError as exc:
+            # Do not let one stale/unreachable worker make the whole task detail
+            # API return 502. Keep the item visible and let users rerun/delete it.
+            item.failure_type = "pi-re-agent"
+            item.error_reason = str(exc)
+            item.progress = build_item_progress(item, {
+                "status": item.status,
+                "phase": item.phase,
+                "progress": item.progress or {},
+                "error": str(exc),
+            })
+            changed = True
+            continue
         if job is None:
             item.status = "failed"
             item.failure_type = "pi-re-agent"
@@ -560,6 +574,8 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
     total = len(items)
     if total == 0:
         task.status = "pending"
+    elif counts["failed_items"] > 0 and counts["failed_items"] + counts["cancelled_items"] + counts["success_items"] == total:
+        task.status = "partial" if counts["success_items"] > 0 else "failed"
     elif counts["running_items"] > 0:
         task.status = "running"
     elif counts["queued_items"] > 0 or counts["pending_items"] > 0:

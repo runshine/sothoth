@@ -37,9 +37,9 @@ data:
     pi_re_agent:
       base_url: "http://secflow-pi-re-agent:8000"
       worker_urls:
-        - "http://10.42.2.113:8000"
-        - "http://10.42.2.114:8000"
-        - "http://10.42.2.115:8000"
+        - "http://secflow-pi-re-agent-0.secflow-pi-re-agent-headless.secflow-ns.svc.cluster.local:8000"
+        - "http://secflow-pi-re-agent-1.secflow-pi-re-agent-headless.secflow-ns.svc.cluster.local:8000"
+        - "http://secflow-pi-re-agent-2.secflow-pi-re-agent-headless.secflow-ns.svc.cluster.local:8000"
       api_key: null
       timeout: 30
       batch_size: 8192
