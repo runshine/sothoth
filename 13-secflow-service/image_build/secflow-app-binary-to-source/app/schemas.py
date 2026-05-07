@@ -36,6 +36,11 @@ class RetryRequest(BaseModel):
     item_ids: Optional[list[str]] = None
 
 
+class RerunRequest(BaseModel):
+    clean_output: bool = True
+    cancel_running: bool = True
+
+
 class B2SProgress(BaseModel):
     phase: Optional[str] = None
     raw_phase: Optional[str] = None

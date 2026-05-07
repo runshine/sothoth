@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, LlmProviderListResponse, LlmProviderSummary, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
+from app.schemas import ActionResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
 from app.service.auth import get_auth_service
 from app.service.configcenter import get_configcenter_client
 from app.service.project import get_project_service
@@ -21,6 +21,7 @@ from app.service.task_service import (
     delete_task,
     get_task_or_404,
     retry_task,
+    rerun_task,
     sync_task,
     generate_task_id,
     terminate_task,
@@ -138,6 +139,20 @@ async def delete_b2s_task(
     task = get_task_or_404(db, project_id, task_id)
     await delete_task(db, task)
     return ActionResponse(status="ok", task_id=task_id, message="任务及文件已删除")
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/rerun", response_model=ActionResponse)
+async def rerun_b2s_task(
+    project_id: str,
+    task_id: str,
+    payload: RerunRequest | None = None,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    req = payload or RerunRequest()
+    await rerun_task(db, task, clean_output=req.clean_output, cancel_running=req.cancel_running)
+    return ActionResponse(status="ok", task_id=task_id, message="任务已完整重新提交")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/retry", response_model=ActionResponse)

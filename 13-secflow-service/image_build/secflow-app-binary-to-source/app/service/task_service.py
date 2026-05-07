@@ -17,7 +17,7 @@ from app.model import B2STask, B2STaskItem
 from app.schemas import B2SOverallProgress, TaskCreate, TaskDetailResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
-from app.service.security import app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
+from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
 
 TERMINAL = {"success", "failed", "cancelled"}
 PI_STATUS_MAP = {
@@ -245,6 +245,26 @@ async def terminate_task(db: Session, task: B2STask) -> None:
     db.commit()
 
 
+def clean_item_output_dir(project_id: str, task_id: str, sequence_no: int, output_dir: str) -> Path:
+    """Remove and recreate an item's output directory, preserving input files."""
+    item_root = app_task_item_root(project_id, task_id, sequence_no)
+    root = project_root(project_id)
+    expected_output_root = item_root.joinpath("output").resolve()
+    resolved_output = Path(output_dir).resolve()
+    if not resolved_output.is_relative_to(root):
+        raise ValidationError("输出目录不在项目目录内，拒绝清理")
+    if not resolved_output.is_relative_to(item_root):
+        raise ValidationError("输出目录不在任务项目录内，拒绝清理")
+    if not resolved_output.is_relative_to(expected_output_root):
+        raise ValidationError("仅允许清理output目录，拒绝清理input或其他目录")
+    if resolved_output.exists():
+        if not resolved_output.is_dir():
+            raise ValidationError("输出路径不是目录，拒绝清理")
+        shutil.rmtree(resolved_output)
+    os.makedirs(resolved_output, exist_ok=True)
+    return resolved_output
+
+
 async def delete_task(db: Session, task: B2STask) -> None:
     """Delete a B2S task record and its complete task-id filesystem tree.
 
@@ -274,6 +294,72 @@ async def delete_task(db: Session, task: B2STask) -> None:
     for item in items:
         db.delete(item)
     db.delete(task)
+    db.commit()
+
+
+async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, cancel_running: bool = True) -> None:
+    """Fully rerun all items of a task while keeping taskId and input files."""
+    pi_cfg = get_config().pi_re_agent
+    items = query_items(db, task.id)
+    if not items:
+        raise NotFoundError("任务没有可重跑的任务项")
+    selected_provider_keys = [
+        str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
+        for i in items
+        if str((i.extra_metadata or {}).get("llm_provider_key") or "").strip()
+    ]
+    job_model = await resolve_job_model(selected_provider_keys[0] if selected_provider_keys else None)
+
+    for item in items:
+        if cancel_running and item.pi_job_id and item.status not in TERMINAL:
+            try:
+                await get_pi_client(item_pi_worker_url(item)).cancel_job(item.pi_job_id)
+            except Exception:
+                pass
+
+        if clean_output:
+            item.output_dir = str(clean_item_output_dir(task.project_id, task.id, item.sequence_no, item.output_dir))
+
+        item_concurrency = int((item.extra_metadata or {}).get("concurrency") or pi_cfg.concurrency)
+        worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
+        metadata = item.extra_metadata or {}
+        metadata["pi_worker_url"] = worker_url
+        item.extra_metadata = metadata
+        item.status = "queued"
+        item.phase = "queued"
+        item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
+        item.failure_type = None
+        item.error_reason = None
+        item.generated_files = []
+        item.started_at = None
+        item.finished_at = None
+        db.flush()
+
+        try:
+            job = await get_pi_client(worker_url).create_job({
+                "target": item.elf_path,
+                "output_dir": item.output_dir,
+                "batch_size": pi_cfg.batch_size,
+                "max_retries": pi_cfg.max_retries,
+                "model": job_model,
+                "functions": (item.extra_metadata or {}).get("file_list") or None,
+                "clean": True,
+                "engine": pi_cfg.engine,
+                "concurrency": item_concurrency,
+            })
+            item.pi_job_id = job.get("id")
+            item.status = map_pi_status(job.get("status"))
+            item.phase = map_pi_phase(job.get("phase"), job.get("status"))
+            item.progress = build_item_progress(item, job)
+        except Exception as exc:
+            item.pi_job_id = None
+            item.status = "failed"
+            item.phase = "failed"
+            item.progress = build_item_progress(item, {"status": "failed", "phase": "failed", "progress": {}, "error": str(exc)})
+            item.failure_type = "pi-re-agent"
+            item.error_reason = str(exc)
+            item.finished_at = datetime.utcnow()
+    recompute_task_status(db, task)
     db.commit()
 
 
