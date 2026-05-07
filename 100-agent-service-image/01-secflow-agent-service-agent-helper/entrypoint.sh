@@ -9,14 +9,21 @@ REST_PORT="${REST_PORT:-20001}"
 TTYD_PORT="${TTYD_PORT:-20002}"
 CODE_SERVER_PORT="${CODE_SERVER_PORT:-20003}"
 PROCESS_MONITOR_PORT="${PROCESS_MONITOR_PORT:-20004}"
+OPENCLAW_STATE_DIR="${OPENCLAW_STATE_DIR:-/app/data/openclaw}"
+OPENCLAW_CONFIG_PATH="${OPENCLAW_CONFIG_PATH:-${OPENCLAW_STATE_DIR}/openclaw.json}"
+OPENCLAW_GATEWAY_PORT="${OPENCLAW_GATEWAY_PORT:-20005}"
+OPENCLAW_GATEWAY_PASSWORD="${OPENCLAW_GATEWAY_PASSWORD:-Huawei12#$}"
+OPENCLAW_WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-/host}"
+OPENCLAW_SEED_DIR="${OPENCLAW_SEED_DIR:-/app/openclaw-seed}"
 
 TTYD_PID=""
 CODE_SERVER_PID=""
 PROCESS_MONITOR_PID=""
 GUNICORN_PID=""
+OPENCLAW_PID=""
 
 cleanup_children() {
-    for pid in "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID"; do
+    for pid in "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID" "$OPENCLAW_PID"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
         fi
@@ -24,7 +31,7 @@ cleanup_children() {
 
     sleep 1
 
-    for pid in "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID"; do
+    for pid in "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID" "$OPENCLAW_PID"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill -KILL "$pid" 2>/dev/null || true
         fi
@@ -33,6 +40,24 @@ cleanup_children() {
 }
 
 trap cleanup_children EXIT INT TERM
+
+wait_for_any_child() {
+    local pids=()
+    local pid=""
+
+    for pid in "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID" "$OPENCLAW_PID"; do
+        if [ -n "$pid" ]; then
+            pids+=("$pid")
+        fi
+    done
+
+    if [ "${#pids[@]}" -eq 0 ]; then
+        echo "ERROR: no child processes available to wait for" >&2
+        return 1
+    fi
+
+    wait -n "${pids[@]}"
+}
 
 ensure_port_available() {
     local port="$1"
@@ -95,6 +120,7 @@ echo "=========================================="
 echo "Timeout: ${TIMEOUT} seconds"
 echo "REST Port: ${REST_PORT}"
 echo "Process Monitor Port: ${PROCESS_MONITOR_PORT}"
+echo "OpenClaw Gateway Port: ${OPENCLAW_GATEWAY_PORT}"
 echo "Workdir: ${WORKDIR}"
 echo "Container ID: $(cat /proc/self/cgroup | head -1 | cut -d/ -f3)"
 echo "=========================================="
@@ -137,6 +163,7 @@ ensure_port_available "${REST_PORT}" || exit 1
 ensure_port_available "${TTYD_PORT}" || exit 1
 ensure_port_available "${CODE_SERVER_PORT}" || exit 1
 ensure_port_available "${PROCESS_MONITOR_PORT}" || exit 1
+ensure_port_available "${OPENCLAW_GATEWAY_PORT}" || exit 1
 
 ttyd -p "${TTYD_PORT}" -w / -W /bin/bash >> /tmp/ttyd.log 2>&1 &
 TTYD_PID=$!
@@ -174,6 +201,52 @@ fi
 
 # 智能体后端进程由 REST API 统一管理，不在入口脚本中自动启动
 
+echo "Preparing OpenClaw runtime configuration..."
+mkdir -p "${AGENT_HELPER_STATE_DIR:-/app/data}"
+export OPENCLAW_STATE_DIR
+export OPENCLAW_CONFIG_PATH
+export OPENCLAW_GATEWAY_PORT
+export OPENCLAW_GATEWAY_PASSWORD
+export OPENCLAW_WORKSPACE_DIR
+export OPENCLAW_SEED_DIR
+python3 "${WORKDIR}/openclaw_runtime_config.py" || exit 1
+
+OPENCLAW_BIN="$(resolve_node_global_bin openclaw || true)"
+if [ -z "${OPENCLAW_BIN}" ]; then
+    echo "ERROR: openclaw binary not found; cannot start OpenClaw gateway" >&2
+    exit 1
+fi
+
+echo "Running OpenClaw doctor in non-interactive mode..."
+"${OPENCLAW_BIN}" doctor --non-interactive > >(tee -a /tmp/openclaw-doctor.log) 2>&1 || exit 1
+
+echo "Starting OpenClaw gateway on port ${OPENCLAW_GATEWAY_PORT}..."
+"${OPENCLAW_BIN}" gateway run >> /tmp/openclaw-gateway.log 2>&1 &
+OPENCLAW_PID=$!
+
+openclaw_ready=0
+for _ in $(seq 1 20); do
+    if ! kill -0 "${OPENCLAW_PID}" 2>/dev/null; then
+        echo "ERROR: OpenClaw gateway exited during startup" >&2
+        tail -n 200 /tmp/openclaw-gateway.log >&2 || true
+        exit 1
+    fi
+    if timeout 5s "${OPENCLAW_BIN}" health >> /tmp/openclaw-health.log 2>&1; then
+        openclaw_ready=1
+        break
+    fi
+    sleep 1
+done
+
+if [ "${openclaw_ready}" -ne 1 ]; then
+    echo "ERROR: OpenClaw gateway health check failed" >&2
+    tail -n 200 /tmp/openclaw-health.log >&2 || true
+    tail -n 200 /tmp/openclaw-gateway.log >&2 || true
+    exit 1
+fi
+
+echo "OpenClaw gateway is ready."
+
 echo "Starting Process monitor service on port ${PROCESS_MONITOR_PORT}..."
 echo "Process monitor DNS_SERVER: ${DNS_SERVER:-<empty>}"
 if [ -f "/etc/resolv.conf" ]; then
@@ -200,7 +273,7 @@ gunicorn \
     agent_ai_service.app:app &
 GUNICORN_PID=$!
 
-wait -n "$GUNICORN_PID" "$TTYD_PID" "$CODE_SERVER_PID" "$PROCESS_MONITOR_PID"
+wait_for_any_child
 exit_code=$?
 
 echo "A helper process exited unexpectedly, shutting down remaining processes..." >&2

@@ -30,6 +30,11 @@ services:
       - CLAUDE_CODE_USE_BEDROCK=
       - CODE_SERVER_PORT=20003
       - PROCESS_MONITOR_PORT=20004
+      - OPENCLAW_STATE_DIR=/app/data/openclaw
+      - OPENCLAW_CONFIG_PATH=/app/data/openclaw/openclaw.json
+      - OPENCLAW_GATEWAY_PORT=20005
+      - OPENCLAW_WORKSPACE_DIR=/host
+      - OPENCLAW_GATEWAY_PASSWORD=
       - PROCESS_MONITOR_INTERVAL_SEC=15
       - HOST_ROOT=/host
       - PROCESS_MONITOR_PROC_ROOT=/host/proc

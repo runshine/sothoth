@@ -15,6 +15,10 @@ ENV PROCESS_MONITOR_INTERVAL_SEC=15
 ENV HOST_ROOT=/host
 ENV PROCESS_MONITOR_PROC_ROOT=/host/proc
 ENV CODE_SERVER_PASSWORD=
+ENV OPENCLAW_STATE_DIR=/app/data/openclaw
+ENV OPENCLAW_CONFIG_PATH=/app/data/openclaw/openclaw.json
+ENV OPENCLAW_GATEWAY_PORT=20005
+ENV OPENCLAW_WORKSPACE_DIR=/host
 ENV NVM_DIR=/root/.nvm
 ENV PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -107,18 +111,23 @@ RUN set -eux; \
     OPENCLAW_NO_PROMPT=1 OPENCLAW_NO_ONBOARD=1 \
     curl -fsSL https://openclaw.ai/install.sh | bash -s -- --install-method npm --no-prompt --no-onboard
 
-# 创建 code-server 配置目录
-RUN mkdir -p /root/.config/code-server && \
-    chmod -R 755 /root/.config/code-server
+# 创建 code-server 和 OpenClaw 配置目录
+RUN mkdir -p /root/.config/code-server \
+    /app/data/openclaw \
+    /app/openclaw-seed/state \
+    /app/openclaw-seed/workspace/skills && \
+    chmod -R 755 /root/.config/code-server /app/data /app/openclaw-seed
 
 
 # 复制应用代码
 COPY agent_ai_service ./agent_ai_service
 COPY process_monitor_service ./process_monitor_service
+COPY openclaw_seed ./openclaw-seed
+COPY openclaw_runtime_config.py .
 COPY entrypoint.sh .
 
 # 设置执行权限
-RUN chmod +x entrypoint.sh
+RUN chmod +x entrypoint.sh openclaw_runtime_config.py
 
 # 创建非root用户（安全考虑）
 RUN useradd -m -s /bin/bash debuguser && \
@@ -131,6 +140,7 @@ USER root
 EXPOSE ${REST_PORT}
 EXPOSE ${CODE_SERVER_PORT}
 EXPOSE ${PROCESS_MONITOR_PORT}
+EXPOSE ${OPENCLAW_GATEWAY_PORT}
 
 # 启动脚本
 ENTRYPOINT ["./entrypoint.sh"]

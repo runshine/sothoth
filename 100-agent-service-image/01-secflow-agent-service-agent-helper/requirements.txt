@@ -4,3 +4,4 @@ Flask-Sock
 gunicorn
 requests
 psutil
+json5

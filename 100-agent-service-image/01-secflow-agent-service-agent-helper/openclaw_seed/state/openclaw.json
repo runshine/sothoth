@@ -1,0 +1,19 @@
+{
+  "gateway": {
+    "mode": "local",
+    "port": 20005,
+    "bind": "lan",
+    "auth": {
+      "mode": "password"
+    },
+    "controlUi": {
+      "enabled": true,
+      "dangerouslyAllowHostHeaderOriginFallback": true
+    }
+  },
+  "agents": {
+    "defaults": {
+      "workspace": "/host"
+    }
+  }
+}
