@@ -38,6 +38,16 @@ class BinaryToSourceClient(JsonHttpClient):
     async def cancel_task(self, project_id: str, task_id: str, token: str) -> dict:
         return await self.post(f"/projects/{project_id}/tasks/{task_id}/terminate", token=token)
 
+    async def terminate_task(self, project_id: str, task_id: str, token: str) -> dict:
+        return await self.post(f"/projects/{project_id}/tasks/{task_id}/terminate", token=token)
+
+    async def retry_task(self, project_id: str, task_id: str, token: str, item_ids: list[str] | None = None) -> dict:
+        return await self.post(
+            f"/projects/{project_id}/tasks/{task_id}/retry",
+            token=token,
+            json_body={"item_ids": item_ids},
+        )
+
 
 _client: Optional[BinaryToSourceClient] = None
 

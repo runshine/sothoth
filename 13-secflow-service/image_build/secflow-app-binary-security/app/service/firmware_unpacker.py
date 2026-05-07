@@ -30,6 +30,12 @@ class FirmwareUnpackerClient(JsonHttpClient):
     async def cancel_task(self, task_id: str, token: str) -> dict:
         return await self.post(f"/api/app/firmware-unpacker/tasks/{task_id}/cancel", token=token)
 
+    async def retry_task(self, task_id: str, token: str) -> dict:
+        return await self.post(f"/api/app/firmware-unpacker/tasks/{task_id}/retry", token=token)
+
+    async def delete_task(self, task_id: str, token: str) -> dict:
+        return await self.delete(f"/api/app/firmware-unpacker/tasks/{task_id}", token=token)
+
 
 _client: Optional[FirmwareUnpackerClient] = None
 

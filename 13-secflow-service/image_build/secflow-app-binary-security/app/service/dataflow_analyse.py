@@ -31,6 +31,9 @@ class DataflowAnalyseClient(JsonHttpClient):
     async def cancel_task(self, task_id: str) -> dict:
         return await self.post(f"/tasks/{task_id}/cancel")
 
+    async def restart_task(self, task_id: str) -> dict:
+        return await self.post(f"/tasks/{task_id}/restart")
+
 
 _client: Optional[DataflowAnalyseClient] = None
 
