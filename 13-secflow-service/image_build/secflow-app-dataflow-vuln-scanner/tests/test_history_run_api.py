@@ -286,11 +286,37 @@ def test_history_run_reparses_when_atomic_work_path_was_stale(service_config_pat
     assert payload["results"]
 
 
-def test_history_runs_can_pin_legacy_project_root(service_config_path):
+def test_history_runs_list_does_not_re_refresh_synced_rows(service_config_path, monkeypatch):
+    from app.services import history_run_service as history_run_service_module
+
+    config = get_config()
+    project_root = Path(config.fileserver_service.data_mount_path) / "files" / "default"
+    legacy_run = project_root / "dataflow-vuln-scanner" / "runs" / "legacy_no_double_refresh_20260507_010203"
+    _create_legacy_run(legacy_run)
+
+    app = create_app()
+    client = TestClient(app)
+
+    first_list = client.get("/api/dataflow-vuln-scanner/history-runs", params={"project_id": "default"})
+    assert first_list.status_code == 200
+    assert any(item["name"] == legacy_run.name for item in first_list.json())
+
+    def fail_refresh(*args, **kwargs):
+        raise AssertionError("list_history_runs should not refresh already synced rows")
+
+    monkeypatch.setattr(history_run_service_module.HistoryRunService, "refresh_history_run", fail_refresh)
+
+    second_list = client.get("/api/dataflow-vuln-scanner/history-runs", params={"project_id": "default"})
+    assert second_list.status_code == 200
+    assert any(item["name"] == legacy_run.name for item in second_list.json())
+
+
+def test_history_runs_ignore_stale_fixed_project_override_and_use_requested_project(service_config_path):
+    stale_fixed_project_id = "stale-fixed-project-id"
     config_payload = yaml.safe_load(service_config_path.read_text(encoding="utf-8")) or {}
     config_payload["history_runs"] = {
         "enabled": True,
-        "fixed_project_id": "44f9029d00650a10",
+        "fixed_project_id": stale_fixed_project_id,
         "legacy_root_candidates": [
             "{data_mount_path}/{project_files_dirname}/{project_id}/dataflow-vuln-scanner/runs",
             "{data_mount_path}/{project_files_dirname}/{project_id}/DATAFLOW_VULN_SCANNER/runs",
@@ -300,10 +326,11 @@ def test_history_runs_can_pin_legacy_project_root(service_config_path):
     reset_config()
 
     config = get_config()
-    fixed_project_id = str(config.history_runs.fixed_project_id)
-    project_root = Path(config.fileserver_service.data_mount_path) / "files" / fixed_project_id
-    legacy_run = project_root / "dataflow-vuln-scanner" / "runs" / "legacy_fixed_project_20260506_010203"
+    requested_project_root = Path(config.fileserver_service.data_mount_path) / "files" / "default"
+    legacy_run = requested_project_root / "dataflow-vuln-scanner" / "runs" / "legacy_fixed_project_20260506_010203"
     _create_legacy_run(legacy_run)
+    stale_project_root = Path(config.fileserver_service.data_mount_path) / "files" / stale_fixed_project_id
+    _create_legacy_run(stale_project_root / "dataflow-vuln-scanner" / "runs" / "legacy_should_be_ignored_20260506_010204")
 
     app = create_app()
     client = TestClient(app)
@@ -311,7 +338,8 @@ def test_history_runs_can_pin_legacy_project_root(service_config_path):
     assert history_runs.status_code == 200
     items = history_runs.json()
     summary = next(item for item in items if item["name"] == legacy_run.name)
-    assert fixed_project_id in summary["path"]
+    assert "/files/default/" in summary["path"]
+    assert not any(item["name"] == "legacy_should_be_ignored_20260506_010204" for item in items)
 
     resolve = client.get(
         "/api/dataflow-vuln-scanner/history-runs/resolve",
@@ -322,21 +350,8 @@ def test_history_runs_can_pin_legacy_project_root(service_config_path):
 
 
 def test_history_runs_rebind_existing_legacy_index_to_requested_project(service_config_path):
-    config_payload = yaml.safe_load(service_config_path.read_text(encoding="utf-8")) or {}
-    config_payload["history_runs"] = {
-        "enabled": True,
-        "fixed_project_id": "44f9029d00650a10",
-        "legacy_root_candidates": [
-            "{data_mount_path}/{project_files_dirname}/{project_id}/dataflow-vuln-scanner/runs",
-            "{data_mount_path}/{project_files_dirname}/{project_id}/DATAFLOW_VULN_SCANNER/runs",
-        ],
-    }
-    service_config_path.write_text(yaml.safe_dump(config_payload, allow_unicode=True), encoding="utf-8")
-    reset_config()
-
     config = get_config()
-    fixed_project_id = str(config.history_runs.fixed_project_id)
-    project_root = Path(config.fileserver_service.data_mount_path) / "files" / fixed_project_id
+    project_root = Path(config.fileserver_service.data_mount_path) / "files" / "default"
     legacy_run = project_root / "dataflow-vuln-scanner" / "runs" / "legacy_rebind_project_20260506_020304"
     _create_legacy_run(legacy_run)
 

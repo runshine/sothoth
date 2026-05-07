@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, create_engine, inspect, text
-from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.dialects.mysql import DOUBLE, MEDIUMTEXT
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.config import get_config
@@ -163,7 +163,7 @@ class HistoryRun(Base):
     raw_summary_json = Column(JSON, nullable=False, default=dict)
     log_tail_text = Column(Text().with_variant(MEDIUMTEXT(), "mysql"))
     log_size_bytes = Column(Integer, nullable=False, default=0)
-    source_mtime = Column(Float, nullable=False, default=0)
+    source_mtime = Column(Float().with_variant(DOUBLE(asdecimal=False), "mysql"), nullable=False, default=0)
     last_synced_at = Column(DateTime, default=now_utc)
     created_at = Column(DateTime, default=now_utc)
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
@@ -582,6 +582,13 @@ def run_auto_migrations() -> None:
                     connection.execute(text(
                         f"ALTER TABLE {HistoryRun.__tablename__} "
                         "MODIFY COLUMN log_tail_text MEDIUMTEXT NULL"
+                    ))
+                    inspector = inspect(connection)
+            if _column_exists(inspector, HistoryRun.__tablename__, "source_mtime"):
+                if "DOUBLE" not in _column_type_name(inspector, HistoryRun.__tablename__, "source_mtime"):
+                    connection.execute(text(
+                        f"ALTER TABLE {HistoryRun.__tablename__} "
+                        "MODIFY COLUMN source_mtime DOUBLE NOT NULL DEFAULT 0"
                     ))
                     inspector = inspect(connection)
 

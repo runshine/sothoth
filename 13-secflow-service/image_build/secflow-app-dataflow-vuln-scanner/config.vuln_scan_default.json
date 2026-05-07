@@ -19,7 +19,7 @@
       "type": "pi_agent",
       "reset_context": false,
       "runtime_config": {
-        "model": "anthropic/claude-sonnet-4-20250514",
+        "model": "icsl/zai-org/GLM-5",
         "sdk_specific": {
           "thinking": "high"
         },
@@ -41,7 +41,7 @@
       "type": "pi_agent",
       "reset_context": true,
       "runtime_config": {
-        "model": "anthropic/claude-sonnet-4-20250514",
+        "model": "icsl/zai-org/GLM-5",
         "sdk_specific": {
           "thinking": "high",
           "tools": "read,bash"

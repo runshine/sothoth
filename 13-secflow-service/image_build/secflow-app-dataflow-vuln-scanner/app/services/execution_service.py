@@ -252,6 +252,8 @@ class ExecutionService:
 
     def _normalize_project_path(self, raw_path: str) -> str:
         raw = str(raw_path or "").strip() or "/"
+        if any(part == ".." for part in raw.split("/")):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="project path escapes project root")
         normalized = posixpath.normpath(raw)
         if not normalized.startswith("/"):
             normalized = f"/{normalized}"
@@ -268,11 +270,107 @@ class ExecutionService:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{label} escapes allowed root") from exc
         return resolved
 
+    def _project_files_root(self, project_id: str) -> Path:
+        config = get_config()
+        data_mount_path = Path(config.fileserver_service.data_mount_path).resolve()
+        project_root = data_mount_path / config.fileserver_service.project_files_dirname / sanitize_name(project_id)
+        return self._ensure_path_within(path=project_root, root=data_mount_path, label="project_root")
+
+    def _build_project_filesystem_entry(self, *, project_root: Path, candidate: Path) -> dict[str, Any]:
+        resolved = self._ensure_path_within(path=candidate, root=project_root, label="project filesystem path")
+        stat = resolved.stat()
+        relative = resolved.relative_to(project_root).as_posix()
+        depth = 0 if not relative else len(relative.split("/"))
+        is_dir = resolved.is_dir()
+        node_type = "file"
+        if is_dir:
+            node_type = "subproject" if depth == 1 else "directory"
+        has_children = False
+        if is_dir:
+            try:
+                next(resolved.iterdir())
+                has_children = True
+            except StopIteration:
+                has_children = False
+        return {
+            "node_type": node_type,
+            "name": resolved.name,
+            "path": f"/{relative}" if relative else "/",
+            "content_type": None,
+            "size": stat.st_size if resolved.is_file() else None,
+            "updated_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z",
+            "has_children": has_children,
+            "special_badge": None,
+        }
+
+    def _list_project_filesystem_entries(self, *, project_root: Path, current_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        directories: list[dict[str, Any]] = []
+        files: list[dict[str, Any]] = []
+        if not current_dir.exists():
+            return directories, files
+        for child in sorted(current_dir.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+            entry = self._build_project_filesystem_entry(project_root=project_root, candidate=child)
+            if entry["node_type"] == "file":
+                files.append(entry)
+            else:
+                directories.append(entry)
+        return directories, files
+
+    def get_project_filesystem_root(self, principal: dict, project_id: str) -> dict[str, Any]:
+        self._ensure_project_access(principal, project_id)
+        project_root = self._project_files_root(project_id)
+        directories, files = self._list_project_filesystem_entries(project_root=project_root, current_dir=project_root)
+        items = directories + files
+        return {
+            "project_id": project_id,
+            "root_name": project_id,
+            "total": len(items),
+            "items": items,
+        }
+
+    def get_project_filesystem_children(self, principal: dict, project_id: str, path: str) -> dict[str, Any]:
+        self._ensure_project_access(principal, project_id)
+        project_root = self._project_files_root(project_id)
+        normalized = self._normalize_project_path(path)
+        current_dir = project_root if normalized == "/" else self._ensure_path_within(
+            path=project_root / normalized.lstrip("/"),
+            root=project_root,
+            label="project filesystem path",
+        )
+        if not current_dir.exists():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"path not found: {normalized}")
+        if not current_dir.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="path must be a directory")
+
+        directories, files = self._list_project_filesystem_entries(project_root=project_root, current_dir=current_dir)
+        breadcrumbs = [{"node_type": "project", "name": project_id, "path": "/"}]
+        if normalized != "/":
+            parts = [part for part in normalized.split("/") if part]
+            assembled: list[str] = []
+            for index, part in enumerate(parts):
+                assembled.append(part)
+                breadcrumbs.append(
+                    {
+                        "node_type": "subproject" if index == 0 else "directory",
+                        "name": part,
+                        "path": f"/{'/'.join(assembled)}",
+                    }
+                )
+
+        return {
+            "project_id": project_id,
+            "current_path": normalized,
+            "current_name": project_id if normalized == "/" else current_dir.name,
+            "breadcrumbs": breadcrumbs,
+            "directories": directories,
+            "files": files,
+        }
+
     def _resolve_dataflow_input_ref(self, *, project_id: str, ref: dict[str, Any], expected: str) -> Path:
         source = str(ref.get("source") or "project_filesystem").strip()
         data_mount_path = Path(get_config().fileserver_service.data_mount_path)
         if source in {"project_filesystem", "project_path", "project"}:
-            project_root = data_mount_path / get_config().fileserver_service.project_files_dirname / sanitize_name(project_id)
+            project_root = self._project_files_root(project_id)
             normalized = self._normalize_project_path(str(ref.get("path") or ""))
             candidate = project_root / normalized.lstrip("/")
             resolved = self._ensure_path_within(path=candidate, root=project_root, label=expected)
@@ -325,28 +423,34 @@ class ExecutionService:
         output_ref = request.get("output_dir")
         if workspace_ref is None and output_ref is None:
             return None, None
-        if not isinstance(workspace_ref, dict) or not isinstance(output_ref, dict):
+        if workspace_ref is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="workspace_dir and output_dir must be valid directory refs",
+                detail="workspace_dir is required when output_dir is provided",
             )
+        if not isinstance(workspace_ref, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="workspace_dir must be a valid directory ref")
+        if output_ref is not None and not isinstance(output_ref, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="output_dir must be a valid directory ref")
 
         workspace_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=workspace_ref, expected="workspace_dir")
-        output_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=output_ref, expected="output_dir")
         if not workspace_base.is_dir():
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {workspace_base}")
-        if not output_base.is_dir():
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {output_base}")
 
         workspace_base = workspace_base.resolve()
-        output_base = output_base.resolve()
-        try:
-            output_relative = output_base.relative_to(workspace_base)
-        except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="output_dir must be inside workspace_dir",
-            ) from exc
+        output_relative = Path("output")
+        if output_ref is not None:
+            output_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=output_ref, expected="output_dir")
+            if not output_base.is_dir():
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {output_base}")
+            output_base = output_base.resolve()
+            try:
+                output_relative = output_base.relative_to(workspace_base)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="output_dir must be inside workspace_dir",
+                ) from exc
 
         workspace_root = ensure_dir(workspace_base / sanitize_name(execution_id))
         output_dir = ensure_dir(workspace_root / output_relative)
@@ -382,6 +486,9 @@ class ExecutionService:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {output_base}")
         if workspace_base is not None and output_base is not None:
             self._ensure_path_within(path=output_base, root=workspace_base, label="output_dir")
+        effective_output_base = output_base
+        if workspace_base is not None and effective_output_base is None:
+            effective_output_base = workspace_base / "output"
         scan_input_dir = ensure_dir(task_input_dir / "dataflow_scan")
         data_flow_name = sanitize_name(str(data_flow_ref.get("filename") or source_data_flow.name or "data_flow.md"))
         data_flow_target = scan_input_dir / "data_flow" / data_flow_name
@@ -402,9 +509,12 @@ class ExecutionService:
         if workspace_base is not None:
             materialized["workspace_dir"] = abs_path(workspace_base)
             materialized["original_workspace_dir"] = workspace_ref
+        if effective_output_base is not None:
+            materialized["output_dir"] = abs_path(effective_output_base)
         if output_base is not None:
-            materialized["output_dir"] = abs_path(output_base)
             materialized["original_output_dir"] = output_ref
+        elif workspace_base is not None:
+            materialized["output_dir_mode"] = "auto_workspace_output"
         write_json(scan_input_dir / "input_manifest.json", materialized)
         return generated_markdown, materialized
 

@@ -15,6 +15,8 @@ from app.schemas import (
     HistoryRunResolveResponse,
     HistoryRunSessionResponse,
     HistoryRunSummaryResponse,
+    ProjectFilesystemChildrenResponse,
+    ProjectFilesystemRootResponse,
     ScanTaskArtifactsResponse,
     ScanTaskAttemptResponse,
     ScanTaskCreateRequest,
@@ -37,6 +39,7 @@ async def get_capabilities(subject=Depends(get_current_subject)):
         "data_flow_file_types": [".md", ".txt"],
         "source_file_types": [".c", ".h", ".cpp", ".hpp", ".cc", ".asm", ".S", ".s"],
         "models": [
+            "icsl/zai-org/GLM-5",
             "openai/gpt-5.4",
             "openai/gpt-5.4-mini",
             "anthropic/claude-sonnet-4-20250514",
@@ -51,6 +54,27 @@ async def get_capabilities(subject=Depends(get_current_subject)):
         ],
         "process_views": ["runs", "cycles", "reviews", "results", "sessions", "files", "logs"],
     }
+
+
+@router.get("/project-filesystem/root", response_model=ProjectFilesystemRootResponse)
+async def get_project_filesystem_root(
+    project_id: str = Query(...),
+    subject=Depends(get_current_subject),
+):
+    principal, token = subject
+    await ensure_project_access(project_id, token)
+    return get_execution_service().get_project_filesystem_root(principal, project_id)
+
+
+@router.get("/project-filesystem/children", response_model=ProjectFilesystemChildrenResponse)
+async def get_project_filesystem_children(
+    project_id: str = Query(...),
+    path: str = Query(...),
+    subject=Depends(get_current_subject),
+):
+    principal, token = subject
+    await ensure_project_access(project_id, token)
+    return get_execution_service().get_project_filesystem_children(principal, project_id, path)
 
 
 @router.post("/tasks", response_model=ScanTaskResponse, status_code=status.HTTP_201_CREATED)

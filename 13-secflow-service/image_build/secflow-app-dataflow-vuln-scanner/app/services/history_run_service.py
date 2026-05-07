@@ -36,6 +36,7 @@ from app.services.run_inspector import (
 
 HISTORY_RUN_LOG_SUMMARY_MAX_CHARS = 32768
 _ACTIVE_HISTORY_RUN_STATUSES = {"running", "pending", "queued", "cancel_requested"}
+_SOURCE_MTIME_COMPARE_EPSILON = 1e-6
 
 
 def _new_id(prefix: str) -> str:
@@ -152,6 +153,17 @@ def _compute_source_mtime_hint(run_root: Path, atomic_work_path: str | None = No
     return latest
 
 
+def _stored_source_mtime(value: Any) -> float:
+    try:
+        return max(float(value or 0), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _source_mtime_is_current(current_mtime: float, stored_mtime: Any) -> bool:
+    return current_mtime <= (_stored_source_mtime(stored_mtime) + _SOURCE_MTIME_COMPARE_EPSILON)
+
+
 def _task_markdown_for_run(run_root: Path) -> str:
     input_manifest = run_root / "input" / "tasks.json"
     payload = _read_json_file(input_manifest)
@@ -216,15 +228,9 @@ def _history_run_is_active(record: HistoryRun) -> bool:
     return str(record.status or "").strip().lower() in _ACTIVE_HISTORY_RUN_STATUSES
 
 
-def _effective_legacy_project_id(project_id: str) -> str:
-    config = get_config()
-    fixed_project_id = str(config.history_runs.fixed_project_id or "").strip()
-    return fixed_project_id or str(project_id or "").strip()
-
-
 def _project_files_root(project_id: str) -> Path:
     config = get_config()
-    return Path(config.fileserver_service.data_mount_path) / config.fileserver_service.project_files_dirname / _effective_legacy_project_id(project_id)
+    return Path(config.fileserver_service.data_mount_path) / config.fileserver_service.project_files_dirname / str(project_id or "").strip()
 
 
 def _normalize_legacy_request_root(project_id: str, root_path: str) -> Path:
@@ -289,13 +295,12 @@ class HistoryRunService:
 
     def _legacy_root_candidates(self, project_id: str) -> list[Path]:
         config = get_config()
-        effective_project_id = _effective_legacy_project_id(project_id)
         values = []
         for template in config.history_runs.legacy_root_candidates:
             rendered = template.format(
                 data_mount_path=config.fileserver_service.data_mount_path.rstrip("/"),
                 project_files_dirname=config.fileserver_service.project_files_dirname.strip("/"),
-                project_id=effective_project_id,
+                project_id=str(project_id or "").strip(),
             )
             values.append(Path(rendered))
         # Keep order but drop duplicates.
@@ -512,9 +517,10 @@ class HistoryRunService:
 
         source_key = str(run_root)
         record = db.query(HistoryRun).filter(HistoryRun.source_key == source_key).first()
+        stored_source_mtime = _stored_source_mtime(record.source_mtime) if record is not None else 0.0
         if record is not None and not _history_run_is_active(record) and not _history_run_needs_parser_resync(record):
             hint_mtime = _compute_source_mtime_hint(run_root, record.atomic_work_path)
-            if hint_mtime <= float(record.source_mtime or 0):
+            if _source_mtime_is_current(hint_mtime, stored_source_mtime):
                 self._refresh_record_bindings(
                     record,
                     project_id=project_id,
@@ -527,7 +533,7 @@ class HistoryRunService:
                 db.flush()
                 return record
         source_mtime = _compute_source_mtime(run_root)
-        if record is not None and record.source_mtime >= source_mtime and not _history_run_needs_parser_resync(record):
+        if record is not None and _source_mtime_is_current(source_mtime, stored_source_mtime) and not _history_run_needs_parser_resync(record):
             self._refresh_record_bindings(
                 record,
                 project_id=project_id,
@@ -626,8 +632,16 @@ class HistoryRunService:
     def sync_project_history_runs(self, db: Session, project_id: str) -> None:
         if not get_config().history_runs.enabled:
             return
-        for execution, run_root in self._discover_execution_runs(db, project_id):
-            linked_task = db.get(TriggerTask, execution.trigger_task_id)
+        execution_runs = self._discover_execution_runs(db, project_id)
+        linked_tasks_by_id: dict[str, TriggerTask] = {}
+        task_ids = sorted({execution.trigger_task_id for execution, _ in execution_runs if execution.trigger_task_id})
+        if task_ids:
+            linked_tasks_by_id = {
+                item.id: item
+                for item in db.query(TriggerTask).filter(TriggerTask.id.in_(task_ids)).all()
+            }
+        for execution, run_root in execution_runs:
+            linked_task = linked_tasks_by_id.get(execution.trigger_task_id)
             self.sync_run_path(
                 db,
                 project_id=project_id,
@@ -650,12 +664,13 @@ class HistoryRunService:
         run_root = Path(history_run.run_root_path)
         if not run_root.is_dir():
             return history_run
+        stored_source_mtime = _stored_source_mtime(history_run.source_mtime)
         if not _history_run_is_active(history_run) and not _history_run_needs_parser_resync(history_run):
             hint_mtime = _compute_source_mtime_hint(run_root, history_run.atomic_work_path)
-            if hint_mtime <= float(history_run.source_mtime or 0):
+            if _source_mtime_is_current(hint_mtime, stored_source_mtime):
                 return history_run
         current_mtime = _compute_source_mtime(run_root)
-        if current_mtime <= float(history_run.source_mtime or 0) and not _history_run_needs_parser_resync(history_run):
+        if _source_mtime_is_current(current_mtime, stored_source_mtime) and not _history_run_needs_parser_resync(history_run):
             return history_run
         linked_execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
         linked_task = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
@@ -727,7 +742,7 @@ class HistoryRunService:
             ),
             reverse=True,
         )
-        return [self._summary_payload(self.refresh_history_run(db, item)) for item in records]
+        return [self._summary_payload(item) for item in records]
 
     def get_history_run_summary(self, db: Session, history_run: HistoryRun) -> dict[str, Any]:
         history_run = self.refresh_history_run(db, history_run)

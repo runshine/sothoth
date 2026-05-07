@@ -117,8 +117,8 @@ class ScanTaskCreateRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_task_input(self) -> "ScanTaskCreateRequest":
-        if bool(self.workspace_dir) != bool(self.output_dir):
-            raise ValueError("workspace_dir and output_dir must be provided together")
+        if self.output_dir and not self.workspace_dir:
+            raise ValueError("workspace_dir is required when output_dir is provided")
         if self.task_markdown:
             return self
         if self.data_flow and self.source_dir:
@@ -212,6 +212,39 @@ class ServiceEffectiveConfigResponse(BaseModel):
     service_name: str
     api_prefix: str
     config: Dict[str, Any]
+
+
+class ProjectFilesystemBreadcrumbItemResponse(BaseModel):
+    node_type: str
+    name: str
+    path: str
+
+
+class ProjectFilesystemEntryResponse(BaseModel):
+    node_type: str
+    name: str
+    path: str
+    content_type: Optional[str] = None
+    size: Optional[int] = None
+    updated_at: Optional[str] = None
+    has_children: bool
+    special_badge: Optional[str] = None
+
+
+class ProjectFilesystemRootResponse(BaseModel):
+    project_id: str
+    root_name: str
+    total: int
+    items: List[ProjectFilesystemEntryResponse] = Field(default_factory=list)
+
+
+class ProjectFilesystemChildrenResponse(BaseModel):
+    project_id: str
+    current_path: str
+    current_name: str
+    breadcrumbs: List[ProjectFilesystemBreadcrumbItemResponse] = Field(default_factory=list)
+    directories: List[ProjectFilesystemEntryResponse] = Field(default_factory=list)
+    files: List[ProjectFilesystemEntryResponse] = Field(default_factory=list)
 
 
 class WorkflowDefinitionCreate(BaseModel):

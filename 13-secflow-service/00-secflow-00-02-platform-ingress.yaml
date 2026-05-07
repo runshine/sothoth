@@ -138,7 +138,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: secflow-app-dataflow-vuln-scanner
+                name: secflow-platform-ai-agent-framework
                 port:
                   number: 80
           - path: /api/app/binary-to-source

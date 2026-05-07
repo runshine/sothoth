@@ -243,6 +243,106 @@ def test_business_dataflow_task_uses_selected_workspace_and_output_dirs(service_
     assert runtime_config["execution"]["output_dir"] == str(expected_output_root.resolve())
 
 
+def test_business_dataflow_task_defaults_output_dir_inside_selected_workspace(service_config_path, patch_mock_agent_runtime):
+    config = get_config()
+    project_root = config.fileserver_service.data_mount_path
+    from pathlib import Path
+    import json
+
+    case_root = Path(project_root) / "files" / "default" / "case-workspace-only"
+    source_dir = case_root / "source"
+    workspace_dir = case_root / "workspace"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
+    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "business scan default output",
+            "workspace_dir": {"source": "project_filesystem", "path": "/case-workspace-only/workspace"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-workspace-only/data_flow.md"},
+            "source_dir": {"source": "project_filesystem", "path": "/case-workspace-only/source"},
+            "model": "mock/model",
+            "thinking": "medium",
+            "review_profile": "fast",
+            "max_review_cycles": 1,
+            "result_review_concurrency": 1,
+            "priority": 80,
+        },
+    )
+    assert task.status_code == 201
+    task_id = task.json()["task_id"]
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    materialized = detail.json()["task_metadata"]["dataflow_scan_materialized"]
+    assert materialized["workspace_dir"] == str(workspace_dir.resolve())
+    assert materialized["output_dir"] == str((workspace_dir / "output").resolve())
+    assert materialized["output_dir_mode"] == "auto_workspace_output"
+
+    attempts = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/attempts")
+    assert attempts.status_code == 200
+    execution_id = attempts.json()[0]["execution_id"]
+    expected_workspace_root = workspace_dir / execution_id
+    expected_output_root = expected_workspace_root / "output"
+    assert attempts.json()[0]["workspace_root"] == str(expected_workspace_root.resolve())
+
+    assert SchedulerService()._claim_next_execution() == execution_id
+    get_execution_service().run_claimed_execution(execution_id)
+
+    runtime_config = json.loads((expected_workspace_root / "config.json").read_text(encoding="utf-8"))
+    assert runtime_config["global_config"]["workspace_root"] == str(expected_workspace_root.resolve())
+    assert runtime_config["execution"]["output_dir"] == str(expected_output_root.resolve())
+
+
+def test_project_filesystem_browser_uses_local_project_tree(service_config_path):
+    config = get_config()
+    project_root = config.fileserver_service.data_mount_path
+    from pathlib import Path
+
+    case_root = Path(project_root) / "files" / "default" / "case-browser"
+    nested_dir = case_root / "source"
+    nested_dir.mkdir(parents=True, exist_ok=True)
+    (case_root / "data_flow.md").write_text("# browser test\n", encoding="utf-8")
+    (nested_dir / "demo.c").write_text("int demo(void) { return 0; }\n", encoding="utf-8")
+
+    app = create_app()
+    client = TestClient(app)
+
+    root = client.get("/api/dataflow-vuln-scanner/project-filesystem/root", params={"project_id": "default"})
+    assert root.status_code == 200
+    items = {item["name"]: item for item in root.json()["items"]}
+    assert items["case-browser"]["node_type"] == "subproject"
+    assert items["case-browser"]["path"] == "/case-browser"
+
+    children = client.get(
+        "/api/dataflow-vuln-scanner/project-filesystem/children",
+        params={"project_id": "default", "path": "/case-browser"},
+    )
+    assert children.status_code == 200
+    payload = children.json()
+    assert payload["current_path"] == "/case-browser"
+    assert payload["breadcrumbs"][-1]["path"] == "/case-browser"
+    directories = {item["name"]: item for item in payload["directories"]}
+    files = {item["name"]: item for item in payload["files"]}
+    assert directories["source"]["node_type"] == "directory"
+    assert files["data_flow.md"]["node_type"] == "file"
+
+    escaped = client.get(
+        "/api/dataflow-vuln-scanner/project-filesystem/children",
+        params={"project_id": "default", "path": "/../etc"},
+    )
+    assert escaped.status_code == 422
+
+
 def test_service_config_is_redacted(service_config_path):
     from app.config import get_config
 

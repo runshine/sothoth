@@ -203,6 +203,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/dataflow-vuln-scanner
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-dataflow-vuln-scanner
+            port:
+              number: 80
+
       - path: /api/ai-agent-framework
         pathType: Prefix
         backend:
