@@ -18,6 +18,9 @@ spec:
       - name: secflow-platform-configcenter
         image: runshine0819/secflow-platform-configcenter:20260403
         imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
         ports:
         - containerPort: 8080
         volumeMounts:

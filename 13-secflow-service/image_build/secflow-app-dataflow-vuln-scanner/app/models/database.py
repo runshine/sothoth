@@ -108,6 +108,11 @@ class WorkflowExecution(Base):
     owner_pod_id = Column(String(128))
     lease_token = Column(String(128))
     lease_expires_at = Column(DateTime)
+    process_pid = Column(Integer)
+    process_host = Column(String(256))
+    process_status = Column(String(32))
+    process_started_at = Column(DateTime)
+    process_finished_at = Column(DateTime)
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
     message = Column(Text)
@@ -501,6 +506,11 @@ def run_auto_migrations() -> None:
         (tables["workflow_execution"], "workflow_definition_version_id", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN workflow_definition_version_id VARCHAR(64) NULL"),
         (tables["workflow_execution"], "attempt_no", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 1"),
         (tables["workflow_execution"], "recovery_reason", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN recovery_reason VARCHAR(255) NULL"),
+        (tables["workflow_execution"], "process_pid", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_pid INTEGER NULL"),
+        (tables["workflow_execution"], "process_host", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_host VARCHAR(256) NULL"),
+        (tables["workflow_execution"], "process_status", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_status VARCHAR(32) NULL"),
+        (tables["workflow_execution"], "process_started_at", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_started_at DATETIME NULL"),
+        (tables["workflow_execution"], "process_finished_at", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_finished_at DATETIME NULL"),
     ]
     index_migrations = [
         (table_name, index_name, _render_index_sql(table_name, index_name, sql_template, dialect))

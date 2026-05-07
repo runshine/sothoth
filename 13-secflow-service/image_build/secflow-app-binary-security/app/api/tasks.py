@@ -174,8 +174,17 @@ async def cancel_task(
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    await get_task_manager().cancel_task(db, project_id=project_id, task_id=task_id)
-    return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
+    return await get_task_manager().cancel_task(db, project_id=project_id, task_id=task_id)
+
+
+@router.delete("/projects/{project_id}/tasks/{task_id}", response_model=BinarySecurityActionResponse)
+async def delete_task(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return await get_task_manager().delete_task(db, project_id=project_id, task_id=task_id)
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/retry", response_model=BinarySecurityActionResponse)

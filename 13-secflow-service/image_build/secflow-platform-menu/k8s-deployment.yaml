@@ -33,6 +33,8 @@ spec:
         image: secflow-menu:latest
         imagePullPolicy: IfNotPresent
         env:
+          - name: TZ
+            value: Asia/Shanghai
         - name: POD_NAME
           valueFrom:
             fieldRef:

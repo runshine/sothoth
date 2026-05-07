@@ -211,11 +211,3 @@ spec:
             name: secflow-app-dataflow-vuln-scanner
             port:
               number: 80
-
-      - path: /api/ai-agent-framework
-        pathType: Prefix
-        backend:
-          service:
-            name: secflow-platform-ai-agent-framework
-            port:
-              number: 80

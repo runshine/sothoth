@@ -19,6 +19,8 @@ spec:
         image: runshine0819/secflow-platform-agent:latest
         imagePullPolicy: Always
         env:
+          - name: TZ
+            value: Asia/Shanghai
         - name: POD_NAME
           valueFrom:
             fieldRef:

@@ -136,6 +136,7 @@ class EngineConfig(BaseModel):
     """引擎参数"""
     max_review_cycles: Optional[int] = None
     review_profile: Literal["fast", "balanced", "strict", "audit"] = "balanced"
+    review_enabled: bool = True
     max_worker_turns_per_cycle: Optional[int] = Field(default=None, ge=1)
     reflection_passes_per_cycle: Optional[int] = Field(default=None, ge=0)
     reflection_max_internal_turns: Optional[int] = Field(default=None, ge=1)
@@ -144,6 +145,9 @@ class EngineConfig(BaseModel):
     reflection_rpc_stdout_trace_bytes: Optional[int] = Field(default=None, ge=1)
     reflection_rpc_stdout_abort_bytes: Optional[int] = Field(default=None, ge=1)
     min_discovery_cycles_before_pass: Optional[int] = Field(default=None, ge=1)
+    progress_required_after_cycle: int = Field(default=0, ge=0)
+    progress_no_signal_closure_streak: int = Field(default=2, ge=1)
+    progress_no_signal_abort_streak: int = Field(default=3, ge=1)
     min_evidence_artifacts: Optional[int] = Field(default=None, ge=0)
     required_pattern_families: list[str] = Field(default_factory=list)
     reset_worker_session_per_cycle: bool = True

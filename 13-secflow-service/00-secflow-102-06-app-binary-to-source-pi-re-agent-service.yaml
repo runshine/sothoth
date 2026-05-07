@@ -12,3 +12,19 @@ spec:
       targetPort: 8000
       protocol: TCP
       name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-pi-re-agent-headless
+  namespace: secflow-ns
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    name: secflow-pi-re-agent
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: http

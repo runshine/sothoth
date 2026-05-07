@@ -52,7 +52,7 @@ class FileserverClient:
                 )
                 payload = self._handle_response(response)
                 for item in payload.get("items", []):
-                    if item.get("name") == self.config.aiwf_subproject_name:
+                    if item.get("name") == self.config.dataflow_subproject_name:
                         return {
                             "id": item["id"],
                             "name": item["name"],
@@ -64,8 +64,8 @@ class FileserverClient:
                     f"{self.config.base_url}/subprojects",
                     json={
                         "project_id": project_id,
-                        "name": self.config.aiwf_subproject_name,
-                        "description": "AI工作流共享工作区",
+                        "name": self.config.dataflow_subproject_name,
+                        "description": "数据流漏洞挖掘共享工作区",
                     },
                     headers=headers,
                 )
@@ -92,11 +92,11 @@ class FileserverClient:
             Path(self.config.data_mount_path)
             / self.config.project_files_dirname
             / sanitize_name(project_id)
-            / sanitize_name(self.config.aiwf_subproject_name)
+            / sanitize_name(self.config.dataflow_subproject_name)
         )
         return {
-            "id": self.config.aiwf_subproject_name,
-            "name": self.config.aiwf_subproject_name,
+            "id": self.config.dataflow_subproject_name,
+            "name": self.config.dataflow_subproject_name,
             "root_dir": root_dir,
             "mode": "filesystem-fallback",
         }

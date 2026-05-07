@@ -378,9 +378,13 @@
         "engine": {
           "max_review_cycles": 6,
           "review_profile": "balanced",
+          "review_enabled": true,
           "max_worker_turns_per_cycle": 70,
           "reflection_passes_per_cycle": 1,
           "min_discovery_cycles_before_pass": 1,
+          "progress_required_after_cycle": 0,
+          "progress_no_signal_closure_streak": 2,
+          "progress_no_signal_abort_streak": 3,
           "reset_worker_session_per_cycle": true,
           "plateau_closure_streak": 2,
           "plateau_abort_streak": 3,

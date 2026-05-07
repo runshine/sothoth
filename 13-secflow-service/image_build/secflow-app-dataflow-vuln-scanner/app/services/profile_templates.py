@@ -8,8 +8,11 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from app.pi_vuln_core.review.profile import (
+    apply_profile_thinking_to_config,
     get_review_profile_policy,
     get_review_score_threshold_policy,
+    normalize_review_profile,
+    resolve_profile_thinking,
 )
 
 TEMPLATE_FILES = {
@@ -49,10 +52,12 @@ def _extract_defaults(template: dict[str, Any]) -> dict[str, Any]:
     advisor_runtime = advisor.get("runtime_config") or {}
     return {
         "model": worker_runtime.get("model") or advisor_runtime.get("model") or "",
-        "thinking": (
-            (worker_runtime.get("sdk_specific") or {}).get("thinking")
-            or (advisor_runtime.get("sdk_specific") or {}).get("thinking")
-            or "high"
+        "thinking": resolve_profile_thinking(
+            worker_runtime.get("model") or advisor_runtime.get("model") or "",
+            (
+                (((template.get("workflows") or {}).get("atomic") or [{}])[-1].get("engine") or {}).get("review_profile")
+                or "balanced"
+            ),
         ),
         "max_review_cycles": ((template.get("global") or {}).get("max_review_cycles") or 6),
         "review_profile": (
@@ -115,10 +120,9 @@ class ProfileTemplateService:
         compiled = copy.deepcopy(template)
 
         model = str(normalized_payload.get("model") or "").strip()
-        thinking = str(normalized_payload.get("thinking") or "high").strip() or "high"
         worker_timeout = int(normalized_payload.get("worker_timeout") or 3600)
         advisor_timeout = int(normalized_payload.get("advisor_timeout") or 3600)
-        review_profile = str(normalized_payload.get("review_profile") or "balanced").strip() or "balanced"
+        review_profile = normalize_review_profile(normalized_payload.get("review_profile"))
         profile_policy = get_review_profile_policy(review_profile)
         explicit_max_cycles = (
             isinstance(config_payload, dict)
@@ -127,7 +131,7 @@ class ProfileTemplateService:
         payload_runtime_overrides = normalized_payload.get("runtime_overrides") or {}
 
         global_cfg = compiled.setdefault("global", {})
-        global_cfg["max_review_cycles"] = int(
+        global_cfg["max_review_cycles"] = 1 if not profile_policy.review_enabled else int(
             normalized_payload.get("max_review_cycles")
             if explicit_max_cycles else
             profile_policy.default_max_review_cycles
@@ -137,10 +141,8 @@ class ProfileTemplateService:
 
         for agent in compiled.get("agents") or []:
             runtime_config = agent.setdefault("runtime_config", {})
-            sdk_specific = runtime_config.setdefault("sdk_specific", {})
             if model:
                 runtime_config["model"] = model
-            sdk_specific["thinking"] = thinking
             if agent.get("id") == "pi-worker":
                 runtime_config["timeout_seconds"] = worker_timeout
                 runtime_config["max_internal_turns"] = profile_policy.max_worker_turns_per_cycle
@@ -163,6 +165,7 @@ class ProfileTemplateService:
             engine = workflow.setdefault("engine", {})
             if "review_profile" in engine or workflow.get("id") == "vuln_scan":
                 engine["review_profile"] = review_profile
+                engine["review_enabled"] = profile_policy.review_enabled
                 engine["max_review_cycles"] = global_cfg["max_review_cycles"]
                 engine["max_worker_turns_per_cycle"] = profile_policy.max_worker_turns_per_cycle
                 engine["reflection_passes_per_cycle"] = profile_policy.reflection_passes_per_cycle
@@ -173,8 +176,13 @@ class ProfileTemplateService:
                 engine["reflection_rpc_stdout_abort_bytes"] = profile_policy.reflection_rpc_stdout_abort_bytes
                 engine.setdefault("summary_repair_attempt_budget", 2)
                 engine["min_discovery_cycles_before_pass"] = profile_policy.min_discovery_cycles_before_pass
+                engine["progress_required_after_cycle"] = profile_policy.progress_required_after_cycle
+                engine["progress_no_signal_closure_streak"] = profile_policy.progress_no_signal_closure_streak
+                engine["progress_no_signal_abort_streak"] = profile_policy.progress_no_signal_abort_streak
                 engine["min_evidence_artifacts"] = profile_policy.min_evidence_artifacts
                 engine["required_pattern_families"] = list(profile_policy.required_pattern_families)
+                engine["plateau_closure_streak"] = profile_policy.progress_no_signal_closure_streak
+                engine["plateau_abort_streak"] = profile_policy.progress_no_signal_abort_streak
                 advisors = ((workflow.get("roles") or {}).get("advisors") or {})
                 for advisor in advisors.get("global_review") or []:
                     instance_id = str(advisor.get("instance_id") or "")
@@ -199,10 +207,40 @@ class ProfileTemplateService:
             compiled = _deep_merge(compiled, runtime_overrides)
         if not runtime_overrides_set_engine_cycles:
             _sync_engine_max_cycles(compiled)
+        if not profile_policy.review_enabled:
+            compiled.setdefault("global", {})["max_review_cycles"] = 1
+            _sync_engine_max_cycles(compiled)
+        for workflow in ((compiled.get("workflows") or {}).get("atomic") or []):
+            if not isinstance(workflow, dict):
+                continue
+            engine = workflow.setdefault("engine", {})
+            if "review_profile" in engine or workflow.get("id") == "vuln_scan":
+                engine["review_profile"] = profile_policy.name
+                engine["review_enabled"] = profile_policy.review_enabled
+                engine["progress_required_after_cycle"] = profile_policy.progress_required_after_cycle
+                engine["progress_no_signal_closure_streak"] = profile_policy.progress_no_signal_closure_streak
+                engine["progress_no_signal_abort_streak"] = profile_policy.progress_no_signal_abort_streak
+        apply_profile_thinking_to_config(compiled, profile_policy.name)
+        normalized_payload["review_profile"] = profile_policy.name
+        normalized_payload["thinking"] = self._extract_resolved_thinking(compiled)
         return normalized_payload, compiled
 
     def get_supported_templates(self) -> list[str]:
         return sorted(TEMPLATE_FILES.keys())
+
+    @staticmethod
+    def _extract_resolved_thinking(compiled: dict[str, Any]) -> str:
+        for agent in compiled.get("agents") or []:
+            if not isinstance(agent, dict):
+                continue
+            runtime_config = agent.get("runtime_config")
+            if not isinstance(runtime_config, dict):
+                continue
+            sdk_specific = runtime_config.get("sdk_specific") or {}
+            thinking = str(sdk_specific.get("thinking") or "").strip()
+            if thinking:
+                return thinking
+        return ""
 
 
 _profile_template_service: ProfileTemplateService | None = None

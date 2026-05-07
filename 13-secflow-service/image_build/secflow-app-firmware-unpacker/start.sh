@@ -6,6 +6,7 @@ echo "  SecFlow Firmware Unpacker Service (K8S)"
 echo "  Node: $(node --version)"
 echo "  Python: $(python3 --version 2>&1)"
 echo "  Pi: $(pi --version 2>/dev/null || echo N/A)"
+echo "  Gunicorn: $(gunicorn --version 2>&1)"
 echo "========================================="
 
 export CONFIG_PATH="${CONFIG_PATH:-/app/config.yaml}"
@@ -16,7 +17,7 @@ echo ""
 echo "Config: ${FIRMWARE_UNPACKER_CONFIG}"
 echo "Agent Dir: ${UNPACKER_AGENT_DIR}"
 echo "Tools Dir: ${UNPACKER_TOOLS_DIR}"
-echo "Starting FastAPI service ..."
+echo "Starting FastAPI service with Gunicorn ..."
 
 mkdir -p /app/data
 mkdir -p "${UNPACKER_TOOLS_DIR}"

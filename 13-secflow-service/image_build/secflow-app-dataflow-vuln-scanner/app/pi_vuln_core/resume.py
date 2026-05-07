@@ -15,6 +15,10 @@ from app.pi_vuln_core.engine.models import CompositeWorkflowResult
 from app.pi_vuln_core.plugins.executor import PluginChainExecutor
 from app.pi_vuln_core.plugins.registry import PluginRegistry
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
+from app.pi_vuln_core.review.profile import (
+    apply_profile_thinking_to_runtime_config,
+    get_review_profile_policy,
+)
 from app.pi_vuln_core.review.state import (
     FailedResultItem,
     GlobalReviewRecord,
@@ -495,6 +499,15 @@ def _apply_runtime_overrides(
     thinking: str | None = None,
 ) -> None:
     effective_model = _normalize_model_name(model, provider)
+    review_profile = "balanced"
+    for workflow in getattr(config.workflows, "atomic", []) or []:
+        engine = getattr(workflow, "engine", None)
+        if engine is not None:
+            policy = get_review_profile_policy(getattr(engine, "review_profile", "balanced"))
+            engine.review_profile = policy.name
+            engine.review_enabled = policy.review_enabled
+            review_profile = policy.name
+            break
     for agent in config.agents:
         if effective_model:
             agent.runtime_config["model"] = effective_model
@@ -502,8 +515,7 @@ def _apply_runtime_overrides(
         # 新版 pi_agent 使用 --model provider/model，不再写入 sdk_specific.provider。
         if "provider" in sdk_specific and effective_model:
             sdk_specific.pop("provider", None)
-        if thinking:
-            sdk_specific["thinking"] = thinking
+        apply_profile_thinking_to_runtime_config(agent.runtime_config, review_profile)
 
 
 async def resume_run(

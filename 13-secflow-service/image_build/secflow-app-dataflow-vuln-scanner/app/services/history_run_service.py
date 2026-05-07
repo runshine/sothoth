@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import posixpath
+import shlex
+import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +24,7 @@ from app.models.database import (
     HistoryRunSession,
     TriggerTask,
     WorkflowExecution,
+    WorkflowExecutionEvent,
 )
 from app.services.run_inspector import (
     inspect_cycle_detail,
@@ -35,7 +38,7 @@ from app.services.run_inspector import (
 )
 
 HISTORY_RUN_LOG_SUMMARY_MAX_CHARS = 32768
-_ACTIVE_HISTORY_RUN_STATUSES = {"running", "pending", "queued", "cancel_requested"}
+_ACTIVE_HISTORY_RUN_STATUSES = {"running", "pending", "queued", "cancel_requested", "delete_requested"}
 _SOURCE_MTIME_COMPARE_EPSILON = 1e-6
 
 
@@ -206,6 +209,83 @@ def _summary_markdown_for_run(run_root: Path, atomic_work_path: str | None) -> s
     return ""
 
 
+def _command_display(args: list[Any]) -> str:
+    return " ".join(shlex.quote(str(item)) for item in args)
+
+
+def _normalize_command_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    command = payload.get("command")
+    if not isinstance(command, list):
+        command = payload.get("argv") if isinstance(payload.get("argv"), list) else []
+    command = [str(item) for item in command]
+    command_display = str(payload.get("command_display") or "").strip()
+    if not command_display and command:
+        command_display = _command_display(command)
+    normalized: dict[str, Any] = {
+        "command": command,
+        "command_display": command_display,
+    }
+    for key in ("argv", "launcher", "launch_mode", "run_name", "runs_root"):
+        if key in payload:
+            normalized[key] = payload[key]
+    return {key: value for key, value in normalized.items() if value not in ("", [], None)}
+
+
+def _task_dataflow_cli_payload(linked_task: TriggerTask | None) -> dict[str, Any]:
+    if linked_task is None or not isinstance(linked_task.input_tasks_json, dict):
+        return {}
+    tasks = linked_task.input_tasks_json.get("tasks")
+    if not isinstance(tasks, list):
+        return {}
+    for item in tasks:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        payload = _normalize_command_payload(metadata.get("dataflow_cli") if isinstance(metadata.get("dataflow_cli"), dict) else {})
+        if payload:
+            return payload
+    return {}
+
+
+def _execution_started_command_payload(db: Session, linked_execution: WorkflowExecution | None) -> dict[str, Any]:
+    if linked_execution is None:
+        return {}
+    event = (
+        db.query(WorkflowExecutionEvent)
+        .filter(
+            WorkflowExecutionEvent.execution_id == linked_execution.id,
+            WorkflowExecutionEvent.event_type == "execution_started",
+        )
+        .order_by(WorkflowExecutionEvent.created_at.desc())
+        .first()
+    )
+    return _normalize_command_payload(dict(event.payload_json or {}) if event else {})
+
+
+def _process_file_command_payload(run_root: Path) -> dict[str, Any]:
+    payload = _read_json_file(run_root / "_meta" / "process.json")
+    return _normalize_command_payload(payload)
+
+
+def _run_command_payload(
+    db: Session,
+    *,
+    run_root: Path,
+    linked_execution: WorkflowExecution | None,
+    linked_task: TriggerTask | None,
+) -> dict[str, Any]:
+    for candidate in (
+        _execution_started_command_payload(db, linked_execution),
+        _task_dataflow_cli_payload(linked_task),
+        _process_file_command_payload(run_root),
+    ):
+        if candidate.get("command_display") or candidate.get("command"):
+            return candidate
+    return {}
+
+
 def _parent_root(path: str) -> str:
     try:
         return str(Path(path).resolve().parent)
@@ -293,6 +373,24 @@ class HistoryRunService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run not found")
         return record
 
+    def _delete_children(self, db: Session, history_run_id: str) -> None:
+        db.query(HistoryRunCycle).filter(HistoryRunCycle.history_run_id == history_run_id).delete(synchronize_session=False)
+        db.query(HistoryRunGlobalReview).filter(HistoryRunGlobalReview.history_run_id == history_run_id).delete(synchronize_session=False)
+        db.query(HistoryRunResult).filter(HistoryRunResult.history_run_id == history_run_id).delete(synchronize_session=False)
+        db.query(HistoryRunResultReview).filter(HistoryRunResultReview.history_run_id == history_run_id).delete(synchronize_session=False)
+        db.query(HistoryRunRemovedResult).filter(HistoryRunRemovedResult.history_run_id == history_run_id).delete(synchronize_session=False)
+        db.query(HistoryRunSession).filter(HistoryRunSession.history_run_id == history_run_id).delete(synchronize_session=False)
+        db.query(HistoryRunFile).filter(HistoryRunFile.history_run_id == history_run_id).delete(synchronize_session=False)
+
+    def _managed_project_run_root(self, project_id: str, run_root: str | Path) -> Path:
+        project_root = _project_files_root(project_id).resolve()
+        candidate = Path(run_root).resolve()
+        try:
+            candidate.relative_to(project_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="history run path escapes project root") from exc
+        return candidate
+
     def _is_run_directory(self, entry: Path) -> bool:
         return entry.is_dir() and entry.name != "detached_logs" and not entry.name.startswith(".")
 
@@ -344,13 +442,7 @@ class HistoryRunService:
         return items
 
     def _sync_children(self, db: Session, history_run_id: str, detail: dict[str, Any], sessions: list[dict[str, Any]], files: list[dict[str, Any]]) -> None:
-        db.query(HistoryRunCycle).filter(HistoryRunCycle.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunGlobalReview).filter(HistoryRunGlobalReview.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunResult).filter(HistoryRunResult.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunResultReview).filter(HistoryRunResultReview.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunRemovedResult).filter(HistoryRunRemovedResult.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunSession).filter(HistoryRunSession.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunFile).filter(HistoryRunFile.history_run_id == history_run_id).delete(synchronize_session=False)
+        self._delete_children(db, history_run_id)
 
         for cycle in detail.get("cycles") or []:
             cycle_no = int(cycle.get("cycle") or 0)
@@ -558,7 +650,7 @@ class HistoryRunService:
         started_at = _parse_datetime(str(run_timestamps.get("started_at") or "")) or _datetime_from_epoch(summary.get("start_epoch"))
         finished_at = _parse_datetime(str(run_timestamps.get("finished_at") or ""))
         last_activity_at = _parse_datetime(str(detail.get("last_activity") or "")) or finished_at
-        if finished_at is None and summary.get("status") not in {"running", "pending", "queued", "cancel_requested"}:
+        if finished_at is None and summary.get("status") not in {"running", "pending", "queued", "cancel_requested", "delete_requested"}:
             duration = int(summary.get("duration_seconds") or 0)
             if started_at and duration > 0:
                 finished_at = started_at + timedelta(seconds=duration)
@@ -569,7 +661,19 @@ class HistoryRunService:
             "summary_markdown": _summary_markdown_for_run(run_root, atomic_work_path),
             "task_markdown": _task_markdown_for_run(run_root),
         }
+        command_payload = _run_command_payload(
+            db,
+            run_root=run_root,
+            linked_execution=linked_execution,
+            linked_task=linked_task,
+        )
+        if command_payload:
+            raw_summary["dataflow_cli"] = command_payload
+            raw_summary["command"] = command_payload.get("command") or []
+            raw_summary["command_display"] = command_payload.get("command_display") or ""
 
+        if record is None:
+            record = db.query(HistoryRun).filter(HistoryRun.source_key == source_key).first()
         if record is None:
             record = HistoryRun(id=_new_id("hr"))
 
@@ -891,6 +995,30 @@ class HistoryRunService:
     def get_history_run_detail(self, db: Session, history_run: HistoryRun) -> dict[str, Any]:
         history_run = self.refresh_history_run(db, history_run)
         payload = self._summary_payload(history_run)
+        raw_summary = dict(history_run.raw_summary_json or {})
+        cli_payload = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
+        command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else raw_summary.get("command")
+        if not isinstance(command, list):
+            command = []
+        command_display = str(cli_payload.get("command_display") or raw_summary.get("command_display") or "")
+        if not command and not command_display:
+            linked_execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
+            linked_task = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
+            cli_payload = _run_command_payload(
+                db,
+                run_root=Path(history_run.run_root_path),
+                linked_execution=linked_execution,
+                linked_task=linked_task,
+            )
+            if cli_payload:
+                raw_summary["dataflow_cli"] = cli_payload
+                raw_summary["command"] = cli_payload.get("command") or []
+                raw_summary["command_display"] = cli_payload.get("command_display") or ""
+                history_run.raw_summary_json = raw_summary
+                db.add(history_run)
+                db.commit()
+                command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else []
+                command_display = str(cli_payload.get("command_display") or "")
         payload.update(
             {
                 "config": dict(history_run.config_json or {}),
@@ -904,7 +1032,9 @@ class HistoryRunService:
                 "files": self._list_history_run_files_rows(db, history_run, limit=20000),
                 "sessions": self._list_history_run_sessions_rows(db, history_run),
                 "run_log": history_run.log_tail_text or "",
-                "raw": dict(history_run.raw_summary_json or {}),
+                "command": [str(item) for item in command],
+                "command_display": command_display,
+                "raw": raw_summary,
             }
         )
         return payload
@@ -989,10 +1119,54 @@ class HistoryRunService:
         record = db.query(HistoryRun).filter(HistoryRun.linked_execution_id == execution.id).first()
         if record is not None:
             return self.refresh_history_run(db, record)
+        source_key = str(Path(execution.workspace_root).resolve())
+        record = db.query(HistoryRun).filter(HistoryRun.source_key == source_key).first()
+        if record is not None:
+            return self.refresh_history_run(db, record)
+        if str(execution.status or "").strip().lower() in _ACTIVE_HISTORY_RUN_STATUSES:
+            return None
         record = self.sync_execution_run(db, execution)
         if record is not None:
             db.commit()
         return record
+
+    def bind_runtime_state(
+        self,
+        db: Session,
+        history_run: HistoryRun,
+        *,
+        linked_execution: WorkflowExecution | None = None,
+        linked_task: TriggerTask | None = None,
+        profile_id: str | None = None,
+        status_text: str | None = None,
+    ) -> HistoryRun:
+        self._refresh_record_bindings(
+            history_run,
+            project_id=history_run.project_id,
+            source_type=history_run.source_type,
+            linked_execution=linked_execution,
+            linked_task=linked_task,
+            profile_id=profile_id,
+        )
+        if status_text:
+            history_run.status = status_text
+        run_root = Path(history_run.run_root_path)
+        if run_root.is_dir():
+            history_run.source_mtime = max(_stored_source_mtime(history_run.source_mtime), _compute_source_mtime(run_root))
+        history_run.last_synced_at = datetime.utcnow()
+        db.add(history_run)
+        db.flush()
+        return history_run
+
+    def delete_history_run(self, db: Session, history_run: HistoryRun, *, allow_active: bool = False) -> None:
+        run_root = self._managed_project_run_root(history_run.project_id, history_run.run_root_path)
+        if _history_run_is_active(history_run) and not allow_active:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history run is active and cannot be deleted")
+        self._delete_children(db, history_run.id)
+        db.delete(history_run)
+        db.flush()
+        if run_root.exists():
+            shutil.rmtree(run_root, ignore_errors=False)
 
 
 _history_run_service: HistoryRunService | None = None

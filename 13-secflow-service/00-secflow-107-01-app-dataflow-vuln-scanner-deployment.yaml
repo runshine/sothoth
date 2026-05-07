@@ -40,6 +40,8 @@ spec:
               export PI_BOOTSTRAP_DIR=/opt/runtime-bootstrap-disabled
               exec /usr/local/bin/secflow-entrypoint serve
           env:
+            - name: TZ
+              value: Asia/Shanghai
             - name: CONFIG_PATH
               value: /app/config.yaml
             - name: POD_ID

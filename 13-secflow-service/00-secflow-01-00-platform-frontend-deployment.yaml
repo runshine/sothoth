@@ -18,6 +18,9 @@ spec:
       - name: secflow-platform-frontend
         image: runshine0819/secflow-frontend:latest
         imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
         ports:
           - containerPort: 8080
         volumeMounts:

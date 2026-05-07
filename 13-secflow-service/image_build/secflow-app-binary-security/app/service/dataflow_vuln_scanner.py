@@ -39,6 +39,9 @@ class DataflowVulnScannerClient(JsonHttpClient):
     async def retry_task(self, task_id: str, token: str) -> dict:
         return await self.post(f"/api/dataflow-vuln-scanner/tasks/{task_id}/retry", token=token)
 
+    async def delete_task(self, task_id: str, token: str) -> dict:
+        return await self.delete(f"/api/dataflow-vuln-scanner/tasks/{task_id}", token=token)
+
 
 _client: Optional[DataflowVulnScannerClient] = None
 

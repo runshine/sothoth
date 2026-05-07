@@ -110,6 +110,8 @@ spec:
               mountPath: /app/config
               readOnly: true
           env:
+            - name: TZ
+              value: Asia/Shanghai
             - name: CONFIG_PATH
               value: /app/config/config.yaml
           resources:

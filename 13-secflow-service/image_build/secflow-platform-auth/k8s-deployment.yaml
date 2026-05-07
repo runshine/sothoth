@@ -21,6 +21,9 @@ spec:
         - name: secflow-user
           image: secflow-user:latest
           imagePullPolicy: IfNotPresent
+          env:
+            - name: TZ
+              value: Asia/Shanghai
           ports:
             - containerPort: 8080
               name: http

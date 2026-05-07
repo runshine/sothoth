@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -22,6 +23,14 @@ from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, wr
 from app.config import get_config
 from app.models.contracts import TaskItem, TaskManifest
 from app.models.database import (
+    HistoryRun,
+    HistoryRunCycle,
+    HistoryRunFile,
+    HistoryRunGlobalReview,
+    HistoryRunRemovedResult,
+    HistoryRunResult,
+    HistoryRunResultReview,
+    HistoryRunSession,
     TriggerTask,
     WorkflowDefinition,
     WorkflowDefinitionVersion,
@@ -34,18 +43,12 @@ from app.pi_vuln_core.utils.logger import attach_log_file, detach_log_file
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
 from app.schemas import (
     ArtifactRef,
-    ScanTaskArtifactsResponse,
-    ScanTaskArtifactFileResponse,
+    HistoryRunRetryRequest,
     ScanTaskAttemptResponse,
     ScanTaskCreateRequest,
     ScanTaskDetailResponse,
-    ScanTaskEventResponse,
     ScanTaskResponse,
-    TriggerTaskCreate,
     TriggerTaskInputTask,
-    TriggerTaskResponse,
-    WorkflowExecutionEventResponse,
-    WorkflowExecutionResponse,
 )
 from app.services.fileserver_client import get_fileserver_client
 from app.services.history_run_service import get_history_run_service
@@ -75,6 +78,10 @@ def _command_display(args: list[str]) -> str:
 
 
 class ExecutionService:
+    def __init__(self) -> None:
+        self._process_lock = threading.RLock()
+        self._active_cli_processes: dict[str, subprocess.Popen] = {}
+
     def _ensure_project_access(self, principal: dict, project_id: str) -> None:
         project_ids = _project_ids(principal)
         if project_ids and project_id not in project_ids:
@@ -122,15 +129,6 @@ class ExecutionService:
             .all()
         )
 
-    def _trigger_response(self, model: TriggerTask) -> TriggerTaskResponse:
-        return TriggerTaskResponse.model_validate(model, from_attributes=True)
-
-    def _execution_response(self, model: WorkflowExecution) -> WorkflowExecutionResponse:
-        return WorkflowExecutionResponse.model_validate(model, from_attributes=True)
-
-    def _event_response(self, model: WorkflowExecutionEvent) -> WorkflowExecutionEventResponse:
-        return WorkflowExecutionEventResponse.model_validate(model, from_attributes=True)
-
     def _scan_task_response(self, db: Session, trigger: TriggerTask) -> ScanTaskResponse:
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
         if trigger.workflow_definition_version_id:
@@ -165,11 +163,21 @@ class ExecutionService:
         task_metadata: dict[str, Any] = {}
         title = first_task.title if first_task else trigger.id
         if first_task:
-            try:
-                task_markdown = Path(first_task.task_md_path).read_text(encoding="utf-8")
-            except FileNotFoundError:
-                task_markdown = ""
             task_metadata = dict(first_task.metadata or {})
+            dataflow_cli = task_metadata.get("dataflow_cli") if isinstance(task_metadata.get("dataflow_cli"), dict) else {}
+            candidate_task_paths = [
+                str(first_task.task_md_path or "").strip(),
+                str(dataflow_cli.get("task_md_path") or "").strip(),
+            ]
+            for candidate in candidate_task_paths:
+                if not candidate:
+                    continue
+                try:
+                    task_markdown = Path(candidate).read_text(encoding="utf-8")
+                    if task_markdown:
+                        break
+                except FileNotFoundError:
+                    continue
             for item in task_metadata.get("artifact_refs") or []:
                 if isinstance(item, dict):
                     artifact_refs.append(ArtifactRef.model_validate(item))
@@ -178,6 +186,11 @@ class ExecutionService:
         history_service = get_history_run_service()
         for item in self._list_executions_for_trigger(db, trigger.id):
             history_run = history_service.get_history_run_by_execution(db, item) if item.workspace_root else None
+            if not task_markdown and history_run is not None:
+                try:
+                    task_markdown = (Path(history_run.run_root_path) / "input" / "task.md").read_text(encoding="utf-8")
+                except (FileNotFoundError, TypeError):
+                    task_markdown = ""
             attempts.append(self._attempt_response(item, history_run_id=history_run.id if history_run else None))
         return ScanTaskDetailResponse(
             **response.model_dump(),
@@ -198,6 +211,11 @@ class ExecutionService:
             history_run_id=history_run_id,
             owner_pod_id=execution.owner_pod_id,
             lease_expires_at=execution.lease_expires_at,
+            process_pid=execution.process_pid,
+            process_host=execution.process_host,
+            process_status=execution.process_status,
+            process_started_at=execution.process_started_at,
+            process_finished_at=execution.process_finished_at,
             started_at=execution.started_at,
             finished_at=execution.finished_at,
             recovery_reason=execution.recovery_reason,
@@ -208,6 +226,110 @@ class ExecutionService:
             created_at=execution.created_at,
             updated_at=execution.updated_at,
         )
+
+    def _execution_command_payload(self, db: Session, execution_id: str) -> dict[str, Any]:
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == execution_id,
+                WorkflowExecutionEvent.event_type == "execution_started",
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .first()
+        )
+        payload = dict(event.payload_json or {}) if event else {}
+        command = payload.get("command") if isinstance(payload.get("command"), list) else []
+        return {
+            "command": [str(item) for item in command],
+            "command_display": str(payload.get("command_display") or ""),
+        }
+
+    def _register_cli_process(self, execution_id: str, process: subprocess.Popen) -> None:
+        with self._process_lock:
+            self._active_cli_processes[execution_id] = process
+
+    def _forget_cli_process(self, execution_id: str, process: subprocess.Popen | None = None) -> None:
+        with self._process_lock:
+            current = self._active_cli_processes.get(execution_id)
+            if process is None or current is process:
+                self._active_cli_processes.pop(execution_id, None)
+
+    def _local_cli_process(self, execution_id: str) -> subprocess.Popen | None:
+        with self._process_lock:
+            process = self._active_cli_processes.get(execution_id)
+        if process is not None and process.poll() is None:
+            return process
+        if process is not None:
+            self._forget_cli_process(execution_id, process)
+        return None
+
+    def _signal_local_cli_process(
+        self,
+        execution_id: str,
+        *,
+        wait: bool,
+        graceful_timeout: float = 5.0,
+        terminate_timeout: float = 5.0,
+    ) -> dict[str, Any]:
+        process = self._local_cli_process(execution_id)
+        if process is None:
+            return {"found": False, "signal": "db_flag_only"}
+        payload: dict[str, Any] = {"found": True, "pid": process.pid, "signal": "sigint"}
+        if process.poll() is None:
+            try:
+                process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                payload["signal"] = "already_exited"
+                return payload
+        if not wait:
+            return payload
+        try:
+            payload["exit_code"] = process.wait(timeout=graceful_timeout)
+            payload["signal"] = "sigint"
+            return payload
+        except subprocess.TimeoutExpired:
+            if process.poll() is None:
+                process.terminate()
+            payload["signal"] = "terminate"
+        try:
+            payload["exit_code"] = process.wait(timeout=terminate_timeout)
+            return payload
+        except subprocess.TimeoutExpired:
+            if process.poll() is None:
+                process.kill()
+            payload["signal"] = "kill"
+            payload["exit_code"] = process.wait()
+            return payload
+
+    def _write_run_control_state(self, run_root: str | Path | None, *, status_text: str, message: str) -> None:
+        if not run_root:
+            return
+        try:
+            root = Path(run_root)
+            if not root.exists():
+                return
+            timestamp_path = root / "_meta" / "run_timestamps.json"
+            payload: dict[str, Any] = {}
+            if timestamp_path.is_file():
+                try:
+                    import json
+
+                    payload = json.loads(timestamp_path.read_text(encoding="utf-8"))
+                except Exception:
+                    payload = {}
+            payload.update(
+                {
+                    "status": status_text,
+                    "control_message": message,
+                    "last_updated_at": datetime.utcnow().isoformat(),
+                }
+            )
+            write_json(
+                timestamp_path,
+                payload,
+            )
+        except OSError:
+            pass
 
     def _build_workspace_root(self, execution_id: str, definition: WorkflowDefinition) -> Path:
         base_dir = definition.workspace_base_dir or get_config().service.workspace_base_dir
@@ -474,9 +596,21 @@ class ExecutionService:
             Path(config.fileserver_service.data_mount_path)
             / config.fileserver_service.project_files_dirname
             / sanitize_name(project_id)
-            / config.fileserver_service.aiwf_subproject_name
+            / config.fileserver_service.dataflow_subproject_name
             / "runs"
         ).resolve()
+
+    def _normalize_model_override(self, *, model: str | None, provider: str | None) -> str | None:
+        model_text = str(model or "").strip()
+        provider_text = str(provider or "").strip()
+        if not model_text:
+            return None
+        if provider_text and "/" not in model_text:
+            return f"{provider_text}/{model_text}"
+        return model_text
+
+    def _is_dataflow_cli_resume_request(self, request: dict[str, Any]) -> bool:
+        return bool(str(request.get("resume_run_dir") or "").strip())
 
     def _resolve_dataflow_cli_runs_root(self, *, project_id: str, request: dict[str, Any]) -> Path:
         workspace_ref = request.get("workspace_dir")
@@ -503,6 +637,37 @@ class ExecutionService:
             return fallback
         return f"{fallback}_{uuid.uuid4().hex[:6]}"
 
+    def _build_dataflow_cli_resume_plan(
+        self,
+        *,
+        project_id: str,
+        request: dict[str, Any],
+    ) -> dict[str, Any]:
+        raw_run_dir = str(request.get("resume_run_dir") or "").strip()
+        if not raw_run_dir:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="resume_run_dir is required")
+        candidate = Path(raw_run_dir)
+        if not candidate.is_absolute():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="resume_run_dir must be an absolute path")
+        run_dir = self._ensure_path_within(
+            path=candidate,
+            root=self._project_files_root(project_id),
+            label="resume_run_dir",
+        )
+        if not run_dir.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"resume_run_dir not found: {run_dir}")
+        task_md_path = run_dir / "input" / "task.md"
+        return {
+            "launcher": "run_vuln_scan.py",
+            "mode": "resume",
+            "run_name": run_dir.name,
+            "runs_root": abs_path(run_dir.parent),
+            "run_dir": abs_path(run_dir),
+            "task_md_path": abs_path(task_md_path),
+            "resume_run_dir": abs_path(run_dir),
+            "extra_cycles": max(int(request.get("resume_extra_cycles") or 5), 1),
+        }
+
     def _build_dataflow_cli_plan(
         self,
         *,
@@ -510,6 +675,8 @@ class ExecutionService:
         request: dict[str, Any],
         execution_id: str,
     ) -> dict[str, Any]:
+        if self._is_dataflow_cli_resume_request(request):
+            return self._build_dataflow_cli_resume_plan(project_id=project_id, request=request)
         data_flow_ref = request.get("data_flow")
         source_dir_ref = request.get("source_dir")
         if not isinstance(data_flow_ref, dict) or not isinstance(source_dir_ref, dict):
@@ -546,15 +713,26 @@ class ExecutionService:
         }
 
     def _write_dataflow_cli_task_preview(self, plan: dict[str, Any]) -> None:
-        from run_vuln_scan import generate_task_md
-
         run_dir = Path(plan["run_dir"])
         task_md_path = Path(plan["task_md_path"])
         ensure_dir(task_md_path.parent)
-        write_text(
-            task_md_path,
-            generate_task_md(plan["data_flow_file"], plan["source_dir"]).strip() + "\n",
-        )
+        if plan.get("mode") == "resume":
+            if not task_md_path.exists():
+                write_text(
+                    task_md_path,
+                    (
+                        "# Resume Existing Dataflow Vulnerability Scan\n\n"
+                        f"- Run directory: `{plan['run_dir']}`\n"
+                        f"- Extra cycles: `{plan.get('extra_cycles', 5)}`\n"
+                    ),
+                )
+        else:
+            from run_vuln_scan import generate_task_md
+
+            write_text(
+                task_md_path,
+                generate_task_md(plan["data_flow_file"], plan["source_dir"]).strip() + "\n",
+            )
         ensure_dir(run_dir / "output")
 
     def _dataflow_cli_config_requires_file(self, *, request: dict[str, Any], runtime_overrides: dict[str, Any]) -> bool:
@@ -574,6 +752,23 @@ class ExecutionService:
         compiled_config: dict[str, Any],
         runtime_overrides: dict[str, Any],
     ) -> tuple[list[str], str | None]:
+        if plan.get("mode") == "resume" or self._is_dataflow_cli_resume_request(request):
+            argv = [
+                "--resume-run-dir",
+                plan["resume_run_dir"],
+                "--extra-cycles",
+                str(max(int(request.get("resume_extra_cycles") or plan.get("extra_cycles") or 5), 1)),
+            ]
+            model = self._normalize_model_override(
+                model=str(request.get("model") or "").strip() or None,
+                provider=str(request.get("provider") or "").strip() or None,
+            )
+            if model:
+                argv.extend(["--model", model])
+            if bool(request.get("clean_workspace")):
+                argv.append("--clean")
+            return argv, None
+
         argv = [
             "--data-flow",
             plan["data_flow_file"],
@@ -596,14 +791,11 @@ class ExecutionService:
             return argv, temp_config_path
 
         model = str(config_payload.get("model") or request.get("model") or "").strip()
-        thinking = str(config_payload.get("thinking") or request.get("thinking") or "high").strip() or "high"
         review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
         max_cycles = int(config_payload.get("max_review_cycles") or request.get("max_review_cycles") or 0)
         result_review_concurrency = int(config_payload.get("result_review_concurrency") or request.get("result_review_concurrency") or 3)
         if model:
             argv.extend(["--model", model])
-        if thinking:
-            argv.extend(["--thinking", thinking])
         if max_cycles > 0:
             argv.extend(["--max-cycles", str(max_cycles)])
         argv.extend(["--result-review-concurrency", str(max(result_review_concurrency, 1))])
@@ -843,6 +1035,9 @@ class ExecutionService:
         execution.output_task_count = output_task_count
         execution.lease_expires_at = now
         execution.current_stage_id = None
+        if execution.process_status in {"running", "stop_requested", "delete_requested"}:
+            execution.process_status = "exited"
+            execution.process_finished_at = now
         trigger.status = execution_status
         trigger.message = message
         trigger.finished_at = now
@@ -914,7 +1109,7 @@ class ExecutionService:
         trigger.workflow_definition_version_id = definition_version.id
         trigger.profile_id = definition.id
         trigger.finished_at = None
-        trigger.message = "pending dispatch" if not recovery_reason else f"pending dispatch: {recovery_reason}"
+        trigger.message = "pending start" if not recovery_reason else f"pending start: {recovery_reason}"
         execution = WorkflowExecution(
             id=execution_id,
             trigger_task_id=trigger.id,
@@ -925,7 +1120,7 @@ class ExecutionService:
             status="pending",
             recovery_reason=recovery_reason,
             workspace_root=abs_path(workspace_root),
-            message="pending dispatch" if not recovery_reason else f"pending dispatch: {recovery_reason}",
+            message="pending start" if not recovery_reason else f"pending start: {recovery_reason}",
         )
         db.add(trigger)
         db.add(execution)
@@ -958,7 +1153,7 @@ class ExecutionService:
             retry_count=0,
             max_retry_count=definition.max_retry_count,
             latest_execution_id=None,
-            message="pending dispatch",
+            message="pending start",
         )
         db.add(trigger)
         db.flush()
@@ -1027,7 +1222,7 @@ class ExecutionService:
         trigger.workflow_definition_version_id = definition_version.id
         trigger.profile_id = definition.id
         trigger.finished_at = None
-        trigger.message = "pending dispatch" if not recovery_reason else f"pending dispatch: {recovery_reason}"
+        trigger.message = "pending start" if not recovery_reason else f"pending start: {recovery_reason}"
         execution = WorkflowExecution(
             id=execution_id,
             trigger_task_id=trigger.id,
@@ -1038,7 +1233,7 @@ class ExecutionService:
             status="pending",
             recovery_reason=recovery_reason,
             workspace_root=plan["run_dir"],
-            message="pending dispatch" if not recovery_reason else f"pending dispatch: {recovery_reason}",
+            message="pending start" if not recovery_reason else f"pending start: {recovery_reason}",
         )
         db.add(trigger)
         db.add(execution)
@@ -1070,7 +1265,7 @@ class ExecutionService:
             retry_count=0,
             max_retry_count=definition.max_retry_count,
             latest_execution_id=None,
-            message="pending dispatch",
+            message="pending start",
         )
         db.add(trigger)
         db.flush()
@@ -1095,6 +1290,223 @@ class ExecutionService:
         )
         return trigger, execution
 
+    def _history_run_retry_response(
+        self,
+        *,
+        history_run_id: str,
+        project_id: str,
+        status_text: str,
+        message: str,
+        linked_task_id: str | None,
+        linked_execution_id: str | None,
+        process_pid: int | None = None,
+        process_host: str | None = None,
+        process_signal: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "success": True,
+            "history_run_id": history_run_id,
+            "project_id": project_id,
+            "status": status_text,
+            "message": message,
+            "linked_task_id": linked_task_id,
+            "linked_execution_id": linked_execution_id,
+            "process_pid": process_pid,
+            "process_host": process_host,
+            "process_signal": process_signal,
+        }
+
+    def _history_run_status_is_active(self, status_text: str | None) -> bool:
+        return str(status_text or "").strip().lower() in {"pending", "queued", "running", "cancel_requested", "delete_requested"}
+
+    def _adopted_history_run_task_status(self, status_text: str | None) -> str:
+        value = str(status_text or "").strip().lower()
+        if value in {"pending", "queued", "running", "cancel_requested", "delete_requested", "failed", "cancelled", "orphaned"}:
+            return value
+        if value in {"completed", "succeeded", "success", "passed"}:
+            return "succeeded"
+        if value in {"interrupted", "stopped"}:
+            return "cancelled"
+        if value in {
+            "timeout",
+            "error",
+            "review_error",
+            "review_plateau",
+            "summary_incomplete",
+            "runtime_output_limit",
+            "runtime_timeout",
+            "blocked_context_window",
+            "blocked_quota",
+            "provider_rate_limited",
+            "model_contract_violation",
+            "no_workspace",
+        }:
+            return "failed"
+        return value or "succeeded"
+
+    def _history_run_output_manifest_path(self, history_run) -> str | None:
+        atomic_work_path = str(history_run.atomic_work_path or "").strip()
+        if not atomic_work_path:
+            return None
+        candidate = Path(atomic_work_path) / "_meta" / "results_manifest.json"
+        return abs_path(candidate) if candidate.exists() else None
+
+    def _history_run_adoption_manifest(self, history_run) -> dict[str, Any]:
+        return TaskManifest(
+            tasks=[
+                TaskItem(
+                    task_id=_new_id("task"),
+                    task_type="dataflow_vuln_scan_cli",
+                    title=f"Run {history_run.run_name}",
+                    task_md_path=abs_path(Path(history_run.run_root_path) / "input" / "task.md"),
+                    metadata={
+                        "history_run_adoption": {
+                            "history_run_id": history_run.id,
+                            "source_type": history_run.source_type,
+                            "run_root_path": history_run.run_root_path,
+                            "adopted_at": datetime.utcnow().isoformat(),
+                        },
+                        "runtime_overrides": {},
+                        "task_title": f"Run {history_run.run_name}",
+                    },
+                    upstream_refs=[],
+                )
+            ]
+        ).model_dump(mode="json")
+
+    def _select_history_run_definition(self, db: Session, history_run, principal: dict) -> WorkflowDefinition:
+        workflow_service = get_workflow_service()
+        candidate_ids: list[str] = []
+        if history_run.linked_task_id:
+            try:
+                trigger = self._trigger_or_404(db, history_run.linked_task_id)
+                candidate_ids.append(trigger.workflow_definition_id)
+            except HTTPException:
+                pass
+        if history_run.profile_id:
+            candidate_ids.append(history_run.profile_id)
+        for definition_id in candidate_ids:
+            try:
+                definition = workflow_service._get_definition_or_404(db, definition_id)
+            except HTTPException:
+                continue
+            self._ensure_project_access(principal, definition.project_id)
+            return definition
+        return workflow_service.get_or_create_default_profile_model(db, history_run.project_id, principal)
+
+    def _build_history_run_resume_request(self, *, history_run, payload: HistoryRunRetryRequest) -> dict[str, Any]:
+        return {
+            "launcher": "run_vuln_scan.py",
+            "project_id": history_run.project_id,
+            "resume_run_dir": history_run.run_root_path,
+            "resume_extra_cycles": payload.extra_cycles,
+            "model": self._normalize_model_override(model=payload.model, provider=payload.provider),
+            "provider": None,
+            "clean_workspace": payload.clean_workspace,
+            "options": {
+                "history_run_id": history_run.id,
+                "resume": True,
+            },
+        }
+
+    def _update_trigger_for_history_run_resume(
+        self,
+        *,
+        trigger: TriggerTask,
+        history_run,
+        request: dict[str, Any],
+    ) -> None:
+        manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        if manifest.tasks:
+            first_task = manifest.tasks[0]
+            remaining_tasks = list(manifest.tasks[1:])
+        else:
+            first_task = TaskItem(
+                task_id=_new_id("task"),
+                task_type="dataflow_vuln_scan_cli",
+                title=f"Resume {history_run.run_name}",
+                task_md_path="",
+                metadata={},
+                upstream_refs=[],
+            )
+            remaining_tasks = []
+        extra_cycles = int(request.get("resume_extra_cycles") or 5)
+        metadata = dict(first_task.metadata or {})
+        metadata["dataflow_scan_request"] = request
+        metadata["history_run_retry"] = {
+            "history_run_id": history_run.id,
+            "source_type": history_run.source_type,
+            "requested_at": datetime.utcnow().isoformat(),
+            "extra_cycles": extra_cycles,
+        }
+        metadata["task_title"] = f"Resume {history_run.run_name}"
+        first_task.task_type = "dataflow_vuln_scan_cli"
+        first_task.title = f"Resume {history_run.run_name}"
+        first_task.metadata = metadata
+        trigger.input_tasks_json = TaskManifest(tasks=[first_task, *remaining_tasks]).model_dump(mode="json")
+        trigger.message = f"pending start: resume requested (+{extra_cycles} cycles)"
+
+    def _create_history_run_resume_task_record(
+        self,
+        db: Session,
+        *,
+        definition: WorkflowDefinition,
+        definition_version: WorkflowDefinitionVersion,
+        history_run,
+        request: dict[str, Any],
+        actor: str,
+    ) -> tuple[TriggerTask, WorkflowExecution]:
+        extra_cycles = int(request.get("resume_extra_cycles") or 5)
+        trigger = TriggerTask(
+            id=_new_id("tt"),
+            workflow_definition_id=definition.id,
+            workflow_definition_version_id=definition_version.id,
+            profile_id=definition.id,
+            project_id=definition.project_id,
+            trigger_type="manual",
+            input_tasks_json=TaskManifest(tasks=[]).model_dump(mode="json"),
+            priority=definition.priority_default,
+            status="pending",
+            submitted_by=actor,
+            retry_count=0,
+            max_retry_count=definition.max_retry_count,
+            latest_execution_id=None,
+            message=f"pending start: resume requested (+{extra_cycles} cycles)",
+        )
+        db.add(trigger)
+        db.flush()
+        trigger.input_tasks_json = TaskManifest(
+            tasks=[
+                TaskItem(
+                    task_id=_new_id("task"),
+                    task_type="dataflow_vuln_scan_cli",
+                    title=f"Resume {history_run.run_name}",
+                    task_md_path=abs_path(Path(history_run.run_root_path) / "input" / "task.md"),
+                    metadata={
+                        "dataflow_scan_request": request,
+                        "history_run_retry": {
+                            "history_run_id": history_run.id,
+                            "source_type": history_run.source_type,
+                            "requested_at": datetime.utcnow().isoformat(),
+                            "extra_cycles": extra_cycles,
+                        },
+                        "runtime_overrides": {},
+                        "task_title": f"Resume {history_run.run_name}",
+                    },
+                    upstream_refs=[],
+                )
+            ]
+        ).model_dump(mode="json")
+        execution = self._create_dataflow_cli_execution_attempt(
+            db,
+            trigger=trigger,
+            definition=definition,
+            definition_version=definition_version,
+            actor=actor,
+            recovery_reason="manual history run resume requested",
+        )
+        return trigger, execution
+
     def create_scan_task(
         self,
         db: Session,
@@ -1114,7 +1526,6 @@ class ExecutionService:
         actor = _principal_id(principal)
         config_payload_overrides = {
             "model": payload.model,
-            "thinking": payload.thinking,
             "review_profile": payload.review_profile,
             "max_review_cycles": payload.max_review_cycles,
             "worker_timeout": payload.worker_timeout,
@@ -1137,6 +1548,9 @@ class ExecutionService:
             "task_title": payload.title,
         }
         if payload.data_flow and payload.source_dir:
+            scan_options = dict(payload.scan_options or {})
+            if str(payload.title or "").strip():
+                scan_options.setdefault("run_name", str(payload.title).strip())
             metadata["dataflow_scan_request"] = {
                 "launcher": "run_vuln_scan.py",
                 "project_id": payload.project_id,
@@ -1146,13 +1560,12 @@ class ExecutionService:
                 "output_dir": payload.output_dir.model_dump(mode="json") if payload.output_dir else None,
                 "model": payload.model,
                 "provider": payload.provider,
-                "thinking": payload.thinking,
                 "review_profile": payload.review_profile,
                 "max_review_cycles": payload.max_review_cycles,
                 "worker_timeout": payload.worker_timeout,
                 "advisor_timeout": payload.advisor_timeout,
                 "result_review_concurrency": payload.result_review_concurrency,
-                "options": payload.scan_options,
+                "options": scan_options,
             }
         if payload.data_flow and payload.source_dir:
             trigger, _ = self._create_dataflow_cli_task_record(
@@ -1191,7 +1604,7 @@ class ExecutionService:
                 db,
                 execution_id=latest_execution.id,
                 event_type="execution_queued",
-                message="task queued",
+                message="task start requested",
                 payload_json={"task_id": trigger.id, "attempt_no": latest_execution.attempt_no},
             )
         return self._scan_task_response(db, trigger)
@@ -1223,135 +1636,10 @@ class ExecutionService:
         self._ensure_project_access(principal, trigger.project_id)
         return self._scan_task_detail(db, trigger)
 
-    def list_scan_task_attempts(self, db: Session, task_id: str, principal: dict) -> List[ScanTaskAttemptResponse]:
+    def get_scan_task_summary(self, db: Session, task_id: str, principal: dict) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
-        history_service = get_history_run_service()
-        responses: list[ScanTaskAttemptResponse] = []
-        for item in self._list_executions_for_trigger(db, task_id):
-            history_run = history_service.get_history_run_by_execution(db, item) if item.workspace_root else None
-            responses.append(self._attempt_response(item, history_run_id=history_run.id if history_run else None))
-        return responses
-
-    def list_scan_task_events(self, db: Session, task_id: str, principal: dict) -> List[ScanTaskEventResponse]:
-        trigger = self._trigger_or_404(db, task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        executions = self._list_executions_for_trigger(db, task_id)
-        attempt_by_execution = {item.id: item.attempt_no for item in executions}
-        events = (
-            db.query(WorkflowExecutionEvent)
-            .filter(WorkflowExecutionEvent.execution_id.in_(list(attempt_by_execution.keys()) or [""]))
-            .order_by(WorkflowExecutionEvent.created_at.asc())
-            .all()
-        )
-        return [
-            ScanTaskEventResponse(
-                event_id=item.id,
-                execution_id=item.execution_id,
-                attempt_no=attempt_by_execution.get(item.execution_id, 0),
-                event_type=item.event_type,
-                stage_id=item.stage_id,
-                round_no=item.round_no,
-                level=item.level,
-                message=item.message,
-                payload_json=item.payload_json or {},
-                created_at=item.created_at,
-            )
-            for item in events
-        ]
-
-    def get_scan_task_artifacts(self, db: Session, task_id: str, principal: dict) -> ScanTaskArtifactsResponse:
-        trigger = self._trigger_or_404(db, task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        latest_execution = self._latest_execution_for_trigger(db, task_id)
-        files: list[ScanTaskArtifactFileResponse] = []
-        workspace_root = Path(latest_execution.workspace_root) if latest_execution and latest_execution.workspace_root else None
-        if workspace_root and workspace_root.exists():
-            for path in sorted(p for p in workspace_root.rglob("*") if p.is_file()):
-                files.append(
-                    ScanTaskArtifactFileResponse(
-                        path=str(path.relative_to(workspace_root)),
-                        size=path.stat().st_size,
-                    )
-                )
-        return ScanTaskArtifactsResponse(
-            task_id=task_id,
-            execution_id=latest_execution.id if latest_execution else None,
-            workspace_root=latest_execution.workspace_root if latest_execution else None,
-            output_manifest_path=latest_execution.output_manifest_path if latest_execution else None,
-            files=files,
-        )
-
-    def _execution_for_task_or_404(self, db: Session, task_id: str, execution_id: str, principal: dict) -> WorkflowExecution:
-        trigger = self._trigger_or_404(db, task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        execution = self._execution_or_404(db, execution_id)
-        if execution.trigger_task_id != task_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found for task")
-        return execution
-
-    def list_scan_task_runs(self, db: Session, task_id: str, principal: dict) -> list[dict[str, Any]]:
-        trigger = self._trigger_or_404(db, task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        history_service = get_history_run_service()
-        runs: list[dict[str, Any]] = []
-        for execution in self._list_executions_for_trigger(db, task_id):
-            history_run = history_service.get_history_run_by_execution(db, execution) if execution.workspace_root else None
-            summary = history_service.get_history_run_summary(db, history_run) if history_run else {}
-            attempt = self._attempt_response(execution, history_run_id=history_run.id if history_run else None).model_dump(mode="json")
-            runs.append({**attempt, "run_summary": summary})
-        return runs
-
-    def get_scan_task_run(self, db: Session, task_id: str, execution_id: str, principal: dict) -> dict[str, Any]:
-        execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        history_service = get_history_run_service()
-        history_run = history_service.get_history_run_by_execution(db, execution) if execution.workspace_root else None
-        if not execution.workspace_root:
-            return {"execution": self._attempt_response(execution, history_run_id=history_run.id if history_run else None).model_dump(mode="json"), "detail": None}
-        return {
-            "execution": self._attempt_response(execution, history_run_id=history_run.id if history_run else None).model_dump(mode="json"),
-            "detail": history_service.get_history_run_detail(db, history_run) if history_run else None,
-        }
-
-    def get_scan_task_run_cycle(self, db: Session, task_id: str, execution_id: str, cycle: int, principal: dict) -> dict[str, Any]:
-        execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
-        if history_run is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run workspace not found")
-        return get_history_run_service().get_history_run_cycle(db, history_run, cycle)
-
-    def list_scan_task_run_sessions(self, db: Session, task_id: str, execution_id: str, principal: dict) -> list[dict[str, Any]]:
-        execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
-        return get_history_run_service().list_history_run_sessions(db, history_run) if history_run else []
-
-    def list_scan_task_run_files(self, db: Session, task_id: str, execution_id: str, principal: dict, limit: int = 1200) -> list[dict[str, Any]]:
-        execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
-        if history_run is None:
-            return []
-        return get_history_run_service().list_history_run_files(db, history_run, limit=limit)
-
-    def get_scan_task_run_file(self, db: Session, task_id: str, execution_id: str, principal: dict, path: str) -> dict[str, Any]:
-        execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
-        if history_run is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run workspace not found")
-        return get_history_run_service().get_history_run_file(db, history_run, path)
-
-    def get_scan_task_run_session_file(self, db: Session, task_id: str, execution_id: str, principal: dict, path: str) -> dict[str, Any]:
-        execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
-        if history_run is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run workspace not found")
-        return get_history_run_service().get_history_run_session_file(db, history_run, path)
-
-    def get_scan_task_run_log(self, db: Session, task_id: str, execution_id: str, principal: dict, lines: int = 300) -> dict[str, Any]:
-        execution = self._execution_for_task_or_404(db, task_id, execution_id, principal)
-        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
-        if history_run is None:
-            return {"content": "(no workspace)"}
-        return get_history_run_service().get_history_run_log(db, history_run, lines=lines)
+        return self._scan_task_response(db, trigger)
 
     def _history_run_or_404(self, db: Session, history_run_id: str, principal: dict) -> Any:
         history_run = get_history_run_service()._history_run_or_404(db, history_run_id)
@@ -1362,9 +1650,7 @@ class ExecutionService:
         self._ensure_project_access(principal, project_id)
         return get_history_run_service().list_history_runs(db, project_id)
 
-    def resolve_history_run(self, db: Session, principal: dict, *, project_id: str, run_name: str, root_path: str) -> dict[str, Any]:
-        self._ensure_project_access(principal, project_id)
-        history_run = get_history_run_service().resolve_history_run(db, project_id=project_id, run_name=run_name, root_path=root_path)
+    def _history_run_resolve_response(self, history_run: HistoryRun) -> dict[str, Any]:
         return {
             "history_run_id": history_run.id,
             "project_id": history_run.project_id,
@@ -1374,6 +1660,33 @@ class ExecutionService:
             "linked_task_id": history_run.linked_task_id,
             "linked_execution_id": history_run.linked_execution_id,
         }
+
+    def resolve_history_run(self, db: Session, principal: dict, *, project_id: str, run_name: str, root_path: str) -> dict[str, Any]:
+        self._ensure_project_access(principal, project_id)
+        history_run = get_history_run_service().resolve_history_run(db, project_id=project_id, run_name=run_name, root_path=root_path)
+        return self._history_run_resolve_response(history_run)
+
+    def resolve_history_run_by_task(
+        self,
+        db: Session,
+        principal: dict,
+        *,
+        project_id: str,
+        task_id: str,
+        execution_id: str | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_project_access(principal, project_id)
+        get_history_run_service().sync_project_history_runs(db, project_id)
+        query = db.query(HistoryRun).filter(
+            HistoryRun.project_id == project_id,
+            HistoryRun.linked_task_id == task_id,
+        )
+        if execution_id:
+            query = query.filter(HistoryRun.linked_execution_id == execution_id)
+        history_run = query.order_by(HistoryRun.started_at.desc(), HistoryRun.created_at.desc()).first()
+        if history_run is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run not found for task")
+        return self._history_run_resolve_response(history_run)
 
     def get_history_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
         history_run = self._history_run_or_404(db, history_run_id, principal)
@@ -1403,7 +1716,378 @@ class ExecutionService:
         history_run = self._history_run_or_404(db, history_run_id, principal)
         return get_history_run_service().get_history_run_log(db, history_run, lines=lines)
 
-    def cancel_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskResponse:
+    def _linked_history_run_runtime(self, db: Session, history_run) -> tuple[TriggerTask | None, WorkflowExecution | None]:
+        trigger = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
+        execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
+        if trigger is None and execution is not None:
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+        if trigger is not None and (execution is None or execution.trigger_task_id != trigger.id):
+            execution = self._latest_execution_for_trigger(db, trigger.id)
+        return trigger, execution
+
+    def _wait_until_execution_inactive(self, db: Session, execution_id: str, *, timeout_seconds: float) -> bool:
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        while True:
+            db.expire_all()
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is None:
+                return True
+            if not self._history_run_status_is_active(execution.status):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+
+    def _delete_linked_runtime_records(self, db: Session, *, linked_task_id: str | None, linked_execution_id: str | None) -> None:
+        execution_ids: list[str] = []
+        if linked_task_id:
+            execution_ids = [
+                item[0]
+                for item in db.query(WorkflowExecution.id)
+                .filter(WorkflowExecution.trigger_task_id == linked_task_id)
+                .all()
+            ]
+        elif linked_execution_id:
+            execution_ids = [linked_execution_id]
+        if execution_ids:
+            db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id.in_(execution_ids)).delete(synchronize_session=False)
+            db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(execution_ids)).delete(synchronize_session=False)
+        if linked_task_id:
+            trigger = db.get(TriggerTask, linked_task_id)
+            if trigger is not None:
+                db.delete(trigger)
+        db.flush()
+
+    def delete_history_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        project_id = history_run.project_id
+        run_name = history_run.run_name
+        linked_task_id = history_run.linked_task_id
+        linked_execution_id = history_run.linked_execution_id
+        trigger, execution = self._linked_history_run_runtime(db, history_run)
+        stop_payload: dict[str, Any] = {"signal": None}
+        process_pid = execution.process_pid if execution is not None else None
+        process_host = execution.process_host if execution is not None else None
+        if execution is None and self._history_run_status_is_active(history_run.status):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="active history run is not linked to a managed execution; adopt/link it before deleting",
+            )
+        if execution is not None and execution.status == "pending":
+            execution.status = "cancelled"
+            execution.finished_at = datetime.utcnow()
+            execution.message = "deleted before dispatch"
+            execution.process_status = "not_started"
+            db.add(execution)
+            if trigger is not None:
+                trigger.status = "cancelled"
+                trigger.finished_at = execution.finished_at
+                trigger.message = "deleted before dispatch"
+                db.add(trigger)
+        elif execution is not None and self._history_run_status_is_active(execution.status):
+            execution.status = "delete_requested"
+            execution.message = "delete requested; stopping run_vuln_scan.py"
+            execution.process_status = "delete_requested"
+            db.add(execution)
+            if trigger is not None:
+                trigger.status = "delete_requested"
+                trigger.message = "delete requested; stopping run_vuln_scan.py"
+                db.add(trigger)
+            history_run = get_history_run_service().bind_runtime_state(
+                db,
+                history_run,
+                linked_execution=execution,
+                linked_task=trigger,
+                profile_id=history_run.profile_id,
+                status_text="delete_requested",
+            )
+            self._write_run_control_state(history_run.run_root_path, status_text="delete_requested", message="delete requested")
+            db.commit()
+            stop_payload = self._signal_local_cli_process(execution.id, wait=True)
+            process_pid = stop_payload.get("pid") or process_pid
+            stopped = self._wait_until_execution_inactive(db, execution.id, timeout_seconds=45)
+            if not stopped:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="history run deletion requested but run_vuln_scan.py is still stopping; retry delete shortly",
+                )
+            db.expire_all()
+            history_run = db.get(type(history_run), history_run_id)
+            if history_run is None:
+                return self._history_run_retry_response(
+                    history_run_id=history_run_id,
+                    project_id=project_id,
+                    status_text="deleted",
+                    message=f"history run {run_name} deleted",
+                    linked_task_id=linked_task_id,
+                    linked_execution_id=linked_execution_id,
+                    process_pid=process_pid,
+                    process_host=process_host,
+                    process_signal=stop_payload.get("signal"),
+                )
+        self._delete_linked_runtime_records(db, linked_task_id=linked_task_id, linked_execution_id=linked_execution_id)
+        get_history_run_service().delete_history_run(db, history_run, allow_active=True)
+        db.commit()
+        return self._history_run_retry_response(
+            history_run_id=history_run_id,
+            project_id=project_id,
+            status_text="deleted",
+            message=f"history run {run_name} deleted",
+            linked_task_id=linked_task_id,
+            linked_execution_id=linked_execution_id,
+            process_pid=process_pid,
+            process_host=process_host,
+            process_signal=stop_payload.get("signal"),
+        )
+
+    def adopt_history_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        run_root = Path(history_run.run_root_path)
+        if not run_root.is_dir():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run directory not found")
+
+        trigger = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
+        execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
+        if trigger is None and execution is not None:
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+        if trigger is not None and execution is not None and execution.trigger_task_id != trigger.id:
+            execution = None
+        if trigger is not None and execution is None:
+            execution = self._latest_execution_for_trigger(db, trigger.id)
+
+        definition = self._select_history_run_definition(db, history_run, principal)
+        definition_version = get_workflow_service().get_profile_version_model(db, definition.id)
+        actor = _principal_id(principal)
+        task_status = self._adopted_history_run_task_status(history_run.status)
+        active = self._history_run_status_is_active(history_run.status)
+        started_at = history_run.started_at
+        finished_at = None if active else (history_run.finished_at or history_run.last_activity_at)
+        adoption_message = f"adopted history run {history_run.run_name}"
+
+        if trigger is None:
+            trigger = TriggerTask(
+                id=_new_id("tt"),
+                workflow_definition_id=definition.id,
+                workflow_definition_version_id=definition_version.id,
+                profile_id=definition.id,
+                project_id=history_run.project_id,
+                trigger_type="manual",
+                input_tasks_json=self._history_run_adoption_manifest(history_run),
+                priority=definition.priority_default,
+                status=task_status,
+                submitted_by=actor,
+                retry_count=0,
+                max_retry_count=definition.max_retry_count,
+                latest_execution_id=None,
+                started_at=started_at,
+                finished_at=finished_at,
+                message=adoption_message,
+            )
+        else:
+            self._ensure_project_access(principal, trigger.project_id)
+            trigger.workflow_definition_id = definition.id
+            trigger.workflow_definition_version_id = definition_version.id
+            trigger.profile_id = definition.id
+            trigger.project_id = history_run.project_id
+            trigger.input_tasks_json = self._history_run_adoption_manifest(history_run)
+            trigger.status = task_status
+            trigger.started_at = started_at
+            trigger.finished_at = finished_at
+            trigger.message = adoption_message
+        db.add(trigger)
+        db.flush()
+
+        if execution is None:
+            execution = WorkflowExecution(
+                id=_new_id("exec"),
+                trigger_task_id=trigger.id,
+                workflow_definition_id=definition.id,
+                workflow_definition_version_id=definition_version.id,
+                project_id=history_run.project_id,
+                attempt_no=(
+                    db.query(WorkflowExecution)
+                    .filter(WorkflowExecution.trigger_task_id == trigger.id)
+                    .count()
+                ) + 1,
+                status=task_status,
+                recovery_reason="history run adopted",
+                workspace_root=abs_path(run_root),
+                output_manifest_path=self._history_run_output_manifest_path(history_run),
+                output_task_count=history_run.result_count,
+                started_at=started_at,
+                finished_at=finished_at,
+                message=adoption_message,
+            )
+        else:
+            self._ensure_project_access(principal, execution.project_id)
+            execution.trigger_task_id = trigger.id
+            execution.workflow_definition_id = definition.id
+            execution.workflow_definition_version_id = definition_version.id
+            execution.project_id = history_run.project_id
+            execution.status = task_status
+            execution.recovery_reason = execution.recovery_reason or "history run adopted"
+            execution.workspace_root = abs_path(run_root)
+            execution.output_manifest_path = self._history_run_output_manifest_path(history_run)
+            execution.output_task_count = history_run.result_count
+            execution.started_at = started_at
+            execution.finished_at = finished_at
+            execution.message = adoption_message
+        db.add(execution)
+        db.flush()
+
+        trigger.latest_execution_id = execution.id
+        db.add(trigger)
+        history_run = get_history_run_service().bind_runtime_state(
+            db,
+            history_run,
+            linked_execution=execution,
+            linked_task=trigger,
+            profile_id=definition.id,
+            status_text=history_run.status,
+        )
+        db.commit()
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="history_run_adopted",
+            message=adoption_message,
+            payload_json={
+                "history_run_id": history_run.id,
+                "project_id": history_run.project_id,
+                "run_root_path": history_run.run_root_path,
+            },
+        )
+        return self._history_run_retry_response(
+            history_run_id=history_run.id,
+            project_id=history_run.project_id,
+            status_text=history_run.status,
+            message=adoption_message,
+            linked_task_id=trigger.id,
+            linked_execution_id=execution.id,
+        )
+
+    def cancel_history_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        if history_run.linked_task_id:
+            self.cancel_scan_task(db, history_run.linked_task_id, principal, signal_process=False)
+            trigger = self._trigger_or_404(db, history_run.linked_task_id)
+            latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+            stop_payload = (
+                self._signal_local_cli_process(latest_execution.id, wait=False)
+                if latest_execution is not None and latest_execution.status in {"running", "cancel_requested"}
+                else {"signal": None}
+            )
+            status_text = "cancel_requested"
+            message = "history run cancel requested"
+            if latest_execution is None or latest_execution.status == "cancelled":
+                status_text = "cancelled"
+                message = "history run cancelled before dispatch"
+            elif latest_execution.status == "pending":
+                status_text = "cancelled"
+                message = "history run cancelled before dispatch"
+            self._write_run_control_state(history_run.run_root_path, status_text=status_text, message=message)
+            history_run = get_history_run_service().bind_runtime_state(
+                db,
+                history_run,
+                linked_execution=latest_execution,
+                linked_task=trigger,
+                profile_id=history_run.profile_id,
+                status_text=status_text,
+            )
+            db.commit()
+            return self._history_run_retry_response(
+                history_run_id=history_run.id,
+                project_id=history_run.project_id,
+                status_text=history_run.status,
+                message=message,
+                linked_task_id=history_run.linked_task_id,
+                linked_execution_id=history_run.linked_execution_id,
+                process_pid=stop_payload.get("pid") or (latest_execution.process_pid if latest_execution else None),
+                process_host=latest_execution.process_host if latest_execution else None,
+                process_signal=stop_payload.get("signal"),
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history run is not managed by a cancellable execution")
+
+    def retry_history_run(
+        self,
+        db: Session,
+        history_run_id: str,
+        principal: dict,
+        payload: HistoryRunRetryRequest,
+    ) -> dict[str, Any]:
+        history_run = self._history_run_or_404(db, history_run_id, principal)
+        run_root = Path(history_run.run_root_path)
+        if not run_root.is_dir():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run directory not found")
+        status_value = str(history_run.status or "").strip().lower()
+        if status_value in {"pending", "queued", "running", "cancel_requested", "delete_requested"}:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="history run is still active; cancel it and wait until cancelled before retry",
+            )
+        if status_value != "cancelled":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history run must be cancelled before retry")
+
+        definition = self._select_history_run_definition(db, history_run, principal)
+        workflow_service = get_workflow_service()
+        definition_version = workflow_service.get_profile_version_model(db, definition.id)
+        request = self._build_history_run_resume_request(history_run=history_run, payload=payload)
+        actor = _principal_id(principal)
+
+        trigger = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
+        if trigger is not None:
+            self._ensure_project_access(principal, trigger.project_id)
+            self._update_trigger_for_history_run_resume(trigger=trigger, history_run=history_run, request=request)
+            db.add(trigger)
+            execution = self._create_dataflow_cli_execution_attempt(
+                db,
+                trigger=trigger,
+                definition=definition,
+                definition_version=definition_version,
+                actor=actor,
+                recovery_reason="manual history run resume requested",
+            )
+        else:
+            trigger, execution = self._create_history_run_resume_task_record(
+                db,
+                definition=definition,
+                definition_version=definition_version,
+                history_run=history_run,
+                request=request,
+                actor=actor,
+            )
+
+        history_run = get_history_run_service().bind_runtime_state(
+            db,
+            history_run,
+            linked_execution=execution,
+            linked_task=trigger,
+            profile_id=definition.id,
+            status_text="queued",
+        )
+        db.commit()
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="execution_requeued",
+            message="manual history run resume requested",
+            payload_json={
+                "history_run_id": history_run.id,
+                "project_id": history_run.project_id,
+                "run_root_path": history_run.run_root_path,
+                "extra_cycles": payload.extra_cycles,
+            },
+        )
+        return self._history_run_retry_response(
+            history_run_id=history_run.id,
+            project_id=history_run.project_id,
+            status_text=history_run.status,
+            message="history run resume started",
+            linked_task_id=trigger.id,
+            linked_execution_id=execution.id,
+        )
+
+    def cancel_scan_task(self, db: Session, task_id: str, principal: dict, *, signal_process: bool = True) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
@@ -1423,13 +2107,63 @@ class ExecutionService:
             if latest_execution is not None and latest_execution.status == "running":
                 latest_execution.status = "cancel_requested"
                 latest_execution.message = "cancel requested"
+                latest_execution.process_status = "stop_requested"
                 db.add(latest_execution)
         else:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task is not cancelable")
         db.add(trigger)
         db.commit()
+        if signal_process and latest_execution is not None:
+            self._write_run_control_state(latest_execution.workspace_root, status_text=trigger.status, message=trigger.message or "cancel requested")
+            if latest_execution.status in {"running", "cancel_requested"}:
+                self._signal_local_cli_process(latest_execution.id, wait=False)
         db.refresh(trigger)
         return self._scan_task_response(db, trigger)
+
+    def delete_scan_task(self, db: Session, task_id: str, principal: dict) -> dict[str, Any]:
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        if trigger.status in {"pending", "running", "cancel_requested"}:
+            try:
+                self.cancel_scan_task(db, task_id, principal)
+                trigger = self._trigger_or_404(db, task_id)
+            except Exception:
+                db.rollback()
+                trigger = self._trigger_or_404(db, task_id)
+
+        executions = self._list_executions_for_trigger(db, trigger.id)
+        history_run_ids: set[str] = set()
+        workspace_roots: set[str] = set()
+        for execution in executions:
+            if execution.workspace_root:
+                workspace_roots.add(execution.workspace_root)
+            history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+            if history_run:
+                history_run_ids.add(history_run.id)
+                if history_run.run_root_path:
+                    workspace_roots.add(history_run.run_root_path)
+
+        if history_run_ids:
+            db.query(HistoryRunFile).filter(HistoryRunFile.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunSession).filter(HistoryRunSession.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunRemovedResult).filter(HistoryRunRemovedResult.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunResultReview).filter(HistoryRunResultReview.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunResult).filter(HistoryRunResult.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunGlobalReview).filter(HistoryRunGlobalReview.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunCycle).filter(HistoryRunCycle.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRun).filter(HistoryRun.id.in_(list(history_run_ids))).delete(synchronize_session=False)
+
+        execution_ids = [execution.id for execution in executions]
+        if execution_ids:
+            db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id.in_(execution_ids)).delete(synchronize_session=False)
+            db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(execution_ids)).delete(synchronize_session=False)
+        db.delete(trigger)
+        db.commit()
+
+        for path in workspace_roots:
+            if path:
+                shutil.rmtree(path, ignore_errors=True)
+        return {"success": True, "message": "task deleted"}
 
     def _create_retry_attempt_for_task(
         self,
@@ -1518,128 +2252,6 @@ class ExecutionService:
         db.commit()
         db.refresh(trigger)
         return self._scan_task_response(db, trigger)
-
-    def create_trigger_task(
-        self,
-        db: Session,
-        definition_id: str,
-        payload: TriggerTaskCreate,
-        principal: dict,
-        *,
-        trigger_type: str,
-        authorization_token: str | None = None,
-    ) -> TriggerTaskResponse:
-        definition = self._definition_or_404(db, definition_id)
-        self._ensure_project_access(principal, definition.project_id)
-        if not definition.enabled:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="workflow definition is disabled")
-        if trigger_type == "http":
-            if definition.trigger_type != "http" or not definition.trigger_enabled or not definition.is_active:
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="workflow definition http trigger is unavailable")
-        actor = _principal_id(principal)
-        version = get_workflow_service().get_profile_version_model(db, definition.id)
-        trigger, execution = self._create_task_record(
-            db,
-            definition=definition,
-            definition_version=version,
-            input_tasks=payload.input_tasks,
-            priority=payload.priority if payload.priority is not None else definition.priority_default,
-            trigger_type=trigger_type,
-            actor=actor,
-            authorization_token=authorization_token,
-        )
-        db.commit()
-        db.refresh(trigger)
-        self.record_event(
-            db,
-            execution_id=execution.id,
-            event_type="execution_queued",
-            message="legacy trigger task queued",
-            payload_json={"task_id": trigger.id, "attempt_no": execution.attempt_no},
-        )
-        return self._trigger_response(trigger)
-
-    def list_trigger_tasks(self, db: Session, principal: dict) -> List[TriggerTaskResponse]:
-        project_ids = _project_ids(principal)
-        query = db.query(TriggerTask).order_by(TriggerTask.created_at.desc())
-        if project_ids:
-            query = query.filter(TriggerTask.project_id.in_(project_ids))
-        return [self._trigger_response(item) for item in query.all()]
-
-    def get_trigger_task(self, db: Session, trigger_task_id: str, principal: dict) -> TriggerTaskResponse:
-        trigger = self._trigger_or_404(db, trigger_task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        return self._trigger_response(trigger)
-
-    def cancel_trigger_task(self, db: Session, trigger_task_id: str, principal: dict) -> None:
-        self.cancel_scan_task(db, trigger_task_id, principal)
-
-    def retry_trigger_task(
-        self,
-        db: Session,
-        trigger_task_id: str,
-        principal: dict,
-        *,
-        authorization_token: str | None = None,
-    ) -> TriggerTaskResponse:
-        trigger = self._trigger_or_404(db, trigger_task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        definition = self._definition_or_404(db, trigger.workflow_definition_id)
-        payload = TriggerTaskCreate(
-            input_tasks=self._input_tasks_from_manifest(TaskManifest.model_validate(trigger.input_tasks_json)),
-            priority=trigger.priority,
-        )
-        return self.create_trigger_task(
-            db,
-            definition.id,
-            payload,
-            principal,
-            trigger_type=trigger.trigger_type,
-            authorization_token=authorization_token,
-        )
-
-    def list_executions(self, db: Session, principal: dict) -> List[WorkflowExecutionResponse]:
-        project_ids = _project_ids(principal)
-        query = db.query(WorkflowExecution).order_by(WorkflowExecution.created_at.desc())
-        if project_ids:
-            query = query.filter(WorkflowExecution.project_id.in_(project_ids))
-        return [self._execution_response(item) for item in query.all()]
-
-    def get_execution(self, db: Session, execution_id: str, principal: dict) -> WorkflowExecutionResponse:
-        execution = self._execution_or_404(db, execution_id)
-        self._ensure_project_access(principal, execution.project_id)
-        return self._execution_response(execution)
-
-    def list_execution_events(self, db: Session, execution_id: str, principal: dict) -> List[WorkflowExecutionEventResponse]:
-        execution = self._execution_or_404(db, execution_id)
-        self._ensure_project_access(principal, execution.project_id)
-        events = (
-            db.query(WorkflowExecutionEvent)
-            .filter(WorkflowExecutionEvent.execution_id == execution.id)
-            .order_by(WorkflowExecutionEvent.created_at.asc())
-            .all()
-        )
-        return [self._event_response(item) for item in events]
-
-    def get_execution_artifacts(self, db: Session, execution_id: str, principal: dict) -> Dict[str, Any]:
-        execution = self._execution_or_404(db, execution_id)
-        self._ensure_project_access(principal, execution.project_id)
-        files: List[Dict[str, Any]] = []
-        workspace_root = Path(execution.workspace_root) if execution.workspace_root else None
-        if workspace_root and workspace_root.exists():
-            for path in sorted(p for p in workspace_root.rglob("*") if p.is_file()):
-                files.append({"path": str(path.relative_to(workspace_root)), "size": path.stat().st_size})
-        return {
-            "execution_id": execution.id,
-            "workspace_root": execution.workspace_root,
-            "output_manifest_path": execution.output_manifest_path,
-            "files": files,
-        }
-
-    def cancel_execution(self, db: Session, execution_id: str, principal: dict) -> None:
-        execution = self._execution_or_404(db, execution_id)
-        self._ensure_project_access(principal, execution.project_id)
-        self.cancel_scan_task(db, execution.trigger_task_id, principal)
 
     def record_event(
         self,
@@ -1733,13 +2345,54 @@ class ExecutionService:
         script_path = Path(__file__).resolve().parents[2] / "run_vuln_scan.py"
         cmd = [sys.executable, str(script_path), *argv]
         process = subprocess.Popen(cmd, cwd=str(script_path.parent))
+        self._register_cli_process(execution.id, process)
+        now = datetime.utcnow()
+        execution.process_pid = int(process.pid)
+        execution.process_host = get_config().scheduler.pod_id
+        execution.process_status = "running"
+        execution.process_started_at = now
+        execution.process_finished_at = None
+        db.add(execution)
+        db.commit()
+        if execution.workspace_root:
+            write_json(
+                Path(execution.workspace_root) / "_meta" / "process.json",
+                {
+                    "execution_id": execution.id,
+                    "trigger_task_id": trigger.id,
+                    "pid": process.pid,
+                    "pod_id": get_config().scheduler.pod_id,
+                    "host_name": get_config().scheduler.host_name,
+                    "command": cmd,
+                    "started_at": now.isoformat(),
+                    "status": "running",
+                },
+            )
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="run_vuln_scan_process_started",
+            message=f"run_vuln_scan.py process started pid={process.pid}",
+            payload_json={
+                "pid": process.pid,
+                "pod_id": get_config().scheduler.pod_id,
+                "host_name": get_config().scheduler.host_name,
+                "command": cmd,
+            },
+        )
         try:
             while process.poll() is None:
                 time.sleep(max(1, int(get_config().service.execution_cancel_check_interval_seconds)))
                 db.expire(execution)
                 db.expire(trigger)
-                if execution.status == "cancel_requested" or trigger.status == "cancel_requested":
-                    process.send_signal(signal.SIGINT)
+                if execution.status in {"cancel_requested", "delete_requested"} or trigger.status in {"cancel_requested", "delete_requested"}:
+                    execution.process_status = "delete_requested" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "stop_requested"
+                    db.add(execution)
+                    db.commit()
+                    try:
+                        process.send_signal(signal.SIGINT)
+                    except ProcessLookupError:
+                        return int(process.returncode or 0)
                     try:
                         return process.wait(timeout=30)
                     except subprocess.TimeoutExpired:
@@ -1753,6 +2406,29 @@ class ExecutionService:
         finally:
             if process.poll() is None:
                 process.terminate()
+            self._forget_cli_process(execution.id, process)
+            try:
+                execution.process_status = "exited"
+                execution.process_finished_at = datetime.utcnow()
+                db.add(execution)
+                db.commit()
+                if execution.workspace_root:
+                    process_path = Path(execution.workspace_root) / "_meta" / "process.json"
+                    payload = {
+                        "execution_id": execution.id,
+                        "trigger_task_id": trigger.id,
+                        "pid": process.pid,
+                        "pod_id": get_config().scheduler.pod_id,
+                        "host_name": get_config().scheduler.host_name,
+                        "command": cmd,
+                        "started_at": execution.process_started_at.isoformat() if execution.process_started_at else "",
+                        "finished_at": execution.process_finished_at.isoformat() if execution.process_finished_at else "",
+                        "status": "exited",
+                        "return_code": process.returncode,
+                    }
+                    write_json(process_path, payload)
+            except Exception:
+                db.rollback()
 
     def _run_claimed_dataflow_cli_execution(
         self,
@@ -1839,9 +2515,13 @@ class ExecutionService:
             if exit_code == 0:
                 terminal_status = "succeeded"
                 message = "run_vuln_scan.py completed"
-            elif exit_code == 130 or execution.status == "cancel_requested" or trigger.status == "cancel_requested":
+            elif (
+                exit_code in {130, -signal.SIGINT, -signal.SIGTERM, -signal.SIGKILL}
+                or execution.status in {"cancel_requested", "delete_requested"}
+                or trigger.status in {"cancel_requested", "delete_requested"}
+            ):
                 terminal_status = "cancelled"
-                message = "run_vuln_scan.py cancelled"
+                message = "run_vuln_scan.py stopped for delete" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "run_vuln_scan.py cancelled"
             else:
                 terminal_status = "failed"
                 message = f"run_vuln_scan.py failed with exit code {exit_code}"

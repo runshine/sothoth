@@ -18,6 +18,9 @@ spec:
       - name: secflow-platform-auth
         image: runshine0819/secflow-platform-auth:latest  # 包含kubectl命令
         imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
         ports:
         - containerPort: 8080
         volumeMounts:

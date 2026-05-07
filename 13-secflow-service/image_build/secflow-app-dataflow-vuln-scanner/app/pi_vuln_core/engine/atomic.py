@@ -350,6 +350,8 @@ class AtomicWorkflowEngine:
     @staticmethod
     def _classify_terminal_status(message: str, *, default: str = "failed") -> str:
         lower = (message or "").lower()
+        if "summary_incomplete" in lower:
+            return "summary_incomplete"
         if "runtime_output_limit" in lower or "stdout limit" in lower or "output limit" in lower:
             return "runtime_output_limit"
         if "runtime_timeout" in lower or "no-progress timeout" in lower or "max wall clock" in lower or "timed out" in lower:
@@ -452,6 +454,11 @@ class AtomicWorkflowEngine:
         work_dir = ctx.working_dir
         cycle_metrics_history: list[dict] = []
         review_state.workflow_mode = ctx.review_mode
+        profile_policy = get_review_profile_policy(ctx.review_profile)
+        ctx.review_profile = profile_policy.name
+        review_enabled = bool(getattr(self.wf.engine, "review_enabled", profile_policy.review_enabled)) and profile_policy.review_enabled
+        if not review_enabled:
+            total_cycle_limit = min(total_cycle_limit, 1)
         if review_state.global_review_history and not review_state.issue_ledger:
             review_state.rebuild_issue_ledger_from_history()
 
@@ -574,8 +581,19 @@ class AtomicWorkflowEngine:
                         phase=exc.phase,
                         message=str(exc),
                     )
-                # 如果 Worker 未生成 summary.md，创建占位文件，让全局评审正常进行（会判不通过并打回）
-                if not os.path.isfile(summary_path):
+                # fast 档不进入评审兜底，必须由 Worker 真实生成非空 summary.md。
+                if not os.path.isfile(summary_path) or (
+                    not review_enabled and os.path.getsize(summary_path) <= 0
+                ):
+                    if not review_enabled:
+                        return await self._fail_worker_stage(
+                            ctx=ctx,
+                            phase="summary",
+                            message=(
+                                "summary_incomplete: fast profile requires Worker "
+                                "to generate a non-empty summary.md before completion"
+                            ),
+                        )
                     logger.warning(
                         "summary_not_found",
                         summary_path=summary_path,
@@ -603,6 +621,47 @@ class AtomicWorkflowEngine:
                     summary_file=ctx.summary_file,
                     results_dir=ctx.results_dir,
                 )
+
+            if not review_enabled:
+                if (
+                    not ctx.summary_file
+                    or not os.path.isfile(ctx.summary_file)
+                    or os.path.getsize(ctx.summary_file) <= 0
+                ):
+                    return await self._fail_worker_stage(
+                        ctx=ctx,
+                        phase="summary",
+                        message=(
+                            "summary_incomplete: fast profile requires Worker "
+                            "to generate a non-empty summary.md before completion"
+                        ),
+                    )
+                await self.recorder.record_review_cycle_summary(
+                    work_dir=work_dir,
+                    cycle=cycle,
+                    global_passed=True,
+                    global_feedback="review disabled by fast profile",
+                    total_results=len(result_files),
+                    passed_results=[],
+                    failed_results=[],
+                    workflow_mode=ctx.review_mode,
+                    issues=[],
+                    plateau_status={
+                        "workflow_mode": ctx.review_mode,
+                        "review_enabled": False,
+                    },
+                    global_advisor_results=[],
+                )
+                logger.info(
+                    "profile_review_disabled_completed_after_summary",
+                    workflow_id=ctx.workflow_id,
+                    task_id=ctx.task_id,
+                    cycle=cycle,
+                    review_profile=profile_policy.name,
+                    summary_file=ctx.summary_file,
+                    result_count=len(result_files),
+                )
+                return None
 
             # ── 5. 全局评审 ──
             global_advisors = self.wf.roles.advisors.global_review
@@ -1081,6 +1140,7 @@ class AtomicWorkflowEngine:
         metrics_history: list[dict],
     ) -> dict:
         engine_cfg = getattr(getattr(self, "wf", None), "engine", None)
+        profile_policy = get_review_profile_policy(ctx.review_profile)
 
         def cfg_int(name: str, default: int) -> int:
             try:
@@ -1096,6 +1156,18 @@ class AtomicWorkflowEngine:
 
         closure_streak_threshold = cfg_int("plateau_closure_streak", 2)
         abort_streak_threshold = cfg_int("plateau_abort_streak", 3)
+        progress_required_after_cycle = cfg_int(
+            "progress_required_after_cycle",
+            profile_policy.progress_required_after_cycle,
+        )
+        progress_no_signal_closure_streak = cfg_int(
+            "progress_no_signal_closure_streak",
+            profile_policy.progress_no_signal_closure_streak,
+        )
+        progress_no_signal_abort_streak = cfg_int(
+            "progress_no_signal_abort_streak",
+            profile_policy.progress_no_signal_abort_streak,
+        )
         same_issue_stagnation_threshold = cfg_int("same_issue_stagnation_threshold", 2)
         same_issue_abort_threshold = cfg_int("same_issue_abort_threshold", 3)
         per_issue_attempt_budget = cfg_int("per_issue_attempt_budget", 2)
@@ -1114,6 +1186,23 @@ class AtomicWorkflowEngine:
             }
 
         current = metrics_history[-1]
+        progress_gate_active = (
+            progress_required_after_cycle > 0
+            and int(current.get("cycle") or 0) >= progress_required_after_cycle
+        )
+        if progress_required_after_cycle > 0:
+            if progress_gate_active:
+                closure_streak_threshold = min(
+                    closure_streak_threshold,
+                    progress_no_signal_closure_streak,
+                )
+                abort_streak_threshold = min(
+                    abort_streak_threshold,
+                    progress_no_signal_abort_streak,
+                )
+            else:
+                closure_streak_threshold = max(closure_streak_threshold, 2)
+                abort_streak_threshold = max(abort_streak_threshold, 3)
         if current["global_passed"] and current["failed_result_count"] == 0:
             ctx.plateau_streak = 0
             ctx.plateau_reason = ""
@@ -1172,6 +1261,15 @@ class AtomicWorkflowEngine:
         failure_scope = str(current.get("global_failure_scope") or "")
 
         issue_status = current.get("issue_ledger_status") or {}
+        prev_issue_status = prev.get("issue_ledger_status") or {}
+        active_issue_not_decreased = (
+            int(issue_status.get("active_issue_count") or 0)
+            >= int(prev_issue_status.get("active_issue_count") or 0)
+        )
+        current_issue_not_decreased = (
+            int(issue_status.get("current_issue_count") or 0)
+            >= int(prev_issue_status.get("current_issue_count") or 0)
+        )
         dominant_issue = issue_status.get("dominant_issue") or None
         try:
             max_issue_consecutive = int(issue_status.get("max_consecutive_count") or 0)
@@ -1222,8 +1320,24 @@ class AtomicWorkflowEngine:
             and passed_not_grown
             and no_new_unreviewed_results
         )
+        score_no_signal = scores_not_improved or not current_scores or not prev_scores
+        no_effective_progress_failure = (
+            progress_gate_active
+            and result_artifacts_unchanged
+            and supporting_docs_unchanged
+            and passed_not_grown
+            and no_new_unreviewed_results
+            and score_no_signal
+            and active_issue_not_decreased
+            and current_issue_not_decreased
+        )
 
         reasons: list[str] = []
+        if no_effective_progress_failure:
+            reasons.append(
+                "audit 有效进展信号不足：未新增/修正 result，supporting_docs 未变化，"
+                "通过结果未增长，issue/coverage 未收敛，且全局评分无有效提升"
+            )
         if scores_not_improved:
             reasons.append(f"全局评审分数有效提升不足（max_gain={max_score_gain:.3f} < {score_min_delta:.3f}）")
         if stable_result_failure:
@@ -1254,7 +1368,7 @@ class AtomicWorkflowEngine:
             and result_artifacts_unchanged
             and passed_not_grown
             and no_new_unreviewed_results
-        ) or same_issue_failure or summary_freshness_failure or issue_churn_failure
+        ) or same_issue_failure or summary_freshness_failure or issue_churn_failure or no_effective_progress_failure
 
         switched_to_closure = False
         abort = False
@@ -1359,6 +1473,9 @@ class AtomicWorkflowEngine:
             "terminal_status": terminal_status,
             "score_min_delta": score_min_delta,
             "max_score_gain": max_score_gain,
+            "progress_required_after_cycle": progress_required_after_cycle,
+            "progress_gate_active": progress_gate_active,
+            "no_effective_progress_failure": no_effective_progress_failure,
             "summary_artifact_unchanged": summary_artifact_unchanged,
             "supporting_docs_unchanged": supporting_docs_unchanged,
             "same_issue_repeated": same_issue_repeated,

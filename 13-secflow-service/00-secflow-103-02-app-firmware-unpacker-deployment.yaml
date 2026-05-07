@@ -17,9 +17,11 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: secflow-app-firmware-unpacker
-          image: ghcr.io/runshine/secflow-app-firmware-unpacker:amd64-20260507
+          image: ghcr.io/runshine/secflow-app-firmware-unpacker:20260507
           imagePullPolicy: Always
           env:
+            - name: TZ
+              value: Asia/Shanghai
             - name: CONFIG_PATH
               value: /app/config.yaml
             - name: FIRMWARE_UNPACKER_CONFIG

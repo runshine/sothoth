@@ -1,10 +1,11 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: secflow-pi-re-agent
   namespace: secflow-ns
 spec:
-  replicas: 1
+  serviceName: secflow-pi-re-agent-headless
+  replicas: 3
   selector:
     matchLabels:
       name: secflow-pi-re-agent
@@ -16,14 +17,16 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-pi-re-agent
-        image: ghcr.io/skiyer/pi-re-agent:main
-        imagePullPolicy: IfNotPresent
+        image: ghcr.io/skiyer/pi-re-agent:sha-bd5f0f5
+        imagePullPolicy: Always
         command: ["pi-re-server"]
         args: ["--host", "0.0.0.0", "--port", "8000"]
         ports:
         - containerPort: 8000
           name: http
         env:
+        - name: TZ
+          value: Asia/Shanghai
         - name: PI_RE_ALLOWED_DIRS
           value: "/data/files"
         - name: PI_MODELS_JSON

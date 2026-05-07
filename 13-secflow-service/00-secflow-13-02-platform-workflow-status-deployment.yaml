@@ -18,6 +18,9 @@ spec:
       - name: secflow-platform-workflow-status
         image: runshine0819/secflow-platform-workflow-status:latest
         imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
         ports:
         - containerPort: 8080
         volumeMounts:

@@ -1,4 +1,4 @@
-# Multi-Agent Workflow Framework
+# SecFlow Dataflow Vulnerability Scanner
 
 > JSON 配置驱动 · Python 插件化 · 多智能体协同 · 三级评审闭环
 
@@ -32,7 +32,7 @@
 ### 前置条件
 
 ```bash
-cd secflow-platform-ai-agent-framework
+cd secflow-app-dataflow-vuln-scanner
 pip install -r requirements.txt
 # 确保 pi CLI 已安装（用于调用 AI 智能体）
 pi --version
@@ -794,10 +794,12 @@ curl -X POST http://127.0.0.1:8080/api/dataflow-vuln-scanner/tasks \
     "runtime_overrides": {}
   }'
 
-# 3. 查询任务和执行状态
+# 3. 查询 Run 和执行详情
 curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/tasks?project_id=default'
-curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/tasks/<task_id>/events'
-curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/tasks/<task_id>/artifacts'
+curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/history-runs?project_id=default'
+curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/history-runs/by-task?project_id=default&task_id=<task_id>'
+curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/history-runs/<history_run_id>'
+curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/history-runs/<history_run_id>/files'
 ```
 
 ### 7. 使用 `docker compose`
