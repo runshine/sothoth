@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,19 @@ def _write_json_code(payload: dict[str, Any]) -> str:
         "Path(payload['output_file']).write_text(json.dumps(payload['data'], ensure_ascii=False, indent=2), encoding='utf-8')\n"
         "print(json.dumps(payload['data'], ensure_ascii=False))\n"
     )
+
+
+def _python_node_env() -> dict[str, str]:
+    paths = [str(_repo_root), str(_repo_root / "app")]
+    existing = os.environ.get("PYTHONPATH")
+    if existing:
+        paths.append(existing)
+    return {"PYTHONPATH": os.pathsep.join(paths)}
+
+
+def _node_timeout(ctx: dict[str, Any], divisor: int = 1) -> int:
+    configured = int(ctx.get("node_timeout_seconds", 1800))
+    return max(1, configured // max(1, divisor))
 
 
 def _preprocess_code(ctx: dict[str, Any]) -> str:
@@ -111,11 +125,13 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             task_id="preprocess",
             code=_preprocess_code(ctx),
             tools="read_only",
+            env=_python_node_env(),
         )
         feature_match = python_node(
             task_id="feature_match",
             code=_feature_match_code(ctx),
             tools="read_only",
+            env=_python_node_env(),
         )
         skill_executor = pi(
             task_id="skill_executor",
@@ -132,7 +148,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_write",
             model=ctx.get("executor_model"),
             extra_args=ctx.get("executor_extra_args", []),
-            timeout_seconds=ctx.get("node_timeout_seconds", 1800),
+            timeout_seconds=_node_timeout(ctx),
         )
         skill_reviewer = pi(
             task_id="skill_reviewer",
@@ -147,7 +163,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_only",
             model=ctx.get("review_model"),
             extra_args=ctx.get("review_extra_args", []),
-            timeout_seconds=max(300, int(ctx.get("node_timeout_seconds", 1800) // 2)),
+            timeout_seconds=_node_timeout(ctx, divisor=2),
             success_criteria=REVIEW_SUCCESS_CRITERIA,
         )
         generic_executor = pi(
@@ -166,7 +182,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_write",
             model=ctx.get("executor_model"),
             extra_args=ctx.get("executor_extra_args", []),
-            timeout_seconds=ctx.get("node_timeout_seconds", 1800),
+            timeout_seconds=_node_timeout(ctx),
         )
         generic_reviewer = pi(
             task_id="generic_reviewer",
@@ -181,7 +197,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_only",
             model=ctx.get("review_model"),
             extra_args=ctx.get("review_extra_args", []),
-            timeout_seconds=max(300, int(ctx.get("node_timeout_seconds", 1800) // 2)),
+            timeout_seconds=_node_timeout(ctx, divisor=2),
             success_criteria=REVIEW_SUCCESS_CRITERIA,
         )
         skill_author = pi(
@@ -196,7 +212,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_write",
             model=ctx.get("author_model"),
             extra_args=ctx.get("author_extra_args", []),
-            timeout_seconds=ctx.get("node_timeout_seconds", 1800),
+            timeout_seconds=_node_timeout(ctx),
         )
         cleanup = pi(
             task_id="cleanup",
@@ -207,7 +223,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_write",
             model=ctx.get("cleanup_model"),
             extra_args=ctx.get("cleanup_extra_args", []),
-            timeout_seconds=max(300, int(ctx.get("node_timeout_seconds", 1800) // 3)),
+            timeout_seconds=_node_timeout(ctx, divisor=3),
         )
         finalize = python_node(
             task_id="finalize",
@@ -221,6 +237,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
                 }
             ),
             tools="read_only",
+            env=_python_node_env(),
         )
 
         preprocess >> feature_match >> skill_executor >> skill_reviewer

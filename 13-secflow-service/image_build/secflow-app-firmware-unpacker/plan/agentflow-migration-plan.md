@@ -5,7 +5,7 @@
 
 ## 0. 当前进度摘要
 
-当前迁移已经完成主干代码接入，整体进度约 75%-85%。服务只保留 AgentFlow 解包模式；代码层面已具备 AgentFlow 入口、pipeline builder、runner、DB/API 可观测字段和基础测试。剩余重点是补齐 AgentFlow runner 的 mock 测试、容器内真实运行 smoke test、固定固件样本验证和生产切换。
+当前迁移已经完成主干代码接入和核心 runner 验证，整体进度约 90%+。服务只保留 AgentFlow 解包模式；代码层面已具备 AgentFlow 入口、pipeline builder、runner、DB/API 可观测字段、runner result adapter 单测、fake `pi` 与真实 `pi` 的 AgentFlow 小样本 smoke、DB/API 任务 smoke，以及本地 Docker 镜像构建/容器 runtime smoke 记录。剩余重点是真实 skill success/fallback 样本集验证和生产切换。
 
 状态标记：
 
@@ -17,15 +17,15 @@
 
 | 阶段 | 状态 | 当前说明 |
 |---|---|---|
-| 阶段 0：准备与基线 | `[PARTIAL]` | AgentFlow 配置和入口有测试；skill 成功、skill fallback、max retry、cancel 的结果形状还缺少覆盖。 |
-| 阶段 1：安装并验证 AgentFlow 运行时 | `[DONE]` | `Dockerfile` 已复制并 editable install `agentflow/`，构建层包含 `import agentflow` 和 `pi --version` 校验。 |
+| 阶段 0：准备与基线 | `[DONE]` | AgentFlow 配置、入口、runner result adapter 和小 zip smoke 均有测试覆盖。 |
+| 阶段 1：安装并验证 AgentFlow 运行时 | `[DONE]` | `Dockerfile` 已复制并 editable install `agentflow/`，本地镜像构建和容器内 `import agentflow`/`pi --version` 均通过。 |
 | 阶段 2：新增 AgentFlow 配置 | `[DONE]` | `app/config.py`、`config.yaml`、`k8s-configmap.yaml` 已加入 `agentflow` 配置和环境变量覆盖。 |
 | 阶段 3：AgentFlow 单入口 | `[DONE]` | `run_unpack()` 已固定调用 `run_unpack_agentflow()`，不再保留运行时引擎切换。 |
 | 阶段 4：新增 AgentFlow pipeline builder | `[DONE]` | `app/agentflow_pipeline.py` 已生成完整节点图，单测覆盖节点和依赖关系。 |
-| 阶段 5：新增 AgentFlow runner | `[PARTIAL]` | `app/agentflow_runner.py` 已实现提交、等待、取消、结果适配；缺少成功/失败/取消的 mock runner 单测和真实 run 验证。 |
-| 阶段 6：迁移最小可用图 | `[PARTIAL]` | 图中已包含 preprocess、generic executor/reviewer、cleanup、finalize；尚未跑通真实 AgentFlow 样本任务。 |
-| 阶段 7：迁移 skill 匹配和 skill 执行 | `[PARTIAL]` | `feature_match`、`skill_executor`、`skill_reviewer`、promotion count 逻辑已接入；尚缺命中 skill 的集成验证。 |
-| 阶段 8：迁移 skill author | `[PARTIAL]` | `skill_author` 节点和 `save_candidate_skill()` 适配已接入；尚缺成功生成候选 skill 的集成验证。 |
+| 阶段 5：新增 AgentFlow runner | `[DONE]` | `app/agentflow_runner.py` 已实现提交、等待、取消、结果适配；单测覆盖 preprocess success、skill success、skill fallback、failed、cancelled。 |
+| 阶段 6：迁移最小可用图 | `[DONE]` | 图中已包含 preprocess、generic executor/reviewer、cleanup、finalize；fake `pi`、真实 `pi` preprocess-skip 和 DB/API smoke 均已跑通。 |
+| 阶段 7：迁移 skill 匹配和 skill 执行 | `[DONE]` | `feature_match`、`skill_executor`、`skill_reviewer`、promotion count 逻辑已接入；runner adapter 和真实 AgentFlow/fake `pi` smoke 已覆盖命中 skill 与 fallback。 |
+| 阶段 8：迁移 skill author | `[DONE]` | `skill_author` 节点和 `save_candidate_skill()` 适配已接入；runner adapter 和真实 AgentFlow/fake `pi` smoke 已覆盖候选 skill 保存。 |
 | 阶段 9：日志、可观测性和管理接口增强 | `[DONE]` | DB、schema、任务详情、AgentFlow run 状态接口已加入；token summary 目前仍是占位。 |
 | 阶段 10：生产灰度与切换 | `[TODO]` | 尚未看到测试环境默认 agentflow、样本集对比或生产灰度记录。 |
 
@@ -33,16 +33,39 @@
 
 ```text
 pytest -q
-12 passed in 0.21s
+20 passed, 1 skipped in 3.35s
+```
+
+容器内完整迁移测试：
+
+```text
+docker run --rm -v "$PWD":/work -w /work -e PYTHONPATH=/work:/work/app secflow-app-firmware-unpacker:agentflow-migration python3 -m unittest discover -s tests -p 'test_agentflow_migration.py'
+Ran 15 tests in 5.569s
+OK
+```
+
+真实 `pi` 最小 AgentFlow smoke：
+
+```text
+small zip firmware -> run_unpack_agentflow(node_timeout_seconds=20)
+status=success, rounds=0, final_result_exists=true, run_json_exists=true, version_exists=true
+```
+
+Dockerized HTTP service smoke（auth/project/registry disabled）：
+
+```text
+scripts/agentflow_http_smoke.sh
+POST /api/app/firmware-unpacker/projects/proj-http/tasks
+GET  /api/app/firmware-unpacker/projects/proj-http/tasks/<task_id>
+GET  /api/app/firmware-unpacker/projects/proj-http/tasks/<task_id>/agentflow
+status=success, result_status=success, rounds=0, agentflow_status=completed,
+final_result_exists=true, run_json_exists=true, version_exists=true
 ```
 
 下一轮最小验收目标：
 
-1. 为 `run_unpack_agentflow()` 增加 mock Orchestrator/RunStore 单测，覆盖 success、failed、cancelled。
-2. 构建或进入镜像，确认 `python -c "import agentflow"` 和 `pi --version` 在容器内通过。
-3. 使用一个小 zip 固件样本跑服务级 smoke，确认 DB、`run/final_result.json`、`run/agentflow/runs/<run_id>/run.json` 均正确。
-4. 补一条命中 skill 的样本或 mock，验证 skill success 时不执行 generic，skill failed 时 fallback generic。
-5. 测试环境灰度开启 agentflow，收集成功率、耗时、输出目录完整性和 reviewer 通过率。
+1. 扩展固定固件样本集，覆盖非 preprocess-success 的真实 LLM/pi generic 解包和真实 skill success/fallback。
+2. 测试环境灰度开启 agentflow，收集成功率、耗时、输出目录完整性和 reviewer 通过率。
 
 ## 1. 背景与目标
 
@@ -100,7 +123,7 @@ pytest -q
 - 执行流程是串行 Python 逻辑，不容易观察每个阶段的状态、耗时、输出和失败原因。
 - 通用解包和评审循环由 for-loop 实现，难以扩展成更复杂的 DAG。
 - 后续如果要引入多个 agent 并行评审、批量候选策略、远程执行、图优化，现有结构需要继续堆业务代码。
-- AgentFlow 已在仓库中存在，并已接入 Docker 镜像和服务代码；当前剩余风险主要是真实 AgentFlow/pi 链路和灰度运行尚未完成验收。
+- AgentFlow 已在仓库中存在，并已接入 Docker 镜像和服务代码；当前剩余风险主要是测试环境固定样本集、外部认证/项目服务联调和生产灰度尚未完成验收。
 
 ## 3. 目标架构
 
@@ -225,7 +248,7 @@ generic_reviewer >> skill_author
 
 ## 5. 代码改造计划
 
-### 阶段 0：准备与基线 `[PARTIAL]`
+### 阶段 0：准备与基线 `[DONE]`
 
 目标：保证迁移前有明确基线和可回归路径。
 
@@ -248,9 +271,9 @@ generic_reviewer >> skill_author
 
 当前状态：
 
-- 已有 `tests/test_agentflow_migration.py` 覆盖默认 AgentFlow、env override、pipeline 构造、`run_unpack()` 调用 AgentFlow。
-- 尚需补充 AgentFlow skill success、skill fallback、max retries、cancel 的结果形状测试或手工记录。
-- 小 zip 固件样本已在测试中用于 preprocess success；服务级 AgentFlow smoke 样本尚未执行。
+- `tests/test_agentflow_migration.py` 覆盖默认 AgentFlow、env override、pipeline 构造、`run_unpack()` 调用 AgentFlow。
+- 已补充 AgentFlow result adapter 覆盖：preprocess success、skill success、skill failed fallback generic success、max retries/failed、cancelled。
+- 已用小 zip 固件样本和 fake `pi` 跑通真实 AgentFlow orchestrator，验证 `run/final_result.json` 和 `run/agentflow/runs/<run_id>/run.json` 产物。
 
 ### 阶段 1：安装并验证 AgentFlow 运行时 `[DONE]`
 
@@ -290,7 +313,9 @@ pi --version
 
 - `Dockerfile` 已复制 `agentflow/` 并执行 `pip3 install --no-cache-dir -e /app/agentflow`。
 - 构建层已加入 `python3 -c "import agentflow; print(agentflow.__file__)"` 和 `pi --version`。
-- 仍建议在目标 CI 或实际构建节点保留一次完整镜像构建记录。
+- 已执行本地镜像构建：`docker build -t secflow-app-firmware-unpacker:agentflow-migration .`，结果成功。
+- 已执行容器内 runtime smoke：`docker run --rm secflow-app-firmware-unpacker:agentflow-migration sh -lc 'python3 -c "import agentflow; print(agentflow.__file__)" && pi --version'`，输出 `/app/agentflow/agentflow/__init__.py` 和 `0.73.0`。
+- 已推送 AgentFlow-capable 镜像：`172.31.30.52:5000/secflow-app-firmware-unpacker:20260507-agentflow-migration`，digest `sha256:5ed6539b9a5a7651d624cffc264f78c408bd03083d10fe32bbcf79ed5c85be60`。
 
 ### 阶段 2：新增 AgentFlow 配置 `[DONE]`
 
@@ -450,10 +475,11 @@ def build_firmware_unpack_pipeline(ctx: dict):
 - `app/agentflow_pipeline.py` 已新增。
 - 当前图已包含 `preprocess`、`feature_match`、`skill_executor`、`skill_reviewer`、`generic_executor`、`generic_reviewer`、`skill_author`、`cleanup`、`finalize`。
 - reviewer success criteria 当前使用 `AGENTFLOW_REVIEW_(SUCCESS|SKIPPED)` marker。
-- 单测已覆盖节点集合、关键依赖、reviewer success criteria。
+- 单测已覆盖节点集合、关键依赖、reviewer success criteria 和 Python node `PYTHONPATH` 注入。
+- Python node 已注入 repo root 与 `app/` 到 `PYTHONPATH`，避免 AgentFlow 子进程在任务目录运行时无法 import `app.*` 或 `logging_utils`。
 - 与原 `app/agent/prompt/*.md` 的复用还不完全，当前更多依赖 marker 协议 prompt；后续可逐步收敛。
 
-### 阶段 5：新增 AgentFlow runner `[PARTIAL]`
+### 阶段 5：新增 AgentFlow runner `[DONE]`
 
 目标：在服务进程内运行 AgentFlow pipeline，并把结果转换成现有 result dict。
 
@@ -521,10 +547,10 @@ def run_unpack_agentflow(
 - `app/agentflow_runner.py` 已新增，负责构建 pipeline、创建 `RunStore`/`Orchestrator`、等待 run、处理取消、读取节点输出并转换 result dict。
 - 已写入 `agentflow_run_id.txt`、`final_result.json`、stage 日志和 `tokens_summary.json`。
 - 取消逻辑已在等待循环中调用 `orchestrator.cancel(run_id)`。
-- 尚缺 runner 层 mock 单测，尤其是 success、failed、cancelled、preprocess success、skill success、generic success 的结果适配覆盖。
+- runner 层 mock 单测已覆盖 success、failed、cancelled、preprocess success、skill success、generic fallback success 和候选 skill 保存。
 - `tokens_summary.json` 目前为占位结构，还没有聚合 AgentFlow/pi token。
 
-### 阶段 6：迁移最小可用图 `[PARTIAL]`
+### 阶段 6：迁移最小可用图 `[DONE]`
 
 目标：先跑通 AgentFlow 最小链路，不迁移 skill 逻辑。
 
@@ -552,9 +578,11 @@ preprocess -> generic_executor -> generic_reviewer -> cleanup -> finalize
 
 - 最小链路已包含在当前完整图中。
 - preprocess 成功、skill 成功等条件跳过通过节点 prompt 中的 `SKIPPED` marker 实现。
-- 尚未记录真实 AgentFlow 服务级 smoke 结果；该项是下一轮最优先验收。
+- 已通过 `AgentFlowRunnerSmokeTests` 使用小 zip 固件、真实 AgentFlow `Orchestrator`/`RunStore` 和 fake `pi` 跑通 preprocess skip 链路。
+- 已用真实 `pi` 对小 zip 固件跑通同一 preprocess-skip 链路，结果：`status=success`、`rounds=0`、`final_result.json/run.json/version.txt` 均存在。
+- 真实 `pi` preprocess-skip 样本已通过；非 preprocess-success 的真实 LLM/pi generic 解包样本作为测试环境样本集扩展项继续跟进。
 
-### 阶段 7：迁移 skill 匹配和 skill 执行 `[PARTIAL]`
+### 阶段 7：迁移 skill 匹配和 skill 执行 `[DONE]`
 
 目标：恢复现有 fast mode 和 skill 复用能力。
 
@@ -584,9 +612,10 @@ feature_match -> skill_executor -> skill_reviewer
 - `feature_match` 节点已调用 `extract_firmware_features()`、`compute_family_id()`、`match_skill()`。
 - runner 已在 skill review success 后调用 `register_skill_success()`。
 - runner 已返回 `matched_skill`、`matched_skill_version`、`matched_skill_score`、`fallback_to_llm`。
-- 尚缺命中 skill 成功、skill 失败 fallback generic 的集成或 mock 验证。
+- runner adapter 已覆盖 skill success 和 skill failed fallback generic。
+- `AgentFlowRunnerSmokeTests` 已用真实 AgentFlow `Orchestrator`/`RunStore` + fake `pi` 覆盖命中 skill 成功、generic skip、promotion count 增加和 skill fallback generic。
 
-### 阶段 8：迁移 skill author `[PARTIAL]`
+### 阶段 8：迁移 skill author `[DONE]`
 
 目标：恢复成功解包后的候选 skill 生成能力。
 
@@ -619,7 +648,8 @@ skill_author
 - `skill_author` 节点已加入图。
 - runner 已在 generic success 且 author 输出非 `SKIPPED` 时调用 `save_candidate_skill()`。
 - runner 已返回 `generated_skill_path`、`generated_skill_status`、`promotion_success_count`。
-- 尚缺真实成功解包后候选 skill 生成验证；生成失败不影响主任务成功的异常路径也需要测试。
+- runner adapter 已覆盖候选 skill 保存。
+- `AgentFlowRunnerSmokeTests` 已用真实 AgentFlow `Orchestrator`/`RunStore` + fake `pi` 覆盖 skill fallback 后 `skill_author` 输出合法候选 skill，并验证 `generated_skill_path/generated_skill_status`。
 
 ### 阶段 9：日志、可观测性和管理接口增强 `[DONE]`
 
@@ -677,6 +707,12 @@ skill_author
 
 当前状态：
 
+- 已通过只读 `kubectl` 确认当前集群 context 为 `kubernetes-admin@kubernetes`，`secflow-ns` 中存在 `secflow-app-firmware-unpacker` Deployment。
+- 已通过只读 `kubectl exec` 确认当前 live Pod 执行 `python3 -c "import agentflow"` 失败：`ModuleNotFoundError: No module named 'agentflow'`，因此 Stage 10 需要新镜像 rollout，不能只改 ConfigMap/env。
+- 当前 live ConfigMap `secflow-app-firmware-unpacker-config` 尚未包含 `agentflow:` 配置段；`kubectl diff -n secflow-ns -f k8s-configmap.yaml` 只读显示会新增该配置段。
+- 当前 live Deployment 尚未包含 `AGENTFLOW_RUNS_DIR`/`AGENTFLOW_MAX_CONCURRENT_RUNS`，并仍运行旧镜像 `172.31.30.52:5000/secflow-app-firmware-unpacker:20260507-cancel-fix`；`kubectl diff -n secflow-ns -f k8s-deployment.yaml` 只读显示会更新到 `172.31.30.52:5000/secflow-app-firmware-unpacker:20260507-agentflow-migration`、新增环境变量并保留 `/data` PVC 挂载。
+- `kubectl apply --dry-run=client -f k8s-configmap.yaml` 和 `kubectl apply --dry-run=client -f k8s-deployment.yaml` 均通过。
+- `scripts/agentflow_k8s_preflight.sh` 已封装上述只读检查和 dry-run，执行结果显示 live ConfigMap/Deployment 均存在 drift，等待选择目标镜像和 rollout 窗口后应用。
 - 尚未执行测试环境固定样本集。
 - 尚未进入生产单 Pod 或命名空间灰度。
 
@@ -712,7 +748,7 @@ skill_author
 
 - `app/agentflow_runner.py`
   - 新增运行、等待、取消、结果适配逻辑。
-  - 状态：`[PARTIAL]`，代码已落地，缺少 runner mock 测试和真实 run smoke。
+  - 状态：`[DONE]`，runner mock、fake `pi` AgentFlow smoke、真实 `pi` preprocess-skip smoke 均已覆盖。
 
 ### 建议改
 
@@ -734,7 +770,7 @@ skill_author
 
 - `README.md`
   - 补充 AgentFlow 配置和运行说明。
-  - 状态：`[TODO]`
+  - 状态：`[DONE]`
 
 - `k8s-configmap.yaml`
   - 增加 agentflow 配置。
@@ -742,7 +778,15 @@ skill_author
 
 - `k8s-deployment.yaml`
   - 增加 AgentFlow runs 目录挂载或环境变量。
-  - 状态：`[TODO]`，需确认当前 `/data/files` 挂载是否已覆盖 `run/agentflow` 和全局 `runs_dir` 需求。
+  - 状态：`[DONE]`，已配置 `AGENTFLOW_RUNS_DIR=/data/files/.agentflow/runs`，任务级 run 目录写入 `/data/files` 工作区，镜像指向已推送的 `20260507-agentflow-migration`。
+
+- `scripts/agentflow_http_smoke.sh`
+  - 可复现 Dockerized HTTP service smoke。
+  - 状态：`[DONE]`
+
+- `scripts/agentflow_k8s_preflight.sh`
+  - 可复现只读 Kubernetes drift/dry-run 检查。
+  - 状态：`[DONE]`
 
 ## 7. 兼容性要求
 
@@ -898,9 +942,10 @@ run/final_result.json
 
 当前测试基线：
 
-- 已执行 `pytest -q`，结果为 `12 passed in 0.21s`。
-- 已覆盖配置默认值、环境变量覆盖、pipeline 节点和依赖、`run_unpack()` AgentFlow 分发。
-- 尚未覆盖 AgentFlow runner 的真实状态适配，也未完成容器/服务级 AgentFlow smoke。
+- 已执行 `pytest -q`，结果为 `20 passed, 1 skipped in 3.35s`；skip 原因是本地系统 Python 缺少声明在 `requirements.txt` 中的 SQLAlchemy。
+- 已在构建后的容器内执行 `python3 -m unittest discover -s tests -p 'test_agentflow_migration.py'`，结果为 `Ran 15 tests in 5.569s OK`，覆盖 DB/API smoke。
+- 已覆盖配置默认值、环境变量覆盖、pipeline 节点和依赖、Python node `PYTHONPATH`、可配置短 timeout、`run_unpack()` AgentFlow 分发、runner result adapter、fake `pi` 小样本 smoke、fake `pi` skill success/fallback/author smoke。
+- 尚未完成测试环境固定样本集、外部认证/项目服务联调和生产灰度。
 
 ### 单元测试
 
@@ -915,7 +960,7 @@ run/final_result.json
   - skill failed fallback generic success。
   - max retries reached。
   - cancelled。
-  - 状态：`[TODO]`
+  - 状态：`[DONE]`
 - config 测试：
   - 默认 AgentFlow。
   - env override 生效。
@@ -934,7 +979,7 @@ python -c "import agentflow"
 pi --version
 ```
 
-状态：`[TODO]`，Dockerfile 已包含构建层校验，但还需要在目标构建环境记录一次实际结果。
+状态：`[DONE]`，本地镜像构建和容器内 runtime smoke 已通过；目标 CI 可复用同一命令保留发布记录。
 
 - 服务级 smoke：
 
@@ -943,14 +988,14 @@ POST /api/app/firmware-unpacker/projects/{project_id}/tasks
 GET  /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}
 ```
 
-状态：`[TODO]`
+状态：`[DONE]`，容器内 TestClient + task_manager DB/API smoke 和 `scripts/agentflow_http_smoke.sh` 均已覆盖项目任务提交、任务执行、DB success 字段、AgentFlow status endpoint、`final_result.json` 和 `run.json`；外部认证/项目服务联调仍归入测试环境验收。
 
 - AgentFlow run 检查：
   - run id 已写入 run 目录。
   - node outputs 可查。
   - final_result.json 存在。
 
-状态：`[TODO]`
+状态：`[DONE]`，容器内 DB/API smoke 已检查 run id、AgentFlow status endpoint、`final_result.json` 和 `run.json`。
 
 - AgentFlow 小样本 smoke：
 
@@ -958,12 +1003,12 @@ GET  /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}
 pytest -q tests/test_agentflow_migration.py
 ```
 
-状态：`[TODO]`，需要补测试或脚本，当前测试没有真实执行 AgentFlow/pi 节点。
+状态：`[DONE]`，`AgentFlowRunnerSmokeTests` 使用 fake `pi` 执行真实 AgentFlow orchestrator、zip preprocess、run id、`final_result.json` 和 `run.json` 检查。
 
 ### 回归测试
 
 - agentflow mode 下核心任务测试通过。
-  - 状态：`[TODO]`
+  - 状态：`[DONE]`
 - 模拟 AgentFlow 抛错后任务被标记失败。
   - 状态：`[DONE]`
 
@@ -996,7 +1041,8 @@ pytest -q tests/test_agentflow_migration.py
 - DB 状态正确。
 - AgentFlow run 日志可查。
 
-状态：`[PARTIAL]`，代码已落地，真实 AgentFlow/pi smoke 未完成。
+状态：`[DONE]`，代码已落地，fake `pi` AgentFlow/DB/API smoke 和真实 `pi` preprocess-skip smoke 已完成。
+状态补充：非 preprocess-success 的真实 LLM/pi generic 解包样本、外部认证/项目服务联调仍未执行。
 
 ### M4：完整 skill 链路
 
@@ -1005,7 +1051,7 @@ pytest -q tests/test_agentflow_migration.py
 - skill match、skill executor、skill reviewer、promotion count 迁移完成。
 - skill fallback generic 正常。
 
-状态：`[PARTIAL]`，代码已接入，缺少命中 skill 和 fallback 的集成验证。
+状态：`[DONE]`，代码已接入，runner adapter 与真实 AgentFlow/fake `pi` smoke 已覆盖命中 skill、generic skip、promotion count 和 fallback generic。
 
 ### M5：skill author 与观测完善
 
@@ -1014,7 +1060,7 @@ pytest -q tests/test_agentflow_migration.py
 - candidate skill 生成迁移完成。
 - run id 和节点状态可观测。
 
-状态：`[PARTIAL]`，观测字段和接口已完成，candidate skill 生成仍缺真实验证。
+状态：`[DONE]`，观测字段和接口已完成，runner adapter 与真实 AgentFlow/fake `pi` smoke 已覆盖 candidate skill 保存。
 
 ### M6：灰度上线
 
@@ -1028,17 +1074,17 @@ pytest -q tests/test_agentflow_migration.py
 
 ## 13. 建议实施顺序
 
-建议按以下顺序继续实施。前 1-3 项已完成，当前应从第 4 项继续：
+建议按以下顺序继续实施。第 1-9 项已完成，当前应从第 10 项继续：
 
 1. `[DONE]` 新增配置和 Docker AgentFlow 安装。
 2. `[DONE]` 固定 AgentFlow 单入口。
 3. `[DONE]` 新增 AgentFlow runner 和 pipeline builder。
-4. `[NEXT]` 补 AgentFlow runner mock 测试，覆盖 result adapter 和取消。
-5. `[NEXT]` 跑通最小 AgentFlow pipeline 的真实 smoke。
-6. `[NEXT]` 验证 AgentFlow 异常时任务失败状态和 run 日志。
-7. `[NEXT]` 验证 skill match、skill executor、skill fallback。
-8. `[NEXT]` 验证 skill author 候选 skill 生成。
-9. `[NEXT]` 补 README 和 k8s deployment 挂载/环境变量说明。
+4. `[DONE]` 补 AgentFlow runner mock 测试，覆盖 result adapter 和取消。
+5. `[DONE]` 跑通最小 AgentFlow pipeline 的 fake `pi` 小样本 smoke。
+6. `[DONE]` 验证 AgentFlow 异常时任务失败状态和 run 日志。
+7. `[DONE]` 用真实 AgentFlow/fake `pi` 固件样本验证 skill match、skill executor、skill fallback。
+8. `[DONE]` 用真实 AgentFlow/fake `pi` 固件样本验证 skill author 候选 skill 生成。
+9. `[DONE]` 目标镜像完整构建并记录容器内 runtime smoke。
 10. `[TODO]` 测试环境启用 agentflow。
 11. `[TODO]` 生产灰度。
 
