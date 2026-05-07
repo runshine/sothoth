@@ -737,13 +737,11 @@ class TaskManager:
                         payload={"status": status},
                     )
                     break
-                if status == "failed" and stage_name in {"firmware_unpack", "system_analysis"}:
-                    task.status = "failed"
-                    task.finished_at = _now()
+                if status == "failed":
                     task.last_error = summary.get("error")
-                    self._record_event(db, task, "stage_failed", f"关键阶段失败: {stage_name}", level="error", stage_name=stage_name)
+                    self._record_event(db, task, "stage_failed", f"阶段失败，停止后续推进: {stage_name}", level="error", stage_name=stage_name)
                     db.commit()
-                    return
+                    break
             if stage_retry_mode:
                 task.execution_mode = None
                 task.target_stage_name = None
