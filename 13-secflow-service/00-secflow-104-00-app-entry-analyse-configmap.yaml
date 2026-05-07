@@ -4,36 +4,6 @@ metadata:
   name: secflow-app-entry-analyse-config
   namespace: secflow-ns
 data:
-  config.json: |
-    {
-      "max_rounds": 3,
-      "min_rounds": 2,
-      "pass_threshold": 1,
-      "agent_max_retries": 100,
-      "agent_retry_delay": 30,
-      "pi_max_retries": -1,
-      "pi_retry_delay": 5,
-      "workers": {
-        "default_tools": ["read", "bash", "edit", "write", "grep", "find"],
-        "system_prompt_dir": "/app/prompts/workers",
-        "default_thinking_level": "off",
-        "agents": [
-          {"model": "vllm/zai-org/GLM-5"}
-        ]
-      },
-      "judges": {
-        "default_tools": ["read", "bash", "grep", "find"],
-        "system_prompt_dir": "/app/prompts/judges",
-        "default_thinking_level": "off",
-        "agents": [
-          {"model": "vllm/zai-org/GLM-5"}
-        ]
-      },
-      "output_dir": "/data/output",
-      "archive_dir": "/data/output",
-      "result_dir": "/data/output"
-    }
-
   service.yaml: |
     # SecFlow App Entry Analyse Service Configuration
     database:
@@ -86,6 +56,10 @@ data:
       host: "0.0.0.0"
       port: 8080
       debug: false
+
+    configcenter_service:
+      base_url: "http://secflow-platform-configcenter/api/configcenter"
+      timeout: 30
 
     logging:
       level: "INFO"

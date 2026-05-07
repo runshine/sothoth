@@ -23,37 +23,18 @@ spec:
             value: Asia/Shanghai
         - name: PORT
           value: "8080"
-        - name: SERVICE_CONFIG
-          value: /app/config.json
         - name: SERVICE_YAML
           value: /app/service.yaml
-        - name: OUTPUT_DIR
-          value: /data/output
-        - name: RESULT_DIR
-          value: /data/output
-        - name: ARCHIVE_DIR
-          value: /data/output
-        - name: SESSION_DIR
-          value: /data/sessions
+        - name: FILESERVER_ROOT
+          value: /data/files
         ports:
         - containerPort: 8080
         volumeMounts:
         - name: secflow-app-dataflow-analyse-config
-          mountPath: /app/config.json
-          subPath: config.json
-        - name: secflow-app-dataflow-analyse-config
           mountPath: /app/service.yaml
           subPath: service.yaml
-        - name: secflow-app-dataflow-analyse-config
-          mountPath: /data/config/models.json
-          subPath: models.json
-        - name: secflow-app-dataflow-analyse-output
-          mountPath: /data/output
-        - name: secflow-app-dataflow-analyse-sessions
-          mountPath: /data/sessions
         - name: secflow-platform-fileserver-data-nfs-pvc
-          mountPath: /data/fileserver
-          readOnly: true
+          mountPath: /data
         resources:
           requests:
             memory: "256Mi"
@@ -78,16 +59,8 @@ spec:
         configMap:
           name: secflow-app-dataflow-analyse-config
           items:
-            - key: config.json
-              path: config.json
             - key: service.yaml
               path: service.yaml
-            - key: models.json
-              path: models.json
-      - name: secflow-app-dataflow-analyse-output
-        emptyDir: {}
-      - name: secflow-app-dataflow-analyse-sessions
-        emptyDir: {}
       - name: secflow-platform-fileserver-data-nfs-pvc
         persistentVolumeClaim:
           claimName: secflow-platform-fileserver-data-nfs-pvc
