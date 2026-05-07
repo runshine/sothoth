@@ -88,6 +88,19 @@ class WorkerConfig(BaseModel):
     claim_batch_size: int = 8
 
 
+class AgentFlowConfig(BaseModel):
+    """AgentFlow engine configuration."""
+
+    enabled: bool = False
+    engine_mode: str = "legacy"
+    fallback_to_legacy: bool = True
+    runs_dir: str = "/data/files/.agentflow/runs"
+    max_concurrent_runs: int = 2
+    node_timeout_seconds: int = 1800
+    use_worktree: bool = False
+    cleanup_runs_retention_days: int = 7
+
+
 class RegistryMenuLevelConfig(BaseModel):
     name: Optional[str] = None
     name_en: Optional[str] = None
@@ -153,6 +166,7 @@ class Config(BaseModel):
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
+    agentflow: AgentFlowConfig = Field(default_factory=AgentFlowConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     app: AppConfig = Field(default_factory=AppConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
@@ -182,6 +196,41 @@ def _ensure_local_database_dir(cfg: Config) -> None:
         os.makedirs(db_dir, exist_ok=True)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _apply_env_overrides(cfg: Config) -> Config:
+    cfg.agentflow.engine_mode = os.environ.get(
+        "UNPACKER_ENGINE_MODE",
+        cfg.agentflow.engine_mode,
+    ).strip().lower()
+    cfg.agentflow.enabled = _env_bool("AGENTFLOW_ENABLED", cfg.agentflow.enabled)
+    cfg.agentflow.runs_dir = os.environ.get("AGENTFLOW_RUNS_DIR", cfg.agentflow.runs_dir)
+    cfg.agentflow.max_concurrent_runs = _env_int(
+        "AGENTFLOW_MAX_CONCURRENT_RUNS",
+        cfg.agentflow.max_concurrent_runs,
+    )
+    cfg.agentflow.fallback_to_legacy = _env_bool(
+        "AGENTFLOW_FALLBACK_TO_LEGACY",
+        cfg.agentflow.fallback_to_legacy,
+    )
+    return cfg
+
+
 def load_config(config_path: Optional[str] = None) -> Config:
     global _config
     if _config is not None:
@@ -192,11 +241,11 @@ def load_config(config_path: Optional[str] = None) -> Config:
             continue
         with open(path, "r", encoding="utf-8") as file:
             data = yaml.safe_load(file) or {}
-        _config = Config(**data)
+        _config = _apply_env_overrides(Config(**data))
         _ensure_local_database_dir(_config)
         return _config
 
-    _config = Config()
+    _config = _apply_env_overrides(Config())
     _ensure_local_database_dir(_config)
     return _config
 

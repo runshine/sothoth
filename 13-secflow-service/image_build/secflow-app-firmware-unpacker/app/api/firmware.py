@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, status
@@ -114,6 +116,29 @@ def _get_task_resource_usage(task_id: str) -> dict:
         "worker_id": worker_id,
         "available": True,
         **metrics,
+    }
+
+
+def _get_task_agentflow_status(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    run_id = str(task.get("agentflow_run_id") or "").strip() or None
+    run_path = str(task.get("run_path") or "").strip()
+    run_json = None
+    if run_id and run_path:
+        candidate = Path(run_path) / "agentflow" / "runs" / run_id / "run.json"
+        if candidate.is_file():
+            try:
+                run_json = json.loads(candidate.read_text(encoding="utf-8"))
+            except Exception:
+                run_json = None
+    return {
+        "task_id": task_id,
+        "engine_mode": task.get("engine_mode"),
+        "agentflow_run_id": run_id,
+        "run_path": run_path or None,
+        "status": run_json.get("status") if isinstance(run_json, dict) else None,
+        "nodes": run_json.get("nodes") if isinstance(run_json, dict) else None,
+        "run": run_json,
     }
 
 
@@ -372,6 +397,20 @@ async def get_project_task(
     return task
 
 
+@router.get("/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/agentflow")
+async def get_project_task_agentflow(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _get_task_agentflow_status(task_id)
+
+
 @router.delete(
     "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}",
     response_model=ActionResponse,
@@ -440,6 +479,16 @@ async def get_task_legacy(
 ):
     _, token = subject_and_token
     return await _get_task_with_access(task_id, token)
+
+
+@router.get("/api/app/firmware-unpacker/tasks/{task_id}/agentflow")
+async def get_task_agentflow_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_agentflow_status(task_id)
 
 
 @router.get(

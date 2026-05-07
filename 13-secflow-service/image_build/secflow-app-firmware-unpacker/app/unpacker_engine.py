@@ -693,12 +693,35 @@ def _run_cleaner(output_path: str, log_dir: Path | None = None) -> str:
     return result
 
 
-def run_unpack(
+def _get_unpack_engine_mode() -> str:
+    try:
+        from app.config import get_config
+
+        return get_config().agentflow.engine_mode.strip().lower()
+    except Exception:
+        return os.environ.get("UNPACKER_ENGINE_MODE", "legacy").strip().lower()
+
+
+def _agentflow_fallback_enabled() -> bool:
+    try:
+        from app.config import get_config
+
+        return bool(get_config().agentflow.fallback_to_legacy)
+    except Exception:
+        return os.environ.get("AGENTFLOW_FALLBACK_TO_LEGACY", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
+
+def run_unpack_legacy(
     firmware_path: str,
     output_path: str,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> dict:
-    """Execute the firmware unpacking pipeline."""
+    """Execute the legacy Pi RPC firmware unpacking pipeline."""
 
     def _check_cancel(executor: PiRpcClient | None = None) -> None:
         if cancel_check and cancel_check():
@@ -872,3 +895,49 @@ def run_unpack(
             else generated_skill.get("promotion_success_count") if generated_skill else None
         ),
     }
+
+
+def run_unpack(
+    firmware_path: str,
+    output_path: str,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    task_id: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    """Execute the configured firmware unpacking pipeline."""
+
+    mode = _get_unpack_engine_mode()
+    if mode == "agentflow":
+        try:
+            from app.agentflow_runner import run_unpack_agentflow
+
+            return run_unpack_agentflow(
+                firmware_path,
+                output_path,
+                cancel_check=cancel_check,
+                task_id=task_id,
+                project_id=project_id,
+            )
+        except Exception:
+            if _agentflow_fallback_enabled():
+                log.exception("agentflow engine failed, falling back to legacy")
+                return run_unpack_legacy(
+                    firmware_path,
+                    output_path,
+                    cancel_check=cancel_check,
+                )
+            raise
+
+    if mode != "legacy":
+        log_event(
+            log,
+            logging.WARNING,
+            "unknown unpacker engine mode; using legacy",
+            event="unpacker_engine_unknown_mode",
+            engine_mode=mode,
+        )
+    return run_unpack_legacy(
+        firmware_path,
+        output_path,
+        cancel_check=cancel_check,
+    )

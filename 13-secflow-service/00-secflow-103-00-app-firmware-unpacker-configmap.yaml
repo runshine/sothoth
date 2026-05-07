@@ -49,6 +49,16 @@ data:
       claim_interval_seconds: 2
       claim_batch_size: 8
 
+    agentflow:
+      enabled: false
+      engine_mode: "legacy"
+      fallback_to_legacy: true
+      runs_dir: "/data/files/.agentflow/runs"
+      max_concurrent_runs: 2
+      node_timeout_seconds: 1800
+      use_worktree: false
+      cleanup_runs_retention_days: 7
+
     registry:
       enabled: true
       menu_service_url: "http://secflow-platform-menu:80"

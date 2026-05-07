@@ -26,6 +26,14 @@ spec:
               value: /app/config.yaml
             - name: UNPACKER_AGENT_DIR
               value: /app/app/agent
+            - name: UNPACKER_ENGINE_MODE
+              value: legacy
+            - name: AGENTFLOW_RUNS_DIR
+              value: /data/files/.agentflow/runs
+            - name: AGENTFLOW_MAX_CONCURRENT_RUNS
+              value: "2"
+            - name: AGENTFLOW_FALLBACK_TO_LEGACY
+              value: "true"
             - name: POD_IP
               valueFrom:
                 fieldRef:

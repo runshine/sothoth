@@ -571,6 +571,8 @@ def _run_claimed_task(task_id: str) -> None:
             runtime_paths["input_path"],
             runtime_paths["output_path"],
             cancel_check=lambda: _should_cancel(task_id),
+            task_id=task_id,
+            project_id=task.project_id,
         )
         _update_task_result(task_id, result)
     except Exception as exc:
@@ -626,6 +628,10 @@ def _update_task_result(task_id: str, result: dict) -> None:
         task.generated_skill_path = result.get("generated_skill_path")
         task.generated_skill_status = result.get("generated_skill_status")
         task.promotion_success_count = result.get("promotion_success_count")
+        task.agentflow_run_id = result.get("agentflow_run_id")
+        task.engine_mode = result.get("engine_mode")
+        task.engine_error = result.get("engine_error")
+        task.run_path = result.get("run_path")
         task.completed_at = datetime.utcnow()
         db.commit()
     finally:

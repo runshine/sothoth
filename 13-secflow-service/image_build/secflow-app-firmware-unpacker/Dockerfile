@@ -39,6 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lzma \
     gzip \
     bzip2 \
+    ripgrep \
+    fd-find \
     zstd \
     unrar \
     && rm -rf /var/lib/apt/lists/*
@@ -49,6 +51,8 @@ RUN python3 -m venv "${VIRTUAL_ENV}"
 
 COPY requirements.txt /app/
 RUN pip3 install --no-cache-dir -r /app/requirements.txt
+COPY agentflow/ /app/agentflow/
+RUN pip3 install --no-cache-dir -e /app/agentflow
 
 RUN pip3 install --no-cache-dir \
     jefferson \
@@ -102,6 +106,9 @@ COPY start.sh /app/start.sh
 
 RUN mkdir -p /app/data \
     && chmod +x /app/start.sh
+
+RUN python3 -c "import agentflow; print(agentflow.__file__)" \
+    && pi --version
 
 EXPOSE 8080
 

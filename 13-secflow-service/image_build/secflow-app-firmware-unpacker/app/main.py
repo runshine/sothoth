@@ -98,7 +98,11 @@ async def lifespan(app: FastAPI):
         start_heartbeat()
         start_task_dispatcher()
         await get_registry_service().start()
-        logger.info("secflow-app-firmware-unpacker started")
+        logger.info(
+            "secflow-app-firmware-unpacker started engine_mode=%s agentflow_enabled=%s",
+            config.agentflow.engine_mode,
+            config.agentflow.enabled,
+        )
     except Exception as exc:
         logger.exception("service startup failed: %s", exc)
         sys.exit(1)

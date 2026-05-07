@@ -63,6 +63,10 @@ class UnpackTask(Base):
     generated_skill_path = Column(String(512), nullable=True)
     generated_skill_status = Column(String(32), nullable=True)
     promotion_success_count = Column(Integer, nullable=True)
+    agentflow_run_id = Column(String(64), nullable=True)
+    engine_mode = Column(String(32), nullable=True)
+    engine_error = Column(Text, nullable=True)
+    run_path = Column(String(512), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
@@ -86,6 +90,10 @@ class UnpackTask(Base):
             "generated_skill_path": self.generated_skill_path,
             "generated_skill_status": self.generated_skill_status,
             "promotion_success_count": self.promotion_success_count,
+            "agentflow_run_id": self.agentflow_run_id,
+            "engine_mode": self.engine_mode,
+            "engine_error": self.engine_error,
+            "run_path": self.run_path,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -224,6 +232,10 @@ def _ensure_unpack_task_columns() -> None:
         "generated_skill_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_path VARCHAR(512)",
         "generated_skill_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_status VARCHAR(32)",
         "promotion_success_count": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN promotion_success_count INTEGER",
+        "agentflow_run_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN agentflow_run_id VARCHAR(64)",
+        "engine_mode": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN engine_mode VARCHAR(32)",
+        "engine_error": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN engine_error TEXT",
+        "run_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN run_path VARCHAR(512)",
     }
 
     with engine.begin() as conn:

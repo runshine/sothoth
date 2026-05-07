@@ -32,8 +32,11 @@ def detect_format(firmware_path: str) -> dict:
     magic = b""
     try:
         with open(firmware_path, "rb") as fh:
-            magic = fh.read(16)
-        if magic[:2] == b"\x1f\x8b":
+            header = fh.read(512)
+            magic = header[:16]
+        if header[257:262] == b"ustar":
+            fmt = "tar"
+        elif magic[:2] == b"\x1f\x8b":
             fmt = "gzip"
         elif magic[:4] == b"PK\x03\x04":
             fmt = "zip"
