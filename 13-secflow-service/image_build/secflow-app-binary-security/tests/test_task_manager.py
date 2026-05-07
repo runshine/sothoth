@@ -2,7 +2,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.model import BinarySecurityEvent, BinarySecurityTask
+from app.model import (
+    BinarySecurityEvent,
+    BinarySecurityTask,
+    TASK_TYPE_BINARY,
+    TASK_TYPE_SOURCE,
+)
 from app.service.task_manager import TaskManager
 
 
@@ -54,11 +59,18 @@ class TaskManagerTests(unittest.TestCase):
             (modules_dir / "dropbear").mkdir(parents=True)
             (root / "modules.list").write_text("busybox\ndropbear\n", encoding="utf-8")
 
-            modules = self.manager._parse_system_analysis_modules(root)
+            modules = self.manager._parse_system_analysis_modules(root, {
+                "firmware_key": "fw1",
+                "firmware_name": "fw1",
+                "filename": "fw1.bin",
+                "unpacked_root": str(root),
+                "task_type": TASK_TYPE_BINARY,
+            })
 
             self.assertEqual(2, len(modules))
             self.assertEqual("busybox", modules[0]["module_name"])
             self.assertTrue((root / "high_risk_modules.json").is_file())
+            self.assertEqual(str((modules_dir / "busybox")), modules[0]["source_dir"])
 
     def test_parse_entries_prefers_json_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -110,14 +122,13 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual(str(target.resolve()), path)
 
     def test_aggregate_stage_items_marks_partial_success(self):
-        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         task.summary = {}
         db = _FakeDb()
 
         status, summary = self.manager._aggregate_stage_items(
             db,
             task,
-            stage_run=None,
             results=[
                 {"status": "success", "item": {"id": "a"}},
                 {"status": "failed", "item": {"id": "b"}, "error": "boom"},
@@ -132,7 +143,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(1, db.commits)
 
     def test_finalize_task_prefers_partial_success_after_vuln_stage(self):
-        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         db = _FakeDb(rows=[_StageRun("binary_to_source", "failed"), _StageRun("vuln_scan", "partial_success")])
 
         self.manager._finalize_task(db, task)
@@ -142,11 +153,63 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(any(isinstance(obj, BinarySecurityEvent) for obj in db.added))
 
     def test_stage_enabled_uses_policy_override(self):
-        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         task.policy = {"stage_options": {"vuln_scan": {"enabled": False}}}
 
         self.assertFalse(self.manager._stage_enabled(task, "vuln_scan"))
         self.assertTrue(self.manager._stage_enabled(task, "entry_analysis"))
+
+    def test_stage_sequence_uses_task_type(self):
+        binary_task = BinarySecurityTask(id="b1", project_id="p1", name="binary", task_type=TASK_TYPE_BINARY, status="pending", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        source_task = BinarySecurityTask(id="s1", project_id="p1", name="source", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/src", output_root="/o", workspace_root="/w")
+
+        self.assertEqual(
+            ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+            self.manager._stage_sequence_for_task(binary_task),
+        )
+        self.assertEqual(
+            ["system_analysis", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+            self.manager._stage_sequence_for_task(source_task),
+        )
+
+    def test_source_system_analysis_inputs_use_workspace_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "input").mkdir()
+            task = BinarySecurityTask(id="s1", project_id="p1", name="source-task", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/src", output_root=str(workspace / "output"), workspace_root=str(workspace))
+
+            rows = self.manager._system_analysis_inputs(task)
+
+            self.assertEqual(1, len(rows))
+            self.assertEqual(TASK_TYPE_SOURCE, rows[0]["task_type"])
+            self.assertEqual(str(workspace / "input"), rows[0]["unpacked_root"])
+            self.assertEqual(str(workspace / "input"), rows[0]["source_root"])
+
+    def test_source_entry_analysis_inputs_come_from_high_risk_modules(self):
+        task = BinarySecurityTask(id="s1", project_id="p1", name="source-task", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/src", output_root="/o", workspace_root="/w")
+        task.summary = {
+            "high_risk_modules": [
+                {"module_key": "m1", "module_name": "module1", "source_dir": "/src/module1"},
+            ],
+            "b2s_results": [
+                {"module_key": "legacy", "module_name": "legacy", "source_dir": "/legacy"},
+            ],
+        }
+
+        rows = self.manager._entry_analysis_inputs(task)
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("m1", rows[0]["module_key"])
+
+    def test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
+        with self.assertRaisesRegex(Exception, "重复相对路径"):
+            self.manager._normalize_input_files(
+                [
+                    {"filename": "a.c", "relative_path": "src/a.c"},
+                    {"filename": "a.c", "relative_path": "src/a.c"},
+                ],
+                task_type=TASK_TYPE_SOURCE,
+            )
 
 
 if __name__ == "__main__":

@@ -70,10 +70,11 @@ async def ready_check():
 async def list_tasks(
     project_id: str,
     status: Optional[str] = Query(None),
+    task_type: Optional[str] = Query(None),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return get_task_manager().list_tasks(db, project_id=project_id, status=status)
+    return get_task_manager().list_tasks(db, project_id=project_id, status=status, task_type=task_type)
 
 
 @router.post("/projects/{project_id}/tasks/prepare", response_model=BinarySecurityTaskPrepareResponse)

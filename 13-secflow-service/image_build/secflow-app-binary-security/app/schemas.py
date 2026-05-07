@@ -7,7 +7,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
-from app.model import STAGE_SEQUENCE
+from app.model import STAGE_SEQUENCE, TASK_TYPE_BINARY
 
 
 class TokenUser(BaseModel):
@@ -37,6 +37,7 @@ class TaskPolicyOverrides(BaseModel):
 
 class BinarySecurityTaskCreate(BaseModel):
     task_id: Optional[str] = None
+    task_type: str = Field(default=TASK_TYPE_BINARY)
     name: str = Field(..., min_length=1)
     description: Optional[str] = None
     input_files: list[BinarySecurityInputFile] = Field(default_factory=list)
@@ -71,10 +72,12 @@ class BinarySecurityStageSummary(BaseModel):
 class BinarySecurityTaskResponse(BaseModel):
     id: str
     project_id: str
+    task_type: str = TASK_TYPE_BINARY
     name: str
     status: str
     current_stage: Optional[str] = None
     firmware_path: str
+    stage_sequence: list[str] = Field(default_factory=list)
     is_queued: bool = False
     queue_position: Optional[int] = None
     dispatcher_instance_id: Optional[str] = None

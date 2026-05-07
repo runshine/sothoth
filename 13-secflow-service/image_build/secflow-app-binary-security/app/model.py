@@ -24,6 +24,17 @@ STAGE_SEQUENCE = [
     "dataflow_analysis",
     "vuln_scan",
 ]
+TASK_TYPE_BINARY = "binary"
+TASK_TYPE_SOURCE = "source"
+TASK_STAGE_SEQUENCES = {
+    TASK_TYPE_BINARY: STAGE_SEQUENCE,
+    TASK_TYPE_SOURCE: [
+        "system_analysis",
+        "entry_analysis",
+        "dataflow_analysis",
+        "vuln_scan",
+    ],
+}
 
 
 class JsonMixin:
@@ -48,6 +59,7 @@ class BinarySecurityTask(Base, JsonMixin):
     description = Column(Text, nullable=True)
     created_by = Column(String(64), nullable=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
+    task_type = Column(String(32), nullable=False, default=TASK_TYPE_BINARY, index=True)
     current_stage = Column(String(64), nullable=True, index=True)
     firmware_name = Column(String(255), nullable=True)
     firmware_source = Column(String(32), nullable=False, default="project_filesystem")
@@ -315,6 +327,10 @@ def _ensure_compat_columns(engine) -> None:
         if "dispatch_started_at" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN dispatch_started_at DATETIME NULL"
+            )
+        if "task_type" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN task_type VARCHAR(32) NOT NULL DEFAULT '{TASK_TYPE_BINARY}'"
             )
         if "execution_mode" not in columns:
             statements.append(

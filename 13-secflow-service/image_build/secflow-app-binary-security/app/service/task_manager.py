@@ -12,13 +12,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.exception import NotFoundError, ValidationError
 from app.model import (
     STAGE_SEQUENCE,
+    TASK_STAGE_SEQUENCES,
+    TASK_TYPE_BINARY,
+    TASK_TYPE_SOURCE,
     BinarySecurityEvent,
     BinarySecurityProjectConfig,
     BinarySecurityServiceConfig,
@@ -100,6 +103,7 @@ STAGE_METRIC_RESETTERS = {
     "entry_analysis": {"entry_count": 0},
     "vuln_scan": {"vuln_result_count": 0},
 }
+SOURCE_TASK_INPUT_KEY = "source_project"
 
 
 class TaskManager:
@@ -142,6 +146,19 @@ class TaskManager:
                 return task_id
         raise ValidationError("无法生成唯一任务 ID，请重试")
 
+    def _task_type(self, task: BinarySecurityTask | str | None) -> str:
+        raw = task if isinstance(task, str) else getattr(task, "task_type", None)
+        return raw if raw in TASK_STAGE_SEQUENCES else TASK_TYPE_BINARY
+
+    def _stage_sequence_for_task(self, task: BinarySecurityTask | str | None) -> list[str]:
+        return list(TASK_STAGE_SEQUENCES[self._task_type(task)])
+
+    def _validate_task_type(self, task_type: str | None) -> str:
+        normalized = str(task_type or TASK_TYPE_BINARY).strip().lower()
+        if normalized not in TASK_STAGE_SEQUENCES:
+            raise ValidationError(f"不支持的任务类型: {task_type}")
+        return normalized
+
     async def create_task(
         self,
         db: Session,
@@ -152,12 +169,13 @@ class TaskManager:
         authorization_token: str,
     ) -> BinarySecurityTaskDetailResponse:
         task_id = validate_task_id(payload.task_id) if payload.task_id else self.prepare_task_id(db, project_id)
+        task_type = self._validate_task_type(payload.task_type)
         if db.query(BinarySecurityTask.id).filter(
             BinarySecurityTask.project_id == project_id,
             BinarySecurityTask.id == task_id,
         ).first():
             raise ValidationError("任务 ID 已存在")
-        input_files = self._normalize_input_files(payload.input_files)
+        input_files = self._normalize_input_files(payload.input_files, task_type=task_type)
         workspace_root = app_task_root(project_id, task_id)
         output_root = self._resolve_output_root(workspace_root, payload.output_root)
         input_dir = workspace_root / "input"
@@ -170,6 +188,7 @@ class TaskManager:
         task = BinarySecurityTask(
             id=task_id,
             project_id=project_id,
+            task_type=task_type,
             name=payload.name,
             description=payload.description,
             created_by=created_by,
@@ -190,6 +209,7 @@ class TaskManager:
             "run_dir": self._fileserver_task_path(task_id, "run"),
             "input_manifest_path": f"{self._fileserver_task_path(task_id, 'input')}/task-metadata.json",
             "input_files": input_files,
+            "input_kind": "source_tree" if task_type == TASK_TYPE_SOURCE else "firmware_files",
             "downstream_task_ids": {},
         }
         task.metrics = {
@@ -227,15 +247,19 @@ class TaskManager:
         if task.status not in {"pending_upload", "uploading", "ready_to_start"}:
             raise ValidationError(f"当前状态不允许确认上传完成: {task.status}")
         input_dir = Path(task.workspace_root) / "input"
-        declared = self._normalize_input_files(payload.files or [BinarySecurityInputFile(**item) for item in task.summary.get("input_files") or []])
+        declared = self._normalize_input_files(
+            payload.files or [BinarySecurityInputFile(**item) for item in task.summary.get("input_files") or []],
+            task_type=self._task_type(task),
+        )
         self._record_event(db, task, "task_upload_started", "开始校验上传文件")
         actual_files = []
         total_bytes = 0
         for file_info in declared:
             filename = str(file_info["filename"])
-            local_path = input_dir / filename
+            relative_path = str(file_info.get("relative_path") or filename).strip().replace("\\", "/")
+            local_path = input_dir / relative_path
             if not local_path.is_file():
-                raise ValidationError(f"上传文件缺失: {filename}")
+                raise ValidationError(f"上传文件缺失: {relative_path}")
             stat = local_path.stat()
             total_bytes += stat.st_size
             actual_files.append(
@@ -243,7 +267,7 @@ class TaskManager:
                     **file_info,
                     "size": stat.st_size,
                     "uploaded": True,
-                    "path": f"{task.summary.get('input_dir')}/{filename}",
+                    "path": f"{task.summary.get('input_dir')}/{relative_path}",
                 }
             )
         task.status = "ready_to_start"
@@ -276,7 +300,7 @@ class TaskManager:
         if not input_files:
             raise ValidationError("没有可用的输入文件")
         task.status = "pending"
-        task.current_stage = STAGE_SEQUENCE[0]
+        task.current_stage = self._stage_sequence_for_task(task)[0]
         task.execution_mode = None
         task.target_stage_name = None
         task.last_error = None
@@ -293,14 +317,28 @@ class TaskManager:
         }
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(db, task, "task_start_requested", "任务已进入调度队列")
-        self._record_event(db, task, "firmware_items_initialized", f"已初始化 {len(input_files)} 个固件输入")
+        if self._task_type(task) == TASK_TYPE_BINARY:
+            self._record_event(db, task, "firmware_items_initialized", f"已初始化 {len(input_files)} 个固件输入")
+        else:
+            self._record_event(db, task, "source_tree_initialized", f"已初始化源码工程输入，共 {len(input_files)} 个文件")
         db.commit()
         return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
-    def list_tasks(self, db: Session, *, project_id: str, status: str | None = None) -> BinarySecurityTaskListResponse:
+    def list_tasks(self, db: Session, *, project_id: str, status: str | None = None, task_type: str | None = None) -> BinarySecurityTaskListResponse:
         query = db.query(BinarySecurityTask).filter(BinarySecurityTask.project_id == project_id)
         if status:
             query = query.filter(BinarySecurityTask.status == status)
+        if task_type:
+            normalized_task_type = self._validate_task_type(task_type)
+            if normalized_task_type == TASK_TYPE_BINARY:
+                query = query.filter(
+                    or_(
+                        BinarySecurityTask.task_type == TASK_TYPE_BINARY,
+                        BinarySecurityTask.task_type.is_(None),
+                    )
+                )
+            else:
+                query = query.filter(BinarySecurityTask.task_type == normalized_task_type)
         tasks = query.order_by(BinarySecurityTask.created_at.desc()).all()
         queue_info = self._build_queue_info(db, project_id=project_id)
         service_config = self._load_service_config(db)
@@ -398,7 +436,7 @@ class TaskManager:
             return
         input_files = task.summary.get("input_files") or []
         task.status = "pending"
-        task.current_stage = STAGE_SEQUENCE[0]
+        task.current_stage = self._stage_sequence_for_task(task)[0]
         task.execution_mode = None
         task.target_stage_name = None
         task.last_error = None
@@ -410,7 +448,9 @@ class TaskManager:
             **task.summary,
             "downstream_task_ids": {},
             "firmware_unpack_results": [],
+            "system_analysis_results": [],
             "high_risk_modules": [],
+            "b2s_results": [],
             "entry_results": [],
             "dataflow_results": [],
             "vuln_results": [],
@@ -435,9 +475,10 @@ class TaskManager:
         db.commit()
 
     def retry_stage(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
-        if stage_name not in STAGE_SEQUENCE:
-            raise ValidationError(f"无效阶段: {stage_name}")
         task = self._task_or_404(db, project_id, task_id)
+        stage_sequence = self._stage_sequence_for_task(task)
+        if stage_name not in stage_sequence:
+            raise ValidationError(f"无效阶段: {stage_name}")
         if task.status in STAGE_RETRY_BLOCKED_TASK_STATUSES:
             raise ValidationError(f"当前任务状态不允许阶段重试: {task.status}")
         stage_run = db.query(BinarySecurityStageRun).filter(
@@ -470,7 +511,7 @@ class TaskManager:
             }
             for item in previous_items
         }
-        downstream_stale = STAGE_SEQUENCE[STAGE_SEQUENCE.index(stage_name) + 1 :]
+        downstream_stale = stage_sequence[stage_sequence.index(stage_name) + 1 :]
         summary = dict(task.summary or {})
         stage_retry_context = dict(summary.get("stage_retry_context") or {})
         stage_retry_context[stage_name] = previous_snapshot
@@ -539,7 +580,7 @@ class TaskManager:
             return
         if task.status not in {"failed", "partial_success", "cancelled"}:
             return
-        task.current_stage = self._next_incomplete_stage(db, task.id) or STAGE_SEQUENCE[0]
+        task.current_stage = self._next_incomplete_stage(db, task) or self._stage_sequence_for_task(task)[0]
         task.status = "pending"
         task.execution_mode = None
         task.target_stage_name = None
@@ -659,10 +700,11 @@ class TaskManager:
             if not task:
                 return
             token = self._service_token()
-            start_index = STAGE_SEQUENCE.index(task.current_stage) if task.current_stage in STAGE_SEQUENCE else 0
+            stage_sequence = self._stage_sequence_for_task(task)
+            start_index = stage_sequence.index(task.current_stage) if task.current_stage in stage_sequence else 0
             stage_retry_mode = task.execution_mode == "stage_retry" and bool(task.target_stage_name)
             target_stage_name = task.target_stage_name if stage_retry_mode else None
-            for stage_name in STAGE_SEQUENCE[start_index:]:
+            for stage_name in stage_sequence[start_index:]:
                 if stage_retry_mode and stage_name != target_stage_name:
                     continue
                 db.refresh(task)
@@ -916,12 +958,14 @@ class TaskManager:
             {
                 "task_id": task.id,
                 "project_id": task.project_id,
+                "task_type": self._task_type(task),
                 "name": task.name,
                 "description": task.description,
                 "created_by": task.created_by,
                 "created_at": task.created_at.isoformat() if task.created_at else None,
                 "status": status,
                 "input_files": task.summary.get("input_files", []),
+                "input_kind": task.summary.get("input_kind"),
                 "policy": task.policy,
                 "stage_options": task.policy.get("stage_options", {}),
                 "paths": {
@@ -933,9 +977,10 @@ class TaskManager:
             },
         )
 
-    def _normalize_input_files(self, files: list[BinarySecurityInputFile | dict[str, Any]]) -> list[dict[str, Any]]:
+    def _normalize_input_files(self, files: list[BinarySecurityInputFile | dict[str, Any]], *, task_type: str) -> list[dict[str, Any]]:
         rows = []
         seen_names: set[str] = set()
+        seen_paths: set[str] = set()
         seen_keys: set[str] = set()
         for index, raw in enumerate(files):
             item = raw.model_dump(mode="json") if isinstance(raw, BinarySecurityInputFile) else dict(raw)
@@ -944,9 +989,24 @@ class TaskManager:
                 raise ValidationError("上传文件名不能为空")
             if "/" in filename or "\\" in filename:
                 raise ValidationError(f"文件名不合法: {filename}")
-            if filename in seen_names:
-                raise ValidationError(f"存在重复文件名: {filename}")
-            seen_names.add(filename)
+            relative_path_raw = str(item.get("relative_path") or "").strip().replace("\\", "/").strip("/")
+            if relative_path_raw:
+                path_parts = [part for part in relative_path_raw.split("/") if part]
+                if any(part in {".", ".."} for part in path_parts):
+                    raise ValidationError(f"相对路径不合法: {relative_path_raw}")
+                effective_path = "/".join(path_parts)
+                if Path(effective_path).name != filename:
+                    effective_path = "/".join([part for part in path_parts[:-1]] + [filename]) if path_parts else filename
+            else:
+                effective_path = filename
+            if task_type == TASK_TYPE_SOURCE:
+                if effective_path in seen_paths:
+                    raise ValidationError(f"存在重复相对路径: {effective_path}")
+                seen_paths.add(effective_path)
+            else:
+                if filename in seen_names:
+                    raise ValidationError(f"存在重复文件名: {filename}")
+                seen_names.add(filename)
             firmware_key = _slug(filename)
             if firmware_key in seen_keys:
                 firmware_key = _slug(f"{index + 1}-{filename}")
@@ -956,7 +1016,7 @@ class TaskManager:
                     "filename": filename,
                     "size": int(item.get("size") or 0),
                     "content_type": item.get("content_type"),
-                    "relative_path": item.get("relative_path"),
+                    "relative_path": effective_path,
                     "metadata": item.get("metadata") or {},
                     "firmware_key": firmware_key,
                     "firmware_name": Path(filename).stem or filename,
@@ -1037,7 +1097,7 @@ class TaskManager:
             task_id=task.id,
             project_id=task.project_id,
             stage_name=stage_name,
-            sequence_no=STAGE_SEQUENCE.index(stage_name) + 1,
+            sequence_no=self._stage_sequence_for_task(task).index(stage_name) + 1,
             status="pending",
         )
         db.add(stage_run)
@@ -1091,13 +1151,16 @@ class TaskManager:
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
+        stage_sequence = self._stage_sequence_for_task(task)
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
+            task_type=self._task_type(task),
             name=task.name,
             status=task.status,
             current_stage=task.current_stage,
             firmware_path=task.firmware_path,
+            stage_sequence=stage_sequence,
             is_queued=task.status == "pending",
             queue_position=queue_position,
             dispatcher_instance_id=task.dispatcher_instance_id,
@@ -1128,6 +1191,7 @@ class TaskManager:
                     last_error=run.last_error,
                 )
                 for run in stage_runs
+                if run.stage_name in stage_sequence
             ],
         )
 
@@ -1159,10 +1223,10 @@ class TaskManager:
                 entry[item.status] += 1
         return stats
 
-    def _next_incomplete_stage(self, db: Session, task_id: str) -> str | None:
-        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task_id).all()
+    def _next_incomplete_stage(self, db: Session, task: BinarySecurityTask) -> str | None:
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         completed = {run.stage_name for run in stage_runs if run.status in {"success", "skipped"}}
-        for stage_name in STAGE_SEQUENCE:
+        for stage_name in self._stage_sequence_for_task(task):
             if stage_name not in completed:
                 return stage_name
         return None
@@ -1299,14 +1363,14 @@ class TaskManager:
 
     async def _stage_system_analysis(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
         del token
-        firmware_items = list(task.summary.get("firmware_unpack_results") or [])
-        if not firmware_items:
-            return "failed", {"error": "缺少成功解包的固件结果"}
+        system_inputs = self._system_analysis_inputs(task)
+        if not system_inputs:
+            return "failed", {"error": "缺少可用于系统分析的输入"}
         results = await self._run_stage_pool(
             task,
-            firmware_items,
+            system_inputs,
             self._stage_parallelism(task, stage_run.stage_name),
-            lambda firmware: self._run_system_analysis_item(task, stage_run, firmware),
+            lambda analysis_input: self._run_system_analysis_item(task, stage_run, analysis_input),
             retries=int(task.policy.get("max_retries_per_item") or 0),
         )
         success = [result["item"] for result in results if result.get("status") == "success"]
@@ -1333,6 +1397,23 @@ class TaskManager:
             "module_count": len(all_modules),
             "error": failed[0].get("error") if failed else None,
         }
+
+    def _system_analysis_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        if self._task_type(task) == TASK_TYPE_SOURCE:
+            input_dir = Path(task.workspace_root) / "input"
+            if not input_dir.exists():
+                return []
+            return [
+                {
+                    "firmware_key": SOURCE_TASK_INPUT_KEY,
+                    "firmware_name": task.name,
+                    "filename": "source-project",
+                    "unpacked_root": str(input_dir),
+                    "source_root": str(input_dir),
+                    "task_type": TASK_TYPE_SOURCE,
+                }
+            ]
+        return list(task.summary.get("firmware_unpack_results") or [])
 
     async def _run_system_analysis_item(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, firmware: dict[str, Any]) -> dict[str, Any]:
         session = get_session_factory()()
@@ -1411,8 +1492,11 @@ class TaskManager:
         names = [line.strip() for line in _read_text(modules_list).splitlines() if line.strip()]
         if not names and modules_dir.is_dir():
             names = [path.name for path in sorted(p for p in modules_dir.iterdir() if p.is_dir())]
+        if not names and self._task_type(firmware.get("task_type")) == TASK_TYPE_SOURCE:
+            names = ["source-project"]
         for name in names:
             module_dir = modules_dir / name
+            source_dir = module_dir if module_dir.is_dir() else Path(str(firmware.get("source_root") or firmware.get("unpacked_root") or root))
             module_key = _slug(f"{firmware['firmware_key']}-{name}")
             items.append(
                 {
@@ -1420,9 +1504,12 @@ class TaskManager:
                     "firmware_name": firmware["firmware_name"],
                     "filename": firmware["filename"],
                     "unpacked_root": firmware["unpacked_root"],
+                    "source_root": firmware.get("source_root") or firmware.get("unpacked_root"),
+                    "task_type": firmware.get("task_type", TASK_TYPE_BINARY),
                     "module_key": module_key,
                     "module_name": name,
                     "module_dir": str(module_dir),
+                    "source_dir": str(source_dir),
                     "module_report": str(module_dir / "module_report.md"),
                     "files_list": str(module_dir / "files.list"),
                 }
@@ -1461,9 +1548,9 @@ class TaskManager:
         return self._aggregate_stage_items(db, task, results, "b2s_results")
 
     async def _stage_entry_analysis(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
-        b2s_success = list(task.summary.get("b2s_results") or [])
+        b2s_success = self._entry_analysis_inputs(task)
         if not b2s_success:
-            return "failed", {"error": "没有可用于入口分析的反编译结果"}
+            return "failed", {"error": "没有可用于入口分析的源码模块"}
         results = await self._run_stage_pool(
             task,
             b2s_success,
@@ -1474,6 +1561,11 @@ class TaskManager:
         status, summary = self._aggregate_stage_items(db, task, results, "entry_results")
         summary["entry_count"] = sum(len(item.get("entries") or []) for item in summary.get("items", []))
         return status, summary
+
+    def _entry_analysis_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        if self._task_type(task) == TASK_TYPE_SOURCE:
+            return list(task.summary.get("high_risk_modules") or [])
+        return list(task.summary.get("b2s_results") or [])
 
     async def _stage_dataflow_analysis(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
         entry_results = list(task.summary.get("entry_results") or [])
