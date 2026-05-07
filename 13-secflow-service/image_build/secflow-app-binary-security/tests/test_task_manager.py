@@ -211,6 +211,63 @@ class TaskManagerTests(unittest.TestCase):
                 task_type=TASK_TYPE_SOURCE,
             )
 
+    def test_resolve_downstream_output_sources_prefers_output_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            output_dir = workspace / "output"
+            output_dir.mkdir(parents=True)
+            (output_dir / "report.md").write_text("ok", encoding="utf-8")
+
+            rows = self.manager._resolve_downstream_output_sources(
+                {"workspace_root": str(workspace)},
+                downstream_task_id="t123",
+            )
+
+            self.assertEqual(output_dir, rows[0])
+
+    def test_archive_downstream_output_copies_output_contents_without_output_layer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            output_dir = workspace / "output"
+            output_dir.mkdir(parents=True)
+            (output_dir / "result.json").write_text("{}", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(root / "task-output"),
+                workspace_root=str(root / "workspace-root"),
+            )
+            item = type("Item", (), {
+                "downstream_service": "system_analyse",
+                "stage_name": "system_analysis",
+                "downstream_task_id": "down1",
+                "item_key": "fw1",
+                "id": "si1",
+            })()
+            db = _FakeDb()
+
+            target = self.manager._archive_downstream_output(
+                db,
+                task,
+                item,
+                semantic_key="fw1",
+                payload={"workspace_root": str(workspace)},
+            )
+
+            self.assertIsNotNone(target)
+            assert target is not None
+            self.assertTrue((target / "result.json").is_file())
+            self.assertFalse((target / "output").exists())
+            self.assertEqual("system-analyse", target.parent.name)
+            self.assertEqual("fw1__down1", target.name)
+
 
 if __name__ == "__main__":
     unittest.main()

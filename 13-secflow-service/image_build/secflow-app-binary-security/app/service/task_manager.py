@@ -87,6 +87,18 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
 STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancelled"}
 STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading", "ready_to_start"}
 STAGE_SUMMARY_RESULT_KEYS = {
@@ -104,6 +116,14 @@ STAGE_METRIC_RESETTERS = {
     "vuln_scan": {"vuln_result_count": 0},
 }
 SOURCE_TASK_INPUT_KEY = "source_project"
+SERVICE_OUTPUT_FOLDERS = {
+    "firmware_unpacker": "firmware-unpacker",
+    "system_analyse": "system-analyse",
+    "binary_to_source": "binary-to-source",
+    "entry_analyse": "entry-analyse",
+    "dataflow_analyse": "dataflow-analyse",
+    "dataflow_vuln_scanner": "dataflow-vuln-scanner",
+}
 
 
 class TaskManager:
@@ -1296,8 +1316,7 @@ class TaskManager:
         try:
             firmware_key = input_file["firmware_key"]
             input_path = Path(task.workspace_root) / "input" / input_file["filename"]
-            output_dir = Path(task.output_root) / firmware_key / "unpack"
-            ensure_dir(output_dir)
+            output_dir = ensure_dir(Path(task.workspace_root) / "run" / "firmware-unpacker" / firmware_key)
             retry_snapshot = self._retry_snapshot_for_item(task, stage_run.stage_name, firmware_key)
             item = BinarySecurityStageItem(
                 id=f"si_{uuid.uuid4().hex[:20]}",
@@ -1341,14 +1360,25 @@ class TaskManager:
             )
             item.finished_at = _now()
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            archived_dir = self._archive_downstream_output(
+                session,
+                task,
+                item,
+                semantic_key=firmware_key,
+                payload={"output_path": str(output_dir)},
+            )
             result = {
                 **input_file,
                 "input_path": str(input_path),
-                "unpacked_root": str(output_dir),
+                "unpacked_root": str(archived_dir or output_dir),
                 "downstream": payload,
             }
             item.result = result
-            item.output_ref = {"unpacked_root": str(output_dir)}
+            item.output_ref = {
+                "runtime_output_path": str(output_dir),
+                "archive_root": str(archived_dir) if archived_dir else None,
+                "unpacked_root": str(archived_dir or output_dir),
+            }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -1460,8 +1490,15 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            artifact_root = Path(task.output_root) / firmware["firmware_key"] / "system-analysis"
-            materialized = self._materialize_stage_artifact(artifact_root, item.downstream_task_id, payload)
+            artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, firmware["firmware_key"], item.downstream_task_id)
+            materialized = self._materialize_stage_artifact(
+                artifact_root,
+                item.downstream_task_id,
+                payload,
+                db=session,
+                task=task,
+                item=item,
+            )
             modules = self._parse_system_analysis_modules(materialized, firmware)
             item.finished_at = _now()
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
@@ -1472,7 +1509,7 @@ class TaskManager:
                 "downstream": payload,
             }
             item.result = result
-            item.output_ref = {"artifact_root": str(materialized)}
+            item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized)}
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -1517,21 +1554,183 @@ class TaskManager:
         _write_json(root / "high_risk_modules.json", {"items": items})
         return items
 
-    def _materialize_stage_artifact(self, artifact_root: Path, downstream_task_id: str | None, payload: dict[str, Any]) -> Path:
-        ensure_dir(artifact_root)
+    def _service_output_dir(
+        self,
+        task: BinarySecurityTask,
+        downstream_service: str,
+        semantic_key: str,
+        downstream_task_id: str | None,
+    ) -> Path:
+        service_folder = SERVICE_OUTPUT_FOLDERS.get(downstream_service, downstream_service.replace("_", "-"))
+        suffix = downstream_task_id or "unknown-task"
+        dirname = f"{semantic_key}__{suffix}"
+        return ensure_dir(Path(task.output_root) / service_folder / dirname)
+
+    def _resolve_downstream_output_sources(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        downstream_task_id: str | None = None,
+        extra_paths: list[str | Path] | None = None,
+    ) -> list[Path]:
         candidates: list[Path] = []
-        for key in ("artifact_root", "result_root", "workspace_root", "output_path"):
+        payload = payload or {}
+        for key in ("output_path", "artifact_root", "result_root", "workspace_root"):
             value = payload.get(key)
             if not value:
                 continue
             raw = Path(str(value))
             if key == "output_path" and downstream_task_id and raw.exists() and (raw / downstream_task_id).exists():
-                candidates.append(raw / downstream_task_id)
+                raw = raw / downstream_task_id
+            if key == "workspace_root" and (raw / "output").exists():
+                candidates.append(raw / "output")
+            candidates.append(raw)
+        for value in extra_paths or []:
+            if not value:
+                continue
+            raw = Path(str(value))
+            if raw.is_file():
+                candidates.append(raw.parent)
             else:
                 candidates.append(raw)
+        normalized: list[Path] = []
         for candidate in candidates:
-            if candidate.exists():
+            if candidate.name == "output":
+                normalized.append(candidate)
+                continue
+            if candidate.is_dir() and (candidate / "output").exists():
+                normalized.append(candidate / "output")
+                continue
+            normalized.append(candidate)
+        return _dedupe_paths(normalized)
+
+    def _archive_downstream_output(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        semantic_key: str,
+        payload: dict[str, Any] | None = None,
+        extra_paths: list[str | Path] | None = None,
+    ) -> Path | None:
+        target_dir = self._service_output_dir(task, item.downstream_service or item.stage_name, semantic_key, item.downstream_task_id)
+        sources = self._resolve_downstream_output_sources(
+            payload,
+            downstream_task_id=item.downstream_task_id,
+            extra_paths=extra_paths,
+        )
+        existing_sources = [source for source in sources if source.exists()]
+        if not existing_sources:
+            self._record_event(
+                db,
+                task,
+                "downstream_output_copy_skipped",
+                f"下游阶段产物不存在，跳过归档: {item.downstream_service or item.stage_name}",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "target_dir": str(target_dir),
+                    "sources": [str(path) for path in sources],
+                },
+            )
+            return None
+        try:
+            for source in existing_sources:
+                _copytree(source, target_dir)
+        except Exception as exc:
+            self._record_event(
+                db,
+                task,
+                "downstream_output_copy_failed",
+                f"下游阶段产物归档失败: {exc}",
+                stage_name=item.stage_name,
+                item=item,
+                level="error",
+                payload={
+                    "target_dir": str(target_dir),
+                    "sources": [str(path) for path in existing_sources],
+                    "error": str(exc),
+                },
+            )
+            return None
+        self._record_event(
+            db,
+            task,
+            "downstream_output_copied",
+            f"下游阶段产物已归档: {item.downstream_service or item.stage_name}",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "target_dir": str(target_dir),
+                "sources": [str(path) for path in existing_sources],
+            },
+        )
+        return target_dir
+
+    def _materialize_stage_artifact(
+        self,
+        artifact_root: Path,
+        downstream_task_id: str | None,
+        payload: dict[str, Any],
+        *,
+        db: Session | None = None,
+        task: BinarySecurityTask | None = None,
+        item: BinarySecurityStageItem | None = None,
+    ) -> Path:
+        ensure_dir(artifact_root)
+        existing_candidates = [
+            candidate
+            for candidate in self._resolve_downstream_output_sources(payload, downstream_task_id=downstream_task_id)
+            if candidate.exists()
+        ]
+        if not existing_candidates:
+            if db and task and item:
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_output_copy_skipped",
+                    f"下游阶段产物不存在，跳过归档: {item.downstream_service or item.stage_name}",
+                    stage_name=item.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={"target_dir": str(artifact_root)},
+                )
+            return artifact_root
+        try:
+            for candidate in existing_candidates:
                 _copytree(candidate, artifact_root)
+        except Exception as exc:
+            if db and task and item:
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_output_copy_failed",
+                    f"下游阶段产物归档失败: {exc}",
+                    stage_name=item.stage_name,
+                    item=item,
+                    level="error",
+                    payload={
+                        "target_dir": str(artifact_root),
+                        "sources": [str(path) for path in existing_candidates],
+                        "error": str(exc),
+                    },
+                )
+            return artifact_root
+        if db and task and item:
+            self._record_event(
+                db,
+                task,
+                "downstream_output_copied",
+                f"下游阶段产物已归档: {item.downstream_service or item.stage_name}",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "target_dir": str(artifact_root),
+                    "sources": [str(path) for path in existing_candidates],
+                },
+            )
         return artifact_root
 
     async def _stage_binary_to_source(self, db: Session, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, token: str | None) -> tuple[str, dict[str, Any]]:
@@ -1664,26 +1863,40 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            artifact_root = Path(task.output_root) / module["firmware_key"] / "b2s" / module["module_key"]
-            ensure_dir(artifact_root)
+            artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, module["module_key"], item.downstream_task_id)
             generated_files = []
+            extra_paths: list[str] = []
             for child in payload.get("items", []):
+                if child.get("output_dir"):
+                    extra_paths.append(child["output_dir"])
                 for file_path in child.get("generated_files") or []:
                     src = Path(file_path)
                     if src.exists():
                         target = artifact_root / src.name
                         _copytree(src, target)
                         generated_files.append(str(target))
+                        extra_paths.append(str(src.parent))
+            archived_dir = self._archive_downstream_output(
+                session,
+                task,
+                item,
+                semantic_key=module["module_key"],
+                payload=payload,
+                extra_paths=extra_paths,
+            )
             result = {
                 **module,
-                "source_dir": str(artifact_root),
+                "source_dir": str(archived_dir or artifact_root),
                 "generated_files": generated_files,
                 "downstream": payload,
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
             item.result = result
-            item.output_ref = {"source_dir": str(artifact_root)}
+            item.output_ref = {
+                "archive_root": str(archived_dir or artifact_root),
+                "source_dir": str(archived_dir or artifact_root),
+            }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -1764,8 +1977,15 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            artifact_root = Path(task.output_root) / module["firmware_key"] / "entry" / module["module_key"]
-            materialized = self._materialize_stage_artifact(artifact_root, item.downstream_task_id, payload)
+            artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, module["module_key"], item.downstream_task_id)
+            materialized = self._materialize_stage_artifact(
+                artifact_root,
+                item.downstream_task_id,
+                payload,
+                db=session,
+                task=task,
+                item=item,
+            )
             entries = self._parse_entries(materialized, module)
             result = {
                 **module,
@@ -1777,7 +1997,7 @@ class TaskManager:
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
             item.result = result
-            item.output_ref = {"artifact_root": str(materialized)}
+            item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized)}
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -1809,8 +2029,8 @@ class TaskManager:
                     rows.append(
                         {
                             "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
-                            "firmware_key": module["firmware_key"],
-                            "firmware_name": module["firmware_name"],
+                            "firmware_key": module.get("firmware_key") or "",
+                            "firmware_name": module.get("firmware_name") or "",
                             "module_key": module["module_key"],
                             "module_name": module["module_name"],
                             "file_name": file_name,
@@ -1827,6 +2047,10 @@ class TaskManager:
         rows = []
         for line in content.splitlines():
             parts = [part.strip() for part in line.split("|")]
+            if parts and not parts[0]:
+                parts = parts[1:]
+            if parts and not parts[-1]:
+                parts = parts[:-1]
             if len(parts) >= 7 and parts[1].isdigit():
                 file_name = parts[2]
                 function_name = parts[3]
@@ -1835,8 +2059,8 @@ class TaskManager:
                     rows.append(
                         {
                             "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
-                            "firmware_key": module["firmware_key"],
-                            "firmware_name": module["firmware_name"],
+                            "firmware_key": module.get("firmware_key") or "",
+                            "firmware_name": module.get("firmware_name") or "",
                             "module_key": module["module_key"],
                             "module_name": module["module_name"],
                             "file_name": file_name,
@@ -1896,8 +2120,15 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            artifact_root = Path(task.output_root) / entry["firmware_key"] / "dataflow" / entry["entry_key"]
-            materialized = self._materialize_stage_artifact(artifact_root, item.downstream_task_id, payload)
+            artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, entry["entry_key"], item.downstream_task_id)
+            materialized = self._materialize_stage_artifact(
+                artifact_root,
+                item.downstream_task_id,
+                payload,
+                db=session,
+                task=task,
+                item=item,
+            )
             data_flow_file = self._find_first(materialized, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             result = {
                 **entry,
@@ -1908,7 +2139,7 @@ class TaskManager:
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
             item.result = result
-            item.output_ref = {"artifact_root": str(materialized), "data_flow_file": result["data_flow_file"]}
+            item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized), "data_flow_file": result["data_flow_file"]}
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -1941,7 +2172,7 @@ class TaskManager:
             item.input_ref = dataflow_result
             session.add(item)
             session.commit()
-            vuln_workspace = Path(task.output_root) / dataflow_result["firmware_key"] / "vuln" / dataflow_result["entry_key"] / "workspace"
+            vuln_workspace = ensure_dir(Path(task.workspace_root) / "run" / "dataflow-vuln-scanner" / dataflow_result["entry_key"] / "workspace")
             vuln_output = vuln_workspace / "output"
             ensure_dir(vuln_output)
             created = None
@@ -1974,17 +2205,28 @@ class TaskManager:
                 item=item,
             )
             artifacts = await get_dataflow_vuln_scanner_client().get_artifacts(item.downstream_task_id, token or "")
+            archived_dir = self._archive_downstream_output(
+                session,
+                task,
+                item,
+                semantic_key=dataflow_result["entry_key"],
+                payload={"workspace_root": artifacts.get("workspace_root")},
+            )
             result = {
                 **dataflow_result,
                 "workspace_root": artifacts.get("workspace_root"),
                 "artifact_files": artifacts.get("files", []),
+                "archive_root": str(archived_dir) if archived_dir else None,
                 "downstream": payload,
                 "artifacts": artifacts,
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
             item.result = result
-            item.output_ref = {"workspace_root": artifacts.get("workspace_root")}
+            item.output_ref = {
+                "workspace_root": artifacts.get("workspace_root"),
+                "archive_root": str(archived_dir) if archived_dir else None,
+            }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
