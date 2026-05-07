@@ -66,6 +66,36 @@ def _extract_defaults(template: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _overrides_engine_max_cycles(overrides: dict[str, Any] | None) -> bool:
+    if not isinstance(overrides, dict):
+        return False
+    workflows = overrides.get("workflows")
+    if not isinstance(workflows, dict):
+        return False
+    atomic_workflows = workflows.get("atomic")
+    if not isinstance(atomic_workflows, list):
+        return False
+    for workflow in atomic_workflows:
+        if not isinstance(workflow, dict):
+            continue
+        engine = workflow.get("engine")
+        if isinstance(engine, dict) and "max_review_cycles" in engine:
+            return True
+    return False
+
+
+def _sync_engine_max_cycles(compiled: dict[str, Any]) -> None:
+    global_cycles = (compiled.get("global") or {}).get("max_review_cycles")
+    if global_cycles is None:
+        return
+    for workflow in ((compiled.get("workflows") or {}).get("atomic") or []):
+        if not isinstance(workflow, dict):
+            continue
+        engine = workflow.setdefault("engine", {})
+        if "review_profile" in engine or workflow.get("id") == "vuln_scan":
+            engine["max_review_cycles"] = int(global_cycles)
+
+
 def normalize_config_payload(template_kind: str, config_payload: dict[str, Any] | None) -> dict[str, Any]:
     template = _load_template(template_kind)
     defaults = _extract_defaults(template)
@@ -94,6 +124,7 @@ class ProfileTemplateService:
             isinstance(config_payload, dict)
             and "max_review_cycles" in config_payload
         )
+        payload_runtime_overrides = normalized_payload.get("runtime_overrides") or {}
 
         global_cfg = compiled.setdefault("global", {})
         global_cfg["max_review_cycles"] = int(
@@ -132,6 +163,7 @@ class ProfileTemplateService:
             engine = workflow.setdefault("engine", {})
             if "review_profile" in engine or workflow.get("id") == "vuln_scan":
                 engine["review_profile"] = review_profile
+                engine["max_review_cycles"] = global_cfg["max_review_cycles"]
                 engine["max_worker_turns_per_cycle"] = profile_policy.max_worker_turns_per_cycle
                 engine["reflection_passes_per_cycle"] = profile_policy.reflection_passes_per_cycle
                 engine["reflection_max_internal_turns"] = profile_policy.reflection_max_internal_turns
@@ -157,11 +189,16 @@ class ProfileTemplateService:
                     advisor["score_thresholds"] = score_policy.score_thresholds
                     advisor["score_threshold_ramp_cycles"] = score_policy.score_threshold_ramp_cycles
 
-        payload_runtime_overrides = normalized_payload.get("runtime_overrides") or {}
+        runtime_overrides_set_engine_cycles = (
+            _overrides_engine_max_cycles(payload_runtime_overrides)
+            or _overrides_engine_max_cycles(runtime_overrides)
+        )
         if isinstance(payload_runtime_overrides, dict) and payload_runtime_overrides:
             compiled = _deep_merge(compiled, payload_runtime_overrides)
         if runtime_overrides:
             compiled = _deep_merge(compiled, runtime_overrides)
+        if not runtime_overrides_set_engine_cycles:
+            _sync_engine_max_cycles(compiled)
         return normalized_payload, compiled
 
     def get_supported_templates(self) -> list[str]:

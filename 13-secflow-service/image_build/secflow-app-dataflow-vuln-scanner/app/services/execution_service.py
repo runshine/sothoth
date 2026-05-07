@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import posixpath
 import shutil
+import shlex
+import signal
+import subprocess
+import sys
+import tempfile
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +30,7 @@ from app.models.database import (
     get_db_session,
 )
 from app.pi_vuln_core.runner import build_runtime_framework_config, run_framework_config
+from app.pi_vuln_core.utils.logger import attach_log_file, detach_log_file
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
 from app.schemas import (
     ArtifactRef,
@@ -60,6 +68,10 @@ def _principal_id(principal: dict) -> str:
 
 def _project_ids(principal: dict) -> set[str]:
     return set(principal.get("project_ids") or [])
+
+
+def _command_display(args: list[str]) -> str:
+    return " ".join(shlex.quote(str(item)) for item in args)
 
 
 class ExecutionService:
@@ -456,6 +468,167 @@ class ExecutionService:
         output_dir = ensure_dir(workspace_root / output_relative)
         return workspace_root, output_dir
 
+    def _default_dataflow_cli_runs_root(self, project_id: str) -> Path:
+        config = get_config()
+        return (
+            Path(config.fileserver_service.data_mount_path)
+            / config.fileserver_service.project_files_dirname
+            / sanitize_name(project_id)
+            / config.fileserver_service.aiwf_subproject_name
+            / "runs"
+        ).resolve()
+
+    def _resolve_dataflow_cli_runs_root(self, *, project_id: str, request: dict[str, Any]) -> Path:
+        workspace_ref = request.get("workspace_dir")
+        if workspace_ref is None:
+            return ensure_dir(self._default_dataflow_cli_runs_root(project_id)).resolve()
+        if not isinstance(workspace_ref, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="workspace_dir must be a valid directory ref")
+        runs_root = self._resolve_dataflow_input_ref(project_id=project_id, ref=workspace_ref, expected="workspace_dir")
+        if not runs_root.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {runs_root}")
+        return runs_root.resolve()
+
+    def _build_dataflow_cli_run_name(self, *, data_flow_path: Path, runs_root: Path, execution_id: str, requested_run_name: str | None = None) -> str:
+        requested = str(requested_run_name or "").strip()
+        if requested:
+            base_name = sanitize_name(requested)
+        else:
+            base_name = f"{sanitize_name(data_flow_path.stem)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_name = base_name or f"dataflow_vuln_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        if not (runs_root / run_name).exists():
+            return run_name
+        fallback = f"{run_name}_{sanitize_name(execution_id)[-8:]}"
+        if not (runs_root / fallback).exists():
+            return fallback
+        return f"{fallback}_{uuid.uuid4().hex[:6]}"
+
+    def _build_dataflow_cli_plan(
+        self,
+        *,
+        project_id: str,
+        request: dict[str, Any],
+        execution_id: str,
+    ) -> dict[str, Any]:
+        data_flow_ref = request.get("data_flow")
+        source_dir_ref = request.get("source_dir")
+        if not isinstance(data_flow_ref, dict) or not isinstance(source_dir_ref, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="dataflow scan request is incomplete")
+        if request.get("output_dir") is not None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="output_dir is not supported by run_vuln_scan.py launcher; choose workspace_dir/runs root instead",
+            )
+        data_flow_path = self._resolve_dataflow_input_ref(project_id=project_id, ref=data_flow_ref, expected="data_flow")
+        if not data_flow_path.is_file():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected file but got: {data_flow_path}")
+        source_dir_path = self._resolve_dataflow_input_ref(project_id=project_id, ref=source_dir_ref, expected="source_dir")
+        if not source_dir_path.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {source_dir_path}")
+        runs_root = self._resolve_dataflow_cli_runs_root(project_id=project_id, request=request)
+        options = request.get("options") if isinstance(request.get("options"), dict) else {}
+        run_name = self._build_dataflow_cli_run_name(
+            data_flow_path=data_flow_path,
+            runs_root=runs_root,
+            execution_id=execution_id,
+            requested_run_name=options.get("run_name"),
+        )
+        run_dir = runs_root / run_name
+        task_md_path = run_dir / "input" / "task.md"
+        return {
+            "launcher": "run_vuln_scan.py",
+            "run_name": run_name,
+            "runs_root": abs_path(runs_root),
+            "run_dir": abs_path(run_dir),
+            "task_md_path": abs_path(task_md_path),
+            "data_flow_file": abs_path(data_flow_path),
+            "source_dir": abs_path(source_dir_path),
+        }
+
+    def _write_dataflow_cli_task_preview(self, plan: dict[str, Any]) -> None:
+        from run_vuln_scan import generate_task_md
+
+        run_dir = Path(plan["run_dir"])
+        task_md_path = Path(plan["task_md_path"])
+        ensure_dir(task_md_path.parent)
+        write_text(
+            task_md_path,
+            generate_task_md(plan["data_flow_file"], plan["source_dir"]).strip() + "\n",
+        )
+        ensure_dir(run_dir / "output")
+
+    def _dataflow_cli_config_requires_file(self, *, request: dict[str, Any], runtime_overrides: dict[str, Any]) -> bool:
+        if runtime_overrides:
+            return True
+        for key in ("worker_timeout", "advisor_timeout"):
+            if request.get(key) is not None:
+                return True
+        return False
+
+    def _build_dataflow_cli_argv(
+        self,
+        *,
+        plan: dict[str, Any],
+        config_payload: dict[str, Any],
+        request: dict[str, Any],
+        compiled_config: dict[str, Any],
+        runtime_overrides: dict[str, Any],
+    ) -> tuple[list[str], str | None]:
+        argv = [
+            "--data-flow",
+            plan["data_flow_file"],
+            "--source-dir",
+            plan["source_dir"],
+            "--runs-root",
+            plan["runs_root"],
+            "--run-name",
+            plan["run_name"],
+        ]
+        temp_config_path: str | None = None
+        if self._dataflow_cli_config_requires_file(request=request, runtime_overrides=runtime_overrides):
+            fd, temp_config_path = tempfile.mkstemp(prefix="secflow-dataflow-cli-", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json_payload = compiled_config or {}
+                import json
+
+                json.dump(json_payload, handle, ensure_ascii=False, indent=2)
+            argv.extend(["--config", temp_config_path])
+            return argv, temp_config_path
+
+        model = str(config_payload.get("model") or request.get("model") or "").strip()
+        thinking = str(config_payload.get("thinking") or request.get("thinking") or "high").strip() or "high"
+        review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
+        max_cycles = int(config_payload.get("max_review_cycles") or request.get("max_review_cycles") or 0)
+        result_review_concurrency = int(config_payload.get("result_review_concurrency") or request.get("result_review_concurrency") or 3)
+        if model:
+            argv.extend(["--model", model])
+        if thinking:
+            argv.extend(["--thinking", thinking])
+        if max_cycles > 0:
+            argv.extend(["--max-cycles", str(max_cycles)])
+        argv.extend(["--result-review-concurrency", str(max(result_review_concurrency, 1))])
+        argv.extend(["--review-profile", review_profile])
+        return argv, temp_config_path
+
+    def _is_dataflow_cli_task_metadata(self, metadata: dict[str, Any]) -> bool:
+        request = metadata.get("dataflow_scan_request")
+        return isinstance(request, dict) and request.get("launcher") == "run_vuln_scan.py"
+
+    def _update_trigger_cli_task(
+        self,
+        *,
+        trigger: TriggerTask,
+        metadata: dict[str, Any],
+        task_md_path: str,
+    ) -> None:
+        manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        if not manifest.tasks:
+            return
+        task = manifest.tasks[0]
+        task.metadata = metadata
+        task.task_md_path = task_md_path
+        trigger.input_tasks_json = TaskManifest(tasks=[task, *manifest.tasks[1:]]).model_dump(mode="json")
+
     def _materialize_dataflow_scan_inputs(self, *, task_input_dir: Path, metadata: Dict[str, Any]) -> tuple[str | None, Dict[str, Any]]:
         request = metadata.get("dataflow_scan_request")
         if not isinstance(request, dict):
@@ -583,6 +756,22 @@ class ExecutionService:
                 )
             )
         return normalized
+
+    def _prepare_single_task_entry_file(self, *, workspace_root: Path, manifest: TaskManifest) -> str | None:
+        if len(manifest.tasks) != 1:
+            return None
+        task = manifest.tasks[0]
+        markdown_path = str(task.task_md_path or "").strip()
+        if not markdown_path:
+            return None
+        try:
+            markdown = Path(markdown_path).read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        if not markdown.strip():
+            return None
+        task_file = write_text(workspace_root / "input" / "task.md", markdown.strip() + "\n")
+        return abs_path(task_file)
 
     def _build_project_workspace_root(
         self,
@@ -799,6 +988,113 @@ class ExecutionService:
         )
         return trigger, execution
 
+    def _create_dataflow_cli_execution_attempt(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask,
+        definition: WorkflowDefinition,
+        definition_version: WorkflowDefinitionVersion,
+        actor: str,
+        recovery_reason: str | None = None,
+    ) -> WorkflowExecution:
+        manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        if not manifest.tasks:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="input_tasks must not be empty")
+        task = manifest.tasks[0]
+        metadata = dict(task.metadata or {})
+        request = metadata.get("dataflow_scan_request")
+        if not isinstance(request, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="dataflow scan request is incomplete")
+        execution_id = _new_id("exec")
+        next_attempt_no = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.trigger_task_id == trigger.id)
+            .count()
+        ) + 1
+        plan = self._build_dataflow_cli_plan(
+            project_id=definition.project_id,
+            request=request,
+            execution_id=execution_id,
+        )
+        metadata["dataflow_cli"] = plan
+        self._write_dataflow_cli_task_preview(plan)
+        task.task_md_path = plan["task_md_path"]
+        task.metadata = metadata
+        trigger.input_tasks_json = TaskManifest(tasks=[task, *manifest.tasks[1:]]).model_dump(mode="json")
+        trigger.status = "pending"
+        trigger.latest_execution_id = execution_id
+        trigger.workflow_definition_version_id = definition_version.id
+        trigger.profile_id = definition.id
+        trigger.finished_at = None
+        trigger.message = "pending dispatch" if not recovery_reason else f"pending dispatch: {recovery_reason}"
+        execution = WorkflowExecution(
+            id=execution_id,
+            trigger_task_id=trigger.id,
+            workflow_definition_id=definition.id,
+            workflow_definition_version_id=definition_version.id,
+            project_id=definition.project_id,
+            attempt_no=next_attempt_no,
+            status="pending",
+            recovery_reason=recovery_reason,
+            workspace_root=plan["run_dir"],
+            message="pending dispatch" if not recovery_reason else f"pending dispatch: {recovery_reason}",
+        )
+        db.add(trigger)
+        db.add(execution)
+        db.flush()
+        return execution
+
+    def _create_dataflow_cli_task_record(
+        self,
+        db: Session,
+        *,
+        definition: WorkflowDefinition,
+        definition_version: WorkflowDefinitionVersion,
+        payload: ScanTaskCreateRequest,
+        metadata: dict[str, Any],
+        priority: int,
+        actor: str,
+    ) -> tuple[TriggerTask, WorkflowExecution]:
+        trigger = TriggerTask(
+            id=_new_id("tt"),
+            workflow_definition_id=definition.id,
+            workflow_definition_version_id=definition_version.id,
+            profile_id=definition.id,
+            project_id=definition.project_id,
+            trigger_type="manual",
+            input_tasks_json=TaskManifest(tasks=[]).model_dump(mode="json"),
+            priority=priority,
+            status="pending",
+            submitted_by=actor,
+            retry_count=0,
+            max_retry_count=definition.max_retry_count,
+            latest_execution_id=None,
+            message="pending dispatch",
+        )
+        db.add(trigger)
+        db.flush()
+        trigger.input_tasks_json = TaskManifest(
+            tasks=[
+                TaskItem(
+                    task_id=_new_id("task"),
+                    task_type="dataflow_vuln_scan_cli",
+                    title=payload.title,
+                    task_md_path=abs_path(self._default_dataflow_cli_runs_root(definition.project_id) / "_pending" / trigger.id / "task.md"),
+                    metadata=metadata,
+                    upstream_refs=[],
+                )
+            ]
+        ).model_dump(mode="json")
+        execution = self._create_dataflow_cli_execution_attempt(
+            db,
+            trigger=trigger,
+            definition=definition,
+            definition_version=definition_version,
+            actor=actor,
+        )
+        return trigger, execution
+
     def create_scan_task(
         self,
         db: Session,
@@ -842,6 +1138,7 @@ class ExecutionService:
         }
         if payload.data_flow and payload.source_dir:
             metadata["dataflow_scan_request"] = {
+                "launcher": "run_vuln_scan.py",
                 "project_id": payload.project_id,
                 "workspace_dir": payload.workspace_dir.model_dump(mode="json") if payload.workspace_dir else None,
                 "data_flow": payload.data_flow.model_dump(mode="json"),
@@ -857,24 +1154,35 @@ class ExecutionService:
                 "result_review_concurrency": payload.result_review_concurrency,
                 "options": payload.scan_options,
             }
-        trigger, _ = self._create_task_record(
-            db,
-            definition=definition,
-            definition_version=definition_version,
-            input_tasks=[
-                TriggerTaskInputTask(
-                    task_id=_new_id("task"),
-                    title=payload.title,
-                    task_markdown=payload.task_markdown,
-                    metadata=metadata,
-                    upstream_refs=[],
-                )
-            ],
-            priority=payload.priority if payload.priority is not None else definition.priority_default,
-            trigger_type="manual",
-            actor=actor,
-            authorization_token=authorization_token,
-        )
+        if payload.data_flow and payload.source_dir:
+            trigger, _ = self._create_dataflow_cli_task_record(
+                db,
+                definition=definition,
+                definition_version=definition_version,
+                payload=payload,
+                metadata=metadata,
+                priority=payload.priority if payload.priority is not None else definition.priority_default,
+                actor=actor,
+            )
+        else:
+            trigger, _ = self._create_task_record(
+                db,
+                definition=definition,
+                definition_version=definition_version,
+                input_tasks=[
+                    TriggerTaskInputTask(
+                        task_id=_new_id("task"),
+                        title=payload.title,
+                        task_markdown=payload.task_markdown,
+                        metadata=metadata,
+                        upstream_refs=[],
+                    )
+                ],
+                priority=payload.priority if payload.priority is not None else definition.priority_default,
+                trigger_type="manual",
+                actor=actor,
+                authorization_token=authorization_token,
+            )
         db.commit()
         db.refresh(trigger)
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
@@ -1138,15 +1446,27 @@ class ExecutionService:
         actor = _principal_id(principal)
         if increment_retry_count:
             trigger.retry_count += 1
-        execution = self._create_execution_attempt(
-            db,
-            trigger=trigger,
-            definition=definition,
-            definition_version=version,
-            actor=actor,
-            authorization_token=authorization_token,
-            recovery_reason=recovery_reason,
-        )
+        manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        metadata = dict(manifest.tasks[0].metadata or {}) if manifest.tasks else {}
+        if self._is_dataflow_cli_task_metadata(metadata):
+            execution = self._create_dataflow_cli_execution_attempt(
+                db,
+                trigger=trigger,
+                definition=definition,
+                definition_version=version,
+                actor=actor,
+                recovery_reason=recovery_reason,
+            )
+        else:
+            execution = self._create_execution_attempt(
+                db,
+                trigger=trigger,
+                definition=definition,
+                definition_version=version,
+                actor=actor,
+                authorization_token=authorization_token,
+                recovery_reason=recovery_reason,
+            )
         db.commit()
         db.refresh(trigger)
         self.record_event(
@@ -1388,15 +1708,204 @@ class ExecutionService:
         )
         return True
 
+    def _invoke_run_vuln_scan_cli(
+        self,
+        *,
+        argv: list[str],
+        db: Session,
+        execution: WorkflowExecution,
+        trigger: TriggerTask,
+    ) -> int:
+        if os.environ.get("SECFLOW_DATAFLOW_CLI_IN_PROCESS") == "1":
+            import run_vuln_scan
+
+            try:
+                run_vuln_scan.main(argv)
+                return 0
+            except SystemExit as exc:
+                code = exc.code
+                if code is None:
+                    return 0
+                if isinstance(code, int):
+                    return code
+                return 1
+
+        script_path = Path(__file__).resolve().parents[2] / "run_vuln_scan.py"
+        cmd = [sys.executable, str(script_path), *argv]
+        process = subprocess.Popen(cmd, cwd=str(script_path.parent))
+        try:
+            while process.poll() is None:
+                time.sleep(max(1, int(get_config().service.execution_cancel_check_interval_seconds)))
+                db.expire(execution)
+                db.expire(trigger)
+                if execution.status == "cancel_requested" or trigger.status == "cancel_requested":
+                    process.send_signal(signal.SIGINT)
+                    try:
+                        return process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.terminate()
+                        try:
+                            return process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            return process.wait()
+            return int(process.returncode or 0)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+
+    def _run_claimed_dataflow_cli_execution(
+        self,
+        *,
+        db: Session,
+        execution: WorkflowExecution,
+        trigger: TriggerTask,
+        definition: WorkflowDefinition,
+        version: WorkflowDefinitionVersion,
+        metadata: dict[str, Any],
+    ) -> None:
+        launcher_mode = "run_vuln_scan_cli"
+        request = metadata.get("dataflow_scan_request")
+        plan = metadata.get("dataflow_cli")
+        if not isinstance(request, dict) or not isinstance(plan, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="dataflow CLI task metadata is incomplete")
+        run_dir = Path(plan["run_dir"])
+        self._write_dataflow_cli_task_preview(plan)
+        execution.workspace_root = abs_path(run_dir)
+        execution.message = "run_vuln_scan.py running"
+        if execution.started_at is None:
+            execution.started_at = datetime.utcnow()
+        if trigger.started_at is None:
+            trigger.started_at = execution.started_at
+        trigger.status = "running"
+        trigger.message = "run_vuln_scan.py running"
+        db.add(execution)
+        db.add(trigger)
+        db.commit()
+
+        runtime_overrides = dict(metadata.get("runtime_overrides") or {})
+        config_payload = version.config_payload_json or definition.config_payload_json or {}
+        compiled_config = version.compiled_config_json or version.definition_json or definition.definition_json
+        temp_config_path: str | None = None
+        argv: list[str] = []
+        try:
+            argv, temp_config_path = self._build_dataflow_cli_argv(
+                plan=plan,
+                config_payload=config_payload,
+                request=request,
+                compiled_config=compiled_config,
+                runtime_overrides=runtime_overrides,
+            )
+            command = [sys.executable, str(Path(__file__).resolve().parents[2] / "run_vuln_scan.py"), *argv]
+            metadata["dataflow_cli"] = {
+                **plan,
+                "argv": argv,
+                "command": command,
+                "command_display": _command_display(command),
+                "launch_mode": launcher_mode,
+            }
+            self._update_trigger_cli_task(trigger=trigger, metadata=metadata, task_md_path=plan["task_md_path"])
+            db.add(trigger)
+            db.commit()
+            get_history_run_service().sync_execution_run(db, execution)
+            db.commit()
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="execution_started",
+                message="run_vuln_scan.py started",
+                payload_json={
+                    "workspace_root": abs_path(run_dir),
+                    "owner_pod_id": execution.owner_pod_id,
+                    "launch_mode": launcher_mode,
+                    "command": command,
+                    "command_display": _command_display(command),
+                    "run_name": plan["run_name"],
+                    "runs_root": plan["runs_root"],
+                },
+            )
+            exit_code = self._invoke_run_vuln_scan_cli(
+                argv=argv,
+                db=db,
+                execution=execution,
+                trigger=trigger,
+            )
+            db.refresh(execution)
+            db.refresh(trigger)
+            history_run = get_history_run_service().sync_execution_run(db, execution)
+            output_summary = run_dir / "output" / "execution_summary.json"
+            output_manifest = run_dir / "output" / "tasks.json"
+            output_manifest_path = output_manifest if output_manifest.is_file() else output_summary if output_summary.is_file() else None
+            if exit_code == 0:
+                terminal_status = "succeeded"
+                message = "run_vuln_scan.py completed"
+            elif exit_code == 130 or execution.status == "cancel_requested" or trigger.status == "cancel_requested":
+                terminal_status = "cancelled"
+                message = "run_vuln_scan.py cancelled"
+            else:
+                terminal_status = "failed"
+                message = f"run_vuln_scan.py failed with exit code {exit_code}"
+            self._set_terminal_state(
+                db,
+                execution=execution,
+                trigger=trigger,
+                execution_status=terminal_status,
+                message=message,
+                output_manifest_path=abs_path(output_manifest_path) if output_manifest_path else None,
+                output_task_count=int(history_run.result_count if history_run else 0),
+            )
+            db.commit()
+            get_history_run_service().sync_execution_run(db, execution)
+            db.commit()
+            event_type = "execution_finished"
+            if terminal_status == "cancelled":
+                event_type = "execution_cancelled"
+            elif terminal_status != "succeeded":
+                event_type = "execution_failed"
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type=event_type,
+                message=message,
+                level="info" if terminal_status == "succeeded" else "warning",
+                payload_json={
+                    "status": execution.status,
+                    "exit_code": exit_code,
+                    "launch_mode": launcher_mode,
+                    "run_dir": abs_path(run_dir),
+                    "output_manifest_path": execution.output_manifest_path,
+                    "output_task_count": execution.output_task_count,
+                },
+            )
+        finally:
+            if temp_config_path:
+                try:
+                    Path(temp_config_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     def run_claimed_execution(self, execution_id: str) -> None:
         db = get_db_session()
         execution: WorkflowExecution | None = None
         trigger: TriggerTask | None = None
+        launcher_mode = "rest_service"
         try:
             execution = self._execution_or_404(db, execution_id)
             trigger = self._trigger_or_404(db, execution.trigger_task_id)
             definition = self._definition_or_404(db, execution.workflow_definition_id)
             version = self._definition_version_or_404(db, execution.workflow_definition_version_id or trigger.workflow_definition_version_id)
+            service_manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+            task_metadata = dict(service_manifest.tasks[0].metadata or {}) if service_manifest.tasks else {}
+            if self._is_dataflow_cli_task_metadata(task_metadata):
+                self._run_claimed_dataflow_cli_execution(
+                    db=db,
+                    execution=execution,
+                    trigger=trigger,
+                    definition=definition,
+                    version=version,
+                    metadata=task_metadata,
+                )
+                return
             compiled_config = version.compiled_config_json or version.definition_json or definition.definition_json
             workspace_root = Path(execution.workspace_root) if execution.workspace_root else self._build_workspace_root(execution.id, definition)
             input_manifest_path = workspace_root / "input" / "tasks.json"
@@ -1414,15 +1923,6 @@ class ExecutionService:
             db.add(execution)
             db.add(trigger)
             db.commit()
-            self.record_event(
-                db,
-                execution_id=execution.id,
-                event_type="execution_started",
-                message="execution claimed and started",
-                payload_json={"workspace_root": str(workspace_root), "owner_pod_id": execution.owner_pod_id},
-            )
-            service_manifest = TaskManifest.model_validate(trigger.input_tasks_json)
-            task_metadata = dict(service_manifest.tasks[0].metadata or {}) if service_manifest.tasks else {}
             custom_workspace_root, custom_output_dir = self._resolve_custom_execution_paths(
                 project_id=definition.project_id,
                 metadata=task_metadata,
@@ -1433,15 +1933,21 @@ class ExecutionService:
                 execution.workspace_root = abs_path(workspace_root)
                 db.add(execution)
                 db.commit()
+            single_task_entry_file = self._prepare_single_task_entry_file(
+                workspace_root=workspace_root,
+                manifest=service_manifest,
+            )
+            entry_task_file = single_task_entry_file or service_manifest.tasks[0].task_md_path
+            launcher_mode = "rest_service_cli" if single_task_entry_file else "rest_service"
             runtime_config = build_runtime_framework_config(
                 compiled_config,
                 workspace_root=abs_path(workspace_root),
                 execution_id=execution.id,
-                input_task_file=service_manifest.tasks[0].task_md_path,
+                input_task_file=entry_task_file,
                 input_task_id=service_manifest.tasks[0].task_id,
                 output_dir=abs_path(custom_output_dir or (workspace_root / "output")),
                 summary_file=abs_path((custom_output_dir or (workspace_root / "output")) / "execution_summary.json"),
-                runtime_mode="rest_service",
+                runtime_mode=launcher_mode,
             )
             write_json(workspace_root / "config.json", runtime_config.model_dump(mode="json"))
             write_json(
@@ -1449,23 +1955,40 @@ class ExecutionService:
                 {
                     "started_at": datetime.utcnow().isoformat(),
                     "status": "running",
-                    "last_mode": "rest_service",
+                    "last_mode": launcher_mode,
                     "last_updated_at": datetime.utcnow().isoformat(),
                 },
             )
             get_history_run_service().sync_execution_run(db, execution)
             db.commit()
+            log_path = attach_log_file(abs_path(workspace_root / "run.log"))
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="execution_started",
+                message="execution claimed and started",
+                payload_json={
+                    "workspace_root": str(workspace_root),
+                    "owner_pod_id": execution.owner_pod_id,
+                    "launch_mode": launcher_mode,
+                    "entry_task_file": entry_task_file,
+                    "log_path": log_path,
+                },
+            )
             observer = DbExecutionObserver(execution.id)
             recorder = DbExecutionRecorder(abs_path(workspace_root), execution.id)
             ensure_event_loop_policy()
-            artifacts = asyncio.run(
-                run_framework_config(
-                    runtime_config,
-                    initial_tasks=build_core_tasks(service_manifest),
-                    observer=observer,
-                    recorder=recorder,
+            try:
+                artifacts = asyncio.run(
+                    run_framework_config(
+                        runtime_config,
+                        initial_tasks=None if single_task_entry_file else build_core_tasks(service_manifest),
+                        observer=observer,
+                        recorder=recorder,
+                    )
                 )
-            )
+            finally:
+                detach_log_file()
             output_manifest_path = write_final_task_manifest(
                 workspace_root=workspace_root,
                 final_tasks=artifacts.result.final_tasks,
@@ -1491,7 +2014,7 @@ class ExecutionService:
                     "finished_at": datetime.utcnow().isoformat(),
                     "status": execution.status,
                     "exit_code": 0 if artifacts.result.success else 1,
-                    "last_mode": "rest_service",
+                    "last_mode": launcher_mode,
                     "last_updated_at": datetime.utcnow().isoformat(),
                 },
             )
@@ -1506,6 +2029,7 @@ class ExecutionService:
                     "status": execution.status,
                     "output_manifest_path": execution.output_manifest_path,
                     "output_task_count": execution.output_task_count,
+                    "launch_mode": launcher_mode,
                 },
             )
         except Exception as exc:
@@ -1527,7 +2051,7 @@ class ExecutionService:
                             "finished_at": datetime.utcnow().isoformat(),
                             "status": "cancelled",
                             "exit_code": 130,
-                            "last_mode": "rest_service",
+                            "last_mode": launcher_mode,
                             "last_updated_at": datetime.utcnow().isoformat(),
                         },
                     )
@@ -1556,7 +2080,7 @@ class ExecutionService:
                         "finished_at": datetime.utcnow().isoformat(),
                         "status": "failed",
                         "exit_code": 1,
-                        "last_mode": "rest_service",
+                        "last_mode": launcher_mode,
                         "last_updated_at": datetime.utcnow().isoformat(),
                     },
                 )

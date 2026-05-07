@@ -175,6 +175,41 @@ def test_profile_template_compilation_applies_score_gates() -> None:
     assert engine["required_pattern_families"] == list(get_review_profile_policy("audit").required_pattern_families)
 
 
+def test_profile_template_compilation_syncs_review_cycles_to_engine() -> None:
+    service = ProfileTemplateService()
+    _, config = service.compile_profile(
+        template_kind="vuln_scan_default",
+        config_payload={
+            "model": "mock/model",
+            "thinking": "high",
+            "review_profile": "fast",
+            "max_review_cycles": 3,
+        },
+    )
+
+    engine = config["workflows"]["atomic"][0]["engine"]
+    assert config["global"]["max_review_cycles"] == 3
+    assert engine["review_profile"] == "fast"
+    assert engine["max_review_cycles"] == 3
+
+
+def test_profile_template_runtime_global_cycles_reach_engine() -> None:
+    service = ProfileTemplateService()
+    _, config = service.compile_profile(
+        template_kind="vuln_scan_default",
+        config_payload={
+            "model": "mock/model",
+            "thinking": "high",
+            "review_profile": "balanced",
+        },
+        runtime_overrides={"global": {"max_review_cycles": 4}},
+    )
+
+    engine = config["workflows"]["atomic"][0]["engine"]
+    assert config["global"]["max_review_cycles"] == 4
+    assert engine["max_review_cycles"] == 4
+
+
 def test_profile_gate_requires_artifacts_and_pattern_family_evidence(tmp_path) -> None:
     work_dir = tmp_path / "work"
     (work_dir / "_meta").mkdir(parents=True)

@@ -181,6 +181,9 @@ def _task_markdown_for_run(run_root: Path) -> str:
         content = _read_text_file(candidate)
         if content:
             return content
+    content = _read_text_file(run_root / "input" / "task.md")
+    if content:
+        return content
     return ""
 
 

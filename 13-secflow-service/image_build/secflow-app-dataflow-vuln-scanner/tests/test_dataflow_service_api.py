@@ -119,6 +119,51 @@ def test_create_task_bootstraps_default_profile_when_missing(service_config_path
     assert profile_items[0]["enabled"] is True
 
 
+def test_task_bound_profile_versions_do_not_become_default(service_config_path, patch_mock_agent_runtime):
+    app = create_app()
+    client = TestClient(app)
+
+    create_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+    assert create_profile.status_code == 201
+    profile = create_profile.json()
+    profile_id = profile["profile_id"]
+    assert profile["version"] == 1
+
+    override_task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile_id,
+            "title": "fast one-off task",
+            "task_markdown": "# Package List\n\n- demo.tar.gz\n",
+            "review_profile": "fast",
+            "max_review_cycles": 1,
+        },
+    )
+    assert override_task.status_code == 201
+    assert override_task.json()["profile_version"] == 2
+
+    default_task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile_id,
+            "title": "default task after one-off override",
+            "task_markdown": "# Package List\n\n- demo.tar.gz\n",
+        },
+    )
+    assert default_task.status_code == 201
+    assert default_task.json()["profile_version"] == 1
+
+    profile_after = client.get(f"/api/dataflow-vuln-scanner/profiles/{profile_id}")
+    assert profile_after.status_code == 200
+    assert profile_after.json()["version"] == 1
+
+    effective = client.get("/api/dataflow-vuln-scanner/projects/default/config/effective")
+    assert effective.status_code == 200
+    assert effective.json()["effective_config"]["profile_version"]["version"] == 1
+
+
 def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path, patch_mock_agent_runtime):
     config = get_config()
     project_root = config.fileserver_service.data_mount_path
@@ -157,9 +202,11 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     assert detail.status_code == 200
     payload = detail.json()
     assert "漏洞挖掘任务" in payload["task_markdown"]
-    materialized = payload["task_metadata"]["dataflow_scan_materialized"]
-    assert materialized["data_flow_file"].endswith("data_flow.md")
-    assert materialized["source_dir"].endswith("source")
+    cli_plan = payload["task_metadata"]["dataflow_cli"]
+    assert cli_plan["launcher"] == "run_vuln_scan.py"
+    assert cli_plan["data_flow_file"] == str((case_root / "data_flow.md").resolve())
+    assert cli_plan["source_dir"] == str(source_dir.resolve())
+    assert Path(cli_plan["run_dir"]).parent.name == "runs"
 
     execution_id = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/attempts").json()[0]["execution_id"]
     assert SchedulerService()._claim_next_execution() == execution_id
@@ -175,10 +222,13 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
 
     run_files = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/runs/{execution_id}/files")
     assert run_files.status_code == 200
-    assert any(item["path"].endswith("task.md") for item in run_files.json())
+    file_paths = [item["path"] for item in run_files.json()]
+    assert "input/task.md" in file_paths
+    assert "config.json" in file_paths
+    assert "run.log" in file_paths
 
 
-def test_business_dataflow_task_uses_selected_workspace_and_output_dirs(service_config_path, patch_mock_agent_runtime):
+def test_business_dataflow_task_uses_selected_runs_root(service_config_path, patch_mock_agent_runtime):
     config = get_config()
     project_root = config.fileserver_service.data_mount_path
     from pathlib import Path
@@ -186,8 +236,69 @@ def test_business_dataflow_task_uses_selected_workspace_and_output_dirs(service_
 
     case_root = Path(project_root) / "files" / "default" / "case-custom"
     source_dir = case_root / "source"
-    workspace_dir = case_root / "workspace"
-    output_dir = workspace_dir / "nested-output"
+    runs_root = case_root / "runs"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    runs_root.mkdir(parents=True, exist_ok=True)
+    (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
+    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "business scan custom workspace",
+            "workspace_dir": {"source": "project_filesystem", "path": "/case-custom/runs"},
+            "data_flow": {"source": "project_filesystem", "path": "/case-custom/data_flow.md"},
+            "source_dir": {"source": "project_filesystem", "path": "/case-custom/source"},
+            "model": "mock/model",
+            "thinking": "medium",
+            "review_profile": "fast",
+            "max_review_cycles": 1,
+            "result_review_concurrency": 1,
+            "priority": 80,
+        },
+    )
+    assert task.status_code == 201
+    task_id = task.json()["task_id"]
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
+    assert detail.status_code == 200
+    cli_plan = detail.json()["task_metadata"]["dataflow_cli"]
+    assert cli_plan["runs_root"] == str(runs_root.resolve())
+
+    attempts = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/attempts")
+    assert attempts.status_code == 200
+    execution_id = attempts.json()[0]["execution_id"]
+    expected_run_root = Path(attempts.json()[0]["workspace_root"])
+    assert expected_run_root.parent == runs_root.resolve()
+    assert expected_run_root.name.startswith("data_flow_")
+
+    assert SchedulerService()._claim_next_execution() == execution_id
+    get_execution_service().run_claimed_execution(execution_id)
+
+    run_detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/runs/{execution_id}")
+    assert run_detail.status_code == 200
+    assert run_detail.json()["execution"]["workspace_root"] == str(expected_run_root.resolve())
+
+    runtime_config = json.loads((expected_run_root / "config.json").read_text(encoding="utf-8"))
+    assert runtime_config["global"]["workspace_root"] == str((expected_run_root / "workspace").resolve())
+    assert runtime_config["execution"]["output_dir"] == str((expected_run_root / "output").resolve())
+
+
+def test_business_dataflow_task_rejects_output_dir_with_cli_launcher(service_config_path, patch_mock_agent_runtime):
+    config = get_config()
+    project_root = config.fileserver_service.data_mount_path
+    from pathlib import Path
+
+    case_root = Path(project_root) / "files" / "default" / "case-workspace-only"
+    source_dir = case_root / "source"
+    runs_root = case_root / "runs"
+    output_dir = runs_root / "nested-output"
     source_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
@@ -202,74 +313,11 @@ def test_business_dataflow_task_uses_selected_workspace_and_output_dirs(service_
         json={
             "project_id": "default",
             "profile_id": profile["profile_id"],
-            "title": "business scan custom workspace",
-            "workspace_dir": {"source": "project_filesystem", "path": "/case-custom/workspace"},
-            "data_flow": {"source": "project_filesystem", "path": "/case-custom/data_flow.md"},
-            "source_dir": {"source": "project_filesystem", "path": "/case-custom/source"},
-            "output_dir": {"source": "project_filesystem", "path": "/case-custom/workspace/nested-output"},
-            "model": "mock/model",
-            "thinking": "medium",
-            "review_profile": "fast",
-            "max_review_cycles": 1,
-            "result_review_concurrency": 1,
-            "priority": 80,
-        },
-    )
-    assert task.status_code == 201
-    task_id = task.json()["task_id"]
-
-    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
-    assert detail.status_code == 200
-    materialized = detail.json()["task_metadata"]["dataflow_scan_materialized"]
-    assert materialized["workspace_dir"] == str(workspace_dir.resolve())
-    assert materialized["output_dir"] == str(output_dir.resolve())
-
-    attempts = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/attempts")
-    assert attempts.status_code == 200
-    execution_id = attempts.json()[0]["execution_id"]
-    expected_workspace_root = workspace_dir / execution_id
-    expected_output_root = expected_workspace_root / "nested-output"
-    assert attempts.json()[0]["workspace_root"] == str(expected_workspace_root.resolve())
-
-    assert SchedulerService()._claim_next_execution() == execution_id
-    get_execution_service().run_claimed_execution(execution_id)
-
-    run_detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/runs/{execution_id}")
-    assert run_detail.status_code == 200
-    assert run_detail.json()["execution"]["workspace_root"] == str(expected_workspace_root.resolve())
-
-    runtime_config = json.loads((expected_workspace_root / "config.json").read_text(encoding="utf-8"))
-    assert runtime_config["global_config"]["workspace_root"] == str(expected_workspace_root.resolve())
-    assert runtime_config["execution"]["output_dir"] == str(expected_output_root.resolve())
-
-
-def test_business_dataflow_task_defaults_output_dir_inside_selected_workspace(service_config_path, patch_mock_agent_runtime):
-    config = get_config()
-    project_root = config.fileserver_service.data_mount_path
-    from pathlib import Path
-    import json
-
-    case_root = Path(project_root) / "files" / "default" / "case-workspace-only"
-    source_dir = case_root / "source"
-    workspace_dir = case_root / "workspace"
-    source_dir.mkdir(parents=True, exist_ok=True)
-    workspace_dir.mkdir(parents=True, exist_ok=True)
-    (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
-    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
-
-    app = create_app()
-    client = TestClient(app)
-    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
-
-    task = client.post(
-        "/api/dataflow-vuln-scanner/tasks",
-        json={
-            "project_id": "default",
-            "profile_id": profile["profile_id"],
             "title": "business scan default output",
-            "workspace_dir": {"source": "project_filesystem", "path": "/case-workspace-only/workspace"},
+            "workspace_dir": {"source": "project_filesystem", "path": "/case-workspace-only/runs"},
             "data_flow": {"source": "project_filesystem", "path": "/case-workspace-only/data_flow.md"},
             "source_dir": {"source": "project_filesystem", "path": "/case-workspace-only/source"},
+            "output_dir": {"source": "project_filesystem", "path": "/case-workspace-only/runs/nested-output"},
             "model": "mock/model",
             "thinking": "medium",
             "review_profile": "fast",
@@ -278,29 +326,8 @@ def test_business_dataflow_task_defaults_output_dir_inside_selected_workspace(se
             "priority": 80,
         },
     )
-    assert task.status_code == 201
-    task_id = task.json()["task_id"]
-
-    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
-    assert detail.status_code == 200
-    materialized = detail.json()["task_metadata"]["dataflow_scan_materialized"]
-    assert materialized["workspace_dir"] == str(workspace_dir.resolve())
-    assert materialized["output_dir"] == str((workspace_dir / "output").resolve())
-    assert materialized["output_dir_mode"] == "auto_workspace_output"
-
-    attempts = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/attempts")
-    assert attempts.status_code == 200
-    execution_id = attempts.json()[0]["execution_id"]
-    expected_workspace_root = workspace_dir / execution_id
-    expected_output_root = expected_workspace_root / "output"
-    assert attempts.json()[0]["workspace_root"] == str(expected_workspace_root.resolve())
-
-    assert SchedulerService()._claim_next_execution() == execution_id
-    get_execution_service().run_claimed_execution(execution_id)
-
-    runtime_config = json.loads((expected_workspace_root / "config.json").read_text(encoding="utf-8"))
-    assert runtime_config["global_config"]["workspace_root"] == str(expected_workspace_root.resolve())
-    assert runtime_config["execution"]["output_dir"] == str(expected_output_root.resolve())
+    assert task.status_code == 422
+    assert "output_dir is not supported" in task.text
 
 
 def test_project_filesystem_browser_uses_local_project_tree(service_config_path):

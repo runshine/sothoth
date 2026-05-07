@@ -73,6 +73,7 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     }
     config_path.write_text(yaml.safe_dump(config_payload, allow_unicode=True), encoding="utf-8")
     monkeypatch.setenv("CONFIG_PATH", str(config_path))
+    monkeypatch.setenv("SECFLOW_DATAFLOW_CLI_IN_PROCESS", "1")
     reset_config()
     reset_database_state()
     from app.services import auth, execution_service, fileserver_client, project, scheduler, workflow_service

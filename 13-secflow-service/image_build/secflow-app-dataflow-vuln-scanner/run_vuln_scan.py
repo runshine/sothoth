@@ -906,7 +906,7 @@ def _print_run_outputs(run_dir: str, success: bool, exit_code: int) -> None:
         print(f"\n❌ 漏洞挖掘失败 (exit_code={exit_code})", file=sys.stderr)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         description="数据流驱动漏洞挖掘启动器",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -985,6 +985,9 @@ def main():
         "--run-name", "-n", default=None,
         help="运行名称（默认: 根据数据流文件名自动生成）")
     parser.add_argument(
+        "--runs-root", default=None,
+        help="runs 根目录（默认: run_vuln_scan.py 同目录下的 runs/）")
+    parser.add_argument(
         "--model", "-m", default=None,
         help="AI 模型，必须使用 provider/model 格式，例如 anthropic/claude-sonnet-4-20250514")
     parser.add_argument(
@@ -1008,10 +1011,10 @@ def main():
         "--clean", action="store_true",
         help="执行完毕后删除工作目录")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # Git Bash 会转换命令行路径，但 JSON/某些调用链可能仍传入 /c/... 形式；这里兜底规范化。
-    for _path_arg in ("data_flow", "source_dir", "resume_run_dir", "config"):
+    for _path_arg in ("data_flow", "source_dir", "resume_run_dir", "config", "runs_root"):
         _value = getattr(args, _path_arg, None)
         if _value:
             setattr(args, _path_arg, from_msys_path(_value))
@@ -1194,7 +1197,8 @@ def main():
         profile_policy.default_max_review_cycles
     )
 
-    run_dir = str(PROJECT_ROOT / "runs" / args.run_name)
+    runs_root = Path(args.runs_root).resolve() if args.runs_root else PROJECT_ROOT / "runs"
+    run_dir = str(runs_root / args.run_name)
     os.makedirs(os.path.join(run_dir, "input"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "output"), exist_ok=True)
 

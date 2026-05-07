@@ -114,6 +114,25 @@ class WorkflowService:
             .first()
         )
 
+    def _latest_definition_config_version(
+        self,
+        db: Session,
+        definition: WorkflowDefinition,
+    ) -> Optional[WorkflowDefinitionVersion]:
+        target_payload = definition.config_payload_json or self._extract_config_payload(definition.definition_json)
+        target_config = definition.definition_json or {}
+        items = (
+            db.query(WorkflowDefinitionVersion)
+            .filter(WorkflowDefinitionVersion.workflow_definition_id == definition.id)
+            .order_by(WorkflowDefinitionVersion.version_no.desc())
+            .all()
+        )
+        for item in items:
+            item_config = item.compiled_config_json or item.definition_json or {}
+            if (item.config_payload_json or {}) == target_payload and item_config == target_config:
+                return item
+        return items[0] if items else None
+
     def _ensure_single_default(self, db: Session, definition: WorkflowDefinition) -> None:
         if not definition.is_default:
             existing_default = (
@@ -181,7 +200,7 @@ class WorkflowService:
         return WorkflowDefinitionResponse.model_validate(payload)
 
     def _profile_response(self, db: Session, definition: WorkflowDefinition) -> ScanProfileResponse:
-        version = self._latest_version(db, definition.id)
+        version = self._latest_definition_config_version(db, definition)
         version_no = version.version_no if version is not None else 0
         config_payload = definition.config_payload_json or self._extract_config_payload(definition.definition_json)
         compiled_config = definition.definition_json or {}
@@ -425,7 +444,8 @@ class WorkflowService:
 
     def get_profile_version_model(self, db: Session, profile_id: str, version_no: int | None = None) -> WorkflowDefinitionVersion:
         if version_no is None:
-            version = self._latest_version(db, profile_id)
+            definition = self._get_definition_or_404(db, profile_id)
+            version = self._latest_definition_config_version(db, definition)
             if version is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="profile version not found")
             return version

@@ -3,10 +3,10 @@
 
 两路输出:
 - stdout / stderr → 终端实时显示 (不变)
-- log_file        → 同时写入日志文件 (新增)
+- log_file        → 同时写入当前线程绑定的日志文件
 
-通过 TeeStream 在进程级别做 IO 分流,
-不需要框架内部任何模块感知日志文件的存在.
+CLI 模式通常是单进程单任务，服务模式则可能同进程并发执行多个任务。
+因此这里使用线程级日志分流，避免不同执行互相覆盖 run.log。
 """
 
 import io
@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -35,38 +36,86 @@ class TeeStream:
     - 文件侧: 自动去除 ANSI 转义序列
     """
 
-    def __init__(self, original: io.TextIOBase, log_file: io.TextIOBase):
+    def __init__(self, original: io.TextIOBase):
         self._original = original
-        self._log_file = log_file
+
+    def _current_log_file(self) -> io.TextIOBase | None:
+        with _log_router_lock:
+            return _thread_log_files.get(threading.get_ident())
 
     def write(self, data: str) -> int:
         if data:
             self._original.write(data)
-            # 写文件时去掉 ANSI 色彩码
-            clean = _ANSI_RE.sub('', data)
-            self._log_file.write(clean)
-            self._log_file.flush()
+            log_file = self._current_log_file()
+            if log_file is not None:
+                # 写文件时去掉 ANSI 色彩码
+                clean = _ANSI_RE.sub('', data)
+                log_file.write(clean)
+                log_file.flush()
         return len(data) if data else 0
 
     def flush(self):
         self._original.flush()
-        self._log_file.flush()
+        log_file = self._current_log_file()
+        if log_file is not None:
+            log_file.flush()
 
     # 代理其余属性给原始流 (encoding, fileno, isatty 等)
     def __getattr__(self, name):
         return getattr(self._original, name)
 
 
-# 全局状态: 记录当前日志文件, 便于 detach
-_active_log_file: Optional[io.TextIOBase] = None
+# 全局状态: 当前线程 -> 日志文件
+_thread_log_files: dict[int, io.TextIOBase] = {}
 _original_stdout: Optional[io.TextIOBase] = None
 _original_stderr: Optional[io.TextIOBase] = None
 _current_log_level: str = "INFO"
+_log_router_lock = threading.RLock()
+
+
+def _write_log_header(log_file: io.TextIOBase) -> None:
+    log_file.write(f"\n{'=' * 70}\n")
+    log_file.write(f"  Log started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log_file.write(f"  PID: {os.getpid()}\n")
+    log_file.write(f"  Thread: {threading.current_thread().name}\n")
+    log_file.write(f"{'=' * 70}\n\n")
+    log_file.flush()
+
+
+def _write_log_footer(log_file: io.TextIOBase) -> None:
+    log_file.write(f"\n{'=' * 70}\n")
+    log_file.write(f"  Log ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log_file.write(f"{'=' * 70}\n")
+    log_file.flush()
+
+
+def _install_log_router_if_needed() -> None:
+    global _original_stdout, _original_stderr
+    if _original_stdout is not None and _original_stderr is not None:
+        return
+    _original_stdout = sys.stdout
+    _original_stderr = sys.stderr
+    sys.stdout = TeeStream(sys.stdout)
+    sys.stderr = TeeStream(sys.stderr)
+    setup_logging(_current_log_level)
+
+
+def _uninstall_log_router_if_possible() -> None:
+    global _original_stdout, _original_stderr
+    if _thread_log_files:
+        return
+    if _original_stdout is not None:
+        sys.stdout = _original_stdout
+        _original_stdout = None
+    if _original_stderr is not None:
+        sys.stderr = _original_stderr
+        _original_stderr = None
+    setup_logging(_current_log_level)
 
 
 def attach_log_file(log_path: str) -> str:
     """
-    开始将 stdout + stderr 同时写入日志文件.
+    开始将当前线程的 stdout + stderr 同时写入日志文件.
 
     Args:
         log_path: 日志文件路径 (自动创建父目录)
@@ -74,61 +123,45 @@ def attach_log_file(log_path: str) -> str:
     Returns:
         实际日志文件绝对路径
     """
-    global _active_log_file, _original_stdout, _original_stderr
-
-    # 如果已经 attach 了, 先 detach
-    if _active_log_file is not None:
-        detach_log_file()
-
     path = Path(log_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(path, "a", encoding="utf-8", buffering=1)  # 行缓冲
+    _write_log_header(log_file)
 
-    # 写入日志头
-    log_file.write(f"\n{'=' * 70}\n")
-    log_file.write(f"  Log started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    log_file.write(f"  PID: {os.getpid()}\n")
-    log_file.write(f"{'=' * 70}\n\n")
-    log_file.flush()
-
-    _active_log_file = log_file
-    _original_stdout = sys.stdout
-    _original_stderr = sys.stderr
-
-    sys.stdout = TeeStream(sys.stdout, log_file)
-    sys.stderr = TeeStream(sys.stderr, log_file)
-    setup_logging(_current_log_level)
+    with _log_router_lock:
+        thread_id = threading.get_ident()
+        previous = _thread_log_files.get(thread_id)
+        if previous is not None:
+            try:
+                _write_log_footer(previous)
+                previous.close()
+            except Exception:
+                pass
+        _thread_log_files[thread_id] = log_file
+        _install_log_router_if_needed()
 
     return str(path.resolve())
 
 
 def detach_log_file() -> None:
-    """停止写入日志文件, 恢复原始 stdout/stderr."""
-    global _active_log_file, _original_stdout, _original_stderr
-
-    if _original_stdout is not None:
-        sys.stdout = _original_stdout
-        _original_stdout = None
-    if _original_stderr is not None:
-        sys.stderr = _original_stderr
-        _original_stderr = None
-    if _active_log_file is not None:
-        try:
-            _active_log_file.write(f"\n{'=' * 70}\n")
-            _active_log_file.write(
-                f"  Log ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            _active_log_file.write(f"{'=' * 70}\n")
-            _active_log_file.close()
-        except Exception:
-            pass
-        _active_log_file = None
-    setup_logging(_current_log_level)
+    """停止当前线程的日志写入; 当无活跃日志时恢复原始 stdout/stderr."""
+    with _log_router_lock:
+        log_file = _thread_log_files.pop(threading.get_ident(), None)
+        if log_file is not None:
+            try:
+                _write_log_footer(log_file)
+                log_file.close()
+            except Exception:
+                pass
+        _uninstall_log_router_if_possible()
 
 
 def get_log_file_path() -> Optional[str]:
-    """返回当前日志文件路径, 未 attach 时返回 None."""
-    if _active_log_file is not None and hasattr(_active_log_file, 'name'):
-        return _active_log_file.name
+    """返回当前线程对应的日志文件路径, 未 attach 时返回 None."""
+    with _log_router_lock:
+        log_file = _thread_log_files.get(threading.get_ident())
+        if log_file is not None and hasattr(log_file, "name"):
+            return log_file.name
     return None
 
 
