@@ -94,6 +94,21 @@ class TaskResourceUsageResponse(BaseModel):
     message: Optional[str] = None
 
 
+class TaskProgressPhaseResponse(BaseModel):
+    key: str
+    label: str
+    status: str
+    detail: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class TaskProgressResponse(BaseModel):
+    task_id: str
+    current_phase: Optional[str] = None
+    summary: Optional[str] = None
+    phases: List[TaskProgressPhaseResponse]
+
+
 class TaskListResponse(BaseModel):
     total: int
     offset: int

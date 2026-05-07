@@ -23,6 +23,8 @@ _dispatcher_thread: Optional[threading.Thread] = None
 _dispatcher_stop = threading.Event()
 _futures: Dict[str, Future] = {}
 _futures_lock = threading.Lock()
+_active_cancel_hooks: Dict[str, object] = {}
+_active_cancel_hooks_lock = threading.Lock()
 PROJECT_FILES_ROOT = Path(os.environ.get("PROJECT_FILES_ROOT", "/data/files"))
 TASK_WORKSPACE_ROOT = Path("app/secflow-app-firmware-unpacker")
 
@@ -180,6 +182,25 @@ def _active_future_count() -> int:
     _cleanup_completed_futures()
     with _futures_lock:
         return sum(1 for future in _futures.values() if not future.done())
+
+
+def _register_cancel_hook(task_id: str, hook) -> None:
+    with _active_cancel_hooks_lock:
+        if hook is None:
+            _active_cancel_hooks.pop(task_id, None)
+        else:
+            _active_cancel_hooks[task_id] = hook
+
+
+def _trigger_cancel_hook(task_id: str) -> None:
+    with _active_cancel_hooks_lock:
+        hook = _active_cancel_hooks.get(task_id)
+    if hook is None:
+        return
+    try:
+        hook()
+    except Exception as exc:
+        logger.warning("failed to trigger cancel hook for task %s: %s", task_id, exc)
 
 
 def build_task_workspace(project_id: str, task_id: str) -> dict[str, Path]:
@@ -346,16 +367,20 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if task is None:
             return False, "任务不存在"
+        trigger_runtime_cancel = False
         if task.status == TaskStatus.PENDING.value:
             task.status = TaskStatus.CANCELLED.value
             task.completed_at = datetime.utcnow()
         elif task.status in (TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value):
             task.status = TaskStatus.CANCELLING.value
+            trigger_runtime_cancel = True
         elif task.status == TaskStatus.CANCELLED.value:
             return True, "任务已取消"
         else:
             return False, "仅支持取消排队中或运行中的任务"
         db.commit()
+        if trigger_runtime_cancel:
+            _trigger_cancel_hook(task_id)
         return True, "取消请求已提交"
     finally:
         db.close()
@@ -571,12 +596,14 @@ def _run_claimed_task(task_id: str) -> None:
             runtime_paths["input_path"],
             runtime_paths["output_path"],
             cancel_check=lambda: _should_cancel(task_id),
+            register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),
         )
         _update_task_result(task_id, result)
     except Exception as exc:
         logger.exception("task %s failed with exception: %s", task_id, exc)
         _update_task_error(task_id, str(exc))
     finally:
+        _register_cancel_hook(task_id, None)
         update_worker_active_tasks(-1)
         with _futures_lock:
             _futures.pop(task_id, None)
