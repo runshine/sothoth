@@ -29,6 +29,7 @@ configcenter_service:
 
 pi_re_agent:
   base_url: "http://secflow-pi-re-agent:8000"
+  worker_urls: []
   api_key: null
   timeout: 30
   batch_size: 8192

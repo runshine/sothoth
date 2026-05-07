@@ -56,6 +56,7 @@ class ConfigCenterServiceConfig(BaseModel):
 
 class PiReAgentConfig(BaseModel):
     base_url: str = "http://secflow-pi-re-agent:8000"
+    worker_urls: list[str] = Field(default_factory=list)
     api_key: Optional[str] = None
     timeout: int = 30
     batch_size: int = 8192

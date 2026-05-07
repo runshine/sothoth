@@ -12,12 +12,13 @@ from app.exception import ConflictError, NotFoundError, UpstreamError, Validatio
 
 
 class PiReAgentClient:
-    def __init__(self):
+    def __init__(self, base_url: str | None = None):
         self.config = get_config().pi_re_agent
+        self._base_url = base_url
 
     @property
     def base_url(self) -> str:
-        return os.environ.get("PI_RE_AGENT_URL") or self.config.base_url
+        return self._base_url or os.environ.get("PI_RE_AGENT_URL") or self.config.base_url
 
     @property
     def api_key(self) -> str | None:
@@ -42,6 +43,21 @@ class PiReAgentClient:
         except httpx.ConnectError as exc:
             raise UpstreamError(f"无法连接pi-re-agent: {exc}")
         return _handle(resp)
+
+    async def list_jobs(self) -> list[dict[str, Any]]:
+        try:
+            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+                resp = await client.get(
+                    f"{self.base_url.rstrip('/')}/api/v1/jobs",
+                    headers=self._headers(),
+                )
+        except httpx.TimeoutException:
+            raise UpstreamError("pi-re-agent查询任务列表超时")
+        except httpx.ConnectError as exc:
+            raise UpstreamError(f"无法连接pi-re-agent: {exc}")
+        payload = _handle(resp)
+        jobs = payload.get("jobs") if isinstance(payload, dict) else []
+        return jobs if isinstance(jobs, list) else []
 
     async def get_job(self, job_id: str) -> Optional[dict]:
         try:
@@ -88,10 +104,16 @@ def _handle(resp: httpx.Response) -> dict:
 
 
 _pi_client: Optional[PiReAgentClient] = None
+_pi_clients: dict[str, PiReAgentClient] = {}
 
 
-def get_pi_client() -> PiReAgentClient:
+def get_pi_client(base_url: str | None = None) -> PiReAgentClient:
     global _pi_client
+    if base_url:
+        normalized = base_url.rstrip("/")
+        if normalized not in _pi_clients:
+            _pi_clients[normalized] = PiReAgentClient(normalized)
+        return _pi_clients[normalized]
     if _pi_client is None:
         _pi_client = PiReAgentClient()
     return _pi_client

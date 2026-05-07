@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from datetime import datetime
@@ -56,6 +57,46 @@ def generate_task_id(db: Session, project_id: str) -> str:
     raise ConflictError("无法生成唯一B2S任务ID，请重试")
 
 
+def configured_pi_workers() -> list[str]:
+    cfg = get_config().pi_re_agent
+    workers = [url.rstrip("/") for url in (cfg.worker_urls or []) if url and url.strip()]
+    return workers or [cfg.base_url.rstrip("/")]
+
+
+async def choose_pi_worker(db: Session, task_id: str, sequence_no: int) -> str:
+    """Pick a pi-re-agent worker with simple worker affinity.
+
+    The primary signal is the worker's own queued/running job count, which also
+    covers jobs created before this B2S release.  The DB count is a cheap local
+    supplement, and the stable hash is only a deterministic tie breaker.
+    """
+    workers = configured_pi_workers()
+    if len(workers) == 1:
+        return workers[0]
+    counts = {worker: 0 for worker in workers}
+
+    for worker in workers:
+        try:
+            jobs = await get_pi_client(worker).list_jobs()
+            counts[worker] += sum(1 for job in jobs if job.get("status") in {"queued", "running"})
+        except Exception:
+            # Avoid placing new work on an unreachable worker.
+            counts[worker] += 1_000_000
+
+    active_items = db.query(B2STaskItem).filter(B2STaskItem.status.in_(["queued", "running"])).all()
+    for active_item in active_items:
+        worker_url = str((active_item.extra_metadata or {}).get("pi_worker_url") or "").rstrip("/")
+        if worker_url in counts:
+            counts[worker_url] += 1
+    salt = int(hashlib.sha256(f"{task_id}:{sequence_no}".encode("utf-8")).hexdigest(), 16)
+    return min(enumerate(workers), key=lambda item: (counts[item[1]], (item[0] - salt) % len(workers)))[1]
+
+
+def item_pi_worker_url(item: B2STaskItem) -> str | None:
+    worker_url = str((item.extra_metadata or {}).get("pi_worker_url") or "").strip()
+    return worker_url.rstrip("/") or None
+
+
 def prepare_input_file(project_id: str, task_id: str, sequence_no: int, source_path: Path) -> Path:
     input_dir = safe_input_dir(project_id, task_id, sequence_no)
     target_path = input_dir.joinpath(source_path.name).resolve()
@@ -91,7 +132,6 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     llm_provider_key = (req.llm_provider_key or "").strip() or None
     job_model = await resolve_job_model(llm_provider_key)
     job_concurrency = req.concurrency if req.concurrency and req.concurrency > 0 else pi_cfg.concurrency
-    client = get_pi_client()
     for idx, elf in enumerate(req.elf_tasks, start=1):
         source_elf_path = ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)
         input_elf_path = prepare_input_file(project_id, task.id, idx, source_elf_path)
@@ -104,12 +144,14 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             output_dir=str(safe_output_dir(project_id, task.id, idx, elf.output_subdir)),
             status="pending",
         )
+        worker_url = await choose_pi_worker(db, task.id, idx)
         item.extra_metadata = {
             **(elf.metadata or {}),
             "file_list": elf.file_list or [],
             "source_elf_path": str(source_elf_path),
             "llm_provider_key": llm_provider_key,
             "concurrency": job_concurrency,
+            "pi_worker_url": worker_url,
         }
         item.phase = "queued"
         item.progress = build_item_progress(item, {"status": "queued", "phase": "queued", "progress": {}})
@@ -117,7 +159,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
         db.flush()
 
         try:
-            job = await client.create_job({
+            job = await get_pi_client(worker_url).create_job({
                 "target": item.elf_path,
                 "output_dir": item.output_dir,
                 "batch_size": pi_cfg.batch_size,
@@ -146,13 +188,12 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
 
 
 async def sync_task(db: Session, task: B2STask) -> None:
-    client = get_pi_client()
     changed = False
     items = query_items(db, task.id)
     for item in items:
         if not item.pi_job_id or item.status in TERMINAL:
             continue
-        job = await client.get_job(item.pi_job_id)
+        job = await get_pi_client(item_pi_worker_url(item)).get_job(item.pi_job_id)
         if job is None:
             item.status = "failed"
             item.failure_type = "pi-re-agent"
@@ -191,12 +232,11 @@ async def sync_task(db: Session, task: B2STask) -> None:
 
 
 async def terminate_task(db: Session, task: B2STask) -> None:
-    client = get_pi_client()
     for item in query_items(db, task.id):
         if item.status in TERMINAL:
             continue
         if item.pi_job_id:
-            await client.cancel_job(item.pi_job_id)
+            await get_pi_client(item_pi_worker_url(item)).cancel_job(item.pi_job_id)
         item.status = "cancelled"
         item.phase = "cancelled"
         item.progress = build_item_progress(item, {"status": "cancelled", "phase": "cancelled", "progress": item.progress})
@@ -207,7 +247,6 @@ async def terminate_task(db: Session, task: B2STask) -> None:
 
 async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = None) -> None:
     pi_cfg = get_config().pi_re_agent
-    client = get_pi_client()
     items = query_items(db, task.id)
     selected = [i for i in items if item_ids is None or i.id in item_ids]
     selected_provider_keys = [
@@ -222,7 +261,11 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         if item.status not in {"failed", "cancelled"}:
             continue
         item_concurrency = int((item.extra_metadata or {}).get("concurrency") or pi_cfg.concurrency)
-        job = await client.create_job({
+        worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
+        metadata = item.extra_metadata or {}
+        metadata["pi_worker_url"] = worker_url
+        item.extra_metadata = metadata
+        job = await get_pi_client(worker_url).create_job({
             "target": item.elf_path,
             "output_dir": item.output_dir,
             "batch_size": pi_cfg.batch_size,
