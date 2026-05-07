@@ -31,6 +31,7 @@ from app.model import (
     get_session_factory,
 )
 from app.schemas import (
+    BinarySecurityActionResponse,
     BinarySecurityArtifactsResponse,
     BinarySecurityInputFile,
     BinarySecurityProjectConfigPayload,
@@ -426,10 +427,10 @@ class TaskManager:
             files=files,
         )
 
-    async def cancel_task(self, db: Session, *, project_id: str, task_id: str) -> None:
+    async def cancel_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
         if task.status == "cancelled":
-            return
+            return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
         task.status = "cancelled"
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
@@ -448,6 +449,47 @@ class TaskManager:
         await asyncio.gather(
             *(self._cancel_downstream(item, token) for item in running_items if item.downstream_task_id),
             return_exceptions=True,
+        )
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            message="任务已取消",
+            cancelled_downstream_count=len([item for item in running_items if item.downstream_task_id]),
+            cleanup_status="cancelled",
+        )
+
+    async def delete_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        task.status = "cancelled"
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.finished_at = task.finished_at or _now()
+        self._record_event(db, task, "task_delete_requested", "任务删除已请求")
+        items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+        downstream_refs = self._collect_downstream_refs(task, items)
+        for item in items:
+            if item.status in {"pending", "queued", "running"}:
+                item.status = "cancelled"
+                item.finished_at = _now()
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
+        db.commit()
+
+        await self._cancel_local_worker(task.id)
+        token = self._service_token()
+        cancelled_count = await self._cancel_downstream_refs(db, task, downstream_refs, token)
+        deleted_count = await self._delete_downstream_refs(db, task, downstream_refs, token)
+        cleanup_status = await self._cleanup_task_workspace(task, token)
+
+        db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).delete(synchronize_session=False)
+        db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).delete(synchronize_session=False)
+        db.query(BinarySecurityEvent).filter(BinarySecurityEvent.task_id == task.id).delete(synchronize_session=False)
+        db.delete(task)
+        db.commit()
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            message="任务及下游资源已删除",
+            cancelled_downstream_count=cancelled_count,
+            deleted_downstream_count=deleted_count,
+            cleanup_status=cleanup_status,
         )
 
     def retry_task(self, db: Session, *, project_id: str, task_id: str) -> None:
@@ -1263,7 +1305,7 @@ class TaskManager:
                 await get_firmware_unpacker_client().cancel_task(item.downstream_task_id, token or "")
             elif item.downstream_service == "binary_to_source":
                 result = item.result
-                await get_binary_to_source_client().cancel_task(result["project_id"], item.downstream_task_id, token or "")
+                await get_binary_to_source_client().cancel_task(result.get("project_id") or item.project_id, item.downstream_task_id, token or "")
             elif item.downstream_service == "entry_analyse":
                 await get_entry_analyse_client().cancel_task(item.downstream_task_id)
             elif item.downstream_service == "dataflow_analyse":
@@ -1274,6 +1316,128 @@ class TaskManager:
                 await get_system_analyse_client().cancel_task(item.downstream_task_id)
         except Exception:
             pass
+
+    def _collect_downstream_refs(self, task: BinarySecurityTask, items: list[BinarySecurityStageItem]) -> list[dict[str, str]]:
+        refs: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in items:
+            if not item.downstream_service or not item.downstream_task_id:
+                continue
+            key = (item.downstream_service, item.downstream_task_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(
+                {
+                    "service": item.downstream_service,
+                    "task_id": item.downstream_task_id,
+                    "project_id": task.project_id,
+                    "stage_name": item.stage_name,
+                }
+            )
+        return refs
+
+    async def _cancel_local_worker(self, task_id: str) -> None:
+        async with self._worker_lock:
+            worker = self._workers.get(task_id)
+        if worker and not worker.done():
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
+    async def _cancel_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
+        async def do_cancel(ref: dict[str, str]) -> bool:
+            self._record_event(
+                db,
+                task,
+                "downstream_cancel_requested",
+                f"请求取消下游任务: {ref['service']}:{ref['task_id']}",
+                stage_name=ref.get("stage_name"),
+                payload=ref,
+            )
+            try:
+                if ref["service"] == "firmware_unpacker":
+                    await get_firmware_unpacker_client().cancel_task(ref["task_id"], token or "")
+                elif ref["service"] == "system_analyse":
+                    await get_system_analyse_client().cancel_task(ref["task_id"])
+                elif ref["service"] == "binary_to_source":
+                    await get_binary_to_source_client().cancel_task(ref["project_id"], ref["task_id"], token or "")
+                elif ref["service"] == "entry_analyse":
+                    await get_entry_analyse_client().cancel_task(ref["task_id"])
+                elif ref["service"] == "dataflow_analyse":
+                    await get_dataflow_analyse_client().cancel_task(ref["task_id"])
+                elif ref["service"] == "dataflow_vuln_scanner":
+                    await get_dataflow_vuln_scanner_client().cancel_task(ref["task_id"], token or "")
+                return True
+            except Exception as exc:
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_cancel_failed",
+                    f"下游取消失败: {ref['service']}:{ref['task_id']} - {exc}",
+                    stage_name=ref.get("stage_name"),
+                    level="warning",
+                    payload={**ref, "error": str(exc)},
+                )
+                return False
+
+        results = await asyncio.gather(*(do_cancel(ref) for ref in refs), return_exceptions=False)
+        db.commit()
+        return sum(1 for ok in results if ok)
+
+    async def _delete_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
+        async def do_delete(ref: dict[str, str]) -> bool:
+            self._record_event(
+                db,
+                task,
+                "downstream_delete_requested",
+                f"请求删除下游任务: {ref['service']}:{ref['task_id']}",
+                stage_name=ref.get("stage_name"),
+                payload=ref,
+            )
+            try:
+                if ref["service"] == "firmware_unpacker":
+                    await get_firmware_unpacker_client().delete_task(ref["task_id"], token or "")
+                elif ref["service"] == "system_analyse":
+                    await get_system_analyse_client().delete_task(ref["task_id"])
+                elif ref["service"] == "binary_to_source":
+                    await get_binary_to_source_client().delete_task(ref["project_id"], ref["task_id"], token or "")
+                elif ref["service"] == "entry_analyse":
+                    await get_entry_analyse_client().delete_task(ref["task_id"])
+                elif ref["service"] == "dataflow_analyse":
+                    await get_dataflow_analyse_client().delete_task(ref["task_id"])
+                elif ref["service"] == "dataflow_vuln_scanner":
+                    await get_dataflow_vuln_scanner_client().delete_task(ref["task_id"], token or "")
+                return True
+            except Exception as exc:
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_delete_failed",
+                    f"下游删除失败: {ref['service']}:{ref['task_id']} - {exc}",
+                    stage_name=ref.get("stage_name"),
+                    level="warning",
+                    payload={**ref, "error": str(exc)},
+                )
+                return False
+
+        results = await asyncio.gather(*(do_delete(ref) for ref in refs), return_exceptions=False)
+        db.commit()
+        return sum(1 for ok in results if ok)
+
+    async def _cleanup_task_workspace(self, task: BinarySecurityTask, token: str | None) -> str:
+        relative_path = f"app/secflow-app-binary-security/{task.id}"
+        workspace_root = Path(task.workspace_root)
+        client = get_fileserver_client()
+        cleanup_status = "deleted"
+        try:
+            await client.delete_project_path(task.project_id, relative_path, token, recursive=True)
+        except Exception:
+            cleanup_status = "fallback"
+        try:
+            shutil.rmtree(workspace_root, ignore_errors=True)
+        except Exception:
+            cleanup_status = "partial_failed"
+        return cleanup_status
 
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
         while True:
@@ -1293,7 +1457,7 @@ class TaskManager:
         session = get_session_factory()()
         try:
             row = session.query(BinarySecurityTask.status).filter(BinarySecurityTask.id == task_id).first()
-            return bool(row and row[0] == "cancelled")
+            return row is None or bool(row and row[0] == "cancelled")
         finally:
             session.close()
 

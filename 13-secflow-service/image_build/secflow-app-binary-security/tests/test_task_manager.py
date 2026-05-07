@@ -268,6 +268,39 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("system-analyse", target.parent.name)
             self.assertEqual("fw1__down1", target.name)
 
+    def test_collect_downstream_refs_dedupes_same_service_and_task_id(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        items = []
+        for item_id, task_id in [("i1", "down1"), ("i2", "down1"), ("i3", "down2")]:
+            item = type("Item", (), {})()
+            item.id = item_id
+            item.downstream_service = "entry_analyse"
+            item.downstream_task_id = task_id
+            item.project_id = "p1"
+            item.stage_name = "entry_analysis"
+            items.append(item)
+
+        refs = self.manager._collect_downstream_refs(task, items)
+
+        self.assertEqual(2, len(refs))
+        self.assertEqual(
+            [
+                {"service": "entry_analyse", "task_id": "down1", "project_id": "p1", "stage_name": "entry_analysis"},
+                {"service": "entry_analyse", "task_id": "down2", "project_id": "p1", "stage_name": "entry_analysis"},
+            ],
+            refs,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any, Optional
 
@@ -109,6 +110,33 @@ class FileserverClient:
         except Exception:
             ensure_dir(local_path)
         return normalized
+
+    async def delete_project_path(self, project_id: str, path: str, authorization_token: str | None, recursive: bool = True) -> None:
+        normalized = self.project_relative_path(path)
+        if normalized == "/":
+            return
+        headers = self._headers(authorization_token)
+        try:
+            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
+                resp = await client.delete(
+                    f"{self.config.base_url.rstrip('/')}/project-filesystem",
+                    params={
+                        "project_id": project_id,
+                        "path": normalized,
+                        "recursive": str(bool(recursive)).lower(),
+                    },
+                    headers=headers,
+                )
+                if resp.status_code in (200, 204, 404):
+                    return
+                resp.raise_for_status()
+        except Exception:
+            local_path = self.project_files_root(project_id) / normalized.lstrip("/")
+            if local_path.is_dir():
+                shutil.rmtree(local_path, ignore_errors=True)
+                return
+            if local_path.exists():
+                local_path.unlink(missing_ok=True)
 
 
 _fileserver_client: Optional[FileserverClient] = None

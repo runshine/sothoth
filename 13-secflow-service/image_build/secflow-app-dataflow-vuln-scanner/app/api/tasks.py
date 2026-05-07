@@ -24,6 +24,7 @@ from app.schemas import (
     ScanTaskEventResponse,
     ScanTaskPriorityUpdateRequest,
     ScanTaskResponse,
+    SuccessResponse,
 )
 from app.services.execution_service import get_execution_service
 
@@ -305,6 +306,12 @@ async def get_history_run_log(
 async def cancel_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().cancel_scan_task(db, task_id, principal)
+
+
+@router.delete("/tasks/{task_id}", response_model=SuccessResponse)
+async def delete_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().delete_scan_task(db, task_id, principal)
 
 
 @router.post("/tasks/{task_id}/retry", response_model=ScanTaskResponse)

@@ -167,6 +167,9 @@ class BinarySecurityActionResponse(BaseModel):
     status: str = "ok"
     task_id: str
     message: str
+    cancelled_downstream_count: int = 0
+    deleted_downstream_count: int = 0
+    cleanup_status: Optional[str] = None
 
 
 class BinarySecurityProjectConfigPayload(BaseModel):

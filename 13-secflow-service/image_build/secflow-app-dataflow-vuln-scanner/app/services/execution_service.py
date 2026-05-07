@@ -22,6 +22,14 @@ from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, wr
 from app.config import get_config
 from app.models.contracts import TaskItem, TaskManifest
 from app.models.database import (
+    HistoryRun,
+    HistoryRunCycle,
+    HistoryRunFile,
+    HistoryRunGlobalReview,
+    HistoryRunRemovedResult,
+    HistoryRunResult,
+    HistoryRunResultReview,
+    HistoryRunSession,
     TriggerTask,
     WorkflowDefinition,
     WorkflowDefinitionVersion,
@@ -1430,6 +1438,51 @@ class ExecutionService:
         db.commit()
         db.refresh(trigger)
         return self._scan_task_response(db, trigger)
+
+    def delete_scan_task(self, db: Session, task_id: str, principal: dict) -> dict[str, Any]:
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        if trigger.status in {"pending", "running", "cancel_requested"}:
+            try:
+                self.cancel_scan_task(db, task_id, principal)
+                trigger = self._trigger_or_404(db, task_id)
+            except Exception:
+                db.rollback()
+                trigger = self._trigger_or_404(db, task_id)
+
+        executions = self._list_executions_for_trigger(db, trigger.id)
+        history_run_ids: set[str] = set()
+        workspace_roots: set[str] = set()
+        for execution in executions:
+            if execution.workspace_root:
+                workspace_roots.add(execution.workspace_root)
+            history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+            if history_run:
+                history_run_ids.add(history_run.id)
+                if history_run.run_root_path:
+                    workspace_roots.add(history_run.run_root_path)
+
+        if history_run_ids:
+            db.query(HistoryRunFile).filter(HistoryRunFile.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunSession).filter(HistoryRunSession.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunRemovedResult).filter(HistoryRunRemovedResult.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunResultReview).filter(HistoryRunResultReview.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunResult).filter(HistoryRunResult.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunGlobalReview).filter(HistoryRunGlobalReview.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRunCycle).filter(HistoryRunCycle.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
+            db.query(HistoryRun).filter(HistoryRun.id.in_(list(history_run_ids))).delete(synchronize_session=False)
+
+        execution_ids = [execution.id for execution in executions]
+        if execution_ids:
+            db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id.in_(execution_ids)).delete(synchronize_session=False)
+            db.query(WorkflowExecution).filter(WorkflowExecution.id.in_(execution_ids)).delete(synchronize_session=False)
+        db.delete(trigger)
+        db.commit()
+
+        for path in workspace_roots:
+            if path:
+                shutil.rmtree(path, ignore_errors=True)
+        return {"success": True, "message": "task deleted"}
 
     def _create_retry_attempt_for_task(
         self,

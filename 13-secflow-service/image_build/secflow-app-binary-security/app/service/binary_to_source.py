@@ -48,6 +48,9 @@ class BinaryToSourceClient(JsonHttpClient):
             json_body={"item_ids": item_ids},
         )
 
+    async def delete_task(self, project_id: str, task_id: str, token: str) -> dict:
+        return await self.delete(f"/projects/{project_id}/tasks/{task_id}", token=token)
+
 
 _client: Optional[BinaryToSourceClient] = None
 
