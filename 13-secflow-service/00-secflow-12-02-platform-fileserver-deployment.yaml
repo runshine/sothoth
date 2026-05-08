@@ -16,15 +16,15 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-fileserver
-        image: runshine0819/secflow-platform-fileserver:20260506
+        image: ghcr.io/runshine/secflow-platform-fileserver:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
         env:
           - name: TZ
             value: Asia/Shanghai
-        - name: DATA_PVC_NAME
-          value: secflow-platform-fileserver-data-nfs-pvc
+          - name: DATA_PVC_NAME
+            value: secflow-platform-fileserver-data-nfs-pvc
         volumeMounts:
         - name: secflow-platform-fileserver-config
           mountPath: /app/config.yaml

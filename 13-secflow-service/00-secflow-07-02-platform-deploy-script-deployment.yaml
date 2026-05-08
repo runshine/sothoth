@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-deploy-script
-        image: runshine0819/secflow-platform-deploy-script:latest  # 包含kubectl命令
+        image: ghcr.io/runshine/secflow-platform-deploy-script:latest  # 包含kubectl命令
         imagePullPolicy: Always
         env:
           - name: TZ
@@ -59,4 +59,3 @@ spec:
           items:
             - key: config.yaml
               path: config.yaml
-

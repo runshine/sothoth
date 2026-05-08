@@ -17,7 +17,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-code-server
-        image: runshine0819/secflow-app-code-server:latest  # 包含kubectl命令
+        image: ghcr.io/runshine/secflow-app-code-server:latest  # 包含kubectl命令
         imagePullPolicy: Always
         env:
           - name: TZ

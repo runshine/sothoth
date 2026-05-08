@@ -16,16 +16,16 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-menu
-        image: runshine0819/secflow-platform-menu:20260408  # 包含kubectl命令
+        image: ghcr.io/runshine/secflow-platform-menu:latest  # 包含kubectl命令
         imagePullPolicy: Always
         command: ["python", "app.py", "--config", "/app/config.yaml"]
         env:
           - name: TZ
             value: Asia/Shanghai
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
         ports:
         - containerPort: 8080
         volumeMounts:

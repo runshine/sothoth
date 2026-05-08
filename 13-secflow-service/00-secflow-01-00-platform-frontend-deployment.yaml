@@ -16,7 +16,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-frontend
-        image: runshine0819/secflow-frontend:latest
+        image: ghcr.io/runshine/secflow-frontend:latest
         imagePullPolicy: Always
         env:
           - name: TZ

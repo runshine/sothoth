@@ -16,15 +16,15 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-agent
-        image: runshine0819/secflow-platform-agent:latest
+        image: ghcr.io/runshine/secflow-platform-agent:latest
         imagePullPolicy: Always
         env:
           - name: TZ
             value: Asia/Shanghai
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
         command:
         - /bin/sh
         - -c

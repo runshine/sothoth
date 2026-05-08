@@ -29,21 +29,21 @@ spec:
             name: secflow-app-binary-to-source-worker
       containers:
       - name: secflow-app-binary-to-source-worker
-        image: runshine0819/secflow-app-binary-to-source:latest
+        image: ghcr.io/runshine/secflow-app-binary-to-source:latest
         imagePullPolicy: Always
         env:
           - name: TZ
             value: Asia/Shanghai
-        - name: ROLE
-          value: "worker"
-        - name: WORKER_CONCURRENCY
-          value: "4"
-        - name: WORKER_POOL
-          value: "prefork"
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
+          - name: ROLE
+            value: "worker"
+          - name: WORKER_CONCURRENCY
+            value: "4"
+          - name: WORKER_POOL
+            value: "prefork"
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
         volumeMounts:
         - name: secflow-app-binary-to-source-config
           mountPath: /app/config.yaml

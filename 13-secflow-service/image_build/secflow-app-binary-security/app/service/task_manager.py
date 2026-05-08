@@ -306,7 +306,7 @@ class TaskManager:
         )
         self._record_event(db, task, "task_upload_started", "开始校验上传文件")
         if self._task_type(task) == TASK_TYPE_SOURCE:
-            actual_files, total_bytes, extracted_count = self._materialize_source_archives(task, declared)
+            actual_files, total_bytes, extracted_count = await self._materialize_source_archives(task, declared)
             self._record_event(
                 db,
                 task,
@@ -1173,7 +1173,16 @@ class TaskManager:
             return extracted
         raise ValidationError(f"不支持的源码压缩文件格式: {archive_path.name}")
 
-    def _materialize_source_archives(self, task: BinarySecurityTask, declared: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
+    async def _wait_for_uploaded_file(self, path: Path, *, timeout_seconds: int = 10, interval_seconds: int = 1) -> bool:
+        attempts = max(1, timeout_seconds // max(1, interval_seconds)) + 1
+        for attempt in range(attempts):
+            if path.is_file():
+                return True
+            if attempt < attempts - 1:
+                await asyncio.sleep(interval_seconds)
+        return path.is_file()
+
+    async def _materialize_source_archives(self, task: BinarySecurityTask, declared: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
         input_dir = ensure_dir(Path(task.workspace_root) / "input")
         temp_dir = self._source_temp_upload_root(task)
         actual_files: list[dict[str, Any]] = []
@@ -1182,7 +1191,7 @@ class TaskManager:
         for file_info in declared:
             filename = str(file_info["filename"])
             temp_path = temp_dir / filename
-            if not temp_path.is_file():
+            if not await self._wait_for_uploaded_file(temp_path, timeout_seconds=10, interval_seconds=1):
                 raise ValidationError(f"上传文件缺失: {filename}")
             stat = temp_path.stat()
             total_bytes += stat.st_size

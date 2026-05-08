@@ -17,19 +17,19 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-binary-to-source-manager
-        image: runshine0819/secflow-app-binary-to-source:latest
+        image: ghcr.io/runshine/secflow-app-binary-to-source:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080
         env:
           - name: TZ
             value: Asia/Shanghai
-        - name: ROLE
-          value: "manager"
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
+          - name: ROLE
+            value: "manager"
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
         volumeMounts:
         - name: secflow-app-binary-to-source-config
           mountPath: /app/config.yaml

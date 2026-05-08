@@ -16,13 +16,13 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-platform-system-analysis
-        image: runshine0819/secflow-platform-system-analysis:latest
+        image: ghcr.io/runshine/secflow-platform-system-analysis:latest
         imagePullPolicy: Always
         env:
           - name: TZ
             value: Asia/Shanghai
-        - name: CONFIG_PATH
-          value: /app/config.yaml
+          - name: CONFIG_PATH
+            value: /app/config.yaml
         ports:
         - containerPort: 8080
         volumeMounts:
