@@ -750,7 +750,7 @@ def _advanced_kind(path: Path) -> str:
     return path.suffix.lstrip(".") or "file"
 
 
-def _safe_read_advanced_file(path: Path, base: Path, include_content: bool) -> AdvancedFile | None:
+def _safe_read_advanced_file(path: Path, base: Path, include_content: bool, metadata: dict | None = None) -> AdvancedFile | None:
     try:
         resolved = path.resolve()
         resolved.relative_to(base.resolve())
@@ -770,14 +770,89 @@ def _safe_read_advanced_file(path: Path, base: Path, include_content: bool) -> A
             size=size,
             content=content,
             truncated=truncated,
+            **(metadata or {}),
         )
     except Exception:
         return None
 
 
 def _batch_no(path: Path) -> int | None:
-    match = re.search(r"batch_(\d+)", path.name)
+    match = re.search(r"batch_(\d+)", str(path))
     return int(match.group(1)) if match else None
+
+
+def _attempt_no(path: Path | str) -> int | None:
+    match = re.search(r"attempt[_-]?(\d+)", str(path), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _batch_label(no: int | None) -> str:
+    return f"Batch {no:03d}" if no else "Batch"
+
+
+def _stage4_meta(batch_no: int | None, *, section: str, section_order: int, round_label: str, round_order: int = 0, agent: str | None = None, role: str | None = None, attempt_no: int | None = None) -> dict:
+    if batch_no:
+        stage = f"阶段 4 · {_batch_label(batch_no)} 函数"
+        stage_order = 4000 + batch_no
+    else:
+        stage = "阶段 4 · 全局执行会话"
+        stage_order = 4998
+    return {
+        "stage": stage,
+        "stage_order": stage_order,
+        "section": section,
+        "section_order": section_order,
+        "round": round_label,
+        "round_order": round_order,
+        "agent": agent,
+        "role": role,
+        "batch_no": batch_no,
+        "attempt_no": attempt_no,
+    }
+
+
+def _session_meta(path: Path, run_dir: Path, default_batch_no: int | None) -> dict:
+    rel = str(path.relative_to(run_dir)) if path.is_relative_to(run_dir) else str(path)
+    lower = rel.lower()
+    batch_no = _batch_no(rel) or default_batch_no
+    attempt_no = _attempt_no(rel)
+    is_prompt = "system-prompt" in lower or path.name.lower().endswith("system-prompt.md")
+    role = "System Prompt" if is_prompt else "JSONL 会话"
+    if "header" in lower or "synth" in lower:
+        return {
+            "stage": "阶段 3 · 共享头文件合成",
+            "stage_order": 3000,
+            "section": "Header Agent",
+            "section_order": 0,
+            "round": f"第 {attempt_no} 轮" if attempt_no else "Header 会话",
+            "round_order": attempt_no or 0,
+            "agent": "header agent",
+            "role": role,
+            "batch_no": None,
+            "attempt_no": attempt_no,
+        }
+    if "validator" in lower:
+        return _stage4_meta(batch_no, section="评审", section_order=20, round_label=f"第 {attempt_no} 次评审" if attempt_no else "评审会话", round_order=attempt_no or 0, agent="validator agent", role=role, attempt_no=attempt_no)
+    if "executor" in lower:
+        return _stage4_meta(batch_no, section="执行", section_order=10, round_label="执行会话", round_order=0, agent="executor agent", role=role)
+    return _stage4_meta(batch_no, section="其他会话", section_order=90, round_label=f"第 {attempt_no} 轮" if attempt_no else "Agent 会话", round_order=attempt_no or 0, agent="agent", role=role, attempt_no=attempt_no)
+
+
+def _run_file_meta(path: Path) -> dict:
+    name = path.name.lower()
+    if name == "run_manifest.json":
+        return {"stage": "阶段 0 · 运行配置", "stage_order": 0, "section": "文件", "section_order": 0, "round": "产物", "round_order": 0, "role": "运行配置"}
+    if name == "batch_manifest.json":
+        return {"stage": "阶段 2 · Batch 划分清单", "stage_order": 2000, "section": "文件", "section_order": 0, "round": "产物", "round_order": 0, "role": "Batch 清单"}
+    if name == "results.json":
+        return {"stage": "结果汇总", "stage_order": 6000, "section": "文件", "section_order": 0, "round": "产物", "round_order": 0, "role": "结果汇总"}
+    if name == "preamble.h":
+        return {"stage": "阶段 3 · 共享头文件", "stage_order": 3000, "section": "文件", "section_order": 0, "round": "产物", "round_order": 0, "role": "共享头文件"}
+    return {"stage": "运行文件", "stage_order": 500, "section": "文件", "section_order": 0, "round": "产物", "round_order": 0}
+
+
+def _ida_file_meta(path: Path) -> dict:
+    return {"stage": "阶段 1 · IDA 分析缓存", "stage_order": 1000, "section": "文件", "section_order": 0, "round": "产物", "round_order": 0, "role": "IDA 缓存"}
 
 
 def _collect_advanced_files(paths: list[Path], base: Path, include_content: bool) -> list[AdvancedFile]:
@@ -800,24 +875,26 @@ def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) ->
         ida_root = work_dir / "ida_cache"
         if ida_root.exists():
             ida_paths = [p for p in ida_root.rglob("*") if p.is_file() and p.suffix.lower() in ADVANCED_TEXT_EXTENSIONS]
-            ida_files = _collect_advanced_files(sorted(ida_paths), base, include_content)
+            ida_files = [file for path in sorted(ida_paths) if (file := _safe_read_advanced_file(path, base, include_content, _ida_file_meta(path)))]
         runs_root = work_dir / "runs"
         run_dirs = sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.name) if runs_root.exists() else []
         for run_dir in run_dirs:
             batch_map: dict[int, AdvancedBatch] = {}
             for batch_path in sorted(run_dir.glob("batch_*.c")):
                 no = _batch_no(batch_path) or 0
-                batch_map.setdefault(no, AdvancedBatch(name=f"batch_{no:03d}", batch_no=no)).source = _safe_read_advanced_file(batch_path, base, include_content)
+                batch_map.setdefault(no, AdvancedBatch(name=f"batch_{no:03d}", batch_no=no)).source = _safe_read_advanced_file(batch_path, base, include_content, _stage4_meta(no or None, section="执行", section_order=10, round_label="执行输出", round_order=0, agent="executor agent", role="batch 输出"))
             for disasm_path in sorted(run_dir.glob("disasm_batch_*.c")):
                 no = _batch_no(disasm_path) or 0
-                batch_map.setdefault(no, AdvancedBatch(name=f"batch_{no:03d}", batch_no=no)).disasm = _safe_read_advanced_file(disasm_path, base, include_content)
+                batch_map.setdefault(no, AdvancedBatch(name=f"batch_{no:03d}", batch_no=no)).disasm = _safe_read_advanced_file(disasm_path, base, include_content, {"stage": "阶段 2 · Batch 上下文切片", "stage_order": 2000, "section": "文件", "section_order": 0, "round": _batch_label(no or None), "round_order": no, "role": "反编译上下文", "batch_no": no or None})
             review_dir = run_dir / "review_snapshots"
             if review_dir.exists():
                 for review_path in sorted(review_dir.iterdir()):
                     if not review_path.is_file():
                         continue
                     no = _batch_no(review_path) or 0
-                    file = _safe_read_advanced_file(review_path, base, include_content)
+                    attempt_no = _attempt_no(review_path) or 0
+                    role = "评审输出" if review_path.name.endswith(".verdict.json") else "评审输入"
+                    file = _safe_read_advanced_file(review_path, base, include_content, _stage4_meta(no or None, section="评审", section_order=20, round_label=f"第 {attempt_no} 次评审" if attempt_no else "评审轮次", round_order=attempt_no, agent="validator agent", role=role, attempt_no=attempt_no or None))
                     if not file:
                         continue
                     batch = batch_map.setdefault(no, AdvancedBatch(name=f"batch_{no:03d}", batch_no=no))
@@ -827,6 +904,8 @@ def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) ->
                         batch.review_snapshots.append(file)
             session_dir = run_dir / "agent_sessions"
             session_paths = sorted([p for p in session_dir.rglob("*") if p.is_file()]) if session_dir.exists() else []
+            single_batch_no = next(iter(batch_map.keys())) if len(batch_map) == 1 else None
+            session_files = [file for path in session_paths if (file := _safe_read_advanced_file(path, base, include_content, _session_meta(path, run_dir, single_batch_no)))]
             misc_paths = [p for p in run_dir.iterdir() if p.is_file() and p.name not in {"preamble.h"} and not p.name.startswith("batch_") and not p.name.startswith("disasm_batch_")]
             preamble = run_dir / "preamble.h"
             if preamble.exists():
@@ -835,8 +914,8 @@ def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) ->
                 name=run_dir.name,
                 path=str(run_dir),
                 batches=[batch_map[key] for key in sorted(batch_map)],
-                agent_sessions=_collect_advanced_files(session_paths, base, include_content),
-                files=_collect_advanced_files(misc_paths, base, include_content),
+                agent_sessions=session_files,
+                files=[file for path in misc_paths if (file := _safe_read_advanced_file(path, base, include_content, _run_file_meta(path)))],
             ))
     mode, mode_label = task_mode_summary([item])
     return TaskItemAdvancedResponse(
