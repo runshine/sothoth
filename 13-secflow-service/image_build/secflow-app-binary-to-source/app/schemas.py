@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -29,6 +29,7 @@ class TaskCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     llm_provider_key: Optional[str] = None
     concurrency: Optional[int] = None
+    engine: Optional[Literal["hybrid", "agent"]] = None
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None

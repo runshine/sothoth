@@ -31,6 +31,7 @@ PI_STATUS_MAP = {
 PI_PHASE_MAP = {
     "analyzing": "ida",
     "batching": "batching",
+    "header_synthesis": "header",
     "processing": "body",
     "merging": "merge",
 }
@@ -162,6 +163,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     llm_provider_key = (req.llm_provider_key or "").strip() or None
     job_model = await resolve_job_model(llm_provider_key)
     job_concurrency = req.concurrency if req.concurrency and req.concurrency > 0 else pi_cfg.concurrency
+    job_engine = req.engine or pi_cfg.engine
     for idx, elf in enumerate(req.elf_tasks, start=1):
         source_elf_path = ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)
         input_elf_path = prepare_input_file(project_id, task.id, idx, source_elf_path)
@@ -188,6 +190,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "source_elf_path": str(source_elf_path),
             "llm_provider_key": llm_provider_key,
             "concurrency": job_concurrency,
+            "engine": job_engine,
             "pi_worker_url": worker_url,
         }
         item.phase = "queued"
@@ -204,7 +207,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
                 "model": job_model,
                 "functions": elf.file_list or None,
                 "clean": False,
-                "engine": pi_cfg.engine,
+                "engine": job_engine,
                 "concurrency": job_concurrency,
             })
             item.pi_job_id = job.get("id")
@@ -372,6 +375,7 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
             item.output_dir = str(clean_item_output_dir(task.project_id, task.id, item.sequence_no, item.output_dir))
 
         item_concurrency = int((item.extra_metadata or {}).get("concurrency") or pi_cfg.concurrency)
+        item_engine = str((item.extra_metadata or {}).get("engine") or pi_cfg.engine).strip() or pi_cfg.engine
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
@@ -395,7 +399,7 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
                 "model": job_model,
                 "functions": (item.extra_metadata or {}).get("file_list") or None,
                 "clean": True,
-                "engine": pi_cfg.engine,
+                "engine": item_engine,
                 "concurrency": item_concurrency,
             })
             item.pi_job_id = job.get("id")
@@ -430,6 +434,7 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
         if item.status not in {"failed", "cancelled"}:
             continue
         item_concurrency = int((item.extra_metadata or {}).get("concurrency") or pi_cfg.concurrency)
+        item_engine = str((item.extra_metadata or {}).get("engine") or pi_cfg.engine).strip() or pi_cfg.engine
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
@@ -442,7 +447,7 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
             "model": job_model,
             "functions": (item.extra_metadata or {}).get("file_list") or None,
             "clean": True,
-            "engine": pi_cfg.engine,
+            "engine": item_engine,
             "concurrency": item_concurrency,
         })
         item.pi_job_id = job.get("id")
