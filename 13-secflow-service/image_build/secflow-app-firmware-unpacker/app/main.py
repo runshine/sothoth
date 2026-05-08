@@ -23,16 +23,7 @@ from app.api.firmware import router as firmware_router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.logging_utils import configure_container_logging
-from app.model import init_database
-from app.services.registry import get_registry_service
-from app.services.task_manager import start as start_task_dispatcher
-from app.services.task_manager import stop as stop_task_dispatcher
-from app.services.worker import (
-    deregister_worker,
-    register_worker,
-    start_heartbeat,
-    stop_heartbeat,
-)
+from app.runtime import start_runtime, stop_runtime
 
 
 configure_container_logging("secflow-app-firmware-unpacker")
@@ -91,13 +82,7 @@ async def lifespan(app: FastAPI):
         logging.getLogger().setLevel(
             getattr(logging, config.logging.level.upper(), logging.INFO)
         )
-
-        verify_auth_service_or_exit()
-        init_database()
-        register_worker()
-        start_heartbeat()
-        start_task_dispatcher()
-        await get_registry_service().start()
+        await start_runtime()
         logger.info("secflow-app-firmware-unpacker started")
     except Exception as exc:
         logger.exception("service startup failed: %s", exc)
@@ -106,10 +91,7 @@ async def lifespan(app: FastAPI):
     yield
 
     try:
-        stop_task_dispatcher()
-        stop_heartbeat()
-        deregister_worker()
-        await get_registry_service().stop()
+        await stop_runtime()
     except Exception as exc:
         logger.warning("service shutdown warning: %s", exc)
 

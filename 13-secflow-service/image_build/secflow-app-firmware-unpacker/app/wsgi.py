@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import atexit
 import os
 import sys
 from pathlib import Path
@@ -17,6 +19,10 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "app"))
 
 from app.main import app as asgi_app
+from app.runtime import start_runtime, stop_runtime
 
+
+asyncio.run(start_runtime())
+atexit.register(lambda: asyncio.run(stop_runtime()))
 
 app = ASGIMiddleware(asgi_app)
