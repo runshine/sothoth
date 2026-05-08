@@ -731,7 +731,7 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
     return TaskDetailResponse(**base, overall_progress=build_overall_progress(raw_items), items=items)
 
 
-ADVANCED_TEXT_EXTENSIONS = {".c", ".h", ".json", ".md", ".txt", ".log", ".yaml", ".yml"}
+ADVANCED_TEXT_EXTENSIONS = {".c", ".h", ".json", ".jsonl", ".md", ".txt", ".log", ".yaml", ".yml"}
 ADVANCED_MAX_BYTES = 512 * 1024
 
 
