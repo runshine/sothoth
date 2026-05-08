@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: secflow-platform-vuln
-        image: ghcr.io/runshine/secflow-platform-vuln:20260322
+        image: ghcr.io/runshine/secflow-platform-vuln:latest
         imagePullPolicy: Always
         env:
           - name: TZ

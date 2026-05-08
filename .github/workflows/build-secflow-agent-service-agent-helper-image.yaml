@@ -48,17 +48,17 @@ jobs:
           DOCKER_BUILDKIT=0 docker build \
             -f 100-agent-service-image/01-secflow-agent-service-agent-helper/Dockerfile \
             --build-arg TARGETARCH=${{ matrix.arch }} \
-            -t runshine0819/secflow-agent-service-agent-helper:latest-${{ matrix.arch }} \
+            # -t runshine0819/secflow-agent-service-agent-helper:latest-${{ matrix.arch }} \
             -t ghcr.io/runshine/secflow-agent-service-agent-helper:latest-${{ matrix.arch }} \
-            -t runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }} \
+            # -t runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }} \
             -t ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }} \
             100-agent-service-image/01-secflow-agent-service-agent-helper/
 
       - name: Push arch images
         run: |
-          docker push runshine0819/secflow-agent-service-agent-helper:latest-${{ matrix.arch }}
+          # docker push runshine0819/secflow-agent-service-agent-helper:latest-${{ matrix.arch }}
           docker push ghcr.io/runshine/secflow-agent-service-agent-helper:latest-${{ matrix.arch }}
-          docker push runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }}
+          # docker push runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }}
           docker push ghcr.io/runshine/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-${{ matrix.arch }}
 
   publish-multiarch-manifest:
@@ -87,14 +87,14 @@ jobs:
 
       - name: Create and push Docker Hub manifests
         run: |
-          docker manifest create runshine0819/secflow-agent-service-agent-helper:latest \
-            runshine0819/secflow-agent-service-agent-helper:latest-amd64 \
-            runshine0819/secflow-agent-service-agent-helper:latest-arm64
-          docker manifest create runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }} \
-            runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-amd64 \
-            runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-arm64
-          docker manifest push runshine0819/secflow-agent-service-agent-helper:latest
-          docker manifest push runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}
+          # docker manifest create runshine0819/secflow-agent-service-agent-helper:latest \
+            # runshine0819/secflow-agent-service-agent-helper:latest-amd64 \
+            # runshine0819/secflow-agent-service-agent-helper:latest-arm64
+          # docker manifest create runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }} \
+            # runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-amd64 \
+            # runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}-arm64
+          # docker manifest push runshine0819/secflow-agent-service-agent-helper:latest
+          # docker manifest push runshine0819/secflow-agent-service-agent-helper:${{ steps.date.outputs.date_tag }}
 
       - name: Create and push GHCR manifests
         run: |

@@ -51,17 +51,17 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-app-dataflow-analyse/Dockerfile \
-            --tag runshine0819/secflow-app-dataflow-analyse:amd64-latest \
+            # --tag runshine0819/secflow-app-dataflow-analyse:amd64-latest \
             --tag ghcr.io/runshine/secflow-app-dataflow-analyse:amd64-latest \
-            --tag runshine0819/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            # --tag runshine0819/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-dataflow-analyse/
 
       - name: Push amd64 image
         run: |
-          docker push runshine0819/secflow-app-dataflow-analyse:amd64-latest
+          # docker push runshine0819/secflow-app-dataflow-analyse:amd64-latest
           docker push ghcr.io/runshine/secflow-app-dataflow-analyse:amd64-latest
-          docker push runshine0819/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
+          # docker push runshine0819/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
           docker push ghcr.io/runshine/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
@@ -94,17 +94,17 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-app-dataflow-analyse/Dockerfile \
-            --tag runshine0819/secflow-app-dataflow-analyse:arm64-latest \
+            # --tag runshine0819/secflow-app-dataflow-analyse:arm64-latest \
             --tag ghcr.io/runshine/secflow-app-dataflow-analyse:arm64-latest \
-            --tag runshine0819/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
+            # --tag runshine0819/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-dataflow-analyse/
 
       - name: Push arm64 image
         run: |
-          docker push runshine0819/secflow-app-dataflow-analyse:arm64-latest
+          # docker push runshine0819/secflow-app-dataflow-analyse:arm64-latest
           docker push ghcr.io/runshine/secflow-app-dataflow-analyse:arm64-latest
-          docker push runshine0819/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
+          # docker push runshine0819/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
           docker push ghcr.io/runshine/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
@@ -133,10 +133,10 @@ jobs:
             --amend ghcr.io/runshine/secflow-app-dataflow-analyse:amd64-latest \
             --amend ghcr.io/runshine/secflow-app-dataflow-analyse:arm64-latest
           docker manifest push ghcr.io/runshine/secflow-app-dataflow-analyse:latest
-          docker manifest create runshine0819/secflow-app-dataflow-analyse:latest \
-            --amend runshine0819/secflow-app-dataflow-analyse:amd64-latest \
-            --amend runshine0819/secflow-app-dataflow-analyse:arm64-latest || true
-          docker manifest push runshine0819/secflow-app-dataflow-analyse:latest || true
+          # docker manifest create runshine0819/secflow-app-dataflow-analyse:latest \
+            # --amend runshine0819/secflow-app-dataflow-analyse:amd64-latest \
+            # --amend runshine0819/secflow-app-dataflow-analyse:arm64-latest || true
+          # docker manifest push runshine0819/secflow-app-dataflow-analyse:latest || true
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
@@ -144,7 +144,7 @@ jobs:
             --amend ghcr.io/runshine/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
             --amend ghcr.io/runshine/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-dataflow-analyse:${{ needs.prepare.outputs.date_tag }}
-          docker manifest create runshine0819/secflow-app-dataflow-analyse:${{ needs.prepare.outputs.date_tag }} \
-            --amend runshine0819/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
-            --amend runshine0819/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }} || true
-          docker manifest push runshine0819/secflow-app-dataflow-analyse:${{ needs.prepare.outputs.date_tag }} || true
+          # docker manifest create runshine0819/secflow-app-dataflow-analyse:${{ needs.prepare.outputs.date_tag }} \
+            # --amend runshine0819/secflow-app-dataflow-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
+            # --amend runshine0819/secflow-app-dataflow-analyse:arm64-${{ needs.prepare.outputs.date_tag }} || true
+          # docker manifest push runshine0819/secflow-app-dataflow-analyse:${{ needs.prepare.outputs.date_tag }} || true

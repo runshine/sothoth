@@ -46,17 +46,17 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-platform-fileserver/Dockerfile \
-            --tag runshine0819/secflow-platform-fileserver:amd64-latest \
+            # --tag runshine0819/secflow-platform-fileserver:amd64-latest \
             --tag ghcr.io/runshine/secflow-platform-fileserver:amd64-latest \
-            --tag runshine0819/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }} \
+            # --tag runshine0819/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-platform-fileserver/
 
       - name: Push amd64 image
         run: |
-          docker push runshine0819/secflow-platform-fileserver:amd64-latest
+          # docker push runshine0819/secflow-platform-fileserver:amd64-latest
           docker push ghcr.io/runshine/secflow-platform-fileserver:amd64-latest
-          docker push runshine0819/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }}
+          # docker push runshine0819/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }}
           docker push ghcr.io/runshine/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
@@ -88,17 +88,17 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-platform-fileserver/Dockerfile \
-            --tag runshine0819/secflow-platform-fileserver:arm64-latest \
+            # --tag runshine0819/secflow-platform-fileserver:arm64-latest \
             --tag ghcr.io/runshine/secflow-platform-fileserver:arm64-latest \
-            --tag runshine0819/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }} \
+            # --tag runshine0819/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-platform-fileserver/
 
       - name: Push arm64 image
         run: |
-          docker push runshine0819/secflow-platform-fileserver:arm64-latest
+          # docker push runshine0819/secflow-platform-fileserver:arm64-latest
           docker push ghcr.io/runshine/secflow-platform-fileserver:arm64-latest
-          docker push runshine0819/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }}
+          # docker push runshine0819/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }}
           docker push ghcr.io/runshine/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
@@ -123,22 +123,22 @@ jobs:
 
       - name: Create and push multi-arch manifest (latest)
         run: |
-          docker manifest create runshine0819/secflow-platform-fileserver:latest \
-            --amend runshine0819/secflow-platform-fileserver:amd64-latest \
-            --amend runshine0819/secflow-platform-fileserver:arm64-latest
+          # docker manifest create runshine0819/secflow-platform-fileserver:latest \
+            # --amend runshine0819/secflow-platform-fileserver:amd64-latest \
+            # --amend runshine0819/secflow-platform-fileserver:arm64-latest
           docker manifest create ghcr.io/runshine/secflow-platform-fileserver:latest \
             --amend ghcr.io/runshine/secflow-platform-fileserver:amd64-latest \
             --amend ghcr.io/runshine/secflow-platform-fileserver:arm64-latest
-          docker manifest push runshine0819/secflow-platform-fileserver:latest
+          # docker manifest push runshine0819/secflow-platform-fileserver:latest
           docker manifest push ghcr.io/runshine/secflow-platform-fileserver:latest
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
-          docker manifest create runshine0819/secflow-platform-fileserver:${{ needs.prepare.outputs.date_tag }} \
-            --amend runshine0819/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }} \
-            --amend runshine0819/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }}
+          # docker manifest create runshine0819/secflow-platform-fileserver:${{ needs.prepare.outputs.date_tag }} \
+            # --amend runshine0819/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }} \
+            # --amend runshine0819/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }}
           docker manifest create ghcr.io/runshine/secflow-platform-fileserver:${{ needs.prepare.outputs.date_tag }} \
             --amend ghcr.io/runshine/secflow-platform-fileserver:amd64-${{ needs.prepare.outputs.date_tag }} \
             --amend ghcr.io/runshine/secflow-platform-fileserver:arm64-${{ needs.prepare.outputs.date_tag }}
-          docker manifest push runshine0819/secflow-platform-fileserver:${{ needs.prepare.outputs.date_tag }}
+          # docker manifest push runshine0819/secflow-platform-fileserver:${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-platform-fileserver:${{ needs.prepare.outputs.date_tag }}
