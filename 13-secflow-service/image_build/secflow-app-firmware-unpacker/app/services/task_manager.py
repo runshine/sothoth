@@ -634,6 +634,37 @@ def prepare_task_workspace(
     }
 
 
+def reset_task_workspace(
+    project_id: str,
+    task_id: str,
+    source_firmware_path: str,
+) -> dict[str, str]:
+    workspace = build_task_workspace(project_id, task_id)
+
+    import shutil
+
+    for key in ("input_dir", "output_dir", "run_dir"):
+        directory = workspace[key]
+        if directory.exists():
+            shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = _write_task_manifest(
+        workspace["input_dir"],
+        source_firmware_path,
+        str(workspace["output_dir"]),
+        str(workspace["run_dir"]),
+    )
+    return {
+        "base_dir": str(workspace["base_dir"]),
+        "input_path": source_firmware_path,
+        "input_dir": str(workspace["input_dir"]),
+        "output_path": str(workspace["output_dir"]),
+        "run_path": str(workspace["run_dir"]),
+        "manifest_path": str(manifest_path),
+    }
+
+
 def remove_task_workspace(task_id: str, project_id: Optional[str]) -> None:
     normalized_project_id = str(project_id or "").strip()
     if not normalized_project_id:
@@ -839,29 +870,49 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
             TaskStatus.CANCELLED.value,
         ):
             return False, None, "仅支持重试失败或已取消的任务"
-        new_task = submit_unpack_task(
-            firmware_path=task.firmware_path,
-            project_id=task.project_id,
-            llm_binding_snapshot=_parse_llm_binding_snapshot(task.llm_binding_snapshot),
-            task_origin_type=task.task_origin_type,
-            parent_project_id=task.parent_project_id,
-            parent_task_id=task.parent_task_id,
-            parent_task_type=task.parent_task_type,
-            parent_stage_name=task.parent_stage_name,
-            parent_stage_item_id=task.parent_stage_item_id,
-            parent_stage_item_key=task.parent_stage_item_key,
+        normalized_project_id = str(task.project_id or "").strip()
+        if not normalized_project_id:
+            return False, None, "任务缺少 project_id，无法重试"
+
+        reset_task_workspace(
+            normalized_project_id,
+            task.id,
+            task.firmware_path,
         )
+        task.status = TaskStatus.PENDING.value
+        task.owner_id = None
+        task.current_stage = "pending"
+        task.lease_expires_at = None
+        task.cancel_requested_at = None
+        task.last_progress_at = datetime.utcnow()
+        task.result_status = None
+        task.result_message = None
+        task.rounds = None
+        task.error_message = None
+        task.matched_skill = None
+        task.matched_skill_version = None
+        task.matched_skill_score = None
+        task.fallback_to_llm = False
+        task.generated_skill_path = None
+        task.generated_skill_status = None
+        task.promotion_success_count = None
+        task.started_at = None
+        task.completed_at = None
+        if not task.llm_binding_snapshot:
+            snapshot = _build_llm_binding_snapshot(db)
+            task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
+        db.commit()
         _record_task_event(
-            new_task["task_id"],
+            task.id,
             project_id=task.project_id,
-            event_type="retry_created",
-            summary="任务由重试操作创建",
+            event_type="task_requeued",
+            summary="任务已按原任务 ID 重新入队",
             stage_key="pending",
             status=TaskStatus.PENDING.value,
-            detail={"source_task_id": task_id},
+            detail={"retry_mode": "inplace"},
             created_by="task_manager",
         )
-        return True, new_task["task_id"], "重试任务已创建"
+        return True, task.id, "任务已按原任务 ID 重新入队"
     finally:
         db.close()
 

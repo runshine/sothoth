@@ -44,6 +44,7 @@ from app.services.task_events import list_task_events
 from app.services.task_manager import cancel_task, delete_tasks, retry_task, submit_unpack_task
 from app.services.worker import get_cluster_snapshot, get_worker_id
 from app.skill_store import list_skills
+from app.unpacker_engine_config import get_max_retries
 from app.unpacker_engine import TOOLS_DIR
 
 
@@ -131,13 +132,23 @@ def _get_task_resource_usage(task_id: str) -> dict:
     }
 
 
-def _phase_payload(key: str, label: str, status: str, detail: Optional[str] = None, updated_at: Optional[str] = None) -> dict:
+def _phase_payload(
+    key: str,
+    label: str,
+    status: str,
+    detail: Optional[str] = None,
+    updated_at: Optional[str] = None,
+    current_round: Optional[int] = None,
+    total_rounds: Optional[int] = None,
+) -> dict:
     return {
         "key": key,
         "label": label,
         "status": status,
         "detail": detail,
         "updated_at": updated_at,
+        "current_round": current_round,
+        "total_rounds": total_rounds,
     }
 
 
@@ -195,11 +206,41 @@ def _get_task_progress(task_id: str) -> dict:
 
     task_status = str(task.get("status") or "").lower()
     task_result = str(task.get("result_status") or "").lower()
+    task_current_stage = str(task.get("current_stage") or "").strip().lower()
     result_message = str(task.get("result_message") or "")
     quick_preprocess_success = "quick pre-process" in result_message.lower()
     matched_skill = str(task.get("matched_skill") or "").strip()
     fallback_to_llm = bool(task.get("fallback_to_llm"))
     generated_skill_path = str(task.get("generated_skill_path") or "").strip()
+    final_round = int(task.get("rounds") or 0)
+    total_llm_rounds = max(1, int(get_max_retries() or 1))
+
+    def _clamp_round(value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        return max(1, min(int(value), total_llm_rounds))
+
+    def _running_unpack_round() -> Optional[int]:
+        if task_current_stage != "llm_unpack":
+            return None
+        if executor_logs:
+            return _clamp_round(len(executor_logs))
+        return 1
+
+    def _running_review_round() -> Optional[int]:
+        if task_current_stage != "review":
+            return None
+        base = max(len(executor_logs), len(verifier_logs) + 1, final_round, 1)
+        return _clamp_round(base)
+
+    def _completed_round() -> Optional[int]:
+        if final_round > 0:
+            return _clamp_round(final_round)
+        if verifier_logs:
+            return _clamp_round(max(len(verifier_logs), len(executor_logs), 1))
+        if executor_logs:
+            return _clamp_round(max(len(executor_logs), 1))
+        return None
 
     phases = [
         _phase_payload("preprocess", "预处理", "pending"),
@@ -282,7 +323,9 @@ def _get_task_progress(task_id: str) -> dict:
         if executor_logs or fallback_to_llm or (task_status == "running" and stage2_path.exists()):
             unpack_status = "running"
             unpack_detail = "LLM 正在执行解包"
+            unpack_round = _running_unpack_round()
             if executor_logs:
+                unpack_round = _clamp_round(max(len(executor_logs), final_round or 0, 1))
                 unpack_detail = f"已执行 {len(executor_logs)} 轮解包"
                 if verifier_logs or task_result in {"success", "max_retries_reached", "failed"}:
                     unpack_status = "success"
@@ -298,6 +341,8 @@ def _get_task_progress(task_id: str) -> dict:
                 unpack_status,
                 unpack_detail,
                 _mtime_iso_text(executor_logs[-1]) if executor_logs else (_mtime_iso_text(stage3_llm_unpack_log) or _mtime_iso_text(stage4_path)),
+                current_round=unpack_round if unpack_status != "skipped" else None,
+                total_rounds=total_llm_rounds if unpack_status != "skipped" else None,
             )
         elif matched_skill and not fallback_to_llm:
             phases[2] = _phase_payload("llm_unpack", "LLM 解包", "skipped", "工具执行成功，未进入 LLM 解包")
@@ -305,9 +350,14 @@ def _get_task_progress(task_id: str) -> dict:
         if verifier_logs or task_result in {"success", "max_retries_reached", "failed"}:
             review_status = "running"
             review_detail = "LLM 正在评审当前解包结果"
+            review_round = _running_review_round()
             if verifier_logs:
                 review_status = "success" if task_status == "success" else ("failed" if task_status == "failed" else "running")
                 review_detail = f"已完成 {len(verifier_logs)} 轮评审"
+                if review_status != "running":
+                    review_round = _completed_round()
+                else:
+                    review_round = _clamp_round(max(len(verifier_logs), len(executor_logs), 1))
                 if task_status == "failed":
                     review_detail = "评审未通过，任务失败"
             phases[3] = _phase_payload(
@@ -316,6 +366,8 @@ def _get_task_progress(task_id: str) -> dict:
                 review_status,
                 review_detail,
                 _mtime_iso_text(verifier_logs[-1]) if verifier_logs else _mtime_iso_text(stage4_llm_review_log),
+                current_round=review_round,
+                total_rounds=total_llm_rounds if review_round is not None else None,
             )
         elif matched_skill and not fallback_to_llm:
             phases[3] = _phase_payload("llm_review", "LLM 评审", "skipped", "工具执行成功后未进入 LLM 评审链路")
@@ -359,10 +411,26 @@ def _get_task_progress(task_id: str) -> dict:
         summary_parts.append(f"生成候选工具：{Path(generated_skill_path).name}")
     summary = "；".join(summary_parts) if summary_parts else "根据运行目录推导当前阶段进展"
 
+    overall_current_round = None
+    overall_total_rounds = None
+    for phase in phases:
+        if phase["key"] in {"llm_unpack", "llm_review"} and phase.get("current_round") is not None:
+            overall_current_round = phase.get("current_round")
+            overall_total_rounds = phase.get("total_rounds")
+            if phase["status"] == "running":
+                break
+    if overall_current_round is None:
+        completed_round = _completed_round()
+        if completed_round is not None:
+            overall_current_round = completed_round
+            overall_total_rounds = total_llm_rounds
+
     return {
         "task_id": task_id,
         "current_phase": current_phase,
         "summary": summary,
+        "current_round": overall_current_round,
+        "total_rounds": overall_total_rounds,
         "phases": phases,
     }
 
@@ -1210,13 +1278,12 @@ async def retry_task_legacy(
 ):
     _, token = subject_and_token
     await _get_task_with_access(task_id, token)
-    ok, new_task_id, message = retry_task(task_id)
-    if not ok or not new_task_id:
+    ok, retried_task_id, message = retry_task(task_id)
+    if not ok or not retried_task_id:
         raise ValidationError(message)
     return {
         "message": message,
-        "task_id": task_id,
-        "new_task_id": new_task_id,
+        "task_id": retried_task_id,
     }
 
 

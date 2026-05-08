@@ -120,12 +120,16 @@ class TaskProgressPhaseResponse(BaseModel):
     status: str
     detail: Optional[str] = None
     updated_at: Optional[str] = None
+    current_round: Optional[int] = None
+    total_rounds: Optional[int] = None
 
 
 class TaskProgressResponse(BaseModel):
     task_id: str
     current_phase: Optional[str] = None
     summary: Optional[str] = None
+    current_round: Optional[int] = None
+    total_rounds: Optional[int] = None
     phases: List[TaskProgressPhaseResponse]
 
 
