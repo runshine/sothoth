@@ -53,10 +53,15 @@ worker:
 # AgentFlow 解包引擎配置。服务仅保留 AgentFlow 运行模式。
 agentflow:
   enabled: true
+  profile: "production"
   runs_dir: "/data/files/.agentflow/runs"
   max_concurrent_runs: 2
   node_timeout_seconds: 1800
   use_worktree: false
+  graph_optimization_enabled: false
+  graph_optimizer: "codex"
+  graph_optimization_rounds: 1
+  evolution_archive_dir: ""
   cleanup_runs_retention_days: 7
 
 # 服务注册配置

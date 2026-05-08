@@ -132,12 +132,19 @@ def _get_task_agentflow_status(task_id: str) -> dict:
                 run_json = json.loads(candidate.read_text(encoding="utf-8"))
             except Exception:
                 run_json = None
+    run_dir = Path(run_path) if run_path else None
+    final_result = _read_json_file(run_dir / "final_result.json") if run_dir else None
+    tokens_summary = _read_json_file(run_dir / "tokens_summary.json") if run_dir else None
     return {
         "task_id": task_id,
         "agentflow_run_id": run_id,
         "run_path": run_path or None,
         "status": run_json.get("status") if isinstance(run_json, dict) else None,
         "nodes": run_json.get("nodes") if isinstance(run_json, dict) else None,
+        "final_result": final_result,
+        "tokens_summary": tokens_summary,
+        "node_attempts": task.get("node_attempts"),
+        "failure_summary": task.get("failure_summary"),
         "run": run_json,
     }
 

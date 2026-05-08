@@ -92,10 +92,15 @@ class AgentFlowConfig(BaseModel):
     """AgentFlow engine configuration."""
 
     enabled: bool = True
+    profile: str = "production"
     runs_dir: str = "/data/files/.agentflow/runs"
     max_concurrent_runs: int = 2
     node_timeout_seconds: int = 1800
     use_worktree: bool = False
+    graph_optimization_enabled: bool = False
+    graph_optimizer: str = "codex"
+    graph_optimization_rounds: int = 1
+    evolution_archive_dir: str = ""
     cleanup_runs_retention_days: int = 7
 
 
@@ -213,10 +218,27 @@ def _env_int(name: str, default: int) -> int:
 
 def _apply_env_overrides(cfg: Config) -> Config:
     cfg.agentflow.enabled = True
+    cfg.agentflow.profile = os.environ.get("AGENTFLOW_PROFILE", cfg.agentflow.profile)
     cfg.agentflow.runs_dir = os.environ.get("AGENTFLOW_RUNS_DIR", cfg.agentflow.runs_dir)
     cfg.agentflow.max_concurrent_runs = _env_int(
         "AGENTFLOW_MAX_CONCURRENT_RUNS",
         cfg.agentflow.max_concurrent_runs,
+    )
+    cfg.agentflow.graph_optimization_enabled = _env_bool(
+        "AGENTFLOW_GRAPH_OPTIMIZATION_ENABLED",
+        cfg.agentflow.graph_optimization_enabled,
+    )
+    cfg.agentflow.graph_optimizer = os.environ.get(
+        "AGENTFLOW_GRAPH_OPTIMIZER",
+        cfg.agentflow.graph_optimizer,
+    )
+    cfg.agentflow.graph_optimization_rounds = _env_int(
+        "AGENTFLOW_GRAPH_OPTIMIZATION_ROUNDS",
+        cfg.agentflow.graph_optimization_rounds,
+    )
+    cfg.agentflow.evolution_archive_dir = os.environ.get(
+        "AGENTFLOW_EVOLUTION_ARCHIVE_DIR",
+        cfg.agentflow.evolution_archive_dir,
     )
     return cfg
 

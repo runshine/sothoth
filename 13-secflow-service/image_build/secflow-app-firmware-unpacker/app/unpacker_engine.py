@@ -706,7 +706,7 @@ def _run_cleaner(
     if bind_cancel_client:
         bind_cancel_client(cleaner)
     try:
-        clean_msg = render_prompt(CLEAN_PROMPT_TMPL, output_path, "")
+        clean_msg = render_prompt(CLEAN_PROMPT_TMPL, "", output_path)
         log_event(log, logging.INFO, "cleanup started", event="cleanup_start")
         result = cleaner.prompt(clean_msg)
         _save_agent_log(cleaner, log_dir, "cleaner")

@@ -186,6 +186,88 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
         _write_stage_log(log_dir, stage_entries)
         return result
 
+    def _find_magic_offset(magic: bytes, max_scan: int = 16 * 1024 * 1024) -> int:
+        try:
+            with open(firmware_path, "rb") as fh:
+                data = fh.read(max_scan)
+            return data.find(magic)
+        except Exception:
+            return -1
+
+    def _copy_from_offset(offset: int, dest: Path) -> int:
+        total = 0
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(firmware_path, "rb") as src, open(dest, "wb") as out:
+            src.seek(offset)
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
+                total += len(chunk)
+        return total
+
+    def _extract_elf_at_offset(offset: int) -> dict | None:
+        firmware_stem = Path(firmware_path).stem or "firmware"
+        elf_out = Path(output_path) / f"{firmware_stem}_elf"
+        header_out = Path(output_path) / "header.bin"
+        try:
+            extracted_size = _copy_from_offset(offset, elf_out)
+            header_size = 0
+            if offset > 0:
+                with open(firmware_path, "rb") as src, open(header_out, "wb") as out:
+                    out.write(src.read(offset))
+                header_size = header_out.stat().st_size
+
+            file_proc = _run(["file", str(elf_out)])
+            file_desc = file_proc.stdout.strip() if file_proc.returncode == 0 else ""
+            summary_lines = [
+                f"Firmware: {firmware_path}",
+                f"Method: embedded ELF extraction",
+                f"ELF offset: {offset} (0x{offset:x})",
+                f"Extracted ELF: {elf_out.name} ({extracted_size} bytes)",
+            ]
+            if header_size:
+                summary_lines.append(f"Preserved prefix/header: {header_out.name} ({header_size} bytes)")
+            if file_desc:
+                summary_lines.append(f"File identification: {file_desc}")
+            summary_lines.extend(
+                [
+                    "",
+                    "Tools and commands used:",
+                    "- magic scan for ELF header",
+                    f"- copied bytes from offset {offset} into {elf_out.name}",
+                    "- file on extracted ELF",
+                    "",
+                    "What was found:",
+                    "- Embedded ELF executable/shared object payload",
+                    "- Prefix bytes before the ELF were preserved separately when present",
+                    "",
+                    "Skill Reuse Notes:",
+                    "- Check for zero padding followed by ELF magic at a fixed offset.",
+                    "- Extract from the ELF offset and preserve the prefix as a header artifact.",
+                    "- Record file/readelf metadata for similar samples.",
+                    "",
+                ]
+            )
+            Path(output_path, "summary.txt").write_text("\n".join(summary_lines), encoding="utf-8")
+            _record(
+                "embedded ELF extraction",
+                file_proc,
+                success=True,
+                extra={
+                    "offset": offset,
+                    "output_file": str(elf_out),
+                    "output_size": extracted_size,
+                    "header_file": str(header_out) if header_size else None,
+                    "header_size": header_size,
+                },
+            )
+            return _success("embedded ELF extraction")
+        except Exception as exc:
+            _record("embedded ELF extraction", extra={"offset": offset, "error": str(exc)})
+            return None
+
     def _stream_decompress(tool: str, shell_cmd: str) -> dict | None:
         log_event(
             log,
@@ -215,6 +297,13 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
             returncode=proc.returncode,
         )
         return None
+
+    if fmt in (None, "elf"):
+        elf_offset = _find_magic_offset(b"\x7fELF")
+        if elf_offset >= 0:
+            result = _extract_elf_at_offset(elf_offset)
+            if result:
+                return result
 
     if fmt == "tar":
         log_event(

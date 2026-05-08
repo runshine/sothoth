@@ -550,6 +550,13 @@ def run_unpack_agentflow(
 - runner 层 mock 单测已覆盖 success、failed、cancelled、preprocess success、skill success、generic fallback success 和候选 skill 保存。
 - `tokens_summary.json` 目前为占位结构，还没有聚合 AgentFlow/pi token。
 
+### 图级优化试点补充
+
+- 服务侧新增 `agentflow.profile`、`agentflow.graph_optimization_enabled`、`agentflow.graph_optimizer`、`agentflow.graph_optimization_rounds`。
+- 图优化只允许在 `test` / `staging` profile 下启用；生产配置即使设置了多轮也会退回单轮执行。
+- 优化轮次产物由 AgentFlow run 目录保存，包括 `pipeline.original.py`、`pipeline.edited.py`、`optimizer-validation.json` 和 `graph_report.json`。
+- 固定样本集门禁入口为 `scripts/agentflow_regression_eval.py --manifest plan/agentflow-regression-samples.json`。
+
 ### 阶段 6：迁移最小可用图 `[DONE]`
 
 目标：先跑通 AgentFlow 最小链路，不迁移 skill 逻辑。

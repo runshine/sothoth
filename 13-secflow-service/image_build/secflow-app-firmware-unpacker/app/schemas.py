@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel
 
@@ -64,6 +64,9 @@ class TaskResponse(BaseModel):
     generated_skill_status: Optional[str] = None
     promotion_success_count: Optional[int] = None
     agentflow_run_id: Optional[str] = None
+    node_attempts: Optional[dict[str, Any]] = None
+    failure_summary: Optional[dict[str, Any]] = None
+    total_tokens: Optional[int] = None
     engine_error: Optional[str] = None
     run_path: Optional[str] = None
     created_at: Optional[str] = None

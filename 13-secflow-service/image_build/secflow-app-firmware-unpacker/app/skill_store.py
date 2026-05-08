@@ -57,6 +57,9 @@ def parse_skill_metadata(skill_path: Path, include_prompt: bool = False) -> dict
         "family_id": skill_path.stem,
         "promotion_success_count": 0,
         "promotion_threshold": DEFAULT_PROMOTION_THRESHOLD,
+        "source_run_id": "",
+        "source_node_id": "",
+        "evaluation_batch": "",
         "tools": [],
     }
     for line in header.splitlines():
@@ -184,6 +187,9 @@ def _serialize_frontmatter(meta: dict[str, Any]) -> str:
         "family_id",
         "promotion_success_count",
         "promotion_threshold",
+        "source_run_id",
+        "source_node_id",
+        "evaluation_batch",
         "tools",
     ]
     lines: list[str] = ["---"]
@@ -231,6 +237,9 @@ def save_candidate_skill(skills_dir: Path, raw_document: str, fallback_meta: dic
     meta["skill_status"] = SKILL_STATUS_CANDIDATE
     meta["promotion_success_count"] = 0
     meta["promotion_threshold"] = DEFAULT_PROMOTION_THRESHOLD
+    meta["source_run_id"] = str(fallback_meta.get("source_run_id") or meta.get("source_run_id") or "")
+    meta["source_node_id"] = str(fallback_meta.get("source_node_id") or meta.get("source_node_id") or "")
+    meta["evaluation_batch"] = str(fallback_meta.get("evaluation_batch") or meta.get("evaluation_batch") or "")
     existing_versions = [
         int(item.get("skill_version") or 0)
         for item in list_skills(skills_dir)
@@ -270,4 +279,3 @@ def register_skill_success(skills_dir: Path, skill_path: str) -> dict[str, Any]:
                 _rewrite_skill(Path(existing["path"]), {"skill_status": SKILL_STATUS_ARCHIVED})
         updated = _rewrite_skill(path, {"skill_status": SKILL_STATUS_ACTIVE})
     return updated
-

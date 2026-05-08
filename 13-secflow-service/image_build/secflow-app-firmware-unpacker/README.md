@@ -57,18 +57,37 @@ AgentFlow Web API 在本服务 REST 前缀下同步暴露，保留原始 `/api/r
 ```yaml
 agentflow:
   enabled: true
+  profile: "production"
   runs_dir: "/data/files/.agentflow/runs"
   max_concurrent_runs: 2
   node_timeout_seconds: 1800
   use_worktree: false
+  graph_optimization_enabled: false
+  graph_optimizer: "codex"
+  graph_optimization_rounds: 1
 ```
 
 也可通过环境变量覆盖：
 
 - `AGENTFLOW_RUNS_DIR=/data/files/.agentflow/runs`
 - `AGENTFLOW_MAX_CONCURRENT_RUNS=2`
+- `AGENTFLOW_PROFILE=staging`
+- `AGENTFLOW_GRAPH_OPTIMIZATION_ENABLED=false`
+- `AGENTFLOW_GRAPH_OPTIMIZATION_ROUNDS=1`
 
-AgentFlow 运行日志写入任务 `run/agentflow/runs/<run_id>/`，任务响应会返回 `agentflow_run_id` 和 `run_path`。
+AgentFlow 运行日志写入任务 `run/agentflow/runs/<run_id>/`，任务响应会返回 `agentflow_run_id` 和 `run_path`。图级优化只会在 `profile` 为 `test` 或 `staging` 且显式开启优化轮次时运行；优化产物由 AgentFlow 写入对应 run 目录。
+
+离线回归评测入口：
+
+```bash
+scripts/agentflow_regression_eval.py --manifest plan/agentflow-regression-samples.json
+```
+
+从已归档 run 手工沉淀候选 skill：
+
+```bash
+scripts/agentflow_evolve_skill_from_run.py --run-dir /path/to/run --node-id generic_executor --skill-document /path/to/skill.md --skills-dir /data/files/tools
+```
 
 ## 构建与运行
 

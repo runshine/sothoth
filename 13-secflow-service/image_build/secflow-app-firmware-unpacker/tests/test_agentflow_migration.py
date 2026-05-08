@@ -91,7 +91,8 @@ def _write_fake_pi(fake_bin, mode="preprocess"):
     fake_pi = fake_bin / "pi"
     fake_pi.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, sys\n"
+        "import json, re, sys\n"
+        "from pathlib import Path\n"
         f"mode = {mode!r}\n"
         "prompt = sys.stdin.read()\n"
         "skill_doc = '''---\\nname: generated skill\\ndescription: generated fallback skill\\nformat_id: generated-bin\\nextensions: .bin\\nmagic_hex: abcd1234\\nkeywords: generated\\nbinwalk_sigs: firmware\\nskill_status: candidate\\nskill_version: 1\\nfamily_id: generated-bin\\npromotion_success_count: 0\\npromotion_threshold: 5\\ntools: read, bash\\n---\\n\\nUse this generated guidance.\\n'''\n"
@@ -104,10 +105,18 @@ def _write_fake_pi(fake_bin, mode="preprocess"):
         "elif mode == 'skill_fallback' and 'Author a reusable skill candidate' in prompt:\n"
         "    text = skill_doc\n"
         "elif mode == 'skill_fallback' and 'Unpack the firmware' in prompt:\n"
+        "    match = re.search(r'^\\$output = (.+)$', prompt, re.MULTILINE)\n"
+        "    if match:\n"
+        "        out = Path(match.group(1).strip())\n"
+        "        out.mkdir(parents=True, exist_ok=True)\n"
+        "        (out / 'artifact.bin').write_bytes(b'payload')\n"
+        "        (out / 'summary.txt').write_text('fallback unpack summary\\n', encoding='utf-8')\n"
         "    text = 'generic unpack done'\n"
         "elif mode == 'skill_success' and 'Unpack the firmware' in prompt:\n"
         "    text = 'AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_BY_SKILL_SUCCESS'\n"
-        "elif mode in ('skill_success', 'skill_fallback') and 'Otherwise use the system_prompt' in prompt:\n"
+        "elif mode == 'skill_fallback' and 'Otherwise use the system_prompt' in prompt:\n"
+        "    text = 'skill executor failed'\n"
+        "elif mode == 'skill_success' and 'Otherwise use the system_prompt' in prompt:\n"
         "    text = 'skill executor completed'\n"
         "elif 'Review the matched-skill extraction result' in prompt:\n"
         "    text = 'AGENTFLOW_REVIEW_SKIPPED reason=SKIPPED_BY_PREPROCESS'\n"
@@ -166,10 +175,15 @@ class AgentFlowConfigTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "enabled",
+                    "profile",
                     "runs_dir",
                     "max_concurrent_runs",
                     "node_timeout_seconds",
                     "use_worktree",
+                    "graph_optimization_enabled",
+                    "graph_optimizer",
+                    "graph_optimization_rounds",
+                    "evolution_archive_dir",
                     "cleanup_runs_retention_days",
                 },
                 set(cfg.agentflow.model_dump()),
@@ -182,12 +196,22 @@ class AgentFlowConfigTests(unittest.TestCase):
             env = {
                 "AGENTFLOW_RUNS_DIR": "/tmp/agentflow-runs",
                 "AGENTFLOW_MAX_CONCURRENT_RUNS": "7",
+                "AGENTFLOW_PROFILE": "staging",
+                "AGENTFLOW_GRAPH_OPTIMIZATION_ENABLED": "true",
+                "AGENTFLOW_GRAPH_OPTIMIZER": "pi",
+                "AGENTFLOW_GRAPH_OPTIMIZATION_ROUNDS": "2",
+                "AGENTFLOW_EVOLUTION_ARCHIVE_DIR": "/tmp/evolution",
             }
             with patch.dict(os.environ, env, clear=False):
                 cfg = reload_config(str(config_path))
             self.assertTrue(cfg.agentflow.enabled)
             self.assertEqual("/tmp/agentflow-runs", cfg.agentflow.runs_dir)
             self.assertEqual(7, cfg.agentflow.max_concurrent_runs)
+            self.assertEqual("staging", cfg.agentflow.profile)
+            self.assertTrue(cfg.agentflow.graph_optimization_enabled)
+            self.assertEqual("pi", cfg.agentflow.graph_optimizer)
+            self.assertEqual(2, cfg.agentflow.graph_optimization_rounds)
+            self.assertEqual("/tmp/evolution", cfg.agentflow.evolution_archive_dir)
 
 
 class AgentFlowPipelineTests(unittest.TestCase):
@@ -220,6 +244,7 @@ class AgentFlowPipelineTests(unittest.TestCase):
                     "skill_executor",
                     "skill_reviewer",
                     "generic_executor",
+                    "output_summary",
                     "generic_reviewer",
                     "skill_author",
                     "cleanup",
@@ -229,7 +254,8 @@ class AgentFlowPipelineTests(unittest.TestCase):
             )
             node_map = spec.node_map
             self.assertIn("feature_match", node_map["skill_executor"].depends_on)
-            self.assertIn("generic_executor", node_map["generic_reviewer"].depends_on)
+            self.assertIn("generic_executor", node_map["output_summary"].depends_on)
+            self.assertIn("output_summary", node_map["generic_reviewer"].depends_on)
             self.assertIn("generic_executor", node_map["generic_reviewer"].on_failure_restart)
             for node_id in ("skill_reviewer", "generic_reviewer"):
                 criteria = node_map[node_id].success_criteria
@@ -240,7 +266,36 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 self.assertIn("PYTHONPATH", node_map[node_id].env)
                 self.assertIn("/app", node_map[node_id].env["PYTHONPATH"])
             self.assertEqual(450, node_map["skill_reviewer"].timeout_seconds)
-            self.assertEqual(300, node_map["cleanup"].timeout_seconds)
+            self.assertEqual("python", node_map["output_summary"].agent)
+            self.assertEqual("python", node_map["cleanup"].agent)
+            self.assertIn("Always create $output/summary.txt", node_map["generic_executor"].prompt)
+
+    def test_pipeline_can_enable_graph_optimization_in_safe_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ctx = {
+                "base_dir": str(root),
+                "firmware_path": str(root / "input" / "fw.bin"),
+                "output_path": str(root / "output"),
+                "tools_dir": str(root / "tools"),
+                "preprocess_output_file": str(root / "run" / "preprocess.json"),
+                "feature_match_output_file": str(root / "run" / "feature-match.json"),
+                "final_result_file": str(root / "run" / "final_result.json"),
+                "agentflow_concurrency": 2,
+                "max_retries": 3,
+                "node_timeout_seconds": 900,
+                "use_worktree": False,
+                "graph_optimization_enabled": True,
+                "graph_optimizer": "pi",
+                "graph_optimization_rounds": 2,
+                "executor_extra_args": [],
+                "review_extra_args": [],
+                "author_extra_args": [],
+                "cleanup_extra_args": [],
+            }
+            spec = build_firmware_unpack_pipeline(ctx)
+            self.assertEqual("pi", spec.optimizer)
+            self.assertEqual(2, spec.n_run)
 
     def test_pipeline_respects_short_node_timeout_for_smoke_runs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,7 +320,7 @@ class AgentFlowPipelineTests(unittest.TestCase):
             node_map = build_firmware_unpack_pipeline(ctx).node_map
             self.assertEqual(30, node_map["generic_executor"].timeout_seconds)
             self.assertEqual(15, node_map["generic_reviewer"].timeout_seconds)
-            self.assertEqual(10, node_map["cleanup"].timeout_seconds)
+            self.assertEqual("python", node_map["cleanup"].agent)
 
 
 class EngineDispatchTests(unittest.TestCase):
@@ -305,7 +360,10 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
             self.assertEqual(0, result["rounds"])
             self.assertFalse(result["fallback_to_llm"])
             self.assertEqual("run-1", result["agentflow_run_id"])
+            self.assertIn("preprocess", result["node_attempts"])
+            self.assertEqual(0, result["total_tokens"])
             self.assertTrue((Path(tmp) / "task" / "run" / "final_result.json").is_file())
+            self.assertTrue((Path(tmp) / "task" / "run" / "tokens_summary.json").is_file())
 
     def test_skill_success_registers_promotion(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -360,6 +418,7 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
             self.assertTrue(result["fallback_to_llm"])
             self.assertEqual("/data/tools/candidates/family-1.md", result["generated_skill_path"])
             self.assertEqual("candidate", result["generated_skill_status"])
+            self.assertEqual("STRUCTURAL_FAILURE", result["failure_summary"]["failed_nodes"][0]["classification"]["category"])
             save_skill.assert_called_once()
 
     def test_failed_run_reports_attempt_rounds(self):

@@ -64,6 +64,9 @@ class UnpackTask(Base):
     generated_skill_status = Column(String(32), nullable=True)
     promotion_success_count = Column(Integer, nullable=True)
     agentflow_run_id = Column(String(64), nullable=True)
+    node_attempts = Column(Text, nullable=True)
+    failure_summary = Column(Text, nullable=True)
+    total_tokens = Column(Integer, nullable=True)
     engine_error = Column(Text, nullable=True)
     run_path = Column(String(512), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -90,6 +93,9 @@ class UnpackTask(Base):
             "generated_skill_status": self.generated_skill_status,
             "promotion_success_count": self.promotion_success_count,
             "agentflow_run_id": self.agentflow_run_id,
+            "node_attempts": json_loads_safe(self.node_attempts),
+            "failure_summary": json_loads_safe(self.failure_summary),
+            "total_tokens": self.total_tokens,
             "engine_error": self.engine_error,
             "run_path": self.run_path,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -152,6 +158,17 @@ DEFAULT_CONFIGS = [
     ("dead_threshold", "90", "int", "Worker 心跳超时秒数"),
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
 ]
+
+
+def json_loads_safe(raw: str | None):
+    if raw is None:
+        return None
+    try:
+        import json
+
+        return json.loads(raw)
+    except Exception:
+        return raw
 
 
 _engine = None
@@ -231,6 +248,9 @@ def _ensure_unpack_task_columns() -> None:
         "generated_skill_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_status VARCHAR(32)",
         "promotion_success_count": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN promotion_success_count INTEGER",
         "agentflow_run_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN agentflow_run_id VARCHAR(64)",
+        "node_attempts": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN node_attempts TEXT",
+        "failure_summary": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN failure_summary TEXT",
+        "total_tokens": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN total_tokens INTEGER",
         "engine_error": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN engine_error TEXT",
         "run_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN run_path VARCHAR(512)",
     }
