@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,7 @@ from app.schemas import (
     TaskListResponse,
     TaskLogResponse,
     TaskProgressResponse,
+    TaskResultResponse,
     TaskResourceUsageResponse,
     TaskResponse,
     TaskSubmitResponse,
@@ -502,6 +504,150 @@ def _get_task_events(task_id: str, limit: int) -> dict:
     return list_task_events(task_id, limit=limit)
 
 
+def _count_task_events(task_id: str) -> int:
+    return int(list_task_events(task_id, limit=1).get("total") or 0)
+
+
+def _read_json_index_items(path: Path) -> list[dict]:
+    payload = _read_json_file(path)
+    if not isinstance(payload, dict):
+        return []
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        return []
+    return [item for item in raw_items if isinstance(item, dict)]
+
+
+def _scan_output_tree(output_root: Path) -> tuple[int, int, int, Optional[str], int, int]:
+    file_count = 0
+    dir_count = 0
+    total_size = 0
+    largest_file_path: Optional[str] = None
+    largest_file_size = 0
+    top_level_entry_count = 0
+
+    if not output_root.exists() or not output_root.is_dir():
+        return file_count, dir_count, total_size, largest_file_path, largest_file_size, top_level_entry_count
+
+    try:
+        top_level_entry_count = sum(1 for _ in output_root.iterdir())
+    except Exception:
+        top_level_entry_count = 0
+
+    for root, dirs, files in os.walk(output_root, followlinks=False):
+        root_path = Path(root)
+        real_dirs: list[str] = []
+        for directory in dirs:
+            path = root_path / directory
+            if path.is_symlink():
+                continue
+            dir_count += 1
+            real_dirs.append(directory)
+        dirs[:] = real_dirs
+
+        for filename in files:
+            path = root_path / filename
+            if path.is_symlink():
+                continue
+            try:
+                size = path.stat().st_size
+            except Exception:
+                continue
+            file_count += 1
+            total_size += size
+            if size > largest_file_size:
+                largest_file_size = size
+                largest_file_path = str(path)
+
+    return file_count, dir_count, total_size, largest_file_path, largest_file_size, top_level_entry_count
+
+
+def _get_task_result(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    output_root = Path(str(task.get("output_path") or "").strip())
+    run_root = _derive_run_path(task)
+    summary_path = run_root / "summary.txt"
+    reason_path = run_root / "reason.txt"
+    tokens_summary_path = run_root / "tokens_summary.json"
+    sessions_index_path = run_root / "sessions" / "index.json"
+
+    warnings: list[str] = []
+    task_status = str(task.get("status") or "").strip() or "unknown"
+    session_count = len(_read_json_index_items(sessions_index_path))
+    event_count = _count_task_events(task_id)
+
+    available = task_status in {"success", "failed", "cancelled"}
+    if not output_root.exists() or not output_root.is_dir():
+        warnings.append("输出目录不存在")
+        available = False
+
+    output_file_count = 0
+    output_dir_count = 0
+    output_total_size_bytes = 0
+    largest_file_path: Optional[str] = None
+    largest_file_size_bytes = 0
+    top_level_entry_count = 0
+    if output_root.exists() and output_root.is_dir():
+        (
+            output_file_count,
+            output_dir_count,
+            output_total_size_bytes,
+            largest_file_path,
+            largest_file_size_bytes,
+            top_level_entry_count,
+        ) = _scan_output_tree(output_root)
+
+    summary_text = _read_text_file(summary_path).strip() or None
+    reason_text = _read_text_file(reason_path).strip() or None
+    if summary_path.exists() and not summary_text:
+        warnings.append("summary.txt 存在但为空")
+    if reason_path.exists() and not reason_text:
+        warnings.append("reason.txt 存在但为空")
+    if sessions_index_path.exists() and session_count == 0:
+        warnings.append("会话索引存在但未解析到任何会话")
+
+    started_at = str(task.get("started_at") or "").strip() or None
+    completed_at = str(task.get("completed_at") or "").strip() or None
+    duration_seconds: Optional[int] = None
+    if started_at and completed_at:
+        try:
+            duration_seconds = max(0, int((datetime.fromisoformat(completed_at) - datetime.fromisoformat(started_at)).total_seconds()))
+        except Exception:
+            duration_seconds = None
+
+    return {
+        "task_id": task_id,
+        "available": available,
+        "status": task_status,
+        "output_root": str(output_root) if str(output_root) else None,
+        "run_root": str(run_root),
+        "summary_path": str(summary_path) if summary_path.exists() else None,
+        "reason_path": str(reason_path) if reason_path.exists() else None,
+        "tokens_summary_path": str(tokens_summary_path) if tokens_summary_path.exists() else None,
+        "summary_text": summary_text,
+        "reason_text": reason_text,
+        "warnings": warnings,
+        "summary": {
+            "output_file_count": output_file_count,
+            "output_dir_count": output_dir_count,
+            "output_total_size_bytes": output_total_size_bytes,
+            "largest_file_path": largest_file_path,
+            "largest_file_size_bytes": largest_file_size_bytes,
+            "top_level_entry_count": top_level_entry_count,
+            "matched_skill": str(task.get("matched_skill") or "").strip() or None,
+            "fallback_to_llm": bool(task.get("fallback_to_llm")),
+            "generated_skill_path": str(task.get("generated_skill_path") or "").strip() or None,
+            "promotion_success_count": int(task.get("promotion_success_count") or 0),
+            "executor_rounds": int(task.get("rounds") or 0),
+            "session_count": session_count,
+            "event_count": event_count,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_seconds": duration_seconds,
+        },
+    }
+
+
 async def _get_task_with_access(task_id: str, token: str) -> dict:
     task = _get_task_or_404(task_id)
     project_id = _normalize_project_id(task.get("project_id"))
@@ -866,6 +1012,23 @@ async def get_project_task_events(
     return _get_task_events(task_id, limit)
 
 
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/result",
+    response_model=TaskResultResponse,
+)
+async def get_project_task_result(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _get_task_result(task_id)
+
+
 @router.delete(
     "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}",
     response_model=ActionResponse,
@@ -974,6 +1137,19 @@ async def get_task_events_legacy(
     _, token = subject_and_token
     await _get_task_with_access(task_id, token)
     return _get_task_events(task_id, limit)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/result",
+    response_model=TaskResultResponse,
+)
+async def get_task_result_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_result(task_id)
 
 
 @router.get(

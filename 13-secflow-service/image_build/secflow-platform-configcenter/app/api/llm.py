@@ -108,6 +108,7 @@ def apply_payload(provider: LlmProvider, payload: LlmProviderCreateRequest | Llm
     provider.is_default = payload.is_default
     provider.api_base = payload.api_base.strip()
     provider.model = payload.model.strip()
+    provider.model_context_window = payload.model_context_window
     provider.api_key = payload.api_key.strip()
     provider.organization = payload.organization.strip() if payload.organization else None
     provider.api_version = payload.api_version.strip() if payload.api_version else None

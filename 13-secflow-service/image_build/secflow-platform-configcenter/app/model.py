@@ -27,6 +27,7 @@ class LlmProvider(Base):
     is_default = Column(Boolean, nullable=False, default=False)
     api_base = Column(String(512), nullable=False)
     model = Column(String(256), nullable=False)
+    model_context_window = Column(Integer, nullable=False, default=128000)
     api_key = Column(Text, nullable=False)
     organization = Column(String(256), nullable=True)
     api_version = Column(String(128), nullable=True)
@@ -69,6 +70,7 @@ def init_database():
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_file_bindings_column(engine)
+    _ensure_model_context_window_column(engine)
 
 
 def _ensure_file_bindings_column(engine):
@@ -86,6 +88,26 @@ def _ensure_file_bindings_column(engine):
         alter_sql = f"ALTER TABLE {table_name} ADD COLUMN file_bindings JSON NULL"
     else:
         alter_sql = f"ALTER TABLE {table_name} ADD COLUMN file_bindings JSON"
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(alter_sql)
+
+
+def _ensure_model_context_window_column(engine):
+    inspector = inspect(engine)
+    table_name = LlmProvider.__tablename__
+    try:
+        columns = {col.get("name") for col in inspector.get_columns(table_name)}
+    except Exception:
+        return
+    if "model_context_window" in columns:
+        return
+
+    dialect = engine.dialect.name
+    if dialect == "mysql":
+        alter_sql = f"ALTER TABLE {table_name} ADD COLUMN model_context_window INT NOT NULL DEFAULT 128000"
+    else:
+        alter_sql = f"ALTER TABLE {table_name} ADD COLUMN model_context_window INTEGER NOT NULL DEFAULT 128000"
 
     with engine.begin() as conn:
         conn.exec_driver_sql(alter_sql)

@@ -25,6 +25,7 @@ class LlmProviderBase(BaseModel):
     is_default: bool = False
     api_base: str
     model: str
+    model_context_window: int = 128000
     api_key: str
     organization: Optional[str] = None
     api_version: Optional[str] = None
@@ -54,6 +55,13 @@ class LlmProviderBase(BaseModel):
     def validate_timeout(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("timeout_seconds 必须大于 0")
+        return value
+
+    @field_validator("model_context_window")
+    @classmethod
+    def validate_model_context_window(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("model_context_window 必须大于 0")
         return value
 
     @field_validator("temperature")
@@ -165,6 +173,7 @@ class LlmProviderSummary(BaseModel):
     is_default: bool
     api_base: str
     model: str
+    model_context_window: int
     api_key: str
     organization: Optional[str] = None
     api_version: Optional[str] = None
@@ -187,6 +196,7 @@ class LlmProviderDetail(BaseModel):
     is_default: bool
     api_base: str
     model: str
+    model_context_window: int
     api_key: str
     organization: Optional[str] = None
     api_version: Optional[str] = None
@@ -215,6 +225,7 @@ class LlmProviderServiceListItem(BaseModel):
     is_default: bool
     api_base: str
     model: str
+    model_context_window: int
     api_key: str
     organization: Optional[str] = None
     api_version: Optional[str] = None
@@ -258,6 +269,7 @@ def build_summary_payload(item) -> LlmProviderSummary:
         is_default=item.is_default,
         api_base=item.api_base,
         model=item.model,
+        model_context_window=item.model_context_window or 128000,
         api_key=item.api_key,
         organization=item.organization,
         api_version=item.api_version,
@@ -282,6 +294,7 @@ def build_detail_payload(item) -> LlmProviderDetail:
         is_default=item.is_default,
         api_base=item.api_base,
         model=item.model,
+        model_context_window=item.model_context_window or 128000,
         api_key=item.api_key,
         organization=item.organization,
         api_version=item.api_version,
@@ -306,6 +319,7 @@ def build_service_payload(item) -> LlmProviderServiceListItem:
         is_default=item.is_default,
         api_base=item.api_base,
         model=item.model,
+        model_context_window=item.model_context_window or 128000,
         api_key=item.api_key,
         organization=item.organization,
         api_version=item.api_version,

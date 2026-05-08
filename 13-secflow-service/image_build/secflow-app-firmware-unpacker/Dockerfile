@@ -41,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bzip2 \
     zstd \
     unrar \
+    xxd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python

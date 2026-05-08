@@ -139,6 +139,40 @@ class TaskLogResponse(BaseModel):
     message: Optional[str] = None
 
 
+class TaskResultSummaryResponse(BaseModel):
+    output_file_count: int = 0
+    output_dir_count: int = 0
+    output_total_size_bytes: int = 0
+    largest_file_path: Optional[str] = None
+    largest_file_size_bytes: int = 0
+    top_level_entry_count: int = 0
+    matched_skill: Optional[str] = None
+    fallback_to_llm: bool = False
+    generated_skill_path: Optional[str] = None
+    promotion_success_count: int = 0
+    executor_rounds: int = 0
+    session_count: int = 0
+    event_count: int = 0
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_seconds: Optional[int] = None
+
+
+class TaskResultResponse(BaseModel):
+    task_id: str
+    available: bool
+    status: str
+    output_root: Optional[str] = None
+    run_root: Optional[str] = None
+    summary_path: Optional[str] = None
+    reason_path: Optional[str] = None
+    tokens_summary_path: Optional[str] = None
+    summary_text: Optional[str] = None
+    reason_text: Optional[str] = None
+    warnings: List[str] = []
+    summary: TaskResultSummaryResponse
+
+
 class TaskEventResponse(BaseModel):
     id: str
     task_id: str
