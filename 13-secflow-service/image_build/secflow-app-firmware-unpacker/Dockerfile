@@ -14,18 +14,55 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     curl \
     wget \
     ca-certificates \
     git \
     build-essential \
+    pkg-config \
+    cmake \
+    ninja-build \
+    make \
     file \
+    binutils \
+    elfutils \
+    gawk \
+    bsdmainutils \
     software-properties-common \
     python3 \
     python3-pip \
     python3-venv \
     python3-dev \
+    gdb \
+    gdbserver \
+    strace \
+    ltrace \
+    lsof \
+    procps \
+    psmisc \
+    less \
+    vim \
+    nano \
+    tmux \
+    screen \
+    tree \
+    ripgrep \
+    jq \
+    iputils-ping \
+    dnsutils \
+    net-tools \
+    iproute2 \
+    tcpdump \
+    socat \
+    netcat-openbsd \
+    telnet \
+    fdisk \
+    parted \
+    gdisk \
+    dosfstools \
+    e2fsprogs \
+    mtools \
     xz-utils \
     binwalk \
     squashfs-tools \
@@ -41,7 +78,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bzip2 \
     zstd \
     unrar \
+    zip \
+    unzip \
+    arj \
+    lrzip \
+    lz4 \
+    nasm \
     xxd \
+    hexdump \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
