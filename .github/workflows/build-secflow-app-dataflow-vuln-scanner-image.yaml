@@ -48,17 +48,13 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner/Dockerfile \
-            # --tag runshine0819/secflow-app-dataflow-vuln-scanner:amd64-latest \
             --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:amd64-latest \
-            # --tag runshine0819/secflow-app-dataflow-vuln-scanner:amd64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner/
 
       - name: Push amd64 image
         run: |
-          # docker push runshine0819/secflow-app-dataflow-vuln-scanner:amd64-latest
           docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:amd64-latest
-          # docker push runshine0819/secflow-app-dataflow-vuln-scanner:amd64-${{ needs.prepare.outputs.date_tag }}
           docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
@@ -90,17 +86,13 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner/Dockerfile \
-            # --tag runshine0819/secflow-app-dataflow-vuln-scanner:arm64-latest \
             --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:arm64-latest \
-            # --tag runshine0819/secflow-app-dataflow-vuln-scanner:arm64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner/
 
       - name: Push arm64 image
         run: |
-          # docker push runshine0819/secflow-app-dataflow-vuln-scanner:arm64-latest
           docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:arm64-latest
-          # docker push runshine0819/secflow-app-dataflow-vuln-scanner:arm64-${{ needs.prepare.outputs.date_tag }}
           docker push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
@@ -125,22 +117,14 @@ jobs:
 
       - name: Create and push multi-arch manifest (latest)
         run: |
-          # docker manifest create runshine0819/secflow-app-dataflow-vuln-scanner:latest \
-            # --amend runshine0819/secflow-app-dataflow-vuln-scanner:amd64-latest \
-            # --amend runshine0819/secflow-app-dataflow-vuln-scanner:arm64-latest
           docker manifest create ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest \
             --amend ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:amd64-latest \
             --amend ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:arm64-latest
-          # docker manifest push runshine0819/secflow-app-dataflow-vuln-scanner:latest
           docker manifest push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest
 
       - name: Create and push multi-arch manifest (date tag)
         run: |
-          # docker manifest create runshine0819/secflow-app-dataflow-vuln-scanner:${{ needs.prepare.outputs.date_tag }} \
-            # --amend runshine0819/secflow-app-dataflow-vuln-scanner:amd64-${{ needs.prepare.outputs.date_tag }} \
-            # --amend runshine0819/secflow-app-dataflow-vuln-scanner:arm64-${{ needs.prepare.outputs.date_tag }}
           docker manifest create ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:${{ needs.prepare.outputs.date_tag }} \
             --amend ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:amd64-${{ needs.prepare.outputs.date_tag }} \
             --amend ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:arm64-${{ needs.prepare.outputs.date_tag }}
-          # docker manifest push runshine0819/secflow-app-dataflow-vuln-scanner:${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:${{ needs.prepare.outputs.date_tag }}
