@@ -8,6 +8,7 @@ from sqlalchemy.dialects.mysql import DOUBLE, MEDIUMTEXT
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.config import get_config
+from app.time_utils import now_local
 
 Base = declarative_base()
 _engine = None
@@ -20,7 +21,7 @@ MYSQL_INDEX_LENGTHS = {
 
 
 def now_utc() -> datetime:
-    return datetime.utcnow()
+    return now_local()
 
 
 def _prefix(name: str) -> str:

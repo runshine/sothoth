@@ -13,6 +13,7 @@ from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, create_
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from app.config import get_config
+from app.time_utils import isoformat_local, now_local
 
 
 Base = declarative_base()
@@ -75,7 +76,7 @@ class UnpackTask(Base):
     generated_skill_status = Column(String(32), nullable=True)
     promotion_success_count = Column(Integer, nullable=True)
     llm_binding_snapshot = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=now_local)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
 
@@ -103,9 +104,9 @@ class UnpackTask(Base):
             "status": self.status,
             "owner_id": self.owner_id,
             "current_stage": self.current_stage,
-            "lease_expires_at": self.lease_expires_at.isoformat() if self.lease_expires_at else None,
-            "cancel_requested_at": self.cancel_requested_at.isoformat() if self.cancel_requested_at else None,
-            "last_progress_at": self.last_progress_at.isoformat() if self.last_progress_at else None,
+            "lease_expires_at": isoformat_local(self.lease_expires_at),
+            "cancel_requested_at": isoformat_local(self.cancel_requested_at),
+            "last_progress_at": isoformat_local(self.last_progress_at),
             "result_status": self.result_status,
             "result_message": self.result_message,
             "rounds": self.rounds,
@@ -117,9 +118,9 @@ class UnpackTask(Base):
             "generated_skill_path": self.generated_skill_path,
             "generated_skill_status": self.generated_skill_status,
             "promotion_success_count": self.promotion_success_count,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "created_at": isoformat_local(self.created_at),
+            "started_at": isoformat_local(self.started_at),
+            "completed_at": isoformat_local(self.completed_at),
         }
 
 
@@ -129,8 +130,8 @@ class WorkerInstance(Base):
     worker_id = Column(String(96), primary_key=True)
     hostname = Column(String(128), nullable=True)
     pod_ip = Column(String(64), nullable=True)
-    started_at = Column(DateTime, default=datetime.utcnow)
-    last_heartbeat = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, default=now_local)
+    last_heartbeat = Column(DateTime, default=now_local)
     is_alive = Column(Boolean, default=True)
     active_tasks = Column(Integer, default=0)
 
@@ -139,8 +140,8 @@ class WorkerInstance(Base):
             "owner_id": self.worker_id,
             "hostname": self.hostname,
             "pod_ip": self.pod_ip,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "last_heartbeat": self.last_heartbeat.isoformat() if self.last_heartbeat else None,
+            "started_at": isoformat_local(self.started_at),
+            "last_heartbeat": isoformat_local(self.last_heartbeat),
             "is_alive": self.is_alive,
             "active_tasks": self.active_tasks,
         }
@@ -153,7 +154,7 @@ class ServiceConfig(Base):
     value = Column(Text, nullable=False)
     value_type = Column(String(32), nullable=False, default="string")
     description = Column(Text, nullable=True)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local)
 
     def to_dict(self) -> dict:
         return {
@@ -161,7 +162,7 @@ class ServiceConfig(Base):
             "value": self.value,
             "value_type": self.value_type,
             "description": self.description,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "updated_at": isoformat_local(self.updated_at),
         }
 
 
@@ -178,7 +179,7 @@ class UnpackTaskEvent(Base):
     detail_json = Column(Text, nullable=True)
     owner_id = Column(String(96), nullable=True, index=True)
     created_by = Column(String(64), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, default=now_local, index=True)
 
     def to_dict(self) -> dict:
         detail = None
@@ -200,7 +201,7 @@ class UnpackTaskEvent(Base):
             "detail": detail,
             "owner_id": self.owner_id,
             "created_by": self.created_by,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "created_at": isoformat_local(self.created_at),
         }
 
 
@@ -352,7 +353,7 @@ def _seed_default_configs() -> None:
 
 
 def generate_id() -> str:
-    raw = f"{uuid.uuid4()}_{datetime.utcnow().timestamp()}"
+    raw = f"{uuid.uuid4()}_{now_local().timestamp()}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 

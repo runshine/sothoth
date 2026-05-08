@@ -9,11 +9,11 @@ import os
 import signal
 import subprocess
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
 from logging_utils import log_event
+from time_utils import isoformat_local, now_local
 
 log = logging.getLogger("unpacker.service")
 
@@ -53,7 +53,7 @@ def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
     )
     lines: list[str] = []
     for entry in stage_entries:
-        stamp = datetime.utcnow().isoformat()
+        stamp = isoformat_local(now_local()) or ""
         if entry.get("step") == "format_detection":
             lines.append(
                 f"[{stamp}] format_detection firmware={entry.get('firmware')} fmt={entry.get('fmt')} magic_hex={entry.get('magic_hex')}"

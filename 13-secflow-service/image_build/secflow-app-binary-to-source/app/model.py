@@ -10,6 +10,7 @@ from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, i
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
+from app.time_utils import now_local
 
 
 Base = declarative_base()
@@ -33,8 +34,8 @@ class B2STask(Base):
     tags_json = Column(Text, nullable=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
     created_by = Column(String(64), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
     @property
     def tags(self) -> list[str]:
@@ -64,8 +65,8 @@ class B2STaskItem(Base):
     metadata_json = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
     @property
     def generated_files(self) -> list[str]:

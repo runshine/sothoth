@@ -4,7 +4,7 @@ import json
 import shlex
 import shutil
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +35,7 @@ from app.services.run_inspector import (
     inspect_session_file,
     inspect_sessions,
 )
+from app.time_utils import UTC_PLUS_8, ensure_local, isoformat_local, now_local
 
 HISTORY_RUN_LOG_SUMMARY_MAX_CHARS = 32768
 _ACTIVE_HISTORY_RUN_STATUSES = {"running", "pending", "queued", "cancel_requested", "delete_requested"}
@@ -55,20 +56,18 @@ def _parse_datetime(value: str | None) -> datetime | None:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed
+    return ensure_local(parsed)
 
 
 def _datetime_from_epoch(value: int | float | None) -> datetime | None:
     epoch = float(value or 0)
     if epoch <= 0:
         return None
-    return datetime.fromtimestamp(epoch, tz=timezone.utc).replace(tzinfo=None)
+    return datetime.fromtimestamp(epoch, tz=UTC_PLUS_8).replace(tzinfo=None)
 
 
 def _iso_or_empty(value: datetime | None) -> str:
-    return value.isoformat() if value else ""
+    return isoformat_local(value) or ""
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -700,7 +699,7 @@ class HistoryRunService:
         record.log_tail_text = _truncate_log_summary(run_log)
         record.log_size_bytes = log_path.stat().st_size if log_path.is_file() else 0
         record.source_mtime = source_mtime
-        record.last_synced_at = datetime.utcnow()
+        record.last_synced_at = now_local()
         db.add(record)
         db.flush()
         detail["path"] = str(run_root)
@@ -1153,7 +1152,7 @@ class HistoryRunService:
         run_root = Path(history_run.run_root_path)
         if run_root.is_dir():
             history_run.source_mtime = max(_stored_source_mtime(history_run.source_mtime), _compute_source_mtime(run_root))
-        history_run.last_synced_at = datetime.utcnow()
+        history_run.last_synced_at = now_local()
         db.add(history_run)
         db.flush()
         return history_run

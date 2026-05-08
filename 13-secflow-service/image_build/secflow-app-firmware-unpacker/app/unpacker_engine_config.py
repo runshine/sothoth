@@ -156,7 +156,9 @@ def render_template(template_path: Path, replacements: dict[str, str]) -> str:
 
 
 def utc_now_iso() -> str:
-    return datetime.utcnow().isoformat()
+    from app.time_utils import isoformat_local, now_local
+
+    return isoformat_local(now_local()) or ""
 
 
 def slug_session_part(value: str, *, fallback: str) -> str:

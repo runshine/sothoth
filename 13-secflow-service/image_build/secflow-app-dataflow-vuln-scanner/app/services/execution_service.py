@@ -62,6 +62,7 @@ from app.services.pi_vuln_adapter import (
     write_final_task_manifest,
 )
 from app.services.workflow_service import get_workflow_service
+from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 
 
 def _new_id(prefix: str) -> str:
@@ -427,7 +428,7 @@ class ExecutionService:
                 {
                     "status": status_text,
                     "control_message": message,
-                    "last_updated_at": datetime.utcnow().isoformat(),
+                    "last_updated_at": isoformat_local(now_local()),
                 }
             )
             write_json(
@@ -537,7 +538,7 @@ class ExecutionService:
             "path": f"/{relative}" if relative else "/",
             "content_type": None,
             "size": stat.st_size if resolved.is_file() else None,
-            "updated_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z",
+            "updated_at": datetime.fromtimestamp(stat.st_mtime, tz=UTC_PLUS_8).isoformat(),
             "has_children": has_children,
             "special_badge": None,
         }
@@ -1166,7 +1167,7 @@ class ExecutionService:
         output_manifest_path: str | None = None,
         output_task_count: int = 0,
     ) -> None:
-        now = datetime.utcnow()
+        now = now_local()
         execution.status = execution_status
         execution.message = message
         execution.finished_at = now
@@ -1515,7 +1516,7 @@ class ExecutionService:
                             "history_run_id": history_run.id,
                             "source_type": history_run.source_type,
                             "run_root_path": history_run.run_root_path,
-                            "adopted_at": datetime.utcnow().isoformat(),
+                            "adopted_at": isoformat_local(now_local()),
                         },
                         "runtime_overrides": {},
                         "task_title": f"Run {history_run.run_name}",
@@ -1587,7 +1588,7 @@ class ExecutionService:
         metadata["history_run_retry"] = {
             "history_run_id": history_run.id,
             "source_type": history_run.source_type,
-            "requested_at": datetime.utcnow().isoformat(),
+            "requested_at": isoformat_local(now_local()),
             "extra_cycles": extra_cycles,
         }
         metadata["task_title"] = f"Resume {history_run.run_name}"
@@ -1638,7 +1639,7 @@ class ExecutionService:
                         "history_run_retry": {
                             "history_run_id": history_run.id,
                             "source_type": history_run.source_type,
-                            "requested_at": datetime.utcnow().isoformat(),
+                            "requested_at": isoformat_local(now_local()),
                             "extra_cycles": extra_cycles,
                         },
                         "runtime_overrides": {},
@@ -1951,7 +1952,7 @@ class ExecutionService:
             )
         if execution is not None and execution.status == "pending":
             execution.status = "cancelled"
-            execution.finished_at = datetime.utcnow()
+            execution.finished_at = now_local()
             execution.message = "deleted before dispatch"
             execution.process_status = "not_started"
             db.add(execution)
@@ -2270,7 +2271,7 @@ class ExecutionService:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
-        now = datetime.utcnow()
+        now = now_local()
         if trigger.status == "pending":
             trigger.status = "cancelled"
             trigger.finished_at = now
@@ -2465,11 +2466,11 @@ class ExecutionService:
         if execution.status != "orphaned":
             execution.status = "orphaned"
             execution.message = reason
-            execution.finished_at = datetime.utcnow()
+            execution.finished_at = now_local()
             db.add(execution)
         if trigger.retry_count >= trigger.max_retry_count:
             trigger.status = "failed"
-            trigger.finished_at = datetime.utcnow()
+            trigger.finished_at = now_local()
             trigger.message = "max auto retry reached after orphaned execution"
             db.add(trigger)
             db.commit()
@@ -2526,7 +2527,7 @@ class ExecutionService:
         cmd = [sys.executable, str(script_path), *argv]
         process = subprocess.Popen(cmd, cwd=str(script_path.parent))
         self._register_cli_process(execution.id, process)
-        now = datetime.utcnow()
+        now = now_local()
         execution.process_pid = int(process.pid)
         execution.process_host = get_config().scheduler.pod_id
         execution.process_status = "running"
@@ -2613,7 +2614,7 @@ class ExecutionService:
             self._forget_cli_process(execution.id, process)
             try:
                 execution.process_status = "exited"
-                execution.process_finished_at = datetime.utcnow()
+                execution.process_finished_at = now_local()
                 db.add(execution)
                 db.commit()
                 if execution.workspace_root:
@@ -2654,7 +2655,7 @@ class ExecutionService:
         execution.workspace_root = abs_path(run_dir)
         execution.message = "run_vuln_scan.py running"
         if execution.started_at is None:
-            execution.started_at = datetime.utcnow()
+            execution.started_at = now_local()
         if trigger.started_at is None:
             trigger.started_at = execution.started_at
         trigger.status = "running"
@@ -2805,7 +2806,7 @@ class ExecutionService:
             execution.workspace_root = abs_path(workspace_root)
             execution.message = "execution running"
             if execution.started_at is None:
-                execution.started_at = datetime.utcnow()
+                execution.started_at = now_local()
             if trigger.started_at is None:
                 trigger.started_at = execution.started_at
             trigger.status = "running"
@@ -2843,10 +2844,10 @@ class ExecutionService:
             write_json(
                 workspace_root / "_meta" / "run_timestamps.json",
                 {
-                    "started_at": datetime.utcnow().isoformat(),
+                    "started_at": isoformat_local(now_local()),
                     "status": "running",
                     "last_mode": launcher_mode,
-                    "last_updated_at": datetime.utcnow().isoformat(),
+                    "last_updated_at": isoformat_local(now_local()),
                 },
             )
             get_history_run_service().sync_execution_run(db, execution)
@@ -2900,12 +2901,12 @@ class ExecutionService:
             write_json(
                 workspace_root / "_meta" / "run_timestamps.json",
                 {
-                    "started_at": (execution.started_at or trigger.started_at or datetime.utcnow()).isoformat(),
-                    "finished_at": datetime.utcnow().isoformat(),
+                    "started_at": isoformat_local(execution.started_at or trigger.started_at or now_local()),
+                    "finished_at": isoformat_local(now_local()),
                     "status": execution.status,
                     "exit_code": 0 if artifacts.result.success else 1,
                     "last_mode": launcher_mode,
-                    "last_updated_at": datetime.utcnow().isoformat(),
+                    "last_updated_at": isoformat_local(now_local()),
                 },
             )
             get_history_run_service().sync_execution_run(db, execution)
@@ -2937,12 +2938,12 @@ class ExecutionService:
                     write_json(
                         workspace_root / "_meta" / "run_timestamps.json",
                         {
-                            "started_at": (execution.started_at or trigger.started_at or datetime.utcnow()).isoformat(),
-                            "finished_at": datetime.utcnow().isoformat(),
+                            "started_at": isoformat_local(execution.started_at or trigger.started_at or now_local()),
+                            "finished_at": isoformat_local(now_local()),
                             "status": "cancelled",
                             "exit_code": 130,
                             "last_mode": launcher_mode,
-                            "last_updated_at": datetime.utcnow().isoformat(),
+                            "last_updated_at": isoformat_local(now_local()),
                         },
                     )
                     get_history_run_service().sync_execution_run(db, execution)
@@ -2966,12 +2967,12 @@ class ExecutionService:
                 write_json(
                     workspace_root / "_meta" / "run_timestamps.json",
                     {
-                        "started_at": (execution.started_at or trigger.started_at or datetime.utcnow()).isoformat(),
-                        "finished_at": datetime.utcnow().isoformat(),
+                        "started_at": isoformat_local(execution.started_at or trigger.started_at or now_local()),
+                        "finished_at": isoformat_local(now_local()),
                         "status": "failed",
                         "exit_code": 1,
                         "last_mode": launcher_mode,
-                        "last_updated_at": datetime.utcnow().isoformat(),
+                        "last_updated_at": isoformat_local(now_local()),
                     },
                 )
                 get_history_run_service().sync_execution_run(db, execution)

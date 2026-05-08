@@ -25,7 +25,6 @@ import hashlib
 import json
 import os
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 
 from app.pi_vuln_core.review.profile import (
@@ -37,6 +36,7 @@ from app.pi_vuln_core.review.profile import (
     resolve_profile_thinking,
 )
 from app.pi_vuln_core.utils.win_compat import IS_WINDOWS, ensure_event_loop_policy, from_msys_path
+from app.time_utils import isoformat_local, now_local
 
 # 项目根目录
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -45,7 +45,7 @@ DEFAULT_CONFIG = PROJECT_ROOT / "config.vuln_scan_default.json"
 DEFAULT_MODEL = "icsl/zai-org/GLM-5"
 DEFAULT_PROVIDER = "icsl"
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return isoformat_local(now_local()) or ""
 
 
 def _run_timestamps_path(run_dir: str | Path) -> Path:

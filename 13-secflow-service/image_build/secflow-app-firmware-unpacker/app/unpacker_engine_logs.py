@@ -217,7 +217,9 @@ def write_json_log(log_dir: Path | None, name: str, payload: dict[str, Any]) -> 
 def append_stage_log(log_dir: Path | None, filename: str, message: str, **fields: Any) -> None:
     if log_dir is None:
         return
-    stamp = datetime.utcnow().isoformat()
+    from app.time_utils import isoformat_local, now_local
+
+    stamp = isoformat_local(now_local()) or ""
     line = f"[{stamp}] {message}"
     if fields:
         rendered = " ".join(
@@ -260,7 +262,9 @@ def append_stream_delta(log_dir: Path | None, filename: str, actor: str, event: 
                 fh.write("\n")
                 state["open"] = False
             if not state.get("open"):
-                stamp = datetime.utcnow().isoformat()
+                from app.time_utils import isoformat_local, now_local
+
+                stamp = isoformat_local(now_local()) or ""
                 fh.write(f"[{stamp}] [stream][{actor}][{rendered_type}] ")
                 state["open"] = True
                 state["delta_type"] = delta_type

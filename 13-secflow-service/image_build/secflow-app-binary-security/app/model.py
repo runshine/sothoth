@@ -10,6 +10,7 @@ from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, i
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import get_config
+from app.time_utils import now_local
 
 
 Base = declarative_base()
@@ -79,8 +80,8 @@ class BinarySecurityTask(Base, JsonMixin):
     dispatch_started_at = Column(DateTime, nullable=True, index=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
     @property
     def policy(self) -> dict[str, Any]:
@@ -132,8 +133,8 @@ class BinarySecurityStageRun(Base, JsonMixin):
     last_error = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
     @property
     def input_snapshot(self) -> dict[str, Any]:
@@ -190,8 +191,8 @@ class BinarySecurityStageItem(Base, JsonMixin):
     error_message = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
 
     @property
     def input_ref(self) -> dict[str, Any]:

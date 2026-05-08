@@ -7,15 +7,15 @@ agent runtime to workflow-specific concepts.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app.pi_vuln_core.utils.file_ops import read_json, write_json
+from app.time_utils import isoformat_local, now_local
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return isoformat_local(now_local()) or ""
 
 
 def _checkpoint_dir(work_dir: str | Path) -> Path:

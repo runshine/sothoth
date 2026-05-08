@@ -6,10 +6,11 @@ import logging
 import os
 import socket
 import threading
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 from app.config import get_config
+from app.time_utils import now_local
 
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,8 @@ def register_worker() -> None:
                 worker_id=owner_id,
                 hostname=socket.gethostname(),
                 pod_ip=os.environ.get("POD_IP", ""),
-                started_at=datetime.utcnow(),
-                last_heartbeat=datetime.utcnow(),
+                started_at=now_local(),
+                last_heartbeat=now_local(),
                 is_alive=True,
                 active_tasks=0,
             )
@@ -71,7 +72,7 @@ def register_worker() -> None:
             row.hostname = socket.gethostname()
             row.pod_ip = os.environ.get("POD_IP", "")
             row.is_alive = True
-            row.last_heartbeat = datetime.utcnow()
+            row.last_heartbeat = now_local()
             row.active_tasks = 0
         db.commit()
         logger.info("worker registered: %s", owner_id)
@@ -87,7 +88,7 @@ def heartbeat() -> None:
     try:
         row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
         if row is not None:
-            row.last_heartbeat = datetime.utcnow()
+            row.last_heartbeat = now_local()
             row.is_alive = True
             db.commit()
     finally:
@@ -106,7 +107,7 @@ def refresh_worker_active_tasks() -> None:
             row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
             if row is not None:
                 row.active_tasks = max(0, int(current_active))
-                row.last_heartbeat = datetime.utcnow()
+                row.last_heartbeat = now_local()
                 row.is_alive = True
                 db.commit()
         finally:
@@ -123,7 +124,7 @@ def deregister_worker() -> None:
         if row is not None:
             row.is_alive = False
             row.active_tasks = 0
-            row.last_heartbeat = datetime.utcnow()
+            row.last_heartbeat = now_local()
             db.commit()
         logger.info("worker deregistered: %s", owner_id)
     finally:
@@ -134,7 +135,7 @@ def reclaim_orphaned_tasks() -> None:
     from app.model import WorkerInstance, get_db_session
     from app.services.task_manager import recover_orphaned_tasks
 
-    cutoff = datetime.utcnow() - timedelta(seconds=_runtime_dead_threshold_seconds())
+    cutoff = now_local() - timedelta(seconds=_runtime_dead_threshold_seconds())
     db = get_db_session()
     try:
         stale_workers = (
@@ -160,7 +161,7 @@ def cleanup_finished_tasks() -> None:
     if retention_days <= 0:
         return
 
-    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    cutoff = now_local() - timedelta(days=retention_days)
     expired_tasks: list[tuple[str, Optional[str]]] = []
     db = get_db_session()
     try:

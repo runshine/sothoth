@@ -7,11 +7,11 @@ import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from app.pi_vuln_core.utils.file_ops import write_file, write_json
+from app.time_utils import isoformat_local, now_local
 
 IS_WINDOWS = platform.system() == "Windows"
 DEFAULT_STDOUT_TRACE_LIMIT_BYTES = 16 * 1024 * 1024
@@ -20,7 +20,7 @@ DEFAULT_RESPONSE_TRACE_LIMIT_BYTES = 16 * 1024 * 1024
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return isoformat_local(now_local()) or ""
 
 
 def command_display(cmd_args: list[str]) -> str:

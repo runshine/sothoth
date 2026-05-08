@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from app.time_utils import now_local
 
 SKILL_STATUS_ACTIVE = "active"
 SKILL_STATUS_CANDIDATE = "candidate"
@@ -226,7 +228,7 @@ def _write_skill(path: Path, meta: dict[str, Any], system_prompt: str) -> None:
 def save_candidate_skill(skills_dir: Path, raw_document: str, fallback_meta: dict[str, Any]) -> dict[str, Any]:
     meta = validate_skill_document(raw_document)
     family_id = _slugify(meta.get("family_id") or fallback_meta.get("family_id"))
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    timestamp = now_local().strftime("%Y%m%d%H%M%S")
     meta["family_id"] = family_id
     meta["skill_status"] = SKILL_STATUS_CANDIDATE
     meta["promotion_success_count"] = 0
@@ -270,4 +272,3 @@ def register_skill_success(skills_dir: Path, skill_path: str) -> dict[str, Any]:
                 _rewrite_skill(Path(existing["path"]), {"skill_status": SKILL_STATUS_ARCHIVED})
         updated = _rewrite_skill(path, {"skill_status": SKILL_STATUS_ACTIVE})
     return updated
-

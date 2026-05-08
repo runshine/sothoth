@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Dict, Optional
 
 from app.config import get_config
+from app.time_utils import isoformat_local, now_local
 
 
 logger = logging.getLogger(__name__)
@@ -201,7 +202,7 @@ def _cancel_timeout_seconds() -> int:
 
 
 def _lease_deadline(now: Optional[datetime] = None) -> datetime:
-    return (now or datetime.utcnow()) + timedelta(seconds=_task_lease_seconds())
+    return (now or now_local()) + timedelta(seconds=_task_lease_seconds())
 
 
 def get_executor() -> ThreadPoolExecutor:
@@ -367,7 +368,7 @@ def _mark_task_stage(task_id: str, stage: str) -> None:
         if task is None:
             return
         task.current_stage = stage
-        task.last_progress_at = datetime.utcnow()
+        task.last_progress_at = now_local()
         db.commit()
     finally:
         db.close()
@@ -396,7 +397,7 @@ def _build_llm_binding_snapshot(db) -> dict:
 
     roles: dict[str, dict] = {}
     client = get_configcenter_client()
-    frozen_at = datetime.utcnow().isoformat()
+    frozen_at = isoformat_local(now_local()) or ""
     for role, config_key in ROLE_CONFIG_FILE_KEYS.items():
         config_file_key = str(get_config_value(db, config_key, default="") or "").strip()
         if not config_file_key:
@@ -441,7 +442,7 @@ def _freeze_task_llm_binding_snapshot(task_id: str) -> dict:
 
         snapshot = _build_llm_binding_snapshot(db)
         task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
-        task.last_progress_at = datetime.utcnow()
+        task.last_progress_at = now_local()
         db.commit()
         return snapshot
     finally:
@@ -470,7 +471,7 @@ def _renew_task_lease(task_id: str, *, stage: Optional[str] = None) -> None:
             return
         previous_stage = str(task.current_stage or "").strip() or None
         task.lease_expires_at = _lease_deadline()
-        task.last_progress_at = datetime.utcnow()
+        task.last_progress_at = now_local()
         if stage:
             task.current_stage = stage
         db.commit()
@@ -517,8 +518,8 @@ def _finalize_orphaned_task(task_id: str, reason: str) -> None:
         previous_owner_id = task.owner_id
         task.owner_id = None
         task.lease_expires_at = None
-        task.completed_at = datetime.utcnow()
-        task.last_progress_at = datetime.utcnow()
+        task.completed_at = now_local()
+        task.last_progress_at = now_local()
         db.commit()
         _record_task_event_from_row(
             task,
@@ -755,7 +756,7 @@ def submit_unpack_task(
                 status=TaskStatus.PENDING.value,
                 llm_binding_snapshot=json.dumps(effective_snapshot, ensure_ascii=False),
                 current_stage="pending",
-                last_progress_at=datetime.utcnow(),
+                last_progress_at=now_local(),
             )
         )
         db.commit()
@@ -797,10 +798,10 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
         trigger_runtime_cancel = False
         if task.status == TaskStatus.PENDING.value:
             task.status = TaskStatus.CANCELLED.value
-            task.cancel_requested_at = datetime.utcnow()
+            task.cancel_requested_at = now_local()
             task.result_status = "cancelled"
             task.result_message = "Task was cancelled before execution"
-            task.completed_at = datetime.utcnow()
+            task.completed_at = now_local()
             db.commit()
             _record_task_event_from_row(
                 task,
@@ -823,8 +824,8 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
             return True, "取消请求已提交"
         elif task.status in (TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value):
             task.status = TaskStatus.CANCELLING.value
-            task.cancel_requested_at = task.cancel_requested_at or datetime.utcnow()
-            task.last_progress_at = datetime.utcnow()
+            task.cancel_requested_at = task.cancel_requested_at or now_local()
+            task.last_progress_at = now_local()
             trigger_runtime_cancel = True
         elif task.status == TaskStatus.CANCELLED.value:
             return True, "任务已取消"
@@ -874,7 +875,7 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
         task.current_stage = "pending"
         task.lease_expires_at = None
         task.cancel_requested_at = None
-        task.last_progress_at = datetime.utcnow()
+        task.last_progress_at = now_local()
         task.result_status = None
         task.result_message = None
         task.rounds = None
@@ -996,7 +997,7 @@ def recover_orphaned_tasks() -> None:
     from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session
     from app.services.worker import get_worker_id
 
-    now = datetime.utcnow()
+    now = now_local()
     active_owner_ids: set[str] = set()
     heartbeat_cutoff = now - timedelta(seconds=max(15, int(get_config().worker.dead_threshold_seconds)))
     db = get_db_session()
@@ -1069,8 +1070,8 @@ def _claim_task(task_id: str) -> bool:
                     UnpackTask.current_stage: "queued",
                     UnpackTask.lease_expires_at: _lease_deadline(),
                     UnpackTask.cancel_requested_at: None,
-                    UnpackTask.last_progress_at: datetime.utcnow(),
-                    UnpackTask.started_at: datetime.utcnow(),
+                    UnpackTask.last_progress_at: now_local(),
+                    UnpackTask.started_at: now_local(),
                     UnpackTask.completed_at: None,
                     UnpackTask.error_message: None,
                     UnpackTask.result_status: None,
@@ -1119,7 +1120,7 @@ def _reset_claim(task_id: str) -> None:
                     UnpackTask.lease_expires_at: None,
                     UnpackTask.cancel_requested_at: None,
                     UnpackTask.started_at: None,
-                    UnpackTask.last_progress_at: datetime.utcnow(),
+                    UnpackTask.last_progress_at: now_local(),
                 },
                 synchronize_session=False,
             )
@@ -1253,8 +1254,8 @@ def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> No
         task.result_message = reason
         task.owner_id = None
         task.lease_expires_at = None
-        task.completed_at = datetime.utcnow()
-        task.last_progress_at = datetime.utcnow()
+        task.completed_at = now_local()
+        task.last_progress_at = now_local()
         db.commit()
         _record_task_event_from_row(
             task,
@@ -1306,8 +1307,8 @@ def _update_task_result(task_id: str, result: dict) -> None:
         task.generated_skill_path = result.get("generated_skill_path")
         task.generated_skill_status = result.get("generated_skill_status")
         task.promotion_success_count = result.get("promotion_success_count")
-        task.completed_at = datetime.utcnow()
-        task.last_progress_at = datetime.utcnow()
+        task.completed_at = now_local()
+        task.last_progress_at = now_local()
         db.commit()
         _record_task_event_from_row(
             task,
@@ -1343,8 +1344,8 @@ def _update_task_error(task_id: str, error: str) -> None:
         task.result_status = "cancelled" if task.status == TaskStatus.CANCELLED.value else "failed"
         task.result_message = error if task.status == TaskStatus.CANCELLED.value else task.result_message
         task.error_message = error
-        task.completed_at = datetime.utcnow()
-        task.last_progress_at = datetime.utcnow()
+        task.completed_at = now_local()
+        task.last_progress_at = now_local()
         db.commit()
         _record_task_event_from_row(
             task,

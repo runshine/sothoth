@@ -4,7 +4,7 @@ import asyncio
 import logging
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict, List
 
 from fastapi import HTTPException, status
@@ -20,6 +20,7 @@ from app.models.database import (
 )
 from app.schemas import SchedulerWorkerResponse
 from app.services.execution_service import get_execution_service
+from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ class SchedulerService:
             if worker is not None:
                 worker.status = "offline"
                 worker.running_count = len(self._running_tasks)
-                worker.last_heartbeat_at = datetime.utcnow()
+                worker.last_heartbeat_at = now_local()
                 db.add(worker)
                 db.commit()
         finally:
@@ -108,7 +109,7 @@ class SchedulerService:
         if worker is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="scheduler worker not found")
         worker.status = status_value
-        worker.last_heartbeat_at = datetime.utcnow()
+        worker.last_heartbeat_at = now_local()
         db.add(worker)
         db.commit()
         if pod_id == self.pod_id:
@@ -124,7 +125,7 @@ class SchedulerService:
         db = get_db_session()
         try:
             worker = db.get(SchedulerWorker, self.pod_id)
-            now = datetime.utcnow()
+            now = now_local()
             if worker is None:
                 worker = SchedulerWorker(
                     pod_id=self.pod_id,
@@ -177,7 +178,7 @@ class SchedulerService:
                 .all()
             )
             for execution, trigger, _definition in candidates:
-                now = datetime.utcnow()
+                now = now_local()
                 lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)
                 lease_token = uuid.uuid4().hex
                 updated_execution = (
@@ -236,7 +237,7 @@ class SchedulerService:
             definition = db.get(WorkflowDefinition, execution.workflow_definition_id)
             if definition is None or not definition.enabled:
                 return None
-            now = datetime.utcnow()
+            now = now_local()
             lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)
             lease_token = uuid.uuid4().hex
             updated_execution = (
@@ -334,7 +335,7 @@ class SchedulerService:
             return
         db = get_db_session()
         try:
-            now = datetime.utcnow()
+            now = now_local()
             lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)
             for execution_id in list(self._running_tasks):
                 db.query(WorkflowExecution).filter(
@@ -358,7 +359,7 @@ class SchedulerService:
     def _cleanup_once(self) -> None:
         db = get_db_session()
         try:
-            now = datetime.utcnow()
+            now = now_local()
             worker_timeout_at = now - timedelta(seconds=get_config().scheduler.worker_timeout_seconds)
             offline_workers = (
                 db.query(SchedulerWorker)

@@ -19,6 +19,7 @@ from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SOverallProg
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
+from app.time_utils import isoformat_local, now_local
 
 TERMINAL = {"success", "failed", "cancelled"}
 PI_STATUS_MAP = {
@@ -225,7 +226,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             item.progress = build_item_progress(item, {"status": "failed", "phase": "failed", "progress": {}, "error": str(exc)})
             item.failure_type = "pi-re-agent"
             item.error_reason = str(exc)
-            item.finished_at = datetime.utcnow()
+            item.finished_at = now_local()
     recompute_task_status(db, task)
     db.commit()
     db.refresh(task)
@@ -257,7 +258,7 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.status = "failed"
             item.failure_type = "pi-re-agent"
             item.error_reason = "pi-re-agent job not found"
-            item.finished_at = datetime.utcnow()
+            item.finished_at = now_local()
             changed = True
             continue
         new_status = map_pi_status(job.get("status"))
@@ -273,9 +274,9 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.progress = new_progress
             changed = True
         if new_status == "running" and item.started_at is None:
-            item.started_at = datetime.utcnow()
+            item.started_at = now_local()
         if new_status in TERMINAL and item.finished_at is None:
-            item.finished_at = datetime.utcnow()
+            item.finished_at = now_local()
         if new_status == "success":
             output = job.get("output") or {}
             item.generated_files = build_generated_files(item, output)
@@ -299,7 +300,7 @@ async def terminate_task(db: Session, task: B2STask) -> None:
         item.status = "cancelled"
         item.phase = "cancelled"
         item.progress = build_item_progress(item, {"status": "cancelled", "phase": "cancelled", "progress": item.progress})
-        item.finished_at = datetime.utcnow()
+        item.finished_at = now_local()
     recompute_task_status(db, task)
     db.commit()
 
@@ -418,7 +419,7 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
             item.progress = build_item_progress(item, {"status": "failed", "phase": "failed", "progress": {}, "error": str(exc)})
             item.failure_type = "pi-re-agent"
             item.error_reason = str(exc)
-            item.finished_at = datetime.utcnow()
+            item.finished_at = now_local()
     recompute_task_status(db, task)
     db.commit()
 
@@ -611,7 +612,7 @@ def build_item_progress(item: B2STaskItem, job: dict) -> dict:
         "percent": percent,
         "bytes_percent": _safe_percent(completed_bytes, total_bytes),
         "batches_percent": batch_percent,
-        "updated_at": datetime.utcnow().isoformat() + "Z",
+        "updated_at": isoformat_local(now_local()),
     }
 
 
@@ -639,7 +640,7 @@ def recompute_task_status(db: Session, task: B2STask) -> None:
         task.status = "partial"
     else:
         task.status = "pending"
-    task.updated_at = datetime.utcnow()
+    task.updated_at = now_local()
 
 
 def count_status(items: list[B2STaskItem]) -> dict[str, int]:

@@ -58,10 +58,11 @@ from app.service.fileserver import get_fileserver_client
 from app.service.firmware_unpacker import get_firmware_unpacker_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.system_analyse import get_system_analyse_client
+from app.time_utils import now_local
 
 
 def _now() -> datetime:
-    return datetime.utcnow()
+    return now_local()
 
 
 def _slug(value: str) -> str:
