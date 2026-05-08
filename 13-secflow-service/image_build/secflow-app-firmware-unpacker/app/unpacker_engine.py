@@ -239,6 +239,150 @@ def render_template(template_path: Path, replacements: dict[str, str]) -> str:
     return text
 
 
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+
+def _slug_session_part(value: str, *, fallback: str) -> str:
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", str(value or "").strip().lower())
+    normalized = normalized.strip(".-_")
+    return normalized or fallback
+
+
+def get_session_dir(log_dir: Path | None) -> Path | None:
+    if log_dir is None:
+        return None
+    session_dir = log_dir / "sessions"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    index_path = session_dir / "index.json"
+    if not index_path.exists():
+        index_path.write_text(
+            json.dumps({"version": 1, "items": []}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    return session_dir
+
+
+def _session_index_path(session_dir: Path | None) -> Path | None:
+    if session_dir is None:
+        return None
+    return session_dir / "index.json"
+
+
+def _load_session_index(session_dir: Path | None) -> dict[str, Any]:
+    path = _session_index_path(session_dir)
+    if path is None or not path.exists():
+        return {"version": 1, "items": []}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "items": []}
+    items = payload.get("items")
+    if not isinstance(items, list):
+        items = []
+    return {"version": 1, "items": items}
+
+
+def _write_session_index(session_dir: Path | None, payload: dict[str, Any]) -> None:
+    path = _session_index_path(session_dir)
+    if path is None:
+        return
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def build_session_artifacts(
+    log_dir: Path | None,
+    *,
+    role: str,
+    name: str,
+    provider_role: str | None,
+    phase: str,
+    round_id: int | None = None,
+    skill_name: str | None = None,
+) -> dict[str, Any]:
+    session_dir = get_session_dir(log_dir)
+    if session_dir is None:
+        raise ValueError("session artifacts require a valid log_dir")
+    role_slug = _slug_session_part(role, fallback="agent")
+    name_slug = _slug_session_part(name, fallback="default")
+    session_file = f"{role_slug}.{name_slug}.session.jsonl"
+    session_path = session_dir / session_file
+    session_path.touch(exist_ok=True)
+    return {
+        "session_dir": session_dir,
+        "session_path": session_path,
+        "session_role": role_slug,
+        "session_name": name_slug,
+        "provider_role": str(provider_role or "").strip() or None,
+        "phase": phase,
+        "round": round_id,
+        "skill_name": skill_name,
+    }
+
+
+def update_session_index(
+    session_dir: Path | None,
+    *,
+    role: str,
+    name: str,
+    session_file: str,
+    provider_role: str | None,
+    phase: str,
+    status: str,
+    round_id: int | None = None,
+    skill_name: str | None = None,
+) -> None:
+    if session_dir is None:
+        return
+    payload = _load_session_index(session_dir)
+    items = payload["items"]
+    entry = next(
+        (
+            item
+            for item in items
+            if item.get("role") == role and item.get("name") == name
+        ),
+        None,
+    )
+    now = _utc_now_iso()
+    if entry is None:
+        entry = {
+            "role": role,
+            "name": name,
+            "session_file": session_file,
+            "provider_role": provider_role,
+            "status": status,
+            "created_at": now,
+            "updated_at": now,
+            "closed_at": None,
+            "round": round_id,
+            "skill_name": skill_name,
+            "phase": phase,
+        }
+        items.append(entry)
+    else:
+        entry["session_file"] = session_file
+        entry["provider_role"] = provider_role
+        entry["status"] = status
+        entry["updated_at"] = now
+        entry["round"] = round_id
+        entry["skill_name"] = skill_name
+        entry["phase"] = phase
+    if status in {"closed", "failed"}:
+        entry["closed_at"] = now
+    else:
+        entry["closed_at"] = None
+    _write_session_index(session_dir, payload)
+
+
+def _reviewer_session_name(suffix: str) -> tuple[str, int | None]:
+    normalized = str(suffix or "").strip().replace("_", "-")
+    match = re.fullmatch(r"round-(\d+)", normalized)
+    if match:
+        return normalized, int(match.group(1))
+    return normalized or "default", None
+
+
 class PiRpcClient:
     RETRIES = 2
 
@@ -258,8 +402,19 @@ class PiRpcClient:
         return "/"
 
     @staticmethod
-    def build_args(*, system_prompt_file=None, model=None, tools=None):
-        args = ["pi", "--mode", "rpc", "--no-session"]
+    def build_args(
+        *,
+        system_prompt_file=None,
+        model=None,
+        tools=None,
+        session_dir=None,
+        session_path=None,
+    ):
+        args = ["pi", "--mode", "rpc"]
+        if session_dir:
+            args.extend(["--session-dir", str(session_dir)])
+        if session_path:
+            args.extend(["--session", str(session_path)])
         if system_prompt_file:
             args.extend(["--append-system-prompt", system_prompt_file])
         if model:
@@ -268,7 +423,23 @@ class PiRpcClient:
             args.extend(["--tools", ",".join(tools)])
         return args
 
-    def __init__(self, *, system_prompt_file=None, model=None, tools=None, cwd=None, provider_role: str | None = None, llm_binding_snapshot: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        *,
+        system_prompt_file=None,
+        model=None,
+        tools=None,
+        cwd=None,
+        provider_role: str | None = None,
+        llm_binding_snapshot: dict[str, Any] | None = None,
+        session_dir: Path | None = None,
+        session_path: Path | None = None,
+        session_role: str | None = None,
+        session_name: str | None = None,
+        session_phase: str | None = None,
+        session_round: int | None = None,
+        session_skill_name: str | None = None,
+    ):
         self._cwd = self.resolve_cwd(cwd)
         self._system_prompt_file = system_prompt_file
         self._model = model
@@ -278,7 +449,41 @@ class PiRpcClient:
         self._provider_runtime: dict[str, Any] | None = None
         self._agent_dir: Path | None = None
         self._agent_tmp_root: Path | None = None
+        self._session_dir = session_dir
+        self._session_path = session_path
+        self._session_role = str(session_role or "").strip() or None
+        self._session_name = str(session_name or "").strip() or None
+        self._session_phase = str(session_phase or "").strip() or None
+        self._session_round = session_round
+        self._session_skill_name = str(session_skill_name or "").strip() or None
+        self._session_status = "created"
+        self._register_session("created")
         self._start()
+
+    def _register_session(self, status: str) -> None:
+        if self._session_dir is None or self._session_path is None:
+            return
+        update_session_index(
+            self._session_dir,
+            role=self._session_role or "agent",
+            name=self._session_name or "default",
+            session_file=self._session_path.name,
+            provider_role=self._provider_role,
+            phase=self._session_phase or "unknown",
+            status=status,
+            round_id=self._session_round,
+            skill_name=self._session_skill_name,
+        )
+        self._session_status = status
+
+    def _mark_session_active(self) -> None:
+        self._register_session("running")
+
+    def _mark_session_failed(self) -> None:
+        self._register_session("failed")
+
+    def _mark_session_closed(self) -> None:
+        self._register_session("closed")
 
     def _resolve_provider_runtime(self) -> dict[str, Any] | None:
         if self._provider_role is None:
@@ -375,6 +580,8 @@ class PiRpcClient:
                 system_prompt_file=self._system_prompt_file,
                 model=resolved_model,
                 tools=self._tools,
+                session_dir=self._session_dir,
+                session_path=self._session_path,
             )
             env = os.environ.copy()
             if agent_dir is not None:
@@ -402,8 +609,10 @@ class PiRpcClient:
                 text=True,
                 start_new_session=True,
             )
+            self._mark_session_active()
             self.send({"type": "set_auto_retry", "enabled": True})
         except Exception:
+            self._mark_session_failed()
             self._cleanup_agent_dir()
             raise
 
@@ -469,6 +678,7 @@ class PiRpcClient:
         message: str,
         stream_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> str:
+        self._mark_session_active()
         self.send(
             {
                 "type": "prompt",
@@ -508,6 +718,7 @@ class PiRpcClient:
 
             events.append(event)
 
+        self._mark_session_active()
         for event in reversed(events):
             if (
                 event.get("type") == "message_end"
@@ -547,6 +758,7 @@ class PiRpcClient:
                 if self.proc.poll() is None:
                     raise
                 if attempt >= self.RETRIES:
+                    self._mark_session_failed()
                     raise
                 self._respawn()
 
@@ -579,6 +791,8 @@ class PiRpcClient:
     def close(self):
         try:
             if self.proc.poll() is not None:
+                if self._session_status not in {"closed", "failed"}:
+                    self._mark_session_closed()
                 return
             try:
                 pgid = os.getpgid(self.proc.pid)
@@ -606,6 +820,8 @@ class PiRpcClient:
                 finally:
                     self.proc.wait()
         finally:
+            if self._session_status not in {"closed", "failed"}:
+                self._mark_session_closed()
             self._cleanup_agent_dir()
 
     def _cleanup_agent_dir(self) -> None:
@@ -623,6 +839,7 @@ def get_log_dir(output_path: str) -> Path:
     else:
         log_dir = LOG_OUTPUT_DIR / output_dir.name
     log_dir.mkdir(parents=True, exist_ok=True)
+    get_session_dir(log_dir)
     return log_dir
 
 
@@ -919,12 +1136,28 @@ def _run_reviewer(
         firmware_path=firmware_path,
         output_path=output_path,
     )
+    session_name, round_id = _reviewer_session_name(suffix)
+    session_artifacts = build_session_artifacts(
+        log_dir,
+        role="reviewer",
+        name=session_name,
+        provider_role="reviewer",
+        phase="review",
+        round_id=round_id,
+    )
     validator = PiRpcClient(
         system_prompt_file=val_sp,
         model=val_def["model"],
         tools=val_def["tools"],
         provider_role="reviewer",
         llm_binding_snapshot=llm_binding_snapshot,
+        session_dir=session_artifacts["session_dir"],
+        session_path=session_artifacts["session_path"],
+        session_role=session_artifacts["session_role"],
+        session_name=session_artifacts["session_name"],
+        session_phase=session_artifacts["phase"],
+        session_round=session_artifacts["round"],
+        session_skill_name=session_artifacts["skill_name"],
     )
     if bind_cancel_client:
         bind_cancel_client(validator)
@@ -981,12 +1214,28 @@ def _run_skill_unpack(
         output_path=output_path,
     )
     skill_sp = _write_system_prompt(str(skill_meta.get("system_prompt") or ""), "firmware-skill-")
+    skill_name = _slug_session_part(Path(str(skill_meta.get("path") or "skill")).stem, fallback="skill")
+    session_artifacts = build_session_artifacts(
+        log_dir,
+        role="skill-executor",
+        name=skill_name,
+        provider_role="skill_executor",
+        phase="tool_match",
+        skill_name=skill_name,
+    )
     executor = PiRpcClient(
         system_prompt_file=skill_sp,
         model=skill_meta.get("model"),
         tools=skill_meta.get("tools"),
         provider_role="skill_executor",
         llm_binding_snapshot=llm_binding_snapshot,
+        session_dir=session_artifacts["session_dir"],
+        session_path=session_artifacts["session_path"],
+        session_role=session_artifacts["session_role"],
+        session_name=session_artifacts["session_name"],
+        session_phase=session_artifacts["phase"],
+        session_round=session_artifacts["round"],
+        session_skill_name=session_artifacts["skill_name"],
     )
     if bind_cancel_client:
         bind_cancel_client(executor)
@@ -1060,12 +1309,27 @@ def _run_generic_unpack(
         output_path=output_path,
     )
     max_retries = _get_max_retries()
+    session_artifacts = build_session_artifacts(
+        log_dir,
+        role="executor",
+        name="round-1",
+        provider_role="executor",
+        phase="llm_unpack",
+        round_id=1,
+    )
     executor = PiRpcClient(
         system_prompt_file=exec_sp,
         model=exec_def["model"],
         tools=exec_def["tools"],
         provider_role="executor",
         llm_binding_snapshot=llm_binding_snapshot,
+        session_dir=session_artifacts["session_dir"],
+        session_path=session_artifacts["session_path"],
+        session_role=session_artifacts["session_role"],
+        session_name=session_artifacts["session_name"],
+        session_phase=session_artifacts["phase"],
+        session_round=session_artifacts["round"],
+        session_skill_name=session_artifacts["skill_name"],
     )
     cancel_check(executor)
     passed = False
@@ -1075,6 +1339,31 @@ def _run_generic_unpack(
         for attempt in range(1, max_retries + 1):
             cancel_check(executor)
             final_round = attempt
+            if attempt > 1:
+                round_artifacts = build_session_artifacts(
+                    log_dir,
+                    role="executor",
+                    name=f"round-{attempt}",
+                    provider_role="executor",
+                    phase="llm_unpack",
+                    round_id=attempt,
+                )
+                executor.close()
+                executor = PiRpcClient(
+                    system_prompt_file=exec_sp,
+                    model=exec_def["model"],
+                    tools=exec_def["tools"],
+                    provider_role="executor",
+                    llm_binding_snapshot=llm_binding_snapshot,
+                    session_dir=round_artifacts["session_dir"],
+                    session_path=round_artifacts["session_path"],
+                    session_role=round_artifacts["session_role"],
+                    session_name=round_artifacts["session_name"],
+                    session_phase=round_artifacts["phase"],
+                    session_round=round_artifacts["round"],
+                    session_skill_name=round_artifacts["skill_name"],
+                )
+                cancel_check(executor)
             exec_msg = render_prompt(
                 EXEC_FIRST_TMPL if attempt == 1 else EXEC_RETRY_TMPL,
                 firmware_path,
@@ -1225,12 +1514,26 @@ def _generate_candidate_skill(
             },
         )
         author_sp = _write_system_prompt(author_def["system_prompt"], "firmware-skill-author-")
+        session_artifacts = build_session_artifacts(
+            log_dir,
+            role="skill-author",
+            name="default",
+            provider_role="skill_author",
+            phase="skill_author",
+        )
         author = PiRpcClient(
             system_prompt_file=author_sp,
             model=author_def["model"],
             tools=author_def["tools"],
             provider_role="skill_author",
             llm_binding_snapshot=llm_binding_snapshot,
+            session_dir=session_artifacts["session_dir"],
+            session_path=session_artifacts["session_path"],
+            session_role=session_artifacts["session_role"],
+            session_name=session_artifacts["session_name"],
+            session_phase=session_artifacts["phase"],
+            session_round=session_artifacts["round"],
+            session_skill_name=session_artifacts["skill_name"],
         )
         if bind_cancel_client:
             bind_cancel_client(author)
@@ -1300,12 +1603,26 @@ def _run_cleaner(
     clean_def = load_agent_def(CLEAN_AGENT_DEF)
     clean_sp = "/tmp/firmware-extract-cleanup.md"
     Path(clean_sp).write_text(clean_def["system_prompt"])
+    session_artifacts = build_session_artifacts(
+        log_dir,
+        role="cleaner",
+        name="default",
+        provider_role="cleaner",
+        phase="cleanup",
+    )
     cleaner = PiRpcClient(
         system_prompt_file=clean_sp,
         model=clean_def["model"],
         tools=clean_def["tools"],
         provider_role="cleaner",
         llm_binding_snapshot=llm_binding_snapshot,
+        session_dir=session_artifacts["session_dir"],
+        session_path=session_artifacts["session_path"],
+        session_role=session_artifacts["session_role"],
+        session_name=session_artifacts["session_name"],
+        session_phase=session_artifacts["phase"],
+        session_round=session_artifacts["round"],
+        session_skill_name=session_artifacts["skill_name"],
     )
     if bind_cancel_client:
         bind_cancel_client(cleaner)

@@ -9,6 +9,7 @@ import yaml
 from app.config import reload_config
 from app.model import TaskStatus, UnpackTask, UnpackTaskEvent, WorkerInstance, get_db_session, init_database
 import app.model as model_module
+import app.unpacker_engine as unpacker_engine_module
 import app.services.task_manager as task_manager_module
 from app.api.firmware import _submit_task
 from app.exception import ValidationError
@@ -16,6 +17,47 @@ from app.model import ServiceConfig
 from app.schemas import UnpackRequest
 from app.services.task_manager import prepare_task_workspace, resolve_task_runtime_paths, submit_unpack_task
 from app.services.task_events import list_task_events
+
+
+class _StubStream:
+    def __iter__(self):
+        return iter(())
+
+    def readline(self):
+        return ""
+
+
+class _StubStdin:
+    def write(self, _data):
+        return None
+
+    def flush(self):
+        return None
+
+    def close(self):
+        return None
+
+
+class _StubProc:
+    def __init__(self):
+        self.stdin = _StubStdin()
+        self.stdout = _StubStream()
+        self.stderr = _StubStream()
+        self.pid = 4321
+        self._poll = None
+
+    def poll(self):
+        return self._poll
+
+    def terminate(self):
+        self._poll = 0
+
+    def wait(self, timeout=None):
+        self._poll = 0
+        return 0
+
+    def kill(self):
+        self._poll = -9
 
 
 class TaskManagerWorkspaceTests(unittest.TestCase):
@@ -381,6 +423,198 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
         event_types = [item["event_type"] for item in events["items"]]
         self.assertIn("cancel_requested", event_types)
         self.assertIn("task_cancelled", event_types)
+
+
+class PiSessionRecordingTests(unittest.TestCase):
+    def test_build_args_include_session_flags(self):
+        args = unpacker_engine_module.PiRpcClient.build_args(
+            model="demo-model",
+            tools=["read", "bash"],
+            session_dir="/tmp/sessions",
+            session_path="/tmp/sessions/executor.round-1.session.jsonl",
+        )
+
+        self.assertIn("--session-dir", args)
+        self.assertIn("/tmp/sessions", args)
+        self.assertIn("--session", args)
+        self.assertIn("/tmp/sessions/executor.round-1.session.jsonl", args)
+        self.assertNotIn("--no-session", args)
+
+    def test_session_index_tracks_lifecycle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "run"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            session = unpacker_engine_module.build_session_artifacts(
+                log_dir,
+                role="executor",
+                name="round-1",
+                provider_role="executor",
+                phase="llm_unpack",
+                round_id=1,
+            )
+            unpacker_engine_module.update_session_index(
+                session["session_dir"],
+                role=session["session_role"],
+                name=session["session_name"],
+                session_file=session["session_path"].name,
+                provider_role=session["provider_role"],
+                phase=session["phase"],
+                status="created",
+                round_id=session["round"],
+                skill_name=session["skill_name"],
+            )
+            unpacker_engine_module.update_session_index(
+                session["session_dir"],
+                role=session["session_role"],
+                name=session["session_name"],
+                session_file=session["session_path"].name,
+                provider_role=session["provider_role"],
+                phase=session["phase"],
+                status="running",
+                round_id=session["round"],
+                skill_name=session["skill_name"],
+            )
+            unpacker_engine_module.update_session_index(
+                session["session_dir"],
+                role=session["session_role"],
+                name=session["session_name"],
+                session_file=session["session_path"].name,
+                provider_role=session["provider_role"],
+                phase=session["phase"],
+                status="closed",
+                round_id=session["round"],
+                skill_name=session["skill_name"],
+            )
+
+            payload = json.loads((log_dir / "sessions" / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(1, payload["version"])
+            self.assertEqual(1, len(payload["items"]))
+            item = payload["items"][0]
+            self.assertEqual("executor", item["role"])
+            self.assertEqual("round-1", item["name"])
+            self.assertEqual("executor.round-1.session.jsonl", item["session_file"])
+            self.assertEqual("closed", item["status"])
+            self.assertEqual(1, item["round"])
+            self.assertIsNotNone(item["closed_at"])
+
+    def test_pi_rpc_client_marks_failed_when_startup_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "run"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            session = unpacker_engine_module.build_session_artifacts(
+                log_dir,
+                role="cleaner",
+                name="default",
+                provider_role="cleaner",
+                phase="cleanup",
+            )
+
+            with patch("app.unpacker_engine.subprocess.Popen", side_effect=RuntimeError("boom")):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    unpacker_engine_module.PiRpcClient(
+                        provider_role=None,
+                        session_dir=session["session_dir"],
+                        session_path=session["session_path"],
+                        session_role=session["session_role"],
+                        session_name=session["session_name"],
+                        session_phase=session["phase"],
+                        session_round=session["round"],
+                        session_skill_name=session["skill_name"],
+                    )
+
+            payload = json.loads((log_dir / "sessions" / "index.json").read_text(encoding="utf-8"))
+            item = payload["items"][0]
+            self.assertEqual("failed", item["status"])
+            self.assertIsNotNone(item["closed_at"])
+
+    def test_run_reviewer_uses_role_and_round_session_name(self):
+        captured = {}
+
+        class _FakePi:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def prompt(self, *_args, **_kwargs):
+                return '{"result":"success"}'
+
+            def get_messages(self):
+                return []
+
+            def get_token_stats(self):
+                return {"tokens": {}}
+
+            def close(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "run"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with patch("app.unpacker_engine.PiRpcClient", _FakePi):
+                passed, _review = unpacker_engine_module._run_reviewer(
+                    "/tmp/fw.bin",
+                    "/tmp/output",
+                    log_dir,
+                    "round_2",
+                    {"model": "demo", "tools": []},
+                    "/tmp/reviewer.md",
+                )
+
+        self.assertTrue(passed)
+        self.assertEqual("reviewer", captured["session_role"])
+        self.assertEqual("round-2", captured["session_name"])
+        self.assertEqual("review", captured["session_phase"])
+        self.assertEqual(2, captured["session_round"])
+        self.assertEqual("reviewer.round-2.session.jsonl", captured["session_path"].name)
+
+    def test_run_skill_unpack_uses_skill_executor_session_name(self):
+        captured = {}
+
+        class _FakePi:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def prompt(self, *_args, **_kwargs):
+                return "ok"
+
+            def get_messages(self):
+                return []
+
+            def get_token_stats(self):
+                return {"tokens": {}}
+
+            def close(self):
+                return None
+
+        skill_meta = {
+            "path": "/tmp/tools/vendor-router.md",
+            "system_prompt": "system",
+            "model": "demo",
+            "tools": [],
+            "family_id": "family",
+            "skill_version": 1,
+            "filename": "vendor-router.md",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp) / "run"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            with patch("app.unpacker_engine.PiRpcClient", _FakePi), \
+                 patch("app.unpacker_engine._run_reviewer", return_value=(True, '{"result":"success"}')):
+                result = unpacker_engine_module._run_skill_unpack(
+                    skill_meta,
+                    "/tmp/fw.bin",
+                    "/tmp/output",
+                    log_dir,
+                    {"model": "demo", "tools": []},
+                    "/tmp/reviewer.md",
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual("skill-executor", captured["session_role"])
+        self.assertEqual("vendor-router", captured["session_name"])
+        self.assertEqual("tool_match", captured["session_phase"])
+        self.assertEqual("vendor-router", captured["session_skill_name"])
+        self.assertEqual("skill-executor.vendor-router.session.jsonl", captured["session_path"].name)
 
 
 if __name__ == "__main__":
