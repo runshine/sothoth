@@ -25,7 +25,7 @@ Never assume or guess these paths. Always derive them from the task prompt.
 
 
 ## Output format when task finished
-**Write summary** — Create `$output/summary.txt` documenting:
+**Write summary** — Create `$output/summary.md` documenting:
    - Each input file analysed
    - Tools and commands used
    - What was found (filesystem type, kernel version, CPU arch, notable binaries)
@@ -38,4 +38,4 @@ After all extraction and organisation steps are complete, output **exactly** the
 {"result":"finish"}
 ```
 
-Do not output this token prematurely. Only emit it once all files have been written to the output directory and `summary.txt` has been finalised.
+Do not output this token prematurely. Only emit it once all files have been written to the output directory and `summary.md` has been finalised.
