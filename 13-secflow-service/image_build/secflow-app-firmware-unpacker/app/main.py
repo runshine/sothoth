@@ -134,34 +134,8 @@ app.include_router(firmware_router)
 
 
 if __name__ == "__main__":
-    from app.start import _default_workers, _env_int
+    from app.start import build_gunicorn_argv
     import gunicorn.app.wsgiapp
 
-    config = get_config()
-    workers = _env_int("GUNICORN_WORKERS", _default_workers())
-    threads = _env_int("GUNICORN_THREADS", 8)
-    timeout = _env_int("GUNICORN_TIMEOUT", 600)
-    keepalive = _env_int("GUNICORN_KEEPALIVE", 10)
-
-    sys.argv = [
-        "gunicorn",
-        "--bind",
-        f"{config.app.host}:{config.app.port}",
-        "--workers",
-        str(workers),
-        "--threads",
-        str(threads),
-        "--worker-class",
-        "gthread",
-        "--timeout",
-        str(timeout),
-        "--keep-alive",
-        str(keepalive),
-        "--access-logfile",
-        "-",
-        "--error-logfile",
-        "-",
-        "--capture-output",
-        "app.wsgi:app",
-    ]
+    sys.argv = build_gunicorn_argv()
     gunicorn.app.wsgiapp.run()
