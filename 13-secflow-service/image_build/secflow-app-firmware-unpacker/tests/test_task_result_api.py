@@ -115,6 +115,7 @@ class TaskResultApiTests(unittest.TestCase):
         task_root = self.root / "task-full"
         output_root = task_root / "output"
         run_root = task_root / "run"
+        round0_root = run_root / "round_000"
         nested_dir = output_root / "dirA" / "nested"
         nested_dir.mkdir(parents=True, exist_ok=True)
         (output_root / "root.txt").write_bytes(b"a" * 100)
@@ -122,9 +123,9 @@ class TaskResultApiTests(unittest.TestCase):
         (nested_dir / "huge.img").write_bytes(b"c" * (2 * 1024 * 1024))
         (output_root / "README").write_bytes(b"d" * 10)
         (output_root / "skip-link").symlink_to(output_root / "root.txt")
-        run_root.mkdir(parents=True, exist_ok=True)
-        (output_root / "summary.txt").write_text("# Summary\n\nsummary", encoding="utf-8")
-        (output_root / "reason.txt").write_text("# Reason\n\nreason", encoding="utf-8")
+        round0_root.mkdir(parents=True, exist_ok=True)
+        (output_root / "summary.md").write_text("# Summary\n\nsummary", encoding="utf-8")
+        (output_root / "reason.md").write_text("# Reason\n\nreason", encoding="utf-8")
         sessions_dir = run_root / "sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
         (sessions_dir / "index.json").write_text(
@@ -150,8 +151,8 @@ class TaskResultApiTests(unittest.TestCase):
         self.assertEqual(1, summary["event_count"])
         self.assertEqual(str(output_root / "dirA" / "nested" / "huge.img"), summary["deepest_path"]["path"])
         self.assertEqual(3, summary["deepest_path"]["depth"])
-        self.assertEqual(str(output_root / "summary.txt"), result["summary_path"])
-        self.assertEqual(str(output_root / "reason.txt"), result["reason_path"])
+        self.assertEqual(str(output_root / "summary.md"), result["summary_path"])
+        self.assertEqual(str(output_root / "reason.md"), result["reason_path"])
         self.assertIn("Summary", result["summary_text"] or "")
         self.assertIn("Reason", result["reason_text"] or "")
         self.assertTrue(any(item["extension"] == ".img" for item in summary["file_extension_breakdown"]))

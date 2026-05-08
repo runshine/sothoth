@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -48,15 +50,20 @@ from app.unpacker_engine_config import (
 from app.unpacker_engine_logs import (
     append_stage_log as _append_stage_log,
     append_stream_delta as _append_stream_delta,
+    copy_optional_text_file as _copy_optional_text_file,
     get_log_dir,
+    get_round_dir as _get_round_dir,
     is_review_success as _is_review_success,
     kill_process_tree as _kill_process_tree,
+    read_json_file as _read_json_file,
+    round_dir_name as _round_dir_name,
     save_agent_log as _save_agent_log,
+    write_round_result as _write_round_result,
     write_json_log as _write_json_log,
     write_token_summary as _write_token_summary,
 )
 from app.unpacker_engine_pi import PiRpcClient
-from app.unpacker_engine_session import build_session_artifacts
+from app.unpacker_engine_session import build_session_artifacts, update_session_index
 
 
 log = logging.getLogger("unpacker.engine")
@@ -85,6 +92,38 @@ def _write_system_prompt(content: str, prefix: str) -> str:
     temp_file.flush()
     temp_file.close()
     return temp_file.name
+
+
+def _copy_round_report(output_path: str, round_dir: Path | None, filename: str) -> str | None:
+    if round_dir is None:
+        return None
+    source = Path(output_path) / filename
+    target = round_dir / filename
+    return str(target) if _copy_optional_text_file(source, target) else None
+
+
+def _preview_markdown(path: Path, limit: int = 1000) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not text:
+        return ""
+    return text[:limit]
+
+
+def _normalize_output_reports(output_path: str) -> None:
+    output_root = Path(output_path)
+    for legacy_name, canonical_name in (("summary.txt", "summary.md"), ("reason.txt", "reason.md")):
+        legacy_path = output_root / legacy_name
+        canonical_path = output_root / canonical_name
+        if legacy_path.exists():
+            if canonical_path.exists():
+                legacy_path.unlink(missing_ok=True)
+            else:
+                shutil.move(str(legacy_path), str(canonical_path))
 
 
 def extract_firmware_features(
@@ -146,15 +185,17 @@ def _run_reviewer(
     firmware_path: str,
     output_path: str,
     log_dir: Path | None,
+    round_dir: Path | None,
     suffix: str,
     val_def: dict[str, Any],
     val_sp: str,
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
     heartbeat_callback: Optional[Callable[[], None]] = None,
-) -> tuple[bool, str]:
+) -> tuple[bool, str, dict[str, Any]]:
+    stage_log_dir = _get_round_dir(log_dir, 0)
     _append_stage_log(
-        log_dir,
+        stage_log_dir,
         "stage4_llm_review.log",
         "starting review round",
         suffix=suffix,
@@ -188,18 +229,30 @@ def _run_reviewer(
     if bind_cancel_client:
         bind_cancel_client(validator)
     try:
+        started_at = datetime.utcnow().isoformat()
+        started_monotonic = time.perf_counter()
         verify_result = validator.prompt(
             render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path),
             stream_callback=lambda event: _append_stream_delta(
-                log_dir,
+                stage_log_dir,
                 "stage4_llm_review.log",
                 f"reviewer:{suffix}",
                 event,
             ),
             heartbeat_callback=heartbeat_callback,
         )
-        _save_agent_log(validator, log, log_dir, f"verifier_{suffix}")
-        return _is_review_success(verify_result), verify_result
+        token_stats = _save_agent_log(validator, log, round_dir, "reviewer")
+        completed_at = datetime.utcnow().isoformat()
+        return _is_review_success(verify_result), verify_result, {
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_seconds": round(time.perf_counter() - started_monotonic, 3),
+            "token_stats": token_stats,
+            "session_file": session_artifacts["session_path"].name,
+            "session_role": session_artifacts["session_role"],
+            "session_name": session_artifacts["session_name"],
+            "provider_role": session_artifacts["provider_role"],
+        }
     finally:
         if bind_cancel_client:
             bind_cancel_client(None)
@@ -218,9 +271,10 @@ def _run_skill_unpack(
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
     heartbeat_callback: Optional[Callable[[], None]] = None,
 ) -> dict[str, Any]:
+    global_round_dir = _get_round_dir(log_dir, 0)
     _append_stage_log(
-        log_dir,
-        "stage3_skill_exec.log",
+        global_round_dir,
+        "skill_exec.log",
         "starting skill execution",
         skill=skill_meta.get("path"),
         family_id=skill_meta.get("family_id"),
@@ -260,12 +314,13 @@ def _run_skill_unpack(
             render_prompt(EXEC_FIRST_TMPL, firmware_path, output_path),
             heartbeat_callback=heartbeat_callback,
         )
-        _save_agent_log(executor, log, log_dir, "skill_executor")
-        passed, review_result = _run_reviewer(
+        _save_agent_log(executor, log, global_round_dir, "skill_executor")
+        passed, review_result, _review_meta = _run_reviewer(
             task_id,
             firmware_path,
             output_path,
             log_dir,
+            global_round_dir,
             "skill",
             val_def,
             val_sp,
@@ -280,16 +335,16 @@ def _run_skill_unpack(
             "review": review_result,
         }
         _append_stage_log(
-            log_dir,
-            "stage3_skill_exec.log",
+            global_round_dir,
+            "skill_exec.log",
             "skill execution completed",
             success=passed,
             response_preview=_preview_text(exec_result),
             review_preview=_preview_text(review_result),
         )
         _write_json_log(
-            log_dir,
-            "stage3_skill_exec.json",
+            global_round_dir,
+            "skill_exec.json",
             {
                 "skill": skill_meta.get("path"),
                 "family_id": skill_meta.get("family_id"),
@@ -325,8 +380,9 @@ def _run_generic_unpack(
     unpack_heartbeat_callback: Optional[Callable[[], None]] = None,
     review_heartbeat_callback: Optional[Callable[[], None]] = None,
 ) -> tuple[bool, int, str]:
+    stage_log_dir = _get_round_dir(log_dir, 0)
     _append_stage_log(
-        log_dir,
+        stage_log_dir,
         "stage3_llm_unpack.log",
         "starting generic llm unpack",
         firmware_path=firmware_path,
@@ -362,6 +418,7 @@ def _run_generic_unpack(
     last_reason = ""
     try:
         for attempt in range(1, max_retries + 1):
+            round_dir = _get_round_dir(log_dir, attempt)
             cancel_check(executor)
             final_round = attempt
             if attempt > 1:
@@ -389,25 +446,30 @@ def _run_generic_unpack(
                     session_skill_name=round_artifacts["skill_name"],
                     task_id=task_id,
                 )
+                session_artifacts = round_artifacts
                 cancel_check(executor)
             exec_msg = render_prompt(
                 EXEC_FIRST_TMPL if attempt == 1 else EXEC_RETRY_TMPL,
                 firmware_path,
                 output_path,
             )
+            executor_started_at = datetime.utcnow().isoformat()
+            executor_started_monotonic = time.perf_counter()
             exec_result = executor.prompt(
                 exec_msg,
                 stream_callback=lambda event, round_id=attempt: _append_stream_delta(
-                    log_dir,
+                    stage_log_dir,
                     "stage3_llm_unpack.log",
                     f"executor:round_{round_id}",
                     event,
                 ),
                 heartbeat_callback=unpack_heartbeat_callback,
             )
-            _save_agent_log(executor, log, log_dir, f"executor_round_{attempt}")
+            executor_token_stats = _save_agent_log(executor, log, round_dir, "executor")
+            executor_completed_at = datetime.utcnow().isoformat()
+            executor_duration_seconds = round(time.perf_counter() - executor_started_monotonic, 3)
             _append_stage_log(
-                log_dir,
+                stage_log_dir,
                 "stage3_llm_unpack.log",
                 "executor round completed",
                 attempt=attempt,
@@ -424,21 +486,22 @@ def _run_generic_unpack(
                         "response_preview": _preview_text(exec_result),
                     },
                 )
-            if log_dir is not None:
-                transcript_path = log_dir / f"executor_round_{attempt}_transcript.log"
+            if round_dir is not None:
+                transcript_path = round_dir / "executor_transcript.log"
                 if transcript_path.exists():
                     _append_stage_log(
-                        log_dir,
+                        stage_log_dir,
                         "stage3_llm_unpack.log",
                         "executor conversation transcript captured",
                         attempt=attempt,
                         transcript_file=transcript_path.name,
                     )
-            passed, verify_result = _run_reviewer(
+            passed, verify_result, reviewer_meta = _run_reviewer(
                 task_id,
                 firmware_path,
                 output_path,
                 log_dir,
+                round_dir,
                 f"round_{attempt}",
                 val_def,
                 val_sp,
@@ -463,7 +526,7 @@ def _run_generic_unpack(
                 response_preview=_preview_text(verify_result),
             )
             _append_stage_log(
-                log_dir,
+                stage_log_dir,
                 "stage4_llm_review.log",
                 "review round completed",
                 attempt=attempt,
@@ -482,16 +545,103 @@ def _run_generic_unpack(
                         "review_preview": _preview_text(verify_result),
                     },
                 )
-            if log_dir is not None:
-                reviewer_transcript_path = log_dir / f"verifier_round_{attempt}_transcript.log"
+            if round_dir is not None:
+                _normalize_output_reports(output_path)
+                reviewer_transcript_path = round_dir / "reviewer_transcript.log"
                 if reviewer_transcript_path.exists():
                     _append_stage_log(
-                        log_dir,
+                        stage_log_dir,
                         "stage4_llm_review.log",
                         "reviewer conversation transcript captured",
                         attempt=attempt,
                         transcript_file=reviewer_transcript_path.name,
                     )
+                summary_round_path = _copy_round_report(output_path, round_dir, "summary.md")
+                reason_round_path = _copy_round_report(output_path, round_dir, "reason.md")
+                executor_tokens = dict(executor_token_stats or {})
+                reviewer_tokens = dict(reviewer_meta.get("token_stats") or {})
+                round_total_tokens = {
+                    field: int(executor_tokens.get(field, 0) or 0) + int(reviewer_tokens.get(field, 0) or 0)
+                    for field in ("input", "output", "cacheRead", "cacheWrite", "total")
+                }
+                warnings: list[str] = []
+                if not summary_round_path:
+                    warnings.append("summary.md not generated yet")
+                if not reason_round_path:
+                    warnings.append("reason.md not generated yet")
+                _write_round_result(
+                    round_dir,
+                    task_id=task_id,
+                    round_id=attempt,
+                    status="review_passed" if passed else "review_failed",
+                    created_at=reviewer_meta["completed_at"],
+                    started_at=executor_started_at,
+                    completed_at=reviewer_meta["completed_at"],
+                    duration_seconds=round(
+                        executor_duration_seconds + float(reviewer_meta.get("duration_seconds") or 0.0),
+                        3,
+                    ),
+                    output_root=Path(output_path),
+                    paths={
+                        "run_root": str(log_dir) if log_dir is not None else None,
+                        "round_root": str(round_dir),
+                        "output_root": output_path,
+                        "executor_messages_path": str(round_dir / "executor_messages.json"),
+                        "executor_transcript_path": str(round_dir / "executor_transcript.log"),
+                        "executor_tokens_path": str(round_dir / "executor_tokens.json"),
+                        "reviewer_messages_path": str(round_dir / "reviewer_messages.json"),
+                        "reviewer_transcript_path": str(round_dir / "reviewer_transcript.log"),
+                        "reviewer_tokens_path": str(round_dir / "reviewer_tokens.json"),
+                        "summary_path": summary_round_path,
+                        "reason_path": reason_round_path,
+                        "output_manifest_path": str(round_dir / "output_manifest.json"),
+                    },
+                    executor={
+                        "provider_role": session_artifacts["provider_role"],
+                        "session_role": session_artifacts["session_role"],
+                        "session_name": session_artifacts["session_name"],
+                        "session_file": session_artifacts["session_path"].name,
+                        "prompt_type": "initial" if attempt == 1 else "retry",
+                        "response_preview": _preview_text(exec_result),
+                        "duration_seconds": executor_duration_seconds,
+                        "tokens": executor_tokens,
+                        "started_at": executor_started_at,
+                        "completed_at": executor_completed_at,
+                    },
+                    reviewer={
+                        "provider_role": reviewer_meta["provider_role"],
+                        "session_role": reviewer_meta["session_role"],
+                        "session_name": reviewer_meta["session_name"],
+                        "session_file": reviewer_meta["session_file"],
+                        "passed": passed,
+                        "review_result": verify_result,
+                        "review_preview": _preview_text(verify_result),
+                        "duration_seconds": reviewer_meta["duration_seconds"],
+                        "tokens": reviewer_tokens,
+                        "started_at": reviewer_meta["started_at"],
+                        "completed_at": reviewer_meta["completed_at"],
+                    },
+                    tokens={
+                        "executor": executor_tokens,
+                        "reviewer": reviewer_tokens,
+                        "round_total": round_total_tokens,
+                    },
+                    artifacts={
+                        "summary_present": bool(summary_round_path),
+                        "summary_preview": _preview_markdown(Path(summary_round_path)) if summary_round_path else None,
+                        "reason_present": bool(reason_round_path),
+                        "reason_preview": _preview_markdown(Path(reason_round_path)) if reason_round_path else None,
+                        "tokens_summary_present": False,
+                        "warnings": warnings,
+                    },
+                    context={
+                        "matched_skill": None,
+                        "fallback_to_llm": True,
+                        "executor_rounds_planned": max_retries,
+                        "firmware_path": firmware_path,
+                        "output_path": output_path,
+                    },
+                )
             if passed:
                 break
             last_reason = verify_result
@@ -531,7 +681,7 @@ def _generate_candidate_skill(
     )
     try:
         author_def = load_agent_def(AUTHOR_AGENT_DEF)
-        summary_path = Path(output_path) / "summary.txt"
+        summary_path = Path(output_path) / "summary.md"
         summary_text = summary_path.read_text(encoding="utf-8") if summary_path.exists() else ""
         prompt = render_template(
             AUTHOR_PROMPT_TMPL,
@@ -758,6 +908,7 @@ def run_unpack(
         log_dir = get_log_dir(output_path)
     except Exception:
         log_dir = None
+    global_round_dir = _get_round_dir(log_dir, 0)
 
     _check_cancel()
     _report_progress("preprocess")
@@ -766,7 +917,7 @@ def run_unpack(
         pre_result = run_preprocess(
             firmware_path,
             output_path,
-            log_dir=log_dir,
+            log_dir=global_round_dir,
             cancel_check=cancel_check,
             register_cancel_hook=register_cancel_hook,
         )
@@ -824,8 +975,8 @@ def run_unpack(
             error=str(exc),
         )
     _append_stage_log(
-        log_dir,
-        "stage2_skill_match.log",
+        global_round_dir,
+        "skill_match.log",
         "feature extraction and skill match completed",
         features=features,
         matched_skill=skill_meta.get("path") if skill_meta else None,
@@ -835,8 +986,8 @@ def run_unpack(
     )
 
     _write_json_log(
-        log_dir,
-        "stage2_skill_match.json",
+        global_round_dir,
+        "skill_match.json",
         {
             "features": features,
             "matched_skill": skill_meta.get("path") if skill_meta else None,
@@ -890,8 +1041,8 @@ def run_unpack(
             _check_cancel()
             _report_progress("tool_match")
             _append_stage_log(
-                log_dir,
-                "stage2_skill_match.log",
+                global_round_dir,
+                "skill_match.log",
                 "matched skill selected for execution",
                 skill=skill_meta.get("path"),
                 skill_version=skill_meta.get("skill_version"),
@@ -930,15 +1081,15 @@ def run_unpack(
                         },
                     )
                 _append_stage_log(
-                    log_dir,
+                    global_round_dir,
                     "stage3_llm_unpack.log",
                     "fallback to llm triggered after skill failure",
                     matched_skill=skill_meta.get("path"),
                     reason_preview=_preview_text(last_reason, 400),
                 )
                 _write_json_log(
-                    log_dir,
-                    "stage4_llm_fallback.json",
+                    global_round_dir,
+                    "fallback.json",
                     {
                         "matched_skill": skill_meta.get("path"),
                         "reason": _preview_text(last_reason, 400),
@@ -971,13 +1122,13 @@ def run_unpack(
                     output_path,
                     features,
                     last_reason or '{"result":"success"}',
-                    log_dir,
+                    global_round_dir,
                     llm_binding_snapshot=llm_binding_snapshot,
                     bind_cancel_client=_bind_cancel_client,
                 )
             else:
                 _append_stage_log(
-                    log_dir,
+                    global_round_dir,
                     "stage3_llm_unpack.log",
                     "generic llm unpack finished without verified success",
                     rounds=final_round,
@@ -989,12 +1140,13 @@ def run_unpack(
         _run_cleaner(
             task_id,
             output_path,
-            log_dir=log_dir,
+            log_dir=global_round_dir,
             llm_binding_snapshot=llm_binding_snapshot,
             bind_cancel_client=_bind_cancel_client,
             event_callback=event_callback,
             heartbeat_callback=_stage_heartbeat("cleanup"),
         )
+        _normalize_output_reports(output_path)
         _write_token_summary(log_dir)
 
     except RuntimeError as exc:
@@ -1038,7 +1190,9 @@ __all__ = [
     "PI_AGENT_DIR_ENV",
     "ROLE_CONFIG_FILE_KEYS",
     "ROLE_MODEL_CONFIG_KEYS",
+    "build_session_artifacts",
     "TOOLS_DIR",
+    "update_session_index",
     "VAL_AGENT_DEF",
     "PiRpcClient",
     "_build_settings_json",

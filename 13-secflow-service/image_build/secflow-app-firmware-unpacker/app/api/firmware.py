@@ -47,6 +47,7 @@ from app.services.worker import get_cluster_snapshot, get_worker_id
 from app.skill_store import list_skills
 from app.unpacker_engine_config import get_max_retries
 from app.unpacker_engine import TOOLS_DIR
+from app.unpacker_engine_logs import list_round_dirs as _list_round_dirs
 
 
 router = APIRouter(tags=["Firmware Unpacker"])
@@ -191,19 +192,36 @@ def _derive_run_path(task: dict) -> Path:
     return output_dir.parent / "run" if output_dir.name == "output" else output_dir.parent / "run"
 
 
+def _round_dir(run_dir: Path, round_id: int) -> Path:
+    return run_dir / f"round_{max(0, int(round_id)):03d}"
+
+
+def _round_log_path(run_dir: Path, round_id: int, filename: str) -> Path:
+    return _round_dir(run_dir, round_id) / filename
+
+
+def _existing_round_dirs(run_dir: Path) -> list[Path]:
+    return _list_round_dirs(run_dir)
+
+
+def _llm_round_dirs(run_dir: Path) -> list[Path]:
+    return [path for path in _existing_round_dirs(run_dir) if path.name != "round_000"]
+
+
 def _get_task_progress(task_id: str) -> dict:
     task = _get_task_or_404(task_id)
     run_dir = _derive_run_path(task)
-    stage1_path = run_dir / "stage1_preprocess.json"
-    stage2_path = run_dir / "stage2_skill_match.json"
-    stage3_path = run_dir / "stage3_skill_exec.json"
-    stage3_llm_unpack_log = run_dir / "stage3_llm_unpack.log"
-    stage4_llm_review_log = run_dir / "stage4_llm_review.log"
-    stage4_path = run_dir / "stage4_llm_fallback.json"
-    stage5_path = run_dir / "stage5_skill_generate.json"
-    cleaner_path = run_dir / "cleaner_messages.json"
-    executor_logs = sorted(run_dir.glob("executor_round_*_messages.json"))
-    verifier_logs = sorted(run_dir.glob("verifier_round_*_messages.json"))
+    stage1_path = _round_log_path(run_dir, 0, "preprocess.json")
+    stage2_path = _round_log_path(run_dir, 0, "skill_match.json")
+    stage3_path = _round_log_path(run_dir, 0, "skill_exec.json")
+    stage3_llm_unpack_log = _round_log_path(run_dir, 0, "stage3_llm_unpack.log")
+    stage4_llm_review_log = _round_log_path(run_dir, 0, "stage4_llm_review.log")
+    stage4_path = _round_log_path(run_dir, 0, "fallback.json")
+    stage5_path = _round_log_path(run_dir, 0, "stage5_skill_generate.json")
+    cleaner_path = _round_log_path(run_dir, 0, "cleaner_messages.json")
+    round_dirs = _llm_round_dirs(run_dir)
+    executor_logs = [path / "executor_messages.json" for path in round_dirs if (path / "executor_messages.json").exists()]
+    verifier_logs = [path / "reviewer_messages.json" for path in round_dirs if (path / "reviewer_messages.json").exists()]
 
     task_status = str(task.get("status") or "").lower()
     task_result = str(task.get("result_status") or "").lower()
@@ -456,46 +474,60 @@ def _format_log_file(path: Path) -> str:
 
 def _phase_log_files(run_dir: Path, phase: Optional[str]) -> list[Path]:
     phase_key = str(phase or "").strip()
+    round_zero = _round_dir(run_dir, 0)
+    llm_round_dirs = _llm_round_dirs(run_dir)
     if not phase_key:
         files: list[Path] = [
-            run_dir / "stage1_preprocess.json",
-            run_dir / "stage2_skill_match.json",
-            run_dir / "stage3_skill_exec.json",
-            run_dir / "stage4_llm_fallback.json",
-            run_dir / "stage5_skill_generate.json",
-            run_dir / "cleaner_messages.json",
-            run_dir / "summary.txt",
-            run_dir / "reason.txt",
+            round_zero / "preprocess.json",
+            round_zero / "skill_match.json",
+            round_zero / "skill_exec.json",
+            round_zero / "fallback.json",
+            round_zero / "stage5_skill_generate.json",
+            round_zero / "cleaner_messages.json",
+            round_zero / "summary.md",
+            round_zero / "reason.md",
         ]
-        files.extend(sorted(run_dir.glob("executor_round_*_messages.json")))
-        files.extend(sorted(run_dir.glob("verifier_round_*_messages.json")))
-        files.extend(sorted(run_dir.glob("*.log")))
+        for llm_round_dir in llm_round_dirs:
+            files.extend(
+                [
+                    llm_round_dir / "executor_messages.json",
+                    llm_round_dir / "executor_transcript.log",
+                    llm_round_dir / "executor_tokens.json",
+                    llm_round_dir / "reviewer_messages.json",
+                    llm_round_dir / "reviewer_transcript.log",
+                    llm_round_dir / "reviewer_tokens.json",
+                    llm_round_dir / "results.json",
+                    llm_round_dir / "summary.md",
+                    llm_round_dir / "reason.md",
+                ]
+            )
+        files.extend(sorted(round_zero.glob("*.log")))
         return files
 
     mapping: dict[str, list[Path]] = {
-        "preprocess": [run_dir / "stage1_preprocess.log", run_dir / "stage1_preprocess.json"],
-        "tool_match": [run_dir / "stage2_skill_match.log", run_dir / "stage2_skill_match.json", run_dir / "stage3_skill_exec.log", run_dir / "stage3_skill_exec.json"],
+        "preprocess": [round_zero / "preprocess.log", round_zero / "preprocess.json"],
+        "tool_match": [round_zero / "skill_match.log", round_zero / "skill_match.json", round_zero / "skill_exec.log", round_zero / "skill_exec.json"],
         "llm_unpack": [
-            run_dir / "stage3_llm_unpack.log",
-            run_dir / "stage4_llm_fallback.json",
-            *sorted(run_dir.glob("executor_round_*_transcript.log")),
-            *sorted(run_dir.glob("executor_round_*_messages.json")),
+            round_zero / "stage3_llm_unpack.log",
+            round_zero / "fallback.json",
+            *[path / "executor_transcript.log" for path in llm_round_dirs],
+            *[path / "executor_messages.json" for path in llm_round_dirs],
         ],
         "llm_review": [
-            run_dir / "stage4_llm_review.log",
-            *sorted(run_dir.glob("verifier_round_*_transcript.log")),
-            *sorted(run_dir.glob("verifier_round_*_messages.json")),
-            run_dir / "reason.txt",
-            run_dir / "summary.txt",
+            round_zero / "stage4_llm_review.log",
+            *[path / "reviewer_transcript.log" for path in llm_round_dirs],
+            *[path / "reviewer_messages.json" for path in llm_round_dirs],
+            *[path / "reason.md" for path in llm_round_dirs],
+            *[path / "summary.md" for path in llm_round_dirs],
         ],
         "llm_cleanup": [
-            run_dir / "cleaner.log",
-            run_dir / "cleaner_transcript.log",
-            run_dir / "cleaner_messages.json",
-            run_dir / "stage5_skill_generate.log",
-            run_dir / "stage5_skill_generate.json",
-            run_dir / "skill_author_transcript.log",
-            run_dir / "skill_author_messages.json",
+            round_zero / "cleaner.log",
+            round_zero / "cleaner_transcript.log",
+            round_zero / "cleaner_messages.json",
+            round_zero / "stage5_skill_generate.log",
+            round_zero / "stage5_skill_generate.json",
+            round_zero / "skill_author_transcript.log",
+            round_zero / "skill_author_messages.json",
         ],
     }
     return mapping.get(phase_key, [])
@@ -795,9 +827,9 @@ def _get_task_result(task_id: str) -> dict:
     task = _get_task_or_404(task_id)
     output_root = Path(str(task.get("output_path") or "").strip())
     run_root = _derive_run_path(task)
-    summary_path = output_root / "summary.txt"
-    reason_path = output_root / "reason.txt"
-    tokens_summary_path = run_root / "tokens_summary.json"
+    summary_path = output_root / "summary.md"
+    reason_path = output_root / "reason.md"
+    tokens_summary_path = _round_log_path(run_root, 0, "tokens_summary.json")
     sessions_index_path = run_root / "sessions" / "index.json"
 
     warnings: list[str] = []
@@ -832,9 +864,9 @@ def _get_task_result(task_id: str) -> dict:
     summary_text = _read_text_file(summary_path).strip() or None
     reason_text = _read_text_file(reason_path).strip() or None
     if summary_path.exists() and not summary_text:
-        warnings.append("summary.txt 存在但为空")
+        warnings.append("summary.md 存在但为空")
     if reason_path.exists() and not reason_text:
-        warnings.append("reason.txt 存在但为空")
+        warnings.append("reason.md 存在但为空")
     if sessions_index_path.exists() and session_count == 0:
         warnings.append("会话索引存在但未解析到任何会话")
 

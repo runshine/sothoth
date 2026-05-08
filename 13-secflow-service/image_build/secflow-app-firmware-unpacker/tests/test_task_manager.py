@@ -397,11 +397,11 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
 
     def test_submit_task_freezes_llm_binding_snapshot_immediately(self):
         provider_keys = {
-            "llm_provider_key_executor": "provider-executor-v1",
-            "llm_provider_key_reviewer": "provider-reviewer-v1",
-            "llm_provider_key_cleaner": "provider-cleaner-v1",
-            "llm_provider_key_skill_author": "provider-author-v1",
-            "llm_provider_key_skill_executor": "provider-skill-v1",
+            "llm_config_file_key_executor": "provider-executor-v1",
+            "llm_config_file_key_reviewer": "provider-reviewer-v1",
+            "llm_config_file_key_cleaner": "provider-cleaner-v1",
+            "llm_config_file_key_skill_author": "provider-author-v1",
+            "llm_config_file_key_skill_executor": "provider-skill-v1",
         }
         provider_payloads = {
             provider_key: {
@@ -417,13 +417,32 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
         }
 
         class _FakeClient:
-            def get_llm_provider(self, provider_key: str):
-                return provider_payloads[provider_key]
+            def get_llm_config_file(self, config_file_key: str):
+                payload = provider_payloads[config_file_key]
+                return {
+                    "config_file_key": config_file_key,
+                    "display_name": config_file_key,
+                    "default_model": f"{config_file_key}/{payload['model']}",
+                    "updated_at": payload["updated_at"],
+                    "models_json": {
+                        "providers": {
+                            config_file_key: {
+                                "type": "openai-compatible",
+                                "baseURL": payload["api_base"],
+                                "apiKeyEnv": "OPENAI_API_KEY",
+                                "models": [payload["model"]],
+                            }
+                        }
+                    },
+                }
 
         db = get_db_session()
         try:
             for key, value in provider_keys.items():
                 row = db.query(ServiceConfig).filter(ServiceConfig.key == key).first()
+                if row is None:
+                    row = ServiceConfig(key=key, value="", value_type="string", description="")
+                    db.add(row)
                 row.value = value
             db.commit()
         finally:
@@ -445,7 +464,7 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             created_events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == created["task_id"]).all()
             self.assertTrue(any(event.event_type == "task_created" for event in created_events))
 
-            row = db.query(ServiceConfig).filter(ServiceConfig.key == "llm_provider_key_executor").first()
+            row = db.query(ServiceConfig).filter(ServiceConfig.key == "llm_config_file_key_executor").first()
             row.value = "provider-executor-v2"
             db.commit()
         finally:
@@ -461,28 +480,39 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
 
     def test_cancel_task_records_cancel_requested_event(self):
         provider_keys = {
-            "llm_provider_key_executor": "provider-executor-v1",
-            "llm_provider_key_reviewer": "provider-reviewer-v1",
-            "llm_provider_key_cleaner": "provider-cleaner-v1",
-            "llm_provider_key_skill_author": "provider-author-v1",
-            "llm_provider_key_skill_executor": "provider-skill-v1",
+            "llm_config_file_key_executor": "provider-executor-v1",
+            "llm_config_file_key_reviewer": "provider-reviewer-v1",
+            "llm_config_file_key_cleaner": "provider-cleaner-v1",
+            "llm_config_file_key_skill_author": "provider-author-v1",
+            "llm_config_file_key_skill_executor": "provider-skill-v1",
         }
 
         class _FakeClient:
-            def get_llm_provider(self, provider_key: str):
+            def get_llm_config_file(self, config_file_key: str):
                 return {
-                    "provider_key": provider_key,
-                    "provider_type": "openai-compatible",
-                    "api_base": f"http://llm.local/{provider_key}",
-                    "api_key": f"secret-{provider_key}",
-                    "model": f"model-{provider_key}",
-                    "env_bindings": {},
+                    "config_file_key": config_file_key,
+                    "display_name": config_file_key,
+                    "default_model": f"{config_file_key}/model-default",
+                    "updated_at": "2026-05-08T00:00:00",
+                    "models_json": {
+                        "providers": {
+                            config_file_key: {
+                                "type": "openai-compatible",
+                                "baseURL": f"http://llm.local/{config_file_key}",
+                                "apiKeyEnv": "OPENAI_API_KEY",
+                                "models": ["model-default"],
+                            }
+                        }
+                    },
                 }
 
         db = get_db_session()
         try:
             for key, value in provider_keys.items():
                 row = db.query(ServiceConfig).filter(ServiceConfig.key == key).first()
+                if row is None:
+                    row = ServiceConfig(key=key, value="", value_type="string", description="")
+                    db.add(row)
                 row.value = value
             db.commit()
         finally:
@@ -628,10 +658,12 @@ class PiSessionRecordingTests(unittest.TestCase):
             log_dir = Path(tmp) / "run"
             log_dir.mkdir(parents=True, exist_ok=True)
             with patch("app.unpacker_engine.PiRpcClient", _FakePi):
-                passed, _review = unpacker_engine_module._run_reviewer(
+                passed, _review, _meta = unpacker_engine_module._run_reviewer(
+                    "task-1",
                     "/tmp/fw.bin",
                     "/tmp/output",
                     log_dir,
+                    log_dir / "round_002",
                     "round_2",
                     {"model": "demo", "tools": []},
                     "/tmp/reviewer.md",
@@ -677,8 +709,9 @@ class PiSessionRecordingTests(unittest.TestCase):
             log_dir = Path(tmp) / "run"
             log_dir.mkdir(parents=True, exist_ok=True)
             with patch("app.unpacker_engine.PiRpcClient", _FakePi), \
-                 patch("app.unpacker_engine._run_reviewer", return_value=(True, '{"result":"success"}')):
+                 patch("app.unpacker_engine._run_reviewer", return_value=(True, '{"result":"success"}', {})):
                 result = unpacker_engine_module._run_skill_unpack(
+                    "task-1",
                     skill_meta,
                     "/tmp/fw.bin",
                     "/tmp/output",

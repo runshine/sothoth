@@ -48,7 +48,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
 def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
     if log_dir is None:
         return
-    Path(log_dir, "stage1_preprocess.json").write_text(
+    Path(log_dir, "preprocess.json").write_text(
         json.dumps(stage_entries, indent=2)
     )
     lines: list[str] = []
@@ -84,7 +84,7 @@ def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
             )
             continue
         lines.append(f"[{stamp}] {json.dumps(entry, ensure_ascii=False)}")
-    Path(log_dir, "stage1_preprocess.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    Path(log_dir, "preprocess.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def detect_format(firmware_path: str) -> dict:
