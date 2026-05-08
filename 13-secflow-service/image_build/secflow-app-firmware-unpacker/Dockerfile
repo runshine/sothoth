@@ -85,7 +85,6 @@ RUN apt-get update && apt-get install -y \
     lz4 \
     nasm \
     xxd \
-    hexdump \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
