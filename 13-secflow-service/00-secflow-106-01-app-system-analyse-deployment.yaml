@@ -21,10 +21,10 @@ spec:
         env:
           - name: TZ
             value: Asia/Shanghai
-        - name: PORT
-          value: "8080"
-        - name: FILESERVER_ROOT
-          value: /data/files
+          - name: PORT
+            value: "8080"
+          - name: FILESERVER_ROOT
+            value: /data/files
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -37,9 +37,6 @@ spec:
           requests:
             memory: "256Mi"
             cpu: "200m"
-          limits:
-            memory: "1Gi"
-            cpu: "1000m"
         livenessProbe:
           httpGet:
             path: /api/app/system-analyse/health
