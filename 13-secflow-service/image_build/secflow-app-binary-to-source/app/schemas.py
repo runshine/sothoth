@@ -29,6 +29,7 @@ class TaskCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     llm_provider_key: Optional[str] = None
     concurrency: Optional[int] = None
+    mode: Optional[Literal["fast", "deep"]] = None
     engine: Optional[Literal["hybrid", "agent"]] = None
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
@@ -110,6 +111,8 @@ class TaskResponse(BaseModel):
     parent_stage_item_key: Optional[str] = None
     origin_label: Optional[str] = None
     parent_task_display: Optional[str] = None
+    mode: Optional[str] = None
+    mode_label: Optional[str] = None
     name: str
     status: str
     total_items: int

@@ -163,7 +163,10 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     llm_provider_key = (req.llm_provider_key or "").strip() or None
     job_model = await resolve_job_model(llm_provider_key)
     job_concurrency = req.concurrency if req.concurrency and req.concurrency > 0 else pi_cfg.concurrency
-    job_engine = req.engine or pi_cfg.engine
+    mode_engine_map = {"fast": "hybrid", "deep": "agent"}
+    job_mode = req.mode or ({"hybrid": "fast", "agent": "deep"}.get(req.engine or "") if req.engine else None)
+    job_engine = mode_engine_map.get(job_mode or "") or req.engine or pi_cfg.engine
+    job_mode = job_mode or {"hybrid": "fast", "agent": "deep"}.get(job_engine)
     for idx, elf in enumerate(req.elf_tasks, start=1):
         source_elf_path = ensure_path_in_project(project_id, elf.elf_path, must_be_file=True)
         input_elf_path = prepare_input_file(project_id, task.id, idx, source_elf_path)
@@ -190,6 +193,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "source_elf_path": str(source_elf_path),
             "llm_provider_key": llm_provider_key,
             "concurrency": job_concurrency,
+            "mode": job_mode,
             "engine": job_engine,
             "pi_worker_url": worker_url,
         }
@@ -649,13 +653,38 @@ def count_status(items: list[B2STaskItem]) -> dict[str, int]:
     }
 
 
+def task_mode_summary(items: list[B2STaskItem]) -> tuple[str | None, str | None]:
+    modes: list[str] = []
+    engine_mode_map = {"hybrid": "fast", "agent": "deep"}
+    for item in items:
+        metadata = item.extra_metadata or {}
+        mode = str(metadata.get("mode") or "").strip()
+        if not mode:
+            mode = engine_mode_map.get(str(metadata.get("engine") or "").strip(), "")
+        if mode and mode not in modes:
+            modes.append(mode)
+    if not modes:
+        return None, None
+    if len(modes) == 1:
+        mode = modes[0]
+        if mode == "deep":
+            return mode, "深度模式"
+        if mode == "fast":
+            return mode, "快速模式"
+        return mode, mode
+    return "mixed", "混合模式"
+
+
 def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     items = query_items(db, task.id)
     counts = count_status(items)
+    mode, mode_label = task_mode_summary(items)
     return TaskResponse(
         id=task.id,
         project_id=task.project_id,
         **_task_origin_payload(task),
+        mode=mode,
+        mode_label=mode_label,
         name=task.name,
         status=task.status,
         total_items=len(items),
