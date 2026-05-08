@@ -87,6 +87,22 @@ def _copytree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, dirs_exist_ok=True)
 
 
+def _path_has_content(path: Path) -> bool:
+    if path.is_file():
+        return True
+    if not path.is_dir():
+        return False
+    return any(path.iterdir())
+
+
+def _count_files(path: Path) -> int:
+    if path.is_file():
+        return 1
+    if not path.is_dir():
+        return 0
+    return sum(1 for child in path.rglob("*") if child.is_file())
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     ensure_dir(path.parent)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -175,6 +191,14 @@ SERVICE_OUTPUT_FOLDERS = {
     "entry_analyse": "entry-analyse",
     "dataflow_analyse": "dataflow-analyse",
     "dataflow_vuln_scanner": "dataflow-vuln-scanner",
+}
+DOWNSTREAM_APP_ROOTS = {
+    "firmware_unpacker": "secflow-app-firmware-unpacker",
+    "system_analyse": "secflow-app-system-analyse",
+    "binary_to_source": "secflow-app-binary-to-source",
+    "entry_analyse": "secflow-app-entry-analyse",
+    "dataflow_analyse": "secflow-app-dataflow-analyse",
+    "dataflow_vuln_scanner": "secflow-app-dataflow-vuln-scanner",
 }
 SOURCE_ARCHIVE_FORMATS = (
     ".zip",
@@ -812,6 +836,23 @@ class TaskManager:
                     synced_count += 1
                 else:
                     skipped_count += 1
+                if force or mapped_status in {"success", "partial_success", "failed", "cancelled"}:
+                    archived_dir = self._archive_downstream_output(
+                        db,
+                        task,
+                        item,
+                        semantic_key=item.item_key,
+                        payload=payload,
+                    )
+                    if archived_dir:
+                        item.output_ref = {
+                            **(item.output_ref or {}),
+                            "archive_root": str(archived_dir),
+                        }
+                        item.result = {
+                            **(item.result or {}),
+                            "archive_root": str(archived_dir),
+                        }
                 self._record_event(
                     db,
                     task,
@@ -2302,7 +2343,8 @@ class TaskManager:
                 task,
                 item,
                 semantic_key=firmware_key,
-                payload={"output_path": str(output_dir)},
+                payload=payload,
+                extra_paths=[output_dir],
             )
             result = {
                 **input_file,
@@ -2670,10 +2712,68 @@ class TaskManager:
         semantic_key: str,
         downstream_task_id: str | None,
     ) -> Path:
+        return ensure_dir(self._service_output_path(task, downstream_service, semantic_key, downstream_task_id))
+
+    def _service_output_path(
+        self,
+        task: BinarySecurityTask,
+        downstream_service: str,
+        semantic_key: str,
+        downstream_task_id: str | None,
+    ) -> Path:
         service_folder = SERVICE_OUTPUT_FOLDERS.get(downstream_service, downstream_service.replace("_", "-"))
         suffix = downstream_task_id or "unknown-task"
         dirname = f"{semantic_key}__{suffix}"
-        return ensure_dir(Path(task.output_root) / service_folder / dirname)
+        return Path(task.output_root) / service_folder / dirname
+
+    def _downstream_standard_output_sources(
+        self,
+        task: BinarySecurityTask,
+        downstream_service: str | None,
+        downstream_task_id: str | None,
+    ) -> list[Path]:
+        if not downstream_service or not downstream_task_id:
+            return []
+        app_root = DOWNSTREAM_APP_ROOTS.get(downstream_service)
+        if not app_root:
+            return []
+        project_app_root = Path(task.workspace_root).parent.parent
+        task_root = project_app_root / app_root / downstream_task_id
+        return [task_root / "output", task_root]
+
+    def _payload_output_candidates(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        downstream_task_id: str | None = None,
+    ) -> list[Path]:
+        candidates: list[Path] = []
+        if not isinstance(payload, dict):
+            return candidates
+        for key in (
+            "output_path",
+            "output_root",
+            "artifact_root",
+            "artifacts_root",
+            "result_root",
+            "workspace_root",
+            "work_dir",
+            "task_root",
+        ):
+            value = payload.get(key)
+            if not value:
+                continue
+            raw = Path(str(value))
+            if key in {"output_path", "output_root"} and downstream_task_id:
+                candidates.extend([raw / downstream_task_id / "output", raw / downstream_task_id])
+            if key in {"workspace_root", "work_dir", "task_root"}:
+                candidates.append(raw / "output")
+            candidates.append(raw)
+        for key in ("result", "artifacts", "artifact", "data"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                candidates.extend(self._payload_output_candidates(nested, downstream_task_id=downstream_task_id))
+        return candidates
 
     def _resolve_downstream_output_sources(
         self,
@@ -2681,19 +2781,13 @@ class TaskManager:
         *,
         downstream_task_id: str | None = None,
         extra_paths: list[str | Path] | None = None,
+        task: BinarySecurityTask | None = None,
+        downstream_service: str | None = None,
     ) -> list[Path]:
         candidates: list[Path] = []
-        payload = payload or {}
-        for key in ("output_path", "artifact_root", "result_root", "workspace_root"):
-            value = payload.get(key)
-            if not value:
-                continue
-            raw = Path(str(value))
-            if key == "output_path" and downstream_task_id and raw.exists() and (raw / downstream_task_id).exists():
-                raw = raw / downstream_task_id
-            if key == "workspace_root" and (raw / "output").exists():
-                candidates.append(raw / "output")
-            candidates.append(raw)
+        candidates.extend(self._payload_output_candidates(payload, downstream_task_id=downstream_task_id))
+        if task is not None:
+            candidates.extend(self._downstream_standard_output_sources(task, downstream_service, downstream_task_id))
         for value in extra_paths or []:
             if not value:
                 continue
@@ -2723,13 +2817,22 @@ class TaskManager:
         payload: dict[str, Any] | None = None,
         extra_paths: list[str | Path] | None = None,
     ) -> Path | None:
-        target_dir = self._service_output_dir(task, item.downstream_service or item.stage_name, semantic_key, item.downstream_task_id)
+        target_dir = self._service_output_path(task, item.downstream_service or item.stage_name, semantic_key, item.downstream_task_id)
         sources = self._resolve_downstream_output_sources(
             payload,
             downstream_task_id=item.downstream_task_id,
             extra_paths=extra_paths,
+            task=task,
+            downstream_service=item.downstream_service,
         )
-        existing_sources = [source for source in sources if source.exists()]
+        existing_sources = [
+            source
+            for source in sources
+            if source.exists()
+            and _path_has_content(source)
+            and source.resolve() != target_dir.resolve()
+            and not _is_within_path(target_dir, source)
+        ]
         if not existing_sources:
             self._record_event(
                 db,
@@ -2746,6 +2849,7 @@ class TaskManager:
             )
             return None
         try:
+            ensure_dir(target_dir)
             for source in existing_sources:
                 _copytree(source, target_dir)
         except Exception as exc:
@@ -2774,6 +2878,7 @@ class TaskManager:
             payload={
                 "target_dir": str(target_dir),
                 "sources": [str(path) for path in existing_sources],
+                "copied_file_count": _count_files(target_dir),
             },
         )
         return target_dir
@@ -2788,11 +2893,18 @@ class TaskManager:
         task: BinarySecurityTask | None = None,
         item: BinarySecurityStageItem | None = None,
     ) -> Path:
-        ensure_dir(artifact_root)
         existing_candidates = [
             candidate
-            for candidate in self._resolve_downstream_output_sources(payload, downstream_task_id=downstream_task_id)
+            for candidate in self._resolve_downstream_output_sources(
+                payload,
+                downstream_task_id=downstream_task_id,
+                task=task,
+                downstream_service=item.downstream_service if item else None,
+            )
             if candidate.exists()
+            and _path_has_content(candidate)
+            and candidate.resolve() != artifact_root.resolve()
+            and not _is_within_path(artifact_root, candidate)
         ]
         if not existing_candidates:
             if db and task and item:
@@ -2806,8 +2918,10 @@ class TaskManager:
                     level="warning",
                     payload={"target_dir": str(artifact_root)},
                 )
+            ensure_dir(artifact_root)
             return artifact_root
         try:
+            ensure_dir(artifact_root)
             for candidate in existing_candidates:
                 _copytree(candidate, artifact_root)
         except Exception as exc:
@@ -2838,6 +2952,7 @@ class TaskManager:
                 payload={
                     "target_dir": str(artifact_root),
                     "sources": [str(path) for path in existing_candidates],
+                    "copied_file_count": _count_files(artifact_root),
                 },
             )
         return artifact_root

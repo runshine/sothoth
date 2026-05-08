@@ -412,6 +412,95 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("system-analyse", target.parent.name)
             self.assertEqual("fw1__down1", target.name)
 
+    def test_resolve_downstream_output_sources_reads_nested_result_output_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_dir = root / "service" / "down1" / "output"
+            output_dir.mkdir(parents=True)
+            (output_dir / "report.md").write_text("ok", encoding="utf-8")
+
+            rows = self.manager._resolve_downstream_output_sources(
+                {"result": {"output_root": str(root / "service")}},
+                downstream_task_id="down1",
+            )
+
+            self.assertEqual(output_dir, rows[0])
+
+    def test_archive_downstream_output_uses_standard_service_output_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "app" / "secflow-app-binary-security" / "task1"
+            source_output = root / "app" / "secflow-app-firmware-unpacker" / "down1" / "output"
+            source_output.mkdir(parents=True)
+            (source_output / "summary.md").write_text("ok", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            item = type("Item", (), {
+                "downstream_service": "firmware_unpacker",
+                "stage_name": "firmware_unpack",
+                "downstream_task_id": "down1",
+                "item_key": "fw1",
+                "id": "si1",
+            })()
+
+            target = self.manager._archive_downstream_output(
+                _FakeDb(),
+                task,
+                item,
+                semantic_key="fw1",
+                payload={"output_path": str(workspace / "run" / "firmware-unpacker" / "fw1")},
+            )
+
+            self.assertIsNotNone(target)
+            assert target is not None
+            self.assertTrue((target / "summary.md").is_file())
+            self.assertEqual("firmware-unpacker", target.parent.name)
+
+    def test_archive_downstream_output_skips_empty_sources_without_creating_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            empty_output = workspace / "output"
+            empty_output.mkdir(parents=True)
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(root / "task-output"),
+                workspace_root=str(root / "workspace-root"),
+            )
+            item = type("Item", (), {
+                "downstream_service": "system_analyse",
+                "stage_name": "system_analysis",
+                "downstream_task_id": "down1",
+                "item_key": "fw1",
+                "id": "si1",
+            })()
+
+            target = self.manager._archive_downstream_output(
+                _FakeDb(),
+                task,
+                item,
+                semantic_key="fw1",
+                payload={"workspace_root": str(workspace)},
+            )
+
+            self.assertIsNone(target)
+            self.assertFalse((root / "task-output" / "system-analyse" / "fw1__down1").exists())
+
     def test_collect_downstream_refs_dedupes_same_service_and_task_id(self):
         task = BinarySecurityTask(
             id="task1",
