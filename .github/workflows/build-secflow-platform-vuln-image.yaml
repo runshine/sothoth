@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: Generate date tag
         id: date
-        run: echo "date_tag=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+        run: echo "date_tag=$(date +'%Y%m%d')-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
 
   build-amd64:
     needs: prepare
