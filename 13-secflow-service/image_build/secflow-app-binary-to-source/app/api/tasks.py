@@ -9,16 +9,18 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, TaskCreate, TaskDetailResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
+from app.schemas import ActionResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
 from app.service.auth import get_auth_service
 from app.service.configcenter import get_configcenter_client
 from app.service.project import get_project_service
 from app.service.security import validate_project_id
 from app.service.task_service import (
     build_task_detail,
+    build_task_item_advanced,
     build_task_response,
     create_task,
     delete_task,
+    get_task_item_or_404,
     get_task_or_404,
     retry_task,
     rerun_task,
@@ -115,6 +117,21 @@ async def get_b2s_task(
     task = get_task_or_404(db, project_id, task_id)
     await sync_task(db, task)
     return build_task_detail(db, task)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/advanced", response_model=TaskItemAdvancedResponse)
+async def get_b2s_task_item_advanced(
+    project_id: str,
+    task_id: str,
+    item_id: str,
+    include_content: bool = Query(True),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    item = get_task_item_or_404(db, task, item_id)
+    return build_task_item_advanced(item, include_content=include_content)
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/terminate", response_model=ActionResponse)

@@ -132,6 +132,44 @@ class TaskDetailResponse(TaskResponse):
     items: list[TaskItemResponse] = Field(default_factory=list)
 
 
+class AdvancedFile(BaseModel):
+    name: str
+    path: str
+    kind: str
+    size: int = 0
+    content: Optional[str] = None
+    truncated: bool = False
+
+
+class AdvancedBatch(BaseModel):
+    name: str
+    batch_no: Optional[int] = None
+    source: Optional[AdvancedFile] = None
+    disasm: Optional[AdvancedFile] = None
+    reviews: list[AdvancedFile] = Field(default_factory=list)
+    review_snapshots: list[AdvancedFile] = Field(default_factory=list)
+
+
+class AdvancedRun(BaseModel):
+    name: str
+    path: str
+    batches: list[AdvancedBatch] = Field(default_factory=list)
+    agent_sessions: list[AdvancedFile] = Field(default_factory=list)
+    files: list[AdvancedFile] = Field(default_factory=list)
+
+
+class TaskItemAdvancedResponse(BaseModel):
+    task_id: str
+    item_id: str
+    sequence_no: int
+    mode: Optional[str] = None
+    mode_label: Optional[str] = None
+    output_dir: str
+    work_dir: Optional[str] = None
+    runs: list[AdvancedRun] = Field(default_factory=list)
+    ida_files: list[AdvancedFile] = Field(default_factory=list)
+
+
 class TaskListResponse(BaseModel):
     total: int
     items: list[TaskResponse]

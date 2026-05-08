@@ -6,6 +6,7 @@ import hashlib
 import os
 import shutil
 from datetime import datetime
+import re
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
-from app.schemas import B2SOverallProgress, TaskCreate, TaskDetailResponse, TaskItemResponse, TaskResponse
+from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SOverallProgress, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
@@ -694,6 +695,17 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     )
 
 
+def get_task_item_or_404(db: Session, task: B2STask, item_id: str) -> B2STaskItem:
+    item = db.query(B2STaskItem).filter(B2STaskItem.task_id == task.id, B2STaskItem.id == item_id).first()
+    if item:
+        return item
+    if item_id.isdigit():
+        item = db.query(B2STaskItem).filter(B2STaskItem.task_id == task.id, B2STaskItem.sequence_no == int(item_id)).first()
+        if item:
+            return item
+    raise NotFoundError("B2S任务项不存在")
+
+
 def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
     base = build_task_response(db, task).model_dump()
     raw_items = query_items(db, task.id)
@@ -717,6 +729,127 @@ def build_task_detail(db: Session, task: B2STask) -> TaskDetailResponse:
         for i in raw_items
     ]
     return TaskDetailResponse(**base, overall_progress=build_overall_progress(raw_items), items=items)
+
+
+ADVANCED_TEXT_EXTENSIONS = {".c", ".h", ".json", ".md", ".txt", ".log", ".yaml", ".yml"}
+ADVANCED_MAX_BYTES = 512 * 1024
+
+
+def _advanced_kind(path: Path) -> str:
+    name = path.name.lower()
+    if name.startswith("batch_") and name.endswith(".c"):
+        return "batch_source"
+    if name.startswith("disasm_batch_") and name.endswith(".c"):
+        return "batch_disasm"
+    if "verdict" in name or "review" in name:
+        return "review"
+    if "session" in str(path).lower() or "prompt" in name:
+        return "agent_session"
+    if name.endswith(".json"):
+        return "json"
+    return path.suffix.lstrip(".") or "file"
+
+
+def _safe_read_advanced_file(path: Path, base: Path, include_content: bool) -> AdvancedFile | None:
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(base.resolve())
+        if not resolved.is_file():
+            return None
+        size = resolved.stat().st_size
+        content = None
+        truncated = False
+        if include_content and resolved.suffix.lower() in ADVANCED_TEXT_EXTENSIONS:
+            raw = resolved.read_bytes()[:ADVANCED_MAX_BYTES + 1]
+            truncated = len(raw) > ADVANCED_MAX_BYTES
+            content = raw[:ADVANCED_MAX_BYTES].decode("utf-8", errors="replace")
+        return AdvancedFile(
+            name=resolved.name,
+            path=str(resolved),
+            kind=_advanced_kind(resolved),
+            size=size,
+            content=content,
+            truncated=truncated,
+        )
+    except Exception:
+        return None
+
+
+def _batch_no(path: Path) -> int | None:
+    match = re.search(r"batch_(\d+)", path.name)
+    return int(match.group(1)) if match else None
+
+
+def _collect_advanced_files(paths: list[Path], base: Path, include_content: bool) -> list[AdvancedFile]:
+    files: list[AdvancedFile] = []
+    for path in paths:
+        file = _safe_read_advanced_file(path, base, include_content)
+        if file:
+            files.append(file)
+    return files
+
+
+def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) -> TaskItemAdvancedResponse:
+    output_dir = Path(item.output_dir)
+    base = output_dir.resolve()
+    work_dirs = sorted([p for p in output_dir.glob(".re_work_*") if p.is_dir()], key=lambda p: p.name)
+    work_dir = work_dirs[-1] if work_dirs else None
+    runs: list[AdvancedRun] = []
+    ida_files: list[AdvancedFile] = []
+    if work_dir:
+        ida_root = work_dir / "ida_cache"
+        if ida_root.exists():
+            ida_paths = [p for p in ida_root.rglob("*") if p.is_file() and p.suffix.lower() in ADVANCED_TEXT_EXTENSIONS]
+            ida_files = _collect_advanced_files(sorted(ida_paths), base, include_content)
+        runs_root = work_dir / "runs"
+        run_dirs = sorted([p for p in runs_root.iterdir() if p.is_dir()], key=lambda p: p.name) if runs_root.exists() else []
+        for run_dir in run_dirs:
+            batch_map: dict[int, AdvancedBatch] = {}
+            for batch_path in sorted(run_dir.glob("batch_*.c")):
+                no = _batch_no(batch_path) or 0
+                batch_map.setdefault(no, AdvancedBatch(name=f"batch_{no:03d}", batch_no=no)).source = _safe_read_advanced_file(batch_path, base, include_content)
+            for disasm_path in sorted(run_dir.glob("disasm_batch_*.c")):
+                no = _batch_no(disasm_path) or 0
+                batch_map.setdefault(no, AdvancedBatch(name=f"batch_{no:03d}", batch_no=no)).disasm = _safe_read_advanced_file(disasm_path, base, include_content)
+            review_dir = run_dir / "review_snapshots"
+            if review_dir.exists():
+                for review_path in sorted(review_dir.iterdir()):
+                    if not review_path.is_file():
+                        continue
+                    no = _batch_no(review_path) or 0
+                    file = _safe_read_advanced_file(review_path, base, include_content)
+                    if not file:
+                        continue
+                    batch = batch_map.setdefault(no, AdvancedBatch(name=f"batch_{no:03d}", batch_no=no))
+                    if review_path.name.endswith(".verdict.json"):
+                        batch.reviews.append(file)
+                    else:
+                        batch.review_snapshots.append(file)
+            session_dir = run_dir / "agent_sessions"
+            session_paths = sorted([p for p in session_dir.rglob("*") if p.is_file()]) if session_dir.exists() else []
+            misc_paths = [p for p in run_dir.iterdir() if p.is_file() and p.name not in {"preamble.h"} and not p.name.startswith("batch_") and not p.name.startswith("disasm_batch_")]
+            preamble = run_dir / "preamble.h"
+            if preamble.exists():
+                misc_paths.insert(0, preamble)
+            runs.append(AdvancedRun(
+                name=run_dir.name,
+                path=str(run_dir),
+                batches=[batch_map[key] for key in sorted(batch_map)],
+                agent_sessions=_collect_advanced_files(session_paths, base, include_content),
+                files=_collect_advanced_files(misc_paths, base, include_content),
+            ))
+    mode, mode_label = task_mode_summary([item])
+    return TaskItemAdvancedResponse(
+        task_id=item.task_id,
+        item_id=item.id,
+        sequence_no=item.sequence_no,
+        mode=mode,
+        mode_label=mode_label,
+        output_dir=item.output_dir,
+        work_dir=str(work_dir) if work_dir else None,
+        runs=runs,
+        ida_files=ida_files,
+    )
 
 
 def build_overall_progress(items: list[B2STaskItem]) -> B2SOverallProgress:
