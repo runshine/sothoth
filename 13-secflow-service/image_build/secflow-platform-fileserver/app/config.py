@@ -20,6 +20,9 @@ class DatabaseConfig(BaseModel):
     table_prefix: str = "secflow_"
     pool_size: int = 10
     max_overflow: int = 20
+    pool_timeout: int = 30
+    pool_recycle: int = 1800
+    async_driver: str = "asyncmy"
 
     @property
     def url(self) -> str:
@@ -91,6 +94,26 @@ class AppConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8080
     debug: bool = False
+    workers: int = 2
+
+
+class ConcurrencyConfig(BaseModel):
+    fast_limit: int = 64
+    io_heavy_limit: int = 8
+    stream_limit: int = 16
+    request_timeout_seconds: int = 120
+    queue_timeout_seconds: int = 15
+    max_upload_size: int = 2147483648
+
+
+class WebSocketConfig(BaseModel):
+    enabled: bool = True
+    heartbeat_seconds: int = 15
+    max_connections: int = 200
+    max_connections_per_project: int = 50
+    max_buffer_bytes: int = 262144
+    poll_interval_ms: int = 500
+    auth_recheck_seconds: int = 300
 
 
 class LoggingConfig(BaseModel):
@@ -105,6 +128,8 @@ class Config(BaseModel):
     registry: RegistryConfig
     storage: StorageConfig
     app: AppConfig
+    concurrency: ConcurrencyConfig = ConcurrencyConfig()
+    websocket: WebSocketConfig = WebSocketConfig()
     logging: LoggingConfig = LoggingConfig()
 
 

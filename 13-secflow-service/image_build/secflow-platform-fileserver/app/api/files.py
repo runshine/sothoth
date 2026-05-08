@@ -1,6 +1,7 @@
 """Fileserver API routes."""
 
 from datetime import datetime, timezone
+import asyncio
 import hashlib
 import logging
 import mimetypes
@@ -10,14 +11,15 @@ import shutil
 import tempfile
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.concurrency import get_queue_class, get_queue_controller, get_request_id
 from app.config import get_config, get_data_nfs_base_path, get_data_nfs_server, get_data_pvc_name
 from app.exception import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError, ValidationError
-from app.model import FileDirectory, FileSubproject, ManagedFile, get_db
+from app.model import FileDirectory, FileSubproject, ManagedFile, get_db, get_db_session
 from app.schemas import (
     DirectoryChildrenResponse,
     DirectoryCreate,
@@ -47,6 +49,8 @@ from app.schemas import (
     ProjectFilesystemMoveRequest,
     ProjectFilesystemRenameRequest,
     ProjectFilesystemRootResponse,
+    TaskStatusResponse,
+    TaskSubmitResponse,
     StoragePVCResponse,
     SubprojectCreate,
     SubprojectListResponse,
@@ -57,11 +61,35 @@ from app.schemas import (
 )
 from app.service.auth import AuthServiceError, TokenInvalidError, get_auth_service
 from app.service.project import ProjectServiceError, get_project_service
+from app.service.watch_service import (
+    build_byte_delta,
+    build_line_delta,
+    encode_bytes,
+    get_watch_limiter,
+    maybe_create_observer,
+    stat_file,
+    utc_now_iso,
+)
+from app.task_manager import get_task_manager
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/fileserver", tags=["fileserver"])
 SPECIAL_VULN_SUBPROJECT_NAME = "__vuln_cases__"
+
+
+async def run_in_queue(queue_class: str, coro):
+    return await get_queue_controller().run(queue_class, coro)
+
+
+def with_trace(payload: dict) -> dict:
+    payload["request_id"] = get_request_id()
+    payload["queue_class"] = get_queue_class()
+    return payload
+
+
+async def run_io(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
 
 
 @router.get("/health")
@@ -72,6 +100,332 @@ async def health_check():
 @router.get("/ready")
 async def ready_check():
     return {"status": "ready"}
+
+
+@router.get("/metrics/queue")
+async def queue_metrics():
+    return {
+        "request_id": get_request_id(),
+        "queues": get_queue_controller().snapshot(),
+        "websocket": get_watch_limiter().snapshot(),
+    }
+
+
+@router.websocket("/ws/watch")
+async def watch_file_ws(websocket: WebSocket):
+    cfg = get_config().websocket
+    if not cfg.enabled:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="websocket disabled")
+        return
+
+    request_id = get_request_id() or datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    project_id = websocket.query_params.get("project_id", "").strip()
+    raw_path = websocket.query_params.get("path", "").strip()
+    path_mode = websocket.query_params.get("path_mode", "project_filesystem").strip()
+    read_mode = websocket.query_params.get("read_mode", "line").strip().lower()
+    start_from = websocket.query_params.get("start_from", "head").strip().lower()
+    token_qs = websocket.query_params.get("token", "").strip()
+    auth_hdr = websocket.headers.get("authorization", "").strip()
+    bearer_token = ""
+    if auth_hdr.lower().startswith("bearer "):
+        bearer_token = auth_hdr.split(" ", 1)[1].strip()
+    if not bearer_token:
+        bearer_token = token_qs
+
+    await websocket.accept()
+
+    if not project_id or not raw_path:
+        await websocket.send_json({"type": "error", "request_id": request_id, "message": "project_id/path 必填", "ts": utc_now_iso()})
+        await websocket.close(code=1008)
+        return
+    if read_mode not in {"line", "byte"}:
+        await websocket.send_json({"type": "error", "request_id": request_id, "message": "read_mode 仅支持 line/byte", "ts": utc_now_iso()})
+        await websocket.close(code=1008)
+        return
+    if start_from not in {"head", "tail"}:
+        await websocket.send_json({"type": "error", "request_id": request_id, "message": "start_from 仅支持 head/tail", "ts": utc_now_iso()})
+        await websocket.close(code=1008)
+        return
+    if not bearer_token:
+        await get_watch_limiter().inc_auth_failures()
+        await websocket.send_json({"type": "error", "request_id": request_id, "message": "缺少token", "ts": utc_now_iso()})
+        await websocket.close(code=1008)
+        return
+
+    try:
+        await verify_project_access_by_token(project_id, bearer_token)
+        target_path, normalized_path = resolve_ws_target_path(path_mode, project_id, raw_path)
+    except Exception as exc:
+        await get_watch_limiter().inc_auth_failures()
+        await websocket.send_json({"type": "error", "request_id": request_id, "message": str(exc), "ts": utc_now_iso()})
+        await websocket.close(code=1008)
+        return
+
+    limiter = get_watch_limiter()
+    if not await limiter.acquire(project_id):
+        await websocket.send_json({"type": "error", "request_id": request_id, "message": "连接数超限", "ts": utc_now_iso()})
+        await websocket.close(code=1013)
+        return
+
+    max_buffer = max(4096, cfg.max_buffer_bytes)
+    poll_interval = max(0.1, cfg.poll_interval_ms / 1000.0)
+    heartbeat_seconds = max(2, cfg.heartbeat_seconds)
+    auth_recheck_seconds = max(10, cfg.auth_recheck_seconds)
+    start_line = int(websocket.query_params.get("start_line", "0") or "0")
+    start_byte = int(websocket.query_params.get("start_byte", "0") or "0")
+    observer_queue: asyncio.Queue = asyncio.Queue()
+    observer = maybe_create_observer(target_path, observer_queue)
+
+    try:
+        initial = stat_file(target_path)
+        byte_offset = start_byte if read_mode == "byte" else 0
+        line_offset = start_line if read_mode == "line" else 0
+        if start_from == "tail" and initial.exists:
+            if read_mode == "byte":
+                byte_offset = initial.size
+            else:
+                try:
+                    _, line_offset, _ = await build_line_delta(target_path, 0)
+                except UnicodeDecodeError:
+                    line_offset = 0
+        await websocket.send_json({
+            "type": "snapshot",
+            "request_id": request_id,
+            "project_id": project_id,
+            "path": normalized_path,
+            "path_mode": path_mode,
+            "read_mode": read_mode,
+            "exists": initial.exists,
+            "start_line": line_offset if read_mode == "line" else None,
+            "start_byte": byte_offset if read_mode == "byte" else None,
+            "queue_class": "STREAM",
+            "ts": utc_now_iso(),
+        })
+
+        async def _session_loop():
+            nonlocal read_mode, line_offset, byte_offset, initial
+            last_stat = initial
+            last_heartbeat = asyncio.get_running_loop().time()
+            last_auth_check = asyncio.get_running_loop().time()
+            while True:
+                now = asyncio.get_running_loop().time()
+                try:
+                    msg = await asyncio.wait_for(websocket.receive_json(), timeout=poll_interval)
+                    action = (msg.get("action") or "").strip().lower()
+                    if action in {"unsubscribe", "close"}:
+                        await websocket.send_json({"type": "file_event", "event": "closed", "request_id": request_id, "project_id": project_id, "path": normalized_path, "ts": utc_now_iso()})
+                        break
+                    if action == "seek":
+                        if read_mode == "line":
+                            line_offset = int(msg.get("line", 0) or 0)
+                        else:
+                            byte_offset = int(msg.get("byte", 0) or 0)
+                    elif action == "switch_mode":
+                        next_mode = (msg.get("read_mode") or "").strip().lower()
+                        if next_mode in {"line", "byte"} and next_mode != read_mode:
+                            read_mode = next_mode
+                            if read_mode == "line":
+                                line_offset = int(msg.get("line", 0) or 0)
+                            else:
+                                byte_offset = int(msg.get("byte", 0) or 0)
+                    elif action == "ack":
+                        pass
+                except asyncio.TimeoutError:
+                    pass
+                except WebSocketDisconnect:
+                    break
+
+                current = stat_file(target_path)
+                fs_event = None
+                if not last_stat.exists and current.exists:
+                    fs_event = "created"
+                elif last_stat.exists and not current.exists:
+                    fs_event = "deleted"
+                elif current.exists and last_stat.exists:
+                    if current.inode != last_stat.inode:
+                        fs_event = "renamed"
+                    elif current.size < last_stat.size:
+                        fs_event = "truncated"
+                    elif current.mode != last_stat.mode:
+                        fs_event = "permission_changed"
+                    elif current.mtime != last_stat.mtime and current.size == last_stat.size:
+                        fs_event = "metadata_changed"
+
+                if fs_event:
+                    await limiter.inc_events()
+                    await websocket.send_json({
+                        "type": "file_event",
+                        "event": fs_event,
+                        "request_id": request_id,
+                        "project_id": project_id,
+                        "path": normalized_path,
+                        "size": current.size if current.exists else 0,
+                        "mtime": current.mtime if current.exists else 0,
+                        "inode": current.inode if current.exists else 0,
+                        "ts": utc_now_iso(),
+                    })
+                    if fs_event == "deleted":
+                        break
+                    if fs_event == "truncated":
+                        line_offset = 0
+                        byte_offset = 0
+
+                if current.exists and current.size > (byte_offset if read_mode == "byte" else 0):
+                    if read_mode == "line":
+                        try:
+                            from_line, to_line, lines = await build_line_delta(target_path, line_offset)
+                        except UnicodeDecodeError:
+                            await websocket.send_json({"type": "error", "request_id": request_id, "project_id": project_id, "path": normalized_path, "message": "文件非UTF-8文本，line模式不可用", "ts": utc_now_iso()})
+                            lines = []
+                            from_line = line_offset
+                            to_line = line_offset
+                        if lines:
+                            await limiter.inc_events()
+                            await websocket.send_json({
+                                "type": "delta",
+                                "read_mode": "line",
+                                "from_line": from_line,
+                                "to_line": to_line,
+                                "lines": lines,
+                                "request_id": request_id,
+                                "project_id": project_id,
+                                "path": normalized_path,
+                                "ts": utc_now_iso(),
+                            })
+                            line_offset = to_line
+                    else:
+                        from_byte, to_byte, chunk = await build_byte_delta(target_path, byte_offset, max_buffer)
+                        if chunk:
+                            await limiter.inc_events()
+                            await limiter.inc_bytes(len(chunk))
+                            await websocket.send_json({
+                                "type": "delta",
+                                "read_mode": "byte",
+                                "from_byte": from_byte,
+                                "to_byte": to_byte,
+                                "encoding": "base64",
+                                "content_base64": encode_bytes(chunk),
+                                "request_id": request_id,
+                                "project_id": project_id,
+                                "path": normalized_path,
+                                "ts": utc_now_iso(),
+                            })
+                            byte_offset = to_byte
+
+                # consume watchdog hints (not mandatory for logic correctness)
+                while not observer_queue.empty():
+                    _ = observer_queue.get_nowait()
+
+                if now - last_heartbeat >= heartbeat_seconds:
+                    await websocket.send_json({
+                        "type": "heartbeat",
+                        "request_id": request_id,
+                        "project_id": project_id,
+                        "path": normalized_path,
+                        "read_mode": read_mode,
+                        "line_offset": line_offset if read_mode == "line" else None,
+                        "byte_offset": byte_offset if read_mode == "byte" else None,
+                        "ts": utc_now_iso(),
+                    })
+                    last_heartbeat = now
+
+                if now - last_auth_check >= auth_recheck_seconds:
+                    try:
+                        await verify_project_access_by_token(project_id, bearer_token)
+                    except Exception as exc:
+                        await limiter.inc_auth_failures()
+                        await websocket.send_json({"type": "error", "request_id": request_id, "project_id": project_id, "path": normalized_path, "message": f"鉴权失效: {exc}", "ts": utc_now_iso()})
+                        break
+                    last_auth_check = now
+
+                last_stat = current
+
+        await run_in_queue("STREAM", _session_loop())
+    finally:
+        if observer is not None:
+            observer.stop()
+            observer.join(timeout=1)
+        await limiter.release(project_id)
+
+
+@router.post("/tasks/delete-tree", response_model=TaskSubmitResponse)
+async def submit_delete_tree_task(
+    project_id: str = Body(..., embed=True),
+    path: str = Body(..., embed=True),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(project_id, authorization)
+
+    async def _runner():
+        target_path, normalized = project_filesystem_target_path(project_id, path)
+        if normalized == "/":
+            raise ValidationError("不能删除项目根目录")
+        if not await run_io(os.path.isdir, target_path):
+            raise ValidationError("仅支持目录删除任务")
+        await run_io(shutil.rmtree, target_path, True)
+        return {"project_id": project_id, "path": normalized, "entry_type": "directory"}
+
+    task = await get_task_manager().submit(_runner)
+    return TaskSubmitResponse(
+        task_id=task.task_id,
+        status=task.status,
+        accepted_at=task.accepted_at,
+        request_id=get_request_id(),
+        queue_class=get_queue_class(),
+    )
+
+
+@router.post("/tasks/move-tree", response_model=TaskSubmitResponse)
+async def submit_move_tree_task(
+    project_id: str = Body(..., embed=True),
+    source_path: str = Body(..., embed=True),
+    target_directory_path: str = Body(..., embed=True),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(project_id, authorization)
+
+    async def _runner():
+        source_abs, normalized_source = project_filesystem_target_path(project_id, source_path)
+        target_abs, normalized_target = project_filesystem_target_path(project_id, target_directory_path)
+        if normalized_source == "/":
+            raise ValidationError("不能移动项目根目录")
+        if not await run_io(os.path.lexists, source_abs):
+            raise NotFoundError("项目文件", normalized_source)
+        if not await run_io(os.path.isdir, target_abs):
+            raise NotFoundError("目录", normalized_target)
+        source_name = path_basename(normalized_source)
+        final_normalized = "/" + source_name if normalized_target == "/" else f"{normalized_target.rstrip('/')}/{source_name}"
+        final_abs, _ = project_filesystem_target_path(project_id, final_normalized)
+        if await run_io(os.path.lexists, final_abs):
+            raise ConflictError(f"目标已存在: {final_normalized}")
+        await run_io(os.replace, source_abs, final_abs)
+        return {"project_id": project_id, "source_path": normalized_source, "target_path": final_normalized}
+
+    task = await get_task_manager().submit(_runner)
+    return TaskSubmitResponse(
+        task_id=task.task_id,
+        status=task.status,
+        accepted_at=task.accepted_at,
+        request_id=get_request_id(),
+        queue_class=get_queue_class(),
+    )
+
+
+@router.get("/tasks/{task_id}", response_model=TaskStatusResponse)
+async def get_task_status(task_id: str, authorization: Optional[str] = Header(None)):
+    del authorization
+    task = await get_task_manager().get(task_id)
+    if task is None:
+        raise NotFoundError("任务", task_id)
+    return TaskStatusResponse(
+        task_id=task.task_id,
+        status=task.status,
+        progress=task.progress,
+        accepted_at=task.accepted_at,
+        finished_at=task.finished_at,
+        result=task.result,
+        error=task.error,
+    )
 
 
 def sanitize_name(name: str) -> str:
@@ -157,6 +511,52 @@ async def verify_project_access(project_id: str, authorization: Optional[str]) -
     if not project:
         raise ForbiddenError(f"无权访问项目: {project_id}")
     return project
+
+
+async def verify_project_access_by_token(project_id: str, token: str) -> dict:
+    try:
+        project = await get_project_service().get_project(token, project_id)
+    except ProjectServiceError as exc:
+        raise ForbiddenError(str(exc))
+    if not project:
+        raise ForbiddenError(f"无权访问项目: {project_id}")
+    return project
+
+
+def resolve_ws_target_path(path_mode: str, project_id: str, path: str) -> tuple[str, str]:
+    mode = (path_mode or "").strip().lower()
+    if mode == "project_filesystem":
+        return project_filesystem_target_path(project_id, path)
+    if mode == "vuln_project_path":
+        _, normalized, special_relative = normalize_special_project_path(path)
+        parts = split_special_relative_path(special_relative)
+        if len(parts) < 2:
+            raise ValidationError("vuln_project_path 文件路径至少包含 case_uuid 和文件名")
+        directory_relative = "/" + "/".join(parts[:-1]) if len(parts) > 1 else "/"
+        filename = parts[-1]
+        db = get_db_session()
+        try:
+            subproject = db.query(FileSubproject).filter(
+                FileSubproject.project_id == project_id,
+                FileSubproject.name == SPECIAL_VULN_SUBPROJECT_NAME,
+            ).first()
+            if subproject is None:
+                raise NotFoundError("疑点文件子项目", SPECIAL_VULN_SUBPROJECT_NAME)
+            directory = lookup_directory_by_special_path(db, project_id, subproject, directory_relative)
+            if directory is None:
+                raise NotFoundError("目录", directory_relative)
+            file_record = db.query(ManagedFile).filter(
+                ManagedFile.project_id == project_id,
+                ManagedFile.subproject_id == subproject.id,
+                ManagedFile.directory_id == directory.id,
+                ManagedFile.filename == filename,
+            ).first()
+            if file_record is None:
+                raise NotFoundError("文件", normalized)
+            return absolute_storage_path(file_record.storage_key), normalized
+        finally:
+            db.close()
+    raise ValidationError("path_mode仅支持 project_filesystem 或 vuln_project_path")
 
 
 def require_subproject(db: Session, project_id: str, subproject_id: int) -> FileSubproject:
@@ -880,20 +1280,26 @@ async def persist_sync_stream(request: Request, destination_path: str) -> tuple[
     sha256 = hashlib.sha256()
     total_size = 0
     parent_dir = os.path.dirname(destination_path)
-    os.makedirs(parent_dir, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix="sync_", suffix=".part", dir=parent_dir)
+    await run_io(os.makedirs, parent_dir, 0o777, True)
+    fd, temp_path = await run_io(tempfile.mkstemp, ".part", "sync_", parent_dir)
     os.close(fd)
+    def _truncate(path: str):
+        with open(path, "wb"):
+            pass
+    def _append_chunk(path: str, chunk: bytes):
+        with open(path, "ab") as temp_file:
+            temp_file.write(chunk)
     try:
-        with open(temp_path, "wb") as temp_file:
-            async for chunk in request.stream():
-                if not chunk:
-                    continue
-                sha256.update(chunk)
-                total_size += len(chunk)
-                temp_file.write(chunk)
+        await run_io(_truncate, temp_path)
+        async for chunk in request.stream():
+            if not chunk:
+                continue
+            sha256.update(chunk)
+            total_size += len(chunk)
+            await run_io(_append_chunk, temp_path, chunk)
     except Exception:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        if await run_io(os.path.exists, temp_path):
+            await run_io(os.remove, temp_path)
         raise
     return temp_path, sha256.hexdigest(), total_size
 
@@ -901,20 +1307,26 @@ async def persist_sync_stream(request: Request, destination_path: str) -> tuple[
 async def persist_upload(upload: UploadFile, destination_dir: str) -> tuple[str, str, int]:
     sha256 = hashlib.sha256()
     total_size = 0
-    fd, temp_path = tempfile.mkstemp(prefix="upload_", suffix=".part", dir=destination_dir)
+    fd, temp_path = await run_io(tempfile.mkstemp, ".part", "upload_", destination_dir)
     os.close(fd)
+    def _truncate(path: str):
+        with open(path, "wb"):
+            pass
+    def _append_chunk(path: str, chunk: bytes):
+        with open(path, "ab") as temp_file:
+            temp_file.write(chunk)
     try:
-        with open(temp_path, "wb") as temp_file:
-            while True:
-                chunk = await upload.read(1024 * 1024)
-                if not chunk:
-                    break
-                sha256.update(chunk)
-                total_size += len(chunk)
-                temp_file.write(chunk)
+        await run_io(_truncate, temp_path)
+        while True:
+            chunk = await upload.read(1024 * 1024)
+            if not chunk:
+                break
+            sha256.update(chunk)
+            total_size += len(chunk)
+            await run_io(_append_chunk, temp_path, chunk)
     except Exception:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        if await run_io(os.path.exists, temp_path):
+            await run_io(os.remove, temp_path)
         raise
     finally:
         await upload.close()
@@ -1091,25 +1503,30 @@ async def upload_project_filesystem_file(
     authorization: Optional[str] = Header(None),
 ):
     del current_user
-    await verify_project_access(project_id, authorization)
-    target_directory_path, normalized_directory = project_filesystem_target_path(project_id, path)
-    if not os.path.isdir(target_directory_path):
-        raise NotFoundError("目录", normalized_directory)
-    ensure_project_realpath_inside_root(project_id, target_directory_path)
-    filename = sanitize_name(file.filename or "upload.bin")
-    destination_path = os.path.join(target_directory_path, filename)
-    if os.path.lexists(destination_path):
-        if os.path.isdir(destination_path):
-            raise ConflictError(f"目标路径已存在目录，无法覆盖: {filename}")
-        if not overwrite:
-            raise ConflictError(f"目录下已存在同名文件: {filename}")
 
-    config = get_config()
-    temp_path, _, _ = await persist_upload(file, config.storage.temp_dir)
-    os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-    os.replace(temp_path, destination_path)
-    file_path = "/" + filename if normalized_directory == "/" else f"{normalized_directory.rstrip('/')}/{filename}"
-    return load_project_filesystem_entry(project_id, file_path)
+    async def _op():
+        await verify_project_access(project_id, authorization)
+        target_directory_path, normalized_directory = project_filesystem_target_path(project_id, path)
+        if not await run_io(os.path.isdir, target_directory_path):
+            raise NotFoundError("目录", normalized_directory)
+        ensure_project_realpath_inside_root(project_id, target_directory_path)
+        filename = sanitize_name(file.filename or "upload.bin")
+        destination_path = os.path.join(target_directory_path, filename)
+        if await run_io(os.path.lexists, destination_path):
+            if await run_io(os.path.isdir, destination_path):
+                raise ConflictError(f"目标路径已存在目录，无法覆盖: {filename}")
+            if not overwrite:
+                raise ConflictError(f"目录下已存在同名文件: {filename}")
+
+        config = get_config()
+        temp_path, _, _ = await persist_upload(file, config.storage.temp_dir)
+        await run_io(os.makedirs, os.path.dirname(destination_path), 0o777, True)
+        await run_io(os.replace, temp_path, destination_path)
+        file_path = "/" + filename if normalized_directory == "/" else f"{normalized_directory.rstrip('/')}/{filename}"
+        return load_project_filesystem_entry(project_id, file_path)
+
+    result = await run_in_queue("IO_HEAVY", _op())
+    return with_trace(result.model_dump())
 
 
 @router.post("/project-filesystem/rename", response_model=ProjectFilesystemEntry)
@@ -1177,22 +1594,26 @@ async def delete_project_filesystem_node(
     recursive: bool = Query(True),
     authorization: Optional[str] = Header(None),
 ):
-    await verify_project_access(project_id, authorization)
-    target_path, normalized = project_filesystem_target_path(project_id, path)
-    if normalized == "/":
-        raise ValidationError("不能删除项目根目录")
-    if not os.path.lexists(target_path):
-        raise NotFoundError("项目文件", normalized)
-    parent_target = os.path.dirname(target_path) or project_files_root(project_id)
-    ensure_project_realpath_inside_root(project_id, parent_target)
-    if os.path.isdir(target_path) and not os.path.islink(target_path):
-        if recursive:
-            shutil.rmtree(target_path, ignore_errors=True)
+    async def _op():
+        await verify_project_access(project_id, authorization)
+        target_path, normalized = project_filesystem_target_path(project_id, path)
+        if normalized == "/":
+            raise ValidationError("不能删除项目根目录")
+        if not await run_io(os.path.lexists, target_path):
+            raise NotFoundError("项目文件", normalized)
+        parent_target = os.path.dirname(target_path) or project_files_root(project_id)
+        ensure_project_realpath_inside_root(project_id, parent_target)
+        if await run_io(os.path.isdir, target_path) and not await run_io(os.path.islink, target_path):
+            if recursive:
+                await run_io(shutil.rmtree, target_path, True)
+            else:
+                await run_io(os.rmdir, target_path)
         else:
-            os.rmdir(target_path)
-    else:
-        os.remove(target_path)
-    return SuccessResponse(message="删除成功")
+            await run_io(os.remove, target_path)
+        return SuccessResponse(message="删除成功")
+
+    result = await run_in_queue("IO_HEAVY", _op())
+    return SuccessResponse(**with_trace(result.model_dump()))
 
 
 @router.get("/project-filesystem/preview")
@@ -1201,24 +1622,28 @@ async def preview_project_filesystem_file(
     path: str = Query(...),
     authorization: Optional[str] = Header(None),
 ):
-    await verify_project_access(project_id, authorization)
-    target_path, normalized = project_filesystem_target_path(project_id, path)
-    if not os.path.lexists(target_path):
-        raise NotFoundError("项目文件", normalized)
-    if os.path.isdir(target_path) and not os.path.islink(target_path):
-        raise ValidationError("目录不支持预览")
-    resolved = ensure_project_realpath_inside_root(project_id, target_path)
-    filename = path_basename(normalized)
-    media_type = guess_content_type(filename, None)
-    return FileResponse(
-        path=resolved,
-        filename=filename,
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f'inline; filename="{filename}"',
-            "X-Preview-Mode": infer_preview_mode_by_filename(filename, media_type),
-        },
-    )
+    async def _op():
+        await verify_project_access(project_id, authorization)
+        target_path, normalized = project_filesystem_target_path(project_id, path)
+        if not await run_io(os.path.lexists, target_path):
+            raise NotFoundError("项目文件", normalized)
+        if await run_io(os.path.isdir, target_path) and not await run_io(os.path.islink, target_path):
+            raise ValidationError("目录不支持预览")
+        resolved = ensure_project_realpath_inside_root(project_id, target_path)
+        filename = path_basename(normalized)
+        media_type = guess_content_type(filename, None)
+        return FileResponse(
+            path=resolved,
+            filename=filename,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'inline; filename="{filename}"',
+                "X-Preview-Mode": infer_preview_mode_by_filename(filename, media_type),
+                "X-Queue-Class": "STREAM",
+            },
+        )
+
+    return await run_in_queue("STREAM", _op())
 
 
 @router.get("/project-filesystem/download")
@@ -1227,16 +1652,24 @@ async def download_project_filesystem_file(
     path: str = Query(...),
     authorization: Optional[str] = Header(None),
 ):
-    await verify_project_access(project_id, authorization)
-    target_path, normalized = project_filesystem_target_path(project_id, path)
-    if not os.path.lexists(target_path):
-        raise NotFoundError("项目文件", normalized)
-    if os.path.isdir(target_path) and not os.path.islink(target_path):
-        raise ValidationError("目录不支持下载")
-    resolved = ensure_project_realpath_inside_root(project_id, target_path)
-    filename = path_basename(normalized)
-    media_type = guess_content_type(filename, None)
-    return FileResponse(path=resolved, filename=filename, media_type=media_type or "application/octet-stream")
+    async def _op():
+        await verify_project_access(project_id, authorization)
+        target_path, normalized = project_filesystem_target_path(project_id, path)
+        if not await run_io(os.path.lexists, target_path):
+            raise NotFoundError("项目文件", normalized)
+        if await run_io(os.path.isdir, target_path) and not await run_io(os.path.islink, target_path):
+            raise ValidationError("目录不支持下载")
+        resolved = ensure_project_realpath_inside_root(project_id, target_path)
+        filename = path_basename(normalized)
+        media_type = guess_content_type(filename, None)
+        return FileResponse(
+            path=resolved,
+            filename=filename,
+            media_type=media_type or "application/octet-stream",
+            headers={"X-Queue-Class": "STREAM"},
+        )
+
+    return await run_in_queue("STREAM", _op())
 
 
 @router.get("/vuln/project-path/children", response_model=ProjectPathChildrenResponse)
@@ -1362,53 +1795,57 @@ async def upload_vuln_project_path_file(
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
-    await verify_project_access(project_id, authorization)
-    subproject = ensure_special_subproject(db, project_id, created_by=str(current_user.id))
-    normalized_relative_path = normalize_sync_path(path)[1]
-    parent_dir, filename = resolve_special_parent_and_filename(
-        db,
-        project_id,
-        subproject,
-        normalized_relative_path,
-        create_dirs=True,
-        created_by=str(current_user.id),
-    )
+    async def _op():
+        await verify_project_access(project_id, authorization)
+        subproject = ensure_special_subproject(db, project_id, created_by=str(current_user.id))
+        normalized_relative_path = normalize_sync_path(path)[1]
+        parent_dir, filename = resolve_special_parent_and_filename(
+            db,
+            project_id,
+            subproject,
+            normalized_relative_path,
+            create_dirs=True,
+            created_by=str(current_user.id),
+        )
 
-    config = get_config()
-    temp_path, sha256, total_size = await persist_upload(file, config.storage.temp_dir)
-    existing = db.query(ManagedFile).filter(
-        ManagedFile.project_id == project_id,
-        ManagedFile.subproject_id == subproject.id,
-        ManagedFile.directory_id == (parent_dir.id if parent_dir else None),
-        ManagedFile.filename == filename,
-    ).first()
-    if existing:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise ConflictError(f"目录下已存在同名文件: {filename}")
+        config = get_config()
+        temp_path, sha256, total_size = await persist_upload(file, config.storage.temp_dir)
+        existing = db.query(ManagedFile).filter(
+            ManagedFile.project_id == project_id,
+            ManagedFile.subproject_id == subproject.id,
+            ManagedFile.directory_id == (parent_dir.id if parent_dir else None),
+            ManagedFile.filename == filename,
+        ).first()
+        if existing:
+            if await run_io(os.path.exists, temp_path):
+                await run_io(os.remove, temp_path)
+            raise ConflictError(f"目录下已存在同名文件: {filename}")
 
-    file_record = ManagedFile(
-        project_id=project_id,
-        subproject_id=subproject.id,
-        directory_id=parent_dir.id if parent_dir else None,
-        filename=filename,
-        original_filename=file.filename or filename,
-        content_type=guess_content_type(filename, file.content_type),
-        size=total_size,
-        sha256=sha256,
-        storage_key="pending",
-        created_by=str(current_user.id),
-    )
-    db.add(file_record)
-    db.flush()
-    storage_key = storage_relative_path(project_id, subproject.id, parent_dir, filename)
-    target_path = absolute_storage_path(storage_key)
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    os.replace(temp_path, target_path)
-    file_record.storage_key = storage_key
-    db.commit()
-    db.refresh(file_record)
-    return to_project_path_file_entry(file_record, parent_dir)
+        file_record = ManagedFile(
+            project_id=project_id,
+            subproject_id=subproject.id,
+            directory_id=parent_dir.id if parent_dir else None,
+            filename=filename,
+            original_filename=file.filename or filename,
+            content_type=guess_content_type(filename, file.content_type),
+            size=total_size,
+            sha256=sha256,
+            storage_key="pending",
+            created_by=str(current_user.id),
+        )
+        db.add(file_record)
+        db.flush()
+        storage_key = storage_relative_path(project_id, subproject.id, parent_dir, filename)
+        target_path = absolute_storage_path(storage_key)
+        await run_io(os.makedirs, os.path.dirname(target_path), 0o777, True)
+        await run_io(os.replace, temp_path, target_path)
+        file_record.storage_key = storage_key
+        db.commit()
+        db.refresh(file_record)
+        return to_project_path_file_entry(file_record, parent_dir)
+
+    result = await run_in_queue("IO_HEAVY", _op())
+    return with_trace(result.model_dump())
 
 
 @router.delete("/vuln/project-path/object", response_model=ProjectPathOperationResponse)
@@ -1419,61 +1856,65 @@ async def delete_vuln_project_path_object(
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
-    await verify_project_access(project_id, authorization)
-    subproject = ensure_special_subproject(db, project_id)
-    _, normalized, special_relative = normalize_special_project_path(path)
-    parts = split_special_relative_path(special_relative)
-    if not parts:
-        raise ValidationError("不能删除特殊子项目根目录")
+    async def _op():
+        await verify_project_access(project_id, authorization)
+        subproject = ensure_special_subproject(db, project_id)
+        _, normalized, special_relative = normalize_special_project_path(path)
+        parts = split_special_relative_path(special_relative)
+        if not parts:
+            raise ValidationError("不能删除特殊子项目根目录")
 
-    filename = parts[-1]
-    parent_dir = lookup_directory_by_special_path(
-        db,
-        project_id,
-        subproject,
-        "/" + "/".join(parts[:-1]),
-    ) if len(parts) > 1 else None
-    file_record = db.query(ManagedFile).filter(
-        ManagedFile.project_id == project_id,
-        ManagedFile.subproject_id == subproject.id,
-        ManagedFile.directory_id == (parent_dir.id if parent_dir else None),
-        ManagedFile.filename == filename,
-    ).first()
-    if file_record:
-        file_path = absolute_storage_path(file_record.storage_key)
-        db.delete(file_record)
+        filename = parts[-1]
+        parent_dir = lookup_directory_by_special_path(
+            db,
+            project_id,
+            subproject,
+            "/" + "/".join(parts[:-1]),
+        ) if len(parts) > 1 else None
+        file_record = db.query(ManagedFile).filter(
+            ManagedFile.project_id == project_id,
+            ManagedFile.subproject_id == subproject.id,
+            ManagedFile.directory_id == (parent_dir.id if parent_dir else None),
+            ManagedFile.filename == filename,
+        ).first()
+        if file_record:
+            file_path = absolute_storage_path(file_record.storage_key)
+            db.delete(file_record)
+            db.commit()
+            if await run_io(os.path.exists, file_path):
+                await run_io(os.remove, file_path)
+            remove_empty_special_parents(project_id, subproject.id, parent_dir)
+            return ProjectPathOperationResponse(path=normalized, entry_type="file", message="文件删除成功")
+
+        directory = lookup_directory_by_special_path(db, project_id, subproject, special_relative)
+        if directory is None:
+            raise NotFoundError("对象", normalized)
+
+        descendant_dirs = db.query(FileDirectory).filter(
+            FileDirectory.project_id == project_id,
+            FileDirectory.subproject_id == subproject.id,
+            FileDirectory.path_key.startswith(directory.path_key.rstrip("/") + "/"),
+        ).all()
+        descendant_ids = [directory.id] + [item.id for item in descendant_dirs]
+        file_count = db.query(ManagedFile).filter(ManagedFile.directory_id.in_(descendant_ids)).count()
+        if (descendant_dirs or file_count > 0) and not recursive:
+            raise ConflictError("目录下仍存在子目录或文件，无法删除")
+
+        target_path = get_directory_storage_path(project_id, subproject.id, directory)
+        if descendant_ids:
+            db.query(ManagedFile).filter(ManagedFile.directory_id.in_(descendant_ids)).delete(synchronize_session=False)
+            db.query(FileDirectory).filter(FileDirectory.id.in_(descendant_ids[1:])).delete(synchronize_session=False)
+        parent = directory.parent
+        db.delete(directory)
         db.commit()
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        remove_empty_special_parents(project_id, subproject.id, parent_dir)
-        return ProjectPathOperationResponse(path=normalized, entry_type="file", message="文件删除成功")
+        if await run_io(os.path.isdir, target_path):
+            await run_io(shutil.rmtree, target_path, True)
+            remove_empty_parents(target_path, sync_subproject_root(project_id, subproject.id))
+        remove_empty_special_parents(project_id, subproject.id, parent)
+        return ProjectPathOperationResponse(path=normalized, entry_type="directory", message="目录删除成功")
 
-    directory = lookup_directory_by_special_path(db, project_id, subproject, special_relative)
-    if directory is None:
-        raise NotFoundError("对象", normalized)
-
-    descendant_dirs = db.query(FileDirectory).filter(
-        FileDirectory.project_id == project_id,
-        FileDirectory.subproject_id == subproject.id,
-        FileDirectory.path_key.startswith(directory.path_key.rstrip("/") + "/"),
-    ).all()
-    descendant_ids = [directory.id] + [item.id for item in descendant_dirs]
-    file_count = db.query(ManagedFile).filter(ManagedFile.directory_id.in_(descendant_ids)).count()
-    if (descendant_dirs or file_count > 0) and not recursive:
-        raise ConflictError("目录下仍存在子目录或文件，无法删除")
-
-    target_path = get_directory_storage_path(project_id, subproject.id, directory)
-    if descendant_ids:
-        db.query(ManagedFile).filter(ManagedFile.directory_id.in_(descendant_ids)).delete(synchronize_session=False)
-        db.query(FileDirectory).filter(FileDirectory.id.in_(descendant_ids[1:])).delete(synchronize_session=False)
-    parent = directory.parent
-    db.delete(directory)
-    db.commit()
-    if os.path.isdir(target_path):
-        shutil.rmtree(target_path, ignore_errors=True)
-        remove_empty_parents(target_path, sync_subproject_root(project_id, subproject.id))
-    remove_empty_special_parents(project_id, subproject.id, parent)
-    return ProjectPathOperationResponse(path=normalized, entry_type="directory", message="目录删除成功")
+    result = await run_in_queue("IO_HEAVY", _op())
+    return ProjectPathOperationResponse(**with_trace(result.model_dump()))
 
 
 @router.post("/subprojects", response_model=SubprojectResponse)
@@ -1815,55 +2256,59 @@ async def upload_file(
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
-    await verify_project_access(project_id, authorization)
-    require_subproject(db, project_id, subproject_id)
-    directory = require_directory(db, project_id, subproject_id, directory_id)
-    filename = sanitize_name(file.filename or "unnamed")
+    async def _op():
+        await verify_project_access(project_id, authorization)
+        require_subproject(db, project_id, subproject_id)
+        directory = require_directory(db, project_id, subproject_id, directory_id)
+        filename = sanitize_name(file.filename or "unnamed")
 
-    config = get_config()
-    temp_path, sha256, total_size = await persist_upload(file, config.storage.temp_dir)
+        config = get_config()
+        temp_path, sha256, total_size = await persist_upload(file, config.storage.temp_dir)
 
-    existing = db.query(ManagedFile).filter(
-        ManagedFile.project_id == project_id,
-        ManagedFile.subproject_id == subproject_id,
-        ManagedFile.directory_id == directory_id,
-        ManagedFile.filename == filename,
-    ).first()
-    if existing:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise ConflictError(f"目录下已存在同名文件: {filename}")
+        existing = db.query(ManagedFile).filter(
+            ManagedFile.project_id == project_id,
+            ManagedFile.subproject_id == subproject_id,
+            ManagedFile.directory_id == directory_id,
+            ManagedFile.filename == filename,
+        ).first()
+        if existing:
+            if await run_io(os.path.exists, temp_path):
+                await run_io(os.remove, temp_path)
+            raise ConflictError(f"目录下已存在同名文件: {filename}")
 
-    file_record = ManagedFile(
-        project_id=project_id,
-        subproject_id=subproject_id,
-        directory_id=directory_id,
-        filename=filename,
-        original_filename=file.filename or filename,
-        content_type=guess_content_type(filename, file.content_type),
-        size=total_size,
-        sha256=sha256,
-        storage_key="pending",
-        created_by=str(current_user.id),
-    )
-    db.add(file_record)
-    db.flush()
+        file_record = ManagedFile(
+            project_id=project_id,
+            subproject_id=subproject_id,
+            directory_id=directory_id,
+            filename=filename,
+            original_filename=file.filename or filename,
+            content_type=guess_content_type(filename, file.content_type),
+            size=total_size,
+            sha256=sha256,
+            storage_key="pending",
+            created_by=str(current_user.id),
+        )
+        db.add(file_record)
+        db.flush()
 
-    storage_key = storage_relative_path(project_id, subproject_id, directory, filename)
-    target_path = absolute_storage_path(storage_key)
-    os.makedirs(os.path.dirname(target_path), exist_ok=True)
-    os.replace(temp_path, target_path)
+        storage_key = storage_relative_path(project_id, subproject_id, directory, filename)
+        target_path = absolute_storage_path(storage_key)
+        await run_io(os.makedirs, os.path.dirname(target_path), 0o777, True)
+        await run_io(os.replace, temp_path, target_path)
 
-    file_record.storage_key = storage_key
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        if os.path.exists(target_path):
-            os.remove(target_path)
-        raise ConflictError(f"目录下已存在同名文件: {filename}")
-    db.refresh(file_record)
-    return file_record
+        file_record.storage_key = storage_key
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            if await run_io(os.path.exists, target_path):
+                await run_io(os.remove, target_path)
+            raise ConflictError(f"目录下已存在同名文件: {filename}")
+        db.refresh(file_record)
+        return file_record
+
+    result = await run_in_queue("IO_HEAVY", _op())
+    return with_trace(ManagedFileResponse.model_validate(result).model_dump())
 
 
 @router.get("/files", response_model=FileListResponse)
@@ -2013,11 +2458,15 @@ async def delete_file(
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
-    file_record = require_file(db, file_id)
-    await verify_project_access(file_record.project_id, authorization)
-    file_path = absolute_storage_path(file_record.storage_key)
-    db.delete(file_record)
-    db.commit()
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    return SuccessResponse(message="文件删除成功")
+    async def _op():
+        file_record = require_file(db, file_id)
+        await verify_project_access(file_record.project_id, authorization)
+        file_path = absolute_storage_path(file_record.storage_key)
+        db.delete(file_record)
+        db.commit()
+        if await run_io(os.path.exists, file_path):
+            await run_io(os.remove, file_path)
+        return SuccessResponse(message="文件删除成功")
+
+    result = await run_in_queue("IO_HEAVY", _op())
+    return SuccessResponse(**with_trace(result.model_dump()))

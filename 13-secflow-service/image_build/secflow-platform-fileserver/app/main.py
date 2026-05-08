@@ -9,8 +9,10 @@ from urllib.request import Request, urlopen
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.files import router
+from app.concurrency import get_request_id, new_request_id
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import ensure_storage_dirs, get_engine, init_database
@@ -108,6 +110,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        request_id = request.headers.get("X-Request-Id") or new_request_id()
+        response = await call_next(request)
+        response.headers["X-Request-Id"] = request_id
+        response.headers["X-Queue-Class"] = response.headers.get("X-Queue-Class", "FAST")
+        return response
+
+
+app.add_middleware(RequestContextMiddleware)
+
 setup_exception_handlers(app)
 app.include_router(router)
 
@@ -120,5 +134,6 @@ if __name__ == "__main__":
         "app.main:app",
         host=config.app.host,
         port=config.app.port,
+        workers=config.app.workers,
         reload=config.app.debug,
     )

@@ -9,6 +9,9 @@ database:
   table_prefix: "secflow_"
   pool_size: 10
   max_overflow: 20
+  pool_timeout: 30
+  pool_recycle: 1800
+  async_driver: "asyncmy"
 
 auth_service:
   host: "secflow-platform-auth"
@@ -59,6 +62,24 @@ app:
   host: "0.0.0.0"
   port: 8080
   debug: false
+  workers: 2
+
+concurrency:
+  fast_limit: 64
+  io_heavy_limit: 8
+  stream_limit: 16
+  request_timeout_seconds: 120
+  queue_timeout_seconds: 15
+  max_upload_size: 2147483648
+
+websocket:
+  enabled: true
+  heartbeat_seconds: 15
+  max_connections: 200
+  max_connections_per_project: 50
+  max_buffer_bytes: 262144
+  poll_interval_ms: 500
+  auth_recheck_seconds: 300
 
 logging:
   level: "INFO"

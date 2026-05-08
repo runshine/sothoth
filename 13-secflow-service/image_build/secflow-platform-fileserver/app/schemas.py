@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 
 class SuccessResponse(BaseModel):
     message: str
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
 
 
 class StoragePVCResponse(BaseModel):
@@ -72,6 +74,8 @@ class DirectoryResponse(BaseModel):
     created_by: Optional[str]
     created_at: datetime
     updated_at: datetime
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -118,6 +122,8 @@ class FileResponse(BaseModel):
     created_by: Optional[str]
     created_at: datetime
     updated_at: datetime
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -211,6 +217,8 @@ class ProjectPathDirectoryEntry(BaseModel):
     path: str
     created_at: datetime
     updated_at: datetime
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
 
 
 class ProjectPathFileEntry(BaseModel):
@@ -224,6 +232,8 @@ class ProjectPathFileEntry(BaseModel):
     storage_key: str
     created_at: datetime
     updated_at: datetime
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
 
 
 class ProjectPathChildrenResponse(BaseModel):
@@ -244,6 +254,8 @@ class ProjectPathOperationResponse(BaseModel):
     path: str
     entry_type: str
     message: Optional[str] = None
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
 
 
 class ProjectFilesystemBreadcrumbItem(BaseModel):
@@ -261,6 +273,8 @@ class ProjectFilesystemEntry(BaseModel):
     updated_at: Optional[datetime] = None
     has_children: bool = False
     special_badge: Optional[str] = None
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
 
 
 class ProjectFilesystemRootResponse(BaseModel):
@@ -294,3 +308,21 @@ class ProjectFilesystemMoveRequest(BaseModel):
     project_id: str = Field(..., min_length=1, max_length=32)
     source_path: str = Field(..., min_length=1, max_length=1024)
     target_directory_path: str = Field(..., min_length=1, max_length=1024)
+
+
+class TaskSubmitResponse(BaseModel):
+    task_id: str
+    status: str
+    accepted_at: datetime
+    request_id: Optional[str] = None
+    queue_class: Optional[str] = None
+
+
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    progress: float
+    accepted_at: datetime
+    finished_at: Optional[datetime] = None
+    result: Optional[dict] = None
+    error: Optional[str] = None

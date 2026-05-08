@@ -88,6 +88,8 @@ def get_engine():
             config.database.url,
             pool_size=config.database.pool_size,
             max_overflow=config.database.max_overflow,
+            pool_timeout=config.database.pool_timeout,
+            pool_recycle=config.database.pool_recycle,
             pool_pre_ping=True,
         )
     return _engine
