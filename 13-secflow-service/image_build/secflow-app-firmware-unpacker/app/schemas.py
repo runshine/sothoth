@@ -129,6 +129,16 @@ class TaskProgressResponse(BaseModel):
     phases: List[TaskProgressPhaseResponse]
 
 
+class TaskLogResponse(BaseModel):
+    task_id: str
+    run_path: Optional[str] = None
+    available: bool
+    log_text: str = ""
+    files: List[str] = []
+    phase: Optional[str] = None
+    message: Optional[str] = None
+
+
 class TaskListResponse(BaseModel):
     total: int
     offset: int

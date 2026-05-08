@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -50,6 +51,40 @@ def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
     Path(log_dir, "stage1_preprocess.json").write_text(
         json.dumps(stage_entries, indent=2)
     )
+    lines: list[str] = []
+    for entry in stage_entries:
+        stamp = datetime.utcnow().isoformat()
+        if entry.get("step") == "format_detection":
+            lines.append(
+                f"[{stamp}] format_detection firmware={entry.get('firmware')} fmt={entry.get('fmt')} magic_hex={entry.get('magic_hex')}"
+            )
+            continue
+        if entry.get("step") == "tool_attempt":
+            parts = [
+                f"[{stamp}] tool_attempt tool={entry.get('tool')}",
+                f"success={entry.get('success')}",
+            ]
+            if "returncode" in entry:
+                parts.append(f"returncode={entry.get('returncode')}")
+            if entry.get("output_file"):
+                parts.append(f"output_file={entry.get('output_file')}")
+            if entry.get("size") is not None:
+                parts.append(f"size={entry.get('size')}")
+            if entry.get("error"):
+                parts.append(f"error={entry.get('error')}")
+            if entry.get("stderr"):
+                parts.append(f"stderr={entry.get('stderr')}")
+            if entry.get("stdout"):
+                parts.append(f"stdout={entry.get('stdout')}")
+            lines.append(" ".join(parts))
+            continue
+        if entry.get("step") == "result":
+            lines.append(
+                f"[{stamp}] result success={entry.get('success')} method={entry.get('method')}"
+            )
+            continue
+        lines.append(f"[{stamp}] {json.dumps(entry, ensure_ascii=False)}")
+    Path(log_dir, "stage1_preprocess.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def detect_format(firmware_path: str) -> dict:

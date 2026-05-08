@@ -10,6 +10,8 @@ import signal
 import shutil
 import subprocess
 import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -462,7 +464,11 @@ class PiRpcClient:
         for _ in self._read_until("agent_end"):
             pass
 
-    def _prompt_once(self, message: str) -> str:
+    def _prompt_once(
+        self,
+        message: str,
+        stream_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> str:
         self.send(
             {
                 "type": "prompt",
@@ -494,6 +500,12 @@ class PiRpcClient:
                 elif delta_info.get("type") == "toolcall_delta":
                     print(delta_info.get("delta", ""), end="", flush=True)
 
+            if stream_callback is not None:
+                try:
+                    stream_callback(event)
+                except Exception:
+                    pass
+
             events.append(event)
 
         for event in reversed(events):
@@ -510,13 +522,17 @@ class PiRpcClient:
 
         return self.extract_assistant_text(events)
 
-    def prompt(self, message: str) -> str:
+    def prompt(
+        self,
+        message: str,
+        stream_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> str:
         busy_retries = 2
         for attempt in range(1 + self.RETRIES):
             try:
                 for busy_attempt in range(busy_retries + 1):
                     try:
-                        return self._prompt_once(message)
+                        return self._prompt_once(message, stream_callback=stream_callback)
                     except RuntimeError as exc:
                         if str(exc) != "__PI_BUSY__" or busy_attempt >= busy_retries:
                             raise
@@ -610,6 +626,85 @@ def get_log_dir(output_path: str) -> Path:
     return log_dir
 
 
+def _stringify_message_content(block: Any) -> str:
+    if isinstance(block, str):
+        return block.strip()
+    if not isinstance(block, dict):
+        return ""
+
+    block_type = str(block.get("type") or "").strip()
+    if block_type in {"text", "input_text", "output_text"}:
+        return str(block.get("text") or block.get("content") or "").strip()
+    if block_type in {"thinking", "reasoning"}:
+        text = str(block.get("text") or block.get("content") or "").strip()
+        return f"[thinking]\n{text}" if text else ""
+    if block_type in {"tool_call", "tool_use"}:
+        tool_name = str(block.get("name") or block.get("tool_name") or block.get("tool") or "").strip()
+        tool_input = block.get("input") or block.get("arguments") or block.get("args")
+        rendered_input = ""
+        if tool_input not in (None, ""):
+            try:
+                rendered_input = json.dumps(tool_input, ensure_ascii=False, indent=2)
+            except Exception:
+                rendered_input = str(tool_input)
+        header = f"[tool_call] {tool_name}".strip()
+        return f"{header}\n{rendered_input}".strip()
+    if block_type in {"tool_result", "tool_output"}:
+        tool_name = str(block.get("name") or block.get("tool_name") or block.get("tool") or "").strip()
+        output = block.get("output") or block.get("content") or block.get("result")
+        rendered_output = ""
+        if output not in (None, ""):
+            try:
+                rendered_output = json.dumps(output, ensure_ascii=False, indent=2)
+            except Exception:
+                rendered_output = str(output)
+        header = f"[tool_result] {tool_name}".strip()
+        return f"{header}\n{rendered_output}".strip()
+
+    for key in ("text", "content", "message"):
+        value = block.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    try:
+        return json.dumps(block, ensure_ascii=False, indent=2)
+    except Exception:
+        return str(block).strip()
+
+
+def _render_messages_transcript(messages: Any) -> str:
+    if not isinstance(messages, list):
+        return ""
+
+    sections: list[str] = []
+    for index, message in enumerate(messages, start=1):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "unknown").strip() or "unknown"
+        stop_reason = str(message.get("stopReason") or "").strip()
+        header = f"[{index}] {role}"
+        if stop_reason:
+            header += f" stopReason={stop_reason}"
+
+        contents = message.get("content")
+        body_parts: list[str] = []
+        if isinstance(contents, list):
+            for block in contents:
+                rendered = _stringify_message_content(block)
+                if rendered:
+                    body_parts.append(rendered)
+        elif contents:
+            rendered = _stringify_message_content(contents)
+            if rendered:
+                body_parts.append(rendered)
+        elif message.get("text"):
+            body_parts.append(str(message.get("text")).strip())
+
+        body = "\n\n".join(part for part in body_parts if part)
+        sections.append(header if not body else f"{header}\n{body}")
+
+    return "\n\n".join(sections).strip()
+
+
 def _save_agent_log(client: PiRpcClient, log_dir: Path | None, name: str) -> dict:
     if log_dir is None:
         return {}
@@ -621,6 +716,12 @@ def _save_agent_log(client: PiRpcClient, log_dir: Path | None, name: str) -> dic
             (log_dir / f"{name}_messages.json").write_text(
                 json.dumps(messages, ensure_ascii=False, indent=2)
             )
+            transcript = _render_messages_transcript(messages)
+            if transcript:
+                (log_dir / f"{name}_transcript.log").write_text(
+                    transcript,
+                    encoding="utf-8",
+                )
     except Exception as exc:
         log_event(
             log,
@@ -672,7 +773,38 @@ def _write_token_summary(log_dir: Path | None) -> None:
     output_file.write_text(json.dumps(summary, indent=2))
 
 
-def extract_firmware_features(firmware_path: str) -> dict:
+def _kill_process_tree(proc: subprocess.Popen[Any]) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pgid = None
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:
+            pass
+
+
+def extract_firmware_features(
+    firmware_path: str,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+) -> dict:
     path = Path(firmware_path)
     info = detect_format(firmware_path)
     features = {
@@ -686,17 +818,29 @@ def extract_firmware_features(firmware_path: str) -> dict:
     }
     try:
         features["size"] = os.path.getsize(firmware_path)
+    except RuntimeError:
+        raise
     except Exception:
         pass
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["binwalk", "-B", firmware_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=60,
+            start_new_session=True,
         )
-        for line in proc.stdout.splitlines():
+        if register_cancel_hook is not None:
+            register_cancel_hook(lambda: _kill_process_tree(proc))
+        while True:
+            if cancel_check and cancel_check():
+                _kill_process_tree(proc)
+                raise RuntimeError("__CANCELLED__")
+            if proc.poll() is not None:
+                stdout, _stderr = proc.communicate()
+                break
+            time.sleep(0.2)
+        for line in stdout.splitlines():
             line = line.strip()
             if line and not line.startswith("DECIMAL") and not line.startswith("-"):
                 parts = line.split(None, 2)
@@ -704,6 +848,9 @@ def extract_firmware_features(firmware_path: str) -> dict:
                     features["binwalk_sigs"].append(parts[2][:100].lower())
     except Exception:
         pass
+    finally:
+        if register_cancel_hook is not None:
+            register_cancel_hook(None)
     return features
 
 
@@ -718,6 +865,42 @@ def _write_json_log(log_dir: Path | None, name: str, payload: dict[str, Any]) ->
     (log_dir / name).write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
+def _append_stage_log(log_dir: Path | None, filename: str, message: str, **fields: Any) -> None:
+    if log_dir is None:
+        return
+    stamp = datetime.utcnow().isoformat()
+    line = f"[{stamp}] {message}"
+    if fields:
+        rendered = " ".join(
+            f"{key}={json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value}"
+            for key, value in fields.items()
+            if value is not None
+        )
+        if rendered:
+            line = f"{line} {rendered}"
+    with (log_dir / filename).open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
+def _append_stream_delta(log_dir: Path | None, filename: str, actor: str, event: dict[str, Any]) -> None:
+    if log_dir is None or event.get("type") != "message_update":
+        return
+    delta_info = event.get("assistantMessageEvent", {})
+    delta_type = str(delta_info.get("type") or "").strip()
+    delta = str(delta_info.get("delta") or "").rstrip()
+    if not delta_type or not delta:
+        return
+    for line in delta.splitlines():
+        text = line.rstrip()
+        if not text:
+            continue
+        _append_stage_log(
+            log_dir,
+            filename,
+            f"[stream][{actor}][{delta_type}] {text}",
+        )
+
+
 def _run_reviewer(
     firmware_path: str,
     output_path: str,
@@ -728,6 +911,14 @@ def _run_reviewer(
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> tuple[bool, str]:
+    _append_stage_log(
+        log_dir,
+        "stage4_llm_review.log",
+        "starting review round",
+        suffix=suffix,
+        firmware_path=firmware_path,
+        output_path=output_path,
+    )
     validator = PiRpcClient(
         system_prompt_file=val_sp,
         model=val_def["model"],
@@ -738,7 +929,15 @@ def _run_reviewer(
     if bind_cancel_client:
         bind_cancel_client(validator)
     try:
-        verify_result = validator.prompt(render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path))
+        verify_result = validator.prompt(
+            render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path),
+            stream_callback=lambda event: _append_stream_delta(
+                log_dir,
+                "stage4_llm_review.log",
+                f"reviewer:{suffix}",
+                event,
+            ),
+        )
         _save_agent_log(validator, log_dir, f"verifier_{suffix}")
         return _is_review_success(verify_result), verify_result
     finally:
@@ -771,6 +970,16 @@ def _run_skill_unpack(
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> dict[str, Any]:
+    _append_stage_log(
+        log_dir,
+        "stage3_skill_exec.log",
+        "starting skill execution",
+        skill=skill_meta.get("path"),
+        family_id=skill_meta.get("family_id"),
+        skill_version=skill_meta.get("skill_version"),
+        firmware_path=firmware_path,
+        output_path=output_path,
+    )
     skill_sp = _write_system_prompt(str(skill_meta.get("system_prompt") or ""), "firmware-skill-")
     executor = PiRpcClient(
         system_prompt_file=skill_sp,
@@ -800,6 +1009,14 @@ def _run_skill_unpack(
             "response": exec_result,
             "review": review_result,
         }
+        _append_stage_log(
+            log_dir,
+            "stage3_skill_exec.log",
+            "skill execution completed",
+            success=passed,
+            response_preview=_preview_text(exec_result),
+            review_preview=_preview_text(review_result),
+        )
         _write_json_log(
             log_dir,
             "stage3_skill_exec.json",
@@ -834,6 +1051,13 @@ def _run_generic_unpack(
     val_sp: str,
     llm_binding_snapshot: dict[str, Any] | None = None,
 ) -> tuple[bool, int, str]:
+    _append_stage_log(
+        log_dir,
+        "stage3_llm_unpack.log",
+        "starting generic llm unpack",
+        firmware_path=firmware_path,
+        output_path=output_path,
+    )
     max_retries = _get_max_retries()
     executor = PiRpcClient(
         system_prompt_file=exec_sp,
@@ -855,8 +1079,33 @@ def _run_generic_unpack(
                 firmware_path,
                 output_path,
             )
-            exec_result = executor.prompt(exec_msg)
+            exec_result = executor.prompt(
+                exec_msg,
+                stream_callback=lambda event, round_id=attempt: _append_stream_delta(
+                    log_dir,
+                    "stage3_llm_unpack.log",
+                    f"executor:round_{round_id}",
+                    event,
+                ),
+            )
             _save_agent_log(executor, log_dir, f"executor_round_{attempt}")
+            _append_stage_log(
+                log_dir,
+                "stage3_llm_unpack.log",
+                "executor round completed",
+                attempt=attempt,
+                response_preview=_preview_text(exec_result),
+            )
+            if log_dir is not None:
+                transcript_path = log_dir / f"executor_round_{attempt}_transcript.log"
+                if transcript_path.exists():
+                    _append_stage_log(
+                        log_dir,
+                        "stage3_llm_unpack.log",
+                        "executor conversation transcript captured",
+                        attempt=attempt,
+                        transcript_file=transcript_path.name,
+                    )
             passed, verify_result = _run_reviewer(
                 firmware_path,
                 output_path,
@@ -883,6 +1132,24 @@ def _run_generic_unpack(
                 attempt=attempt,
                 response_preview=_preview_text(verify_result),
             )
+            _append_stage_log(
+                log_dir,
+                "stage4_llm_review.log",
+                "review round completed",
+                attempt=attempt,
+                passed=passed,
+                review_preview=_preview_text(verify_result),
+            )
+            if log_dir is not None:
+                reviewer_transcript_path = log_dir / f"verifier_round_{attempt}_transcript.log"
+                if reviewer_transcript_path.exists():
+                    _append_stage_log(
+                        log_dir,
+                        "stage4_llm_review.log",
+                        "reviewer conversation transcript captured",
+                        attempt=attempt,
+                        transcript_file=reviewer_transcript_path.name,
+                    )
             if passed:
                 break
             last_reason = verify_result
@@ -909,6 +1176,14 @@ def _generate_candidate_skill(
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> dict[str, Any] | None:
+    _append_stage_log(
+        log_dir,
+        "stage5_skill_generate.log",
+        "starting candidate skill generation",
+        firmware_path=firmware_path,
+        output_path=output_path,
+        family_id=compute_family_id(features),
+    )
     try:
         author_def = load_agent_def(AUTHOR_AGENT_DEF)
         summary_path = Path(output_path) / "summary.txt"
@@ -961,12 +1236,26 @@ def _generate_candidate_skill(
                 "skill_status": saved.get("skill_status"),
             },
         )
+        _append_stage_log(
+            log_dir,
+            "stage5_skill_generate.log",
+            "candidate skill generated",
+            generated_skill_path=saved.get("path"),
+            skill_status=saved.get("skill_status"),
+            promotion_success_count=saved.get("promotion_success_count"),
+        )
         return saved
     except Exception as exc:
         _write_json_log(
             log_dir,
             "stage5_skill_generate.json",
             {"error": str(exc), "family_id": compute_family_id(features)},
+        )
+        _append_stage_log(
+            log_dir,
+            "stage5_skill_generate.log",
+            "candidate skill generation failed",
+            error=str(exc),
         )
         return None
 
@@ -977,6 +1266,12 @@ def _run_cleaner(
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> str:
+    _append_stage_log(
+        log_dir,
+        "cleaner.log",
+        "starting cleanup",
+        output_path=output_path,
+    )
     clean_def = load_agent_def(CLEAN_AGENT_DEF)
     clean_sp = "/tmp/firmware-extract-cleanup.md"
     Path(clean_sp).write_text(clean_def["system_prompt"])
@@ -999,6 +1294,12 @@ def _run_cleaner(
             logging.INFO,
             "cleanup completed",
             event="cleanup_complete",
+            response_preview=_preview_text(result),
+        )
+        _append_stage_log(
+            log_dir,
+            "cleaner.log",
+            "cleanup completed",
             response_preview=_preview_text(result),
         )
         return result
@@ -1088,9 +1389,26 @@ def run_unpack(
     _report_progress("feature_extract")
 
     try:
-        features = extract_firmware_features(firmware_path)
+        features = extract_firmware_features(
+            firmware_path,
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
         features["family_id"] = compute_family_id(features)
         skill_meta, skill_score, skill_match = match_skill(features, TOOLS_DIR)
+    except RuntimeError as exc:
+        if str(exc) == "__CANCELLED__":
+            raise
+        skill_meta = None
+        skill_score = 0
+        skill_match = {"matched_status": None, "reasons": []}
+        log_event(
+            log,
+            logging.WARNING,
+            "fast mode feature extraction exception",
+            event="fast_mode_exception",
+            error=str(exc),
+        )
     except Exception as exc:
         skill_meta = None
         skill_score = 0
@@ -1102,6 +1420,16 @@ def run_unpack(
             event="fast_mode_exception",
             error=str(exc),
         )
+    _append_stage_log(
+        log_dir,
+        "stage2_skill_match.log",
+        "feature extraction and skill match completed",
+        features=features if "features" in locals() else {},
+        matched_skill=skill_meta.get("path") if skill_meta else None,
+        matched_skill_score=skill_score if "skill_score" in locals() else None,
+        matched_status=skill_match.get("matched_status") if "skill_match" in locals() else None,
+        reasons=skill_match.get("reasons") if "skill_match" in locals() else None,
+    )
 
     _write_json_log(
         log_dir,
@@ -1146,6 +1474,14 @@ def run_unpack(
         if skill_meta:
             _check_cancel()
             _report_progress("tool_match")
+            _append_stage_log(
+                log_dir,
+                "stage2_skill_match.log",
+                "matched skill selected for execution",
+                skill=skill_meta.get("path"),
+                skill_version=skill_meta.get("skill_version"),
+                family_id=skill_meta.get("family_id"),
+            )
             skill_result = _run_skill_unpack(
                 skill_meta,
                 firmware_path,
@@ -1165,6 +1501,13 @@ def run_unpack(
             else:
                 fallback_to_llm = True
                 last_reason = str(skill_result.get("review") or skill_result.get("response") or "")
+                _append_stage_log(
+                    log_dir,
+                    "stage3_llm_unpack.log",
+                    "fallback to llm triggered after skill failure",
+                    matched_skill=skill_meta.get("path"),
+                    reason_preview=_preview_text(last_reason, 400),
+                )
                 _write_json_log(
                     log_dir,
                     "stage4_llm_fallback.json",
@@ -1198,6 +1541,14 @@ def run_unpack(
                     log_dir,
                     llm_binding_snapshot=llm_binding_snapshot,
                     bind_cancel_client=_bind_cancel_client,
+                )
+            else:
+                _append_stage_log(
+                    log_dir,
+                    "stage3_llm_unpack.log",
+                    "generic llm unpack finished without verified success",
+                    rounds=final_round,
+                    last_reason_preview=_preview_text(last_reason, 400),
                 )
 
         _check_cancel()

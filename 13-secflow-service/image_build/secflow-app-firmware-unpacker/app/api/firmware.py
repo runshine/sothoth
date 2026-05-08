@@ -25,6 +25,7 @@ from app.schemas import (
     LlmProviderSummaryListResponse,
     ReadyResponse,
     TaskListResponse,
+    TaskLogResponse,
     TaskProgressResponse,
     TaskResourceUsageResponse,
     TaskResponse,
@@ -177,6 +178,8 @@ def _get_task_progress(task_id: str) -> dict:
     stage1_path = run_dir / "stage1_preprocess.json"
     stage2_path = run_dir / "stage2_skill_match.json"
     stage3_path = run_dir / "stage3_skill_exec.json"
+    stage3_llm_unpack_log = run_dir / "stage3_llm_unpack.log"
+    stage4_llm_review_log = run_dir / "stage4_llm_review.log"
     stage4_path = run_dir / "stage4_llm_fallback.json"
     stage5_path = run_dir / "stage5_skill_generate.json"
     cleaner_path = run_dir / "cleaner_messages.json"
@@ -287,7 +290,7 @@ def _get_task_progress(task_id: str) -> dict:
                 "LLM 解包",
                 unpack_status,
                 unpack_detail,
-                _mtime_iso_text(executor_logs[-1]) if executor_logs else _mtime_iso_text(stage4_path),
+                _mtime_iso_text(executor_logs[-1]) if executor_logs else (_mtime_iso_text(stage3_llm_unpack_log) or _mtime_iso_text(stage4_path)),
             )
         elif matched_skill and not fallback_to_llm:
             phases[2] = _phase_payload("llm_unpack", "LLM 解包", "skipped", "工具执行成功，未进入 LLM 解包")
@@ -305,7 +308,7 @@ def _get_task_progress(task_id: str) -> dict:
                 "LLM 评审",
                 review_status,
                 review_detail,
-                _mtime_iso_text(verifier_logs[-1]) if verifier_logs else None,
+                _mtime_iso_text(verifier_logs[-1]) if verifier_logs else _mtime_iso_text(stage4_llm_review_log),
             )
         elif matched_skill and not fallback_to_llm:
             phases[3] = _phase_payload("llm_review", "LLM 评审", "skipped", "工具执行成功后未进入 LLM 评审链路")
@@ -354,6 +357,138 @@ def _get_task_progress(task_id: str) -> dict:
         "current_phase": current_phase,
         "summary": summary,
         "phases": phases,
+    }
+
+
+def _read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _format_log_file(path: Path) -> str:
+    if path.suffix.lower() == ".json":
+        payload = _read_json_file(path)
+        if payload is not None:
+            try:
+                return json.dumps(payload, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+    return _read_text_file(path)
+
+
+def _phase_log_files(run_dir: Path, phase: Optional[str]) -> list[Path]:
+    phase_key = str(phase or "").strip()
+    if not phase_key:
+        files: list[Path] = [
+            run_dir / "stage1_preprocess.json",
+            run_dir / "stage2_skill_match.json",
+            run_dir / "stage3_skill_exec.json",
+            run_dir / "stage4_llm_fallback.json",
+            run_dir / "stage5_skill_generate.json",
+            run_dir / "cleaner_messages.json",
+            run_dir / "summary.txt",
+            run_dir / "reason.txt",
+        ]
+        files.extend(sorted(run_dir.glob("executor_round_*_messages.json")))
+        files.extend(sorted(run_dir.glob("verifier_round_*_messages.json")))
+        files.extend(sorted(run_dir.glob("*.log")))
+        return files
+
+    mapping: dict[str, list[Path]] = {
+        "preprocess": [run_dir / "stage1_preprocess.log", run_dir / "stage1_preprocess.json"],
+        "tool_match": [run_dir / "stage2_skill_match.log", run_dir / "stage2_skill_match.json", run_dir / "stage3_skill_exec.log", run_dir / "stage3_skill_exec.json"],
+        "llm_unpack": [
+            run_dir / "stage3_llm_unpack.log",
+            run_dir / "stage4_llm_fallback.json",
+            *sorted(run_dir.glob("executor_round_*_transcript.log")),
+            *sorted(run_dir.glob("executor_round_*_messages.json")),
+        ],
+        "llm_review": [
+            run_dir / "stage4_llm_review.log",
+            *sorted(run_dir.glob("verifier_round_*_transcript.log")),
+            *sorted(run_dir.glob("verifier_round_*_messages.json")),
+            run_dir / "reason.txt",
+            run_dir / "summary.txt",
+        ],
+        "llm_cleanup": [
+            run_dir / "cleaner.log",
+            run_dir / "cleaner_transcript.log",
+            run_dir / "cleaner_messages.json",
+            run_dir / "stage5_skill_generate.log",
+            run_dir / "stage5_skill_generate.json",
+            run_dir / "skill_author_transcript.log",
+            run_dir / "skill_author_messages.json",
+        ],
+    }
+    return mapping.get(phase_key, [])
+
+
+def _get_task_logs(task_id: str, phase: Optional[str] = None) -> dict:
+    task = _get_task_or_404(task_id)
+    run_dir = _derive_run_path(task)
+    if not run_dir.exists() or not run_dir.is_dir():
+        return {
+            "task_id": task_id,
+            "run_path": str(run_dir),
+            "available": False,
+            "log_text": "",
+            "files": [],
+            "phase": phase,
+            "message": "运行日志目录不存在",
+        }
+
+    known_files = _phase_log_files(run_dir, phase)
+
+    deduped_files: list[Path] = []
+    seen: set[str] = set()
+    for path in known_files:
+        key = str(path)
+        if not path.exists() or key in seen:
+            continue
+        seen.add(key)
+        deduped_files.append(path)
+
+    if not deduped_files:
+        return {
+            "task_id": task_id,
+            "run_path": str(run_dir),
+            "available": False,
+            "log_text": "",
+            "files": [],
+            "phase": phase,
+            "message": "当前阶段尚未生成可读日志文件" if phase else "当前任务尚未生成可读日志文件",
+        }
+
+    sections: list[str] = []
+    file_names: list[str] = []
+    for path in deduped_files:
+        rendered = _format_log_file(path).strip()
+        if not rendered:
+            continue
+        file_names.append(path.name)
+        sections.append(f"===== {path.name} =====\n{rendered}")
+
+    if not sections:
+        return {
+            "task_id": task_id,
+            "run_path": str(run_dir),
+            "available": False,
+            "log_text": "",
+            "files": file_names,
+            "phase": phase,
+            "message": "日志文件存在，但当前没有可展示内容",
+        }
+
+    return {
+        "task_id": task_id,
+        "run_path": str(run_dir),
+        "available": True,
+        "log_text": "\n\n".join(sections),
+        "files": file_names,
+        "phase": phase,
+        "message": None,
     }
 
 
@@ -749,6 +884,20 @@ async def get_task_progress_legacy(
     _, token = subject_and_token
     await _get_task_with_access(task_id, token)
     return _get_task_progress(task_id)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/logs",
+    response_model=TaskLogResponse,
+)
+async def get_task_logs_legacy(
+    task_id: str,
+    phase: Optional[str] = Query(default=None),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_logs(task_id, phase)
 
 
 @router.delete("/api/app/firmware-unpacker/tasks/{task_id}", response_model=ActionResponse)
