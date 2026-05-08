@@ -30,11 +30,12 @@ services:
       - CLAUDE_CODE_USE_BEDROCK=
       - CODE_SERVER_PORT=20003
       - PROCESS_MONITOR_PORT=20004
+      # OpenClaw 网关注入配置；如有需要可由部署系统覆盖
       - OPENCLAW_STATE_DIR=/app/data/openclaw
       - OPENCLAW_CONFIG_PATH=/app/data/openclaw/openclaw.json
       - OPENCLAW_GATEWAY_PORT=20005
       - OPENCLAW_WORKSPACE_DIR=/host
-      - OPENCLAW_GATEWAY_PASSWORD=
+      - OPENCLAW_GATEWAY_PASSWORD=Huawei12#$  # 可由外部注入覆盖
       - PROCESS_MONITOR_INTERVAL_SEC=15
       - HOST_ROOT=/host
       - PROCESS_MONITOR_PROC_ROOT=/host/proc
