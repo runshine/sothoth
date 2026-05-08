@@ -1,5 +1,6 @@
 name: build-secflow-app-firmware-unpacker-image
 on:
+  workflow_dispatch:
   push:
     branches:
       - 'v2.*'
