@@ -155,9 +155,15 @@ def reclaim_orphaned_tasks() -> None:
                 .all()
             )
             for task in tasks:
-                task.status = TaskStatus.PENDING.value
-                task.worker_id = None
-                task.started_at = None
+                if task.status == TaskStatus.CANCELLING.value:
+                    task.status = TaskStatus.CANCELLED.value
+                    task.result_status = "cancelled"
+                    task.result_message = "Task was cancelled"
+                    task.completed_at = datetime.utcnow()
+                else:
+                    task.status = TaskStatus.PENDING.value
+                    task.worker_id = None
+                    task.started_at = None
         db.commit()
     finally:
         db.close()

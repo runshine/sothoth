@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -160,6 +161,7 @@ class PiRpcClient:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
         self.send({"type": "set_auto_retry", "enabled": True})
 
@@ -322,15 +324,30 @@ class PiRpcClient:
         if self.proc.poll() is not None:
             return
         try:
+            pgid = os.getpgid(self.proc.pid)
+        except Exception:
+            pgid = None
+        try:
             self.proc.stdin.close()
         except Exception:
             pass
-        self.proc.terminate()
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                self.proc.terminate()
+        except Exception:
+            self.proc.terminate()
         try:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
+            try:
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    self.proc.kill()
+            finally:
+                self.proc.wait()
 
 
 def get_log_dir(output_path: str) -> Path:
@@ -765,7 +782,13 @@ def run_unpack(
     _check_cancel()
 
     try:
-        pre_result = run_preprocess(firmware_path, output_path, log_dir=log_dir)
+        pre_result = run_preprocess(
+            firmware_path,
+            output_path,
+            log_dir=log_dir,
+            cancel_check=cancel_check,
+            register_cancel_hook=register_cancel_hook,
+        )
     except Exception as exc:
         pre_result = {"success": False, "method": None}
         log_event(

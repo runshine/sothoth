@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Startup script — launches Gunicorn with a threaded WSGI adapter."""
+"""Startup script — launches Gunicorn with an ASGI worker."""
 
 from __future__ import annotations
 
-import multiprocessing
 import os
 import sys
 from pathlib import Path
@@ -30,11 +29,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _default_workers() -> int:
-    pod_cpu_millis = _env_int("POD_CPU_LIMIT_MILLICORES", 0)
-    if pod_cpu_millis > 0:
-        return max(2, min(4, pod_cpu_millis // 500))
-    cpu_count = max(1, multiprocessing.cpu_count())
-    return max(2, min(4, cpu_count))
+    # Task cancel hooks live in-process. Keep a single Gunicorn worker so
+    # runtime cancellation requests always reach the executing task thread.
+    return 1
 
 
 if __name__ == "__main__":
@@ -55,7 +52,7 @@ if __name__ == "__main__":
         "--threads",
         str(threads),
         "--worker-class",
-        "gthread",
+        "uvicorn.workers.UvicornWorker",
         "--timeout",
         str(timeout),
         "--keep-alive",
@@ -65,6 +62,6 @@ if __name__ == "__main__":
         "--error-logfile",
         "-",
         "--capture-output",
-        "app.wsgi:app",
+        "app.main:app",
     ]
     gunicorn.app.wsgiapp.run()

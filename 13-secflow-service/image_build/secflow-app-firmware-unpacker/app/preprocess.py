@@ -6,12 +6,42 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
 import subprocess
+import time
 from pathlib import Path
+from typing import Callable, Optional
 
 from logging_utils import log_event
 
 log = logging.getLogger("unpacker.service")
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        pgid = None
+    try:
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except Exception:
+            pass
+        proc.wait()
 
 
 def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
@@ -127,7 +157,13 @@ def detect_format(firmware_path: str) -> dict:
     return {"fmt": fmt, "ext": ext, "ext2": ext2, "magic": magic}
 
 
-def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
+def run_preprocess(
+    firmware_path: str,
+    output_path: str,
+    log_dir=None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+) -> dict:
     """Try deterministic extraction for common archive and compressed formats."""
     stage_entries = []
     info = detect_format(firmware_path)
@@ -154,9 +190,33 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
     )
 
     def _run(cmd, **kw):
-        return subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kw
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+            **kw,
         )
+        if register_cancel_hook is not None:
+            register_cancel_hook(lambda: _kill_process_tree(proc))
+        try:
+            while True:
+                if cancel_check and cancel_check():
+                    _kill_process_tree(proc)
+                    raise RuntimeError("__CANCELLED__")
+                if proc.poll() is not None:
+                    stdout, stderr = proc.communicate()
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        proc.returncode,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+                time.sleep(0.5)
+        finally:
+            if register_cancel_hook is not None:
+                register_cancel_hook(None)
 
     def _record(tool, proc=None, success=False, extra=None):
         entry = {"step": "tool_attempt", "tool": tool, "success": success}
