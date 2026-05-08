@@ -1050,6 +1050,7 @@ def _run_generic_unpack(
     exec_sp: str,
     val_sp: str,
     llm_binding_snapshot: dict[str, Any] | None = None,
+    event_callback: Optional[Callable[[str, str], None]] = None,
 ) -> tuple[bool, int, str]:
     _append_stage_log(
         log_dir,
@@ -1096,6 +1097,17 @@ def _run_generic_unpack(
                 attempt=attempt,
                 response_preview=_preview_text(exec_result),
             )
+            if event_callback:
+                event_callback(
+                    "executor_round_completed",
+                    f"执行轮次 {attempt} 已完成",
+                    stage_key="llm_unpack",
+                    status="running",
+                    detail={
+                        "round": attempt,
+                        "response_preview": _preview_text(exec_result),
+                    },
+                )
             if log_dir is not None:
                 transcript_path = log_dir / f"executor_round_{attempt}_transcript.log"
                 if transcript_path.exists():
@@ -1140,6 +1152,18 @@ def _run_generic_unpack(
                 passed=passed,
                 review_preview=_preview_text(verify_result),
             )
+            if event_callback:
+                event_callback(
+                    "review_round_completed",
+                    f"评审轮次 {attempt} 已完成",
+                    stage_key="review",
+                    status="success" if passed else "running",
+                    detail={
+                        "round": attempt,
+                        "passed": passed,
+                        "review_preview": _preview_text(verify_result),
+                    },
+                )
             if log_dir is not None:
                 reviewer_transcript_path = log_dir / f"verifier_round_{attempt}_transcript.log"
                 if reviewer_transcript_path.exists():
@@ -1265,6 +1289,7 @@ def _run_cleaner(
     log_dir: Path | None = None,
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
+    event_callback: Optional[Callable[[str, str], None]] = None,
 ) -> str:
     _append_stage_log(
         log_dir,
@@ -1287,6 +1312,14 @@ def _run_cleaner(
     try:
         clean_msg = render_prompt(CLEAN_PROMPT_TMPL, output_path, "")
         log_event(log, logging.INFO, "cleanup started", event="cleanup_start")
+        if event_callback:
+            event_callback(
+                "cleanup_started",
+                "开始执行清理收尾",
+                stage_key="cleanup",
+                status="running",
+                detail={"output_path": output_path},
+            )
         result = cleaner.prompt(clean_msg)
         _save_agent_log(cleaner, log_dir, "cleaner")
         log_event(
@@ -1302,6 +1335,14 @@ def _run_cleaner(
             "cleanup completed",
             response_preview=_preview_text(result),
         )
+        if event_callback:
+            event_callback(
+                "cleanup_completed",
+                "清理收尾已完成",
+                stage_key="cleanup",
+                status="success",
+                detail={"response_preview": _preview_text(result)},
+            )
         return result
     finally:
         if bind_cancel_client:
@@ -1316,6 +1357,7 @@ def run_unpack(
     cancel_check: Optional[Callable[[], bool]] = None,
     register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
+    event_callback: Optional[Callable[..., None]] = None,
 ) -> dict:
     """Execute the firmware unpacking pipeline."""
 
@@ -1472,6 +1514,18 @@ def run_unpack(
 
     try:
         if skill_meta:
+            if event_callback:
+                event_callback(
+                    "tool_matched",
+                    f"命中工具：{Path(str(skill_meta.get('path') or '')).name}",
+                    stage_key="tool_match",
+                    status="running",
+                    detail={
+                        "matched_skill": skill_meta.get("path"),
+                        "skill_version": skill_meta.get("skill_version"),
+                        "matched_skill_score": skill_score,
+                    },
+                )
             _check_cancel()
             _report_progress("tool_match")
             _append_stage_log(
@@ -1501,6 +1555,17 @@ def run_unpack(
             else:
                 fallback_to_llm = True
                 last_reason = str(skill_result.get("review") or skill_result.get("response") or "")
+                if event_callback:
+                    event_callback(
+                        "tool_fallback_to_llm",
+                        "工具执行失败，已回退到 LLM 解包",
+                        stage_key="tool_match",
+                        status="running",
+                        detail={
+                            "matched_skill": skill_meta.get("path"),
+                            "reason": _preview_text(last_reason, 400),
+                        },
+                    )
                 _append_stage_log(
                     log_dir,
                     "stage3_llm_unpack.log",
@@ -1529,6 +1594,7 @@ def run_unpack(
                 exec_sp,
                 val_sp,
                 llm_binding_snapshot=llm_binding_snapshot,
+                event_callback=event_callback,
             )
             passed = generic_passed
             if passed:
@@ -1558,6 +1624,7 @@ def run_unpack(
             log_dir=log_dir,
             llm_binding_snapshot=llm_binding_snapshot,
             bind_cancel_client=_bind_cancel_client,
+            event_callback=event_callback,
         )
         _write_token_summary(log_dir)
 

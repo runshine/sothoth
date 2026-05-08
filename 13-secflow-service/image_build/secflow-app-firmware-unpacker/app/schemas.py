@@ -139,6 +139,25 @@ class TaskLogResponse(BaseModel):
     message: Optional[str] = None
 
 
+class TaskEventResponse(BaseModel):
+    id: str
+    task_id: str
+    project_id: Optional[str] = None
+    event_type: str
+    stage_key: Optional[str] = None
+    status: Optional[str] = None
+    summary: str
+    detail: Optional[dict] = None
+    owner_id: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
+
+
+class TaskEventListResponse(BaseModel):
+    total: int
+    items: List[TaskEventResponse]
+
+
 class TaskListResponse(BaseModel):
     total: int
     offset: int

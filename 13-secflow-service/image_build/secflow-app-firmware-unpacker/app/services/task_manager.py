@@ -27,6 +27,17 @@ _active_cancel_hooks: Dict[str, object] = {}
 _active_cancel_hooks_lock = threading.Lock()
 PROJECT_FILES_ROOT = Path(os.environ.get("PROJECT_FILES_ROOT", "/data/files"))
 TASK_WORKSPACE_ROOT = Path("app/secflow-app-firmware-unpacker")
+STAGE_LABELS = {
+    "pending": "待执行",
+    "queued": "排队中",
+    "preprocess": "预处理",
+    "feature_extract": "特征提取",
+    "skill_match": "工具匹配",
+    "tool_match": "工具执行",
+    "llm_unpack": "LLM 解包",
+    "review": "LLM 评审",
+    "cleanup": "清理收尾",
+}
 
 
 def _executor_capacity() -> int:
@@ -226,12 +237,83 @@ def _register_cancel_hook(task_id: str, hook) -> None:
             _active_cancel_hooks[task_id] = hook
 
 
+def _record_task_event(
+    task_id: str,
+    *,
+    project_id: Optional[str],
+    event_type: str,
+    summary: str,
+    stage_key: Optional[str] = None,
+    status: Optional[str] = None,
+    detail: Optional[dict] = None,
+    owner_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+) -> None:
+    from app.services.task_events import record_task_event
+
+    try:
+        record_task_event(
+            task_id,
+            project_id=project_id,
+            event_type=event_type,
+            summary=summary,
+            stage_key=stage_key,
+            status=status,
+            detail=detail,
+            owner_id=owner_id,
+            created_by=created_by,
+        )
+    except Exception as exc:
+        logger.warning("failed to persist task event %s for task %s: %s", event_type, task_id, exc)
+
+
+def _record_task_event_from_row(
+    task,
+    *,
+    event_type: str,
+    summary: str,
+    stage_key: Optional[str] = None,
+    status: Optional[str] = None,
+    detail: Optional[dict] = None,
+    owner_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+) -> None:
+    _record_task_event(
+        task.id,
+        project_id=getattr(task, "project_id", None),
+        event_type=event_type,
+        summary=summary,
+        stage_key=stage_key,
+        status=status,
+        detail=detail,
+        owner_id=owner_id or getattr(task, "owner_id", None),
+        created_by=created_by,
+    )
+
+
 def _trigger_cancel_hook(task_id: str) -> None:
     with _active_cancel_hooks_lock:
         hook = _active_cancel_hooks.get(task_id)
     if hook is None:
         return
     try:
+        from app.model import UnpackTask, get_db_session
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+            if task is not None:
+                _record_task_event_from_row(
+                    task,
+                    event_type="cancel_hook_triggered",
+                    summary="已触发本地取消钩子",
+                    stage_key=task.current_stage,
+                    status=task.status,
+                    detail={"owner_id": task.owner_id},
+                    created_by="task_manager",
+                )
+        finally:
+            db.close()
         hook()
     except Exception as exc:
         logger.warning("failed to trigger cancel hook for task %s: %s", task_id, exc)
@@ -364,11 +446,34 @@ def _renew_task_lease(task_id: str, *, stage: Optional[str] = None) -> None:
         )
         if task is None:
             return
+        previous_stage = str(task.current_stage or "").strip() or None
         task.lease_expires_at = _lease_deadline()
         task.last_progress_at = datetime.utcnow()
         if stage:
             task.current_stage = stage
         db.commit()
+        if stage and stage != previous_stage:
+            stage_label = STAGE_LABELS.get(stage, stage)
+            _record_task_event_from_row(
+                task,
+                event_type="stage_changed",
+                summary=f"进入阶段：{stage_label}",
+                stage_key=stage,
+                status=task.status,
+                detail={"from": previous_stage, "to": stage},
+                owner_id=owner_id,
+                created_by="task_manager",
+            )
+        _record_task_event_from_row(
+            task,
+            event_type="lease_renewed",
+            summary="任务租约已续期",
+            stage_key=str(task.current_stage or "").strip() or None,
+            status=task.status,
+            detail={"lease_expires_at": task.lease_expires_at.isoformat() if task.lease_expires_at else None},
+            owner_id=owner_id,
+            created_by="task_manager",
+        )
     finally:
         db.close()
 
@@ -388,16 +493,61 @@ def _finalize_orphaned_task(task_id: str, reason: str) -> None:
             task.status = TaskStatus.CANCELLED.value
             task.result_status = "cancelled"
             task.result_message = f"Task cancelled: {reason}"
+            terminal_event = "task_cancelled"
+            terminal_summary = f"任务已取消：{reason}"
         else:
             task.status = TaskStatus.FAILED.value
             task.result_status = "failed"
             task.error_message = reason
             task.result_message = f"Task failed: {reason}"
+            terminal_event = "task_failed"
+            terminal_summary = f"任务失败：{reason}"
+        previous_owner_id = task.owner_id
         task.owner_id = None
         task.lease_expires_at = None
         task.completed_at = datetime.utcnow()
         task.last_progress_at = datetime.utcnow()
         db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type="owner_lost",
+            summary="任务 owner 已失活",
+            stage_key=task.current_stage,
+            status=task.status,
+            detail={"reason": reason, "owner_id": previous_owner_id},
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
+        _record_task_event_from_row(
+            task,
+            event_type="lease_expired",
+            summary="任务租约已过期",
+            stage_key=task.current_stage,
+            status=task.status,
+            detail={"reason": reason},
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
+        _record_task_event_from_row(
+            task,
+            event_type="orphan_recovered",
+            summary="孤儿任务已完成状态收敛",
+            stage_key=task.current_stage,
+            status=task.status,
+            detail={"reason": reason},
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
+        _record_task_event_from_row(
+            task,
+            event_type=terminal_event,
+            summary=terminal_summary,
+            stage_key=task.current_stage,
+            status=task.status,
+            detail={"reason": reason},
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
     finally:
         db.close()
 
@@ -565,6 +715,20 @@ def submit_unpack_task(
             )
         )
         db.commit()
+        _record_task_event(
+            task_id,
+            project_id=normalized_project_id,
+            event_type="task_created",
+            summary="任务已创建并进入队列",
+            stage_key="pending",
+            status=TaskStatus.PENDING.value,
+            detail={
+                "firmware_path": firmware_path,
+                "output_path": prepared["output_path"],
+                "task_origin_type": normalized_origin_type,
+            },
+            created_by="task_manager",
+        )
     finally:
         db.close()
 
@@ -592,6 +756,26 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
             task.result_status = "cancelled"
             task.result_message = "Task was cancelled before execution"
             task.completed_at = datetime.utcnow()
+            db.commit()
+            _record_task_event_from_row(
+                task,
+                event_type="cancel_requested",
+                summary="已提交取消请求",
+                stage_key=task.current_stage,
+                status=TaskStatus.CANCELLING.value,
+                detail={"owner_id": task.owner_id},
+                created_by="task_manager",
+            )
+            _record_task_event_from_row(
+                task,
+                event_type="task_cancelled",
+                summary="任务在执行前已取消",
+                stage_key=task.current_stage,
+                status=task.status,
+                detail={"reason": "Task was cancelled before execution"},
+                created_by="task_manager",
+            )
+            return True, "取消请求已提交"
         elif task.status in (TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value):
             task.status = TaskStatus.CANCELLING.value
             task.cancel_requested_at = task.cancel_requested_at or datetime.utcnow()
@@ -602,6 +786,15 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
         else:
             return False, "仅支持取消排队中或运行中的任务"
         db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type="cancel_requested",
+            summary="已提交取消请求",
+            stage_key=task.current_stage,
+            status=task.status,
+            detail={"owner_id": task.owner_id},
+            created_by="task_manager",
+        )
         if trigger_runtime_cancel:
             _trigger_cancel_hook(task_id)
         return True, "取消请求已提交"
@@ -633,6 +826,16 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
             parent_stage_item_id=task.parent_stage_item_id,
             parent_stage_item_key=task.parent_stage_item_key,
         )
+        _record_task_event(
+            new_task["task_id"],
+            project_id=task.project_id,
+            event_type="retry_created",
+            summary="任务由重试操作创建",
+            stage_key="pending",
+            status=TaskStatus.PENDING.value,
+            detail={"source_task_id": task_id},
+            created_by="task_manager",
+        )
         return True, new_task["task_id"], "重试任务已创建"
     finally:
         db.close()
@@ -644,6 +847,7 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
     deleted_count = 0
     skipped_ids: list[str] = []
     deleted_workspaces: list[tuple[str, Optional[str]]] = []
+    deleted_event_payloads: list[dict[str, object]] = []
     db = get_db_session()
     try:
         for task_id in task_ids:
@@ -667,9 +871,31 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
             if not deleted:
                 skipped_ids.append(task_id)
                 continue
+            deleted_event_payloads.append(
+                {
+                    "task_id": task_id,
+                    "project_id": task.project_id,
+                    "stage_key": task.current_stage,
+                    "status": task.status,
+                    "detail": {"output_path": task.output_path},
+                    "owner_id": task.owner_id,
+                }
+            )
             deleted_count += 1
             deleted_workspaces.append((task_id, task.project_id))
         db.commit()
+        for payload in deleted_event_payloads:
+            _record_task_event(
+                str(payload["task_id"]),
+                project_id=payload.get("project_id"),
+                event_type="task_deleted",
+                summary="任务记录已删除",
+                stage_key=payload.get("stage_key"),
+                status=payload.get("status"),
+                detail=payload.get("detail"),
+                owner_id=payload.get("owner_id"),
+                created_by="task_manager",
+            )
         for task_id, project_id in deleted_workspaces:
             try:
                 remove_task_workspace(task_id, project_id)
@@ -789,6 +1015,18 @@ def _claim_task(task_id: str) -> bool:
         )
         if updated:
             db.commit()
+            task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+            if task is not None:
+                _record_task_event_from_row(
+                    task,
+                    event_type="task_claimed",
+                    summary="任务已被当前 owner 认领",
+                    stage_key="queued",
+                    status=task.status,
+                    detail={"owner_id": owner_id},
+                    owner_id=owner_id,
+                    created_by="task_manager",
+                )
             return True
         db.rollback()
         return False
@@ -891,6 +1129,17 @@ def _run_claimed_task(task_id: str) -> None:
             return
 
         llm_binding_snapshot = _freeze_task_llm_binding_snapshot(task_id)
+        _record_task_event(
+            task_id,
+            project_id=task.project_id,
+            event_type="task_started",
+            summary="任务开始执行",
+            stage_key="queued",
+            status=TaskStatus.RUNNING.value,
+            detail={"owner_id": owner_id},
+            owner_id=owner_id,
+            created_by="task_manager",
+        )
 
         os.makedirs(runtime_paths["output_path"], exist_ok=True)
         result = run_unpack(
@@ -900,6 +1149,17 @@ def _run_claimed_task(task_id: str) -> None:
             cancel_check=lambda: _should_cancel(task_id),
             register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),
             progress_callback=lambda stage: _renew_task_lease(task_id, stage=stage),
+            event_callback=lambda event_type, summary, **kwargs: _record_task_event(
+                task_id,
+                project_id=task.project_id,
+                event_type=event_type,
+                summary=summary,
+                stage_key=kwargs.pop("stage_key", None),
+                status=kwargs.pop("status", None),
+                detail=kwargs.pop("detail", None),
+                owner_id=kwargs.pop("owner_id", owner_id),
+                created_by=kwargs.pop("created_by", "unpacker_engine"),
+            ),
         )
         _update_task_result(task_id, result)
     except Exception as exc:
@@ -920,6 +1180,7 @@ def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> No
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if task is None:
             return
+        previous_owner_id = task.owner_id
         task.status = TaskStatus.CANCELLED.value
         task.result_status = "cancelled"
         task.result_message = reason
@@ -928,6 +1189,16 @@ def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> No
         task.completed_at = datetime.utcnow()
         task.last_progress_at = datetime.utcnow()
         db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type="task_cancelled",
+            summary=f"任务已取消：{reason}",
+            stage_key=task.current_stage,
+            status=task.status,
+            detail={"reason": reason},
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
     finally:
         db.close()
 
@@ -944,11 +1215,18 @@ def _update_task_result(task_id: str, result: dict) -> None:
         result_status = str(result.get("status") or "").lower()
         if task.status == TaskStatus.CANCELLING.value or result_status == "cancelled":
             task.status = TaskStatus.CANCELLED.value
+            event_type = "task_cancelled"
+            summary = f"任务已取消：{result.get('message') or 'Task was cancelled'}"
         elif result_status == "success":
             task.status = TaskStatus.SUCCESS.value
+            event_type = "task_succeeded"
+            summary = "任务执行成功"
         else:
             task.status = TaskStatus.FAILED.value
+            event_type = "task_failed"
+            summary = f"任务失败：{result.get('message') or result_status or 'unknown'}"
 
+        previous_owner_id = task.owner_id
         task.owner_id = None
         task.lease_expires_at = None
         task.result_status = result.get("status")
@@ -964,6 +1242,21 @@ def _update_task_result(task_id: str, result: dict) -> None:
         task.completed_at = datetime.utcnow()
         task.last_progress_at = datetime.utcnow()
         db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type=event_type,
+            summary=summary,
+            stage_key=task.current_stage,
+            status=task.status,
+            detail={
+                "result_status": result.get("status"),
+                "rounds": result.get("rounds"),
+                "matched_skill": result.get("matched_skill"),
+                "fallback_to_llm": bool(result.get("fallback_to_llm")),
+            },
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
     finally:
         db.close()
 
@@ -977,6 +1270,7 @@ def _update_task_error(task_id: str, error: str) -> None:
         if task is None:
             return
         task.status = TaskStatus.CANCELLED.value if task.status == TaskStatus.CANCELLING.value else TaskStatus.FAILED.value
+        previous_owner_id = task.owner_id
         task.owner_id = None
         task.lease_expires_at = None
         task.result_status = "cancelled" if task.status == TaskStatus.CANCELLED.value else "failed"
@@ -985,6 +1279,16 @@ def _update_task_error(task_id: str, error: str) -> None:
         task.completed_at = datetime.utcnow()
         task.last_progress_at = datetime.utcnow()
         db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type="task_cancelled" if task.status == TaskStatus.CANCELLED.value else "task_failed",
+            summary=f"{'任务已取消' if task.status == TaskStatus.CANCELLED.value else '任务失败'}：{error}",
+            stage_key=task.current_stage,
+            status=task.status,
+            detail={"reason": error},
+            owner_id=previous_owner_id,
+            created_by="task_manager",
+        )
     finally:
         db.close()
 

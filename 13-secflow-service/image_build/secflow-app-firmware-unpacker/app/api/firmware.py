@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import json
+import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -11,7 +12,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import or_
 
 from app.api.dependencies import ensure_project_access, get_current_subject
-from app.exception import ForbiddenError, NotFoundError, ValidationError
+from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
 from app.model import ServiceConfig, TaskStatus, UnpackTask, get_db_session
 from app.schemas import (
     ActionResponse,
@@ -24,6 +25,7 @@ from app.schemas import (
     HealthResponse,
     LlmProviderSummaryListResponse,
     ReadyResponse,
+    TaskEventListResponse,
     TaskListResponse,
     TaskLogResponse,
     TaskProgressResponse,
@@ -35,6 +37,7 @@ from app.schemas import (
 )
 from app.services.pod_metrics import get_pod_resource_usage
 from app.services.configcenter import get_configcenter_client
+from app.services.task_events import list_task_events
 from app.services.task_manager import cancel_task, delete_tasks, retry_task, submit_unpack_task
 from app.services.worker import get_cluster_snapshot, get_worker_id
 from app.skill_store import list_skills
@@ -42,6 +45,7 @@ from app.unpacker_engine import TOOLS_DIR
 
 
 router = APIRouter(tags=["Firmware Unpacker"])
+logger = logging.getLogger(__name__)
 
 
 def _normalize_project_id(project_id: Optional[str]) -> Optional[str]:
@@ -492,6 +496,11 @@ def _get_task_logs(task_id: str, phase: Optional[str] = None) -> dict:
     }
 
 
+def _get_task_events(task_id: str, limit: int) -> dict:
+    _get_task_or_404(task_id)
+    return list_task_events(task_id, limit=limit)
+
+
 async def _get_task_with_access(task_id: str, token: str) -> dict:
     task = _get_task_or_404(task_id)
     project_id = _normalize_project_id(task.get("project_id"))
@@ -504,17 +513,23 @@ def _submit_task(project_id: Optional[str], request: UnpackRequest) -> dict:
     if project_id and not _normalize_project_id(request.project_id):
         request.project_id = project_id
     _ensure_valid_request_payload(request)
-    result = submit_unpack_task(
-        firmware_path=request.firmware_path,
-        project_id=project_id,
-        task_origin_type=request.task_origin_type,
-        parent_project_id=request.parent_project_id,
-        parent_task_id=request.parent_task_id,
-        parent_task_type=request.parent_task_type,
-        parent_stage_name=request.parent_stage_name,
-        parent_stage_item_id=request.parent_stage_item_id,
-        parent_stage_item_key=request.parent_stage_item_key,
-    )
+    try:
+        result = submit_unpack_task(
+            firmware_path=request.firmware_path,
+            project_id=project_id,
+            task_origin_type=request.task_origin_type,
+            parent_project_id=request.parent_project_id,
+            parent_task_id=request.parent_task_id,
+            parent_task_type=request.parent_task_type,
+            parent_stage_name=request.parent_stage_name,
+            parent_stage_item_id=request.parent_stage_item_id,
+            parent_stage_item_key=request.parent_stage_item_key,
+        )
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    except Exception as exc:
+        logger.exception("failed to submit firmware unpack task for project %s", project_id)
+        raise InternalError("任务提交失败，请检查服务日志") from exc
     return {
         "task_id": result["task_id"],
         "status": "pending",
@@ -790,6 +805,24 @@ async def get_project_task(
     return task
 
 
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/events",
+    response_model=TaskEventListResponse,
+)
+async def get_project_task_events(
+    project_id: str,
+    task_id: str,
+    limit: int = Query(default=200, ge=1, le=200),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _get_task_events(task_id, limit)
+
+
 @router.delete(
     "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}",
     response_model=ActionResponse,
@@ -884,6 +917,20 @@ async def get_task_progress_legacy(
     _, token = subject_and_token
     await _get_task_with_access(task_id, token)
     return _get_task_progress(task_id)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/events",
+    response_model=TaskEventListResponse,
+)
+async def get_task_events_legacy(
+    task_id: str,
+    limit: int = Query(default=200, ge=1, le=200),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_events(task_id, limit)
 
 
 @router.get(

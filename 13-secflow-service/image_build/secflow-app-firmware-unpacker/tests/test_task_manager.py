@@ -7,11 +7,15 @@ from unittest.mock import patch
 import yaml
 
 from app.config import reload_config
-from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session, init_database
+from app.model import TaskStatus, UnpackTask, UnpackTaskEvent, WorkerInstance, get_db_session, init_database
 import app.model as model_module
 import app.services.task_manager as task_manager_module
+from app.api.firmware import _submit_task
+from app.exception import ValidationError
 from app.model import ServiceConfig
+from app.schemas import UnpackRequest
 from app.services.task_manager import prepare_task_workspace, resolve_task_runtime_paths, submit_unpack_task
+from app.services.task_events import list_task_events
 
 
 class TaskManagerWorkspaceTests(unittest.TestCase):
@@ -54,6 +58,17 @@ class TaskManagerWorkspaceTests(unittest.TestCase):
             self.assertEqual(str(firmware), resolved["input_path"])
             self.assertTrue(manifest_path.is_file())
             self.assertEqual(str(root / "data" / "p1" / "app/secflow-app-firmware-unpacker" / "t1" / "output"), resolved["output_path"])
+
+    def test_submit_task_surfaces_value_error_as_validation_error(self):
+        request = UnpackRequest(
+            firmware_path="/tmp/firmware.bin",
+            project_id="p1",
+        )
+
+        with patch("app.api.firmware.os.path.exists", return_value=True), \
+             patch("app.api.firmware.submit_unpack_task", side_effect=ValueError("未配置角色 executor 的 LLM Provider")):
+            with self.assertRaisesRegex(ValidationError, "未配置角色 executor 的 LLM Provider"):
+                _submit_task("p1", request)
 
 
 class TaskManagerLeaseTests(unittest.TestCase):
@@ -150,6 +165,8 @@ class TaskManagerLeaseTests(unittest.TestCase):
             self.assertEqual("pod-a:123:owner", task.owner_id)
             self.assertEqual("queued", task.current_stage)
             self.assertIsNotNone(task.lease_expires_at)
+            events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-claim").all()
+            self.assertTrue(any(event.event_type == "task_claimed" for event in events))
         finally:
             db.close()
 
@@ -305,6 +322,8 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             snapshot = json.loads(task.llm_binding_snapshot)
             self.assertEqual("provider-executor-v1", snapshot["roles"]["executor"]["provider_key"])
             self.assertEqual("provider-reviewer-v1", snapshot["roles"]["reviewer"]["provider_key"])
+            created_events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == created["task_id"]).all()
+            self.assertTrue(any(event.event_type == "task_created" for event in created_events))
 
             row = db.query(ServiceConfig).filter(ServiceConfig.key == "llm_provider_key_executor").first()
             row.value = "provider-executor-v2"
@@ -319,6 +338,49 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
             self.assertEqual("provider-executor-v1", snapshot["roles"]["executor"]["provider_key"])
         finally:
             db.close()
+
+    def test_cancel_task_records_cancel_requested_event(self):
+        provider_keys = {
+            "llm_provider_key_executor": "provider-executor-v1",
+            "llm_provider_key_reviewer": "provider-reviewer-v1",
+            "llm_provider_key_cleaner": "provider-cleaner-v1",
+            "llm_provider_key_skill_author": "provider-author-v1",
+            "llm_provider_key_skill_executor": "provider-skill-v1",
+        }
+
+        class _FakeClient:
+            def get_llm_provider(self, provider_key: str):
+                return {
+                    "provider_key": provider_key,
+                    "provider_type": "openai-compatible",
+                    "api_base": f"http://llm.local/{provider_key}",
+                    "api_key": f"secret-{provider_key}",
+                    "model": f"model-{provider_key}",
+                    "env_bindings": {},
+                }
+
+        db = get_db_session()
+        try:
+            for key, value in provider_keys.items():
+                row = db.query(ServiceConfig).filter(ServiceConfig.key == key).first()
+                row.value = value
+            db.commit()
+        finally:
+            db.close()
+
+        with patch("app.services.task_manager.PROJECT_FILES_ROOT", self.root / "data"), \
+             patch("app.services.configcenter.get_configcenter_client", return_value=_FakeClient()):
+            created = submit_unpack_task(
+                firmware_path=str(self.firmware),
+                project_id="p1",
+            )
+
+        ok, _ = task_manager_module.cancel_task(created["task_id"])
+        self.assertTrue(ok)
+        events = list_task_events(created["task_id"])
+        event_types = [item["event_type"] for item in events["items"]]
+        self.assertIn("cancel_requested", event_types)
+        self.assertIn("task_cancelled", event_types)
 
 
 if __name__ == "__main__":

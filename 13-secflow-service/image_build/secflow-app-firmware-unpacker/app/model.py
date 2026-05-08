@@ -165,6 +165,45 @@ class ServiceConfig(Base):
         }
 
 
+class UnpackTaskEvent(Base):
+    __tablename__ = "secflow_app_firmware_unpacker_task_events"
+
+    id = Column(String(32), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=True, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    stage_key = Column(String(64), nullable=True, index=True)
+    status = Column(String(32), nullable=True, index=True)
+    summary = Column(Text, nullable=False)
+    detail_json = Column(Text, nullable=True)
+    owner_id = Column(String(96), nullable=True, index=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self) -> dict:
+        detail = None
+        if self.detail_json:
+            try:
+                import json
+
+                detail = json.loads(self.detail_json)
+            except Exception:
+                detail = {"raw": self.detail_json}
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "project_id": self.project_id,
+            "event_type": self.event_type,
+            "stage_key": self.stage_key,
+            "status": self.status,
+            "summary": self.summary,
+            "detail": detail,
+            "owner_id": self.owner_id,
+            "created_by": self.created_by,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 DEFAULT_CONFIGS = [
     ("concurrency_mode", "auto", "string", "并发控制模式：auto=按 Pod CPU/内存自动计算，manual=手动指定"),
     ("manual_max_concurrent", "3", "int", "手动模式下单个 Pod 最大并发解包任务数"),
@@ -239,6 +278,7 @@ def apply_table_prefix_if_needed() -> None:
     UnpackTask.__table__.name = f"{prefix}unpack_tasks"
     WorkerInstance.__table__.name = f"{prefix}worker_instances"
     ServiceConfig.__table__.name = f"{prefix}service_configs"
+    UnpackTaskEvent.__table__.name = f"{prefix}task_events"
 
 
 def init_database() -> None:
