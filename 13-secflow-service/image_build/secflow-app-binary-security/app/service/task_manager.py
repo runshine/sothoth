@@ -304,6 +304,7 @@ class TaskManager:
             payload.files or [BinarySecurityInputFile(**item) for item in task.summary.get("input_files") or []],
             task_type=self._task_type(task),
         )
+        input_dir = Path(task.workspace_root) / "input"
         self._record_event(db, task, "task_upload_started", "开始校验上传文件")
         if self._task_type(task) == TASK_TYPE_SOURCE:
             actual_files, total_bytes, extracted_count = await self._materialize_source_archives(task, declared)
@@ -315,7 +316,6 @@ class TaskManager:
                 payload={"archive_count": len(actual_files), "extracted_file_count": extracted_count},
             )
         else:
-            input_dir = Path(task.workspace_root) / "input"
             actual_files = []
             total_bytes = 0
             for file_info in declared:
