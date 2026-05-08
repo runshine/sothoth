@@ -2,6 +2,7 @@
 set -euo pipefail
 
 NAMESPACE="${NAMESPACE:-secflow-ns}"
+DEFAULT_IMAGE_TAG="${DEFAULT_IMAGE_TAG:-latest}"
 B2S_IMAGE_REPO="${B2S_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-to-source}"
 RESOURCE_IMAGE_REPO="${RESOURCE_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource}"
 GATEWAY_WORKER_IMAGE_REPO="${GATEWAY_WORKER_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource-file-gateway-worker}"
@@ -12,30 +13,33 @@ B2S_MANAGER_DEPLOYMENT="secflow-app-binary-to-source-manager"
 B2S_WORKER_DEPLOYMENT="secflow-app-binary-to-source-worker"
 B2S_MANAGER_CONTAINER="secflow-app-binary-to-source-manager"
 B2S_WORKER_CONTAINER="secflow-app-binary-to-source-worker"
-RESOURCE_DEPLOYMENT="secflow-platform-resource"
-RESOURCE_CONTAINER="secflow-platform-resource"
-FW_UNPACKER_DEPLOYMENT="secflow-app-firmware-unpacker"
-FW_UNPACKER_CONTAINER="secflow-app-firmware-unpacker"
 
 usage() {
   cat <<'HELP'
 Usage:
-  ./update_k8s_image_all.sh [binary_to_source_image_or_tag]
-  ./update_k8s_image_all.sh --b2s-image <image_or_tag> --resource-image <image_or_tag> --gateway-worker-image <image_or_tag> --firmware-unpacker-image <image_or_tag>
+  ./update_k8s_image_all.sh
+  ./update_k8s_image_all.sh [global_tag]
+  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>]
 
 Examples:
   ./update_k8s_image_all.sh
   ./update_k8s_image_all.sh latest
+  ./update_k8s_image_all.sh --tag 20260508-abcdef0
   ./update_k8s_image_all.sh --resource-image 20260403
   ./update_k8s_image_all.sh --gateway-worker-image ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:20260403
   ./update_k8s_image_all.sh --firmware-unpacker-image 20260428
 
 Behavior:
-  - No args: only rollout restart all deployments.
-  - b2s image: update binary-to-source manager/worker image.
-  - resource image: update secflow-platform-resource image.
+  - No args: update all secflow-* deployments in the namespace to :latest for managed repos.
+  - global tag: update all secflow-* deployments in the namespace to the same tag for managed repos.
+  - Managed repos:
+      ghcr.io/runshine/*
+      runshine0819/secflow-*
+  - b2s image: override binary-to-source manager/worker image.
+  - resource image: override secflow-platform-resource image.
   - gateway-worker image: update file_gateway.worker_image in resource ConfigMap template vars.
-  - firmware-unpacker image: update secflow-app-firmware-unpacker deployment image.
+  - firmware-unpacker image: override secflow-app-firmware-unpacker image.
+  - Non-secflow deployments and third-party sidecars are skipped.
 HELP
 }
 
@@ -53,16 +57,67 @@ resolve_image() {
   echo "${default_repo}:${input}"
 }
 
+is_managed_repo() {
+  local repo="${1:-}"
+  [[ "${repo}" == ghcr.io/runshine/* || "${repo}" == runshine0819/secflow-* ]]
+}
+
+image_repo() {
+  local image="${1:-}"
+  local without_digest="${image%@*}"
+  local tail="${without_digest##*/}"
+  if [[ "${tail}" == *":"* ]]; then
+    echo "${without_digest%:*}"
+  else
+    echo "${without_digest}"
+  fi
+}
+
+resolve_target_image() {
+  local current_image="${1:-}"
+  local requested="${2:-}"
+  if [[ -z "${requested}" ]]; then
+    echo "${current_image}"
+    return 0
+  fi
+  if [[ "${requested}" == *"/"* && "${requested}" == *":"* ]]; then
+    echo "${requested}"
+    return 0
+  fi
+  echo "$(image_repo "${current_image}"):${requested}"
+}
+
+update_deployment_container() {
+  local deployment="${1:-}"
+  local container="${2:-}"
+  local current_image="${3:-}"
+  local requested="${4:-}"
+  local target_image
+  target_image="$(resolve_target_image "${current_image}" "${requested}")"
+  if [[ "${target_image}" == "${current_image}" ]]; then
+    echo "[INFO] ${deployment}/${container} already uses ${current_image}"
+    return 0
+  fi
+  echo "[INFO] Updating ${deployment}/${container}"
+  echo "       ${current_image} -> ${target_image}"
+  kubectl -n "${NAMESPACE}" set image deployment/"${deployment}" "${container}"="${target_image}" >/dev/null
+}
+
 B2S_IMAGE_ARG=""
 RESOURCE_IMAGE_ARG=""
 GATEWAY_WORKER_IMAGE_ARG=""
 FW_UNPACKER_IMAGE_ARG=""
+GLOBAL_TAG_ARG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help)
       usage
       exit 0
+      ;;
+    --tag)
+      GLOBAL_TAG_ARG="${2:-}"
+      shift 2
       ;;
     --b2s-image)
       B2S_IMAGE_ARG="${2:-}"
@@ -81,8 +136,8 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     *)
-      if [[ -z "${B2S_IMAGE_ARG}" ]]; then
-        B2S_IMAGE_ARG="$1"
+      if [[ -z "${GLOBAL_TAG_ARG}" ]]; then
+        GLOBAL_TAG_ARG="$1"
         shift
       else
         echo "[ERROR] Unknown argument: $1"
@@ -93,6 +148,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+GLOBAL_TAG="${GLOBAL_TAG_ARG:-${DEFAULT_IMAGE_TAG}}"
 B2S_IMAGE="$(resolve_image "${B2S_IMAGE_ARG}" "${B2S_IMAGE_REPO}")"
 RESOURCE_IMAGE="$(resolve_image "${RESOURCE_IMAGE_ARG}" "${RESOURCE_IMAGE_REPO}")"
 GATEWAY_WORKER_IMAGE="$(resolve_image "${GATEWAY_WORKER_IMAGE_ARG}" "${GATEWAY_WORKER_IMAGE_REPO}")"
@@ -103,17 +159,9 @@ if [[ -f "${SCRIPT_DIR}/images.env" ]]; then
   source "${SCRIPT_DIR}/images.env"
 fi
 
-if [[ -n "${B2S_IMAGE}" ]]; then
-  echo "[INFO] Updating binary-to-source image to: ${B2S_IMAGE}"
-  kubectl -n "${NAMESPACE}" set image deployment/"${B2S_MANAGER_DEPLOYMENT}" \
-    "${B2S_MANAGER_CONTAINER}"="${B2S_IMAGE}"
-  kubectl -n "${NAMESPACE}" set image deployment/"${B2S_WORKER_DEPLOYMENT}" \
-    "${B2S_WORKER_CONTAINER}"="${B2S_IMAGE}"
-fi
-
 if [[ -n "${RESOURCE_IMAGE}" || -n "${GATEWAY_WORKER_IMAGE}" ]]; then
-  export SECFLOW_PLATFORM_RESOURCE_IMAGE="${RESOURCE_IMAGE:-${SECFLOW_PLATFORM_RESOURCE_IMAGE:-${RESOURCE_IMAGE_REPO}:latest}}"
-  export SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE="${GATEWAY_WORKER_IMAGE:-${SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE:-${GATEWAY_WORKER_IMAGE_REPO}:latest}}"
+  export SECFLOW_PLATFORM_RESOURCE_IMAGE="${RESOURCE_IMAGE:-${SECFLOW_PLATFORM_RESOURCE_IMAGE:-${RESOURCE_IMAGE_REPO}:${GLOBAL_TAG}}}"
+  export SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE="${GATEWAY_WORKER_IMAGE:-${SECFLOW_PLATFORM_RESOURCE_FILE_GATEWAY_WORKER_IMAGE:-${GATEWAY_WORKER_IMAGE_REPO}:${GLOBAL_TAG}}}"
 
   echo "[INFO] Applying resource ConfigMap with image vars:"
   echo "       SECFLOW_PLATFORM_RESOURCE_IMAGE=${SECFLOW_PLATFORM_RESOURCE_IMAGE}"
@@ -129,11 +177,44 @@ if [[ -n "${RESOURCE_IMAGE}" || -n "${GATEWAY_WORKER_IMAGE}" ]]; then
   envsubst < "${SCRIPT_DIR}/00-secflow-05-03-platform-resource-deployment.yaml" | kubectl apply -f -
 fi
 
-if [[ -n "${FW_UNPACKER_IMAGE}" ]]; then
-  echo "[INFO] Updating firmware-unpacker image to: ${FW_UNPACKER_IMAGE}"
-  kubectl -n "${NAMESPACE}" set image deployment/"${FW_UNPACKER_DEPLOYMENT}" \
-    "${FW_UNPACKER_CONTAINER}"="${FW_UNPACKER_IMAGE}"
-fi
+echo "[INFO] Scanning deployments in namespace: ${NAMESPACE}"
+while IFS=$'\t' read -r deployment containers; do
+  [[ -n "${deployment}" ]] || continue
+  [[ "${deployment}" == secflow-* ]] || continue
+  IFS=';' read -ra pairs <<< "${containers}"
+  for pair in "${pairs[@]}"; do
+    [[ -n "${pair}" ]] || continue
+    container="${pair%%=*}"
+    current_image="${pair#*=}"
+    repo="$(image_repo "${current_image}")"
+    if ! is_managed_repo "${repo}"; then
+      continue
+    fi
+    requested_tag="${GLOBAL_TAG}"
+    case "${deployment}:${container}" in
+      "${B2S_MANAGER_DEPLOYMENT}:${B2S_MANAGER_CONTAINER}"|"${B2S_WORKER_DEPLOYMENT}:${B2S_WORKER_CONTAINER}")
+        [[ -n "${B2S_IMAGE}" ]] && requested_tag="${B2S_IMAGE}"
+        ;;
+      "secflow-platform-resource:secflow-platform-resource")
+        [[ -n "${RESOURCE_IMAGE}" ]] && requested_tag="${RESOURCE_IMAGE}"
+        ;;
+      "secflow-app-firmware-unpacker:secflow-app-firmware-unpacker")
+        [[ -n "${FW_UNPACKER_IMAGE}" ]] && requested_tag="${FW_UNPACKER_IMAGE}"
+        ;;
+    esac
+    update_deployment_container "${deployment}" "${container}" "${current_image}" "${requested_tag}"
+  done
+done < <(
+  kubectl -n "${NAMESPACE}" get deploy \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.name}{"="}{.image}{";"}{end}{"\n"}{end}'
+)
 
-echo "[INFO] Restarting all deployments in namespace: ${NAMESPACE}"
-kubectl rollout restart deployment -n "${NAMESPACE}"
+echo "[INFO] Waiting for secflow deployments to finish rollout"
+while IFS= read -r deployment; do
+  [[ -n "${deployment}" ]] || continue
+  kubectl -n "${NAMESPACE}" rollout status "deployment/${deployment}" --timeout=300s
+done < <(
+  kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep '^secflow-'
+)
+
+echo "[INFO] Done"
