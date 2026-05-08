@@ -6,6 +6,7 @@ ENV TZ=Asia/Shanghai
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
