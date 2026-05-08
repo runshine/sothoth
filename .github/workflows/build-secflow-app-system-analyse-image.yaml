@@ -50,17 +50,13 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-app-system-analyse/Dockerfile \
-            # --tag runshine0819/secflow-app-system-analyse:amd64-latest \
             --tag ghcr.io/runshine/secflow-app-system-analyse:amd64-latest \
-            # --tag runshine0819/secflow-app-system-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-app-system-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-system-analyse/
 
       - name: Push amd64 image
         run: |
-          # docker push runshine0819/secflow-app-system-analyse:amd64-latest
           docker push ghcr.io/runshine/secflow-app-system-analyse:amd64-latest
-          # docker push runshine0819/secflow-app-system-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
           docker push ghcr.io/runshine/secflow-app-system-analyse:amd64-${{ needs.prepare.outputs.date_tag }}
 
   build-arm64:
@@ -93,17 +89,13 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-app-system-analyse/Dockerfile \
-            # --tag runshine0819/secflow-app-system-analyse:arm64-latest \
             --tag ghcr.io/runshine/secflow-app-system-analyse:arm64-latest \
-            # --tag runshine0819/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-app-system-analyse/
 
       - name: Push arm64 image
         run: |
-          # docker push runshine0819/secflow-app-system-analyse:arm64-latest
           docker push ghcr.io/runshine/secflow-app-system-analyse:arm64-latest
-          # docker push runshine0819/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
           docker push ghcr.io/runshine/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
 
   merge-manifest:
@@ -128,14 +120,7 @@ jobs:
 
       - name: Create and push Docker Hub manifests
         run: |
-          # docker manifest create runshine0819/secflow-app-system-analyse:latest \
-            # runshine0819/secflow-app-system-analyse:amd64-latest \
-            # runshine0819/secflow-app-system-analyse:arm64-latest
-          # docker manifest create runshine0819/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }} \
-            # runshine0819/secflow-app-system-analyse:amd64-${{ needs.prepare.outputs.date_tag }} \
-            # runshine0819/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
-          # docker manifest push runshine0819/secflow-app-system-analyse:latest
-          # docker manifest push runshine0819/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }}
+          echo "Docker Hub manifest push disabled"
 
       - name: Create and push GHCR manifests
         run: |
