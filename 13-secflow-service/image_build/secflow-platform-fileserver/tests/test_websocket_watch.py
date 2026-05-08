@@ -53,6 +53,7 @@ def build_client(tmp_path, monkeypatch):
         registry=RegistryConfig(
             menu_service_url="http://menu",
             service_id="secflow-platform-fileserver",
+            service_name="SecFlow Fileserver",
             description="test",
             api_prefix="/api/fileserver",
             port=80,

@@ -51,6 +51,7 @@ def build_client(tmp_path, monkeypatch):
         registry=RegistryConfig(
             menu_service_url="http://menu",
             service_id="secflow-platform-fileserver",
+            service_name="SecFlow Fileserver",
             description="test",
             api_prefix="/api/fileserver",
             port=80,
@@ -132,6 +133,13 @@ def test_project_filesystem_upload_conflict_and_overwrite(tmp_path, monkeypatch)
 def test_project_filesystem_upload_rejects_directory_overwrite(tmp_path, monkeypatch):
     with build_client(tmp_path, monkeypatch) as client:
         headers = {"Authorization": "Bearer fake-token"}
+
+        create_parent_dir = client.post(
+            "/api/fileserver/project-filesystem/directories",
+            json={"project_id": "demo-project", "path": "/docs"},
+            headers=headers,
+        )
+        assert create_parent_dir.status_code == 200
 
         create_dir = client.post(
             "/api/fileserver/project-filesystem/directories",

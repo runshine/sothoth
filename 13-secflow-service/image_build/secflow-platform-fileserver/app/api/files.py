@@ -1307,6 +1307,7 @@ async def persist_sync_stream(request: Request, destination_path: str) -> tuple[
 async def persist_upload(upload: UploadFile, destination_dir: str) -> tuple[str, str, int]:
     sha256 = hashlib.sha256()
     total_size = 0
+    await run_io(os.makedirs, destination_dir, 0o777, True)
     fd, temp_path = await run_io(tempfile.mkstemp, ".part", "upload_", destination_dir)
     os.close(fd)
     def _truncate(path: str):
