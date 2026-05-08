@@ -205,6 +205,41 @@ class UnpackTaskEvent(Base):
         }
 
 
+class WorkspaceCleanupJob(Base):
+    __tablename__ = "secflow_app_firmware_unpacker_workspace_cleanup_jobs"
+
+    id = Column(String(32), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=True, index=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    owner_id = Column(String(96), nullable=True, index=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    reason = Column(String(64), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "project_id": self.project_id,
+            "status": self.status,
+            "owner_id": self.owner_id,
+            "lease_expires_at": isoformat_local(self.lease_expires_at),
+            "attempts": self.attempts,
+            "reason": self.reason,
+            "error_message": self.error_message,
+            "created_by": self.created_by,
+            "created_at": isoformat_local(self.created_at),
+            "started_at": isoformat_local(self.started_at),
+            "completed_at": isoformat_local(self.completed_at),
+        }
+
+
 DEFAULT_CONFIGS = [
     ("concurrency_mode", "auto", "string", "并发控制模式：auto=按 Pod CPU/内存自动计算，manual=手动指定"),
     ("manual_max_concurrent", "3", "int", "手动模式下单个 Pod 最大并发解包任务数"),
@@ -285,6 +320,7 @@ def apply_table_prefix_if_needed() -> None:
     WorkerInstance.__table__.name = f"{prefix}worker_instances"
     ServiceConfig.__table__.name = f"{prefix}service_configs"
     UnpackTaskEvent.__table__.name = f"{prefix}task_events"
+    WorkspaceCleanupJob.__table__.name = f"{prefix}workspace_cleanup_jobs"
 
 
 def init_database() -> None:

@@ -201,6 +201,14 @@ def _cancel_timeout_seconds() -> int:
     )
 
 
+def _cleanup_job_lease_seconds() -> int:
+    return max(30, _task_lease_seconds())
+
+
+def _cleanup_job_lease_deadline(now: Optional[datetime] = None) -> datetime:
+    return (now or now_local()) + timedelta(seconds=_cleanup_job_lease_seconds())
+
+
 def _lease_deadline(now: Optional[datetime] = None) -> datetime:
     return (now or now_local()) + timedelta(seconds=_task_lease_seconds())
 
@@ -679,6 +687,120 @@ def remove_task_workspace(task_id: str, project_id: Optional[str]) -> None:
     logger.info("task workspace removed: %s", base_dir)
 
 
+def enqueue_workspace_cleanup(
+    task_id: str,
+    project_id: Optional[str],
+    *,
+    reason: str,
+    created_by: str = "task_manager",
+) -> None:
+    from app.model import WorkspaceCleanupJob, generate_id, get_db_session
+
+    db = get_db_session()
+    try:
+        existing = (
+            db.query(WorkspaceCleanupJob)
+            .filter(
+                WorkspaceCleanupJob.task_id == task_id,
+                WorkspaceCleanupJob.project_id == project_id,
+                WorkspaceCleanupJob.status.in_(["pending", "running"]),
+            )
+            .first()
+        )
+        if existing is not None:
+            return
+        db.add(
+            WorkspaceCleanupJob(
+                id=generate_id(),
+                task_id=task_id,
+                project_id=project_id,
+                status="pending",
+                reason=reason,
+                created_by=created_by,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def process_workspace_cleanup_jobs(limit: int = 2) -> int:
+    from app.model import WorkspaceCleanupJob, get_db_session, get_worker_id
+
+    owner_id = get_worker_id()
+    processed = 0
+    while processed < max(1, limit):
+        db = get_db_session()
+        job = None
+        now = now_local()
+        try:
+            job = (
+                db.query(WorkspaceCleanupJob)
+                .filter(
+                    (
+                        (WorkspaceCleanupJob.status == "pending")
+                        | (
+                            (WorkspaceCleanupJob.status == "running")
+                            & (
+                                (WorkspaceCleanupJob.lease_expires_at.is_(None))
+                                | (WorkspaceCleanupJob.lease_expires_at < now)
+                            )
+                        )
+                    )
+                )
+                .order_by(WorkspaceCleanupJob.created_at.asc())
+                .first()
+            )
+            if job is None:
+                db.close()
+                break
+            job.status = "running"
+            job.owner_id = owner_id
+            job.started_at = job.started_at or now
+            job.completed_at = None
+            job.error_message = None
+            job.attempts = int(job.attempts or 0) + 1
+            job.lease_expires_at = _cleanup_job_lease_deadline(now)
+            db.commit()
+            task_id = job.task_id
+            project_id = job.project_id
+            job_id = job.id
+        finally:
+            db.close()
+
+        error_message: Optional[str] = None
+        try:
+            remove_task_workspace(task_id, project_id)
+        except Exception as exc:
+            error_message = str(exc)
+            logger.warning(
+                "failed to remove workspace for cleanup job %s task %s: %s",
+                job_id,
+                task_id,
+                exc,
+            )
+
+        db = get_db_session()
+        try:
+            current = db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.id == job_id).first()
+            if current is None:
+                processed += 1
+                continue
+            current.owner_id = owner_id
+            current.lease_expires_at = None
+            current.completed_at = now_local()
+            if error_message:
+                current.status = "failed"
+                current.error_message = error_message
+            else:
+                current.status = "success"
+            db.commit()
+        finally:
+            db.close()
+        processed += 1
+    return processed
+
+
 def resolve_task_runtime_paths(
     task_id: str,
     project_id: Optional[str],
@@ -913,8 +1035,8 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
 
     deleted_count = 0
     skipped_ids: list[str] = []
-    deleted_workspaces: list[tuple[str, Optional[str]]] = []
     deleted_event_payloads: list[dict[str, object]] = []
+    cleanup_candidates: list[tuple[str, Optional[str]]] = []
     db = get_db_session()
     try:
         for task_id in task_ids:
@@ -949,7 +1071,7 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
                 }
             )
             deleted_count += 1
-            deleted_workspaces.append((task_id, task.project_id))
+            cleanup_candidates.append((task_id, task.project_id))
         db.commit()
         for payload in deleted_event_payloads:
             _record_task_event(
@@ -963,15 +1085,13 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
                 owner_id=payload.get("owner_id"),
                 created_by="task_manager",
             )
-        for task_id, project_id in deleted_workspaces:
-            try:
-                remove_task_workspace(task_id, project_id)
-            except Exception as exc:
-                logger.warning(
-                    "failed to remove workspace for deleted task %s: %s",
-                    task_id,
-                    exc,
-                )
+        for task_id, project_id in cleanup_candidates:
+            enqueue_workspace_cleanup(
+                task_id,
+                project_id,
+                reason="task_deleted",
+                created_by="task_manager",
+            )
         return deleted_count, skipped_ids
     finally:
         db.close()

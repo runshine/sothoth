@@ -1274,7 +1274,7 @@ async def delete_project_task(
     if deleted_count == 0:
         raise ForbiddenError("运行中的任务不能删除，请先取消")
     return {
-        "message": "任务删除成功",
+        "message": "任务删除已受理，目录清理将在后台完成",
         "task_id": task_id,
         "deleted_count": deleted_count,
         "skipped_ids": skipped_ids,
@@ -1459,7 +1459,7 @@ async def batch_delete_task_legacy(
         await _get_task_with_access(task_id, token)
     deleted_count, skipped_ids = delete_tasks(request.task_ids)
     return {
-        "message": "批量删除完成",
+        "message": "批量删除已受理，目录清理将在后台完成",
         "deleted_count": deleted_count,
         "skipped_ids": skipped_ids,
     }

@@ -16,6 +16,7 @@ from app.time_utils import now_local
 logger = logging.getLogger(__name__)
 
 _heartbeat_thread: Optional[threading.Thread] = None
+_cleanup_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
 _active_lock = threading.Lock()
 
@@ -155,7 +156,7 @@ def reclaim_orphaned_tasks() -> None:
 
 def cleanup_finished_tasks() -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
-    from app.services.task_manager import remove_task_workspace
+    from app.services.task_manager import enqueue_workspace_cleanup
 
     retention_days = _runtime_cleanup_days()
     if retention_days <= 0:
@@ -197,14 +198,12 @@ def cleanup_finished_tasks() -> None:
         db.close()
 
     for task_id, project_id in expired_tasks:
-        try:
-            remove_task_workspace(task_id, project_id)
-        except Exception as exc:
-            logger.warning(
-                "failed to remove workspace for cleaned task %s: %s",
-                task_id,
-                exc,
-            )
+        enqueue_workspace_cleanup(
+            task_id,
+            project_id,
+            reason="retention_cleanup",
+            created_by="worker",
+        )
 
 
 def get_cluster_snapshot() -> dict:
@@ -252,8 +251,18 @@ def _heartbeat_loop(interval: int) -> None:
             logger.warning("worker heartbeat loop warning: %s", exc)
 
 
+def _cleanup_loop(interval: int) -> None:
+    from app.services.task_manager import process_workspace_cleanup_jobs
+
+    while not _stop_event.wait(timeout=interval):
+        try:
+            process_workspace_cleanup_jobs()
+        except Exception as exc:
+            logger.warning("workspace cleanup loop warning: %s", exc)
+
+
 def start_heartbeat(interval: Optional[int] = None) -> None:
-    global _heartbeat_thread
+    global _heartbeat_thread, _cleanup_thread
 
     if _heartbeat_thread and _heartbeat_thread.is_alive():
         return
@@ -267,6 +276,13 @@ def start_heartbeat(interval: Optional[int] = None) -> None:
         daemon=True,
     )
     _heartbeat_thread.start()
+    _cleanup_thread = threading.Thread(
+        target=_cleanup_loop,
+        args=(max(5, loop_interval),),
+        name="fw-workspace-cleanup",
+        daemon=True,
+    )
+    _cleanup_thread.start()
     logger.info("worker heartbeat started")
 
 
@@ -274,4 +290,6 @@ def stop_heartbeat() -> None:
     _stop_event.set()
     if _heartbeat_thread and _heartbeat_thread.is_alive():
         _heartbeat_thread.join(timeout=5)
+    if _cleanup_thread and _cleanup_thread.is_alive():
+        _cleanup_thread.join(timeout=5)
     logger.info("worker heartbeat stopped")

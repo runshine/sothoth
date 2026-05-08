@@ -7,7 +7,7 @@ from unittest.mock import patch
 import yaml
 
 from app.config import reload_config
-from app.model import TaskStatus, UnpackTask, UnpackTaskEvent, WorkerInstance, get_db_session, init_database
+from app.model import TaskStatus, UnpackTask, UnpackTaskEvent, WorkerInstance, WorkspaceCleanupJob, get_db_session, init_database
 import app.model as model_module
 import app.unpacker_engine as unpacker_engine_module
 import app.services.task_manager as task_manager_module
@@ -279,6 +279,84 @@ class TaskManagerLeaseTests(unittest.TestCase):
             self.assertIn("owner restarted", task.result_message or "")
         finally:
             db.close()
+
+    def test_delete_task_enqueues_cleanup_job_without_removing_workspace_inline(self):
+        firmware = self.root / "firmware.bin"
+        firmware.write_bytes(b"firmware")
+        workspace_root = self.root / "data"
+        outside_file = self.root / "outside.txt"
+        outside_file.write_text("keep", encoding="utf-8")
+
+        with patch("app.services.task_manager.PROJECT_FILES_ROOT", workspace_root):
+            prepared = prepare_task_workspace("p1", "t-delete", str(firmware))
+
+            db = get_db_session()
+            try:
+                db.add(
+                    UnpackTask(
+                        id="t-delete",
+                        project_id="p1",
+                        firmware_path=str(firmware),
+                        output_path=prepared["output_path"],
+                        status=TaskStatus.SUCCESS.value,
+                        current_stage="cleanup",
+                    )
+                )
+                db.commit()
+            finally:
+                db.close()
+
+            with patch("app.services.task_manager.remove_task_workspace") as mocked_remove:
+                deleted_count, skipped_ids = task_manager_module.delete_tasks(["t-delete"])
+
+            self.assertEqual(1, deleted_count)
+            self.assertEqual([], skipped_ids)
+            mocked_remove.assert_not_called()
+            self.assertTrue(outside_file.exists())
+
+            db = get_db_session()
+            try:
+                task = db.query(UnpackTask).filter(UnpackTask.id == "t-delete").first()
+                self.assertIsNone(task)
+                jobs = db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.task_id == "t-delete").all()
+                self.assertEqual(1, len(jobs))
+                self.assertEqual("pending", jobs[0].status)
+                self.assertEqual("task_deleted", jobs[0].reason)
+            finally:
+                db.close()
+
+    def test_process_workspace_cleanup_jobs_removes_only_task_workspace(self):
+        firmware = self.root / "firmware.bin"
+        firmware.write_bytes(b"firmware")
+        workspace_root = self.root / "data"
+        outside_file = self.root / "outside.txt"
+        outside_file.write_text("keep", encoding="utf-8")
+
+        with patch("app.services.task_manager.PROJECT_FILES_ROOT", workspace_root):
+            prepared = prepare_task_workspace("p1", "t-clean", str(firmware))
+            task_base_dir = Path(prepared["output_path"]).parent
+            self.assertTrue(task_base_dir.exists())
+
+            task_manager_module.enqueue_workspace_cleanup(
+                "t-clean",
+                "p1",
+                reason="task_deleted",
+                created_by="test",
+            )
+            processed = task_manager_module.process_workspace_cleanup_jobs(limit=1)
+
+            self.assertEqual(1, processed)
+            self.assertFalse(task_base_dir.exists())
+            self.assertTrue(outside_file.exists())
+
+            db = get_db_session()
+            try:
+                job = db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.task_id == "t-clean").first()
+                self.assertIsNotNone(job)
+                self.assertEqual("success", job.status)
+                self.assertIsNotNone(job.completed_at)
+            finally:
+                db.close()
 
 
 class TaskManagerLlmSnapshotTests(unittest.TestCase):
