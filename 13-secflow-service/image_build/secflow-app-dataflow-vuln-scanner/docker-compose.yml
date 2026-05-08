@@ -44,7 +44,7 @@ services:
       - --run-name
       - ${RUN_NAME:-docker_scan}
       - --model
-      - ${MODEL:-claude-sonnet-4-20250514}
+      - ${MODEL:-icsl/zai-org/GLM-5}
       - --provider
       - ${PROVIDER:-anthropic}
       - --thinking

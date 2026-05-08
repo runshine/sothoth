@@ -169,12 +169,12 @@ def test_direct_context_marks_review_feedback_as_pre_review_snapshot(
 
     assert "当前结果状态摘要（评审前快照）" in context["context_text"]
     assert "补全 issue 关闭说明" in context["context_text"]
-    user_prompt = Path("prompts/vuln_scan/global_review_user.md").read_text(encoding="utf-8")
-    sys_prompt = Path("prompts/vuln_scan/global_review_sys.md").read_text(encoding="utf-8")
+    user_prompt = Path("prompts/vuln_scan/global_review_completeness_user.md").read_text(encoding="utf-8")
+    sys_prompt = Path("prompts/vuln_scan/global_review_completeness_sys.md").read_text(encoding="utf-8")
     assert "本轮评审开始前" in user_prompt
-    assert "状态不一致" in user_prompt
-    assert "resolved_issues" in user_prompt
-    assert "不要" in sys_prompt and "状态不一致" in sys_prompt
+    assert "评审反馈" in user_prompt
+    assert "不要写任何文件" in user_prompt
+    assert "Closure 模式" in sys_prompt
 
 
 def test_direct_context_separates_supporting_docs_from_reviewable_results(
@@ -395,7 +395,7 @@ def test_profile_gate_strict_rejects_summary_only_required_evidence(
     )
 
     assert [item["id"] for item in issues] == [
-        "PROFILE-strict-summary-only-evidence"
+        "PROFILE-audit-summary-only-evidence"
     ]
     assert issues[0]["actionable_by"] == "worker"
 

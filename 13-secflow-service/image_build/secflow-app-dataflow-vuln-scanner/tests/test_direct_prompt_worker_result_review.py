@@ -297,7 +297,7 @@ async def test_worker_and_reviews_use_direct_prompt_mode_and_worker_resets_sessi
     state = DirectPromptRuntime.scenario_state[str(atomic_dir.resolve())]
 
     worker_calls = state["worker_calls"]
-    assert len(worker_calls) == 6
+    assert len(worker_calls) == 5
     assert all(call["task_token_in_prompt"] is False for call in worker_calls)
 
     by_cycle: dict[int, dict[str, str]] = {}
@@ -306,12 +306,12 @@ async def test_worker_and_reviews_use_direct_prompt_mode_and_worker_resets_sessi
 
     assert set(by_cycle.keys()) == {1, 2}
     assert set(by_cycle[1].keys()) == {"worker", "reflection", "summary"}
-    assert set(by_cycle[2].keys()) == {"worker", "reflection", "summary"}
+    assert set(by_cycle[2].keys()) == {"worker", "summary"}
     # 单 session 模式：同一 cycle 内各阶段共用同一 session
     assert len(set(by_cycle[1].values())) == 1
     assert len(set(by_cycle[2].values())) == 1
-    # 跨 cycle 重建 session，历史状态通过工作目录摘要传递，避免长上下文漂移
-    assert next(iter(set(by_cycle[1].values()))) != next(iter(set(by_cycle[2].values())))
+    # 新设计：Worker 跨所有 cycle 复用同一个 session / rpc 进程，保持完整上下文。
+    assert next(iter(set(by_cycle[1].values()))) == next(iter(set(by_cycle[2].values())))
 
     result_review_calls = state["result_review_calls"]
     assert result_review_calls

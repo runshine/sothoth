@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 ReviewProfileName = Literal["fast", "balanced", "audit"]
 ThinkingLevel = Literal["low", "medium", "high", "xhigh"]
@@ -22,8 +22,6 @@ class ReviewProfilePolicy:
     max_worker_turns_per_cycle: int
     reflection_passes_per_cycle: int
     reflection_max_internal_turns: int
-    reflection_no_progress_timeout_seconds: int
-    reflection_max_wall_seconds: int
     reflection_rpc_stdout_trace_bytes: int
     reflection_rpc_stdout_abort_bytes: int
     min_discovery_cycles_before_pass: int
@@ -33,13 +31,9 @@ class ReviewProfilePolicy:
     min_evidence_artifacts: int
     required_pattern_families: tuple[str, ...]
     max_open_obligations_in_worker_prompt: int
-    worker_no_progress_timeout_seconds: int
-    worker_max_wall_seconds: int
     worker_rpc_stdout_trace_bytes: int
     worker_rpc_stdout_abort_bytes: int
     advisor_max_internal_turns: int
-    advisor_no_progress_timeout_seconds: int
-    advisor_max_wall_seconds: int
     advisor_rpc_stdout_trace_bytes: int
     advisor_rpc_stdout_abort_bytes: int
     execution_goal: str
@@ -82,8 +76,6 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         max_worker_turns_per_cycle=35,
         reflection_passes_per_cycle=0,
         reflection_max_internal_turns=4,
-        reflection_no_progress_timeout_seconds=60,
-        reflection_max_wall_seconds=120,
         reflection_rpc_stdout_trace_bytes=512 * 1024,
         reflection_rpc_stdout_abort_bytes=16 * 1024 * 1024,
         min_discovery_cycles_before_pass=1,
@@ -93,13 +85,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         min_evidence_artifacts=0,
         required_pattern_families=(),
         max_open_obligations_in_worker_prompt=8,
-        worker_no_progress_timeout_seconds=240,
-        worker_max_wall_seconds=900,
         worker_rpc_stdout_trace_bytes=2 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=96 * 1024 * 1024,
         advisor_max_internal_turns=12,
-        advisor_no_progress_timeout_seconds=120,
-        advisor_max_wall_seconds=300,
         advisor_rpc_stdout_trace_bytes=1 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=64 * 1024 * 1024,
         execution_goal="快速确认显性漏洞并生成 summary.md；不做评审返工或低风险穷尽。",
@@ -123,10 +111,8 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         max_worker_turns_per_cycle=70,
         reflection_passes_per_cycle=1,
         reflection_max_internal_turns=12,
-        reflection_no_progress_timeout_seconds=120,
-        reflection_max_wall_seconds=420,
         reflection_rpc_stdout_trace_bytes=1 * 1024 * 1024,
-        reflection_rpc_stdout_abort_bytes=64 * 1024 * 1024,
+        reflection_rpc_stdout_abort_bytes=128 * 1024 * 1024,
         min_discovery_cycles_before_pass=1,
         progress_required_after_cycle=0,
         progress_no_signal_closure_streak=2,
@@ -138,13 +124,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
             "input_validation",
         ),
         max_open_obligations_in_worker_prompt=24,
-        worker_no_progress_timeout_seconds=600,
-        worker_max_wall_seconds=1800,
         worker_rpc_stdout_trace_bytes=4 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=256 * 1024 * 1024,
         advisor_max_internal_turns=24,
-        advisor_no_progress_timeout_seconds=240,
-        advisor_max_wall_seconds=900,
         advisor_rpc_stdout_trace_bytes=4 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=128 * 1024 * 1024,
         execution_goal="覆盖 STAR、高风险端点和关键 EXPORT/USED，优先挖出大部分中高危漏洞。",
@@ -170,10 +152,8 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         max_worker_turns_per_cycle=140,
         reflection_passes_per_cycle=3,
         reflection_max_internal_turns=24,
-        reflection_no_progress_timeout_seconds=240,
-        reflection_max_wall_seconds=1080,
         reflection_rpc_stdout_trace_bytes=2 * 1024 * 1024,
-        reflection_rpc_stdout_abort_bytes=128 * 1024 * 1024,
+        reflection_rpc_stdout_abort_bytes=256 * 1024 * 1024,
         min_discovery_cycles_before_pass=3,
         progress_required_after_cycle=3,
         progress_no_signal_closure_streak=1,
@@ -188,13 +168,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
             "concurrency_timing",
         ),
         max_open_obligations_in_worker_prompt=80,
-        worker_no_progress_timeout_seconds=1200,
-        worker_max_wall_seconds=3600,
         worker_rpc_stdout_trace_bytes=8 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=512 * 1024 * 1024,
         advisor_max_internal_turns=54,
-        advisor_no_progress_timeout_seconds=480,
-        advisor_max_wall_seconds=1800,
         advisor_rpc_stdout_trace_bytes=8 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=256 * 1024 * 1024,
         execution_goal="深度审计关键数据流、变体和跨路径副作用；尽量挖出最多且最深的漏洞。",
@@ -268,11 +244,11 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
                 "report_completeness": 0.70,
             },
             score_thresholds={
-                "input_coverage": 1.00,
-                "export_followthrough": 0.95,
-                "used_coverage": 0.95,
-                "limitations_honesty": 0.95,
-                "report_completeness": 0.90,
+                "input_coverage": 0.95,
+                "export_followthrough": 0.90,
+                "used_coverage": 0.90,
+                "limitations_honesty": 0.90,
+                "report_completeness": 0.88,
             },
             score_threshold_ramp_cycles=5,
         ),
@@ -283,8 +259,8 @@ _SCORE_THRESHOLD_POLICIES: dict[str, dict[str, ReviewScoreThresholdPolicy]] = {
                 "code_evidence_depth": 0.60,
             },
             score_thresholds={
-                "vuln_pattern_breadth": 0.85,
-                "code_evidence_depth": 0.85,
+                "vuln_pattern_breadth": 0.82,
+                "code_evidence_depth": 0.82,
             },
             score_threshold_ramp_cycles=5,
         ),
@@ -412,6 +388,141 @@ def get_review_score_threshold_policy(
     )
 
 
+def _runtime_config_dict(agent: dict) -> dict:
+    runtime_config = agent.get("runtime_config")
+    if not isinstance(runtime_config, dict):
+        runtime_config = {}
+        agent["runtime_config"] = runtime_config
+    return runtime_config
+
+
+_RPC_RUNTIME_WATCHDOG_KEYS = (
+    "no_progress_timeout_seconds",
+    "max_wall_seconds",
+    "max_retry_wall_seconds",
+)
+
+_RPC_REFLECTION_WATCHDOG_KEYS = (
+    "reflection_no_progress_timeout_seconds",
+    "reflection_max_wall_seconds",
+)
+
+
+def _coerce_min_int(value: Any, default: int, minimum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= minimum else default
+
+
+def _runtime_transport(runtime_config: dict[str, Any]) -> str:
+    transport = str(runtime_config.get("transport") or runtime_config.get("mode") or "json").strip().lower()
+    return transport if transport in {"json", "rpc"} else "json"
+
+
+def _sanitize_rpc_runtime_config(runtime_config: dict[str, Any]) -> None:
+    timeout_max_retries = _coerce_min_int(runtime_config.get("timeout_max_retries", 3), 3, 1)
+    timeout_retry_interval_seconds = _coerce_min_int(
+        runtime_config.get(
+            "timeout_retry_interval_seconds",
+            runtime_config.get("timeout_retry_delay", 30),
+        ),
+        30,
+        0,
+    )
+    runtime_config["timeout_max_retries"] = timeout_max_retries
+    runtime_config["timeout_retry_delay"] = timeout_retry_interval_seconds
+    runtime_config["timeout_retry_interval_seconds"] = timeout_retry_interval_seconds
+    if _runtime_transport(runtime_config) != "rpc":
+        return
+    for key in _RPC_RUNTIME_WATCHDOG_KEYS:
+        runtime_config.pop(key, None)
+    runtime_config["api_max_retries"] = _coerce_min_int(
+        runtime_config.get("api_max_retries", runtime_config.get("max_retries", 0)),
+        0,
+        0,
+    )
+    runtime_config["pi_max_retries"] = _coerce_min_int(
+        runtime_config.get("pi_max_retries", 0),
+        0,
+        0,
+    )
+
+
+def apply_profile_runtime_policy_to_config(
+    config: dict,
+    review_profile: str | None,
+) -> ReviewProfileName:
+    """Re-apply profile-owned runtime budgets after external overrides."""
+    policy = get_review_profile_policy(review_profile)
+    if not policy.review_enabled:
+        config.setdefault("global", {})["max_review_cycles"] = 1
+
+    for agent in config.get("agents") or []:
+        if not isinstance(agent, dict):
+            continue
+        runtime_config = _runtime_config_dict(agent)
+        agent_type = str(agent.get("type") or "").strip()
+        if agent_type == "pi_agent":
+            _sanitize_rpc_runtime_config(runtime_config)
+        agent_id = str(agent.get("id") or "").strip()
+        if agent_id == "pi-worker":
+            runtime_config["max_internal_turns"] = 0
+            runtime_config["rpc_stdout_trace_bytes"] = policy.worker_rpc_stdout_trace_bytes
+            runtime_config["rpc_stdout_abort_bytes"] = policy.worker_rpc_stdout_abort_bytes
+        elif agent_id == "pi-advisor":
+            runtime_config["advisor_runtime_retries"] = 3
+            runtime_config["max_internal_turns"] = policy.advisor_max_internal_turns
+            runtime_config["rpc_stdout_trace_bytes"] = policy.advisor_rpc_stdout_trace_bytes
+            runtime_config["rpc_stdout_abort_bytes"] = policy.advisor_rpc_stdout_abort_bytes
+
+    atomic_workflows = ((config.get("workflows") or {}).get("atomic") or [])
+    for workflow in atomic_workflows:
+        if not isinstance(workflow, dict):
+            continue
+        engine = workflow.get("engine")
+        if not isinstance(engine, dict):
+            engine = {}
+            workflow["engine"] = engine
+        if "review_profile" not in engine and workflow.get("id") != "vuln_scan":
+            continue
+        engine["review_profile"] = policy.name
+        engine["review_enabled"] = policy.review_enabled
+        if not policy.review_enabled:
+            engine["max_review_cycles"] = 1
+        engine["max_worker_turns_per_cycle"] = policy.max_worker_turns_per_cycle
+        engine["reflection_passes_per_cycle"] = policy.reflection_passes_per_cycle
+        engine["reflection_max_internal_turns"] = policy.reflection_max_internal_turns
+        engine["reflection_rpc_stdout_trace_bytes"] = policy.reflection_rpc_stdout_trace_bytes
+        engine["reflection_rpc_stdout_abort_bytes"] = policy.reflection_rpc_stdout_abort_bytes
+        for key in _RPC_REFLECTION_WATCHDOG_KEYS:
+            engine.pop(key, None)
+        engine["min_discovery_cycles_before_pass"] = policy.min_discovery_cycles_before_pass
+        engine["progress_required_after_cycle"] = policy.progress_required_after_cycle
+        engine["progress_no_signal_closure_streak"] = policy.progress_no_signal_closure_streak
+        engine["progress_no_signal_abort_streak"] = policy.progress_no_signal_abort_streak
+        engine["min_evidence_artifacts"] = policy.min_evidence_artifacts
+        engine["required_pattern_families"] = list(policy.required_pattern_families)
+        engine["plateau_closure_streak"] = policy.progress_no_signal_closure_streak
+        engine["plateau_abort_streak"] = policy.progress_no_signal_abort_streak
+
+        advisors = ((workflow.get("roles") or {}).get("advisors") or {})
+        for advisor in advisors.get("global_review") or []:
+            if not isinstance(advisor, dict):
+                continue
+            instance_id = str(advisor.get("instance_id") or "")
+            if not instance_id:
+                continue
+            score_policy = get_review_score_threshold_policy(policy.name, instance_id)
+            advisor["score_fields"] = list(score_policy.score_fields)
+            advisor["score_thresholds_start"] = score_policy.score_thresholds_start
+            advisor["score_thresholds"] = score_policy.score_thresholds
+            advisor["score_threshold_ramp_cycles"] = score_policy.score_threshold_ramp_cycles
+
+    return policy.name
+
+
 def _format_threshold_brief(policy: ReviewScoreThresholdPolicy) -> str:
     return ", ".join(
         f"{key}>={value:.2f}"
@@ -449,15 +560,14 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
                 f"gate={gate}; required_risks={required}; "
                 f"required_kinds={kinds}; dataflow>={policy.min_declared_extraction_ratio:.0%}; "
                 f"summary_only={summary_only}; cycles={policy.default_max_review_cycles}; "
-                f"internal_turns={policy.max_worker_turns_per_cycle}; "
+                "worker_internal_turns=unlimited; "
                 f"reflection_turns={policy.reflection_max_internal_turns}; "
                 f"advisor_turns={policy.advisor_max_internal_turns}; "
                 f"min_discovery={policy.min_discovery_cycles_before_pass}; "
                 f"progress_after={policy.progress_required_after_cycle}; "
                 f"min_evidence_artifacts={policy.min_evidence_artifacts}; "
                 f"required_patterns={len(policy.required_pattern_families)}; "
-                f"worker_wall={policy.worker_max_wall_seconds}s; "
-                f"advisor_wall={policy.advisor_max_wall_seconds}s; "
+                f"pi_timeout=native; "
                 f"depth_threshold={min(depth_thresholds.score_thresholds.values()):.2f}"
             ),
         ])
@@ -472,20 +582,15 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
         f"- data-flow 抽取下限: {policy.min_declared_extraction_ratio:.0%}",
         f"- summary-only evidence: {'allowed' if policy.allow_summary_only_evidence else 'not sufficient'}",
         f"- 默认最大评审轮次: {policy.default_max_review_cycles}",
-        f"- 单轮 Worker 内部 turn 硬上限: {policy.max_worker_turns_per_cycle}",
-        f"- 单轮 Worker 无进展超时: {policy.worker_no_progress_timeout_seconds}s",
-        f"- 单轮 Worker 最大墙钟: {policy.worker_max_wall_seconds}s",
-        f"- 单轮 Worker stdout hard-abort: {policy.worker_rpc_stdout_abort_bytes // (1024 * 1024)}MB",
+        "- 单轮 Worker 内部 turn 硬上限: 不限制",
+        f"- 单轮 Worker stdout 软上限: {policy.worker_rpc_stdout_abort_bytes // (1024 * 1024)}MB",
         f"- 单次 Advisor 内部 turn 硬上限: {policy.advisor_max_internal_turns}",
-        f"- 单次 Advisor 无进展超时: {policy.advisor_no_progress_timeout_seconds}s",
-        f"- 单次 Advisor 最大墙钟: {policy.advisor_max_wall_seconds}s",
-        f"- 单次 Advisor stdout hard-abort: {policy.advisor_rpc_stdout_abort_bytes // (1024 * 1024)}MB",
+        f"- 单次 Advisor stdout 软上限: {policy.advisor_rpc_stdout_abort_bytes // (1024 * 1024)}MB",
         f"- 全面性最终分数线: {_format_threshold_brief(completeness_thresholds)}",
         f"- 深入性最终分数线: {_format_threshold_brief(depth_thresholds)}",
         f"- 每轮反思 pass: {policy.reflection_passes_per_cycle}",
         f"- 单次反思内部 turn 硬上限: {policy.reflection_max_internal_turns}",
-        f"- 单次反思无进展超时: {policy.reflection_no_progress_timeout_seconds}s",
-        f"- 单次反思最大墙钟: {policy.reflection_max_wall_seconds}s",
+        "- Pi/provider timeout: 仅依赖 Pi 原生 timeout；重发次数/间隔由 runtime_config.timeout_max_retries 与 timeout_retry_interval_seconds 控制",
         f"- 最少探索轮次: {policy.min_discovery_cycles_before_pass}",
         f"- 有效进展检测起始轮: {policy.progress_required_after_cycle or 'disabled'}",
         (

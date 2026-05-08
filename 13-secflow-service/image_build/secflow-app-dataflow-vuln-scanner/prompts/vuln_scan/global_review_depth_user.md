@@ -11,7 +11,8 @@
 {prior_global_findings}
 
 ## Worker 漏洞挖掘清单基线
-若需核对 Worker 应覆盖的漏洞模式，请 `read` 此文件：`{worker_system_prompt_file}`
+若需核对 Worker 的稳定角色/输出契约，请 `read` 此文件：`{worker_system_prompt_file}`。
+实际漏洞模式广度由当前 `review_profile` 动态裁剪，已在下方评审上下文的 Review Profile / Coverage Obligation Ledger 中体现；不要机械要求低档位执行 audit 全量清单。
 
 ## 当前评审上下文
 {review_context}

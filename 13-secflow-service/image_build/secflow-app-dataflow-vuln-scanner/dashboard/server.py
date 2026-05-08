@@ -56,9 +56,12 @@ _TERMINAL_STATUSES = {
     "blocked_quota",
     "provider_rate_limited",
     "model_contract_violation",
+    "blocked_external_source",
     "no_workspace",
     "error",
 }
+
+_GENERIC_TERMINAL_STATUSES = {"failed", "error"}
 
 
 # ═══════════════════════════════════════════════════
@@ -272,9 +275,13 @@ def _read_run_timestamps(run_dir: Path) -> dict:
 def _normalize_run_status(raw_status: str, run_meta: dict | None = None) -> str:
     run_meta = run_meta or {}
     text = str(raw_status or "").strip().lower()
+    meta_status = str(run_meta.get("status") or "").strip().lower()
+    if not run_meta.get("finished_at") and meta_status in _RUNNING_WORKFLOW_STATES | {"running", "queued", "pending", "cancel_requested", "delete_requested"}:
+        return "running" if meta_status == "in_progress" else meta_status
     if run_meta.get("finished_at"):
-        meta_status = str(run_meta.get("status") or "").strip().lower()
         if meta_status in _TERMINAL_STATUSES:
+            if meta_status in _GENERIC_TERMINAL_STATUSES and text in (_TERMINAL_STATUSES - _GENERIC_TERMINAL_STATUSES):
+                return text
             return meta_status
     if text in {"", "unknown", "pending"}:
         return text or "pending"
@@ -993,6 +1000,27 @@ def get_sessions(name: str):
                 "duration_ms": resp.get("duration_ms"),
                 "output_len": resp.get("output_len", 0),
                 "error": resp.get("error"),
+                "error_code": resp.get("error_code", ""),
+                "mode": resp.get("mode", ""),
+                "attempts": resp.get("attempts", []),
+                "api_failures": resp.get("api_failures", 0),
+                "pi_failures": resp.get("pi_failures", 0),
+                "timeout_failures": resp.get("timeout_failures", 0),
+                "timeout_max_retries": resp.get("timeout_max_retries", 0),
+                "timeout_retry_fresh_session": resp.get("timeout_retry_fresh_session", False),
+                "output_total_bytes": resp.get("output_total_bytes", resp.get("stdout_total_bytes", 0)),
+                "stderr_total_bytes": resp.get("stderr_total_bytes", 0),
+                "stdout_truncated": resp.get("stdout_truncated", False),
+                "stderr_truncated": resp.get("stderr_truncated", False),
+                "stdout_soft_limit_exceeded": resp.get("stdout_soft_limit_exceeded", False),
+                "trace_limits": resp.get("trace_limits", {}),
+                "events_truncated_count": resp.get("events_truncated_count", 0),
+                "messages_truncated_count": resp.get("messages_truncated_count", 0),
+                "non_json_truncated_count": resp.get("non_json_truncated_count", 0),
+                "effective_session_id": resp.get("effective_session_id", ""),
+                "effective_session_dir": resp.get("effective_session_dir", ""),
+                "event_total_count": resp.get("event_total_count", 0),
+                "internal_turn_count": resp.get("internal_turn_count", 0),
                 "files": files,
             })
         if calls:

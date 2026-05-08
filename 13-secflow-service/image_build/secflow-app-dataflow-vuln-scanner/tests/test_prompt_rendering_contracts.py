@@ -11,7 +11,17 @@ from app.pi_vuln_core.review.state import ReviewState
 from app.pi_vuln_core.utils.template import TemplateRenderError, render_string
 
 
-def _workflow_with_worker_prompt(worker_prompt: Path, summary_prompt: Path) -> AtomicWorkflowDef:
+def _workflow_with_worker_prompt(
+    worker_prompt: Path,
+    summary_prompt: Path,
+    rework_prompt: Path | None = None,
+) -> AtomicWorkflowDef:
+    work_prompt = {
+        "system_prompt_file": "prompts/vuln_scan/worker_system.md",
+        "user_prompt_file": str(worker_prompt),
+    }
+    if rework_prompt is not None:
+        work_prompt["rework_prompt_file"] = str(rework_prompt)
     return AtomicWorkflowDef.model_validate(
         {
             "id": "wf",
@@ -21,10 +31,7 @@ def _workflow_with_worker_prompt(worker_prompt: Path, summary_prompt: Path) -> A
                 "worker": {
                     "agent_id": "worker",
                     "prompts": {
-                        "work": {
-                            "system_prompt_file": "prompts/vuln_scan/worker_system.md",
-                            "user_prompt_file": str(worker_prompt),
-                        },
+                        "work": work_prompt,
                         "reflection": [],
                         "summary": {
                             "prompt_file": str(summary_prompt),
@@ -137,6 +144,66 @@ def test_summary_or_ledger_issue_enters_rework_prompt(tmp_path: Path) -> None:
     assert "summary 漏洞汇总表没有同步 supporting docs" in prompt
     assert "本轮只修复 `summary.md`" in prompt
     assert "不要新增、删除、重写或重新编号 `results/result_NNN.md`" in prompt
+
+
+def test_configured_rework_prompt_template_is_used(tmp_path: Path) -> None:
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# scan task\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    results_dir = work_dir / "results"
+    results_dir.mkdir(parents=True)
+    (results_dir / "result_001.md").write_text("# old result\n", encoding="utf-8")
+    rework_prompt = tmp_path / "worker_rework.md"
+    rework_prompt.write_text(
+        "REWORK TEMPLATE {cycle}\n"
+        "{active_issue_backlog}\n"
+        "{failed_result_reasons}\n"
+        "{coverage_context}\n",
+        encoding="utf-8",
+    )
+    wf = _workflow_with_worker_prompt(
+        Path("prompts/vuln_scan/worker_user.md"),
+        Path("prompts/vuln_scan/summary.md"),
+        rework_prompt=rework_prompt,
+    )
+    ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file=str(task_file),
+        working_dir=str(work_dir),
+        cycle=2,
+        review_mode="discovery",
+    )
+    state = ReviewState()
+    state.mark_result_failed("result_001.md", 1, "needs stronger source evidence")
+    state.record_global_review_result(
+        cycle=1,
+        passed=False,
+        feedback="worker gap remains",
+        scores={"used_coverage": 0.5},
+        issues=[
+            {
+                "id": "worker-gap",
+                "category": "used_coverage",
+                "target": "USED endpoint",
+                "severity": "medium",
+                "required_action": "补齐 USED endpoint 覆盖",
+                "actionable_by": "worker",
+            }
+        ],
+    )
+
+    prompt = WorkerExecutor(agent_registry=None, recorder=None)._build_user_prompt(  # type: ignore[arg-type]
+        wf,
+        ctx,
+        state,
+    )
+
+    assert "REWORK TEMPLATE 2" in prompt
+    assert "worker-gap" in prompt
+    assert "result_001.md" in prompt
+    assert "needs stronger source evidence" in prompt
+    assert "Coverage obligation ledger" in prompt
 
 
 def test_repeated_analysis_issue_adds_residual_protocol_to_closure_prompt(tmp_path: Path) -> None:

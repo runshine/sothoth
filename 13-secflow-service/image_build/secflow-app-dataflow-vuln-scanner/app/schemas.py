@@ -10,11 +10,12 @@ from app.models.contracts import TaskItem
 
 class ProfileConfigPayload(BaseModel):
     model: str = Field(..., min_length=1)
-    thinking: Optional[str] = None
     review_profile: str = Field(default="balanced", min_length=1)
     max_review_cycles: int = Field(default=6, ge=1)
     worker_timeout: int = Field(default=3600, ge=1)
     advisor_timeout: int = Field(default=3600, ge=1)
+    timeout_max_retries: int = Field(default=3, ge=1)
+    timeout_retry_interval_seconds: int = Field(default=30, ge=0)
     result_review_concurrency: int = Field(default=3, ge=1)
     runtime_overrides: Dict[str, Any] = Field(default_factory=dict)
 
@@ -27,7 +28,6 @@ class ScanProfileCreateRequest(BaseModel):
     config_payload: ProfileConfigPayload
     is_default: bool = False
     enabled: bool = True
-    max_concurrency: int = Field(default=1, ge=1)
     default_priority: int = 100
     max_retry_count: int = Field(default=3, ge=0)
     execution_timeout_seconds: int = Field(default=7200, ge=1)
@@ -40,7 +40,6 @@ class ScanProfileUpdateRequest(BaseModel):
     config_payload: Optional[ProfileConfigPayload] = None
     is_default: Optional[bool] = None
     enabled: Optional[bool] = None
-    max_concurrency: Optional[int] = Field(default=None, ge=1)
     default_priority: Optional[int] = None
     max_retry_count: Optional[int] = Field(default=None, ge=0)
     execution_timeout_seconds: Optional[int] = Field(default=None, ge=1)
@@ -56,7 +55,6 @@ class ScanProfileResponse(BaseModel):
     compiled_config: Dict[str, Any]
     is_default: bool
     enabled: bool
-    max_concurrency: int
     default_priority: int
     max_retry_count: int
     execution_timeout_seconds: int
@@ -104,11 +102,12 @@ class ScanTaskCreateRequest(BaseModel):
     output_dir: Optional[DataflowInputRef] = None
     model: Optional[str] = Field(default=None, min_length=1)
     provider: Optional[str] = None
-    thinking: Optional[str] = Field(default=None, min_length=1)
     review_profile: Optional[str] = Field(default=None, min_length=1)
     max_review_cycles: Optional[int] = Field(default=None, ge=1)
     worker_timeout: Optional[int] = Field(default=None, ge=1)
     advisor_timeout: Optional[int] = Field(default=None, ge=1)
+    timeout_max_retries: Optional[int] = Field(default=None, ge=1)
+    timeout_retry_interval_seconds: Optional[int] = Field(default=None, ge=0)
     result_review_concurrency: Optional[int] = Field(default=None, ge=1)
     scan_options: Dict[str, Any] = Field(default_factory=dict)
     artifact_refs: List[ArtifactRef] = Field(default_factory=list)
@@ -151,6 +150,7 @@ class ScanTaskResponse(BaseModel):
     parent_task_display: Optional[str] = None
     profile_id: str
     profile_version: int
+    title: str = ""
     status: str
     latest_attempt_no: int
     retry_count: int
@@ -162,6 +162,7 @@ class ScanTaskResponse(BaseModel):
     finished_at: Optional[datetime]
     message: Optional[str]
     latest_execution_id: Optional[str]
+    latest_run: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ScanTaskAttemptResponse(BaseModel):
@@ -275,7 +276,6 @@ class HistoryRunRetryRequest(BaseModel):
     extra_cycles: int = Field(default=5, ge=1)
     model: Optional[str] = Field(default=None, min_length=1)
     provider: Optional[str] = None
-    thinking: Optional[str] = Field(default=None, min_length=1)
     clean_workspace: bool = False
 
 

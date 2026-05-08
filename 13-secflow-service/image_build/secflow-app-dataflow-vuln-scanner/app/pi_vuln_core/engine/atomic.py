@@ -489,6 +489,7 @@ class AtomicWorkflowEngine:
             skip_global_review = resume_index > phase_order[AtomicWorkflowState.GLOBAL_REVIEW.value]
             summary_repair_cycle = bool(ctx.pending_summary_repair and not skip_summary)
             worker_partial_salvaged = False
+            worker_rework_skip_reflection = False
             if summary_repair_cycle:
                 ctx.summary_repair_attempts += 1
                 ctx.pending_summary_repair = False
@@ -523,6 +524,9 @@ class AtomicWorkflowEngine:
                 worker_partial_salvaged = bool(
                     (worker_response.metadata or {}).get("partial_salvaged")
                 )
+                worker_rework_skip_reflection = bool(
+                    (worker_response.metadata or {}).get("skip_reflection_after_worker")
+                )
                 vlog.worker_done(worker_response.turn_count)
             elif summary_repair_cycle:
                 logger.info(
@@ -534,6 +538,8 @@ class AtomicWorkflowEngine:
                 logger.info("resume_skip_worker", cycle=cycle, resume_state=cycle_resume_state)
 
             if worker_partial_salvaged:
+                skip_reflect = True
+            elif worker_rework_skip_reflection:
                 skip_reflect = True
 
             # ── 3. 自我反思 ──
@@ -562,6 +568,12 @@ class AtomicWorkflowEngine:
                     "worker_partial_salvage_skip_reflection",
                     cycle=cycle,
                     reason="worker hit runtime turn limit after producing artifacts; proceed to summary/review",
+                )
+            elif worker_rework_skip_reflection:
+                logger.info(
+                    "worker_rework_skip_reflection",
+                    cycle=cycle,
+                    reason="rework cycles use worker/rework + summary without reflection",
                 )
             else:
                 logger.info("resume_skip_reflection", cycle=cycle, resume_state=cycle_resume_state)

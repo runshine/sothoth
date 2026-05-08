@@ -112,7 +112,7 @@ class ConfigLoader:
     def _resolve_prompt_paths(obj: Any, *, base_dir: Path) -> None:
         prompt_keys = {
             "system_prompt_file", "user_prompt_file",
-            "user_prompt_template", "prompt_file",
+            "rework_prompt_file", "user_prompt_template", "prompt_file",
         }
         if isinstance(obj, dict):
             for key, value in obj.items():
@@ -143,6 +143,7 @@ class ConfigLoader:
             "summary_file",
             "system_prompt_file",
             "user_prompt_file",
+            "rework_prompt_file",
             "user_prompt_template",
             "prompt_file",
             "env_file",

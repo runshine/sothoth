@@ -7,7 +7,7 @@ from app.models.database import TriggerTask, WorkflowDefinition, WorkflowExecuti
 from app.services.scheduler import SchedulerService
 
 
-def test_scheduler_claim_respects_single_owner_and_definition_concurrency(
+def test_scheduler_claim_allows_multiple_running_executions_per_definition(
     service_config_path: Path,
     framework_config_payload: dict,
 ):
@@ -29,7 +29,6 @@ def test_scheduler_claim_respects_single_owner_and_definition_concurrency(
             trigger_enabled=False,
             is_active=True,
             enabled=True,
-            max_concurrency=1,
             priority_default=100,
             max_retry_count=3,
             execution_timeout_seconds=7200,
@@ -91,14 +90,14 @@ def test_scheduler_claim_respects_single_owner_and_definition_concurrency(
     config.scheduler.pod_id = "pod-b"
     scheduler_b = SchedulerService()
     second_execution_id = scheduler_b._claim_next_execution()
-    assert second_execution_id is None
+    assert second_execution_id is not None
 
     db = get_db_session()
     try:
         running = db.query(WorkflowExecution).filter(WorkflowExecution.status == "running").all()
         pending = db.query(WorkflowExecution).filter(WorkflowExecution.status == "pending").all()
-        assert len(running) == 1
-        assert running[0].owner_pod_id == "pod-a"
-        assert len(pending) == 1
+        assert len(running) == 2
+        assert {item.owner_pod_id for item in running} == {"pod-a", "pod-b"}
+        assert pending == []
     finally:
         db.close()

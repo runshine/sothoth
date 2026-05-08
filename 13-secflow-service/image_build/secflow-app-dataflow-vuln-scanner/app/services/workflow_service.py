@@ -89,15 +89,12 @@ class WorkflowService:
                 break
         return ProfileConfigPayload(
             model=str(worker_runtime.get("model") or advisor_runtime.get("model") or "legacy/model"),
-            thinking=str(
-                (worker_runtime.get("sdk_specific") or {}).get("thinking")
-                or (advisor_runtime.get("sdk_specific") or {}).get("thinking")
-                or "high"
-            ),
             review_profile=review_profile,
             max_review_cycles=int(((compiled_config.get("global") or {}).get("max_review_cycles") or 6)),
             worker_timeout=int(worker_runtime.get("timeout_seconds") or 3600),
             advisor_timeout=int(advisor_runtime.get("timeout_seconds") or 3600),
+            timeout_max_retries=int(worker_runtime.get("timeout_max_retries") or advisor_runtime.get("timeout_max_retries") or 3),
+            timeout_retry_interval_seconds=int(worker_runtime.get("timeout_retry_interval_seconds") or advisor_runtime.get("timeout_retry_interval_seconds") or 30),
             result_review_concurrency=int(((compiled_config.get("global") or {}).get("parallel_result_review_limit") or 3)),
             runtime_overrides={},
         ).model_dump(mode="json")
@@ -185,7 +182,6 @@ class WorkflowService:
             compiled_config=compiled_config,
             is_default=bool(definition.is_default),
             enabled=bool(definition.enabled),
-            max_concurrency=definition.max_concurrency,
             default_priority=definition.priority_default,
             max_retry_count=definition.max_retry_count,
             execution_timeout_seconds=definition.execution_timeout_seconds,
@@ -218,7 +214,6 @@ class WorkflowService:
             is_active=True,
             is_default=True,
             enabled=True,
-            max_concurrency=1,
             priority_default=100,
             max_retry_count=config.service.trigger_retry_limit,
             workspace_base_dir=None,
@@ -261,7 +256,6 @@ class WorkflowService:
             is_active=True,
             is_default=payload.is_default,
             enabled=payload.enabled,
-            max_concurrency=payload.max_concurrency,
             priority_default=payload.default_priority,
             max_retry_count=payload.max_retry_count,
             workspace_base_dir=None,
@@ -319,8 +313,6 @@ class WorkflowService:
             definition.enabled = updates["enabled"]
         if "is_default" in updates:
             definition.is_default = updates["is_default"]
-        if "max_concurrency" in updates:
-            definition.max_concurrency = updates["max_concurrency"]
         if "default_priority" in updates:
             definition.priority_default = updates["default_priority"]
         if "max_retry_count" in updates:

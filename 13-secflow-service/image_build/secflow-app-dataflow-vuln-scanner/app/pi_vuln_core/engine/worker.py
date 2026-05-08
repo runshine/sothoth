@@ -87,11 +87,27 @@ class WorkerExecutor:
         # Worker 会话策略:同一 cycle 内共用,跨 cycle 重建。
         session_id = await self._ensure_worker_session(agent, wf_def, ctx)
         self._sync_worker_scaffolds(ctx)
+        current_result_files = self._list_result_files(
+            os.path.join(ctx.working_dir, "results")
+        )
+        uses_rework_prompt = self._should_use_rework_prompt(
+            ctx,
+            review_state,
+            current_result_files=current_result_files,
+        )
 
         # 构建 prompt
-        system_prompt = read_file(worker_cfg.prompts.work.system_prompt_file)
+        system_prompt = self._build_worker_system_prompt(
+            worker_cfg.prompts.work.system_prompt_file,
+            ctx,
+        )
         try:
-            user_prompt = self._build_user_prompt(wf_def, ctx, review_state)
+            user_prompt = self._build_user_prompt(
+                wf_def,
+                ctx,
+                review_state,
+                current_result_files=current_result_files,
+            )
         except TemplateRenderError as exc:
             raise WorkerStageError("worker", f"Prompt 渲染失败：{exc}") from exc
 
@@ -120,6 +136,11 @@ class WorkerExecutor:
             max_turns=max_turns,
             session_id=session_id,
         )
+        response.metadata = dict(response.metadata or {})
+        response.metadata.update({
+            "worker_prompt_kind": "rework" if uses_rework_prompt else "initial",
+            "skip_reflection_after_worker": uses_rework_prompt,
+        })
 
         self._relocate_misplaced_outputs(ctx, response.turn_count)
 
@@ -199,6 +220,7 @@ class WorkerExecutor:
             extra={
                 "turn_count": response.turn_count,
                 "max_turns": max_turns,
+                "prompt_kind": response.metadata.get("worker_prompt_kind"),
                 "internal_turn_count": response.metadata.get("internal_turn_count"),
                 "event_total_count": response.metadata.get("event_total_count"),
             },
@@ -217,8 +239,6 @@ class WorkerExecutor:
         response: AgentResponse,
         pre_worker_digest: str,
     ) -> bool:
-        if ctx.cycle <= 1:
-            return False
         if not self._is_runtime_turn_limit_response(response):
             return False
         post_worker_digest = self._worker_editable_artifact_digest(ctx)
@@ -282,22 +302,25 @@ class WorkerExecutor:
     ) -> dict[str, int]:
         policy = get_review_profile_policy(ctx.review_profile)
 
-        def configured_int(name: str, fallback: int) -> int:
+        def configured_int(name: str, fallback: int, *, floor: int | None = None) -> int:
             raw = getattr(wf_def.engine, name, None)
-            return int(raw) if raw is not None else int(fallback)
+            value = int(raw) if raw is not None else int(fallback)
+            if floor is not None and value < int(floor):
+                logger.warning(
+                    "reflection_runtime_limit_below_profile_floor",
+                    workflow_id=ctx.workflow_id,
+                    review_profile=ctx.review_profile,
+                    limit=name,
+                    configured=value,
+                    profile_floor=int(floor),
+                )
+                return int(floor)
+            return value
 
         return {
             "max_internal_turns": configured_int(
                 "reflection_max_internal_turns",
                 policy.reflection_max_internal_turns,
-            ),
-            "no_progress_timeout_seconds": configured_int(
-                "reflection_no_progress_timeout_seconds",
-                policy.reflection_no_progress_timeout_seconds,
-            ),
-            "max_wall_seconds": configured_int(
-                "reflection_max_wall_seconds",
-                policy.reflection_max_wall_seconds,
             ),
             "rpc_stdout_trace_bytes": configured_int(
                 "reflection_rpc_stdout_trace_bytes",
@@ -306,6 +329,7 @@ class WorkerExecutor:
             "rpc_stdout_abort_bytes": configured_int(
                 "reflection_rpc_stdout_abort_bytes",
                 policy.reflection_rpc_stdout_abort_bytes,
+                floor=policy.reflection_rpc_stdout_abort_bytes,
             ),
         }
 
@@ -368,10 +392,12 @@ class WorkerExecutor:
     ) -> str:
         """Reuse one Worker session inside a cycle; rebuild between cycles by default."""
         engine_cfg = getattr(wf_def, "engine", None)
-        reset_per_cycle = bool(getattr(engine_cfg, "reset_worker_session_per_cycle", True))
+        reset_per_cycle = bool(getattr(engine_cfg, "reset_worker_session_per_cycle", False))
         if ctx.worker_session_id and (
             not reset_per_cycle or ctx.worker_session_cycle == ctx.cycle
         ):
+            if not reset_per_cycle:
+                ctx.worker_session_cycle = ctx.cycle
             return ctx.worker_session_id
 
         if ctx.worker_session_id and reset_per_cycle:
@@ -403,24 +429,152 @@ class WorkerExecutor:
     #  Prompt 构建 / Direct 模式
     # ─────────────────────────────────────────────
 
+    def _build_worker_system_prompt(
+        self,
+        system_prompt_file: str,
+        ctx: WorkflowContext,
+    ) -> str:
+        """Build the effective Worker system prompt with profile-owned scope.
+
+        The prompt file intentionally contains only the stable role/contract.
+        The breadth/depth checklist is injected here so fast/balanced/audit do
+        not all receive the same unbounded audit instructions.
+        """
+        base = read_file(system_prompt_file).rstrip()
+        dynamic_sections = [
+            self._format_profile_worker_scope(ctx),
+            self._result_report_template(compact=True),
+        ]
+        return base + "\n\n" + "\n\n".join(
+            section for section in dynamic_sections if section.strip()
+        ).rstrip() + "\n"
+
+    @staticmethod
+    def _result_report_template(*, compact: bool = False) -> str:
+        if compact:
+            return "\n".join([
+                "## result_NNN.md 强制结构摘要",
+                "- 每个 result 只描述一个独立漏洞疑点；无源码证据不得写入 results/。",
+                "- 必须包含：疑点元信息、数据流绑定、受控输入、源码证据、触发条件、校验/绕过分析、影响、修复建议、关联 obligation/issue。",
+                "- 若为补充/修正报告，文件开头必须写 `- **原始报告**: result_NNN.md` 与 `- **本报告性质**: 补充分析/修正`。",
+            ])
+        return "\n".join([
+            "## result_NNN.md 强制模板（按疑点上报字段组织）",
+            "",
+            "每个 `results/result_NNN.md` 必须严格按下列结构撰写；缺少关键字段会导致评审返工。",
+            "",
+            "```markdown",
+            "# <疑点标题：一句话描述漏洞本质>",
+            "",
+            "## 1. 疑点元信息",
+            "- **report_id**: result_NNN",
+            "- **title**: <疑点标题>",
+            "- **summary**: <3-5 句话概述底层问题、影响和关键证据>",
+            "- **severity**: critical / high / medium / low",
+            "- **cvss_score**: <可选；未知写 0.0>",
+            "- **confidence**: <0-100 整数>",
+            "- **state**: suspected",
+            "- **category**: <CWE 或漏洞类别，如 CWE-787 / integer_safety>",
+            "- **rule_id**: <可选；如 DATAFLOW-USED-OOB>",
+            "- **rule_name**: <可选；规则/模式名称>",
+            "- **fingerprint**: <函数名+sink+关键字段组成的稳定指纹>",
+            "",
+            "## 2. 上报主体 subject",
+            "- **subject.type**: source_function / binary_function / module / path",
+            "- **subject.locator**: <文件路径、函数名、行号或反编译地址>",
+            "- **subject.name**: <目标函数/模块名>",
+            "- **subject.version**: <未知可写 unknown>",
+            "",
+            "## 3. 数据流绑定（必须）",
+            "- **data_flow_file**: <原始数据流文件路径>",
+            "- **coverage_obligation_id**: <INPUT/EXPORT/USED/CLEANED/STAR obligation id；未知需说明>",
+            "- **data_flow_kind**: INPUT / EXPORT / USED / CLEANED / STAR",
+            "- **data_flow_source_line**: <数据流报告行号或原文片段>",
+            "- **INPUT**: <INPUT-N、字段、偏移、攻击者可控性>",
+            "- **传播路径**: INPUT → ... → sink",
+            "- **sink/危险操作**: <函数/表达式/内存操作/索引/长度使用点>",
+            "",
+            "## 4. evidence.summary",
+            "<用源码级证据说明底层问题为何真实存在。必须包含文件、函数、关键代码片段、变量来源。>",
+            "",
+            "## 5. evidence.reproduction_hint",
+            "<触发条件、输入字段取值、边界值、配置/权限前提；不可复现时说明静态触发路径。>",
+            "",
+            "## 6. evidence.references",
+            "- `<源码文件或反编译文件>:<行号/函数>` — <说明>",
+            "- `<数据流报告>:<行号>` — <说明>",
+            "",
+            "## 7. 校验与绕过分析",
+            "- 已检查的上游/本地校验：<列出 if/范围检查/长度检查>",
+            "- 绕过或失效原因：<边界值、整数溢出、符号混用、TOCTOU、错误处理等>",
+            "- 若校验充分阻断问题，不得保留为 result；应移入 supporting_docs/。",
+            "",
+            "## 8. 影响评估",
+            "<崩溃、越界读写、内存破坏、DoS、信息泄露、逻辑绕过等；说明置信度和限制。>",
+            "",
+            "## 9. 修复建议",
+            "<具体到校验、长度计算、类型转换、边界处理或调用契约。>",
+            "",
+            "## 10. artifacts / metadata",
+            "- **artifacts**: <相关 supporting_docs、代码片段、日志或 PoC 文件路径；没有写 none>",
+            "- **metadata.review_profile**: <fast/balanced/audit>",
+            "- **metadata.related_issue_ids**: <全局评审 issue id；没有写 []>",
+            "- **metadata.related_results**: <补充/修正关系；没有写 []>",
+            "```",
+        ])
+
+    @staticmethod
+    def _format_profile_worker_scope(ctx: WorkflowContext) -> str:
+        policy = get_review_profile_policy(ctx.review_profile)
+        common = [
+            "## 当前 review_profile 下的 Worker 初始挖掘范围（框架动态裁剪）",
+            f"- profile: `{policy.name}`",
+            "- 本任务是 data-flow driven vulnerability hunting，不是无边界全源码审计。",
+            "- 所有正式漏洞报告、补扫记录和返工动作都必须能回链到数据流文件中的 INPUT / EXPORT / USED / CLEANED / ★，或其直接上下游源码证据。",
+        ]
+        if policy.name == "fast":
+            lanes = [
+                "只审计主 INPUT、★ 关键发现、最直接的高风险 USED/EXPORT。",
+                "漏洞模式裁剪为显性内存安全、整数安全、输入校验缺失和明显 DoS。",
+                "不要求低风险 EXPORT 穷尽；未覆盖项在 supporting_docs/ 中记录 residual 即可。",
+                "不要为满足产物数量创建低置信 result。",
+            ]
+        elif policy.name == "balanced":
+            lanes = [
+                "优先闭环所有 INPUT、★、critical/high 风险 EXPORT/USED/CLEANED。",
+                "漏洞模式覆盖 memory_safety、integer_safety、input_validation；对路径相关的 logic_state/resource_lifetime 做定向扫描。",
+                "EXPORT 跟入到 sink 或可信边界；源码缺失时记录 accepted_residual/external_blocked，不无限追外部依赖。",
+                "低风险、与数据流主轴弱相关的全源码探索不得阻塞本轮。",
+            ]
+        else:
+            lanes = [
+                "审计档需要尽量闭环全部 INPUT/EXPORT/USED/CLEANED/★ obligations。",
+                "漏洞模式完整覆盖 memory_safety、integer_safety、input_validation、logic_state、resource_lifetime、concurrency_timing、resource_exhaustion、information_disclosure。",
+                "对关键校验做边界值、符号混用、整数截断/溢出、TOCTOU、错误处理分支和对称路径分析。",
+                "无法闭环的外部源码/上下文必须写 accepted_residual/external_blocked，并给出人工验收条件。",
+            ]
+        return "\n".join(common + [f"- {item}" for item in lanes])
+
     def _build_user_prompt(
         self,
         wf_def: AtomicWorkflowDef,
         ctx: WorkflowContext,
         review_state: ReviewState,
+        current_result_files: list[str] | None = None,
     ) -> str:
         """构建 Worker 的 user prompt(direct 模式)"""
-        current_result_files = self._list_result_files(os.path.join(ctx.working_dir, "results"))
-
-        if ctx.cycle > 1 and (
-            review_state.has_failures(
-                current_results=current_result_files,
-                actionable_by="worker",
+        if current_result_files is None:
+            current_result_files = self._list_result_files(
+                os.path.join(ctx.working_dir, "results")
             )
-            or self._has_summary_or_ledger_rework(ctx, review_state)
+
+        if self._should_use_rework_prompt(
+            ctx,
+            review_state,
+            current_result_files=current_result_files,
         ):
             self._prepare_rework_context(ctx, review_state)
-            return self._build_rework_prompt(ctx, review_state)
+            return self._build_rework_prompt(ctx, review_state, wf_def=wf_def)
 
         base_prompt = read_file(wf_def.roles.worker.prompts.work.user_prompt_file)
         return render_string(
@@ -441,6 +595,28 @@ class WorkerExecutor:
                 review_state=review_state,
                 current_result_files=current_result_files,
             ),
+            result_report_template=self._result_report_template(),
+        )
+
+    def _should_use_rework_prompt(
+        self,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        *,
+        current_result_files: list[str] | None = None,
+    ) -> bool:
+        if ctx.cycle <= 1:
+            return False
+        if current_result_files is None:
+            current_result_files = self._list_result_files(
+                os.path.join(ctx.working_dir, "results")
+            )
+        return (
+            review_state.has_failures(
+                current_results=current_result_files,
+                actionable_by="worker",
+            )
+            or self._has_summary_or_ledger_rework(ctx, review_state)
         )
 
     @staticmethod
@@ -611,6 +787,8 @@ class WorkerExecutor:
             f"- 后续 summary 阶段同步的局限性记录: `{previous_limitations_file}`",
             "",
             self._format_profile_execution_context(ctx),
+            "",
+            self._format_profile_worker_scope(ctx),
         ]
         coverage_context = self._format_coverage_obligation_context(ctx)
         if coverage_context:
@@ -638,6 +816,7 @@ class WorkerExecutor:
         self,
         ctx: WorkflowContext,
         review_state: ReviewState,
+        wf_def: AtomicWorkflowDef | None = None,
     ) -> str:
         """
         构建评审返工轮的 prompt。
@@ -645,6 +824,36 @@ class WorkerExecutor:
         由于 Worker 全程复用同一 session，已拥有完整对话历史，
         此处只注入评审反馈增量（通过/失败结果、近期问题、收敛要求）。
         """
+        sections = self._build_rework_prompt_sections(ctx, review_state)
+        rework_prompt_file = None
+        if wf_def is not None:
+            rework_prompt_file = getattr(
+                wf_def.roles.worker.prompts.work,
+                "rework_prompt_file",
+                None,
+            )
+        if rework_prompt_file:
+            try:
+                template = read_file(rework_prompt_file)
+            except FileNotFoundError:
+                logger.warning(
+                    "rework_prompt_file_missing_fallback",
+                    workflow_id=ctx.workflow_id,
+                    task_id=ctx.task_id,
+                    cycle=ctx.cycle,
+                    prompt_file=rework_prompt_file,
+                )
+            else:
+                return render_string(template, strict=True, **sections)
+
+        return self._build_legacy_rework_prompt(sections)
+
+    def _build_rework_prompt_sections(
+        self,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+    ) -> dict[str, Any]:
+        """Build dynamic sections shared by file-based and fallback rework prompts."""
         is_closure = (ctx.review_mode == "closure" or review_state.workflow_mode == "closure")
         summary_or_ledger_rework = self._has_summary_or_ledger_rework(ctx, review_state)
         failed_sources = [
@@ -669,31 +878,16 @@ class WorkerExecutor:
             max_items=5,
         )
 
-        # ── 返工轮必须能在新 session 中恢复完整任务上下文 ──
-        lines = [
-            f"# 第 {ctx.cycle} 轮评审返工",
-            "",
-            self._build_rework_recovery_context(ctx, review_state),
-            "",
-            self._build_review_delta_text(
-                ctx=ctx,
-                review_state=review_state,
-                current_result_files=ctx.pre_cycle_result_files,
-                include_recent_feedback=False,
-            ).rstrip(),
-        ]
-
-        # ── 全局评审反馈 ──
+        global_review_feedback = ""
         if review_state.last_global_feedback:
-            lines.extend([
-                "",
+            global_review_feedback = "\n".join([
                 "## 全局评审反馈",
                 self._clip_prompt_section(review_state.last_global_feedback, max_chars=6000),
             ])
 
+        repeated_issue_summary_text = ""
         if repeated_issue_summary:
-            lines.extend([
-                "",
+            repeated_issue_summary_text = "\n".join([
                 "## 重复阻塞项 ledger",
                 repeated_issue_summary,
             ])
@@ -703,9 +897,9 @@ class WorkerExecutor:
             max_items=backlog_max_items,
             include_framework=False,
         )
+        active_issue_backlog = ""
         if open_backlog:
-            lines.extend([
-                "",
+            active_issue_backlog = "\n".join([
                 "## Active issue backlog（本轮必须逐项关闭或记录 residual）",
                 open_backlog,
             ])
@@ -717,54 +911,169 @@ class WorkerExecutor:
         else:
             coverage_max_open = None
         coverage_context = self._format_coverage_obligation_context(ctx, max_open=coverage_max_open)
-        if coverage_context:
-            lines.extend([
-                "",
-                coverage_context,
-            ])
 
-        # ── 未通过结果的失败原因 ──
+        failed_result_reasons = ""
         if failed_files:
-            lines.extend([
-                "",
+            failed_lines = [
                 "## 未通过结果的失败原因",
-            ])
+            ]
             for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files):
                 if item.filename not in failed_files:
                     continue
-                lines.extend([
+                failed_lines.extend([
                     f"### {item.filename}",
                     item.reason,
                     "",
                 ])
+            failed_result_reasons = "\n".join(failed_lines).rstrip()
 
-        lines.extend([
+        numbering_rules = self._build_summary_rework_rules(ctx)
+        convergence_requirements = self._build_rework_convergence_requirements(
+            ctx=ctx,
+            is_closure=is_closure,
+            summary_repair_only=summary_repair_only,
+            result_repair_only=result_repair_only,
+            repeated_issue_summary=repeated_issue_summary,
+        )
+
+        summary_file = ctx.summary_file or os.path.join(ctx.working_dir, "summary.md")
+        results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
+        previous_limitations_file = os.path.join(ctx.working_dir, "previous_limitations.md")
+        supporting_docs_dir = self._supporting_docs_dir(ctx.working_dir)
+        issue_closure_file = os.path.join(
+            supporting_docs_dir,
+            f"issue_closure_cycle_{ctx.cycle:03d}.md",
+        )
+        issue_closure_template = self._build_issue_closure_template(
+            ctx=ctx,
+            review_state=review_state,
+            issue_closure_file=issue_closure_file,
+        )
+        return {
+            "cycle": str(ctx.cycle),
+            "review_mode": ctx.review_mode or review_state.workflow_mode,
+            "task": self._read_task_content(ctx.task_file),
+            "task_file": ctx.task_file,
+            "working_dir": ctx.working_dir,
+            "summary_file": summary_file,
+            "previous_limitations_file": previous_limitations_file,
+            "results_dir": results_dir,
+            "supporting_docs_dir": supporting_docs_dir,
+            "rework_recovery_context": self._build_rework_recovery_context(ctx, review_state),
+            "review_delta_text": self._build_review_delta_text(
+                ctx=ctx,
+                review_state=review_state,
+                current_result_files=ctx.pre_cycle_result_files,
+                include_recent_feedback=False,
+            ).rstrip(),
+            "global_review_feedback": global_review_feedback,
+            "repeated_issue_summary": repeated_issue_summary_text,
+            "active_issue_backlog": active_issue_backlog,
+            "coverage_context": coverage_context,
+            "failed_result_reasons": failed_result_reasons,
+            "output_contract_text": self._build_worker_output_contract_text(ctx),
+            "result_report_template": self._result_report_template(),
+            "issue_closure_file": issue_closure_file,
+            "issue_closure_template": issue_closure_template,
+            "rework_scope_policy": self._build_rework_scope_policy(
+                summary_repair_only=summary_repair_only,
+                result_repair_only=result_repair_only,
+                is_closure=is_closure,
+            ),
+            "numbering_rules": numbering_rules,
+            "convergence_requirements": convergence_requirements,
+            "direct_read_instruction": (
+                "直接使用 read 工具读取需要的文件，不要要求框架重复粘贴全文。"
+            ),
+        }
+
+    @staticmethod
+    def _build_rework_scope_policy(
+        *,
+        summary_repair_only: bool,
+        result_repair_only: bool,
+        is_closure: bool,
+    ) -> str:
+        lines = [
+            "## 返工范围硬约束",
+            "- 返工不是重新漏洞挖掘，而是基于 data-flow obligation、failed result 与 active issue 的定向闭环。",
+            "- 本轮新增探索必须至少命中以下一项：active issue、coverage ledger open obligation、failed result 补证/撤回、previous limitations residual 验证。",
+            "- 脱离 INPUT / EXPORT / USED / CLEANED / ★ 主轴的全源码发散不得写入正式结果。",
+        ]
+        if summary_repair_only:
+            lines.extend([
+                "- 本轮只修复 `summary.md`、`previous_limitations.md`、`supporting_docs/` 与覆盖/issue 映射说明。",
+                "- 禁止新增、删除、重写、重新编号 results/result_NNN.md。",
+            ])
+        elif result_repair_only:
+            lines.extend([
+                "- 当前为结果修复：只处理失败 result 及其直接相关源码路径。",
+                "- 新增 result 只能用于拆分独立真实漏洞或补充已证实的更高编号修正报告。",
+            ])
+        elif is_closure:
+            lines.extend([
+                "- 当前为 closure：优先关闭 active issue backlog 与 high/STAR open obligations。",
+                "- 若源码/外部依赖缺失，写 accepted_residual/external_blocked 与人工验收条件，不要反复写继续分析。",
+            ])
+        else:
+            lines.append("- discovery 返工只围绕评审反馈定向扩展，不重新全量重扫。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_issue_closure_template(
+        *,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        issue_closure_file: str,
+    ) -> str:
+        open_backlog = review_state.get_active_issue_entries()
+        issue_lines = []
+        for item in open_backlog[:20]:
+            issue_id = str(getattr(item, "issue_id", "") or getattr(item, "id", "") or "").strip()
+            target = ""
+            issue = getattr(item, "issue", None)
+            if isinstance(issue, dict):
+                issue_id = issue_id or str(issue.get("id") or "").strip()
+                target = str(issue.get("target") or "").strip()
+            if issue_id:
+                issue_lines.append(f"| {issue_id} | {target} |  |  |  |  |")
+        if not issue_lines:
+            issue_lines.append("| <issue_id 或 obligation_id> | <目标> | <source_closed/promoted_to_result/accepted_residual/unused/not_applicable/external_blocked> | <本轮动作> | <results/... 或 supporting_docs/...> | <剩余限制> |")
+        return "\n".join([
+            "## issue closure 记录要求",
+            f"本轮必须创建或更新：`{issue_closure_file}`",
             "",
-            "## 本阶段输出位置",
-            self._build_worker_output_contract_text(ctx),
+            "建议内容模板：",
+            "",
+            "```markdown",
+            f"# Issue Closure Cycle {ctx.cycle:03d}",
+            "",
+            "| issue_id / obligation_id | target | status | action | evidence | residual/限制 |",
+            "|---|---|---|---|---|---|",
+            *issue_lines,
+            "```",
+            "",
+            "status 只能使用：source_closed / promoted_to_result / accepted_residual / unused / not_applicable / external_blocked。",
         ])
 
-        # ── 文件编号规则 ──
-        numbering_rules = self._build_summary_rework_rules(ctx)
-        if numbering_rules:
-            lines.extend([
-                "",
-                numbering_rules,
-            ])
-
-        # ── 收敛要求 ──
-        lines.append("")
+    def _build_rework_convergence_requirements(
+        self,
+        *,
+        ctx: WorkflowContext,
+        is_closure: bool,
+        summary_repair_only: bool,
+        result_repair_only: bool,
+        repeated_issue_summary: str,
+    ) -> str:
+        lines = ["## 收敛要求"]
         if summary_repair_only:
-            lines.append("## 收敛要求")
             lines.append("- 当前已经进入 **closure（收敛）模式**。")
             lines.append("- 本轮只修复 `summary.md`、`previous_limitations.md`、`supporting_docs/` 与 summary 阶段可影响的结果映射/覆盖账本一致性。")
             lines.append("- 不要新增、删除、重写或重新编号 `results/result_NNN.md`；结果评审已经通过。")
             lines.append("- 不要手工编辑 `_meta/` 下的框架生成文件；只修正正式文档，让框架在 summary 后重新同步 manifest/ledger。")
         elif result_repair_only:
-            lines.append("## 收敛要求")
             lines.append("- 本轮只聚焦**修复/删除未通过结果**，不要继续扩张攻击面。")
         elif is_closure:
-            lines.append("## 收敛要求")
             lines.append("- 当前已经进入 **closure（收敛）模式**。")
             lines.append("- 优先关闭近期全局评审反馈指出的问题，不要继续扩张攻击面。")
             lines.append("- 若没有新增结果，必须在 `supporting_docs/` 记录本轮深挖证据，供后续 summary 阶段统一整理。")
@@ -779,12 +1088,40 @@ class WorkerExecutor:
                 lines.append(f"  3. `accepted_residual`：若因外部源码/上下文缺失不可闭环，写入 `{residual_path}`，说明已查证范围、缺失依赖、风险和后续人工验收条件。")
                 lines.append("- 不要只写“继续跟入/需要继续分析”；本轮结束时必须留下可评审的闭环证据或 residual 记录。")
         else:
-            lines.append("## 收敛要求")
             lines.append("- 围绕近期评审反馈和已有证据定向扩展，不要全量重扫。")
+        return "\n".join(lines)
 
+    @staticmethod
+    def _build_legacy_rework_prompt(sections: dict[str, Any]) -> str:
+        """Fallback for old configs that do not declare a rework prompt file."""
+        lines = [
+            f"# 第 {sections['cycle']} 轮评审返工",
+            "",
+            sections["rework_recovery_context"],
+            "",
+            sections["review_delta_text"],
+        ]
+        for key in (
+            "global_review_feedback",
+            "repeated_issue_summary",
+            "active_issue_backlog",
+            "coverage_context",
+            "failed_result_reasons",
+        ):
+            if sections.get(key):
+                lines.extend(["", str(sections[key])])
         lines.extend([
             "",
-            "直接使用 read 工具读取需要的文件，不要要求框架重复粘贴全文。",
+            "## 本阶段输出位置",
+            sections["output_contract_text"],
+        ])
+        if sections.get("numbering_rules"):
+            lines.extend(["", sections["numbering_rules"]])
+        lines.extend([
+            "",
+            sections["convergence_requirements"],
+            "",
+            sections["direct_read_instruction"],
         ])
         return "\n".join(lines)
 
@@ -845,13 +1182,10 @@ class WorkerExecutor:
         policy = get_review_profile_policy(ctx.review_profile)
         lines = [
             "## Profile 执行预算与深度目标",
-            f"- 单轮 Worker 内部 turn 硬上限: {policy.max_worker_turns_per_cycle}",
-            f"- 单轮 Worker 无进展超时: {policy.worker_no_progress_timeout_seconds}s",
-            f"- 单轮 Worker 最大墙钟: {policy.worker_max_wall_seconds}s",
+            "- 单轮 Worker 内部 turn 硬上限: 不限制",
             f"- 每轮反思 pass: {policy.reflection_passes_per_cycle}",
             f"- 单次反思内部 turn 硬上限: {policy.reflection_max_internal_turns}",
-            f"- 单次反思无进展超时: {policy.reflection_no_progress_timeout_seconds}s",
-            f"- 单次反思最大墙钟: {policy.reflection_max_wall_seconds}s",
+            "- Pi/provider timeout: 仅依赖 Pi 原生 timeout；不再使用档位级 no-progress / wall-clock watchdog",
             f"- 最少探索轮次: {policy.min_discovery_cycles_before_pass}",
             f"- 最少证据产物数: {policy.min_evidence_artifacts}",
             (
@@ -1732,41 +2066,16 @@ class WorkerExecutor:
                     turns=response.turn_count,
                     finished=response.finished,
                 )
-                old_session_id = ctx.worker_session_id
-                if old_session_id:
-                    try:
-                        await agent.close_session(old_session_id)
-                    except Exception as exc:
-                        logger.debug(
-                            "reflection_failed_session_close_failed",
-                            workflow_id=ctx.workflow_id,
-                            task_id=ctx.task_id,
-                            session_id=old_session_id,
-                            error=str(exc),
-                        )
-                try:
-                    new_session_id = await agent.create_session_with_hint(
-                        f"{old_session_id or 'worker'}_summary_after_reflect_failure"
-                    )
-                    ctx.worker_session_id = new_session_id
-                    ctx.worker_session_cycle = ctx.cycle
-                    logger.info(
-                        "reflection_soft_failed_summary_session_reset",
-                        workflow_id=ctx.workflow_id,
-                        task_id=ctx.task_id,
-                        old_session_id=old_session_id or "",
-                        new_session_id=new_session_id,
-                    )
-                except Exception as exc:
-                    ctx.worker_session_id = None
-                    ctx.worker_session_cycle = 0
-                    logger.warning(
-                        "reflection_soft_failed_summary_session_reset_failed",
-                        workflow_id=ctx.workflow_id,
-                        task_id=ctx.task_id,
-                        old_session_id=old_session_id or "",
-                        error=str(exc),
-                    )
+                # 新 Worker 会话策略要求所有轮次/阶段尽量复用同一 RPC session。
+                # Reflection 是非阻塞自审步骤；即使它超时，RPC pi 进程也应继续存活，
+                # 后续 summary 作为 follow-up 发送到同一 session/进程，而不是重建上下文。
+                logger.info(
+                    "reflection_soft_failed_keep_worker_session",
+                    workflow_id=ctx.workflow_id,
+                    task_id=ctx.task_id,
+                    session_id=ctx.worker_session_id or "",
+                    reason=error,
+                )
                 return
 
             await self.recorder.record_reflection(
