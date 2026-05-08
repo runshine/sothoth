@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import os
 import posixpath
 import shutil
@@ -38,6 +40,7 @@ from app.models.database import (
     WorkflowExecutionEvent,
     get_db_session,
 )
+from app.pi_vuln_core.review.profile import apply_profile_runtime_policy_to_config
 from app.pi_vuln_core.runner import build_runtime_framework_config, run_framework_config
 from app.pi_vuln_core.utils.logger import attach_log_file, detach_log_file
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
@@ -157,6 +160,36 @@ class ExecutionService:
         first_task = manifest.tasks[0] if manifest.tasks else None
         return str(first_task.title or trigger.id) if first_task else trigger.id
 
+    def _trigger_task_metadata(self, trigger: TriggerTask | None) -> dict[str, Any]:
+        if trigger is None:
+            return {}
+        try:
+            manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        except Exception:
+            return {}
+        first_task = manifest.tasks[0] if manifest.tasks else None
+        return dict(first_task.metadata or {}) if first_task else {}
+
+    def _trigger_uses_run_directory(self, trigger: TriggerTask | None) -> bool:
+        metadata = self._trigger_task_metadata(trigger)
+        return (
+            self._is_dataflow_cli_task_metadata(metadata)
+            or isinstance(metadata.get("history_run_adoption"), dict)
+            or isinstance(metadata.get("history_run_retry"), dict)
+        )
+
+    def _run_locator_for_execution(self, execution: WorkflowExecution | None, trigger: TriggerTask | None = None) -> dict[str, str | None]:
+        if execution is None or not execution.workspace_root:
+            return {"run_name": None, "runs_root": None, "run_path": None}
+        if not self._trigger_uses_run_directory(trigger):
+            return {"run_name": None, "runs_root": None, "run_path": None}
+        run_root = Path(execution.workspace_root).resolve()
+        return {
+            "run_name": run_root.name,
+            "runs_root": str(run_root.parent),
+            "run_path": str(run_root),
+        }
+
     def _latest_run_summary_for_execution(self, db: Session, execution: WorkflowExecution | None) -> dict[str, Any]:
         if execution is None or not execution.workspace_root:
             return {}
@@ -180,6 +213,17 @@ class ExecutionService:
             if task_origin_type == "binary_security"
             else "手动任务"
         )
+        run_locator = self._run_locator_for_execution(latest_execution, trigger)
+        run_summary = self._latest_run_summary_for_execution(db, latest_execution)
+        if run_locator["run_name"] and run_locator["runs_root"]:
+            run_summary = {
+                "name": run_locator["run_name"],
+                "root_path": run_locator["runs_root"],
+                "path": run_locator["run_path"],
+                "linked_task_id": trigger.id,
+                "linked_execution_id": latest_execution.id if latest_execution else None,
+                **run_summary,
+            }
         return ScanTaskResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
@@ -206,7 +250,11 @@ class ExecutionService:
             finished_at=trigger.finished_at,
             message=trigger.message,
             latest_execution_id=trigger.latest_execution_id,
-            latest_run=self._latest_run_summary_for_execution(db, latest_execution),
+            run_name=run_locator["run_name"],
+            runs_root=run_locator["runs_root"],
+            run_path=run_locator["run_path"],
+            run=run_summary,
+            latest_run=run_summary,
         )
 
     def _scan_task_detail(self, db: Session, trigger: TriggerTask) -> ScanTaskDetailResponse:
@@ -265,6 +313,7 @@ class ExecutionService:
             task_id=execution.trigger_task_id,
             attempt_no=execution.attempt_no,
             status=execution.status,
+            run_id=history_run_id,
             history_run_id=history_run_id,
             owner_pod_id=execution.owner_pod_id,
             lease_expires_at=execution.lease_expires_at,
@@ -392,12 +441,11 @@ class ExecutionService:
         base_dir = definition.workspace_base_dir or get_config().service.workspace_base_dir
         return ensure_dir(Path(base_dir) / execution_id)
 
-    def _copy_uploaded_inputs_to_task_dir(self, *, task_input_dir: Path, metadata: Dict[str, Any]) -> List[Dict[str, str]]:
+    def _copy_uploaded_inputs_to_task_dir(self, *, project_id: str, task_input_dir: Path, metadata: Dict[str, Any]) -> List[Dict[str, str]]:
         uploads = metadata.get("task_input_uploads")
         if not isinstance(uploads, list) or not uploads:
             return []
         copied: List[Dict[str, str]] = []
-        data_mount_path = Path(get_config().fileserver_service.data_mount_path)
         assets_dir = ensure_dir(task_input_dir / get_config().service.default_artifact_subdir)
 
         for item in uploads:
@@ -421,11 +469,11 @@ class ExecutionService:
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"invalid uploaded storage key: {storage_key}",
                 )
-            source_path = data_mount_path / storage_path
+            source_path = self._resolve_project_storage_key(project_id=project_id, storage_key=storage_key, label="uploaded file")
             if not source_path.exists() or not source_path.is_file():
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=f"uploaded file not found in pvc: {storage_key}",
+                    detail=f"uploaded file not found in project storage: {storage_key}",
                 )
             target_path = assets_dir / relative_path
             ensure_dir(target_path.parent)
@@ -557,9 +605,31 @@ class ExecutionService:
             "files": files,
         }
 
+    def _resolve_project_storage_key(self, *, project_id: str, storage_key: str, label: str) -> Path:
+        storage_path = Path(str(storage_key or "").strip())
+        if not storage_path.parts or storage_path.is_absolute() or ".." in storage_path.parts:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"invalid {label} storage_key")
+        config = get_config()
+        parts = storage_path.parts
+        project_component = sanitize_name(project_id)
+        if parts and parts[0] == config.fileserver_service.project_files_dirname:
+            if len(parts) < 2 or parts[1] != project_component:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{label} escapes project root")
+        data_mount_path = Path(config.fileserver_service.data_mount_path).resolve()
+        project_root = self._project_files_root(project_id)
+        candidates = [
+            data_mount_path / storage_path,
+            project_root / storage_path,
+        ]
+        for candidate in candidates:
+            try:
+                return self._ensure_path_within(path=candidate, root=project_root, label=label)
+            except HTTPException:
+                continue
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{label} escapes project root")
+
     def _resolve_dataflow_input_ref(self, *, project_id: str, ref: dict[str, Any], expected: str) -> Path:
         source = str(ref.get("source") or "project_filesystem").strip()
-        data_mount_path = Path(get_config().fileserver_service.data_mount_path)
         if source in {"project_filesystem", "project_path", "project"}:
             project_root = self._project_files_root(project_id)
             normalized = self._normalize_project_path(str(ref.get("path") or ""))
@@ -569,18 +639,17 @@ class ExecutionService:
             storage_key = str(ref.get("storage_key") or ref.get("path") or "").strip()
             if not storage_key:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} storage_key is required")
-            storage_path = Path(storage_key)
-            if storage_path.is_absolute() or ".." in storage_path.parts:
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"invalid {expected} storage_key")
-            resolved = self._ensure_path_within(path=data_mount_path / storage_path, root=data_mount_path, label=expected)
+            resolved = self._resolve_project_storage_key(project_id=project_id, storage_key=storage_key, label=expected)
         elif source in {"absolute", "absolute_path", "local_path"}:
+            if not get_config().service.allow_absolute_input_refs:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} absolute_path input is disabled")
             raw = str(ref.get("path") or "").strip()
             if not raw:
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} path is required")
             candidate = Path(raw)
             if not candidate.is_absolute():
                 raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} absolute path is required")
-            resolved = candidate.resolve()
+            resolved = self._ensure_path_within(path=candidate, root=self._project_files_root(project_id), label=expected)
         else:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"unsupported {expected} source: {source}")
         if not resolved.exists():
@@ -793,12 +862,11 @@ class ExecutionService:
         ensure_dir(run_dir / "output")
 
     def _dataflow_cli_config_requires_file(self, *, request: dict[str, Any], runtime_overrides: dict[str, Any]) -> bool:
-        if runtime_overrides:
-            return True
-        for key in ("worker_timeout", "advisor_timeout"):
-            if request.get(key) is not None:
-                return True
-        return False
+        # worker_timeout/advisor_timeout are deprecated compatibility fields and
+        # do not control RPC prompt timeout, so they must not force the launcher
+        # onto a stale compiled -c config path. Only real runtime_overrides need
+        # a temporary config file.
+        return bool(runtime_overrides)
 
     def _build_dataflow_cli_argv(
         self,
@@ -837,22 +905,31 @@ class ExecutionService:
             plan["run_name"],
         ]
         temp_config_path: str | None = None
+
+        def first_present_int(*values: Any, default: int) -> int:
+            for value in values:
+                if value is None or value == "":
+                    continue
+                return int(value)
+            return default
+
+        model = str(config_payload.get("model") or request.get("model") or "").strip()
+        review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
         if self._dataflow_cli_config_requires_file(request=request, runtime_overrides=runtime_overrides):
             fd, temp_config_path = tempfile.mkstemp(prefix="secflow-dataflow-cli-", suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json_payload = compiled_config or {}
+                json_payload = copy.deepcopy(compiled_config or {})
+                apply_profile_runtime_policy_to_config(json_payload, review_profile)
                 import json
 
                 json.dump(json_payload, handle, ensure_ascii=False, indent=2)
             argv.extend(["--config", temp_config_path])
             return argv, temp_config_path
 
-        model = str(config_payload.get("model") or request.get("model") or "").strip()
-        review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
-        max_cycles = int(config_payload.get("max_review_cycles") or request.get("max_review_cycles") or 0)
-        timeout_max_retries = int(config_payload.get("timeout_max_retries") or request.get("timeout_max_retries") or 3)
-        timeout_retry_interval_seconds = int(config_payload.get("timeout_retry_interval_seconds") or request.get("timeout_retry_interval_seconds") or 30)
-        result_review_concurrency = int(config_payload.get("result_review_concurrency") or request.get("result_review_concurrency") or 3)
+        max_cycles = first_present_int(config_payload.get("max_review_cycles"), request.get("max_review_cycles"), default=0)
+        timeout_max_retries = first_present_int(config_payload.get("timeout_max_retries"), request.get("timeout_max_retries"), default=3)
+        timeout_retry_interval_seconds = first_present_int(config_payload.get("timeout_retry_interval_seconds"), request.get("timeout_retry_interval_seconds"), default=30)
+        result_review_concurrency = first_present_int(config_payload.get("result_review_concurrency"), request.get("result_review_concurrency"), default=3)
         if model:
             argv.extend(["--model", model])
         if max_cycles > 0:
@@ -947,6 +1024,7 @@ class ExecutionService:
     def _normalize_trigger_tasks(
         self,
         *,
+        project_id: str,
         input_tasks: List[TriggerTaskInputTask],
         workspace_root: Path,
         entry_input_task_type: str,
@@ -986,7 +1064,7 @@ class ExecutionService:
                     detail=f"task {task_id} missing task_markdown",
                 )
             task_md_path = write_text(input_dir / "task.md", markdown.strip() + "\n")
-            copied_inputs = self._copy_uploaded_inputs_to_task_dir(task_input_dir=input_dir, metadata=metadata)
+            copied_inputs = self._copy_uploaded_inputs_to_task_dir(project_id=project_id, task_input_dir=input_dir, metadata=metadata)
             write_json(
                 input_dir / "task.json",
                 {
@@ -1143,6 +1221,7 @@ class ExecutionService:
                 created_by=actor,
             )
         normalized_tasks = self._normalize_trigger_tasks(
+            project_id=definition.project_id,
             input_tasks=raw_input_tasks,
             workspace_root=workspace_root,
             entry_input_task_type=validated_definition.resolve_entry_input_task_type(),
@@ -1229,6 +1308,7 @@ class ExecutionService:
             created_by=actor,
         ).parent / "bootstrap"
         normalized_tasks = self._normalize_trigger_tasks(
+            project_id=definition.project_id,
             input_tasks=input_tasks,
             workspace_root=workspace_root,
             entry_input_task_type=validated_definition.resolve_entry_input_task_type(),
@@ -1374,6 +1454,7 @@ class ExecutionService:
     ) -> dict[str, Any]:
         return {
             "success": True,
+            "run_id": history_run_id,
             "history_run_id": history_run_id,
             "project_id": project_id,
             "status": status_text,
@@ -1745,6 +1826,7 @@ class ExecutionService:
 
     def _history_run_resolve_response(self, history_run: HistoryRun) -> dict[str, Any]:
         return {
+            "run_id": history_run.id,
             "history_run_id": history_run.id,
             "project_id": history_run.project_id,
             "run_name": history_run.run_name,
@@ -2424,6 +2506,7 @@ class ExecutionService:
         db: Session,
         execution: WorkflowExecution,
         trigger: TriggerTask,
+        execution_timeout_seconds: int | None = None,
     ) -> int:
         if os.environ.get("SECFLOW_DATAFLOW_CLI_IN_PROCESS") == "1":
             import run_vuln_scan
@@ -2478,10 +2561,34 @@ class ExecutionService:
             },
         )
         try:
+            started_monotonic = time.monotonic()
+            timeout_seconds = int(execution_timeout_seconds or 0)
             while process.poll() is None:
                 time.sleep(max(1, int(get_config().service.execution_cancel_check_interval_seconds)))
                 db.expire(execution)
                 db.expire(trigger)
+                if timeout_seconds > 0 and time.monotonic() - started_monotonic >= timeout_seconds:
+                    execution.process_status = "timeout_requested"
+                    execution.message = f"execution timeout exceeded ({timeout_seconds}s)"
+                    trigger.message = execution.message
+                    db.add(execution)
+                    db.add(trigger)
+                    db.commit()
+                    self._write_run_control_state(execution.workspace_root, status_text="timeout_requested", message=execution.message)
+                    try:
+                        process.send_signal(signal.SIGINT)
+                    except ProcessLookupError:
+                        return 124
+                    try:
+                        process.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                    return 124
                 if execution.status in {"cancel_requested", "delete_requested"} or trigger.status in {"cancel_requested", "delete_requested"}:
                     execution.process_status = "delete_requested" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "stop_requested"
                     db.add(execution)
@@ -2597,12 +2704,15 @@ class ExecutionService:
                     "runs_root": plan["runs_root"],
                 },
             )
-            exit_code = self._invoke_run_vuln_scan_cli(
-                argv=argv,
-                db=db,
-                execution=execution,
-                trigger=trigger,
-            )
+            invoke_kwargs: dict[str, Any] = {
+                "argv": argv,
+                "db": db,
+                "execution": execution,
+                "trigger": trigger,
+            }
+            if "execution_timeout_seconds" in inspect.signature(self._invoke_run_vuln_scan_cli).parameters:
+                invoke_kwargs["execution_timeout_seconds"] = definition.execution_timeout_seconds
+            exit_code = self._invoke_run_vuln_scan_cli(**invoke_kwargs)
             db.refresh(execution)
             db.refresh(trigger)
             history_run = get_history_run_service().sync_execution_run(db, execution)
@@ -2619,6 +2729,9 @@ class ExecutionService:
             ):
                 terminal_status = "cancelled"
                 message = "run_vuln_scan.py stopped for delete" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "run_vuln_scan.py cancelled"
+            elif exit_code == 124:
+                terminal_status = "failed"
+                message = f"execution timeout exceeded ({definition.execution_timeout_seconds}s)"
             else:
                 terminal_status = "failed"
                 message = f"run_vuln_scan.py failed with exit code {exit_code}"

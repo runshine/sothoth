@@ -12,8 +12,8 @@ class ProfileConfigPayload(BaseModel):
     model: str = Field(..., min_length=1)
     review_profile: str = Field(default="balanced", min_length=1)
     max_review_cycles: int = Field(default=6, ge=1)
-    worker_timeout: int = Field(default=3600, ge=1)
-    advisor_timeout: int = Field(default=3600, ge=1)
+    worker_timeout: int = Field(default=3600, ge=1, description="Deprecated compatibility field; RPC prompt timeout is controlled by Pi/provider native timeout settings.")
+    advisor_timeout: int = Field(default=3600, ge=1, description="Deprecated compatibility field; RPC prompt timeout is controlled by Pi/provider native timeout settings.")
     timeout_max_retries: int = Field(default=3, ge=1)
     timeout_retry_interval_seconds: int = Field(default=30, ge=0)
     result_review_concurrency: int = Field(default=3, ge=1)
@@ -30,7 +30,7 @@ class ScanProfileCreateRequest(BaseModel):
     enabled: bool = True
     default_priority: int = 100
     max_retry_count: int = Field(default=3, ge=0)
-    execution_timeout_seconds: int = Field(default=7200, ge=1)
+    execution_timeout_seconds: int = Field(default=0, ge=0, description="Maximum service-managed run_vuln_scan.py process duration in seconds; 0 means unlimited / disabled.")
 
 
 class ScanProfileUpdateRequest(BaseModel):
@@ -42,7 +42,7 @@ class ScanProfileUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     default_priority: Optional[int] = None
     max_retry_count: Optional[int] = Field(default=None, ge=0)
-    execution_timeout_seconds: Optional[int] = Field(default=None, ge=1)
+    execution_timeout_seconds: Optional[int] = Field(default=None, ge=0, description="Maximum service-managed run_vuln_scan.py process duration in seconds; 0 means unlimited / disabled.")
 
 
 class ScanProfileResponse(BaseModel):
@@ -104,8 +104,8 @@ class ScanTaskCreateRequest(BaseModel):
     provider: Optional[str] = None
     review_profile: Optional[str] = Field(default=None, min_length=1)
     max_review_cycles: Optional[int] = Field(default=None, ge=1)
-    worker_timeout: Optional[int] = Field(default=None, ge=1)
-    advisor_timeout: Optional[int] = Field(default=None, ge=1)
+    worker_timeout: Optional[int] = Field(default=None, ge=1, description="Deprecated compatibility field; RPC prompt timeout is controlled by Pi/provider native timeout settings.")
+    advisor_timeout: Optional[int] = Field(default=None, ge=1, description="Deprecated compatibility field; RPC prompt timeout is controlled by Pi/provider native timeout settings.")
     timeout_max_retries: Optional[int] = Field(default=None, ge=1)
     timeout_retry_interval_seconds: Optional[int] = Field(default=None, ge=0)
     result_review_concurrency: Optional[int] = Field(default=None, ge=1)
@@ -162,6 +162,10 @@ class ScanTaskResponse(BaseModel):
     finished_at: Optional[datetime]
     message: Optional[str]
     latest_execution_id: Optional[str]
+    run_name: Optional[str] = None
+    runs_root: Optional[str] = None
+    run_path: Optional[str] = None
+    run: Dict[str, Any] = Field(default_factory=dict)
     latest_run: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -170,6 +174,7 @@ class ScanTaskAttemptResponse(BaseModel):
     task_id: str
     attempt_no: int
     status: str
+    run_id: Optional[str] = None
     history_run_id: Optional[str] = None
     owner_pod_id: Optional[str]
     lease_expires_at: Optional[datetime]
@@ -272,16 +277,20 @@ class SuccessResponse(BaseModel):
     message: str
 
 
-class HistoryRunRetryRequest(BaseModel):
+class RunRetryRequest(BaseModel):
     extra_cycles: int = Field(default=5, ge=1)
     model: Optional[str] = Field(default=None, min_length=1)
     provider: Optional[str] = None
     clean_workspace: bool = False
 
 
-class HistoryRunMutationResponse(BaseModel):
+class HistoryRunRetryRequest(RunRetryRequest):
+    pass
+
+
+class RunMutationResponse(BaseModel):
     success: bool = True
-    history_run_id: str
+    run_id: str
     project_id: str
     status: str
     message: str
@@ -292,6 +301,10 @@ class HistoryRunMutationResponse(BaseModel):
     process_signal: Optional[str] = None
 
 
+class HistoryRunMutationResponse(RunMutationResponse):
+    history_run_id: str
+
+
 class HealthResponse(BaseModel):
     status: str
     pod_id: str
@@ -299,8 +312,8 @@ class HealthResponse(BaseModel):
     scheduler: str
 
 
-class HistoryRunSummaryResponse(BaseModel):
-    history_run_id: str
+class RunSummaryResponse(BaseModel):
+    run_id: str
     project_id: str
     source_type: str
     source_key: str
@@ -327,7 +340,11 @@ class HistoryRunSummaryResponse(BaseModel):
     updated_at: Optional[str] = None
 
 
-class HistoryRunFileResponse(BaseModel):
+class HistoryRunSummaryResponse(RunSummaryResponse):
+    history_run_id: str
+
+
+class RunFileResponse(BaseModel):
     category: str
     path: str
     name: str
@@ -336,7 +353,11 @@ class HistoryRunFileResponse(BaseModel):
     type: str
 
 
-class HistoryRunSessionResponse(BaseModel):
+class HistoryRunFileResponse(RunFileResponse):
+    pass
+
+
+class RunSessionResponse(BaseModel):
     session_id: str
     format: str
     worker_id: str = ""
@@ -346,7 +367,11 @@ class HistoryRunSessionResponse(BaseModel):
     calls: List[Dict[str, Any]] = Field(default_factory=list)
 
 
-class HistoryRunDetailResponse(HistoryRunSummaryResponse):
+class HistoryRunSessionResponse(RunSessionResponse):
+    pass
+
+
+class RunDetailResponse(RunSummaryResponse):
     config: Dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
     cycles: List[Dict[str, Any]] = Field(default_factory=list)
@@ -355,15 +380,21 @@ class HistoryRunDetailResponse(HistoryRunSummaryResponse):
     manifests: Dict[str, Any] = Field(default_factory=dict)
     latest_issues: List[Dict[str, Any]] = Field(default_factory=list)
     atomic_work_path: str = ""
-    files: List[HistoryRunFileResponse] = Field(default_factory=list)
-    sessions: List[HistoryRunSessionResponse] = Field(default_factory=list)
+    files: List[RunFileResponse] = Field(default_factory=list)
+    sessions: List[RunSessionResponse] = Field(default_factory=list)
     run_log: str = ""
     command: List[str] = Field(default_factory=list)
     command_display: str = ""
     raw: Dict[str, Any] = Field(default_factory=dict)
 
 
-class HistoryRunCycleResponse(BaseModel):
+class HistoryRunDetailResponse(RunDetailResponse):
+    history_run_id: str
+    files: List[HistoryRunFileResponse] = Field(default_factory=list)
+    sessions: List[HistoryRunSessionResponse] = Field(default_factory=list)
+
+
+class RunCycleResponse(BaseModel):
     cycle: int
     global_reviews: List[Dict[str, Any]] = Field(default_factory=list)
     result_reviews: List[Dict[str, Any]] = Field(default_factory=list)
@@ -371,21 +402,37 @@ class HistoryRunCycleResponse(BaseModel):
     metrics: Dict[str, Any] = Field(default_factory=dict)
 
 
-class HistoryRunFileContentResponse(BaseModel):
+class HistoryRunCycleResponse(RunCycleResponse):
+    pass
+
+
+class RunFileContentResponse(BaseModel):
     path: str
     type: str
     content: str
 
 
-class HistoryRunLogResponse(BaseModel):
+class HistoryRunFileContentResponse(RunFileContentResponse):
+    pass
+
+
+class RunLogResponse(BaseModel):
     content: str
 
 
-class HistoryRunResolveResponse(BaseModel):
-    history_run_id: str
+class HistoryRunLogResponse(RunLogResponse):
+    pass
+
+
+class RunResolveResponse(BaseModel):
+    run_id: str
     project_id: str
     run_name: str
     root_path: str
     source_type: str
     linked_task_id: Optional[str] = None
     linked_execution_id: Optional[str] = None
+
+
+class HistoryRunResolveResponse(RunResolveResponse):
+    history_run_id: str

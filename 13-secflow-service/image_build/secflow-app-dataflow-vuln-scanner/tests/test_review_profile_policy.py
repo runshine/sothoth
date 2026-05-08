@@ -36,10 +36,10 @@ def test_review_profiles_have_monotonic_execution_budgets() -> None:
     assert [fast.default_max_review_cycles, balanced.default_max_review_cycles, audit.default_max_review_cycles] == [1, 6, 10]
     assert fast.max_worker_turns_per_cycle < balanced.max_worker_turns_per_cycle < audit.max_worker_turns_per_cycle
     assert fast.worker_rpc_stdout_abort_bytes < balanced.worker_rpc_stdout_abort_bytes < audit.worker_rpc_stdout_abort_bytes
-    assert fast.advisor_max_internal_turns < balanced.advisor_max_internal_turns < audit.advisor_max_internal_turns
+    assert [fast.advisor_max_internal_turns, balanced.advisor_max_internal_turns, audit.advisor_max_internal_turns] == [0, 0, 0]
     assert fast.advisor_rpc_stdout_abort_bytes < balanced.advisor_rpc_stdout_abort_bytes < audit.advisor_rpc_stdout_abort_bytes
     assert fast.reflection_passes_per_cycle < balanced.reflection_passes_per_cycle < audit.reflection_passes_per_cycle
-    assert fast.reflection_max_internal_turns < balanced.reflection_max_internal_turns < audit.reflection_max_internal_turns
+    assert [fast.reflection_max_internal_turns, balanced.reflection_max_internal_turns, audit.reflection_max_internal_turns] == [0, 0, 0]
     assert fast.reflection_rpc_stdout_abort_bytes < balanced.reflection_rpc_stdout_abort_bytes < audit.reflection_rpc_stdout_abort_bytes
     assert fast.min_evidence_artifacts < balanced.min_evidence_artifacts < audit.min_evidence_artifacts
     assert len(fast.required_pattern_families) < len(balanced.required_pattern_families) < len(audit.required_pattern_families)
@@ -118,9 +118,9 @@ def test_generate_config_uses_profile_default_budget_when_max_cycles_not_set(
     worker_runtime = config["agents"][0]["runtime_config"]
     advisor_runtime = config["agents"][1]["runtime_config"]
 
-    assert engine["max_worker_turns_per_cycle"] == 140
+    assert engine["max_worker_turns_per_cycle"] == get_review_profile_policy("audit").max_worker_turns_per_cycle
     assert engine["reflection_passes_per_cycle"] == 3
-    assert engine["reflection_max_internal_turns"] == get_review_profile_policy("audit").reflection_max_internal_turns
+    assert engine["reflection_max_internal_turns"] == 0
     assert engine["reflection_rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").reflection_rpc_stdout_abort_bytes
     assert "reflection_max_wall_seconds" not in engine
     assert "reflection_no_progress_timeout_seconds" not in engine
@@ -140,7 +140,7 @@ def test_generate_config_uses_profile_default_budget_when_max_cycles_not_set(
     assert "no_progress_timeout_seconds" not in worker_runtime
     assert "max_retry_wall_seconds" not in worker_runtime
     assert advisor_runtime["advisor_runtime_retries"] == 3
-    assert advisor_runtime["max_internal_turns"] == get_review_profile_policy("audit").advisor_max_internal_turns
+    assert advisor_runtime["max_internal_turns"] == 0
     assert advisor_runtime["rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").advisor_rpc_stdout_abort_bytes
     assert advisor_runtime["api_max_retries"] == 0
     assert advisor_runtime["pi_max_retries"] == 0
@@ -168,7 +168,7 @@ def test_generate_config_respects_explicit_cycles_but_keeps_profile_depth_budget
 
     assert config["global"]["max_review_cycles"] == 4
     assert engine["max_review_cycles"] == 4
-    assert engine["max_worker_turns_per_cycle"] == 140
+    assert engine["max_worker_turns_per_cycle"] == get_review_profile_policy("audit").max_worker_turns_per_cycle
     assert engine["reflection_passes_per_cycle"] == 3
     assert "reflection_max_wall_seconds" not in engine
     assert "reflection_no_progress_timeout_seconds" not in engine
@@ -201,11 +201,32 @@ def test_profile_template_compilation_applies_score_gates() -> None:
     assert config["agents"][1]["runtime_config"]["pi_max_retries"] == 0
     assert "max_wall_seconds" not in config["agents"][1]["runtime_config"]
     engine = config["workflows"]["atomic"][0]["engine"]
-    assert engine["reflection_max_internal_turns"] == get_review_profile_policy("audit").reflection_max_internal_turns
+    assert engine["reflection_max_internal_turns"] == 0
     assert engine["reflection_rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").reflection_rpc_stdout_abort_bytes
     assert "reflection_max_wall_seconds" not in engine
     assert engine["min_evidence_artifacts"] == get_review_profile_policy("audit").min_evidence_artifacts
     assert engine["required_pattern_families"] == list(get_review_profile_policy("audit").required_pattern_families)
+
+
+def test_profile_template_preserves_zero_timeout_retry_interval() -> None:
+    service = ProfileTemplateService()
+    normalized, config = service.compile_profile(
+        template_kind="vuln_scan_default",
+        config_payload={
+            "model": "mock/model",
+            "review_profile": "balanced",
+            "timeout_max_retries": 2,
+            "timeout_retry_interval_seconds": 0,
+        },
+    )
+
+    assert normalized["timeout_retry_interval_seconds"] == 0
+    for agent in config["agents"]:
+        if agent.get("type") == "pi_agent":
+            runtime = agent["runtime_config"]
+            assert runtime["timeout_max_retries"] == 2
+            assert runtime["timeout_retry_interval_seconds"] == 0
+            assert runtime["timeout_retry_delay"] == 0
 
 
 def test_profile_template_compilation_syncs_review_cycles_to_engine() -> None:
@@ -315,10 +336,10 @@ def test_profile_template_runtime_overrides_cannot_lower_profile_runtime_budgets
 
     assert worker_runtime["max_internal_turns"] == 0
     assert worker_runtime["rpc_stdout_abort_bytes"] == policy.worker_rpc_stdout_abort_bytes
-    assert advisor_runtime["max_internal_turns"] == policy.advisor_max_internal_turns
+    assert advisor_runtime["max_internal_turns"] == 0
     assert advisor_runtime["rpc_stdout_abort_bytes"] == policy.advisor_rpc_stdout_abort_bytes
     assert engine["max_worker_turns_per_cycle"] == policy.max_worker_turns_per_cycle
-    assert engine["reflection_max_internal_turns"] == policy.reflection_max_internal_turns
+    assert engine["reflection_max_internal_turns"] == 0
     assert engine["reflection_rpc_stdout_abort_bytes"] == policy.reflection_rpc_stdout_abort_bytes
 
 

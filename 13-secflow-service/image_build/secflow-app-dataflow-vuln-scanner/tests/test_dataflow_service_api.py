@@ -199,6 +199,63 @@ def test_task_bound_profile_versions_do_not_become_default(service_config_path, 
     assert effective.json()["effective_config"]["profile_version"]["version"] == 1
 
 
+def test_dataflow_task_rejects_absolute_input_refs_by_default(service_config_path, patch_mock_agent_runtime):
+    config = get_config()
+    project_root = config.fileserver_service.data_mount_path
+    from pathlib import Path
+
+    case_root = Path(project_root) / "files" / "default" / "case-absolute"
+    source_dir = case_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    data_flow_file = case_root / "data_flow.md"
+    data_flow_file.write_text("# 数据流追踪：demo\n", encoding="utf-8")
+
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "absolute path rejected",
+            "data_flow": {"source": "absolute_path", "path": str(data_flow_file.resolve())},
+            "source_dir": {"source": "absolute_path", "path": str(source_dir.resolve())},
+        },
+    )
+    assert task.status_code == 422
+    assert "absolute_path input is disabled" in task.json()["detail"]
+
+
+def test_dataflow_task_rejects_fileserver_storage_outside_project(service_config_path, patch_mock_agent_runtime):
+    config = get_config()
+    project_root = config.fileserver_service.data_mount_path
+    from pathlib import Path
+
+    other_root = Path(project_root) / "files" / "other" / "case-cross-project"
+    other_source = other_root / "source"
+    other_source.mkdir(parents=True, exist_ok=True)
+    (other_root / "data_flow.md").write_text("# 数据流追踪：demo\n", encoding="utf-8")
+
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "cross project storage rejected",
+            "data_flow": {"source": "fileserver_storage", "storage_key": "files/other/case-cross-project/data_flow.md"},
+            "source_dir": {"source": "fileserver_storage", "storage_key": "files/other/case-cross-project/source"},
+        },
+    )
+    assert task.status_code == 422
+    assert "escapes project root" in task.json()["detail"]
+
+
 def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path, patch_mock_agent_runtime):
     config = get_config()
     project_root = config.fileserver_service.data_mount_path
@@ -304,7 +361,22 @@ def test_business_dataflow_task_uses_selected_runs_root(service_config_path, pat
         },
     )
     assert task.status_code == 201
-    task_id = task.json()["task_id"]
+    created_payload = task.json()
+    task_id = created_payload["task_id"]
+    assert created_payload["run_name"] == "business-scan-custom-workspace"
+    assert created_payload["runs_root"] == str(runs_root.resolve())
+    assert Path(created_payload["run_path"]).parent == runs_root.resolve()
+    assert created_payload["run"]["name"] == "business-scan-custom-workspace"
+    assert created_payload["run"]["root_path"] == str(runs_root.resolve())
+
+    list_payload = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
+    assert list_payload.status_code == 200
+    listed_task = next(item for item in list_payload.json() if item["task_id"] == task_id)
+    assert listed_task["run_name"] == "business-scan-custom-workspace"
+    assert listed_task["runs_root"] == str(runs_root.resolve())
+    assert Path(listed_task["run_path"]).parent == runs_root.resolve()
+    assert listed_task["run"]["name"] == "business-scan-custom-workspace"
+    assert listed_task["run"]["root_path"] == str(runs_root.resolve())
 
     detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
     assert detail.status_code == 200
@@ -318,14 +390,16 @@ def test_business_dataflow_task_uses_selected_runs_root(service_config_path, pat
     assert expected_run_root.parent == runs_root.resolve()
     assert expected_run_root.name == "business-scan-custom-workspace"
 
-    history_resolve = client.get(
-        "/api/dataflow-vuln-scanner/history-runs/by-task",
+    run_resolve = client.get(
+        "/api/dataflow-vuln-scanner/runs/by-task",
         params={"project_id": "default", "task_id": task_id, "execution_id": execution_id},
     )
-    assert history_resolve.status_code == 200
-    history_detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{history_resolve.json()['history_run_id']}")
-    assert history_detail.status_code == 200
-    assert history_detail.json()["path"] == str(expected_run_root.resolve())
+    assert run_resolve.status_code == 200
+    assert run_resolve.json()["run_id"]
+    run_detail = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}")
+    assert run_detail.status_code == 200
+    assert run_detail.json()["run_id"] == run_resolve.json()["run_id"]
+    assert run_detail.json()["path"] == str(expected_run_root.resolve())
 
     runtime_config = json.loads((expected_run_root / "config.json").read_text(encoding="utf-8"))
     assert runtime_config["global"]["workspace_root"] == str((expected_run_root / "workspace").resolve())

@@ -73,9 +73,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         min_declared_extraction_ratio=0.0,
         allow_summary_only_evidence=True,
         default_max_review_cycles=1,
-        max_worker_turns_per_cycle=35,
+        max_worker_turns_per_cycle=80,
         reflection_passes_per_cycle=0,
-        reflection_max_internal_turns=4,
+        reflection_max_internal_turns=0,
         reflection_rpc_stdout_trace_bytes=512 * 1024,
         reflection_rpc_stdout_abort_bytes=16 * 1024 * 1024,
         min_discovery_cycles_before_pass=1,
@@ -87,7 +87,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         max_open_obligations_in_worker_prompt=8,
         worker_rpc_stdout_trace_bytes=2 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=96 * 1024 * 1024,
-        advisor_max_internal_turns=12,
+        advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=1 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=64 * 1024 * 1024,
         execution_goal="快速确认显性漏洞并生成 summary.md；不做评审返工或低风险穷尽。",
@@ -108,9 +108,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         min_declared_extraction_ratio=0.50,
         allow_summary_only_evidence=True,
         default_max_review_cycles=6,
-        max_worker_turns_per_cycle=70,
+        max_worker_turns_per_cycle=140,
         reflection_passes_per_cycle=1,
-        reflection_max_internal_turns=12,
+        reflection_max_internal_turns=0,
         reflection_rpc_stdout_trace_bytes=1 * 1024 * 1024,
         reflection_rpc_stdout_abort_bytes=128 * 1024 * 1024,
         min_discovery_cycles_before_pass=1,
@@ -126,7 +126,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         max_open_obligations_in_worker_prompt=24,
         worker_rpc_stdout_trace_bytes=4 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=256 * 1024 * 1024,
-        advisor_max_internal_turns=24,
+        advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=4 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=128 * 1024 * 1024,
         execution_goal="覆盖 STAR、高风险端点和关键 EXPORT/USED，优先挖出大部分中高危漏洞。",
@@ -149,9 +149,9 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         min_declared_extraction_ratio=1.00,
         allow_summary_only_evidence=False,
         default_max_review_cycles=10,
-        max_worker_turns_per_cycle=140,
+        max_worker_turns_per_cycle=260,
         reflection_passes_per_cycle=3,
-        reflection_max_internal_turns=24,
+        reflection_max_internal_turns=0,
         reflection_rpc_stdout_trace_bytes=2 * 1024 * 1024,
         reflection_rpc_stdout_abort_bytes=256 * 1024 * 1024,
         min_discovery_cycles_before_pass=3,
@@ -170,7 +170,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         max_open_obligations_in_worker_prompt=80,
         worker_rpc_stdout_trace_bytes=8 * 1024 * 1024,
         worker_rpc_stdout_abort_bytes=512 * 1024 * 1024,
-        advisor_max_internal_turns=54,
+        advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=8 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=256 * 1024 * 1024,
         execution_goal="深度审计关键数据流、变体和跨路径副作用；尽量挖出最多且最深的漏洞。",
@@ -473,7 +473,7 @@ def apply_profile_runtime_policy_to_config(
             runtime_config["rpc_stdout_abort_bytes"] = policy.worker_rpc_stdout_abort_bytes
         elif agent_id == "pi-advisor":
             runtime_config["advisor_runtime_retries"] = 3
-            runtime_config["max_internal_turns"] = policy.advisor_max_internal_turns
+            runtime_config["max_internal_turns"] = 0
             runtime_config["rpc_stdout_trace_bytes"] = policy.advisor_rpc_stdout_trace_bytes
             runtime_config["rpc_stdout_abort_bytes"] = policy.advisor_rpc_stdout_abort_bytes
 
@@ -493,7 +493,7 @@ def apply_profile_runtime_policy_to_config(
             engine["max_review_cycles"] = 1
         engine["max_worker_turns_per_cycle"] = policy.max_worker_turns_per_cycle
         engine["reflection_passes_per_cycle"] = policy.reflection_passes_per_cycle
-        engine["reflection_max_internal_turns"] = policy.reflection_max_internal_turns
+        engine["reflection_max_internal_turns"] = 0
         engine["reflection_rpc_stdout_trace_bytes"] = policy.reflection_rpc_stdout_trace_bytes
         engine["reflection_rpc_stdout_abort_bytes"] = policy.reflection_rpc_stdout_abort_bytes
         for key in _RPC_REFLECTION_WATCHDOG_KEYS:
@@ -561,8 +561,8 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
                 f"required_kinds={kinds}; dataflow>={policy.min_declared_extraction_ratio:.0%}; "
                 f"summary_only={summary_only}; cycles={policy.default_max_review_cycles}; "
                 "worker_internal_turns=unlimited; "
-                f"reflection_turns={policy.reflection_max_internal_turns}; "
-                f"advisor_turns={policy.advisor_max_internal_turns}; "
+                "reflection_turns=unlimited; "
+                "advisor_turns=unlimited; "
                 f"min_discovery={policy.min_discovery_cycles_before_pass}; "
                 f"progress_after={policy.progress_required_after_cycle}; "
                 f"min_evidence_artifacts={policy.min_evidence_artifacts}; "
@@ -584,12 +584,12 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
         f"- 默认最大评审轮次: {policy.default_max_review_cycles}",
         "- 单轮 Worker 内部 turn 硬上限: 不限制",
         f"- 单轮 Worker stdout 软上限: {policy.worker_rpc_stdout_abort_bytes // (1024 * 1024)}MB",
-        f"- 单次 Advisor 内部 turn 硬上限: {policy.advisor_max_internal_turns}",
+        "- 单次 Advisor 内部 turn 硬上限: 不限制",
         f"- 单次 Advisor stdout 软上限: {policy.advisor_rpc_stdout_abort_bytes // (1024 * 1024)}MB",
         f"- 全面性最终分数线: {_format_threshold_brief(completeness_thresholds)}",
         f"- 深入性最终分数线: {_format_threshold_brief(depth_thresholds)}",
         f"- 每轮反思 pass: {policy.reflection_passes_per_cycle}",
-        f"- 单次反思内部 turn 硬上限: {policy.reflection_max_internal_turns}",
+        "- 单次反思内部 turn 硬上限: 不限制",
         "- Pi/provider timeout: 仅依赖 Pi 原生 timeout；重发次数/间隔由 runtime_config.timeout_max_retries 与 timeout_retry_interval_seconds 控制",
         f"- 最少探索轮次: {policy.min_discovery_cycles_before_pass}",
         f"- 有效进展检测起始轮: {policy.progress_required_after_cycle or 'disabled'}",

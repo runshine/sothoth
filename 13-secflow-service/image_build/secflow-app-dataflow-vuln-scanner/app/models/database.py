@@ -47,7 +47,7 @@ class WorkflowDefinition(Base):
     priority_default = Column(Integer, nullable=False, default=100)
     max_retry_count = Column(Integer, nullable=False, default=3)
     workspace_base_dir = Column(String(512))
-    execution_timeout_seconds = Column(Integer, nullable=False, default=7200)
+    execution_timeout_seconds = Column(Integer, nullable=False, default=0)
     created_by = Column(String(128), nullable=False)
     updated_by = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=now_utc)

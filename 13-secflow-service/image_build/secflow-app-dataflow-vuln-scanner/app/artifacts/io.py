@@ -19,7 +19,17 @@ def abs_path(path: str | Path) -> str:
 
 
 def sanitize_name(value: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip("-") or "item"
+    """Return a safe single path component.
+
+    Keep historical support for dots inside names, but never return ``.`` or
+    ``..`` (or a value made only of separators).  Callers use this for project
+    ids, run names and task ids before appending to filesystem roots, so the
+    result must not be able to collapse or climb directories.
+    """
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "")).strip("-.")
+    if cleaned in {"", ".", ".."}:
+        return "item"
+    return cleaned
 
 
 def read_json(path: str | Path) -> Any:

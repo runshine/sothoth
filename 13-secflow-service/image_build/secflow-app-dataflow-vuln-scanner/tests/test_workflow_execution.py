@@ -29,7 +29,7 @@ async def test_full_pipeline_run(framework_config_payload: dict, tmp_path: Path,
     assert len(artifacts.result.final_tasks) == 2
     assert Path(artifacts.summary_file or "").exists()
     assert (Path(artifacts.result.working_dir) / "_meta" / "workflow_result.json").exists()
-    assert (Path(artifacts.result.working_dir) / "stage_01_scan").exists()
+    assert (Path(artifacts.result.working_dir) / "stage_01_vuln_scan").exists()
 
 
 @pytest.mark.asyncio

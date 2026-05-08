@@ -16,6 +16,7 @@ from app.pi_vuln_core.plugins.executor import PluginChainExecutor
 from app.pi_vuln_core.plugins.registry import PluginRegistry
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
 from app.pi_vuln_core.review.profile import (
+    apply_profile_runtime_policy_to_config,
     apply_profile_thinking_to_runtime_config,
     get_review_profile_policy,
 )
@@ -497,7 +498,7 @@ def _apply_runtime_overrides(
     model: str | None = None,
     provider: str | None = None,
     thinking: str | None = None,
-) -> None:
+) -> FrameworkConfig:
     effective_model = _normalize_model_name(model, provider)
     review_profile = "balanced"
     for workflow in getattr(config.workflows, "atomic", []) or []:
@@ -517,6 +518,14 @@ def _apply_runtime_overrides(
             sdk_specific.pop("provider", None)
         apply_profile_thinking_to_runtime_config(agent.runtime_config, review_profile)
 
+    # Old runs may contain stale RPC watchdog / low max_internal_turns values
+    # (for example fast profile worker max_internal_turns=35). Re-apply the
+    # current profile runtime policy before resuming so historical tasks do not
+    # fail again for obsolete framework-side limits.
+    payload = config.model_dump(mode="json", by_alias=True)
+    apply_profile_runtime_policy_to_config(payload, review_profile)
+    return FrameworkConfig.model_validate(payload)
+
 
 async def resume_run(
     run_dir: str | Path,
@@ -531,7 +540,7 @@ async def resume_run(
         raise ValueError("extra_cycles 必须 >= 1")
 
     config, plan = build_resume_plan(run_dir)
-    _apply_runtime_overrides(
+    config = _apply_runtime_overrides(
         config,
         model=model,
         provider=provider,

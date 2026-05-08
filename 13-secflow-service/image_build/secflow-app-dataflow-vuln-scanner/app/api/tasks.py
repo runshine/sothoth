@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import ensure_project_access, get_current_subject, get_db
+from app.config import get_config
 from app.schemas import (
     HistoryRunCycleResponse,
     HistoryRunDetailResponse,
@@ -19,6 +20,16 @@ from app.schemas import (
     HistoryRunSummaryResponse,
     ProjectFilesystemChildrenResponse,
     ProjectFilesystemRootResponse,
+    RunCycleResponse,
+    RunDetailResponse,
+    RunFileContentResponse,
+    RunFileResponse,
+    RunLogResponse,
+    RunMutationResponse,
+    RunResolveResponse,
+    RunRetryRequest,
+    RunSessionResponse,
+    RunSummaryResponse,
     ScanTaskCreateRequest,
     ScanTaskDetailResponse,
     ScanTaskPriorityUpdateRequest,
@@ -33,9 +44,12 @@ router = APIRouter(prefix="/api/dataflow-vuln-scanner", tags=["Dataflow Vuln Sca
 
 @router.get("/capabilities", response_model=Dict[str, Any])
 async def get_capabilities(subject=Depends(get_current_subject)):
+    task_input_modes = ["project_filesystem", "upload_to_project_filesystem", "fileserver_storage"]
+    if get_config().service.allow_absolute_input_refs:
+        task_input_modes.append("absolute_path")
     return {
         "service": "secflow-app-dataflow-vuln-scanner",
-        "task_input_modes": ["project_filesystem", "upload_to_project_filesystem", "fileserver_storage", "absolute_path"],
+        "task_input_modes": task_input_modes,
         "required_inputs": ["data_flow", "source_dir"],
         "data_flow_file_types": [".md", ".txt"],
         "source_file_types": [".c", ".h", ".cpp", ".hpp", ".cc", ".asm", ".S", ".s"],
@@ -115,6 +129,153 @@ async def list_tasks(
 async def get_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_scan_task(db, task_id, principal)
+
+
+@router.get("/runs", response_model=List[RunSummaryResponse])
+async def list_runs(
+    project_id: str = Query(...),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, token = subject
+    await ensure_project_access(project_id, token)
+    return get_execution_service().list_history_runs(db, principal, project_id=project_id)
+
+
+@router.get("/runs/resolve", response_model=RunResolveResponse)
+async def resolve_run(
+    project_id: str = Query(...),
+    run_name: str = Query(...),
+    root_path: str = Query(...),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, token = subject
+    await ensure_project_access(project_id, token)
+    return get_execution_service().resolve_history_run(db, principal, project_id=project_id, run_name=run_name, root_path=root_path)
+
+
+@router.get("/runs/by-task", response_model=RunResolveResponse)
+async def resolve_run_by_task(
+    project_id: str = Query(...),
+    task_id: str = Query(...),
+    execution_id: Optional[str] = Query(None),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, token = subject
+    await ensure_project_access(project_id, token)
+    return get_execution_service().resolve_history_run_by_task(
+        db,
+        principal,
+        project_id=project_id,
+        task_id=task_id,
+        execution_id=execution_id,
+    )
+
+
+@router.get("/runs/{run_id}", response_model=RunDetailResponse)
+async def get_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().get_history_run(db, run_id, principal)
+
+
+@router.get("/runs/{run_id}/cycles/{cycle}", response_model=RunCycleResponse)
+async def get_run_cycle(
+    run_id: str,
+    cycle: int,
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().get_history_run_cycle(db, run_id, cycle, principal)
+
+
+@router.get("/runs/{run_id}/sessions", response_model=List[RunSessionResponse])
+async def list_run_sessions(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().list_history_run_sessions(db, run_id, principal)
+
+
+@router.get("/runs/{run_id}/files", response_model=List[RunFileResponse])
+async def list_run_files(
+    run_id: str,
+    limit: int = Query(default=1200, ge=1, le=5000),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().list_history_run_files(db, run_id, principal, limit=limit)
+
+
+@router.get("/runs/{run_id}/file", response_model=RunFileContentResponse)
+async def get_run_file(
+    run_id: str,
+    path: str = Query(...),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().get_history_run_file(db, run_id, principal, path)
+
+
+@router.get("/runs/{run_id}/session-file", response_model=Dict[str, Any])
+async def get_run_session_file(
+    run_id: str,
+    path: str = Query(...),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().get_history_run_session_file(db, run_id, principal, path)
+
+
+@router.get("/runs/{run_id}/log", response_model=RunLogResponse)
+async def get_run_log(
+    run_id: str,
+    lines: int = Query(default=300, ge=1, le=2000),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().get_history_run_log(db, run_id, principal, lines=lines)
+
+
+@router.delete("/runs/{run_id}", response_model=RunMutationResponse)
+async def delete_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().delete_history_run(db, run_id, principal)
+
+
+@router.post("/runs/{run_id}/cancel", response_model=RunMutationResponse)
+async def cancel_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().cancel_history_run(db, run_id, principal)
+
+
+@router.post("/runs/{run_id}/adopt", response_model=RunMutationResponse)
+async def adopt_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().adopt_history_run(db, run_id, principal)
+
+
+@router.post(
+    "/runs/{run_id}/retry",
+    response_model=RunMutationResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_run(
+    run_id: str,
+    payload: RunRetryRequest,
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    result = get_execution_service().retry_history_run(db, run_id, principal, payload)
+    if get_scheduler_service().start_execution_now(result.get("linked_execution_id")):
+        result["status"] = "running"
+        result["message"] = "Run resume started"
+    return result
 
 
 @router.get("/history-runs", response_model=List[HistoryRunSummaryResponse])

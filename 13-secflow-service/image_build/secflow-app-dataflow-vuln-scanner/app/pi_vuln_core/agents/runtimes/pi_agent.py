@@ -834,13 +834,6 @@ class PiAgentRuntime(BaseAgentRuntime):
                     if event.get("type") != "turn_start":
                         return
                     internal_turns += 1
-                    if max_internal_turns > 0 and internal_turns > max_internal_turns:
-                        with contextlib.suppress(ProcessLookupError):
-                            proc.terminate()
-                        raise _RuntimeTurnLimitError(
-                            "runtime internal turn limit exceeded: "
-                            f"{internal_turns}>{max_internal_turns}"
-                        )
 
                 async def _read_stdout() -> None:
                     nonlocal stdout_soft_limit_exceeded
@@ -1367,13 +1360,6 @@ class PiAgentRuntime(BaseAgentRuntime):
 
                     if event.get("type") == "turn_start":
                         internal_turns += 1
-                        if max_internal_turns > 0 and internal_turns > max_internal_turns:
-                            with contextlib.suppress(Exception):
-                                await self._rpc_send(proc, {"type": "abort"})
-                            raise _RuntimeTurnLimitError(
-                                "runtime internal turn limit exceeded: "
-                                f"{internal_turns}>{max_internal_turns}"
-                            )
 
                     if (
                         event.get("type") == "response"
@@ -1578,11 +1564,10 @@ class PiAgentRuntime(BaseAgentRuntime):
         )
         max_event_count = self._runtime_int("max_event_count", _DEFAULT_MAX_PARSED_EVENTS)
         max_single_line_bytes = self._runtime_int("max_single_line_bytes", _DEFAULT_MAX_RPC_LINE_BYTES)
-        effective_max_internal_turns = (
-            int(max_internal_turns)
-            if max_internal_turns is not None else
-            self._runtime_int("max_internal_turns", 0)
-        )
+        # Pi internal turn count is an implementation detail, not a safe
+        # progress signal for vuln scanning. Keep collecting the metric, but
+        # never abort a running agent because this counter grows.
+        effective_max_internal_turns = 0
         effective_no_progress_timeout_seconds: float | None = None
         effective_max_wall_seconds: float | None = None
         max_retry_wall_seconds: float | None = None

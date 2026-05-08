@@ -67,8 +67,8 @@ def _extract_defaults(template: dict[str, Any]) -> dict[str, Any]:
         ),
         "worker_timeout": worker_runtime.get("timeout_seconds") or 3600,
         "advisor_timeout": advisor_runtime.get("timeout_seconds") or 3600,
-        "timeout_max_retries": worker_runtime.get("timeout_max_retries") or advisor_runtime.get("timeout_max_retries") or 3,
-        "timeout_retry_interval_seconds": worker_runtime.get("timeout_retry_interval_seconds") or advisor_runtime.get("timeout_retry_interval_seconds") or 30,
+        "timeout_max_retries": worker_runtime.get("timeout_max_retries") if worker_runtime.get("timeout_max_retries") is not None else advisor_runtime.get("timeout_max_retries") if advisor_runtime.get("timeout_max_retries") is not None else 3,
+        "timeout_retry_interval_seconds": worker_runtime.get("timeout_retry_interval_seconds") if worker_runtime.get("timeout_retry_interval_seconds") is not None else advisor_runtime.get("timeout_retry_interval_seconds") if advisor_runtime.get("timeout_retry_interval_seconds") is not None else 30,
         "result_review_concurrency": ((template.get("global") or {}).get("parallel_result_review_limit") or 3),
         "runtime_overrides": {},
     }
@@ -90,6 +90,14 @@ def _overrides_engine_max_cycles(overrides: dict[str, Any] | None) -> bool:
         if isinstance(engine, dict) and "max_review_cycles" in engine:
             return True
     return False
+
+
+def _first_present_int(*values: Any, default: int) -> int:
+    for value in values:
+        if value is None or value == "":
+            continue
+        return int(value)
+    return default
 
 
 def _sync_engine_max_cycles(compiled: dict[str, Any]) -> None:
@@ -125,8 +133,8 @@ class ProfileTemplateService:
         model = str(normalized_payload.get("model") or "").strip()
         worker_timeout = int(normalized_payload.get("worker_timeout") or 3600)
         advisor_timeout = int(normalized_payload.get("advisor_timeout") or 3600)
-        timeout_max_retries = max(int(normalized_payload.get("timeout_max_retries") or 3), 1)
-        timeout_retry_interval_seconds = max(int(normalized_payload.get("timeout_retry_interval_seconds") or 30), 0)
+        timeout_max_retries = max(_first_present_int(normalized_payload.get("timeout_max_retries"), default=3), 1)
+        timeout_retry_interval_seconds = max(_first_present_int(normalized_payload.get("timeout_retry_interval_seconds"), default=30), 0)
         review_profile = normalize_review_profile(normalized_payload.get("review_profile"))
         profile_policy = get_review_profile_policy(review_profile)
         explicit_max_cycles = (
@@ -159,7 +167,7 @@ class ProfileTemplateService:
             elif agent.get("id") == "pi-advisor":
                 runtime_config["timeout_seconds"] = advisor_timeout
                 runtime_config["advisor_runtime_retries"] = 3
-                runtime_config["max_internal_turns"] = profile_policy.advisor_max_internal_turns
+                runtime_config["max_internal_turns"] = 0
                 runtime_config["rpc_stdout_trace_bytes"] = profile_policy.advisor_rpc_stdout_trace_bytes
                 runtime_config["rpc_stdout_abort_bytes"] = profile_policy.advisor_rpc_stdout_abort_bytes
 
@@ -171,7 +179,7 @@ class ProfileTemplateService:
                 engine["max_review_cycles"] = global_cfg["max_review_cycles"]
                 engine["max_worker_turns_per_cycle"] = profile_policy.max_worker_turns_per_cycle
                 engine["reflection_passes_per_cycle"] = profile_policy.reflection_passes_per_cycle
-                engine["reflection_max_internal_turns"] = profile_policy.reflection_max_internal_turns
+                engine["reflection_max_internal_turns"] = 0
                 engine["reflection_rpc_stdout_trace_bytes"] = profile_policy.reflection_rpc_stdout_trace_bytes
                 engine["reflection_rpc_stdout_abort_bytes"] = profile_policy.reflection_rpc_stdout_abort_bytes
                 engine.setdefault("summary_repair_attempt_budget", 2)

@@ -113,7 +113,9 @@ python3 run_vuln_scan.py \
 | `transport` | `agents[*].runtime_config.transport` | Pi 调用模式，默认模板使用 `rpc`（支持 pi 内建 auto-retry）；兼容 `json` |
 | `api_max_retries` / `api_retry_delay` | `agents[*].runtime_config` | 框架侧 API/网络/限流错误重试次数/初始退避秒数；默认 RPC 模板为 `0`，仅在显式配置正整数时才做额外框架重试 |
 | `pi_max_retries` / `pi_retry_delay` | `agents[*].runtime_config` | 框架侧 Pi 进程崩溃/中断类错误重试次数/初始退避秒数；默认 RPC 模板为 `0`，避免与长连接 RPC 会话重复重放 |
-| `timeout_retry_interval_seconds` | `agents[*].runtime_config` | RPC 下 Pi/provider 原生 timeout 的固定重发间隔秒数，默认 30；不再使用 `no_progress_timeout_seconds` / `max_wall_seconds` / `max_retry_wall_seconds` 截断 prompt |
+| `timeout_retry_interval_seconds` | `agents[*].runtime_config` | RPC 下 Pi/provider 原生 timeout 的固定重发间隔秒数，默认 30；可显式设为 0；不再使用 `no_progress_timeout_seconds` / `max_wall_seconds` / `max_retry_wall_seconds` 截断 prompt |
+| `worker_timeout` / `advisor_timeout` | `config_payload` | 兼容旧 Profile 字段；默认 RPC 模式下不控制 prompt 超时，建议不要作为运行时超时开关使用 |
+| `execution_timeout_seconds` | Profile 定义 | 服务托管的 `run_vuln_scan.py` 子进程最大执行时长；默认 `0`（不限制/禁用框架超时）；仅显式设置正整数时才会由服务请求停止并标记失败 |
 | `reset_worker_session_per_cycle` | `workflows.atomic[*].engine` | Worker 是否每轮重建会话；默认 `false`，所有轮次复用同一 RPC session / pi 进程 |
 | `thinking` | `agents[*].runtime_config.sdk_specific.thinking` | 思考深度，可设为 `off` / `low` / `medium` / `high` / `xhigh` |
 | `max_review_cycles` | `global` 或 `workflows.atomic[*].engine` | 评审循环次数 |
@@ -776,8 +778,8 @@ curl -X POST http://127.0.0.1:8080/api/dataflow-vuln-scanner/profiles \
       "model": "icsl/zai-org/GLM-5",
       "thinking": "high",
       "max_review_cycles": 6,
-      "worker_timeout": 3600,
-      "advisor_timeout": 3600,
+      "timeout_max_retries": 3,
+      "timeout_retry_interval_seconds": 30,
       "result_review_concurrency": 3,
       "runtime_overrides": {}
     },
@@ -785,7 +787,7 @@ curl -X POST http://127.0.0.1:8080/api/dataflow-vuln-scanner/profiles \
     "enabled": true,
     "default_priority": 100,
     "max_retry_count": 3,
-    "execution_timeout_seconds": 7200
+    "execution_timeout_seconds": 0
   }'
 
 # 2. 下发扫描任务
@@ -802,10 +804,10 @@ curl -X POST http://127.0.0.1:8080/api/dataflow-vuln-scanner/tasks \
 
 # 3. 查询 Run 和执行详情
 curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/tasks?project_id=default'
-curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/history-runs?project_id=default'
-curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/history-runs/by-task?project_id=default&task_id=<task_id>'
-curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/history-runs/<history_run_id>'
-curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/history-runs/<history_run_id>/files'
+curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/runs?project_id=default'
+curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/runs/by-task?project_id=default&task_id=<task_id>'
+curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/runs/<run_id>'
+curl 'http://127.0.0.1:8080/api/dataflow-vuln-scanner/runs/<run_id>/files'
 ```
 
 ### 7. 使用 `docker compose`
@@ -857,6 +859,16 @@ docker run --rm -it --entrypoint bash secflow-app-dataflow-vuln-scanner:latest
 ### 9. K8S
 
 推荐做法是把本机 Agent 配置同步成 Secret，再由 Pod 启动时自动恢复到 `/root/.pi` 与 `/root/.copilot`。仓库里已经接好了对应挂载和恢复逻辑。
+
+服务数据库密码与服务间 machine token 不再写入 ConfigMap，部署前需要先创建 Secret：
+
+```bash
+kubectl -n secflow-ns create secret generic secflow-app-dataflow-vuln-scanner-secret \
+  --from-literal=db-password='<mysql-password>' \
+  --from-literal=service-machine-token='<machine-token>'
+```
+
+然后同步 Agent home：
 
 ```bash
 cd 13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner

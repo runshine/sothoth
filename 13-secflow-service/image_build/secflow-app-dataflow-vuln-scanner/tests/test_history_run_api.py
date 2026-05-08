@@ -294,12 +294,20 @@ def test_history_runs_list_uses_execution_bound_runs_and_ignores_unbound_directo
 
     history_runs = client.get("/api/dataflow-vuln-scanner/history-runs", params={"project_id": "default"})
     assert history_runs.status_code == 200
+    runs = client.get("/api/dataflow-vuln-scanner/runs", params={"project_id": "default"})
+    assert runs.status_code == 200
     items = history_runs.json()
+    run_items = runs.json()
     names = {item["name"] for item in items}
+    run_names = {item["name"] for item in run_items}
     assert bound_run.name in names
+    assert bound_run.name in run_names
     assert unbound_run.name not in names
+    assert unbound_run.name not in run_names
 
     summary = next(item for item in items if item["name"] == bound_run.name)
+    run_summary = next(item for item in run_items if item["name"] == bound_run.name)
+    assert run_summary["run_id"] == summary["history_run_id"]
     assert summary["source_type"] == "execution_workspace"
     assert summary["linked_task_id"] == bound["task_id"]
     assert summary["linked_execution_id"] == bound["execution_id"]
@@ -308,6 +316,7 @@ def test_history_runs_list_uses_execution_bound_runs_and_ignores_unbound_directo
     assert tasks.status_code == 200
     task_summary = next(item for item in tasks.json() if item["task_id"] == bound["task_id"])
     assert task_summary["title"] == "DB bound scan"
+    assert task_summary["run"]["run_id"] == run_summary["run_id"]
     assert task_summary["latest_run"]["history_run_id"] == summary["history_run_id"]
 
 

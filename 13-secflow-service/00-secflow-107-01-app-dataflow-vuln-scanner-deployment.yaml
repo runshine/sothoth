@@ -48,6 +48,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: SECFLOW_DATAFLOW_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: secflow-app-dataflow-vuln-scanner-secret
+                  key: db-password
+            - name: SECFLOW_DATAFLOW_SERVICE_MACHINE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: secflow-app-dataflow-vuln-scanner-secret
+                  key: service-machine-token
           ports:
             - containerPort: 8080
           volumeMounts:

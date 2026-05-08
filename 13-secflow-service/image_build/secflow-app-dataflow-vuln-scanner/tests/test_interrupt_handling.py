@@ -60,7 +60,7 @@ async def test_interrupted_run_records_standard_abnormal_exit(
     framework_config_payload: dict,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setitem(AgentRuntimeRegistry.RUNTIME_MAP, "claude_code", InterruptingRuntime)
+    monkeypatch.setitem(AgentRuntimeRegistry.RUNTIME_MAP, "pi_agent", InterruptingRuntime)
 
     input_task = tmp_path / "input-task.md"
     input_task.write_text("# Test Task\n\nTrigger interrupt.\n", encoding="utf-8")
@@ -84,7 +84,7 @@ async def test_interrupted_run_records_standard_abnormal_exit(
     atomic_abnormal = (
         workspace_root
         / "pipeline_interrupt-run-001"
-        / "stage_01_scan"
+        / "stage_01_vuln_scan"
         / "vuln_scan_initial_001"
         / "_meta"
         / "abnormal_exit.json"

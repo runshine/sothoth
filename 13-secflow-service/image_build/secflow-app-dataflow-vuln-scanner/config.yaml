@@ -59,13 +59,14 @@ registry:
 
 service:
   workspace_base_dir: /data/files
-  default_execution_timeout_seconds: 7200
+  default_execution_timeout_seconds: 0
   execution_cancel_check_interval_seconds: 1
   trigger_retry_limit: 3
   public_api_prefix: /api/dataflow-vuln-scanner
   default_entry_task_type: package_list
   default_artifact_subdir: assets
   default_profile_template_kind: vuln_scan_default
+  allow_absolute_input_refs: false
 
 scheduler:
   enabled: true

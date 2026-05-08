@@ -93,8 +93,8 @@ class WorkflowService:
             max_review_cycles=int(((compiled_config.get("global") or {}).get("max_review_cycles") or 6)),
             worker_timeout=int(worker_runtime.get("timeout_seconds") or 3600),
             advisor_timeout=int(advisor_runtime.get("timeout_seconds") or 3600),
-            timeout_max_retries=int(worker_runtime.get("timeout_max_retries") or advisor_runtime.get("timeout_max_retries") or 3),
-            timeout_retry_interval_seconds=int(worker_runtime.get("timeout_retry_interval_seconds") or advisor_runtime.get("timeout_retry_interval_seconds") or 30),
+            timeout_max_retries=int(worker_runtime.get("timeout_max_retries") if worker_runtime.get("timeout_max_retries") is not None else advisor_runtime.get("timeout_max_retries") if advisor_runtime.get("timeout_max_retries") is not None else 3),
+            timeout_retry_interval_seconds=int(worker_runtime.get("timeout_retry_interval_seconds") if worker_runtime.get("timeout_retry_interval_seconds") is not None else advisor_runtime.get("timeout_retry_interval_seconds") if advisor_runtime.get("timeout_retry_interval_seconds") is not None else 30),
             result_review_concurrency=int(((compiled_config.get("global") or {}).get("parallel_result_review_limit") or 3)),
             runtime_overrides={},
         ).model_dump(mode="json")

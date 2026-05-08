@@ -318,10 +318,7 @@ class WorkerExecutor:
             return value
 
         return {
-            "max_internal_turns": configured_int(
-                "reflection_max_internal_turns",
-                policy.reflection_max_internal_turns,
-            ),
+            "max_internal_turns": 0,
             "rpc_stdout_trace_bytes": configured_int(
                 "reflection_rpc_stdout_trace_bytes",
                 policy.reflection_rpc_stdout_trace_bytes,
@@ -1184,7 +1181,7 @@ class WorkerExecutor:
             "## Profile 执行预算与深度目标",
             "- 单轮 Worker 内部 turn 硬上限: 不限制",
             f"- 每轮反思 pass: {policy.reflection_passes_per_cycle}",
-            f"- 单次反思内部 turn 硬上限: {policy.reflection_max_internal_turns}",
+            "- 单次反思内部 turn 硬上限: 不限制",
             "- Pi/provider timeout: 仅依赖 Pi 原生 timeout；不再使用档位级 no-progress / wall-clock watchdog",
             f"- 最少探索轮次: {policy.min_discovery_cycles_before_pass}",
             f"- 最少证据产物数: {policy.min_evidence_artifacts}",

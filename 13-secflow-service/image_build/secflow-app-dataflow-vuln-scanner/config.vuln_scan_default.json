@@ -29,7 +29,7 @@
         "pi_retry_delay": 10,
         "timeout_max_retries": 3,
         "timeout_retry_delay": 30,
-        "max_internal_turns": 70,
+        "max_internal_turns": 140,
         "rpc_stdout_trace_bytes": 4194304,
         "transport": "rpc",
         "timeout_retry_interval_seconds": 30

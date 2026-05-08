@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, Optional
 
 import yaml
@@ -106,13 +107,16 @@ class RegistryConfig(BaseModel):
 
 class ServiceConfig(BaseModel):
     workspace_base_dir: str = "/data/files"
-    default_execution_timeout_seconds: int = 7200
+    # 0 means unlimited / disabled. We deliberately avoid framework-side
+    # timeout enforcement for the Pi process unless a caller explicitly opts in.
+    default_execution_timeout_seconds: int = 0
     execution_cancel_check_interval_seconds: int = 1
     trigger_retry_limit: int = 3
     public_api_prefix: str = "/api/dataflow-vuln-scanner"
     default_entry_task_type: str = "package_list"
     default_artifact_subdir: str = "assets"
     default_profile_template_kind: str = "vuln_scan_default"
+    allow_absolute_input_refs: bool = False
 
 
 class SchedulerConfig(BaseModel):
@@ -159,6 +163,14 @@ def _candidate_paths(config_path: Optional[str]) -> list[str]:
     ]
 
 
+def _resolve_env_vars(text: str) -> str:
+    def _replace(match: re.Match) -> str:
+        name = match.group(1)
+        return os.environ.get(name, match.group(0))
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _replace, text)
+
+
 def load_config(config_path: Optional[str] = None) -> Config:
     global _config
     if _config is not None:
@@ -167,7 +179,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
     for path in _candidate_paths(config_path):
         if path and os.path.exists(path):
             with open(path, "r", encoding="utf-8") as file:
-                data: Dict[str, Any] = yaml.safe_load(file) or {}
+                raw_text = file.read()
+            data: Dict[str, Any] = yaml.safe_load(_resolve_env_vars(raw_text)) or {}
             _config = Config(**data)
             return _config
 

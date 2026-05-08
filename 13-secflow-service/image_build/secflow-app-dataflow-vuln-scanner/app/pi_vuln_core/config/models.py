@@ -140,7 +140,7 @@ class EngineConfig(BaseModel):
     review_enabled: bool = True
     max_worker_turns_per_cycle: Optional[int] = Field(default=None, ge=1)
     reflection_passes_per_cycle: Optional[int] = Field(default=None, ge=0)
-    reflection_max_internal_turns: Optional[int] = Field(default=None, ge=1)
+    reflection_max_internal_turns: Optional[int] = Field(default=None, ge=0)
     reflection_rpc_stdout_trace_bytes: Optional[int] = Field(default=None, ge=1)
     reflection_rpc_stdout_abort_bytes: Optional[int] = Field(default=None, ge=1)
     min_discovery_cycles_before_pass: Optional[int] = Field(default=None, ge=1)

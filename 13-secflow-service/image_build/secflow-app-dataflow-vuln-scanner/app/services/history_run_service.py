@@ -797,6 +797,7 @@ class HistoryRunService:
 
     def _summary_payload(self, history_run: HistoryRun) -> dict[str, Any]:
         return {
+            "run_id": history_run.id,
             "history_run_id": history_run.id,
             "project_id": history_run.project_id,
             "source_type": history_run.source_type,

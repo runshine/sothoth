@@ -1,38 +1,62 @@
 {
+  "_说明": "漏洞挖掘默认配置模板。复制此文件后按需修改，通过 run_vuln_scan.py -c 指定使用。",
+  "_说明2": "执行路径类字段 (workspace_root, task_file, output_dir 等) 无需修改，启动器会自动覆盖。",
   "version": "1.0",
   "global": {
-    "workspace_root": "/workspace",
+    "workspace_root": "__AUTO__",
     "log_level": "INFO",
-    "max_workflow_retry": 2,
+    "max_workflow_retry": 1,
     "max_review_cycles": 6,
-    "default_context_reset": false,
+    "default_context_reset": true,
     "parallel_result_review": true,
     "parallel_result_review_limit": 3,
     "env_vars": {}
   },
   "agents": [
     {
-      "id": "mock-worker",
-      "name": "Mock Worker",
-      "type": "claude_code",
+      "id": "pi-worker",
+      "name": "Pi Agent Worker",
+      "type": "pi_agent",
       "reset_context": false,
       "runtime_config": {
         "model": "icsl/zai-org/GLM-5",
-        "api_key_env": "ANTHROPIC_API_KEY",
-        "max_tokens": 8000,
-        "timeout_seconds": 3600
+        "sdk_specific": {
+          "thinking": "medium"
+        },
+        "api_max_retries": 0,
+        "api_retry_delay": 10,
+        "pi_max_retries": 0,
+        "pi_retry_delay": 10,
+        "timeout_max_retries": 3,
+        "timeout_retry_delay": 30,
+        "max_internal_turns": 140,
+        "rpc_stdout_trace_bytes": 4194304,
+        "transport": "rpc",
+        "timeout_retry_interval_seconds": 30
       }
     },
     {
-      "id": "mock-advisor",
-      "name": "Mock Advisor",
-      "type": "claude_code",
+      "id": "pi-advisor",
+      "name": "Pi Agent Advisor",
+      "type": "pi_agent",
       "reset_context": true,
       "runtime_config": {
         "model": "icsl/zai-org/GLM-5",
-        "api_key_env": "ANTHROPIC_API_KEY",
-        "max_tokens": 4000,
-        "timeout_seconds": 3600
+        "sdk_specific": {
+          "thinking": "medium",
+          "tools": "read,bash"
+        },
+        "api_max_retries": 0,
+        "api_retry_delay": 10,
+        "pi_max_retries": 0,
+        "pi_retry_delay": 10,
+        "advisor_runtime_retries": 3,
+        "timeout_max_retries": 3,
+        "timeout_retry_delay": 30,
+        "max_internal_turns": 24,
+        "rpc_stdout_trace_bytes": 4194304,
+        "transport": "rpc",
+        "timeout_retry_interval_seconds": 30
       }
     }
   ],
@@ -42,9 +66,7 @@
       "name": "环境变量设置",
       "module_path": "app.pi_vuln_core.plugins.builtin.env_setup",
       "class_name": "EnvSetupPlugin",
-      "config": {
-        "extra_vars": {}
-      }
+      "config": {}
     },
     {
       "id": "workspace_init",
@@ -78,13 +100,20 @@
       }
     },
     {
+      "id": "final_output_collector",
+      "name": "最终产出收集",
+      "module_path": "app.pi_vuln_core.plugins.builtin.final_output_collector",
+      "class_name": "FinalOutputCollectorPlugin",
+      "config": {
+        "output_subdir": "final_output"
+      }
+    },
+    {
       "id": "next_task_generator",
       "name": "下阶段任务生成器",
       "module_path": "app.pi_vuln_core.plugins.builtin.next_task_generator",
       "class_name": "NextTaskGeneratorPlugin",
       "config": {
-        "agent_id": null,
-        "prompt_template": null,
         "output_subdir": "output"
       }
     }
@@ -92,10 +121,10 @@
   "workflows": {
     "atomic": [
       {
-        "id": "test_vuln_scan",
-        "name": "测试漏洞扫描",
+        "id": "vuln_scan",
+        "name": "数据流驱动漏洞挖掘",
         "type": "atomic",
-        "description": "Mock 测试用原子工作流，扫描单个模块的漏洞",
+        "description": "基于数据流分析结果和源代码进行深度安全漏洞挖掘",
         "working_dir_template": "vuln_scan_{task_id}",
         "start_plugins": [
           "env_setup",
@@ -104,14 +133,19 @@
         ],
         "end_plugins": [
           "result_archiver",
+          "final_output_collector",
           "next_task_generator"
         ],
         "engine": {
           "max_review_cycles": 6,
           "review_profile": "balanced",
+          "review_enabled": true,
           "max_worker_turns_per_cycle": 70,
           "reflection_passes_per_cycle": 1,
           "min_discovery_cycles_before_pass": 1,
+          "progress_required_after_cycle": 0,
+          "progress_no_signal_closure_streak": 2,
+          "progress_no_signal_abort_streak": 3,
           "reset_worker_session_per_cycle": false,
           "plateau_closure_streak": 2,
           "plateau_abort_streak": 3,
@@ -125,9 +159,8 @@
         },
         "roles": {
           "worker": {
-            "agent_id": "mock-worker",
-            "new_session": true,
-            "reset_context_override": null,
+            "agent_id": "pi-worker",
+            "new_session": false,
             "prompts": {
               "work": {
                 "system_prompt_file": "prompts/vuln_scan/worker_system.md",
@@ -138,7 +171,7 @@
                 {
                   "id": "reflect_completeness",
                   "prompt_file": "prompts/vuln_scan/reflect_completeness.md",
-                  "description": "检查是否遗漏了常见漏洞类型"
+                  "description": "检查数据流覆盖度和分析深度"
                 }
               ],
               "summary": {
@@ -152,7 +185,7 @@
             "global_review": [
               {
                 "instance_id": "global_completeness",
-                "agent_id": "mock-advisor",
+                "agent_id": "pi-advisor",
                 "role_name": "全面性审计",
                 "re_review_on_cycle": true,
                 "system_prompt_file": "prompts/vuln_scan/global_review_completeness_sys.md",
@@ -172,17 +205,17 @@
                   "report_completeness": 0.7
                 },
                 "score_thresholds": {
-                  "input_coverage": 1.0,
-                  "export_followthrough": 0.95,
-                  "used_coverage": 0.95,
-                  "limitations_honesty": 0.95,
-                  "report_completeness": 0.9
+                  "input_coverage": 0.95,
+                  "export_followthrough": 0.9,
+                  "used_coverage": 0.9,
+                  "limitations_honesty": 0.9,
+                  "report_completeness": 0.88
                 },
                 "score_threshold_ramp_cycles": 5
               },
               {
                 "instance_id": "global_depth",
-                "agent_id": "mock-advisor",
+                "agent_id": "pi-advisor",
                 "role_name": "深入性审计",
                 "re_review_on_cycle": true,
                 "system_prompt_file": "prompts/vuln_scan/global_review_depth_sys.md",
@@ -196,17 +229,17 @@
                   "code_evidence_depth": 0.6
                 },
                 "score_thresholds": {
-                  "vuln_pattern_breadth": 0.85,
-                  "code_evidence_depth": 0.85
+                  "vuln_pattern_breadth": 0.82,
+                  "code_evidence_depth": 0.82
                 },
                 "score_threshold_ramp_cycles": 5
               }
             ],
             "result_review": [
               {
-                "instance_id": "result_fp_detector",
-                "agent_id": "mock-advisor",
-                "role_name": "误报检测员",
+                "instance_id": "result_fp_check",
+                "agent_id": "pi-advisor",
+                "role_name": "误报检测",
                 "re_review_on_cycle": false,
                 "system_prompt_file": "prompts/vuln_scan/result_review_sys.md",
                 "user_prompt_template": "prompts/vuln_scan/result_review_user.md"
@@ -218,40 +251,39 @@
     ],
     "composite": [
       {
-        "id": "test_pipeline",
-        "name": "测试流水线",
+        "id": "vuln_scan_pipeline",
+        "name": "漏洞挖掘流水线",
         "type": "composite",
-        "description": "包含单个原子工作流的最小组合工作流",
+        "description": "单阶段漏洞挖掘组合工作流",
         "working_dir_template": "pipeline_{execution_id}",
         "stages": [
           {
-            "stage_id": "stage_01_scan",
-            "name": "漏洞扫描",
+            "stage_id": "stage_01_vuln_scan",
+            "name": "数据流驱动漏洞挖掘",
             "sequence": 1,
-            "workflow_ref": "test_vuln_scan",
+            "workflow_ref": "vuln_scan",
             "workflow_type": "atomic",
-            "on_error": "skip_task",
-            "description": "对输入模块执行漏洞扫描"
+            "on_error": "abort"
           }
         ]
       }
     ]
   },
   "execution": {
-    "entry_workflow": "test_pipeline",
+    "entry_workflow": "vuln_scan_pipeline",
     "entry_workflow_type": "composite",
     "input_task": {
-      "task_file": "input/task.md",
-      "task_id": "test_001"
+      "task_file": "__AUTO__",
+      "task_id": "__AUTO__"
     },
-    "output_dir": "output",
-    "execution_id": "test_run_001",
+    "output_dir": "__AUTO__",
+    "execution_id": "__AUTO__",
     "runtime_mode": "local",
     "on_completion": {
       "exit_code_on_success": 0,
       "exit_code_on_failure": 1,
       "write_summary": true,
-      "summary_file": "output/execution_summary.json"
+      "summary_file": "__AUTO__"
     }
   }
 }
