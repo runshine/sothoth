@@ -76,6 +76,13 @@ class TriggerTask(Base):
     profile_id = Column(String(64), nullable=True)
     project_id = Column(String(64), nullable=False)
     trigger_type = Column(String(16), nullable=False, default="manual")
+    task_origin_type = Column(String(32), nullable=True, index=True)
+    parent_project_id = Column(String(64), nullable=True, index=True)
+    parent_task_id = Column(String(64), nullable=True, index=True)
+    parent_task_type = Column(String(32), nullable=True)
+    parent_stage_name = Column(String(64), nullable=True)
+    parent_stage_item_id = Column(String(64), nullable=True)
+    parent_stage_item_key = Column(String(255), nullable=True)
     input_tasks_json = Column(JSON, nullable=False)
     priority = Column(Integer, nullable=False, default=100)
     status = Column(String(32), nullable=False, default="pending")
@@ -500,6 +507,13 @@ def run_auto_migrations() -> None:
         (tables["workflow_definition_version"], "compiled_config_json", f"ALTER TABLE {tables['workflow_definition_version']} ADD COLUMN compiled_config_json {_column_sql(dialect, 'JSON')} NULL"),
         (tables["trigger_task"], "workflow_definition_version_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN workflow_definition_version_id VARCHAR(64) NULL"),
         (tables["trigger_task"], "profile_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN profile_id VARCHAR(64) NULL"),
+        (tables["trigger_task"], "task_origin_type", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN task_origin_type VARCHAR(32) NULL"),
+        (tables["trigger_task"], "parent_project_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_project_id VARCHAR(64) NULL"),
+        (tables["trigger_task"], "parent_task_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_task_id VARCHAR(64) NULL"),
+        (tables["trigger_task"], "parent_task_type", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_task_type VARCHAR(32) NULL"),
+        (tables["trigger_task"], "parent_stage_name", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_stage_name VARCHAR(64) NULL"),
+        (tables["trigger_task"], "parent_stage_item_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_stage_item_id VARCHAR(64) NULL"),
+        (tables["trigger_task"], "parent_stage_item_key", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_stage_item_key VARCHAR(255) NULL"),
         (tables["trigger_task"], "retry_count", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"),
         (tables["trigger_task"], "max_retry_count", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN max_retry_count INTEGER NOT NULL DEFAULT 3"),
         (tables["trigger_task"], "latest_execution_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN latest_execution_id VARCHAR(64) NULL"),

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from app.model import (
@@ -202,14 +203,63 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("m1", rows[0]["module_key"])
 
     def test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
-        with self.assertRaisesRegex(Exception, "重复相对路径"):
+        with self.assertRaisesRegex(Exception, "重复文件名"):
             self.manager._normalize_input_files(
                 [
-                    {"filename": "a.c", "relative_path": "src/a.c"},
-                    {"filename": "a.c", "relative_path": "src/a.c"},
+                    {"filename": "src.zip", "relative_path": "src/a.c"},
+                    {"filename": "src.zip", "relative_path": "src/b.c"},
                 ],
                 task_type=TASK_TYPE_SOURCE,
             )
+
+    def test_normalize_source_input_files_rejects_non_archive(self):
+        with self.assertRaisesRegex(Exception, "仅支持常见压缩文件"):
+            self.manager._normalize_input_files(
+                [
+                    {"filename": "main.c"},
+                ],
+                task_type=TASK_TYPE_SOURCE,
+            )
+
+    def test_materialize_source_archives_extracts_into_input_and_cleans_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            input_dir = workspace / "input"
+            temp_dir = workspace / "run" / "upload-tmp"
+            input_dir.mkdir(parents=True)
+            temp_dir.mkdir(parents=True)
+            archive_path = temp_dir / "source.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("src/main.c", "int main() { return 0; }\n")
+                archive.writestr("README.md", "# demo\n")
+            task = BinarySecurityTask(
+                id="s1",
+                project_id="p1",
+                name="source-task",
+                task_type=TASK_TYPE_SOURCE,
+                status="pending_upload",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {
+                "input_dir": "/app/secflow-app-binary-security/s1/input",
+                "temp_upload_dir": "/app/secflow-app-binary-security/s1/run/upload-tmp",
+            }
+
+            files, total_bytes, extracted_count = self.manager._materialize_source_archives(
+                task,
+                [{"filename": "source.zip", "relative_path": "source.zip"}],
+            )
+
+            self.assertEqual(1, len(files))
+            self.assertGreater(total_bytes, 0)
+            self.assertEqual(2, extracted_count)
+            self.assertTrue((input_dir / "src" / "main.c").is_file())
+            self.assertTrue((input_dir / "README.md").is_file())
+            self.assertFalse(archive_path.exists())
 
     def test_resolve_downstream_output_sources_prefers_output_contents(self):
         with tempfile.TemporaryDirectory() as tmp:

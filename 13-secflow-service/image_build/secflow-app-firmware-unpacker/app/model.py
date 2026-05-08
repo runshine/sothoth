@@ -43,6 +43,13 @@ class UnpackTask(Base):
 
     id = Column(String(32), primary_key=True)
     project_id = Column(String(64), nullable=True, index=True)
+    task_origin_type = Column(String(32), nullable=True, index=True)
+    parent_project_id = Column(String(64), nullable=True, index=True)
+    parent_task_id = Column(String(64), nullable=True, index=True)
+    parent_task_type = Column(String(32), nullable=True)
+    parent_stage_name = Column(String(64), nullable=True)
+    parent_stage_item_id = Column(String(64), nullable=True)
+    parent_stage_item_key = Column(String(255), nullable=True)
     firmware_path = Column(String(512), nullable=False)
     output_path = Column(String(512), nullable=False)
     status = Column(
@@ -51,7 +58,11 @@ class UnpackTask(Base):
         default=TaskStatus.PENDING.value,
         index=True,
     )
-    worker_id = Column(String(64), nullable=True, index=True)
+    owner_id = Column(String(96), nullable=True, index=True)
+    current_stage = Column(String(64), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    cancel_requested_at = Column(DateTime, nullable=True)
+    last_progress_at = Column(DateTime, nullable=True)
     result_status = Column(String(32), nullable=True)
     result_message = Column(Text, nullable=True)
     rounds = Column(Integer, nullable=True)
@@ -68,13 +79,32 @@ class UnpackTask(Base):
     completed_at = Column(DateTime, nullable=True)
 
     def to_dict(self) -> dict:
+        task_origin_type = str(self.task_origin_type or "").strip() or "manual"
+        parent_task_type = str(self.parent_task_type or "").strip() or None
+        if task_origin_type == "binary_security":
+            origin_label = "二进制安全-源码扫描" if parent_task_type == "source" else "二进制安全-二进制类扫描"
+        else:
+            origin_label = "手动任务"
         return {
             "id": self.id,
             "project_id": self.project_id,
+            "task_origin_type": task_origin_type,
+            "parent_project_id": self.parent_project_id,
+            "parent_task_id": self.parent_task_id,
+            "parent_task_type": parent_task_type,
+            "parent_stage_name": self.parent_stage_name,
+            "parent_stage_item_id": self.parent_stage_item_id,
+            "parent_stage_item_key": self.parent_stage_item_key,
+            "origin_label": origin_label,
+            "parent_task_display": self.parent_task_id,
             "firmware_path": self.firmware_path,
             "output_path": self.output_path,
             "status": self.status,
-            "worker_id": self.worker_id,
+            "owner_id": self.owner_id,
+            "current_stage": self.current_stage,
+            "lease_expires_at": self.lease_expires_at.isoformat() if self.lease_expires_at else None,
+            "cancel_requested_at": self.cancel_requested_at.isoformat() if self.cancel_requested_at else None,
+            "last_progress_at": self.last_progress_at.isoformat() if self.last_progress_at else None,
             "result_status": self.result_status,
             "result_message": self.result_message,
             "rounds": self.rounds,
@@ -95,7 +125,7 @@ class UnpackTask(Base):
 class WorkerInstance(Base):
     __tablename__ = "secflow_app_firmware_unpacker_worker_instances"
 
-    worker_id = Column(String(64), primary_key=True)
+    worker_id = Column(String(96), primary_key=True)
     hostname = Column(String(128), nullable=True)
     pod_ip = Column(String(64), nullable=True)
     started_at = Column(DateTime, default=datetime.utcnow)
@@ -105,7 +135,7 @@ class WorkerInstance(Base):
 
     def to_dict(self) -> dict:
         return {
-            "worker_id": self.worker_id,
+            "owner_id": self.worker_id,
             "hostname": self.hostname,
             "pod_ip": self.pod_ip,
             "started_at": self.started_at.isoformat() if self.started_at else None,
@@ -145,11 +175,15 @@ DEFAULT_CONFIGS = [
     ("max_retries", "5", "int", "pi agent 最大重试轮数"),
     ("dead_threshold", "90", "int", "Worker 心跳超时秒数"),
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
+    ("task_lease_seconds", "45", "int", "任务租约秒数"),
+    ("task_lease_renew_interval_seconds", "10", "int", "任务租约续期间隔秒数"),
+    ("cancel_timeout_seconds", "120", "int", "任务取消最长等待秒数"),
 ]
 
 
 _engine = None
 _SessionFactory = None
+_OWNER_ID = None
 
 
 def get_engine():
@@ -217,6 +251,18 @@ def _ensure_unpack_task_columns() -> None:
         return
 
     statements = {
+        "task_origin_type": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN task_origin_type VARCHAR(32)",
+        "parent_project_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN parent_project_id VARCHAR(64)",
+        "parent_task_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN parent_task_id VARCHAR(64)",
+        "parent_task_type": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN parent_task_type VARCHAR(32)",
+        "parent_stage_name": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN parent_stage_name VARCHAR(64)",
+        "parent_stage_item_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN parent_stage_item_id VARCHAR(64)",
+        "parent_stage_item_key": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN parent_stage_item_key VARCHAR(255)",
+        "owner_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN owner_id VARCHAR(96)",
+        "current_stage": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN current_stage VARCHAR(64)",
+        "lease_expires_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN lease_expires_at DATETIME",
+        "cancel_requested_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN cancel_requested_at DATETIME",
+        "last_progress_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN last_progress_at DATETIME",
         "matched_skill": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill VARCHAR(512)",
         "matched_skill_version": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill_version INTEGER",
         "matched_skill_score": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill_score INTEGER",
@@ -259,10 +305,20 @@ def generate_id() -> str:
 
 
 def get_worker_id() -> str:
-    worker_id = os.environ.get("WORKER_ID") or os.environ.get("HOSTNAME")
-    if worker_id:
-        return worker_id[:64]
-    return socket.gethostname()[:64]
+    global _OWNER_ID
+    if _OWNER_ID is not None:
+        return _OWNER_ID
+
+    owner_id = os.environ.get("WORKER_ID")
+    if owner_id:
+        _OWNER_ID = owner_id[:96]
+        return _OWNER_ID
+
+    pod_name = (os.environ.get("HOSTNAME") or socket.gethostname()).strip() or "unknown-pod"
+    pid = os.getpid()
+    unique = uuid.uuid4().hex[:8]
+    _OWNER_ID = f"{pod_name}:{pid}:{unique}"[:96]
+    return _OWNER_ID
 
 
 def get_config_value(db: Session, key: str, default=None):

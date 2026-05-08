@@ -4,6 +4,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
+from app.config import reload_config
+from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session, init_database
+import app.model as model_module
+import app.services.task_manager as task_manager_module
 from app.services.task_manager import prepare_task_workspace, resolve_task_runtime_paths
 
 
@@ -47,6 +53,172 @@ class TaskManagerWorkspaceTests(unittest.TestCase):
             self.assertEqual(str(firmware), resolved["input_path"])
             self.assertTrue(manifest_path.is_file())
             self.assertEqual(str(root / "data" / "p1" / "app/secflow-app-firmware-unpacker" / "t1" / "output"), resolved["output_path"])
+
+
+class TaskManagerLeaseTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.root = root
+        config_path = root / "config.yaml"
+        db_path = root / "tasks.db"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "database": {
+                        "type": "sqlite",
+                        "path": str(db_path),
+                        "table_prefix": "secflow_app_firmware_unpacker_",
+                    },
+                    "worker": {
+                        "heartbeat_interval_seconds": 15,
+                        "dead_threshold_seconds": 90,
+                        "claim_interval_seconds": 1,
+                        "claim_batch_size": 4,
+                        "task_lease_seconds": 45,
+                        "task_lease_renew_interval_seconds": 10,
+                        "cancel_timeout_seconds": 120,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        reload_config(str(config_path))
+        model_module._engine = None
+        model_module._SessionFactory = None
+        model_module._OWNER_ID = "pod-a:123:owner"
+        init_database()
+
+    def tearDown(self):
+        model_module._engine = None
+        model_module._SessionFactory = None
+        model_module._OWNER_ID = None
+        self._tmp.cleanup()
+
+    def _add_task(self, task_id: str, *, status: str, owner_id: str | None = None, cancel_requested_at=None, lease_expires_at=None, last_progress_at=None):
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTask(
+                    id=task_id,
+                    project_id="p1",
+                    firmware_path="/tmp/fw.bin",
+                    output_path="/tmp/output",
+                    status=status,
+                    owner_id=owner_id,
+                    current_stage="llm_unpack",
+                    cancel_requested_at=cancel_requested_at,
+                    lease_expires_at=lease_expires_at,
+                    last_progress_at=last_progress_at,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def _add_worker(self, owner_id: str, *, is_alive: bool = True, last_heartbeat=None):
+        from datetime import datetime
+
+        db = get_db_session()
+        try:
+            db.add(
+                WorkerInstance(
+                    worker_id=owner_id,
+                    hostname="pod-a",
+                    pod_ip="127.0.0.1",
+                    started_at=datetime.utcnow(),
+                    last_heartbeat=last_heartbeat or datetime.utcnow(),
+                    is_alive=is_alive,
+                    active_tasks=0,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def test_claim_task_sets_owner_and_lease(self):
+        self._add_task("t-claim", status=TaskStatus.PENDING.value)
+
+        claimed = task_manager_module._claim_task("t-claim")
+
+        self.assertTrue(claimed)
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-claim").first()
+            self.assertEqual(TaskStatus.RUNNING.value, task.status)
+            self.assertEqual("pod-a:123:owner", task.owner_id)
+            self.assertEqual("queued", task.current_stage)
+            self.assertIsNotNone(task.lease_expires_at)
+        finally:
+            db.close()
+
+    def test_recover_orphaned_running_task_marks_failed(self):
+        from datetime import datetime, timedelta
+
+        self._add_task(
+            "t-orphan",
+            status=TaskStatus.RUNNING.value,
+            owner_id="dead-owner",
+            lease_expires_at=datetime.utcnow() - timedelta(seconds=5),
+            last_progress_at=datetime.utcnow() - timedelta(seconds=5),
+        )
+
+        task_manager_module.recover_orphaned_tasks()
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-orphan").first()
+            self.assertEqual(TaskStatus.FAILED.value, task.status)
+            self.assertIsNone(task.owner_id)
+            self.assertIn("owner lost", (task.result_message or "") + (task.error_message or ""))
+        finally:
+            db.close()
+
+    def test_recover_cancelling_timeout_marks_cancelled(self):
+        from datetime import datetime, timedelta
+
+        self._add_worker("alive-owner", is_alive=True)
+        self._add_task(
+            "t-cancel",
+            status=TaskStatus.CANCELLING.value,
+            owner_id="alive-owner",
+            cancel_requested_at=datetime.utcnow() - timedelta(seconds=300),
+            lease_expires_at=datetime.utcnow() + timedelta(seconds=30),
+            last_progress_at=datetime.utcnow() - timedelta(seconds=300),
+        )
+
+        task_manager_module.recover_orphaned_tasks()
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-cancel").first()
+            self.assertEqual(TaskStatus.CANCELLED.value, task.status)
+            self.assertEqual("cancelled", task.result_status)
+            self.assertIsNone(task.owner_id)
+        finally:
+            db.close()
+
+    def test_recover_stale_owned_task_without_future_marks_cancelled(self):
+        from datetime import datetime, timedelta
+
+        self._add_task(
+            "t-stale",
+            status=TaskStatus.CANCELLING.value,
+            owner_id="pod-a:123:owner",
+            cancel_requested_at=datetime.utcnow() - timedelta(seconds=30),
+            lease_expires_at=datetime.utcnow() + timedelta(seconds=30),
+            last_progress_at=datetime.utcnow(),
+        )
+
+        task_manager_module.recover_stale_owned_tasks()
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-stale").first()
+            self.assertEqual(TaskStatus.CANCELLED.value, task.status)
+            self.assertIn("owner restarted", task.result_message or "")
+        finally:
+            db.close()
 
 
 if __name__ == "__main__":

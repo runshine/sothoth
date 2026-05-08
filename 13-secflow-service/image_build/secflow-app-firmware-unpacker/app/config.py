@@ -86,6 +86,9 @@ class WorkerConfig(BaseModel):
     dead_threshold_seconds: int = 90
     claim_interval_seconds: int = 2
     claim_batch_size: int = 8
+    task_lease_seconds: int = 45
+    task_lease_renew_interval_seconds: int = 10
+    cancel_timeout_seconds: int = 120
 
 
 class RegistryMenuLevelConfig(BaseModel):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from app.config import get_config
 from app.service.downstream_base import JsonHttpClient
@@ -13,7 +13,7 @@ class EntryAnalyseClient(JsonHttpClient):
         cfg = get_config().services.entry_analyse
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
 
-    async def create_task(self, project_id: str, task_name: str, input_path: str) -> dict:
+    async def create_task(self, project_id: str, task_name: str, input_path: str, origin: dict[str, Any] | None = None) -> dict:
         return await self.post(
             "/tasks",
             json_body={
@@ -22,6 +22,7 @@ class EntryAnalyseClient(JsonHttpClient):
                 "input_path": input_path,
                 "task_description": "由 binary security 编排器触发的入口分析任务",
                 "prompt_content": f"分析路径 `{input_path}` 下模块源码中的所有外部入口点，输出入口列表。",
+                **(origin or {}),
             },
         )
 

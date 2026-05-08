@@ -20,6 +20,13 @@ class B2STask(Base):
 
     id = Column(String(32), primary_key=True)
     project_id = Column(String(64), nullable=False, index=True)
+    task_origin_type = Column(String(32), nullable=True, index=True)
+    parent_project_id = Column(String(64), nullable=True, index=True)
+    parent_task_id = Column(String(64), nullable=True, index=True)
+    parent_task_type = Column(String(32), nullable=True)
+    parent_stage_name = Column(String(64), nullable=True)
+    parent_stage_item_id = Column(String(64), nullable=True)
+    parent_stage_item_key = Column(String(255), nullable=True)
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
     priority = Column(Integer, nullable=False, default=5)
@@ -122,6 +129,7 @@ def init_database() -> None:
     engine = get_engine()
     Base.metadata.create_all(bind=engine)
     _ensure_task_item_progress_columns(engine)
+    _ensure_task_origin_columns(engine)
 
 
 def _ensure_task_item_progress_columns(engine) -> None:
@@ -137,6 +145,31 @@ def _ensure_task_item_progress_columns(engine) -> None:
         statements.append(f"ALTER TABLE {table_name} ADD COLUMN phase VARCHAR(32) NULL")
     if "progress_json" not in columns:
         statements.append(f"ALTER TABLE {table_name} ADD COLUMN progress_json TEXT NULL")
+    if not statements:
+        return
+    with engine.begin() as conn:
+        for statement in statements:
+            conn.exec_driver_sql(statement)
+
+
+def _ensure_task_origin_columns(engine) -> None:
+    table_name = B2STask.__tablename__
+    columns = {column["name"] for column in inspect(engine).get_columns(table_name)}
+    statements: list[str] = []
+    if "task_origin_type" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN task_origin_type VARCHAR(32) NULL")
+    if "parent_project_id" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN parent_project_id VARCHAR(64) NULL")
+    if "parent_task_id" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN parent_task_id VARCHAR(64) NULL")
+    if "parent_task_type" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN parent_task_type VARCHAR(32) NULL")
+    if "parent_stage_name" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN parent_stage_name VARCHAR(64) NULL")
+    if "parent_stage_item_id" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN parent_stage_item_id VARCHAR(64) NULL")
+    if "parent_stage_item_key" not in columns:
+        statements.append(f"ALTER TABLE {table_name} ADD COLUMN parent_stage_item_key VARCHAR(255) NULL")
     if not statements:
         return
     with engine.begin() as conn:

@@ -52,13 +52,13 @@ def _runtime_cleanup_days() -> int:
 def register_worker() -> None:
     from app.model import WorkerInstance, get_db_session
 
-    worker_id = get_worker_id()
+    owner_id = get_worker_id()
     db = get_db_session()
     try:
-        row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == worker_id).first()
+        row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
         if row is None:
             row = WorkerInstance(
-                worker_id=worker_id,
+                worker_id=owner_id,
                 hostname=socket.gethostname(),
                 pod_ip=os.environ.get("POD_IP", ""),
                 started_at=datetime.utcnow(),
@@ -74,7 +74,7 @@ def register_worker() -> None:
             row.last_heartbeat = datetime.utcnow()
             row.active_tasks = 0
         db.commit()
-        logger.info("worker registered: %s", worker_id)
+        logger.info("worker registered: %s", owner_id)
     finally:
         db.close()
 
@@ -82,10 +82,10 @@ def register_worker() -> None:
 def heartbeat() -> None:
     from app.model import WorkerInstance, get_db_session
 
-    worker_id = get_worker_id()
+    owner_id = get_worker_id()
     db = get_db_session()
     try:
-        row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == worker_id).first()
+        row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
         if row is not None:
             row.last_heartbeat = datetime.utcnow()
             row.is_alive = True
@@ -94,17 +94,20 @@ def heartbeat() -> None:
         db.close()
 
 
-def update_worker_active_tasks(delta: int) -> None:
+def refresh_worker_active_tasks() -> None:
     from app.model import WorkerInstance, get_db_session
+    from app.services.task_manager import get_local_active_task_count
 
-    worker_id = get_worker_id()
+    owner_id = get_worker_id()
+    current_active = get_local_active_task_count()
     with _active_lock:
         db = get_db_session()
         try:
-            row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == worker_id).first()
+            row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
             if row is not None:
-                row.active_tasks = max(0, int(row.active_tasks or 0) + delta)
+                row.active_tasks = max(0, int(current_active))
                 row.last_heartbeat = datetime.utcnow()
+                row.is_alive = True
                 db.commit()
         finally:
             db.close()
@@ -113,22 +116,23 @@ def update_worker_active_tasks(delta: int) -> None:
 def deregister_worker() -> None:
     from app.model import WorkerInstance, get_db_session
 
-    worker_id = get_worker_id()
+    owner_id = get_worker_id()
     db = get_db_session()
     try:
-        row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == worker_id).first()
+        row = db.query(WorkerInstance).filter(WorkerInstance.worker_id == owner_id).first()
         if row is not None:
             row.is_alive = False
             row.active_tasks = 0
             row.last_heartbeat = datetime.utcnow()
             db.commit()
-        logger.info("worker deregistered: %s", worker_id)
+        logger.info("worker deregistered: %s", owner_id)
     finally:
         db.close()
 
 
 def reclaim_orphaned_tasks() -> None:
-    from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session
+    from app.model import WorkerInstance, get_db_session
+    from app.services.task_manager import recover_orphaned_tasks
 
     cutoff = datetime.utcnow() - timedelta(seconds=_runtime_dead_threshold_seconds())
     db = get_db_session()
@@ -141,32 +145,11 @@ def reclaim_orphaned_tasks() -> None:
         for worker in stale_workers:
             worker.is_alive = False
             worker.active_tasks = 0
-            tasks = (
-                db.query(UnpackTask)
-                .filter(
-                    UnpackTask.worker_id == worker.worker_id,
-                    UnpackTask.status.in_(
-                        [
-                            TaskStatus.RUNNING.value,
-                            TaskStatus.CANCELLING.value,
-                        ]
-                    ),
-                )
-                .all()
-            )
-            for task in tasks:
-                if task.status == TaskStatus.CANCELLING.value:
-                    task.status = TaskStatus.CANCELLED.value
-                    task.result_status = "cancelled"
-                    task.result_message = "Task was cancelled"
-                    task.completed_at = datetime.utcnow()
-                else:
-                    task.status = TaskStatus.PENDING.value
-                    task.worker_id = None
-                    task.started_at = None
         db.commit()
     finally:
         db.close()
+
+    recover_orphaned_tasks()
 
 
 def cleanup_finished_tasks() -> None:
@@ -245,7 +228,7 @@ def get_cluster_snapshot() -> dict:
             task_counts[task.status] = int(task_counts.get(task.status, 0)) + 1
 
         return {
-            "this_worker": get_worker_id(),
+            "this_owner": get_worker_id(),
             "total_workers": len(workers),
             "alive_workers": sum(1 for worker in workers if worker.is_alive),
             "workers": [worker.to_dict() for worker in workers],
@@ -261,6 +244,7 @@ def _heartbeat_loop(interval: int) -> None:
     while not _stop_event.wait(timeout=interval):
         try:
             heartbeat()
+            refresh_worker_active_tasks()
             reclaim_orphaned_tasks()
             cleanup_finished_tasks()
         except Exception as exc:

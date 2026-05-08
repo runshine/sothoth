@@ -7,7 +7,9 @@ import json
 import os
 import re
 import shutil
+import tarfile
 import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -88,6 +90,14 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _is_within_path(base: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def _dedupe_paths(paths: list[Path]) -> list[Path]:
     seen: set[str] = set()
     unique: list[Path] = []
@@ -98,6 +108,18 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
         seen.add(key)
         unique.append(path)
     return unique
+
+
+def _downstream_origin_payload(task: BinarySecurityTask, item: BinarySecurityStageItem) -> dict[str, Any]:
+    return {
+        "task_origin_type": "binary_security",
+        "parent_project_id": task.project_id,
+        "parent_task_id": task.id,
+        "parent_task_type": task.task_type,
+        "parent_stage_name": item.stage_name,
+        "parent_stage_item_id": item.id,
+        "parent_stage_item_key": item.item_key,
+    }
 
 
 STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancelled"}
@@ -125,6 +147,16 @@ SERVICE_OUTPUT_FOLDERS = {
     "dataflow_analyse": "dataflow-analyse",
     "dataflow_vuln_scanner": "dataflow-vuln-scanner",
 }
+SOURCE_ARCHIVE_FORMATS = (
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz2",
+    ".tar.xz",
+    ".txz",
+)
 
 
 class TaskManager:
@@ -228,9 +260,10 @@ class TaskManager:
             "input_dir": self._fileserver_task_path(task_id, "input"),
             "output_dir": self._fileserver_task_path(task_id, "output"),
             "run_dir": self._fileserver_task_path(task_id, "run"),
+            "temp_upload_dir": self._fileserver_task_path(task_id, "run/upload-tmp") if task_type == TASK_TYPE_SOURCE else None,
             "input_manifest_path": f"{self._fileserver_task_path(task_id, 'input')}/task-metadata.json",
             "input_files": input_files,
-            "input_kind": "source_tree" if task_type == TASK_TYPE_SOURCE else "firmware_files",
+            "input_kind": "source_archives" if task_type == TASK_TYPE_SOURCE else "firmware_files",
             "downstream_task_ids": {},
         }
         task.metrics = {
@@ -267,30 +300,40 @@ class TaskManager:
         task = self._task_or_404(db, project_id, task_id)
         if task.status not in {"pending_upload", "uploading", "ready_to_start"}:
             raise ValidationError(f"当前状态不允许确认上传完成: {task.status}")
-        input_dir = Path(task.workspace_root) / "input"
         declared = self._normalize_input_files(
             payload.files or [BinarySecurityInputFile(**item) for item in task.summary.get("input_files") or []],
             task_type=self._task_type(task),
         )
         self._record_event(db, task, "task_upload_started", "开始校验上传文件")
-        actual_files = []
-        total_bytes = 0
-        for file_info in declared:
-            filename = str(file_info["filename"])
-            relative_path = str(file_info.get("relative_path") or filename).strip().replace("\\", "/")
-            local_path = input_dir / relative_path
-            if not local_path.is_file():
-                raise ValidationError(f"上传文件缺失: {relative_path}")
-            stat = local_path.stat()
-            total_bytes += stat.st_size
-            actual_files.append(
-                {
-                    **file_info,
-                    "size": stat.st_size,
-                    "uploaded": True,
-                    "path": f"{task.summary.get('input_dir')}/{relative_path}",
-                }
+        if self._task_type(task) == TASK_TYPE_SOURCE:
+            actual_files, total_bytes, extracted_count = self._materialize_source_archives(task, declared)
+            self._record_event(
+                db,
+                task,
+                "source_archives_extracted",
+                "源码压缩包已解压到任务输入目录",
+                payload={"archive_count": len(actual_files), "extracted_file_count": extracted_count},
             )
+        else:
+            input_dir = Path(task.workspace_root) / "input"
+            actual_files = []
+            total_bytes = 0
+            for file_info in declared:
+                filename = str(file_info["filename"])
+                relative_path = str(file_info.get("relative_path") or filename).strip().replace("\\", "/")
+                local_path = input_dir / relative_path
+                if not local_path.is_file():
+                    raise ValidationError(f"上传文件缺失: {relative_path}")
+                stat = local_path.stat()
+                total_bytes += stat.st_size
+                actual_files.append(
+                    {
+                        **file_info,
+                        "size": stat.st_size,
+                        "uploaded": True,
+                        "path": f"{task.summary.get('input_dir')}/{relative_path}",
+                    }
+                )
         task.status = "ready_to_start"
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
@@ -1013,6 +1056,7 @@ class TaskManager:
         await client.ensure_project_directory(project_id, f"app/secflow-app-binary-security/{task_id}", authorization_token)
         for name in ("input", "output", "run"):
             await client.ensure_project_directory(project_id, f"app/secflow-app-binary-security/{task_id}/{name}", authorization_token)
+        await client.ensure_project_directory(project_id, f"app/secflow-app-binary-security/{task_id}/run/upload-tmp", authorization_token)
 
     def _write_task_metadata(self, task: BinarySecurityTask, metadata_path: Path, *, status: str) -> None:
         _write_json(
@@ -1035,6 +1079,7 @@ class TaskManager:
                     "input_dir": task.summary.get("input_dir"),
                     "output_dir": task.summary.get("output_dir"),
                     "run_dir": task.summary.get("run_dir"),
+                    "temp_upload_dir": task.summary.get("temp_upload_dir"),
                 },
             },
         )
@@ -1062,9 +1107,12 @@ class TaskManager:
             else:
                 effective_path = filename
             if task_type == TASK_TYPE_SOURCE:
-                if effective_path in seen_paths:
-                    raise ValidationError(f"存在重复相对路径: {effective_path}")
-                seen_paths.add(effective_path)
+                effective_path = filename
+                if filename in seen_names:
+                    raise ValidationError(f"存在重复文件名: {filename}")
+                seen_names.add(filename)
+                if not self._is_supported_source_archive(filename):
+                    raise ValidationError(f"源码扫描仅支持常见压缩文件: {filename}")
             else:
                 if filename in seen_names:
                     raise ValidationError(f"存在重复文件名: {filename}")
@@ -1087,6 +1135,74 @@ class TaskManager:
         if not rows:
             raise ValidationError("至少需要上传一个输入文件")
         return rows
+
+    def _is_supported_source_archive(self, filename: str) -> bool:
+        lowered = str(filename or "").strip().lower()
+        return any(lowered.endswith(ext) for ext in SOURCE_ARCHIVE_FORMATS)
+
+    def _source_temp_upload_root(self, task: BinarySecurityTask) -> Path:
+        return ensure_dir(Path(task.workspace_root) / "run" / "upload-tmp")
+
+    def _safe_extract_archive(self, archive_path: Path, target_dir: Path) -> int:
+        ensure_dir(target_dir)
+        extracted = 0
+        if zipfile.is_zipfile(archive_path):
+            with zipfile.ZipFile(archive_path) as archive:
+                for member in archive.infolist():
+                    member_name = member.filename.replace("\\", "/").strip("/")
+                    if not member_name:
+                        continue
+                    target_path = target_dir / member_name
+                    if not _is_within_path(target_dir, target_path):
+                        raise ValidationError(f"压缩包包含非法路径: {member.filename}")
+                    archive.extract(member, target_dir)
+                    if not member.is_dir():
+                        extracted += 1
+            return extracted
+        if tarfile.is_tarfile(archive_path):
+            with tarfile.open(archive_path, "r:*") as archive:
+                for member in archive.getmembers():
+                    member_name = member.name.replace("\\", "/").strip("/")
+                    if not member_name:
+                        continue
+                    target_path = target_dir / member_name
+                    if not _is_within_path(target_dir, target_path):
+                        raise ValidationError(f"压缩包包含非法路径: {member.name}")
+                archive.extractall(target_dir)
+                extracted = sum(1 for member in archive.getmembers() if member.isfile())
+            return extracted
+        raise ValidationError(f"不支持的源码压缩文件格式: {archive_path.name}")
+
+    def _materialize_source_archives(self, task: BinarySecurityTask, declared: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
+        input_dir = ensure_dir(Path(task.workspace_root) / "input")
+        temp_dir = self._source_temp_upload_root(task)
+        actual_files: list[dict[str, Any]] = []
+        total_bytes = 0
+        extracted_count = 0
+        for file_info in declared:
+            filename = str(file_info["filename"])
+            temp_path = temp_dir / filename
+            if not temp_path.is_file():
+                raise ValidationError(f"上传文件缺失: {filename}")
+            stat = temp_path.stat()
+            total_bytes += stat.st_size
+            extracted_count += self._safe_extract_archive(temp_path, input_dir)
+            temp_path.unlink(missing_ok=True)
+            actual_files.append(
+                {
+                    **file_info,
+                    "size": stat.st_size,
+                    "uploaded": True,
+                    "path": str(task.summary.get("input_dir") or self._fileserver_task_path(task.id, "input")),
+                    "temp_path": f"{task.summary.get('temp_upload_dir')}/{filename}" if task.summary.get("temp_upload_dir") else None,
+                    "extracted": True,
+                }
+            )
+        if extracted_count <= 0:
+            raise ValidationError("源码压缩包解压后没有得到任何文件")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        ensure_dir(temp_dir)
+        return actual_files, total_bytes, extracted_count
 
     def _merge_policy(self, db: Session, project_id: str, overrides: dict[str, Any], stage_options: dict[str, Any]) -> dict[str, Any]:
         stage_parallelism = {stage: self.cfg.runtime_policy.max_stage_parallelism for stage in STAGE_SEQUENCE}
@@ -1509,7 +1625,13 @@ class TaskManager:
                     except Exception:
                         pass
             if created is None:
-                created = await get_firmware_unpacker_client().create_task(task.project_id, str(input_path), str(output_dir), token or "")
+                created = await get_firmware_unpacker_client().create_task(
+                    task.project_id,
+                    str(input_path),
+                    str(output_dir),
+                    token or "",
+                    _downstream_origin_payload(task, item),
+                )
             item.status = "running"
             item.downstream_task_id = created.get("task_id") or previous_task_id
             item.started_at = _now()
@@ -1644,6 +1766,7 @@ class TaskManager:
                     task.project_id,
                     f"{task.name}-{firmware['firmware_name']}-system-analysis",
                     firmware["unpacked_root"],
+                    _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("task_id") or previous_task_id
             session.commit()
@@ -2016,6 +2139,7 @@ class TaskManager:
                     elf_path,
                     token or "",
                     module,
+                    _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("id") or previous_task_id
             item.result = {"project_id": task.project_id}
@@ -2131,6 +2255,7 @@ class TaskManager:
                     task.project_id,
                     f"{task.name}-{module['module_name']}-entry",
                     module["source_dir"],
+                    _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("task_id") or previous_task_id
             session.commit()
@@ -2274,6 +2399,7 @@ class TaskManager:
                     f"{task.name}-{entry['function_name']}-dfa",
                     entry["source_dir"],
                     prompt,
+                    _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("task_id") or previous_task_id
             session.commit()
@@ -2358,6 +2484,7 @@ class TaskManager:
                     dataflow_result["source_dir"],
                     str(vuln_workspace),
                     str(vuln_output),
+                    _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("task_id") or previous_task_id
             session.commit()
