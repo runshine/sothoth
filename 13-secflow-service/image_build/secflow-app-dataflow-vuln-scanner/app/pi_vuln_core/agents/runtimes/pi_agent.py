@@ -2,21 +2,29 @@
 Pi Agent 运行时适配 (跨平台: Linux / Windows)
 
 命令格式:
-  首次调用:
+  RPC 模式 (当前默认):
+    pi --mode rpc --model <provider/model> --thinking <level>
+       --append-system-prompt sys.md --session-dir <dir>
+       --tools read,bash,edit,write
+    user_prompt 内容随后通过 stdin JSONL RPC prompt 消息发送。
+
+  JSON 模式:
     pi --mode json --model <provider/model> -p --thinking <level>
        --append-system-prompt sys.md --session-dir <dir>
        --tools read,bash,edit,write @user.md
 
-  续接调用 (同 session 的后续消息):
+  JSON 模式续接调用 (同 session 的后续消息):
     pi --mode json --model <provider/model> -p --thinking <level>
        --session-dir <dir> --continue
        --tools read,bash,edit,write @user.md
 
 关键设计:
   - --model 使用 provider/model 格式, 不再传独立 --provider
-  - 使用 --mode json, 从 JSON Lines 的 message_end 事件提取 assistant 文本
+  - RPC 模式复用长驻 pi 进程, 通过 stdin/stdout JSONL 协议传递 prompt 和读取事件
+  - RPC prompt 超时只接受 Pi/provider 原生 timeout 结果; 框架不再做 client-side no-progress / wall-clock 截断, 后续重试继续向同一会话发送 prompt
+  - JSON 模式从 JSON Lines 的 message_end 事件提取 assistant 文本
   - system_prompt 通过 --append-system-prompt file 追加到 pi 内置提示词 (仅首次)
-  - user_message 通过 @file 传入, 避免命令行长度问题
+  - RPC 模式 user_message 通过 prompt RPC 消息传入; JSON 模式通过 @file 传入
   - 续接调用通过 --continue 加载已有会话上下文, 不重复传 system_prompt
   - Linux: create_subprocess_exec (直接执行)
   - Windows: create_subprocess_shell (处理 .cmd 文件)
@@ -58,6 +66,8 @@ _DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS = 600.0
 _DEFAULT_MAX_WALL_SECONDS = 4 * 60 * 60
 _DEFAULT_MAX_RETRY_WALL_SECONDS = 4 * 60 * 60
 _DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_DEFAULT_TIMEOUT_MAX_RETRIES = 3
+_DEFAULT_TIMEOUT_RETRY_INTERVAL_SECONDS = 30.0
 _TERMINAL_ERROR_CODES = {
     "runtime_output_limit",
     "runtime_turn_limit",
@@ -140,6 +150,7 @@ class _AttemptResult:
     stderr_total_bytes: int = 0
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    stdout_soft_limit_exceeded: bool = False
     internal_turns: int = 0
 
 
@@ -314,6 +325,47 @@ class PiAgentRuntime(BaseAgentRuntime):
             return default
         return parsed if parsed > 0 else default
 
+    def _runtime_retry_count(self, key: str, default: int) -> int:
+        value = self.runtime_config.get(key)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _normalize_framework_retry_count(value: Any, default: int, *, allow_unbounded: bool) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        if parsed < 0 and not allow_unbounded:
+            return default
+        return parsed
+
+    def _runtime_non_negative_float(self, key: str, default: float) -> float:
+        value = self.runtime_config.get(key)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if parsed >= 0 else default
+
+    @staticmethod
+    async def _terminate_process(proc, *, grace_seconds: float = 5.0) -> None:
+        if proc is None or getattr(proc, "returncode", None) is not None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
+            return
+        except Exception:
+            pass
+        with contextlib.suppress(Exception):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+
     @staticmethod
     def _write_call_heartbeat(
         call_dir: str,
@@ -334,19 +386,6 @@ class PiAgentRuntime(BaseAgentRuntime):
             )
         except Exception:
             logger.debug("runtime_heartbeat_write_failed", call_dir=call_dir, status=status)
-
-    @staticmethod
-    async def _read_with_no_progress_timeout(
-        stream,
-        n: int,
-        timeout_seconds: float,
-    ) -> bytes:
-        try:
-            return await asyncio.wait_for(stream.read(n), timeout=timeout_seconds)
-        except asyncio.TimeoutError as exc:
-            raise _NoProgressTimeoutError(
-                f"runtime no-progress timeout after {timeout_seconds:.1f}s"
-            ) from exc
 
     @staticmethod
     def _enforce_wall_clock(started_monotonic: float, max_wall_seconds: float) -> None:
@@ -762,11 +801,12 @@ class PiAgentRuntime(BaseAgentRuntime):
         last_heartbeat = started_monotonic
         last_progress = started_monotonic
         internal_turns = 0
+        stdout_soft_limit_exceeded = False
 
         try:
             async def _stream_and_wait() -> tuple[str, str]:
                 """并发读取 stdout/stderr，避免 stderr 管道塞满导致子进程卡死。"""
-                nonlocal last_heartbeat, last_progress
+                nonlocal last_heartbeat, last_progress, stdout_soft_limit_exceeded
 
                 def _mark_progress() -> None:
                     nonlocal last_progress
@@ -803,6 +843,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                         )
 
                 async def _read_stdout() -> None:
+                    nonlocal stdout_soft_limit_exceeded
                     buffer = b""
                     assert proc.stdout is not None
                     while True:
@@ -811,12 +852,15 @@ class PiAgentRuntime(BaseAgentRuntime):
                             break
                         _mark_progress()
                         stdout_buffer.append(chunk)
-                        if stdout_buffer.truncated:
-                            with contextlib.suppress(ProcessLookupError):
-                                proc.terminate()
-                            raise _RuntimeOutputLimitError(
-                                f"runtime stdout limit exceeded: "
-                                f"{stdout_buffer.total_bytes}>{max_stdout_bytes}"
+                        if stdout_buffer.truncated and not stdout_soft_limit_exceeded:
+                            stdout_soft_limit_exceeded = True
+                            logger.warning(
+                                "runtime_stdout_trace_limit_exceeded_continue",
+                                runtime="pi_agent",
+                                agent_id=self.agent_id,
+                                session_id=session_id,
+                                stdout_bytes=stdout_buffer.total_bytes,
+                                trace_limit_bytes=max_stdout_bytes,
                             )
                         buffer += chunk
                         if len(buffer) > max_single_line_bytes:
@@ -944,6 +988,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
 
@@ -965,6 +1010,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
         except _RuntimeTurnLimitError as exc:
@@ -985,13 +1031,12 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
         except _NoProgressTimeoutError as exc:
             duration_ms = int((time.monotonic() - started_monotonic) * 1000)
-            with contextlib.suppress(Exception):
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
+            await self._terminate_process(proc)
             return _AttemptResult(
                 stdout_text=stdout_buffer.text(),
                 stderr_text=stderr_buffer.text().strip(),
@@ -1006,19 +1051,13 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
         except Exception as exc:
             # 读取过程中异常（进程被杀、管道断裂等）
             duration_ms = int((time.monotonic() - started_monotonic) * 1000)
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            await self._terminate_process(proc)
             return _AttemptResult(
                 stdout_text=stdout_buffer.text(),
                 stderr_text=stderr_buffer.text().strip(),
@@ -1031,6 +1070,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
         finally:
@@ -1056,14 +1096,8 @@ class PiAgentRuntime(BaseAgentRuntime):
         session.pop("rpc_max_stderr_bytes", None)
         session.pop("rpc_stdout_buffer", None)
 
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except Exception:
-                with contextlib.suppress(Exception):
-                    proc.kill()
-                    await proc.wait()
+        if proc is not None:
+            await self._terminate_process(proc)
         session.pop("rpc_proc", None)
 
     @staticmethod
@@ -1098,9 +1132,6 @@ class PiAgentRuntime(BaseAgentRuntime):
         stdout_buffer: _BoundedBytesBuffer,
         *,
         max_single_line_bytes: int,
-        no_progress_timeout_seconds: float,
-        max_wall_seconds: float,
-        started_monotonic: float,
     ) -> tuple[str | None, bool]:
         """Read one JSONL record from the RPC stdout stream without line-length limits.
 
@@ -1133,12 +1164,12 @@ class PiAgentRuntime(BaseAgentRuntime):
                 return line_bytes.decode("utf-8", errors="replace").rstrip("\r"), False
 
             assert proc.stdout is not None
-            self._enforce_wall_clock(started_monotonic, max_wall_seconds)
-            chunk = await self._read_with_no_progress_timeout(
-                proc.stdout,
-                65536,
-                no_progress_timeout_seconds,
-            )
+            # RPC mode deliberately does not apply framework-side no-progress
+            # or wall-clock timeouts.  The pi process/provider is the single
+            # source of truth for prompt timeout.  If pi is still working, keep
+            # waiting for its normal error/agent_end event instead of creating a
+            # client-side timeout that could duplicate queued prompts.
+            chunk = await proc.stdout.read(65536)
             if not chunk:
                 session["rpc_stdout_buffer"] = b""
                 if not buffer:
@@ -1219,8 +1250,6 @@ class PiAgentRuntime(BaseAgentRuntime):
         max_event_count: int,
         max_single_line_bytes: int,
         max_internal_turns: int,
-        no_progress_timeout_seconds: float,
-        max_wall_seconds: float,
         heartbeat_interval_seconds: float,
         rpc_stdout_abort_bytes: int = 0,
         cancel_event: Optional[asyncio.Event] = None,
@@ -1229,16 +1258,18 @@ class PiAgentRuntime(BaseAgentRuntime):
 
         The process is kept in ``session`` and reused across logical turns until
         it exits or the session is closed. Pi's own provider retry is enabled via
-        ``set_auto_retry`` when the process starts. Framework watchdogs are
-        deliberately progress/time oriented so provider retries still have room
-        to work. RPC stdout is a protocol stream: it is counted and trace-limited.
-        A per-call abort threshold can be enabled for lightweight phases such as
-        reflection, where a verbose stream usually means the model is spinning.
+        ``set_auto_retry`` when the process starts. RPC mode deliberately avoids
+        framework-side no-progress / wall-clock watchdog timeouts; prompt timeout
+        is reported only by Pi/provider itself. RPC stdout is a protocol stream:
+        it is counted and trace-limited. The per-call stdout threshold is a soft
+        signal: traces are truncated and a warning is recorded, but the agent is
+        allowed to finish.
         """
         started_monotonic = time.monotonic()
         parsed = _ParsedJsonOutput(max_events=max_event_count)
         stdout_buffer = _BoundedBytesBuffer(max_stdout_bytes)
         stderr_buffer = _BoundedBytesBuffer(max_stderr_bytes)
+        stdout_soft_limit_exceeded = False
         session["rpc_stderr_parts"] = []
         session["rpc_stderr_total_bytes"] = 0
         session["rpc_stderr_retained_bytes"] = 0
@@ -1246,6 +1277,7 @@ class PiAgentRuntime(BaseAgentRuntime):
         session["rpc_max_stderr_bytes"] = max_stderr_bytes
         last_heartbeat = started_monotonic
         internal_turns = 0
+        stale_agent_ends_to_skip = int(session.get("rpc_stale_agent_ends_to_skip") or 0)
 
         try:
             proc = await self._ensure_rpc_process(
@@ -1279,9 +1311,6 @@ class PiAgentRuntime(BaseAgentRuntime):
                         session=session,
                         stdout_buffer=stdout_buffer,
                         max_single_line_bytes=max_single_line_bytes,
-                        no_progress_timeout_seconds=no_progress_timeout_seconds,
-                        max_wall_seconds=max_wall_seconds,
-                        started_monotonic=started_monotonic,
                     )
                     now = time.monotonic()
                     if now - last_heartbeat >= heartbeat_interval_seconds:
@@ -1300,20 +1329,41 @@ class PiAgentRuntime(BaseAgentRuntime):
                     if (
                         rpc_stdout_abort_bytes > 0
                         and stdout_buffer.total_bytes > rpc_stdout_abort_bytes
+                        and not stdout_soft_limit_exceeded
                     ):
-                        with contextlib.suppress(Exception):
-                            await self._rpc_send(proc, {"type": "abort"})
-                        raise _RuntimeOutputLimitError(
-                            "runtime rpc stdout abort limit exceeded: "
-                            f"{stdout_buffer.total_bytes}>{rpc_stdout_abort_bytes}"
+                        stdout_soft_limit_exceeded = True
+                        logger.warning(
+                            "runtime_rpc_stdout_soft_limit_exceeded_continue",
+                            runtime="pi_agent",
+                            agent_id=self.agent_id,
+                            session_id=session_id,
+                            stdout_bytes=stdout_buffer.total_bytes,
+                            soft_limit_bytes=rpc_stdout_abort_bytes,
                         )
-                    self._process_json_line(raw_line, parsed)
                     try:
                         event = json.loads(raw_line)
                     except json.JSONDecodeError:
-                        if eof and not parsed.saw_agent_end:
+                        if eof and not parsed.saw_agent_end and stale_agent_ends_to_skip <= 0:
                             raise RuntimeError("pi rpc process exited before agent_end")
                         continue
+
+                    if stale_agent_ends_to_skip > 0:
+                        if event.get("type") == "agent_end":
+                            stale_agent_ends_to_skip -= 1
+                            session["rpc_stale_agent_ends_to_skip"] = stale_agent_ends_to_skip
+                            logger.info(
+                                "runtime_rpc_stale_agent_end_ignored",
+                                runtime="pi_agent",
+                                agent_id=self.agent_id,
+                                session_id=session_id,
+                                remaining=stale_agent_ends_to_skip,
+                            )
+                            if stale_agent_ends_to_skip == 0:
+                                parsed = _ParsedJsonOutput(max_events=max_event_count)
+                                internal_turns = 0
+                        continue
+
+                    self._process_json_line(raw_line, parsed)
 
                     if event.get("type") == "turn_start":
                         internal_turns += 1
@@ -1371,6 +1421,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                     stderr_total_bytes=stderr_buffer.total_bytes,
                     stdout_truncated=stdout_buffer.truncated,
                     stderr_truncated=stderr_buffer.truncated,
+                    stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                     internal_turns=internal_turns,
                 )
 
@@ -1390,6 +1441,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
         except _RuntimeOutputLimitError as exc:
@@ -1409,6 +1461,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
         except _RuntimeTurnLimitError as exc:
@@ -1428,26 +1481,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
-                internal_turns=internal_turns,
-            )
-        except _NoProgressTimeoutError as exc:
-            stderr_text = b"".join(session.get("rpc_stderr_parts", [])).decode(
-                "utf-8", errors="replace").strip()
-            await self._close_rpc_process_for_session(session)
-            return _AttemptResult(
-                stdout_text=stdout_buffer.text(),
-                stderr_text=stderr_text,
-                duration_ms=int((time.monotonic() - started_monotonic) * 1000),
-                return_code=-1,
-                parsed=parsed,
-                error=str(exc),
-                status="timeout",
-                timeout=True,
-                error_code="runtime_timeout",
-                stdout_total_bytes=stdout_buffer.total_bytes,
-                stderr_total_bytes=stderr_buffer.total_bytes,
-                stdout_truncated=stdout_buffer.truncated,
-                stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
         except Exception as exc:
@@ -1467,6 +1501,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stderr_total_bytes=stderr_buffer.total_bytes,
                 stdout_truncated=stdout_buffer.truncated,
                 stderr_truncated=stderr_buffer.truncated,
+                stdout_soft_limit_exceeded=stdout_soft_limit_exceeded,
                 internal_turns=internal_turns,
             )
 
@@ -1487,8 +1522,9 @@ class PiAgentRuntime(BaseAgentRuntime):
             session_id = await self.create_session()
 
         session = self._restore_session_from_disk(session_id, working_dir)
-        # Provider retries are delegated to pi RPC auto-retry where possible;
-        # framework watchdogs bound output size, no-progress stalls and wall time.
+        # RPC mode delegates prompt timeout to Pi/provider itself and does not
+        # keep framework-side no-progress / wall-clock watchdogs. JSON mode
+        # retains the legacy subprocess watchdogs for compatibility.
         transport = str(self.runtime_config.get("transport") or self.runtime_config.get("mode") or "json").strip().lower()
         if transport not in {"json", "rpc"}:
             logger.warning("unknown_pi_transport_fallback_json", agent_id=self.agent_id, transport=transport)
@@ -1497,10 +1533,33 @@ class PiAgentRuntime(BaseAgentRuntime):
         thinking = str(sdk_cfg.get("thinking") or "").strip()
         tools = sdk_cfg.get("tools", "read,bash,edit,write")
         effective_model, raw_model, _legacy_provider = self._effective_model()
-        api_max_retries = int(self.runtime_config.get("api_max_retries", self.runtime_config.get("max_retries", -1)))
+        allow_unbounded_framework_retry = transport != "rpc"
+        api_max_retries = self._normalize_framework_retry_count(
+            self.runtime_config.get(
+                "api_max_retries",
+                self.runtime_config.get("max_retries", -1 if allow_unbounded_framework_retry else 0),
+            ),
+            -1 if allow_unbounded_framework_retry else 0,
+            allow_unbounded=allow_unbounded_framework_retry,
+        )
         api_retry_delay = float(self.runtime_config.get("api_retry_delay", self.runtime_config.get("retry_delay", 10.0)))
-        pi_max_retries = int(self.runtime_config.get("pi_max_retries", -1))
+        pi_max_retries = self._normalize_framework_retry_count(
+            self.runtime_config.get("pi_max_retries", -1 if allow_unbounded_framework_retry else 0),
+            -1 if allow_unbounded_framework_retry else 0,
+            allow_unbounded=allow_unbounded_framework_retry,
+        )
         pi_retry_delay = float(self.runtime_config.get("pi_retry_delay", 10.0))
+        timeout_max_retries = self._runtime_retry_count("timeout_max_retries", _DEFAULT_TIMEOUT_MAX_RETRIES)
+        timeout_retry_delay = self._runtime_non_negative_float(
+            "timeout_retry_interval_seconds",
+            self._runtime_non_negative_float(
+                "timeout_retry_delay",
+                _DEFAULT_TIMEOUT_RETRY_INTERVAL_SECONDS,
+            ),
+        )
+        timeout_retry_fresh_session = bool(
+            self.runtime_config.get("timeout_retry_fresh_session", self.reset_context)
+        )
         max_stdout_bytes = self._runtime_int("max_stdout_bytes", _DEFAULT_MAX_STDOUT_BYTES)
         max_stderr_bytes = self._runtime_int("max_stderr_bytes", _DEFAULT_MAX_STDERR_BYTES)
         max_response_bytes = self._runtime_int("max_response_bytes", _DEFAULT_MAX_RESPONSE_BYTES)
@@ -1524,23 +1583,27 @@ class PiAgentRuntime(BaseAgentRuntime):
             if max_internal_turns is not None else
             self._runtime_int("max_internal_turns", 0)
         )
-        effective_no_progress_timeout_seconds = (
-            float(no_progress_timeout_seconds)
-            if no_progress_timeout_seconds is not None else
-            self._runtime_float(
-                "no_progress_timeout_seconds",
-                _DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
+        effective_no_progress_timeout_seconds: float | None = None
+        effective_max_wall_seconds: float | None = None
+        max_retry_wall_seconds: float | None = None
+        if transport == "json":
+            effective_no_progress_timeout_seconds = (
+                float(no_progress_timeout_seconds)
+                if no_progress_timeout_seconds is not None else
+                self._runtime_float(
+                    "no_progress_timeout_seconds",
+                    _DEFAULT_NO_PROGRESS_TIMEOUT_SECONDS,
+                )
             )
-        )
-        effective_max_wall_seconds = (
-            float(max_wall_seconds)
-            if max_wall_seconds is not None else
-            self._runtime_float("max_wall_seconds", _DEFAULT_MAX_WALL_SECONDS)
-        )
-        max_retry_wall_seconds = self._runtime_float(
-            "max_retry_wall_seconds",
-            _DEFAULT_MAX_RETRY_WALL_SECONDS,
-        )
+            effective_max_wall_seconds = (
+                float(max_wall_seconds)
+                if max_wall_seconds is not None else
+                self._runtime_float("max_wall_seconds", _DEFAULT_MAX_WALL_SECONDS)
+            )
+            max_retry_wall_seconds = self._runtime_float(
+                "max_retry_wall_seconds",
+                _DEFAULT_MAX_RETRY_WALL_SECONDS,
+            )
         heartbeat_interval_seconds = self._runtime_float(
             "heartbeat_interval_seconds",
             _DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
@@ -1564,33 +1627,68 @@ class PiAgentRuntime(BaseAgentRuntime):
             write_system_prompt=not is_continuation,
         )
 
-        cmd_args = [
-            "pi",
-            "--mode", transport,
-            "--model", effective_model,
-        ]
-        if thinking:
-            cmd_args.extend(["--thinking", thinking])
-        cmd_args.extend(["--tools", tools])
-        if transport == "json":
-            cmd_args.append("-p")
+        def _build_cmd_args_for_session(
+            *,
+            attempt_session: dict[str, Any],
+            attempt_session_dir: str | None,
+        ) -> list[str]:
+            attempt_is_continuation = int(attempt_session.get("turns") or 0) > 0
+            args = [
+                "pi",
+                "--mode", transport,
+                "--model", effective_model,
+            ]
+            if thinking:
+                args.extend(["--thinking", thinking])
+            args.extend(["--tools", tools])
+            if transport == "json":
+                args.append("-p")
 
-        if trace_context.system_prompt_file:
-            cmd_args.extend(["--append-system-prompt", trace_context.system_prompt_file])
+            if trace_context.system_prompt_file and not attempt_is_continuation:
+                args.extend(["--append-system-prompt", trace_context.system_prompt_file])
 
-        if trace_context.session_dir:
-            cmd_args.extend(["--session-dir", trace_context.session_dir])
-            if is_continuation:
-                cmd_args.append("--continue")
-        else:
-            cmd_args.append("--no-session")
+            if attempt_session_dir:
+                args.extend(["--session-dir", attempt_session_dir])
+                if attempt_is_continuation:
+                    args.append("--continue")
+            else:
+                args.append("--no-session")
 
-        if transport == "json":
-            cmd_args.append(f"@{trace_context.user_prompt_file}")
+            if transport == "json":
+                args.append(f"@{trace_context.user_prompt_file}")
+            return args
+
+        cmd_args = _build_cmd_args_for_session(
+            attempt_session=session,
+            attempt_session_dir=trace_context.session_dir,
+        )
         cmd_display = command_display(cmd_args)
 
         attempts: list[dict[str, Any]] = []
         started_at = now_iso()
+        runtime_limits_payload = {
+            "max_stdout_bytes": max_stdout_bytes,
+            "rpc_stdout_trace_bytes": effective_rpc_stdout_trace_bytes,
+            "rpc_stdout_abort_bytes": effective_rpc_stdout_abort_bytes,
+            "rpc_stdout_abort_mode": "soft_continue",
+            "max_stderr_bytes": max_stderr_bytes,
+            "max_response_bytes": max_response_bytes,
+            "max_event_count": max_event_count,
+            "max_single_line_bytes": max_single_line_bytes,
+            "max_internal_turns": effective_max_internal_turns,
+            "heartbeat_interval_seconds": heartbeat_interval_seconds,
+            "timeout_max_retries": timeout_max_retries,
+            "timeout_retry_delay": timeout_retry_delay,
+            "timeout_retry_interval_seconds": timeout_retry_delay,
+        }
+        if transport == "json":
+            runtime_limits_payload.update(
+                {
+                    "no_progress_timeout_seconds": effective_no_progress_timeout_seconds,
+                    "max_wall_seconds": effective_max_wall_seconds,
+                    "max_retry_wall_seconds": max_retry_wall_seconds,
+                }
+            )
         trace_context.write_request(
             {
                 "agent_id": self.agent_id,
@@ -1610,20 +1708,11 @@ class PiAgentRuntime(BaseAgentRuntime):
                 "api_retry_delay": api_retry_delay,
                 "pi_max_retries": pi_max_retries,
                 "pi_retry_delay": pi_retry_delay,
-                "runtime_limits": {
-                    "max_stdout_bytes": max_stdout_bytes,
-                    "rpc_stdout_trace_bytes": effective_rpc_stdout_trace_bytes,
-                    "rpc_stdout_abort_bytes": effective_rpc_stdout_abort_bytes,
-                    "max_stderr_bytes": max_stderr_bytes,
-                    "max_response_bytes": max_response_bytes,
-                    "max_event_count": max_event_count,
-                    "max_single_line_bytes": max_single_line_bytes,
-                    "max_internal_turns": effective_max_internal_turns,
-                    "no_progress_timeout_seconds": effective_no_progress_timeout_seconds,
-                    "max_wall_seconds": effective_max_wall_seconds,
-                    "max_retry_wall_seconds": max_retry_wall_seconds,
-                    "heartbeat_interval_seconds": heartbeat_interval_seconds,
-                },
+                "timeout_max_retries": timeout_max_retries,
+                "timeout_retry_delay": timeout_retry_delay,
+                "timeout_retry_interval_seconds": timeout_retry_delay,
+                "timeout_retry_fresh_session": timeout_retry_fresh_session,
+                "runtime_limits": runtime_limits_payload,
                 "is_continuation": is_continuation,
                 "user_prompt_len": len(message),
                 "sys_prompt_len": len(system_prompt) if system_prompt else 0,
@@ -1656,17 +1745,26 @@ class PiAgentRuntime(BaseAgentRuntime):
 
         api_failures = 0
         pi_failures = 0
+        timeout_failures = 0
+        timeout_retry_sessions: list[dict[str, Any]] = []
+        active_session_id = session_id
+        active_session = session
+        active_session_dir = trace_context.session_dir
         final_result: _AttemptResult | None = None
         overall_started_monotonic = time.monotonic()
 
         try:
             def _retry_budget_exceeded() -> bool:
+                if max_retry_wall_seconds is None:
+                    return False
                 return (
                     time.monotonic() - overall_started_monotonic
                     >= max_retry_wall_seconds
                 )
 
             def _mark_retry_budget_exhausted(result: _AttemptResult) -> None:
+                if max_retry_wall_seconds is None:
+                    return
                 elapsed = time.monotonic() - overall_started_monotonic
                 result.status = "timeout"
                 result.timeout = True
@@ -1677,6 +1775,33 @@ class PiAgentRuntime(BaseAgentRuntime):
                     f"{max_retry_wall_seconds:.1f}s]"
                 )
 
+            def _activate_fresh_timeout_retry_session(retry_index: int) -> None:
+                nonlocal active_session_id, active_session, active_session_dir
+                if not timeout_retry_fresh_session or not trace_context.working_dir:
+                    return
+                retry_session_id = self._reserve_session_id(
+                    f"{session_id}_timeout_retry_{retry_index:03d}"
+                )
+                retry_session_dir = str(
+                    Path(trace_context.working_dir) / "sessions" / retry_session_id
+                )
+                Path(retry_session_dir).mkdir(parents=True, exist_ok=True)
+                active_session_id = retry_session_id
+                active_session = {
+                    "turns": 0,
+                    "timeout_retry_parent": session_id,
+                    "timeout_retry_index": retry_index,
+                }
+                active_session_dir = retry_session_dir
+                self._sessions[retry_session_id] = active_session
+                timeout_retry_sessions.append(
+                    {
+                        "retry_index": retry_index,
+                        "session_id": retry_session_id,
+                        "session_dir": retry_session_dir,
+                    }
+                )
+
             while True:
                 # Cancel 检查
                 if cancel_event and cancel_event.is_set():
@@ -1684,32 +1809,35 @@ class PiAgentRuntime(BaseAgentRuntime):
                     attempts.append({"attempt": len(attempts) + 1, "status": "cancelled", "error": "cancelled"})
                     break
 
+                attempt_cmd_args = _build_cmd_args_for_session(
+                    attempt_session=active_session,
+                    attempt_session_dir=active_session_dir,
+                )
+
                 # 启动子进程（launch 失败用 pi_failures 重试）
                 try:
                     if transport == "rpc":
                         result = await self._execute_once_rpc(
-                            cmd_args=cmd_args,
+                            cmd_args=attempt_cmd_args,
                             message=message,
                             working_dir=working_dir,
-                            session_id=session_id,
+                            session_id=active_session_id,
                             call_dir=trace_context.call_dir or "",
-                            session=session,
+                            session=active_session,
                             max_stdout_bytes=effective_rpc_stdout_trace_bytes,
                             max_stderr_bytes=max_stderr_bytes,
                             max_event_count=max_event_count,
                             max_single_line_bytes=max_single_line_bytes,
                             max_internal_turns=effective_max_internal_turns,
-                            no_progress_timeout_seconds=effective_no_progress_timeout_seconds,
-                            max_wall_seconds=effective_max_wall_seconds,
                             heartbeat_interval_seconds=heartbeat_interval_seconds,
                             rpc_stdout_abort_bytes=effective_rpc_stdout_abort_bytes,
                             cancel_event=cancel_event,
                         )
                     else:
                         result = await self._execute_once(
-                            cmd_args=cmd_args,
+                            cmd_args=attempt_cmd_args,
                             working_dir=working_dir,
-                            session_id=session_id,
+                            session_id=active_session_id,
                             call_dir=trace_context.call_dir or "",
                             max_stdout_bytes=max_stdout_bytes,
                             max_stderr_bytes=max_stderr_bytes,
@@ -1759,6 +1887,9 @@ class PiAgentRuntime(BaseAgentRuntime):
                 attempt_payload = {
                     "attempt": len(attempts) + 1,
                     "status": result.status,
+                    "session_id": active_session_id,
+                    "session_dir": active_session_dir,
+                    "command_display": command_display(attempt_cmd_args),
                     "return_code": result.return_code,
                     "duration_ms": result.duration_ms,
                     "stdout_len": len(result.stdout_text),
@@ -1768,6 +1899,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                     "stderr_total_bytes": result.stderr_total_bytes,
                     "stdout_truncated": result.stdout_truncated,
                     "stderr_truncated": result.stderr_truncated,
+                    "stdout_soft_limit_exceeded": result.stdout_soft_limit_exceeded,
                     "saw_json": result.parsed.saw_json,
                     "message_count": len(result.parsed.messages),
                     "event_count": len(result.parsed.events),
@@ -1789,6 +1921,75 @@ class PiAgentRuntime(BaseAgentRuntime):
 
                 # 0) 致命错误（配置/环境问题，绝不重试）
                 if self._is_fatal_error(result.error):
+                    break
+
+                # 0.3) Pi/provider native timeout.
+                # RPC mode no longer creates framework-side wait timeouts; this
+                # branch is reached only after pi/provider reports a timeout as
+                # the prompt result. Retry by resending the same prompt after a
+                # fixed interval. RPC retries preserve the same session/process;
+                # JSON retries start a new process as before.
+                if result.timeout or result.error_code == "runtime_timeout":
+                    timeout_failures += 1
+                    timeout_attempt_limit = max(1, timeout_max_retries)
+                    attempts[-1]["retry_kind"] = (
+                        "pi_timeout_rpc_resend_same_process"
+                        if transport == "rpc" else
+                        "runtime_timeout_restart"
+                    )
+                    attempts[-1]["timeout_retry_index"] = timeout_failures
+                    attempts[-1]["timeout_attempt_limit"] = timeout_attempt_limit
+                    attempts[-1]["timeout_retry_limit"] = timeout_attempt_limit
+                    if timeout_failures < timeout_attempt_limit:
+                        attempts[-1]["will_retry"] = True
+                        if transport == "rpc":
+                            # RPC mode: a Pi-native timeout means the prompt has
+                            # completed with an error.  Retry the same prompt on
+                            # the same review/worker session and same long-lived
+                            # RPC process.  Different advisor reviews still get
+                            # their own sessions at the review scheduler layer;
+                            # timeout retry within one review must not create a
+                            # new session.
+                            attempts[-1]["process_restarted"] = False
+                            attempts[-1]["rpc_process_preserved"] = True
+                            attempts[-1]["fresh_session"] = False
+                            attempts[-1]["stale_agent_ends_to_skip"] = int(
+                                active_session.get("rpc_stale_agent_ends_to_skip") or 0
+                            )
+                        else:
+                            attempts[-1]["process_restarted"] = True
+                            if timeout_retry_fresh_session:
+                                _activate_fresh_timeout_retry_session(timeout_failures)
+                                attempts[-1]["next_session_id"] = active_session_id
+                                attempts[-1]["next_session_dir"] = active_session_dir
+                        delay = timeout_retry_delay if timeout_retry_delay > 0 else 0.0
+                        logger.warning(
+                            "pi_timeout_retry",
+                            runtime="pi_agent",
+                            agent_id=self.agent_id,
+                            transport=transport,
+                            timeout_failures=timeout_failures,
+                            max_retries=timeout_max_retries,
+                            delay=delay,
+                            session_id=active_session_id,
+                            session_dir=active_session_dir,
+                            rpc_process_preserved=bool(
+                                attempts[-1].get("rpc_process_preserved", transport == "rpc")
+                            ),
+                            fresh_session=bool(attempts[-1].get("fresh_session", timeout_retry_fresh_session)),
+                            error=result.error,
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                        continue
+                    result.error = (
+                        result.error or "runtime timeout"
+                    ) + (
+                        f" [timeout 处理失败已达到上限: {timeout_failures} 次, "
+                        f"上限 {timeout_attempt_limit} 次]"
+                    )
+                    attempts[-1]["error"] = result.error
+                    attempts[-1]["will_retry"] = False
                     break
 
                 # 0.5) 框架已分类的终态错误不进入 API/pi 无限重试。
@@ -1862,7 +2063,13 @@ class PiAgentRuntime(BaseAgentRuntime):
             success = final_result.status == "completed" and not final_result.error
 
             if success:
-                session["turns"] += 1
+                active_session["turns"] = int(active_session.get("turns") or 0) + 1
+                self._sessions[active_session_id] = active_session
+                if active_session_id == session_id:
+                    session = active_session
+                else:
+                    session["turns"] = active_session["turns"]
+                    session["timeout_retry_final_session_id"] = active_session_id
                 self._sessions[session_id] = session
 
             response_status = "completed" if success else final_result.status
@@ -1888,6 +2095,8 @@ class PiAgentRuntime(BaseAgentRuntime):
                     "stderr_len": len(final_result.stderr_text),
                     "response_len": len(final_result.response_text),
                     "conversation_id": session_id,
+                    "effective_session_id": active_session_id,
+                    "effective_session_dir": active_session_dir,
                     "turn_count": session["turns"],
                     "finished": success,
                     "error": final_result.error,
@@ -1897,11 +2106,18 @@ class PiAgentRuntime(BaseAgentRuntime):
                     "attempts": attempts,
                     "api_failures": api_failures,
                     "pi_failures": pi_failures,
+                    "timeout_failures": timeout_failures,
+                    "timeout_max_retries": timeout_max_retries,
+                    "timeout_retry_delay": timeout_retry_delay,
+                    "timeout_retry_interval_seconds": timeout_retry_delay,
+                    "timeout_retry_fresh_session": timeout_retry_fresh_session,
+                    "timeout_retry_sessions": timeout_retry_sessions,
                     "trace_limits": trace_limits,
                     "output_total_bytes": final_result.stdout_total_bytes,
                     "stderr_total_bytes": final_result.stderr_total_bytes,
                     "stdout_truncated": final_result.stdout_truncated,
                     "stderr_truncated": final_result.stderr_truncated,
+                    "stdout_soft_limit_exceeded": final_result.stdout_soft_limit_exceeded,
                     "message_count": len(final_result.parsed.messages),
                     "event_count": len(final_result.parsed.events),
                     "event_total_count": final_result.parsed.total_event_count,
@@ -1940,6 +2156,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                         "call_dir": trace_context.call_dir or "",
                         "mode": transport,
                         "output_total_bytes": final_result.stdout_total_bytes,
+                        "stdout_soft_limit_exceeded": final_result.stdout_soft_limit_exceeded,
                         "event_total_count": final_result.parsed.total_event_count,
                         "events_truncated_count": final_result.parsed.events_truncated_count,
                         "internal_turn_count": final_result.internal_turns,
@@ -1971,12 +2188,23 @@ class PiAgentRuntime(BaseAgentRuntime):
                     "mode": transport,
                     "status": response_status,
                     "output_total_bytes": final_result.stdout_total_bytes,
+                    "effective_session_id": active_session_id,
+                    "timeout_failures": timeout_failures,
+                    "timeout_max_retries": timeout_max_retries,
+                    "timeout_retry_interval_seconds": timeout_retry_delay,
+                    "timeout_retry_exhausted": (
+                        response_error_code == "runtime_timeout"
+                        and timeout_failures > 0
+                    ),
                     "event_total_count": final_result.parsed.total_event_count,
                     "events_truncated_count": final_result.parsed.events_truncated_count,
                     "internal_turn_count": final_result.internal_turns,
                 },
             )
         finally:
+            if active_session_id != session_id:
+                with contextlib.suppress(Exception):
+                    await self._close_rpc_process_for_session(active_session)
             trace_context.cleanup()
 
     async def multi_turn_execute(
@@ -1996,7 +2224,6 @@ class PiAgentRuntime(BaseAgentRuntime):
             session_id=session_id,
             working_dir=working_dir,
             cancel_event=cancel_event,
-            max_internal_turns=max_turns,
         )
 
     async def close_session(self, session_id: str) -> None:

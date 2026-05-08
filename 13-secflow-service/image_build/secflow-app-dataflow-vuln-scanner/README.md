@@ -111,14 +111,18 @@ python3 run_vuln_scan.py \
 |------|------|------|
 | `model` | `agents[*].runtime_config.model` | AI 模型名称，必须使用 `provider/model` 格式 |
 | `transport` | `agents[*].runtime_config.transport` | Pi 调用模式，默认模板使用 `rpc`（支持 pi 内建 auto-retry）；兼容 `json` |
-| `api_max_retries` / `api_retry_delay` | `agents[*].runtime_config` | API/网络/限流错误重试次数/初始退避秒数，`-1` 表示无限重试 |
-| `pi_max_retries` / `pi_retry_delay` | `agents[*].runtime_config` | Pi 进程启动/崩溃类错误重试次数/初始退避秒数，`-1` 表示无限重试 |
+| `api_max_retries` / `api_retry_delay` | `agents[*].runtime_config` | 框架侧 API/网络/限流错误重试次数/初始退避秒数；默认 RPC 模板为 `0`，仅在显式配置正整数时才做额外框架重试 |
+| `pi_max_retries` / `pi_retry_delay` | `agents[*].runtime_config` | 框架侧 Pi 进程崩溃/中断类错误重试次数/初始退避秒数；默认 RPC 模板为 `0`，避免与长连接 RPC 会话重复重放 |
+| `timeout_retry_interval_seconds` | `agents[*].runtime_config` | RPC 下 Pi/provider 原生 timeout 的固定重发间隔秒数，默认 30；不再使用 `no_progress_timeout_seconds` / `max_wall_seconds` / `max_retry_wall_seconds` 截断 prompt |
+| `reset_worker_session_per_cycle` | `workflows.atomic[*].engine` | Worker 是否每轮重建会话；默认 `false`，所有轮次复用同一 RPC session / pi 进程 |
 | `thinking` | `agents[*].runtime_config.sdk_specific.thinking` | 思考深度，可设为 `off` / `low` / `medium` / `high` / `xhigh` |
 | `max_review_cycles` | `global` 或 `workflows.atomic[*].engine` | 评审循环次数 |
 | `parallel_result_review` | `global.parallel_result_review` | 是否开启结果评审并行 |
 | `parallel_result_review_limit` | `global.parallel_result_review_limit` | 结果评审并发上限（默认 3） |
 | `system_prompt_file` 等 | `workflows.atomic[*].roles.worker.prompts` | 自定义 Prompt 文件 |
 | `plugins` / `end_plugins` | 各处 | 插件链配置 |
+
+> 说明：当 `transport=rpc` 时，加载配置后会自动清理旧的 `no_progress_timeout_seconds` / `max_wall_seconds` / `max_retry_wall_seconds` 以及 reflection 对应 watchdog 字段，避免误以为框架仍会主动截断 Pi prompt。
 
 ### 输出
 
@@ -252,11 +256,14 @@ workflow-framework/
 ├── prompts/                          # Prompt 模板
 │   ├── vuln_scan/                    # ★ 漏洞挖掘专用 prompts
 │   │   ├── worker_system.md          #   Worker 人设
-│   │   ├── worker_user.md            #   工作指令模板
+│   │   ├── worker_user.md            #   初始挖掘指令模板
+│   │   ├── worker_rework.md          #   返工/closure 指令模板
 │   │   ├── reflect_completeness.md   #   自我反思
 │   │   ├── summary.md                #   总结输出格式
-│   │   ├── global_review_sys.md      #   全局评审标准
-│   │   ├── global_review_user.md     #   全局评审提问
+│   │   ├── global_review_completeness_sys.md  # 全面性评审标准
+│   │   ├── global_review_completeness_user.md # 全面性评审提问
+│   │   ├── global_review_depth_sys.md         # 深入性评审标准
+│   │   ├── global_review_depth_user.md        # 深入性评审提问
 │   │   ├── result_review_sys.md      #   结果评审标准
 │   │   └── result_review_user.md     #   结果评审提问
 │   └── *.md                          # 通用/旧版 prompts
@@ -292,7 +299,7 @@ python3 run_vuln_scan.py --data-flow <path> --source-dir <path> [选项]
 | `--source-dir, -s` | *(必须)* | 源码目录 |
 | `--config, -c` | | 自定义配置文件 (复制 `config.vuln_scan_default.json` 后修改) |
 | `--run-name, -n` | 自动生成 | 运行名称 |
-| `--model, -m` | `anthropic/claude-sonnet-4-20250514` | AI 模型，使用 `provider/model` 格式 (未指定 `-c` 时生效) |
+| `--model, -m` | `icsl/zai-org/GLM-5` | AI 模型，使用 `provider/model` 格式 (未指定 `-c` 时生效) |
 | `--thinking` | `high` | 思考深度 (可选: `off` / `low` / `medium` / `high` / `xhigh`，未指定 `-c` 时生效) |
 | `--max-cycles` | `10` | 最大评审循环次数 (未指定 `-c` 时生效) |
 | `--result-review-concurrency` | `3` | 结果评审并发上限 (未指定 `-c` 时生效) |
@@ -697,7 +704,7 @@ docker run --rm \
   --data-flow /data/data_flow.md \
   --source-dir /data/source \
   --run-name demo_scan \
-  --model anthropic/claude-sonnet-4-20250514 \
+  --model icsl/zai-org/GLM-5 \
   --max-cycles 6
 ```
 
@@ -766,7 +773,7 @@ curl -X POST http://127.0.0.1:8080/api/dataflow-vuln-scanner/profiles \
     "name": "默认数据流漏洞挖掘模板",
     "template_kind": "vuln_scan_default",
     "config_payload": {
-      "model": "anthropic/claude-sonnet-4-20250514",
+      "model": "icsl/zai-org/GLM-5",
       "thinking": "high",
       "max_review_cycles": 6,
       "worker_timeout": 3600,
@@ -776,7 +783,6 @@ curl -X POST http://127.0.0.1:8080/api/dataflow-vuln-scanner/profiles \
     },
     "is_default": true,
     "enabled": true,
-    "max_concurrency": 1,
     "default_priority": 100,
     "max_retry_count": 3,
     "execution_timeout_seconds": 7200

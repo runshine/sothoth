@@ -41,6 +41,9 @@ def is_retryable_review_runtime_error(response: AgentResponse) -> bool:
     """True when a single-shot review advisor should be retried in a fresh session."""
     if response.success:
         return False
+    metadata = response.metadata or {}
+    if metadata.get("timeout_retry_exhausted"):
+        return False
     error_code = str(response.error_code or "").strip().lower()
     if error_code in _RETRYABLE_REVIEW_ERROR_CODES:
         return True

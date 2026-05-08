@@ -9,6 +9,7 @@ from fastapi import HTTPException, status
 
 from app.pi_vuln_core.review.profile import (
     apply_profile_thinking_to_config,
+    apply_profile_runtime_policy_to_config,
     get_review_profile_policy,
     get_review_score_threshold_policy,
     normalize_review_profile,
@@ -66,6 +67,8 @@ def _extract_defaults(template: dict[str, Any]) -> dict[str, Any]:
         ),
         "worker_timeout": worker_runtime.get("timeout_seconds") or 3600,
         "advisor_timeout": advisor_runtime.get("timeout_seconds") or 3600,
+        "timeout_max_retries": worker_runtime.get("timeout_max_retries") or advisor_runtime.get("timeout_max_retries") or 3,
+        "timeout_retry_interval_seconds": worker_runtime.get("timeout_retry_interval_seconds") or advisor_runtime.get("timeout_retry_interval_seconds") or 30,
         "result_review_concurrency": ((template.get("global") or {}).get("parallel_result_review_limit") or 3),
         "runtime_overrides": {},
     }
@@ -122,6 +125,8 @@ class ProfileTemplateService:
         model = str(normalized_payload.get("model") or "").strip()
         worker_timeout = int(normalized_payload.get("worker_timeout") or 3600)
         advisor_timeout = int(normalized_payload.get("advisor_timeout") or 3600)
+        timeout_max_retries = max(int(normalized_payload.get("timeout_max_retries") or 3), 1)
+        timeout_retry_interval_seconds = max(int(normalized_payload.get("timeout_retry_interval_seconds") or 30), 0)
         review_profile = normalize_review_profile(normalized_payload.get("review_profile"))
         profile_policy = get_review_profile_policy(review_profile)
         explicit_max_cycles = (
@@ -143,21 +148,18 @@ class ProfileTemplateService:
             runtime_config = agent.setdefault("runtime_config", {})
             if model:
                 runtime_config["model"] = model
+            runtime_config["timeout_max_retries"] = timeout_max_retries
+            runtime_config["timeout_retry_delay"] = timeout_retry_interval_seconds
+            runtime_config["timeout_retry_interval_seconds"] = timeout_retry_interval_seconds
             if agent.get("id") == "pi-worker":
                 runtime_config["timeout_seconds"] = worker_timeout
-                runtime_config["max_internal_turns"] = profile_policy.max_worker_turns_per_cycle
-                runtime_config["no_progress_timeout_seconds"] = profile_policy.worker_no_progress_timeout_seconds
-                runtime_config["max_wall_seconds"] = profile_policy.worker_max_wall_seconds
-                runtime_config["max_retry_wall_seconds"] = profile_policy.worker_max_wall_seconds
+                runtime_config["max_internal_turns"] = 0
                 runtime_config["rpc_stdout_trace_bytes"] = profile_policy.worker_rpc_stdout_trace_bytes
                 runtime_config["rpc_stdout_abort_bytes"] = profile_policy.worker_rpc_stdout_abort_bytes
             elif agent.get("id") == "pi-advisor":
                 runtime_config["timeout_seconds"] = advisor_timeout
                 runtime_config["advisor_runtime_retries"] = 3
                 runtime_config["max_internal_turns"] = profile_policy.advisor_max_internal_turns
-                runtime_config["no_progress_timeout_seconds"] = profile_policy.advisor_no_progress_timeout_seconds
-                runtime_config["max_wall_seconds"] = profile_policy.advisor_max_wall_seconds
-                runtime_config["max_retry_wall_seconds"] = profile_policy.advisor_max_wall_seconds
                 runtime_config["rpc_stdout_trace_bytes"] = profile_policy.advisor_rpc_stdout_trace_bytes
                 runtime_config["rpc_stdout_abort_bytes"] = profile_policy.advisor_rpc_stdout_abort_bytes
 
@@ -170,8 +172,6 @@ class ProfileTemplateService:
                 engine["max_worker_turns_per_cycle"] = profile_policy.max_worker_turns_per_cycle
                 engine["reflection_passes_per_cycle"] = profile_policy.reflection_passes_per_cycle
                 engine["reflection_max_internal_turns"] = profile_policy.reflection_max_internal_turns
-                engine["reflection_no_progress_timeout_seconds"] = profile_policy.reflection_no_progress_timeout_seconds
-                engine["reflection_max_wall_seconds"] = profile_policy.reflection_max_wall_seconds
                 engine["reflection_rpc_stdout_trace_bytes"] = profile_policy.reflection_rpc_stdout_trace_bytes
                 engine["reflection_rpc_stdout_abort_bytes"] = profile_policy.reflection_rpc_stdout_abort_bytes
                 engine.setdefault("summary_repair_attempt_budget", 2)
@@ -207,21 +207,13 @@ class ProfileTemplateService:
             compiled = _deep_merge(compiled, runtime_overrides)
         if not runtime_overrides_set_engine_cycles:
             _sync_engine_max_cycles(compiled)
-        if not profile_policy.review_enabled:
-            compiled.setdefault("global", {})["max_review_cycles"] = 1
+        apply_profile_runtime_policy_to_config(compiled, profile_policy.name)
+        if not runtime_overrides_set_engine_cycles:
             _sync_engine_max_cycles(compiled)
-        for workflow in ((compiled.get("workflows") or {}).get("atomic") or []):
-            if not isinstance(workflow, dict):
-                continue
-            engine = workflow.setdefault("engine", {})
-            if "review_profile" in engine or workflow.get("id") == "vuln_scan":
-                engine["review_profile"] = profile_policy.name
-                engine["review_enabled"] = profile_policy.review_enabled
-                engine["progress_required_after_cycle"] = profile_policy.progress_required_after_cycle
-                engine["progress_no_signal_closure_streak"] = profile_policy.progress_no_signal_closure_streak
-                engine["progress_no_signal_abort_streak"] = profile_policy.progress_no_signal_abort_streak
         apply_profile_thinking_to_config(compiled, profile_policy.name)
         normalized_payload["review_profile"] = profile_policy.name
+        normalized_payload["timeout_max_retries"] = timeout_max_retries
+        normalized_payload["timeout_retry_interval_seconds"] = timeout_retry_interval_seconds
         normalized_payload["thinking"] = self._extract_resolved_thinking(compiled)
         return normalized_payload, compiled
 

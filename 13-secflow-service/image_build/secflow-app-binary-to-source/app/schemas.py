@@ -139,6 +139,16 @@ class AdvancedFile(BaseModel):
     size: int = 0
     content: Optional[str] = None
     truncated: bool = False
+    stage: Optional[str] = None
+    stage_order: Optional[int] = None
+    section: Optional[str] = None
+    section_order: Optional[int] = None
+    round: Optional[str] = None
+    round_order: Optional[int] = None
+    agent: Optional[str] = None
+    role: Optional[str] = None
+    batch_no: Optional[int] = None
+    attempt_no: Optional[int] = None
 
 
 class AdvancedBatch(BaseModel):

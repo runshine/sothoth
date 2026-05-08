@@ -41,9 +41,12 @@ _TERMINAL_STATUSES = {
     "blocked_quota",
     "provider_rate_limited",
     "model_contract_violation",
+    "blocked_external_source",
     "no_workspace",
     "error",
 }
+
+_GENERIC_TERMINAL_STATUSES = {"failed", "error"}
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -279,6 +282,8 @@ def _normalize_run_status(raw_status: str, run_meta: dict[str, Any] | None = Non
         return "running" if meta_status == "in_progress" else meta_status
     if run_meta.get("finished_at"):
         if meta_status in _TERMINAL_STATUSES:
+            if meta_status in _GENERIC_TERMINAL_STATUSES and text in (_TERMINAL_STATUSES - _GENERIC_TERMINAL_STATUSES):
+                return text
             return meta_status
     if text in _TERMINAL_STATUSES:
         return text
@@ -749,6 +754,27 @@ def inspect_sessions(workspace_root: str | Path) -> list[dict[str, Any]]:
                     "duration_ms": response.get("duration_ms"),
                     "output_len": response.get("output_len", 0),
                     "error": response.get("error"),
+                    "error_code": response.get("error_code", ""),
+                    "mode": response.get("mode", ""),
+                    "attempts": response.get("attempts", []),
+                    "api_failures": response.get("api_failures", 0),
+                    "pi_failures": response.get("pi_failures", 0),
+                    "timeout_failures": response.get("timeout_failures", 0),
+                    "timeout_max_retries": response.get("timeout_max_retries", 0),
+                    "timeout_retry_fresh_session": response.get("timeout_retry_fresh_session", False),
+                    "output_total_bytes": response.get("output_total_bytes", response.get("stdout_total_bytes", 0)),
+                    "stderr_total_bytes": response.get("stderr_total_bytes", 0),
+                    "stdout_truncated": response.get("stdout_truncated", False),
+                    "stderr_truncated": response.get("stderr_truncated", False),
+                    "stdout_soft_limit_exceeded": response.get("stdout_soft_limit_exceeded", False),
+                    "trace_limits": response.get("trace_limits", {}),
+                    "events_truncated_count": response.get("events_truncated_count", 0),
+                    "messages_truncated_count": response.get("messages_truncated_count", 0),
+                    "non_json_truncated_count": response.get("non_json_truncated_count", 0),
+                    "effective_session_id": response.get("effective_session_id", ""),
+                    "effective_session_dir": response.get("effective_session_dir", ""),
+                    "event_total_count": response.get("event_total_count", 0),
+                    "internal_turn_count": response.get("internal_turn_count", 0),
                     "files": files,
                 }
             )

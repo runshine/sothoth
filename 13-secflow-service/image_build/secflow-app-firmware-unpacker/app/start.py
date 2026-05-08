@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Startup script for the threaded Gunicorn WSGI adapter."""
+"""Startup script for the Gunicorn ASGI entrypoint."""
 
 from __future__ import annotations
 
@@ -37,7 +37,6 @@ def _default_workers() -> int:
 def build_gunicorn_argv() -> list[str]:
     config = get_config()
     workers = _env_int("GUNICORN_WORKERS", _default_workers())
-    threads = _env_int("GUNICORN_THREADS", 8)
     timeout = _env_int("GUNICORN_TIMEOUT", 600)
     keepalive = _env_int("GUNICORN_KEEPALIVE", 10)
 
@@ -47,10 +46,8 @@ def build_gunicorn_argv() -> list[str]:
         f"{config.app.host}:{config.app.port}",
         "--workers",
         str(workers),
-        "--threads",
-        str(threads),
         "--worker-class",
-        "gthread",
+        "uvicorn.workers.UvicornWorker",
         "--timeout",
         str(timeout),
         "--keep-alive",
@@ -60,7 +57,7 @@ def build_gunicorn_argv() -> list[str]:
         "--error-logfile",
         "-",
         "--capture-output",
-        "app.wsgi:app",
+        "app.main:app",
     ]
 
 

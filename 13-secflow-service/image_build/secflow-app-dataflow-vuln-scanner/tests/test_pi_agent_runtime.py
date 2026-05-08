@@ -513,6 +513,261 @@ async def test_pi_agent_runtime_rpc_reuses_long_lived_process(
 
 
 @pytest.mark.asyncio
+async def test_pi_agent_runtime_rpc_uses_pi_native_timeout_without_framework_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": False,
+            "runtime_config": {
+                "model": "anthropic/claude-test",
+                "transport": "rpc",
+                "sdk_specific": {"thinking": "low"},
+            },
+        }
+    )
+
+    proc = _FakeProc(
+        returncode=None,
+        rpc_events=[
+            {"type": "response", "command": "set_auto_retry", "success": True},
+            {"type": "response", "command": "prompt", "success": True},
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "error",
+                    "errorMessage": "provider request timed out",
+                    "content": [],
+                },
+            },
+            {"type": "agent_end", "messages": []},
+        ],
+    )
+
+    async def fake_exec(*args, **kwargs):
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    session: dict = {}
+
+    result = await runtime._execute_once_rpc(
+        cmd_args=["pi", "--mode", "rpc"],
+        message="timeout prompt",
+        working_dir=str(tmp_path),
+        session_id="rpc_timeout_session",
+        call_dir=str(tmp_path / "call"),
+        session=session,
+        max_stdout_bytes=4096,
+        max_stderr_bytes=4096,
+        max_event_count=100,
+        max_single_line_bytes=1024 * 1024,
+        max_internal_turns=0,
+        heartbeat_interval_seconds=30,
+    )
+
+    assert result.status == "error"
+    assert result.error_code == "runtime_timeout"
+    assert result.timeout is False
+    assert proc.killed is False
+    assert session.get("rpc_proc") is proc
+    assert session.get("rpc_stale_agent_ends_to_skip") in {None, 0}
+
+
+@pytest.mark.asyncio
+async def test_pi_agent_runtime_rpc_timeout_retry_resends_to_same_process_after_interval(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": False,
+            "runtime_config": {
+                "model": "anthropic/claude-test",
+                "transport": "rpc",
+                "timeout_max_retries": 2,
+                "timeout_retry_interval_seconds": 0.25,
+                "sdk_specific": {"thinking": "low"},
+            },
+        }
+    )
+
+    calls = 0
+    closed = 0
+    sleeps: list[float] = []
+
+    async def fake_execute_once_rpc(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _AttemptResult(
+                error="runtime no-progress timeout after 1.0s",
+                status="timeout",
+                timeout=True,
+                error_code="runtime_timeout",
+            )
+        return _AttemptResult(response_text="retry ok", status="completed")
+
+    async def fake_close(_session):
+        nonlocal closed
+        closed += 1
+
+    async def fake_sleep(delay: float):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(runtime, "_execute_once_rpc", fake_execute_once_rpc)
+    monkeypatch.setattr(runtime, "_close_rpc_process_for_session", fake_close)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    response = await runtime.send_message(
+        message="retry same rpc process",
+        system_prompt="system",
+        session_id="rpc_retry_session",
+        working_dir=str(tmp_path),
+    )
+
+    assert response.success is True
+    assert response.content == "retry ok"
+    assert calls == 2
+    assert closed == 0
+    assert sleeps == [0.25]
+
+    call_dir = next((tmp_path / "sessions" / "rpc_retry_session" / "calls").iterdir())
+    response_payload = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
+    assert response_payload["timeout_retry_interval_seconds"] == 0.25
+    assert response_payload["attempts"][0]["retry_kind"] == "pi_timeout_rpc_resend_same_process"
+    assert response_payload["attempts"][0]["rpc_process_preserved"] is True
+    assert response_payload["attempts"][0]["process_restarted"] is False
+
+
+@pytest.mark.asyncio
+async def test_pi_agent_runtime_rpc_request_trace_omits_legacy_watchdog_timeouts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": False,
+            "runtime_config": {
+                "model": "anthropic/claude-test",
+                "transport": "rpc",
+                "api_max_retries": -1,
+                "pi_max_retries": -1,
+                "no_progress_timeout_seconds": 60,
+                "max_wall_seconds": 120,
+                "max_retry_wall_seconds": 300,
+                "timeout_max_retries": 2,
+                "timeout_retry_interval_seconds": 7,
+                "sdk_specific": {"thinking": "low"},
+            },
+        }
+    )
+
+    async def fake_execute_once_rpc(**_kwargs):
+        return _AttemptResult(response_text="rpc ok", status="completed")
+
+    monkeypatch.setattr(runtime, "_execute_once_rpc", fake_execute_once_rpc)
+
+    response = await runtime.send_message(
+        message="rpc trace cleanup",
+        system_prompt="system",
+        session_id="rpc_trace_session",
+        working_dir=str(tmp_path),
+        no_progress_timeout_seconds=1,
+        max_wall_seconds=1,
+    )
+
+    assert response.success is True
+    call_dir = next((tmp_path / "sessions" / "rpc_trace_session" / "calls").iterdir())
+    request_payload = json.loads((call_dir / "request.json").read_text(encoding="utf-8"))
+    runtime_limits = request_payload["runtime_limits"]
+
+    assert request_payload["mode"] == "rpc"
+    assert request_payload["api_max_retries"] == 0
+    assert request_payload["pi_max_retries"] == 0
+    assert runtime_limits["timeout_max_retries"] == 2
+    assert runtime_limits["timeout_retry_interval_seconds"] == 7
+    assert "no_progress_timeout_seconds" not in runtime_limits
+    assert "max_wall_seconds" not in runtime_limits
+    assert "max_retry_wall_seconds" not in runtime_limits
+
+
+@pytest.mark.asyncio
+async def test_pi_agent_runtime_rpc_timeout_retry_reuses_same_session_for_reset_context_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": True,
+            "runtime_config": {
+                "model": "anthropic/claude-test",
+                "transport": "rpc",
+                "timeout_max_retries": 2,
+                "timeout_retry_interval_seconds": 0,
+                "sdk_specific": {"thinking": "low"},
+            },
+        }
+    )
+
+    calls = 0
+    closed = 0
+    session_ids: list[str] = []
+
+    async def fake_execute_once_rpc(**kwargs):
+        nonlocal calls
+        calls += 1
+        session_ids.append(kwargs["session_id"])
+        if calls == 1:
+            return _AttemptResult(
+                error="provider request timed out",
+                status="error",
+                error_code="runtime_timeout",
+            )
+        return _AttemptResult(response_text="advisor retry ok", status="completed")
+
+    async def fake_close(_session):
+        nonlocal closed
+        closed += 1
+
+    monkeypatch.setattr(runtime, "_execute_once_rpc", fake_execute_once_rpc)
+    monkeypatch.setattr(runtime, "_close_rpc_process_for_session", fake_close)
+
+    response = await runtime.send_message(
+        message="advisor timeout prompt",
+        system_prompt="system",
+        session_id="advisor_rpc_session",
+        working_dir=str(tmp_path),
+    )
+
+    assert response.success is True
+    assert response.content == "advisor retry ok"
+    assert closed == 0
+    assert session_ids == ["advisor_rpc_session", "advisor_rpc_session"]
+
+    call_dir = next((tmp_path / "sessions" / "advisor_rpc_session" / "calls").iterdir())
+    response_payload = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
+    assert response_payload["effective_session_id"] == "advisor_rpc_session"
+    assert response_payload["timeout_retry_sessions"] == []
+    assert response_payload["attempts"][0]["fresh_session"] is False
+    assert response_payload["attempts"][0]["rpc_process_preserved"] is True
+    assert response_payload["attempts"][0]["process_restarted"] is False
+
+
+@pytest.mark.asyncio
 async def test_pi_agent_runtime_rpc_handles_very_large_single_jsonl_event(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -657,7 +912,7 @@ async def test_pi_agent_runtime_rpc_truncates_verbose_stdout_without_failing(
 
 
 @pytest.mark.asyncio
-async def test_pi_agent_runtime_rpc_abort_limit_fails_verbose_lightweight_call(
+async def test_pi_agent_runtime_rpc_stdout_soft_limit_does_not_abort_call(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -691,6 +946,15 @@ async def test_pi_agent_runtime_rpc_abort_limit_fails_verbose_lightweight_call(
                 }
                 for idx in range(20)
             ],
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "stop",
+                    "content": [{"type": "text", "text": "final after verbose stream"}],
+                },
+            },
+            {"type": "agent_end", "messages": []},
         ],
     )
 
@@ -708,14 +972,15 @@ async def test_pi_agent_runtime_rpc_abort_limit_fails_verbose_lightweight_call(
         rpc_stdout_abort_bytes=1024,
     )
 
-    assert response.success is False
-    assert response.error_code == "runtime_output_limit"
+    assert response.success is True
+    assert response.content == "final after verbose stream"
 
     call_dir = next((tmp_path / "sessions" / "rpc_abort_session" / "calls").iterdir())
     response_payload = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
-    assert response_payload["status"] == "runtime_output_limit"
+    assert response_payload["status"] == "completed"
     assert response_payload["output_total_bytes"] > 1024
     assert response_payload["stdout_truncated"] is True
+    assert response_payload["stdout_soft_limit_exceeded"] is True
 
 
 @pytest.mark.asyncio
@@ -804,7 +1069,7 @@ async def test_pi_agent_runtime_parses_json_mode_output_and_retries_api_errors(
 
 
 @pytest.mark.asyncio
-async def test_pi_agent_runtime_enforces_stdout_output_limit(
+async def test_pi_agent_runtime_truncates_stdout_without_aborting_json_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -826,8 +1091,29 @@ async def test_pi_agent_runtime_enforces_stdout_output_limit(
         }
     )
 
+    stdout = (
+        json.dumps(
+            {
+                "type": "message_update",
+                "message": {"role": "assistant", "content": "x" * 64},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "stopReason": "stop",
+                    "content": [{"type": "text", "text": "json final"}],
+                },
+            }
+        )
+        + "\n"
+    ).encode()
+
     async def fake_exec(*args, **kwargs):
-        return _FakeProc(stdout=b"A" * 128, stderr=b"", returncode=0)
+        return _FakeProc(stdout=stdout, stderr=b"", returncode=0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
 
@@ -838,15 +1124,15 @@ async def test_pi_agent_runtime_enforces_stdout_output_limit(
         working_dir=str(tmp_path),
     )
 
-    assert response.success is False
-    assert response.error_code == "runtime_output_limit"
+    assert response.success is True
+    assert response.content == "json final"
 
     call_dir = next((tmp_path / "sessions" / "limit_session" / "calls").iterdir())
     response_payload = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
-    assert response_payload["status"] == "runtime_output_limit"
-    assert response_payload["error_code"] == "runtime_output_limit"
+    assert response_payload["status"] == "completed"
     assert response_payload["trace_truncated"] is True
-    assert response_payload["output_total_bytes"] == 128
+    assert response_payload["output_total_bytes"] == len(stdout)
+    assert response_payload["stdout_soft_limit_exceeded"] is True
     assert "trace truncated" in (call_dir / "stdout.txt").read_text(encoding="utf-8")
 
 
@@ -903,7 +1189,7 @@ def test_pi_agent_runtime_error_classification_is_actionable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pi_agent_runtime_terminal_timeout_does_not_api_retry(
+async def test_pi_agent_runtime_timeout_restarts_process_before_failing(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -919,6 +1205,8 @@ async def test_pi_agent_runtime_terminal_timeout_does_not_api_retry(
                 "pi_max_retries": -1,
                 "api_retry_delay": 0,
                 "pi_retry_delay": 0,
+                "timeout_max_retries": 3,
+                "timeout_retry_delay": 0,
                 "sdk_specific": {"thinking": "low"},
             },
         }
@@ -936,11 +1224,7 @@ async def test_pi_agent_runtime_terminal_timeout_does_not_api_retry(
             error_code="runtime_timeout",
         )
 
-    async def fail_sleep(_delay):
-        raise AssertionError("terminal runtime timeout must not retry")
-
     monkeypatch.setattr(runtime, "_execute_once", fake_execute_once)
-    monkeypatch.setattr(asyncio, "sleep", fail_sleep)
 
     response = await runtime.send_message(
         message="timeout prompt",
@@ -951,13 +1235,152 @@ async def test_pi_agent_runtime_terminal_timeout_does_not_api_retry(
 
     assert response.success is False
     assert response.error_code == "runtime_timeout"
-    assert calls == 1
+    assert response.metadata["timeout_retry_exhausted"] is True
+    assert calls == 3
 
     call_dir = next((tmp_path / "sessions" / "timeout_session" / "calls").iterdir())
     response_payload = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
     assert response_payload["status"] == "timeout"
     assert response_payload["error_code"] == "runtime_timeout"
-    assert len(response_payload["attempts"]) == 1
+    assert response_payload["timeout_failures"] == 3
+    assert response_payload["timeout_max_retries"] == 3
+    assert len(response_payload["attempts"]) == 3
+    assert [attempt.get("will_retry") for attempt in response_payload["attempts"]] == [
+        True,
+        True,
+        False,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_pi_agent_runtime_timeout_restart_reuses_worker_session_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": False,
+            "runtime_config": {
+                "model": "anthropic/claude-test",
+                "timeout_max_retries": 3,
+                "timeout_retry_delay": 0,
+                "sdk_specific": {"thinking": "low"},
+            },
+        }
+    )
+
+    captured_session_dirs: list[str] = []
+    results = [
+        _AttemptResult(
+            error="runtime no-progress timeout after 1.0s",
+            status="timeout",
+            timeout=True,
+            error_code="runtime_timeout",
+        ),
+        _AttemptResult(
+            error="runtime no-progress timeout after 1.0s",
+            status="timeout",
+            timeout=True,
+            error_code="runtime_timeout",
+        ),
+        _AttemptResult(response_text="ok", status="completed"),
+    ]
+
+    async def fake_execute_once(**kwargs):
+        cmd_args = kwargs["cmd_args"]
+        captured_session_dirs.append(cmd_args[cmd_args.index("--session-dir") + 1])
+        return results.pop(0)
+
+    monkeypatch.setattr(runtime, "_execute_once", fake_execute_once)
+
+    response = await runtime.send_message(
+        message="worker timeout prompt",
+        system_prompt="system",
+        session_id="worker_session",
+        working_dir=str(tmp_path),
+    )
+
+    assert response.success is True
+    assert response.content == "ok"
+    assert len(captured_session_dirs) == 3
+    assert captured_session_dirs == [captured_session_dirs[0]] * 3
+
+    session_dir = tmp_path / "sessions" / "worker_session"
+    call_dirs = sorted((session_dir / "calls").iterdir())
+    assert len(call_dirs) == 1
+    response_payload = json.loads((call_dirs[0] / "response.json").read_text(encoding="utf-8"))
+    assert response_payload["status"] == "completed"
+    assert response_payload["timeout_failures"] == 2
+    assert len(response_payload["attempts"]) == 3
+    assert {attempt["session_id"] for attempt in response_payload["attempts"]} == {"worker_session"}
+
+
+@pytest.mark.asyncio
+async def test_pi_agent_runtime_timeout_restart_uses_fresh_session_dir_for_reset_context_agent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": True,
+            "runtime_config": {
+                "model": "anthropic/claude-test",
+                "timeout_max_retries": 3,
+                "timeout_retry_delay": 0,
+                "sdk_specific": {"thinking": "low"},
+            },
+        }
+    )
+
+    captured_session_dirs: list[str] = []
+    results = [
+        _AttemptResult(
+            error="runtime no-progress timeout after 1.0s",
+            status="timeout",
+            timeout=True,
+            error_code="runtime_timeout",
+        ),
+        _AttemptResult(response_text="advisor ok", status="completed"),
+    ]
+
+    async def fake_execute_once(**kwargs):
+        cmd_args = kwargs["cmd_args"]
+        captured_session_dirs.append(cmd_args[cmd_args.index("--session-dir") + 1])
+        return results.pop(0)
+
+    monkeypatch.setattr(runtime, "_execute_once", fake_execute_once)
+
+    response = await runtime.send_message(
+        message="advisor timeout prompt",
+        system_prompt="system",
+        session_id="advisor_session",
+        working_dir=str(tmp_path),
+    )
+
+    assert response.success is True
+    assert response.content == "advisor ok"
+    assert len(captured_session_dirs) == 2
+    assert captured_session_dirs[0] != captured_session_dirs[1]
+    assert captured_session_dirs[0].endswith("advisor_session")
+    assert "advisor_session_timeout_retry_001" in captured_session_dirs[1]
+
+    call_dir = next((tmp_path / "sessions" / "advisor_session" / "calls").iterdir())
+    response_payload = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
+    assert response_payload["timeout_retry_fresh_session"] is True
+    assert response_payload["effective_session_id"].startswith("advisor_session_timeout_retry_001")
+    assert response_payload["timeout_retry_sessions"][0]["session_id"].startswith(
+        "advisor_session_timeout_retry_001"
+    )
+    assert [attempt["session_id"] for attempt in response_payload["attempts"]] == [
+        "advisor_session",
+        response_payload["effective_session_id"],
+    ]
 
 
 @pytest.mark.asyncio

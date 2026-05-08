@@ -7,7 +7,7 @@
     --data-flow /path/to/data_flow_analysis.md \
     --source-dir /path/to/source_code/ \
     [--run-name my_scan] \
-    [--model anthropic/claude-sonnet-4-20250514] \
+    [--model icsl/zai-org/GLM-5] \
     [--max-cycles 6] \
     [--clean]
 
@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.pi_vuln_core.review.profile import (
+    apply_profile_runtime_policy_to_config,
     apply_profile_thinking_to_config,
     get_review_profile_policy,
     get_review_score_threshold_policy,
@@ -41,6 +42,8 @@ from app.pi_vuln_core.utils.win_compat import IS_WINDOWS, ensure_event_loop_poli
 PROJECT_ROOT = Path(__file__).resolve().parent
 PROMPTS_DIR = PROJECT_ROOT / "prompts" / "vuln_scan"
 DEFAULT_CONFIG = PROJECT_ROOT / "config.vuln_scan_default.json"
+DEFAULT_MODEL = "icsl/zai-org/GLM-5"
+DEFAULT_PROVIDER = "icsl"
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -230,7 +233,7 @@ def generate_config(
     run_dir: str,
     task_file: str,
     run_name: str,
-    model: str = "anthropic/claude-sonnet-4-20250514",
+    model: str = DEFAULT_MODEL,
     provider: str | None = None,
     max_cycles: int | None = 6,
     worker_timeout: int | None = None,  # deprecated; RPC mode does not use framework watchdogs
@@ -238,6 +241,8 @@ def generate_config(
     thinking: str = "high",  # deprecated: resolved from model + review_profile
     result_review_concurrency: int = 3,
     review_profile: str = "balanced",
+    timeout_max_retries: int = 3,
+    timeout_retry_interval_seconds: int = 30,
 ) -> dict:
     """生成完整的配置字典"""
 
@@ -264,6 +269,8 @@ def generate_config(
     execution_id, task_id = _windows_short_ids(run_name) if IS_WINDOWS else (f"{run_name}_run_001", run_name)
     worker_sdk_specific = {"thinking": resolved_thinking} if resolved_thinking else {}
     advisor_sdk_specific = {"tools": "read,bash"}
+    effective_timeout_max_retries = max(int(timeout_max_retries), 1)
+    effective_timeout_retry_interval_seconds = max(int(timeout_retry_interval_seconds), 0)
     if resolved_thinking:
         advisor_sdk_specific["thinking"] = resolved_thinking
 
@@ -288,14 +295,14 @@ def generate_config(
                 "runtime_config": {
                     "model": model,
                     "transport": "rpc",
-                    "api_max_retries": -1,
+                    "api_max_retries": 0,
                     "api_retry_delay": 10,
-                    "pi_max_retries": -1,
+                    "pi_max_retries": 0,
                     "pi_retry_delay": 10,
-                    "max_internal_turns": profile_policy.max_worker_turns_per_cycle,
-                    "no_progress_timeout_seconds": profile_policy.worker_no_progress_timeout_seconds,
-                    "max_wall_seconds": profile_policy.worker_max_wall_seconds,
-                    "max_retry_wall_seconds": profile_policy.worker_max_wall_seconds,
+                    "timeout_max_retries": effective_timeout_max_retries,
+                    "timeout_retry_delay": effective_timeout_retry_interval_seconds,
+                    "timeout_retry_interval_seconds": effective_timeout_retry_interval_seconds,
+                    "max_internal_turns": 0,
                     "rpc_stdout_trace_bytes": profile_policy.worker_rpc_stdout_trace_bytes,
                     "rpc_stdout_abort_bytes": profile_policy.worker_rpc_stdout_abort_bytes,
                     "sdk_specific": worker_sdk_specific,
@@ -309,15 +316,15 @@ def generate_config(
                 "runtime_config": {
                     "model": model,
                     "transport": "rpc",
-                    "api_max_retries": -1,
+                    "api_max_retries": 0,
                     "api_retry_delay": 10,
-                    "pi_max_retries": -1,
+                    "pi_max_retries": 0,
                     "pi_retry_delay": 10,
                     "advisor_runtime_retries": 3,
+                    "timeout_max_retries": effective_timeout_max_retries,
+                    "timeout_retry_delay": effective_timeout_retry_interval_seconds,
+                    "timeout_retry_interval_seconds": effective_timeout_retry_interval_seconds,
                     "max_internal_turns": profile_policy.advisor_max_internal_turns,
-                    "no_progress_timeout_seconds": profile_policy.advisor_no_progress_timeout_seconds,
-                    "max_wall_seconds": profile_policy.advisor_max_wall_seconds,
-                    "max_retry_wall_seconds": profile_policy.advisor_max_wall_seconds,
                     "rpc_stdout_trace_bytes": profile_policy.advisor_rpc_stdout_trace_bytes,
                     "rpc_stdout_abort_bytes": profile_policy.advisor_rpc_stdout_abort_bytes,
                     "sdk_specific": advisor_sdk_specific,
@@ -396,8 +403,6 @@ def generate_config(
                         "max_worker_turns_per_cycle": profile_policy.max_worker_turns_per_cycle,
                         "reflection_passes_per_cycle": profile_policy.reflection_passes_per_cycle,
                         "reflection_max_internal_turns": profile_policy.reflection_max_internal_turns,
-                        "reflection_no_progress_timeout_seconds": profile_policy.reflection_no_progress_timeout_seconds,
-                        "reflection_max_wall_seconds": profile_policy.reflection_max_wall_seconds,
                         "reflection_rpc_stdout_trace_bytes": profile_policy.reflection_rpc_stdout_trace_bytes,
                         "reflection_rpc_stdout_abort_bytes": profile_policy.reflection_rpc_stdout_abort_bytes,
                         "min_discovery_cycles_before_pass": profile_policy.min_discovery_cycles_before_pass,
@@ -406,7 +411,7 @@ def generate_config(
                         "progress_no_signal_abort_streak": profile_policy.progress_no_signal_abort_streak,
                         "min_evidence_artifacts": profile_policy.min_evidence_artifacts,
                         "required_pattern_families": list(profile_policy.required_pattern_families),
-                        "reset_worker_session_per_cycle": True,
+                        "reset_worker_session_per_cycle": False,
                         "plateau_closure_streak": profile_policy.progress_no_signal_closure_streak,
                         "plateau_abort_streak": profile_policy.progress_no_signal_abort_streak,
                         "same_issue_stagnation_threshold": 2,
@@ -428,6 +433,8 @@ def generate_config(
                                         prompts_dir, "worker_system.md"),
                                     "user_prompt_file": os.path.join(
                                         prompts_dir, "worker_user.md"),
+                                    "rework_prompt_file": os.path.join(
+                                        prompts_dir, "worker_rework.md"),
                                 },
                                 "reflection": [
                                     {
@@ -624,6 +631,7 @@ def _apply_profile_resolution_to_config(config: dict) -> None:
                 "progress_no_signal_abort_streak",
                 profile_policy.progress_no_signal_abort_streak,
             )
+    apply_profile_runtime_policy_to_config(config, profile_policy.name)
     apply_profile_thinking_to_config(config, profile_policy.name)
 
 
@@ -635,8 +643,8 @@ def _resolve_prompt_paths(config: dict) -> None:
     已是绝对路径的不动。
     """
     prompt_keys = (
-        "system_prompt_file", "user_prompt_file", "user_prompt_template",
-        "prompt_file",
+        "system_prompt_file", "user_prompt_file", "rework_prompt_file",
+        "user_prompt_template", "prompt_file",
     )
 
     def _walk_and_resolve(obj):
@@ -658,12 +666,12 @@ def _normalize_model_name(model: str | None, provider: str | None = None) -> str
     model = (model or "").strip()
     provider = (provider or "").strip()
     if not model:
-        model = "anthropic/claude-sonnet-4-20250514"
+        model = DEFAULT_MODEL
     if "/" in model:
         return model
     if provider:
         return f"{provider}/{model}"
-    return f"anthropic/{model}"
+    return f"{DEFAULT_PROVIDER}/{model}"
 
 
 def _format_model_display(model: str | None) -> str:
@@ -1012,7 +1020,7 @@ def main(argv: list[str] | None = None):
     --data-flow /path/to/data_flow.md \
     --source-dir /path/to/source/ \
     --run-name my_scan \
-    --model anthropic/claude-sonnet-4-20250514
+    --model icsl/zai-org/GLM-5
 
   # 使用 litellm 的其他模型
   python run_vuln_scan.py \
@@ -1062,7 +1070,7 @@ def main(argv: list[str] | None = None):
         help="runs 根目录（默认: run_vuln_scan.py 同目录下的 runs/）")
     parser.add_argument(
         "--model", "-m", default=None,
-        help="AI 模型，必须使用 provider/model 格式，例如 anthropic/claude-sonnet-4-20250514")
+        help="AI 模型，必须使用 provider/model 格式，例如 icsl/zai-org/GLM-5")
     parser.add_argument(
         "--provider", default=None, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -1072,6 +1080,12 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "--max-cycles", type=int, default=None,
         help="最大评审循环次数 (默认随 --review-profile: fast=1, balanced=6, audit=10；strict 映射 audit)")
+    parser.add_argument(
+        "--timeout-max-retries", type=int, default=3,
+        help="Pi/provider 自身返回 timeout 时的最大处理次数 (默认: 3，仅未指定 -c 时生效)")
+    parser.add_argument(
+        "--timeout-retry-interval-seconds", type=int, default=30,
+        help="Pi/provider 自身返回 timeout 后再次发送同一提示词前的等待秒数 (默认: 30，仅未指定 -c 时生效)")
     parser.add_argument(
         "--result-review-concurrency", type=int, default=3,
         help="结果评审并发上限 (默认: 3，仅未指定 -c 时生效)")
@@ -1243,7 +1257,7 @@ def main(argv: list[str] | None = None):
         parser.error("正常运行模式必须同时提供 --data-flow 和 --source-dir")
 
     if args.model is None:
-        args.model = "anthropic/claude-sonnet-4-20250514"
+        args.model = DEFAULT_MODEL
     else:
         args.model = _normalize_model_name(args.model, args.provider)
 
@@ -1253,6 +1267,14 @@ def main(argv: list[str] | None = None):
 
     if not os.path.isdir(args.source_dir):
         print(f"❌ 源码目录不存在: {args.source_dir}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.timeout_max_retries < 1:
+        print("❌ --timeout-max-retries 必须 >= 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.timeout_retry_interval_seconds < 0:
+        print("❌ --timeout-retry-interval-seconds 必须 >= 0", file=sys.stderr)
         sys.exit(1)
 
     if args.result_review_concurrency < 1:
@@ -1305,6 +1327,8 @@ def main(argv: list[str] | None = None):
             thinking=args.thinking,
             result_review_concurrency=args.result_review_concurrency,
             review_profile=args.review_profile,
+            timeout_max_retries=args.timeout_max_retries,
+            timeout_retry_interval_seconds=args.timeout_retry_interval_seconds,
         )
         config_source = "自动生成"
 

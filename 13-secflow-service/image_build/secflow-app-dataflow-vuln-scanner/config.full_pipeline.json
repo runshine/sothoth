@@ -20,21 +20,21 @@
       "type": "pi_agent",
       "reset_context": true,
       "runtime_config": {
-        "model": "anthropic/claude-sonnet-4-20250514",
+        "model": "icsl/zai-org/GLM-5",
         "sdk_specific": {
           "thinking": "low",
           "tools": "bash,read,write"
         },
-        "api_max_retries": -1,
+        "api_max_retries": 0,
         "api_retry_delay": 10,
-        "pi_max_retries": -1,
+        "pi_max_retries": 0,
         "pi_retry_delay": 10,
         "max_internal_turns": 70,
-        "no_progress_timeout_seconds": 600,
-        "max_wall_seconds": 1800,
-        "max_retry_wall_seconds": 1800,
         "rpc_stdout_trace_bytes": 4194304,
-        "transport": "rpc"
+        "transport": "rpc",
+        "timeout_max_retries": 3,
+        "timeout_retry_delay": 30,
+        "timeout_retry_interval_seconds": 30
       }
     },
     {
@@ -43,20 +43,20 @@
       "type": "pi_agent",
       "reset_context": false,
       "runtime_config": {
-        "model": "anthropic/claude-sonnet-4-20250514",
+        "model": "icsl/zai-org/GLM-5",
         "sdk_specific": {
           "thinking": "high"
         },
-        "api_max_retries": -1,
+        "api_max_retries": 0,
         "api_retry_delay": 10,
-        "pi_max_retries": -1,
+        "pi_max_retries": 0,
         "pi_retry_delay": 10,
         "max_internal_turns": 70,
-        "no_progress_timeout_seconds": 600,
-        "max_wall_seconds": 1800,
-        "max_retry_wall_seconds": 1800,
         "rpc_stdout_trace_bytes": 4194304,
-        "transport": "rpc"
+        "transport": "rpc",
+        "timeout_max_retries": 3,
+        "timeout_retry_delay": 30,
+        "timeout_retry_interval_seconds": 30
       }
     },
     {
@@ -65,22 +65,22 @@
       "type": "pi_agent",
       "reset_context": true,
       "runtime_config": {
-        "model": "anthropic/claude-sonnet-4-20250514",
+        "model": "icsl/zai-org/GLM-5",
         "sdk_specific": {
           "thinking": "high",
           "tools": "read,bash"
         },
-        "api_max_retries": -1,
+        "api_max_retries": 0,
         "api_retry_delay": 10,
-        "pi_max_retries": -1,
+        "pi_max_retries": 0,
         "pi_retry_delay": 10,
         "advisor_runtime_retries": 3,
         "max_internal_turns": 24,
-        "no_progress_timeout_seconds": 240,
-        "max_wall_seconds": 900,
-        "max_retry_wall_seconds": 900,
         "rpc_stdout_trace_bytes": 4194304,
-        "transport": "rpc"
+        "transport": "rpc",
+        "timeout_max_retries": 3,
+        "timeout_retry_delay": 30,
+        "timeout_retry_interval_seconds": 30
       }
     }
   ],
@@ -385,7 +385,7 @@
           "progress_required_after_cycle": 0,
           "progress_no_signal_closure_streak": 2,
           "progress_no_signal_abort_streak": 3,
-          "reset_worker_session_per_cycle": true,
+          "reset_worker_session_per_cycle": false,
           "plateau_closure_streak": 2,
           "plateau_abort_streak": 3,
           "same_issue_stagnation_threshold": 2,
@@ -403,7 +403,8 @@
             "prompts": {
               "work": {
                 "system_prompt_file": "prompts/vuln_scan/worker_system.md",
-                "user_prompt_file": "prompts/vuln_scan/worker_user.md"
+                "user_prompt_file": "prompts/vuln_scan/worker_user.md",
+                "rework_prompt_file": "prompts/vuln_scan/worker_rework.md"
               },
               "reflection": [
                 {
@@ -443,11 +444,11 @@
                   "report_completeness": 0.7
                 },
                 "score_thresholds": {
-                  "input_coverage": 1.0,
-                  "export_followthrough": 0.95,
-                  "used_coverage": 0.95,
-                  "limitations_honesty": 0.95,
-                  "report_completeness": 0.9
+                  "input_coverage": 0.95,
+                  "export_followthrough": 0.9,
+                  "used_coverage": 0.9,
+                  "limitations_honesty": 0.9,
+                  "report_completeness": 0.88
                 },
                 "score_threshold_ramp_cycles": 5
               },
@@ -467,8 +468,8 @@
                   "code_evidence_depth": 0.6
                 },
                 "score_thresholds": {
-                  "vuln_pattern_breadth": 0.85,
-                  "code_evidence_depth": 0.85
+                  "vuln_pattern_breadth": 0.82,
+                  "code_evidence_depth": 0.82
                 },
                 "score_threshold_ramp_cycles": 5
               }

@@ -37,9 +37,6 @@ fileserver_service:
 
 history_runs:
   enabled: true
-  legacy_root_candidates:
-    - "{data_mount_path}/{project_files_dirname}/{project_id}/dataflow-vuln-scanner/runs"
-    - "{data_mount_path}/{project_files_dirname}/{project_id}/DATAFLOW_VULN_SCANNER/runs"
 
 registry:
   enabled: false

@@ -67,6 +67,7 @@ class WorkPromptConfig(BaseModel):
     """Worker 工作 prompt 配置"""
     system_prompt_file: str
     user_prompt_file: str
+    rework_prompt_file: Optional[str] = None
 
 
 class ReflectionPromptConfig(BaseModel):
@@ -140,8 +141,6 @@ class EngineConfig(BaseModel):
     max_worker_turns_per_cycle: Optional[int] = Field(default=None, ge=1)
     reflection_passes_per_cycle: Optional[int] = Field(default=None, ge=0)
     reflection_max_internal_turns: Optional[int] = Field(default=None, ge=1)
-    reflection_no_progress_timeout_seconds: Optional[int] = Field(default=None, ge=1)
-    reflection_max_wall_seconds: Optional[int] = Field(default=None, ge=1)
     reflection_rpc_stdout_trace_bytes: Optional[int] = Field(default=None, ge=1)
     reflection_rpc_stdout_abort_bytes: Optional[int] = Field(default=None, ge=1)
     min_discovery_cycles_before_pass: Optional[int] = Field(default=None, ge=1)
@@ -150,7 +149,7 @@ class EngineConfig(BaseModel):
     progress_no_signal_abort_streak: int = Field(default=3, ge=1)
     min_evidence_artifacts: Optional[int] = Field(default=None, ge=0)
     required_pattern_families: list[str] = Field(default_factory=list)
-    reset_worker_session_per_cycle: bool = True
+    reset_worker_session_per_cycle: bool = False
     plateau_closure_streak: int = Field(default=2, ge=1)
     plateau_abort_streak: int = Field(default=3, ge=1)
     same_issue_stagnation_threshold: int = Field(default=2, ge=1)

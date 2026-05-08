@@ -17,7 +17,7 @@
       "type": "claude_code",
       "reset_context": false,
       "runtime_config": {
-        "model": "claude-sonnet-4-20250514",
+        "model": "icsl/zai-org/GLM-5",
         "api_key_env": "ANTHROPIC_API_KEY",
         "max_tokens": 8000,
         "timeout_seconds": 3600
@@ -29,7 +29,7 @@
       "type": "claude_code",
       "reset_context": true,
       "runtime_config": {
-        "model": "claude-sonnet-4-20250514",
+        "model": "icsl/zai-org/GLM-5",
         "api_key_env": "ANTHROPIC_API_KEY",
         "max_tokens": 4000,
         "timeout_seconds": 3600
@@ -112,7 +112,7 @@
           "max_worker_turns_per_cycle": 70,
           "reflection_passes_per_cycle": 1,
           "min_discovery_cycles_before_pass": 1,
-          "reset_worker_session_per_cycle": true,
+          "reset_worker_session_per_cycle": false,
           "plateau_closure_streak": 2,
           "plateau_abort_streak": 3,
           "same_issue_stagnation_threshold": 2,
@@ -131,7 +131,8 @@
             "prompts": {
               "work": {
                 "system_prompt_file": "prompts/vuln_scan/worker_system.md",
-                "user_prompt_file": "prompts/vuln_scan/worker_user.md"
+                "user_prompt_file": "prompts/vuln_scan/worker_user.md",
+                "rework_prompt_file": "prompts/vuln_scan/worker_rework.md"
               },
               "reflection": [
                 {

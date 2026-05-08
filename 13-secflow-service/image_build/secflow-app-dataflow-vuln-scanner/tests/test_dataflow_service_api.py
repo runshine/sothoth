@@ -40,7 +40,6 @@ def _profile_payload() -> dict:
         },
         "is_default": True,
         "enabled": True,
-        "max_concurrency": 1,
         "default_priority": 120,
         "max_retry_count": 2,
         "execution_timeout_seconds": 600,
@@ -127,6 +126,30 @@ def test_create_task_bootstraps_default_profile_when_missing(service_config_path
     assert profile_items[0]["profile_id"] == task_payload["profile_id"]
     assert profile_items[0]["is_default"] is True
     assert profile_items[0]["enabled"] is True
+
+
+def test_create_task_rejects_profile_from_different_project(service_config_path, patch_mock_agent_runtime):
+    app = create_app()
+    client = TestClient(app)
+
+    profile_payload = _profile_payload()
+    profile_payload["project_id"] = "project-1"
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=profile_payload)
+    assert profile.status_code == 201
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile.json()["profile_id"],
+            "title": "scan with wrong project profile",
+            "task_markdown": "# Package List\n\n- demo.tar.gz\n",
+            "artifact_refs": [],
+            "runtime_overrides": {},
+        },
+    )
+    assert task.status_code == 422
+    assert "different project" in task.json()["detail"]
 
 
 def test_task_bound_profile_versions_do_not_become_default(service_config_path, patch_mock_agent_runtime):

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import posixpath
 import shlex
 import shutil
 import uuid
@@ -113,6 +112,8 @@ def _compute_source_mtime_hint(run_root: Path, atomic_work_path: str | None = No
     candidates: list[Path] = [
         run_root,
         run_root / "_meta",
+        run_root / "_meta" / "run_timestamps.json",
+        run_root / "_meta" / "process.json",
         run_root / "input",
         run_root / "output",
         run_root / "workspace",
@@ -120,12 +121,18 @@ def _compute_source_mtime_hint(run_root: Path, atomic_work_path: str | None = No
         run_root / "config.json",
         run_root / "run.log",
     ]
+    glob_specs: list[tuple[Path, str]] = []
     atomic_text = str(atomic_work_path or "").strip()
     if atomic_text:
         atomic = Path(atomic_text)
         candidates.extend([
             atomic,
             atomic / "_meta",
+            atomic / "_meta" / "state.json",
+            atomic / "_meta" / "workflow_result.json",
+            atomic / "_meta" / "results_manifest.json",
+            atomic / "_meta" / "result_relations_manifest.json",
+            atomic / "_meta" / "coverage_ledger.json",
             atomic / "_meta" / "review_summaries",
             atomic / "_meta" / "review_feedback",
             atomic / "_meta" / "cycle_metrics",
@@ -141,6 +148,18 @@ def _compute_source_mtime_hint(run_root: Path, atomic_work_path: str | None = No
             atomic / "working",
             atomic / "input",
         ])
+        glob_specs.extend([
+            (atomic / "_meta" / "review_summaries", "*.json"),
+            (atomic / "_meta" / "cycle_metrics", "*.json"),
+            (atomic / "_meta" / "summary_snapshots", "*"),
+            (atomic / "reviews", "**/*.json"),
+            (atomic / "results", "*.md"),
+            (atomic / "final_output", "summary.md"),
+            (atomic / "final_output" / "results", "*.md"),
+            (atomic / "supporting_docs", "**/*"),
+            (atomic / "removed_results", "**/*"),
+            (atomic / "sessions", "*/calls/*/response.json"),
+        ])
     latest = 0.0
     seen: set[str] = set()
     for candidate in candidates:
@@ -153,6 +172,21 @@ def _compute_source_mtime_hint(run_root: Path, atomic_work_path: str | None = No
                 latest = max(latest, candidate.stat().st_mtime)
         except OSError:
             continue
+    for root, pattern in glob_specs:
+        try:
+            matches = root.glob(pattern)
+        except OSError:
+            continue
+        for candidate in matches:
+            key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if candidate.exists():
+                    latest = max(latest, candidate.stat().st_mtime)
+            except OSError:
+                continue
     return latest
 
 
@@ -316,31 +350,14 @@ def _project_files_root(project_id: str) -> Path:
     return Path(config.fileserver_service.data_mount_path) / config.fileserver_service.project_files_dirname / str(project_id or "").strip()
 
 
-def _normalize_legacy_request_root(project_id: str, root_path: str) -> Path:
-    config = get_config()
+def _normalize_execution_request_root(root_path: str) -> Path:
     raw = str(root_path or "").strip()
     if not raw:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="root_path is required")
-    data_root = Path(config.fileserver_service.data_mount_path).resolve()
-    if raw.startswith(str(data_root)):
-        target = Path(raw)
-    else:
-        normalized = posixpath.normpath(raw)
-        if not normalized.startswith("/"):
-            normalized = f"/{normalized}"
-        if normalized.startswith("/../") or normalized == "/..":
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="root_path escapes project root")
-        target = _project_files_root(project_id) / normalized.lstrip("/")
-    try:
-        resolved = target.resolve()
-    except FileNotFoundError:
-        resolved = target
-    project_root = _project_files_root(project_id).resolve()
-    try:
-        resolved.relative_to(project_root)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="root_path escapes project root") from exc
-    return resolved
+    target = Path(raw)
+    if not target.is_absolute():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="root_path must be absolute")
+    return target.resolve()
 
 
 class HistoryRunService:
@@ -369,7 +386,7 @@ class HistoryRunService:
 
     def _history_run_or_404(self, db: Session, history_run_id: str) -> HistoryRun:
         record = db.get(HistoryRun, history_run_id)
-        if record is None:
+        if record is None or record.source_type != "execution_workspace":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run not found")
         return record
 
@@ -390,40 +407,6 @@ class HistoryRunService:
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="history run path escapes project root") from exc
         return candidate
-
-    def _is_run_directory(self, entry: Path) -> bool:
-        return entry.is_dir() and entry.name != "detached_logs" and not entry.name.startswith(".")
-
-    def _legacy_root_candidates(self, project_id: str) -> list[Path]:
-        config = get_config()
-        values = []
-        for template in config.history_runs.legacy_root_candidates:
-            rendered = template.format(
-                data_mount_path=config.fileserver_service.data_mount_path.rstrip("/"),
-                project_files_dirname=config.fileserver_service.project_files_dirname.strip("/"),
-                project_id=str(project_id or "").strip(),
-            )
-            values.append(Path(rendered))
-        # Keep order but drop duplicates.
-        unique: list[Path] = []
-        seen = set()
-        for path in values:
-            key = str(path)
-            if key in seen:
-                continue
-            seen.add(key)
-            unique.append(path)
-        return unique
-
-    def _discover_legacy_runs(self, project_id: str) -> list[tuple[str, Path]]:
-        runs: list[tuple[str, Path]] = []
-        for root in self._legacy_root_candidates(project_id):
-            if not root.is_dir():
-                continue
-            for entry in sorted(root.iterdir()):
-                if self._is_run_directory(entry):
-                    runs.append(("legacy_runs_root", entry))
-        return runs
 
     def _discover_execution_runs(self, db: Session, project_id: str) -> list[tuple[WorkflowExecution, Path]]:
         items: list[tuple[WorkflowExecution, Path]] = []
@@ -611,7 +594,10 @@ class HistoryRunService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"run root not found: {run_root}")
 
         source_key = str(run_root)
-        record = db.query(HistoryRun).filter(HistoryRun.source_key == source_key).first()
+        record = db.query(HistoryRun).filter(
+            HistoryRun.source_key == source_key,
+            HistoryRun.source_type == source_type,
+        ).first()
         stored_source_mtime = _stored_source_mtime(record.source_mtime) if record is not None else 0.0
         if record is not None and not _history_run_is_active(record) and not _history_run_needs_parser_resync(record):
             hint_mtime = _compute_source_mtime_hint(run_root, record.atomic_work_path)
@@ -673,7 +659,10 @@ class HistoryRunService:
             raw_summary["command_display"] = command_payload.get("command_display") or ""
 
         if record is None:
-            record = db.query(HistoryRun).filter(HistoryRun.source_key == source_key).first()
+            record = db.query(HistoryRun).filter(
+                HistoryRun.source_key == source_key,
+                HistoryRun.source_type == source_type,
+            ).first()
         if record is None:
             record = HistoryRun(id=_new_id("hr"))
 
@@ -758,13 +747,6 @@ class HistoryRunService:
                 linked_task=linked_task,
                 profile_id=linked_task.profile_id if linked_task else None,
             )
-        for source_type, run_root in self._discover_legacy_runs(project_id):
-            self.sync_run_path(
-                db,
-                project_id=project_id,
-                run_root=run_root,
-                source_type=source_type,
-            )
         db.commit()
 
     def refresh_history_run(self, db: Session, history_run: HistoryRun) -> HistoryRun:
@@ -794,13 +776,21 @@ class HistoryRunService:
         return history_run
 
     def resolve_history_run(self, db: Session, *, project_id: str, run_name: str, root_path: str) -> HistoryRun:
-        normalized_root = _normalize_legacy_request_root(project_id, root_path)
+        normalized_root = _normalize_execution_request_root(root_path)
         candidate = normalized_root / run_name
-        record = db.query(HistoryRun).filter(HistoryRun.project_id == project_id, HistoryRun.run_root_path == str(candidate)).first()
+        record = db.query(HistoryRun).filter(
+            HistoryRun.project_id == project_id,
+            HistoryRun.source_type == "execution_workspace",
+            HistoryRun.run_root_path == str(candidate.resolve()),
+        ).first()
         if record is not None:
             return self.refresh_history_run(db, record)
         self.sync_project_history_runs(db, project_id)
-        record = db.query(HistoryRun).filter(HistoryRun.project_id == project_id, HistoryRun.run_root_path == str(candidate)).first()
+        record = db.query(HistoryRun).filter(
+            HistoryRun.project_id == project_id,
+            HistoryRun.source_type == "execution_workspace",
+            HistoryRun.run_root_path == str(candidate.resolve()),
+        ).first()
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run not found")
         return record
@@ -838,7 +828,10 @@ class HistoryRunService:
         self.sync_project_history_runs(db, project_id)
         records = [
             item
-            for item in db.query(HistoryRun).filter(HistoryRun.project_id == project_id).all()
+            for item in db.query(HistoryRun).filter(
+                HistoryRun.project_id == project_id,
+                HistoryRun.source_type == "execution_workspace",
+            ).all()
             if Path(item.run_root_path).is_dir()
         ]
         records.sort(
@@ -1116,11 +1109,17 @@ class HistoryRunService:
     def get_history_run_by_execution(self, db: Session, execution: WorkflowExecution) -> HistoryRun | None:
         if not execution.workspace_root:
             return None
-        record = db.query(HistoryRun).filter(HistoryRun.linked_execution_id == execution.id).first()
+        record = db.query(HistoryRun).filter(
+            HistoryRun.linked_execution_id == execution.id,
+            HistoryRun.source_type == "execution_workspace",
+        ).first()
         if record is not None:
             return self.refresh_history_run(db, record)
         source_key = str(Path(execution.workspace_root).resolve())
-        record = db.query(HistoryRun).filter(HistoryRun.source_key == source_key).first()
+        record = db.query(HistoryRun).filter(
+            HistoryRun.source_key == source_key,
+            HistoryRun.source_type == "execution_workspace",
+        ).first()
         if record is not None:
             return self.refresh_history_run(db, record)
         if str(execution.status or "").strip().lower() in _ACTIVE_HISTORY_RUN_STATUSES:

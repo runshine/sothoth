@@ -28,7 +28,6 @@ def _create_profile(db):
             },
             is_default=True,
             enabled=True,
-            max_concurrency=1,
             default_priority=100,
             max_retry_count=1,
             execution_timeout_seconds=600,

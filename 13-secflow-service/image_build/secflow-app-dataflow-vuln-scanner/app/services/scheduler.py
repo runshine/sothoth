@@ -176,30 +176,7 @@ class SchedulerService:
                 .limit(64)
                 .all()
             )
-            for execution, trigger, definition in candidates:
-                if definition.max_concurrency <= 0:
-                    continue
-                try:
-                    locked_definition = (
-                        db.query(WorkflowDefinition)
-                        .filter(WorkflowDefinition.id == definition.id)
-                        .with_for_update()
-                        .one()
-                    )
-                except Exception:
-                    db.rollback()
-                    locked_definition = definition
-                running_same_definition = (
-                    db.query(WorkflowExecution)
-                    .filter(
-                        WorkflowExecution.workflow_definition_id == locked_definition.id,
-                        WorkflowExecution.status == "running",
-                    )
-                    .count()
-                )
-                if running_same_definition >= locked_definition.max_concurrency:
-                    db.rollback()
-                    continue
+            for execution, trigger, _definition in candidates:
                 now = datetime.utcnow()
                 lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)
                 lease_token = uuid.uuid4().hex
@@ -257,17 +234,7 @@ class SchedulerService:
             if trigger is None or trigger.status != "pending":
                 return None
             definition = db.get(WorkflowDefinition, execution.workflow_definition_id)
-            if definition is None or not definition.enabled or definition.max_concurrency <= 0:
-                return None
-            running_same_definition = (
-                db.query(WorkflowExecution)
-                .filter(
-                    WorkflowExecution.workflow_definition_id == definition.id,
-                    WorkflowExecution.status == "running",
-                )
-                .count()
-            )
-            if running_same_definition >= definition.max_concurrency:
+            if definition is None or not definition.enabled:
                 return None
             now = datetime.utcnow()
             lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)

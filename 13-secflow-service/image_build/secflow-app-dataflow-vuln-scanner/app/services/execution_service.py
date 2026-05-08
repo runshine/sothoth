@@ -73,6 +73,26 @@ def _project_ids(principal: dict) -> set[str]:
     return set(principal.get("project_ids") or [])
 
 
+_ACTIVE_HISTORY_RUN_STATUSES = {"pending", "queued", "running", "cancel_requested", "delete_requested"}
+_RETRYABLE_HISTORY_RUN_STATUSES = {
+    "cancelled",
+    "failed",
+    "interrupted",
+    "stopped",
+    "review_error",
+    "review_plateau",
+    "summary_incomplete",
+    "runtime_output_limit",
+    "runtime_timeout",
+    "blocked_context_window",
+    "blocked_quota",
+    "provider_rate_limited",
+    "model_contract_violation",
+    "blocked_external_source",
+    "error",
+}
+
+
 def _command_display(args: list[str]) -> str:
     return " ".join(shlex.quote(str(item)) for item in args)
 
@@ -129,6 +149,22 @@ class ExecutionService:
             .all()
         )
 
+    def _trigger_title(self, trigger: TriggerTask) -> str:
+        try:
+            manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        except Exception:
+            return trigger.id
+        first_task = manifest.tasks[0] if manifest.tasks else None
+        return str(first_task.title or trigger.id) if first_task else trigger.id
+
+    def _latest_run_summary_for_execution(self, db: Session, execution: WorkflowExecution | None) -> dict[str, Any]:
+        if execution is None or not execution.workspace_root:
+            return {}
+        history_run = get_history_run_service().get_history_run_by_execution(db, execution)
+        if history_run is None:
+            return {}
+        return get_history_run_service().get_history_run_summary(db, history_run)
+
     def _scan_task_response(self, db: Session, trigger: TriggerTask) -> ScanTaskResponse:
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
         if trigger.workflow_definition_version_id:
@@ -158,6 +194,7 @@ class ExecutionService:
             parent_task_display=trigger.parent_task_id,
             profile_id=trigger.profile_id or trigger.workflow_definition_id,
             profile_version=version.version_no,
+            title=self._trigger_title(trigger),
             status=trigger.status,
             latest_attempt_no=latest_execution.attempt_no if latest_execution else 0,
             retry_count=trigger.retry_count,
@@ -169,6 +206,7 @@ class ExecutionService:
             finished_at=trigger.finished_at,
             message=trigger.message,
             latest_execution_id=trigger.latest_execution_id,
+            latest_run=self._latest_run_summary_for_execution(db, latest_execution),
         )
 
     def _scan_task_detail(self, db: Session, trigger: TriggerTask) -> ScanTaskDetailResponse:
@@ -210,9 +248,10 @@ class ExecutionService:
                 except (FileNotFoundError, TypeError):
                     task_markdown = ""
             attempts.append(self._attempt_response(item, history_run_id=history_run.id if history_run else None))
+        payload = response.model_dump()
+        payload["title"] = title
         return ScanTaskDetailResponse(
-            **response.model_dump(),
-            title=title,
+            **payload,
             task_markdown=task_markdown,
             artifact_refs=artifact_refs,
             runtime_overrides=runtime_overrides,
@@ -811,11 +850,15 @@ class ExecutionService:
         model = str(config_payload.get("model") or request.get("model") or "").strip()
         review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
         max_cycles = int(config_payload.get("max_review_cycles") or request.get("max_review_cycles") or 0)
+        timeout_max_retries = int(config_payload.get("timeout_max_retries") or request.get("timeout_max_retries") or 3)
+        timeout_retry_interval_seconds = int(config_payload.get("timeout_retry_interval_seconds") or request.get("timeout_retry_interval_seconds") or 30)
         result_review_concurrency = int(config_payload.get("result_review_concurrency") or request.get("result_review_concurrency") or 3)
         if model:
             argv.extend(["--model", model])
         if max_cycles > 0:
             argv.extend(["--max-cycles", str(max_cycles)])
+        argv.extend(["--timeout-max-retries", str(max(timeout_max_retries, 1))])
+        argv.extend(["--timeout-retry-interval-seconds", str(max(timeout_retry_interval_seconds, 0))])
         argv.extend(["--result-review-concurrency", str(max(result_review_concurrency, 1))])
         argv.extend(["--review-profile", review_profile])
         return argv, temp_config_path
@@ -1343,7 +1386,7 @@ class ExecutionService:
         }
 
     def _history_run_status_is_active(self, status_text: str | None) -> bool:
-        return str(status_text or "").strip().lower() in {"pending", "queued", "running", "cancel_requested", "delete_requested"}
+        return str(status_text or "").strip().lower() in _ACTIVE_HISTORY_RUN_STATUSES
 
     def _adopted_history_run_task_status(self, status_text: str | None) -> str:
         value = str(status_text or "").strip().lower()
@@ -1365,6 +1408,7 @@ class ExecutionService:
             "blocked_quota",
             "provider_rate_limited",
             "model_contract_violation",
+            "blocked_external_source",
             "no_workspace",
         }:
             return "failed"
@@ -1549,6 +1593,11 @@ class ExecutionService:
             else workflow_service._get_definition_or_404(db, payload.profile_id)
         )
         self._ensure_project_access(principal, definition.project_id)
+        if definition.project_id != payload.project_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="profile_id belongs to a different project",
+            )
         actor = _principal_id(principal)
         config_payload_overrides = {
             "model": payload.model,
@@ -1556,6 +1605,8 @@ class ExecutionService:
             "max_review_cycles": payload.max_review_cycles,
             "worker_timeout": payload.worker_timeout,
             "advisor_timeout": payload.advisor_timeout,
+            "timeout_max_retries": payload.timeout_max_retries,
+            "timeout_retry_interval_seconds": payload.timeout_retry_interval_seconds,
             "result_review_concurrency": payload.result_review_concurrency,
         }
         if payload.provider and payload.model and "/" not in payload.model:
@@ -1597,6 +1648,8 @@ class ExecutionService:
                 "max_review_cycles": payload.max_review_cycles,
                 "worker_timeout": payload.worker_timeout,
                 "advisor_timeout": payload.advisor_timeout,
+                "timeout_max_retries": payload.timeout_max_retries,
+                "timeout_retry_interval_seconds": payload.timeout_retry_interval_seconds,
                 "result_review_concurrency": payload.result_review_concurrency,
                 "options": scan_options,
             }
@@ -1719,6 +1772,7 @@ class ExecutionService:
         get_history_run_service().sync_project_history_runs(db, project_id)
         query = db.query(HistoryRun).filter(
             HistoryRun.project_id == project_id,
+            HistoryRun.source_type == "execution_workspace",
             HistoryRun.linked_task_id == task_id,
         )
         if execution_id:
@@ -2060,13 +2114,16 @@ class ExecutionService:
         if not run_root.is_dir():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run directory not found")
         status_value = str(history_run.status or "").strip().lower()
-        if status_value in {"pending", "queued", "running", "cancel_requested", "delete_requested"}:
+        if status_value in _ACTIVE_HISTORY_RUN_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="history run is still active; cancel it and wait until cancelled before retry",
+                detail="history run is still active; cancel it and wait until terminal before retry",
             )
-        if status_value != "cancelled":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history run must be cancelled before retry")
+        if status_value not in _RETRYABLE_HISTORY_RUN_STATUSES:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"history run status is not retryable: {status_value or 'unknown'}",
+            )
 
         definition = self._select_history_run_definition(db, history_run, principal)
         workflow_service = get_workflow_service()

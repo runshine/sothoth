@@ -77,12 +77,6 @@ class FileserverServiceConfig(BaseModel):
 
 class HistoryRunsConfig(BaseModel):
     enabled: bool = True
-    legacy_root_candidates: list[str] = Field(
-        default_factory=lambda: [
-            "{data_mount_path}/{project_files_dirname}/{project_id}/dataflow-vuln-scanner/runs",
-            "{data_mount_path}/{project_files_dirname}/{project_id}/DATAFLOW_VULN_SCANNER/runs",
-        ]
-    )
 
 
 class MenuConfig(BaseModel):
