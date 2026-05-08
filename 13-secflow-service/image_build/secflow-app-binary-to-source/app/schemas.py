@@ -29,6 +29,13 @@ class TaskCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     llm_provider_key: Optional[str] = None
     concurrency: Optional[int] = None
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
     elf_tasks: list[ElfTaskInput]
 
 
@@ -93,6 +100,15 @@ class TaskItemResponse(BaseModel):
 class TaskResponse(BaseModel):
     id: str
     project_id: str
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
+    origin_label: Optional[str] = None
+    parent_task_display: Optional[str] = None
     name: str
     status: str
     total_items: int

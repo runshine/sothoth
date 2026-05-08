@@ -135,9 +135,27 @@ class ExecutionService:
             version = self._definition_version_or_404(db, trigger.workflow_definition_version_id)
         else:
             version = get_workflow_service().get_profile_version_model(db, trigger.workflow_definition_id)
+        task_origin_type = str(trigger.task_origin_type or "").strip() or "manual"
+        parent_task_type = str(trigger.parent_task_type or "").strip() or None
+        origin_label = (
+            "二进制安全-源码扫描"
+            if task_origin_type == "binary_security" and parent_task_type == "source"
+            else "二进制安全-二进制类扫描"
+            if task_origin_type == "binary_security"
+            else "手动任务"
+        )
         return ScanTaskResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
+            task_origin_type=task_origin_type,
+            parent_project_id=trigger.parent_project_id,
+            parent_task_id=trigger.parent_task_id,
+            parent_task_type=parent_task_type,
+            parent_stage_name=trigger.parent_stage_name,
+            parent_stage_item_id=trigger.parent_stage_item_id,
+            parent_stage_item_key=trigger.parent_stage_item_key,
+            origin_label=origin_label,
+            parent_task_display=trigger.parent_task_id,
             profile_id=trigger.profile_id or trigger.workflow_definition_id,
             profile_version=version.version_no,
             status=trigger.status,
@@ -1146,6 +1164,7 @@ class ExecutionService:
             profile_id=definition.id,
             project_id=definition.project_id,
             trigger_type=trigger_type,
+            task_origin_type=str(trigger_type if trigger_type == "binary_security" else "manual"),
             input_tasks_json=TaskManifest(tasks=[]).model_dump(mode="json"),
             priority=priority,
             status="pending",
@@ -1258,6 +1277,13 @@ class ExecutionService:
             profile_id=definition.id,
             project_id=definition.project_id,
             trigger_type="manual",
+            task_origin_type=str(payload.task_origin_type or "").strip() or "manual",
+            parent_project_id=payload.parent_project_id,
+            parent_task_id=payload.parent_task_id,
+            parent_task_type=payload.parent_task_type,
+            parent_stage_name=payload.parent_stage_name,
+            parent_stage_item_id=payload.parent_stage_item_id,
+            parent_stage_item_key=payload.parent_stage_item_key,
             input_tasks_json=TaskManifest(tasks=[]).model_dump(mode="json"),
             priority=priority,
             status="pending",
@@ -1546,6 +1572,13 @@ class ExecutionService:
             "task_input_uploads": self._artifact_uploads_from_refs(payload.artifact_refs),
             "runtime_overrides": payload.runtime_overrides,
             "task_title": payload.title,
+            "task_origin_type": str(payload.task_origin_type or "").strip() or "manual",
+            "parent_project_id": payload.parent_project_id,
+            "parent_task_id": payload.parent_task_id,
+            "parent_task_type": payload.parent_task_type,
+            "parent_stage_name": payload.parent_stage_name,
+            "parent_stage_item_id": payload.parent_stage_item_id,
+            "parent_stage_item_key": payload.parent_stage_item_key,
         }
         if payload.data_flow and payload.source_dir:
             scan_options = dict(payload.scan_options or {})
@@ -1596,6 +1629,13 @@ class ExecutionService:
                 actor=actor,
                 authorization_token=authorization_token,
             )
+            trigger.task_origin_type = str(payload.task_origin_type or "").strip() or "manual"
+            trigger.parent_project_id = payload.parent_project_id
+            trigger.parent_task_id = payload.parent_task_id
+            trigger.parent_task_type = payload.parent_task_type
+            trigger.parent_stage_name = payload.parent_stage_name
+            trigger.parent_stage_item_id = payload.parent_stage_item_id
+            trigger.parent_stage_item_key = payload.parent_stage_item_key
         db.commit()
         db.refresh(trigger)
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)

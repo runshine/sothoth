@@ -729,6 +729,7 @@ def run_unpack(
     output_path: str,
     cancel_check: Optional[Callable[[], bool]] = None,
     register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> dict:
     """Execute the firmware unpacking pipeline."""
 
@@ -756,6 +757,14 @@ def run_unpack(
             _bind_cancel_client(None)
             raise RuntimeError("__CANCELLED__")
 
+    def _report_progress(stage: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(stage)
+        except Exception:
+            pass
+
     os.makedirs(output_path, exist_ok=True)
     try:
         log_dir = get_log_dir(output_path)
@@ -763,6 +772,7 @@ def run_unpack(
         log_dir = None
 
     _check_cancel()
+    _report_progress("preprocess")
 
     try:
         pre_result = run_preprocess(firmware_path, output_path, log_dir=log_dir)
@@ -784,6 +794,7 @@ def run_unpack(
         }
 
     _check_cancel()
+    _report_progress("feature_extract")
 
     try:
         features = extract_firmware_features(firmware_path)
@@ -815,6 +826,7 @@ def run_unpack(
     )
 
     _check_cancel()
+    _report_progress("skill_match")
 
     try:
         exec_def = load_agent_def(EXEC_AGENT_DEF)
@@ -842,6 +854,7 @@ def run_unpack(
     try:
         if skill_meta:
             _check_cancel()
+            _report_progress("tool_match")
             skill_result = _run_skill_unpack(
                 skill_meta,
                 firmware_path,
@@ -870,6 +883,7 @@ def run_unpack(
                 )
 
         if not passed:
+            _report_progress("llm_unpack")
             generic_passed, final_round, last_reason = _run_generic_unpack(
                 firmware_path,
                 output_path,
@@ -882,6 +896,7 @@ def run_unpack(
             )
             passed = generic_passed
             if passed:
+                _report_progress("review")
                 generated_skill = _generate_candidate_skill(
                     firmware_path,
                     output_path,
@@ -892,6 +907,7 @@ def run_unpack(
                 )
 
         _check_cancel()
+        _report_progress("cleanup")
         _run_cleaner(output_path, log_dir=log_dir, bind_cancel_client=_bind_cancel_client)
         _write_token_summary(log_dir)
 

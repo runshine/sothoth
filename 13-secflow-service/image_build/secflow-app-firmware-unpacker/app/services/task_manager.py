@@ -8,9 +8,9 @@ import os
 import threading
 from math import floor
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from app.config import get_config
 
@@ -159,6 +159,40 @@ def _claim_batch_size() -> int:
     return max(1, int(get_config().worker.claim_batch_size))
 
 
+def _task_lease_seconds() -> int:
+    return max(
+        15,
+        _runtime_config_int(
+            "task_lease_seconds",
+            default=int(get_config().worker.task_lease_seconds),
+        ),
+    )
+
+
+def _task_lease_renew_interval_seconds() -> int:
+    return max(
+        5,
+        _runtime_config_int(
+            "task_lease_renew_interval_seconds",
+            default=int(get_config().worker.task_lease_renew_interval_seconds),
+        ),
+    )
+
+
+def _cancel_timeout_seconds() -> int:
+    return max(
+        15,
+        _runtime_config_int(
+            "cancel_timeout_seconds",
+            default=int(get_config().worker.cancel_timeout_seconds),
+        ),
+    )
+
+
+def _lease_deadline(now: Optional[datetime] = None) -> datetime:
+    return (now or datetime.utcnow()) + timedelta(seconds=_task_lease_seconds())
+
+
 def get_executor() -> ThreadPoolExecutor:
     global _executor
     if _executor is None:
@@ -201,6 +235,118 @@ def _trigger_cancel_hook(task_id: str) -> None:
         hook()
     except Exception as exc:
         logger.warning("failed to trigger cancel hook for task %s: %s", task_id, exc)
+
+
+def get_local_active_task_count() -> int:
+    return _active_future_count()
+
+
+def recover_stale_owned_tasks() -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        tasks = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.owner_id == owner_id,
+                UnpackTask.status.in_(
+                    [TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
+                ),
+            )
+            .all()
+        )
+    finally:
+        db.close()
+
+    with _futures_lock:
+        local_task_ids = {
+            task_id for task_id, future in _futures.items() if not future.done()
+        }
+
+    for task in tasks:
+        if task.id in local_task_ids:
+            continue
+        reason = "owner restarted without active future"
+        if task.status == TaskStatus.CANCELLING.value:
+            _mark_task_cancelled(task.id, reason=reason)
+        else:
+            _finalize_orphaned_task(task.id, reason=reason)
+
+
+def _mark_task_stage(task_id: str, stage: str) -> None:
+    from app.model import UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is None:
+            return
+        task.current_stage = stage
+        task.last_progress_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _renew_task_lease(task_id: str, *, stage: Optional[str] = None) -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        task = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.id == task_id,
+                UnpackTask.owner_id == owner_id,
+                UnpackTask.status.in_(
+                    [TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
+                ),
+            )
+            .first()
+        )
+        if task is None:
+            return
+        task.lease_expires_at = _lease_deadline()
+        task.last_progress_at = datetime.utcnow()
+        if stage:
+            task.current_stage = stage
+        db.commit()
+    finally:
+        db.close()
+
+
+def _finalize_orphaned_task(task_id: str, reason: str) -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is None or task.status not in (
+            TaskStatus.RUNNING.value,
+            TaskStatus.CANCELLING.value,
+        ):
+            return
+        if task.status == TaskStatus.CANCELLING.value:
+            task.status = TaskStatus.CANCELLED.value
+            task.result_status = "cancelled"
+            task.result_message = f"Task cancelled: {reason}"
+        else:
+            task.status = TaskStatus.FAILED.value
+            task.result_status = "failed"
+            task.error_message = reason
+            task.result_message = f"Task failed: {reason}"
+        task.owner_id = None
+        task.lease_expires_at = None
+        task.completed_at = datetime.utcnow()
+        task.last_progress_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
 
 
 def build_task_workspace(project_id: str, task_id: str) -> dict[str, Path]:
@@ -325,6 +471,13 @@ def submit_unpack_task(
     firmware_path: str,
     output_path: Optional[str] = None,
     project_id: Optional[str] = None,
+    task_origin_type: Optional[str] = None,
+    parent_project_id: Optional[str] = None,
+    parent_task_id: Optional[str] = None,
+    parent_task_type: Optional[str] = None,
+    parent_stage_name: Optional[str] = None,
+    parent_stage_item_id: Optional[str] = None,
+    parent_stage_item_key: Optional[str] = None,
 ) -> dict[str, str]:
     """Insert a pending task into the shared database."""
     from app.model import TaskStatus, UnpackTask, generate_id, get_db_session
@@ -334,6 +487,7 @@ def submit_unpack_task(
         raise ValueError("project_id 不能为空")
 
     task_id = generate_id()
+    normalized_origin_type = str(task_origin_type or "").strip() or "manual"
     prepared = prepare_task_workspace(normalized_project_id, task_id, firmware_path)
     db = get_db_session()
     try:
@@ -341,9 +495,18 @@ def submit_unpack_task(
             UnpackTask(
                 id=task_id,
                 project_id=normalized_project_id,
+                task_origin_type=normalized_origin_type,
+                parent_project_id=parent_project_id,
+                parent_task_id=parent_task_id,
+                parent_task_type=parent_task_type,
+                parent_stage_name=parent_stage_name,
+                parent_stage_item_id=parent_stage_item_id,
+                parent_stage_item_key=parent_stage_item_key,
                 firmware_path=firmware_path,
                 output_path=prepared["output_path"],
                 status=TaskStatus.PENDING.value,
+                current_stage="pending",
+                last_progress_at=datetime.utcnow(),
             )
         )
         db.commit()
@@ -370,9 +533,14 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
         trigger_runtime_cancel = False
         if task.status == TaskStatus.PENDING.value:
             task.status = TaskStatus.CANCELLED.value
+            task.cancel_requested_at = datetime.utcnow()
+            task.result_status = "cancelled"
+            task.result_message = "Task was cancelled before execution"
             task.completed_at = datetime.utcnow()
         elif task.status in (TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value):
             task.status = TaskStatus.CANCELLING.value
+            task.cancel_requested_at = task.cancel_requested_at or datetime.utcnow()
+            task.last_progress_at = datetime.utcnow()
             trigger_runtime_cancel = True
         elif task.status == TaskStatus.CANCELLED.value:
             return True, "任务已取消"
@@ -402,6 +570,13 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
         new_task = submit_unpack_task(
             firmware_path=task.firmware_path,
             project_id=task.project_id,
+            task_origin_type=task.task_origin_type,
+            parent_project_id=task.parent_project_id,
+            parent_task_id=task.parent_task_id,
+            parent_task_type=task.parent_task_type,
+            parent_stage_name=task.parent_stage_name,
+            parent_stage_item_id=task.parent_stage_item_id,
+            parent_stage_item_key=task.parent_stage_item_key,
         )
         return True, new_task["task_id"], "重试任务已创建"
     finally:
@@ -470,10 +645,68 @@ def _should_cancel(task_id: str) -> bool:
         db.close()
 
 
+def recover_orphaned_tasks() -> None:
+    from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session
+    from app.services.worker import get_worker_id
+
+    now = datetime.utcnow()
+    active_owner_ids: set[str] = set()
+    heartbeat_cutoff = now - timedelta(seconds=max(15, int(get_config().worker.dead_threshold_seconds)))
+    db = get_db_session()
+    try:
+        active_owner_ids = {
+            str(row.worker_id)
+            for row in db.query(WorkerInstance)
+            .filter(
+                WorkerInstance.is_alive.is_(True),
+                WorkerInstance.last_heartbeat >= heartbeat_cutoff,
+            )
+            .all()
+        }
+        tasks = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.status.in_(
+                    [TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
+                )
+            )
+            .all()
+        )
+    finally:
+        db.close()
+
+    current_owner = get_worker_id()
+    with _futures_lock:
+        local_active = {
+            task_id for task_id, future in _futures.items() if not future.done()
+        }
+
+    for task in tasks:
+        owner_id = str(task.owner_id or "").strip()
+        if owner_id == current_owner and task.id in local_active:
+            continue
+        cancel_requested_at = task.cancel_requested_at
+        lease_expired = task.lease_expires_at is None or task.lease_expires_at < now
+        owner_missing = not owner_id or owner_id not in active_owner_ids
+        cancel_timed_out = bool(
+            cancel_requested_at
+            and cancel_requested_at + timedelta(seconds=_cancel_timeout_seconds()) < now
+        )
+        progress_stale = bool(
+            task.last_progress_at
+            and task.last_progress_at + timedelta(seconds=_cancel_timeout_seconds()) < now
+        )
+        if task.status == TaskStatus.CANCELLING.value and (cancel_timed_out or owner_missing or lease_expired or progress_stale):
+            _mark_task_cancelled(task.id, reason="Task cancelled after owner lost or timeout")
+        elif task.status == TaskStatus.RUNNING.value and (owner_missing or lease_expired):
+            _finalize_orphaned_task(task.id, reason="Task lease expired or owner lost")
+
+
 def _claim_task(task_id: str) -> bool:
     from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id
 
+    owner_id = get_worker_id()
     db = get_db_session()
     try:
         updated = (
@@ -485,10 +718,16 @@ def _claim_task(task_id: str) -> bool:
             .update(
                 {
                     UnpackTask.status: TaskStatus.RUNNING.value,
-                    UnpackTask.worker_id: get_worker_id(),
+                    UnpackTask.owner_id: owner_id,
+                    UnpackTask.current_stage: "queued",
+                    UnpackTask.lease_expires_at: _lease_deadline(),
+                    UnpackTask.cancel_requested_at: None,
+                    UnpackTask.last_progress_at: datetime.utcnow(),
                     UnpackTask.started_at: datetime.utcnow(),
                     UnpackTask.completed_at: None,
                     UnpackTask.error_message: None,
+                    UnpackTask.result_status: None,
+                    UnpackTask.result_message: None,
                 },
                 synchronize_session=False,
             )
@@ -516,8 +755,12 @@ def _reset_claim(task_id: str) -> None:
             .update(
                 {
                     UnpackTask.status: TaskStatus.PENDING.value,
-                    UnpackTask.worker_id: None,
+                    UnpackTask.owner_id: None,
+                    UnpackTask.current_stage: "pending",
+                    UnpackTask.lease_expires_at: None,
+                    UnpackTask.cancel_requested_at: None,
                     UnpackTask.started_at: None,
+                    UnpackTask.last_progress_at: datetime.utcnow(),
                 },
                 synchronize_session=False,
             )
@@ -566,15 +809,16 @@ def _schedule_pending_tasks() -> None:
 
 def _run_claimed_task(task_id: str) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
-    from app.services.worker import get_worker_id, update_worker_active_tasks
+    from app.services.worker import get_worker_id, refresh_worker_active_tasks
     from app.unpacker_engine import run_unpack
 
+    owner_id = get_worker_id()
     db = get_db_session()
     try:
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if task is None:
             return
-        if task.worker_id != get_worker_id():
+        if task.owner_id != owner_id:
             return
         runtime_paths = resolve_task_runtime_paths(
             task_id=task.id,
@@ -585,10 +829,10 @@ def _run_claimed_task(task_id: str) -> None:
     finally:
         db.close()
 
-    update_worker_active_tasks(+1)
+    refresh_worker_active_tasks()
     try:
         if _should_cancel(task_id):
-            _mark_task_cancelled(task_id)
+            _mark_task_cancelled(task_id, reason="cancel requested before execution")
             return
 
         os.makedirs(runtime_paths["output_path"], exist_ok=True)
@@ -597,6 +841,7 @@ def _run_claimed_task(task_id: str) -> None:
             runtime_paths["output_path"],
             cancel_check=lambda: _should_cancel(task_id),
             register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),
+            progress_callback=lambda stage: _renew_task_lease(task_id, stage=stage),
         )
         _update_task_result(task_id, result)
     except Exception as exc:
@@ -604,12 +849,12 @@ def _run_claimed_task(task_id: str) -> None:
         _update_task_error(task_id, str(exc))
     finally:
         _register_cancel_hook(task_id, None)
-        update_worker_active_tasks(-1)
         with _futures_lock:
             _futures.pop(task_id, None)
+        refresh_worker_active_tasks()
 
 
-def _mark_task_cancelled(task_id: str) -> None:
+def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
@@ -619,8 +864,11 @@ def _mark_task_cancelled(task_id: str) -> None:
             return
         task.status = TaskStatus.CANCELLED.value
         task.result_status = "cancelled"
-        task.result_message = "Task was cancelled"
+        task.result_message = reason
+        task.owner_id = None
+        task.lease_expires_at = None
         task.completed_at = datetime.utcnow()
+        task.last_progress_at = datetime.utcnow()
         db.commit()
     finally:
         db.close()
@@ -643,6 +891,8 @@ def _update_task_result(task_id: str, result: dict) -> None:
         else:
             task.status = TaskStatus.FAILED.value
 
+        task.owner_id = None
+        task.lease_expires_at = None
         task.result_status = result.get("status")
         task.result_message = result.get("message")
         task.rounds = result.get("rounds")
@@ -654,6 +904,7 @@ def _update_task_result(task_id: str, result: dict) -> None:
         task.generated_skill_status = result.get("generated_skill_status")
         task.promotion_success_count = result.get("promotion_success_count")
         task.completed_at = datetime.utcnow()
+        task.last_progress_at = datetime.utcnow()
         db.commit()
     finally:
         db.close()
@@ -668,8 +919,13 @@ def _update_task_error(task_id: str, error: str) -> None:
         if task is None:
             return
         task.status = TaskStatus.CANCELLED.value if task.status == TaskStatus.CANCELLING.value else TaskStatus.FAILED.value
+        task.owner_id = None
+        task.lease_expires_at = None
+        task.result_status = "cancelled" if task.status == TaskStatus.CANCELLED.value else "failed"
+        task.result_message = error if task.status == TaskStatus.CANCELLED.value else task.result_message
         task.error_message = error
         task.completed_at = datetime.utcnow()
+        task.last_progress_at = datetime.utcnow()
         db.commit()
     finally:
         db.close()
@@ -678,6 +934,7 @@ def _update_task_error(task_id: str, error: str) -> None:
 def _dispatch_loop() -> None:
     while not _dispatcher_stop.wait(timeout=_dispatch_interval_seconds()):
         try:
+            recover_orphaned_tasks()
             _schedule_pending_tasks()
         except Exception as exc:
             logger.warning("task dispatch warning: %s", exc)
@@ -690,6 +947,8 @@ def start() -> None:
         return
 
     get_executor()
+    recover_stale_owned_tasks()
+    recover_orphaned_tasks()
     logger.info("task dispatcher concurrency: %s", _runtime_max_concurrent_for_logs())
     _dispatcher_stop.clear()
     _dispatcher_thread = threading.Thread(

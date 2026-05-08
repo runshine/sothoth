@@ -114,6 +114,13 @@ class ScanTaskCreateRequest(BaseModel):
     artifact_refs: List[ArtifactRef] = Field(default_factory=list)
     priority: Optional[int] = None
     runtime_overrides: Dict[str, Any] = Field(default_factory=dict)
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_task_input(self) -> "ScanTaskCreateRequest":
@@ -133,6 +140,15 @@ class ScanTaskPriorityUpdateRequest(BaseModel):
 class ScanTaskResponse(BaseModel):
     task_id: str
     project_id: str
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
+    origin_label: Optional[str] = None
+    parent_task_display: Optional[str] = None
     profile_id: str
     profile_version: int
     status: str

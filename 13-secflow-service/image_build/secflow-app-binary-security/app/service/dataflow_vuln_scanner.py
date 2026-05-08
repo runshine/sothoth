@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from app.config import get_config
 from app.service.downstream_base import JsonHttpClient
@@ -13,7 +13,7 @@ class DataflowVulnScannerClient(JsonHttpClient):
         cfg = get_config().services.dataflow_vuln_scanner
         super().__init__(base_url=cfg.base_url.rstrip("/"), timeout=cfg.timeout)
 
-    async def create_task(self, project_id: str, title: str, token: str, data_flow_path: str, source_dir: str, workspace_dir: str, output_dir: str) -> dict:
+    async def create_task(self, project_id: str, title: str, token: str, data_flow_path: str, source_dir: str, workspace_dir: str, output_dir: str, origin: dict[str, Any] | None = None) -> dict:
         return await self.post(
             "/api/dataflow-vuln-scanner/tasks",
             token=token,
@@ -24,6 +24,7 @@ class DataflowVulnScannerClient(JsonHttpClient):
                 "output_dir": {"source": "absolute", "path": output_dir},
                 "data_flow": {"source": "absolute", "path": data_flow_path},
                 "source_dir": {"source": "absolute", "path": source_dir},
+                **(origin or {}),
             },
         )
 

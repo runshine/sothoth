@@ -48,6 +48,29 @@ PHASE_LABELS = {
 }
 
 
+def _task_origin_payload(task: B2STask) -> dict:
+    task_origin_type = str(task.task_origin_type or "").strip() or "manual"
+    parent_task_type = str(task.parent_task_type or "").strip() or None
+    origin_label = (
+        "二进制安全-源码扫描"
+        if task_origin_type == "binary_security" and parent_task_type == "source"
+        else "二进制安全-二进制类扫描"
+        if task_origin_type == "binary_security"
+        else "手动任务"
+    )
+    return {
+        "task_origin_type": task_origin_type,
+        "parent_project_id": task.parent_project_id,
+        "parent_task_id": task.parent_task_id,
+        "parent_task_type": parent_task_type,
+        "parent_stage_name": task.parent_stage_name,
+        "parent_stage_item_id": task.parent_stage_item_id,
+        "parent_stage_item_key": task.parent_stage_item_key,
+        "origin_label": origin_label,
+        "parent_task_display": task.parent_task_id,
+    }
+
+
 def generate_task_id(db: Session, project_id: str) -> str:
     for _ in range(10):
         task_id = uuid4().hex[:16]
@@ -118,6 +141,13 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     task = B2STask(
         id=task_id,
         project_id=project_id,
+        task_origin_type=str(req.task_origin_type or "").strip() or "manual",
+        parent_project_id=req.parent_project_id,
+        parent_task_id=req.parent_task_id,
+        parent_task_type=req.parent_task_type,
+        parent_stage_name=req.parent_stage_name,
+        parent_stage_item_id=req.parent_stage_item_id,
+        parent_stage_item_key=req.parent_stage_item_key,
         name=req.name,
         description=req.description,
         priority=req.priority,
@@ -147,6 +177,13 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
         worker_url = await choose_pi_worker(db, task.id, idx)
         item.extra_metadata = {
             **(elf.metadata or {}),
+            "task_origin_type": str(req.task_origin_type or "").strip() or "manual",
+            "parent_project_id": req.parent_project_id,
+            "parent_task_id": req.parent_task_id,
+            "parent_task_type": req.parent_task_type,
+            "parent_stage_name": req.parent_stage_name,
+            "parent_stage_item_id": req.parent_stage_item_id,
+            "parent_stage_item_key": req.parent_stage_item_key,
             "file_list": elf.file_list or [],
             "source_elf_path": str(source_elf_path),
             "llm_provider_key": llm_provider_key,
@@ -613,6 +650,7 @@ def build_task_response(db: Session, task: B2STask) -> TaskResponse:
     return TaskResponse(
         id=task.id,
         project_id=task.project_id,
+        **_task_origin_payload(task),
         name=task.name,
         status=task.status,
         total_items=len(items),

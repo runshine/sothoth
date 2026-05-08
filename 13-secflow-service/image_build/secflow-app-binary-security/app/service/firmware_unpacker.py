@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from app.config import get_config
 from app.service.downstream_base import JsonHttpClient
@@ -13,7 +13,7 @@ class FirmwareUnpackerClient(JsonHttpClient):
         cfg = get_config().services.firmware_unpacker
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
 
-    async def create_task(self, project_id: str, firmware_path: str, output_path: str, token: str) -> dict:
+    async def create_task(self, project_id: str, firmware_path: str, output_path: str, token: str, origin: dict[str, Any] | None = None) -> dict:
         return await self.post(
             f"/api/app/firmware-unpacker/projects/{project_id}/tasks",
             token=token,
@@ -21,6 +21,7 @@ class FirmwareUnpackerClient(JsonHttpClient):
                 "project_id": project_id,
                 "firmware_path": firmware_path,
                 "output_path": output_path,
+                **(origin or {}),
             },
         )
 

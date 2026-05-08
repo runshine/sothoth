@@ -11,6 +11,13 @@ class UnpackRequest(BaseModel):
     firmware_path: str
     output_path: Optional[str] = None
     project_id: Optional[str] = None
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
 
 
 class TaskSubmitResponse(BaseModel):
@@ -48,10 +55,23 @@ class ConfigBatchUpdateItem(BaseModel):
 class TaskResponse(BaseModel):
     id: str
     project_id: Optional[str]
+    task_origin_type: Optional[str] = None
+    parent_project_id: Optional[str] = None
+    parent_task_id: Optional[str] = None
+    parent_task_type: Optional[str] = None
+    parent_stage_name: Optional[str] = None
+    parent_stage_item_id: Optional[str] = None
+    parent_stage_item_key: Optional[str] = None
+    origin_label: Optional[str] = None
+    parent_task_display: Optional[str] = None
     firmware_path: str
     output_path: str
     status: str
-    worker_id: Optional[str] = None
+    owner_id: Optional[str] = None
+    current_stage: Optional[str] = None
+    lease_expires_at: Optional[str] = None
+    cancel_requested_at: Optional[str] = None
+    last_progress_at: Optional[str] = None
     result_status: Optional[str] = None
     result_message: Optional[str] = None
     rounds: Optional[int] = None
@@ -79,7 +99,7 @@ class TaskResourceContainerResponse(BaseModel):
 
 class TaskResourceUsageResponse(BaseModel):
     task_id: str
-    worker_id: Optional[str] = None
+    owner_id: Optional[str] = None
     available: bool
     pod_name: Optional[str] = None
     namespace: Optional[str] = None
@@ -117,7 +137,7 @@ class TaskListResponse(BaseModel):
 
 
 class WorkerInstanceResponse(BaseModel):
-    worker_id: str
+    owner_id: str
     hostname: Optional[str] = None
     pod_ip: Optional[str] = None
     started_at: Optional[str] = None
@@ -146,7 +166,7 @@ class ConcurrencyInfoResponse(BaseModel):
 
 
 class ClusterInfoResponse(BaseModel):
-    this_worker: str
+    this_owner: str
     total_workers: int
     alive_workers: int
     workers: List[WorkerInstanceResponse]
@@ -192,9 +212,9 @@ class ToolListResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    worker_id: Optional[str] = None
+    owner_id: Optional[str] = None
 
 
 class ReadyResponse(BaseModel):
     status: str
-    worker_id: Optional[str] = None
+    owner_id: Optional[str] = None

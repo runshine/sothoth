@@ -91,30 +91,31 @@ def _get_task_or_404(task_id: str) -> dict:
 
 def _get_task_resource_usage(task_id: str) -> dict:
     task = _get_task_or_404(task_id)
-    worker_id = str(task.get("worker_id") or "").strip() or None
-    if not worker_id:
+    owner_id = str(task.get("owner_id") or "").strip() or None
+    pod_name = owner_id.split(":", 1)[0] if owner_id else None
+    if not pod_name:
         return {
             "task_id": task_id,
-            "worker_id": None,
+            "owner_id": None,
             "available": False,
             "message": "任务当前未绑定运行中的 Worker，无法获取资源使用情况",
             "containers": [],
         }
 
-    metrics = get_pod_resource_usage(worker_id)
+    metrics = get_pod_resource_usage(pod_name)
     if not metrics:
         return {
             "task_id": task_id,
-            "worker_id": worker_id,
+            "owner_id": owner_id,
             "available": False,
-            "pod_name": worker_id,
+            "pod_name": pod_name,
             "message": "未获取到任务所在 Worker Pod 的资源指标",
             "containers": [],
         }
 
     return {
         "task_id": task_id,
-        "worker_id": worker_id,
+        "owner_id": owner_id,
         "available": True,
         **metrics,
     }
@@ -369,6 +370,13 @@ def _submit_task(project_id: Optional[str], request: UnpackRequest) -> dict:
     result = submit_unpack_task(
         firmware_path=request.firmware_path,
         project_id=project_id,
+        task_origin_type=request.task_origin_type,
+        parent_project_id=request.parent_project_id,
+        parent_task_id=request.parent_task_id,
+        parent_task_type=request.parent_task_type,
+        parent_stage_name=request.parent_stage_name,
+        parent_stage_item_id=request.parent_stage_item_id,
+        parent_stage_item_key=request.parent_stage_item_key,
     )
     return {
         "task_id": result["task_id"],
@@ -383,7 +391,7 @@ def _submit_task(project_id: Optional[str], request: UnpackRequest) -> dict:
 def _list_tasks(
     project_id: Optional[str],
     status_filter: Optional[str],
-    worker_id: Optional[str],
+    owner_id: Optional[str],
     search: Optional[str],
     limit: int,
     offset: int,
@@ -395,8 +403,8 @@ def _list_tasks(
             query = query.filter(UnpackTask.project_id == project_id)
         if status_filter:
             query = query.filter(UnpackTask.status == status_filter)
-        if worker_id:
-            query = query.filter(UnpackTask.worker_id == worker_id)
+        if owner_id:
+            query = query.filter(UnpackTask.owner_id == owner_id)
         if search:
             like_value = f"%{search}%"
             query = query.filter(
@@ -502,13 +510,13 @@ def _list_tools() -> dict:
 @router.get("/health", response_model=HealthResponse)
 @router.get("/api/app/firmware-unpacker/health", response_model=HealthResponse)
 async def health_check():
-    return {"status": "ok", "worker_id": get_worker_id()}
+    return {"status": "ok", "owner_id": get_worker_id()}
 
 
 @router.get("/ready", response_model=ReadyResponse)
 @router.get("/api/app/firmware-unpacker/ready", response_model=ReadyResponse)
 async def ready_check():
-    return {"status": "ready", "worker_id": get_worker_id()}
+    return {"status": "ready", "owner_id": get_worker_id()}
 
 
 @router.get("/api/app/firmware-unpacker/cluster", response_model=ClusterInfoResponse)
@@ -581,7 +589,7 @@ async def create_project_task(
 async def list_project_tasks(
     project_id: str,
     status_filter: Optional[str] = Query(default=None, alias="status"),
-    worker_id: Optional[str] = Query(default=None),
+    owner_id: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -589,7 +597,7 @@ async def list_project_tasks(
 ):
     _, token = subject_and_token
     await ensure_project_access(project_id, token)
-    return _list_tasks(project_id, status_filter, worker_id, search, limit, offset)
+    return _list_tasks(project_id, status_filter, owner_id, search, limit, offset)
 
 
 @router.get(
@@ -650,7 +658,7 @@ async def submit_unpack_legacy(
 async def list_tasks_legacy(
     project_id: Optional[str] = Query(default=None),
     status_filter: Optional[str] = Query(default=None, alias="status"),
-    worker_id: Optional[str] = Query(default=None),
+    owner_id: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -663,7 +671,7 @@ async def list_tasks_legacy(
     return _list_tasks(
         normalized_project_id,
         status_filter,
-        worker_id,
+        owner_id,
         search,
         limit,
         offset,
