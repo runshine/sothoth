@@ -21,6 +21,7 @@ Base = declarative_base()
 
 class TaskStatus(str, enum.Enum):
     PENDING = "pending"
+    RETRY_PREPARING = "retry_preparing"
     RUNNING = "running"
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
@@ -249,6 +250,7 @@ DEFAULT_CONFIGS = [
     ("reserved_memory_mb", "256", "int", "自动模式下为 Pod 自身保留的内存(MiB)"),
     ("max_concurrent", "3", "int", "兼容旧版本：单个 Worker 最大并发解包任务数"),
     ("max_retries", "5", "int", "pi agent 最大重试轮数"),
+    ("max_retries_reached_action", "success", "string", "达到最大重试轮数后默认动作：success=按通过处理，failed=按失败处理"),
     ("dead_threshold", "300", "int", "Worker 心跳超时秒数"),
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
     ("task_lease_seconds", "45", "int", "任务租约秒数"),

@@ -18,6 +18,7 @@ from app.unpacker_engine_session import get_session_dir
 
 _STREAM_LOG_STATE: dict[str, dict[str, Any]] = {}
 TOKEN_FIELDS = ("input", "output", "cacheRead", "cacheWrite", "total")
+TASK_RESULT_CACHE_FILENAME = "task_result_cache.json"
 
 
 def get_log_dir(output_path: str) -> Path:
@@ -70,6 +71,24 @@ def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> N
 
 def atomic_write_json(path: Path, payload: Any) -> None:
     atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def read_text_tail(path: Path, max_bytes: int, *, encoding: str = "utf-8") -> str:
+    if max_bytes <= 0:
+        return ""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            read_size = min(size, max_bytes)
+            handle.seek(-read_size, os.SEEK_END)
+            payload = handle.read(read_size)
+        text = payload.decode(encoding, errors="replace")
+        if size > max_bytes:
+            return f"[truncated,last_bytes={read_size},total_bytes={size}]\n{text}"
+        return text
+    except Exception:
+        return ""
 
 
 def stringify_message_content(block: Any) -> str:

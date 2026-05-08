@@ -61,6 +61,23 @@ def get_max_retries() -> int:
         return 5
 
 
+def get_max_retries_reached_action() -> str:
+    try:
+        from app.model import get_config_value, get_db_session
+
+        db = get_db_session()
+        try:
+            value = str(
+                get_config_value(db, "max_retries_reached_action", default="success")
+                or "success"
+            ).strip().lower()
+        finally:
+            db.close()
+    except Exception:
+        value = "success"
+    return value if value in {"success", "failed"} else "success"
+
+
 def preview_text(text: str, limit: int = 240) -> str:
     compact = " ".join(text.split())
     if len(compact) <= limit:

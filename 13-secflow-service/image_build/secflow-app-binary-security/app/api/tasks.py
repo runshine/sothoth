@@ -12,6 +12,7 @@ from app.model import get_db
 from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityArtifactsResponse,
+    BinarySecurityDownstreamStatusSyncPayload,
     BinarySecurityModuleSelectionConfirmPayload,
     BinarySecurityModuleSelectionResponse,
     BinarySecurityProjectConfigPayload,
@@ -210,6 +211,27 @@ async def retry_stage(
 ):
     get_task_manager().retry_stage(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
     return BinarySecurityActionResponse(task_id=task_id, message=f"阶段 {stage_name} 已重新排队")
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/sync-downstream-status", response_model=BinarySecurityActionResponse)
+async def sync_downstream_status(
+    project_id: str,
+    task_id: str,
+    payload: Optional[BinarySecurityDownstreamStatusSyncPayload] = None,
+    _: TokenUser = Depends(get_current_context),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
+    token = authorization.split()[1] if authorization else ""
+    return await get_task_manager().sync_downstream_status(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        stage_name=payload.stage_name if payload else None,
+        item_id=payload.item_id if payload else None,
+        force=payload.force if payload else False,
+        token=token,
+    )
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/module-selection", response_model=BinarySecurityModuleSelectionResponse)

@@ -182,6 +182,15 @@ class BinarySecurityActionResponse(BaseModel):
     cancelled_downstream_count: int = 0
     deleted_downstream_count: int = 0
     cleanup_status: Optional[str] = None
+    synced_downstream_count: int = 0
+    skipped_downstream_count: int = 0
+    failed_downstream_count: int = 0
+
+
+class BinarySecurityDownstreamStatusSyncPayload(BaseModel):
+    stage_name: Optional[str] = None
+    item_id: Optional[str] = None
+    force: bool = False
 
 
 class BinarySecurityModuleSelectionResponse(BaseModel):

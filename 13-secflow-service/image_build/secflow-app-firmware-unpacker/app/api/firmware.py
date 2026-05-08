@@ -15,7 +15,7 @@ from sqlalchemy import or_
 
 from app.api.dependencies import ensure_project_access, get_current_subject
 from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
-from app.model import ServiceConfig, TaskStatus, UnpackTask, get_db_session
+from app.model import ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
 from app.schemas import (
     ActionResponse,
     BatchDeleteRequest,
@@ -31,6 +31,7 @@ from app.schemas import (
     TaskEventListResponse,
     TaskListResponse,
     TaskLogResponse,
+    TaskMetricsResponse,
     TaskProgressResponse,
     TaskResultResponse,
     TaskResourceUsageResponse,
@@ -42,16 +43,17 @@ from app.schemas import (
 from app.services.pod_metrics import get_pod_resource_usage
 from app.services.configcenter import get_configcenter_client
 from app.services.task_events import list_task_events
-from app.services.task_manager import cancel_task, delete_tasks, retry_task, submit_unpack_task
+from app.services.task_manager import cancel_task, delete_tasks, request_task_result_cache_refresh, retry_task, submit_unpack_task
 from app.services.worker import get_cluster_snapshot, get_worker_id
 from app.skill_store import list_skills
 from app.unpacker_engine_config import get_max_retries
 from app.unpacker_engine import TOOLS_DIR
-from app.unpacker_engine_logs import list_round_dirs as _list_round_dirs
+from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, list_round_dirs as _list_round_dirs, read_text_tail
 
 
 router = APIRouter(tags=["Firmware Unpacker"])
 logger = logging.getLogger(__name__)
+MAX_LOG_RENDER_BYTES = 128 * 1024
 
 
 def _normalize_project_id(project_id: Optional[str]) -> Optional[str]:
@@ -89,6 +91,16 @@ def _infer_value_type(value: str) -> str:
     if str(value or "").strip().isdigit():
         return "int"
     return "string"
+
+
+def _normalize_runtime_config_value(key: str, value: str) -> str:
+    normalized = str(value or "").strip()
+    if key == "max_retries_reached_action":
+        lowered = normalized.lower()
+        if lowered not in {"success", "failed"}:
+            raise ValidationError("max_retries_reached_action 仅支持 success 或 failed")
+        return lowered
+    return value
 
 
 def _get_task_or_404(task_id: str) -> dict:
@@ -269,9 +281,9 @@ def _get_task_progress(task_id: str) -> dict:
         _phase_payload("llm_cleanup", "LLM 清理", "pending"),
     ]
 
-    if task_status in {"running", "cancelling", "success", "failed", "cancelled"}:
+    if task_status in {"retry_preparing", "running", "cancelling", "success", "failed", "cancelled"}:
         phases[0]["status"] = "running"
-        phases[0]["detail"] = "正在识别固件格式并尝试确定性预处理"
+        phases[0]["detail"] = "正在识别固件格式并尝试确定性预处理" if task_status != "retry_preparing" else "正在后台重置工作目录并准备重试"
 
     if stage1_path.exists():
         stage1_data = _read_json_file(stage1_path)
@@ -330,12 +342,12 @@ def _get_task_progress(task_id: str) -> dict:
                     detail,
                     _mtime_iso_text(stage3_path if stage3_path.exists() else stage2_path),
                 )
-            elif executor_logs or task_status in {"running", "success", "failed", "cancelled"}:
+            elif executor_logs or task_status in {"retry_preparing", "running", "success", "failed", "cancelled"}:
                 phases[1] = _phase_payload(
                     "tool_match",
                     "工具匹配执行",
-                    "skipped",
-                    "未命中可复用工具，转入 LLM 解包",
+                    "pending" if task_status == "retry_preparing" else "skipped",
+                    "正在等待重试准备完成" if task_status == "retry_preparing" else "未命中可复用工具，转入 LLM 解包",
                     _mtime_iso_text(stage2_path),
                 )
 
@@ -462,13 +474,19 @@ def _read_text_file(path: Path) -> str:
 
 
 def _format_log_file(path: Path) -> str:
-    if path.suffix.lower() == ".json":
+    try:
+        file_size = path.stat().st_size
+    except Exception:
+        file_size = 0
+    if path.suffix.lower() == ".json" and file_size <= MAX_LOG_RENDER_BYTES:
         payload = _read_json_file(path)
         if payload is not None:
             try:
                 return json.dumps(payload, ensure_ascii=False, indent=2)
             except Exception:
                 pass
+    if file_size > MAX_LOG_RENDER_BYTES:
+        return read_text_tail(path, MAX_LOG_RENDER_BYTES, encoding="utf-8")
     return _read_text_file(path)
 
 
@@ -607,6 +625,232 @@ def _get_task_events(task_id: str, limit: int) -> dict:
 
 def _count_task_events(task_id: str) -> int:
     return int(list_task_events(task_id, limit=1).get("total") or 0)
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _now_iso_like(value: Optional[str]) -> str:
+    parsed = _parse_iso_datetime(value)
+    if parsed and parsed.tzinfo is not None:
+        return datetime.now(parsed.tzinfo).isoformat()
+    return datetime.now().isoformat()
+
+
+def _seconds_between(start: Optional[str], end: Optional[str]) -> Optional[int]:
+    start_dt = _parse_iso_datetime(start)
+    end_dt = _parse_iso_datetime(end)
+    if not start_dt or not end_dt:
+        return None
+    if (start_dt.tzinfo is None) != (end_dt.tzinfo is None):
+        start_dt = start_dt.replace(tzinfo=None)
+        end_dt = end_dt.replace(tzinfo=None)
+    return max(0, int((end_dt - start_dt).total_seconds()))
+
+
+def _seconds_since(start: Optional[str]) -> Optional[int]:
+    start_dt = _parse_iso_datetime(start)
+    if not start_dt:
+        return None
+    now = datetime.now(start_dt.tzinfo) if start_dt.tzinfo is not None else datetime.now()
+    return max(0, int((now - start_dt).total_seconds()))
+
+
+def _usage_percent(used: Optional[int], limit: Optional[int]) -> Optional[float]:
+    if used is None or limit is None or int(limit) <= 0:
+        return None
+    return round(max(0.0, float(used) / float(limit) * 100.0), 2)
+
+
+def _get_latest_task_event(task_id: str) -> Optional[dict]:
+    db = get_db_session()
+    try:
+        event = (
+            db.query(UnpackTaskEvent)
+            .filter(UnpackTaskEvent.task_id == task_id)
+            .order_by(UnpackTaskEvent.created_at.desc())
+            .first()
+        )
+        return event.to_dict() if event else None
+    finally:
+        db.close()
+
+
+def _get_session_metrics(run_root: Path) -> dict:
+    items = _read_json_index_items(run_root / "sessions" / "index.json")
+    running = 0
+    failed = 0
+    closed = 0
+    for item in items:
+        status_value = str(item.get("status") or "").strip().lower()
+        if status_value == "running":
+            running += 1
+        elif status_value == "failed":
+            failed += 1
+        elif status_value == "closed":
+            closed += 1
+    return {
+        "session_count": len(items),
+        "running_session_count": running,
+        "failed_session_count": failed,
+        "closed_session_count": closed,
+    }
+
+
+def _get_cached_result_metrics(run_root: Path) -> dict:
+    cache_path = run_root / TASK_RESULT_CACHE_FILENAME
+    payload = _read_json_file(cache_path)
+    summary = payload.get("summary") if isinstance(payload, dict) and isinstance(payload.get("summary"), dict) else {}
+    if not isinstance(payload, dict):
+        return {
+            "cache_available": False,
+            "cache_updated_at": None,
+            "output_file_count": 0,
+            "output_dir_count": 0,
+            "output_total_size_bytes": 0,
+            "largest_file_size_bytes": 0,
+            "top_level_entry_count": 0,
+            "small_file_count": 0,
+            "medium_file_count": 0,
+            "large_file_count": 0,
+            "executor_rounds": 0,
+            "fallback_to_llm": False,
+            "matched_skill": None,
+        }
+    return {
+        "cache_available": True,
+        "cache_updated_at": _mtime_iso_text(cache_path),
+        "output_file_count": int(summary.get("output_file_count") or 0),
+        "output_dir_count": int(summary.get("output_dir_count") or 0),
+        "output_total_size_bytes": int(summary.get("output_total_size_bytes") or 0),
+        "largest_file_size_bytes": int(summary.get("largest_file_size_bytes") or 0),
+        "top_level_entry_count": int(summary.get("top_level_entry_count") or 0),
+        "small_file_count": int(summary.get("small_file_count") or 0),
+        "medium_file_count": int(summary.get("medium_file_count") or 0),
+        "large_file_count": int(summary.get("large_file_count") or 0),
+        "executor_rounds": int(summary.get("executor_rounds") or 0),
+        "fallback_to_llm": bool(summary.get("fallback_to_llm")),
+        "matched_skill": str(summary.get("matched_skill") or "").strip() or None,
+    }
+
+
+def _get_task_metrics(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    status_value = str(task.get("status") or "unknown")
+    terminal = status_value in {"success", "failed", "cancelled", "max_retries_reached"}
+    owner_id = str(task.get("owner_id") or "").strip() or None
+    run_root = _derive_run_path(task)
+    warnings: list[str] = []
+
+    created_at = str(task.get("created_at") or "").strip() or None
+    started_at = str(task.get("started_at") or "").strip() or None
+    completed_at = str(task.get("completed_at") or "").strip() or None
+    duration_end = completed_at if completed_at else (_now_iso_like(started_at) if started_at else None)
+
+    try:
+        resource_payload = _get_task_resource_usage(task_id)
+    except Exception as exc:
+        logger.warning("failed to collect task resource metrics for %s: %s", task_id, exc)
+        resource_payload = {
+            "available": False,
+            "message": "资源指标不可用",
+            "containers": [],
+        }
+    resource_available = bool(resource_payload.get("available"))
+    resource_message = str(resource_payload.get("message") or "").strip() or None
+    if not resource_available and resource_message:
+        warnings.append(resource_message)
+
+    cpu_millicores = resource_payload.get("cpu_millicores")
+    memory_mib = resource_payload.get("memory_mib")
+    cpu_limit = resource_payload.get("pod_cpu_limit_millicores")
+    memory_limit = resource_payload.get("pod_memory_limit_mib")
+    resource = {
+        "available": resource_available,
+        "pod_name": resource_payload.get("pod_name"),
+        "namespace": resource_payload.get("namespace"),
+        "cpu_millicores": cpu_millicores,
+        "memory_mib": memory_mib,
+        "pod_cpu_limit_millicores": cpu_limit,
+        "pod_memory_limit_mib": memory_limit,
+        "cpu_usage_percent": _usage_percent(cpu_millicores, cpu_limit),
+        "memory_usage_percent": _usage_percent(memory_mib, memory_limit),
+        "containers": list(resource_payload.get("containers") or []),
+        "message": resource_message,
+    }
+
+    try:
+        progress_payload = _get_task_progress(task_id)
+    except Exception as exc:
+        logger.warning("failed to collect task progress metrics for %s: %s", task_id, exc)
+        progress_payload = {"phases": []}
+        warnings.append("阶段进展指标不可用")
+    phases = [phase for phase in (progress_payload.get("phases") or []) if isinstance(phase, dict)]
+    progress = {
+        "current_phase": progress_payload.get("current_phase"),
+        "current_round": progress_payload.get("current_round"),
+        "total_rounds": progress_payload.get("total_rounds"),
+        "phase_count": len(phases),
+        "completed_phase_count": sum(1 for phase in phases if phase.get("status") == "success"),
+        "failed_phase_count": sum(1 for phase in phases if phase.get("status") == "failed"),
+        "running_phase_count": sum(1 for phase in phases if phase.get("status") == "running"),
+    }
+
+    event_count = _count_task_events(task_id)
+    latest_event = _get_latest_task_event(task_id) or {}
+    events = {
+        "event_count": event_count,
+        "latest_event_type": latest_event.get("event_type"),
+        "latest_event_summary": latest_event.get("summary"),
+        "latest_event_at": latest_event.get("created_at"),
+    }
+
+    sessions_index_path = run_root / "sessions" / "index.json"
+    sessions = _get_session_metrics(run_root)
+    if started_at and not sessions_index_path.exists():
+        warnings.append("会话索引不存在")
+
+    result = _get_cached_result_metrics(run_root)
+    if not result["cache_available"]:
+        warnings.append("结果缓存不存在，请在结果页手动刷新或等待后台刷新")
+
+    if not terminal and not owner_id:
+        warnings.append("非终态任务缺少 owner")
+
+    return {
+        "task_id": task_id,
+        "task": {
+            "status": status_value,
+            "result_status": task.get("result_status"),
+            "current_stage": task.get("current_stage"),
+            "owner_id": owner_id,
+            "created_at": created_at,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "last_progress_at": str(task.get("last_progress_at") or "").strip() or None,
+            "duration_seconds": _seconds_between(started_at, duration_end),
+            "queue_wait_seconds": _seconds_between(created_at, started_at),
+            "running_seconds": _seconds_since(started_at) if started_at and not terminal else _seconds_between(started_at, completed_at),
+        },
+        "resource": resource,
+        "progress": progress,
+        "events": events,
+        "sessions": sessions,
+        "result": result,
+        "health": {
+            "is_terminal": terminal,
+            "has_owner": bool(owner_id),
+            "resource_available": resource_available,
+            "result_cache_available": bool(result["cache_available"]),
+            "warnings": warnings,
+        },
+    }
 
 
 def _read_json_index_items(path: Path) -> list[dict]:
@@ -827,10 +1071,30 @@ def _get_task_result(task_id: str) -> dict:
     task = _get_task_or_404(task_id)
     output_root = Path(str(task.get("output_path") or "").strip())
     run_root = _derive_run_path(task)
+    cache_path = run_root / TASK_RESULT_CACHE_FILENAME
     summary_path = output_root / "summary.md"
     reason_path = output_root / "reason.md"
     tokens_summary_path = _round_log_path(run_root, 0, "tokens_summary.json")
     sessions_index_path = run_root / "sessions" / "index.json"
+
+    cached_payload = _read_json_file(cache_path)
+    if isinstance(cached_payload, dict):
+        summary = cached_payload.get("summary") if isinstance(cached_payload.get("summary"), dict) else {}
+        summary["event_count"] = _count_task_events(task_id)
+        return {
+            "task_id": task_id,
+            "available": bool(cached_payload.get("available", False)),
+            "status": str(cached_payload.get("status") or task.get("status") or "unknown"),
+            "output_root": cached_payload.get("output_root"),
+            "run_root": cached_payload.get("run_root"),
+            "summary_path": cached_payload.get("summary_path"),
+            "reason_path": cached_payload.get("reason_path"),
+            "tokens_summary_path": cached_payload.get("tokens_summary_path"),
+            "summary_text": cached_payload.get("summary_text"),
+            "reason_text": cached_payload.get("reason_text"),
+            "warnings": list(cached_payload.get("warnings") or []),
+            "summary": summary,
+        }
 
     warnings: list[str] = []
     task_status = str(task.get("status") or "").strip() or "unknown"
@@ -1007,19 +1271,20 @@ def _get_config_entries() -> dict:
 
 
 def _update_config_entry(key: str, payload: ConfigUpdateRequest) -> dict:
+    normalized_value = _normalize_runtime_config_value(key, payload.value)
     db = get_db_session()
     try:
         row = db.query(ServiceConfig).filter(ServiceConfig.key == key).first()
         if row is None:
             row = ServiceConfig(
                 key=key,
-                value=payload.value,
-                value_type=_infer_value_type(payload.value),
+                value=normalized_value,
+                value_type=_infer_value_type(normalized_value),
                 description=payload.description,
             )
             db.add(row)
         else:
-            row.value = payload.value
+            row.value = normalized_value
             if payload.description is not None:
                 row.description = payload.description
         db.commit()
@@ -1288,6 +1553,43 @@ async def get_project_task_result(
     return _get_task_result(task_id)
 
 
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/metrics",
+    response_model=TaskMetricsResponse,
+)
+async def get_project_task_metrics(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _get_task_metrics(task_id)
+
+
+@router.post(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/refresh-result-cache",
+    response_model=ActionResponse,
+)
+async def refresh_project_task_result_cache(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    ok, message = request_task_result_cache_refresh(task_id)
+    if not ok:
+        raise ValidationError(message)
+    return {"message": message, "task_id": task_id}
+
+
 @router.delete(
     "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}",
     response_model=ActionResponse,
@@ -1409,6 +1711,35 @@ async def get_task_result_legacy(
     _, token = subject_and_token
     await _get_task_with_access(task_id, token)
     return _get_task_result(task_id)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/metrics",
+    response_model=TaskMetricsResponse,
+)
+async def get_task_metrics_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_metrics(task_id)
+
+
+@router.post(
+    "/api/app/firmware-unpacker/tasks/{task_id}/refresh-result-cache",
+    response_model=ActionResponse,
+)
+async def refresh_task_result_cache_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    ok, message = request_task_result_cache_refresh(task_id)
+    if not ok:
+        raise ValidationError(message)
+    return {"message": message, "task_id": task_id}
 
 
 @router.get(

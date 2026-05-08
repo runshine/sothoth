@@ -212,6 +212,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
         finally:
             db.close()
 
+
     def test_recover_orphaned_running_task_marks_failed(self):
         from datetime import datetime, timedelta
 
@@ -357,6 +358,162 @@ class TaskManagerLeaseTests(unittest.TestCase):
                 self.assertIsNotNone(job.completed_at)
             finally:
                 db.close()
+
+    def test_request_task_result_cache_refresh_enqueues_background_job(self):
+        firmware = self.root / "firmware.bin"
+        firmware.write_bytes(b"firmware")
+        workspace_root = self.root / "data"
+
+        with patch("app.services.task_manager.PROJECT_FILES_ROOT", workspace_root):
+            prepared = prepare_task_workspace("p1", "t-refresh-cache", str(firmware))
+
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTask(
+                    id="t-refresh-cache",
+                    project_id="p1",
+                    firmware_path=str(firmware),
+                    output_path=prepared["output_path"],
+                    status=TaskStatus.SUCCESS.value,
+                    current_stage="cleanup",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        class _FakeExecutor:
+            def __init__(self):
+                self.calls = []
+
+            def submit(self, fn, *args, **kwargs):
+                self.calls.append((fn, args, kwargs))
+                class _FakeFuture:
+                    def done(self):
+                        return False
+                return _FakeFuture()
+
+        fake_executor = _FakeExecutor()
+        with patch("app.services.task_manager.get_executor", return_value=fake_executor), \
+             patch("app.services.task_manager._write_task_result_cache", side_effect=AssertionError("should not run inline")):
+            ok, message = task_manager_module.request_task_result_cache_refresh("t-refresh-cache")
+
+        self.assertTrue(ok)
+        self.assertIn("后台", message)
+        self.assertEqual(1, len(fake_executor.calls))
+        self.assertEqual("t-refresh-cache", fake_executor.calls[0][1][0])
+
+
+class TaskManagerMaxRetriesReachedActionTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        config_path = root / "config.yaml"
+        db_path = root / "tasks.db"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "database": {
+                        "type": "sqlite",
+                        "path": str(db_path),
+                        "table_prefix": "secflow_app_firmware_unpacker_",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        reload_config(str(config_path))
+        model_module._engine = None
+        model_module._SessionFactory = None
+        init_database()
+
+    def tearDown(self):
+        model_module._engine = None
+        model_module._SessionFactory = None
+        self._tmp.cleanup()
+
+    def _add_task(self, task_id: str):
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTask(
+                    id=task_id,
+                    project_id="p1",
+                    firmware_path="/tmp/fw.bin",
+                    output_path="/tmp/output",
+                    status=TaskStatus.RUNNING.value,
+                    owner_id="pod-a:123:owner",
+                    current_stage="review",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def _set_action(self, action: str):
+        db = get_db_session()
+        try:
+            row = db.query(ServiceConfig).filter(ServiceConfig.key == "max_retries_reached_action").first()
+            if row is None:
+                row = ServiceConfig(
+                    key="max_retries_reached_action",
+                    value=action,
+                    value_type="string",
+                    description="",
+                )
+                db.add(row)
+            else:
+                row.value = action
+            db.commit()
+        finally:
+            db.close()
+
+    def test_max_retries_reached_can_be_treated_as_success(self):
+        self._add_task("t-pass")
+        self._set_action("success")
+
+        task_manager_module._update_task_result(
+            "t-pass",
+            {
+                "status": "max_retries_reached",
+                "message": "Max retries reached. Last reason: none",
+                "rounds": 5,
+            },
+        )
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-pass").first()
+            self.assertEqual(TaskStatus.SUCCESS.value, task.status)
+            self.assertEqual("max_retries_reached", task.result_status)
+            event = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-pass").order_by(UnpackTaskEvent.created_at.desc()).first()
+            self.assertEqual("task_succeeded", event.event_type)
+        finally:
+            db.close()
+
+    def test_max_retries_reached_can_be_treated_as_failed(self):
+        self._add_task("t-fail")
+        self._set_action("failed")
+
+        task_manager_module._update_task_result(
+            "t-fail",
+            {
+                "status": "max_retries_reached",
+                "message": "Max retries reached. Last reason: none",
+                "rounds": 5,
+            },
+        )
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-fail").first()
+            self.assertEqual(TaskStatus.FAILED.value, task.status)
+            self.assertEqual("max_retries_reached", task.result_status)
+            event = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-fail").order_by(UnpackTaskEvent.created_at.desc()).first()
+            self.assertEqual("task_failed", event.event_type)
+        finally:
+            db.close()
 
 
 class TaskManagerLlmSnapshotTests(unittest.TestCase):

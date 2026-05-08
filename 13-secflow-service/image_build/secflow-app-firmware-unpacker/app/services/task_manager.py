@@ -14,6 +14,8 @@ from typing import Callable, Dict, Optional
 
 from app.config import get_config
 from app.time_utils import isoformat_local, now_local
+from app.unpacker_engine_config import get_max_retries_reached_action
+from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, atomic_write_json, scan_output_tree
 
 
 logger = logging.getLogger(__name__)
@@ -26,10 +28,13 @@ _futures: Dict[str, Future] = {}
 _futures_lock = threading.Lock()
 _active_cancel_hooks: Dict[str, object] = {}
 _active_cancel_hooks_lock = threading.Lock()
+_active_result_cache_refreshes: set[str] = set()
+_active_result_cache_refreshes_lock = threading.Lock()
 PROJECT_FILES_ROOT = Path(os.environ.get("PROJECT_FILES_ROOT", "/data/files"))
 TASK_WORKSPACE_ROOT = Path("app/secflow-app-firmware-unpacker")
 STAGE_LABELS = {
     "pending": "待执行",
+    "retry_preparing": "重试准备中",
     "queued": "排队中",
     "preprocess": "预处理",
     "feature_extract": "特征提取",
@@ -569,6 +574,7 @@ def _finalize_orphaned_task(task_id: str, reason: str) -> None:
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
+        _write_task_result_cache(task_id)
     finally:
         db.close()
 
@@ -725,7 +731,7 @@ def enqueue_workspace_cleanup(
 
 
 def process_workspace_cleanup_jobs(limit: int = 2) -> int:
-    from app.model import WorkspaceCleanupJob, get_db_session, get_worker_id
+    from app.model import TaskStatus, UnpackTask, WorkspaceCleanupJob, get_db_session, get_worker_id
 
     owner_id = get_worker_id()
     processed = 0
@@ -769,14 +775,57 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
             db.close()
 
         error_message: Optional[str] = None
+        requeue_task_id: Optional[str] = None
         try:
-            remove_task_workspace(task_id, project_id)
+            if job.reason == "task_retry_reset":
+                db = get_db_session()
+                try:
+                    task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+                    if task is None:
+                        raise RuntimeError("任务不存在，无法执行异步重试重置")
+                    normalized_project_id = str(task.project_id or "").strip()
+                    if not normalized_project_id:
+                        raise RuntimeError("任务缺少 project_id，无法执行异步重试重置")
+                    reset_task_workspace(
+                        normalized_project_id,
+                        task.id,
+                        task.firmware_path,
+                    )
+                    task.status = TaskStatus.PENDING.value
+                    task.owner_id = None
+                    task.current_stage = "pending"
+                    task.lease_expires_at = None
+                    task.cancel_requested_at = None
+                    task.last_progress_at = now_local()
+                    task.result_status = None
+                    task.result_message = None
+                    task.rounds = None
+                    task.error_message = None
+                    task.matched_skill = None
+                    task.matched_skill_version = None
+                    task.matched_skill_score = None
+                    task.fallback_to_llm = False
+                    task.generated_skill_path = None
+                    task.generated_skill_status = None
+                    task.promotion_success_count = None
+                    task.started_at = None
+                    task.completed_at = None
+                    if not task.llm_binding_snapshot:
+                        snapshot = _build_llm_binding_snapshot(db)
+                        task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
+                    db.commit()
+                    requeue_task_id = task.id
+                finally:
+                    db.close()
+            else:
+                remove_task_workspace(task_id, project_id)
         except Exception as exc:
             error_message = str(exc)
             logger.warning(
-                "failed to remove workspace for cleanup job %s task %s: %s",
+                "failed to process workspace job %s task %s reason=%s: %s",
                 job_id,
                 task_id,
+                job.reason,
                 exc,
             )
 
@@ -797,6 +846,21 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
             db.commit()
         finally:
             db.close()
+        if job.reason == "task_retry_reset":
+            if error_message:
+                _fail_retry_preparing_task(task_id, error_message)
+            elif requeue_task_id:
+                _record_task_event(
+                    requeue_task_id,
+                    project_id=project_id,
+                    event_type="task_requeued",
+                    summary="任务工作目录已重置，已重新入队",
+                    stage_key="pending",
+                    status=TaskStatus.PENDING.value,
+                    detail={"retry_mode": "inplace_async"},
+                    created_by="task_manager",
+                )
+                _schedule_pending_tasks()
         processed += 1
     return processed
 
@@ -986,46 +1050,37 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
         normalized_project_id = str(task.project_id or "").strip()
         if not normalized_project_id:
             return False, None, "任务缺少 project_id，无法重试"
-
-        reset_task_workspace(
-            normalized_project_id,
-            task.id,
-            task.firmware_path,
-        )
-        task.status = TaskStatus.PENDING.value
+        task.status = TaskStatus.RETRY_PREPARING.value
         task.owner_id = None
-        task.current_stage = "pending"
+        task.current_stage = "retry_preparing"
         task.lease_expires_at = None
         task.cancel_requested_at = None
         task.last_progress_at = now_local()
         task.result_status = None
-        task.result_message = None
-        task.rounds = None
+        task.result_message = "正在后台重置任务目录并准备重试"
         task.error_message = None
-        task.matched_skill = None
-        task.matched_skill_version = None
-        task.matched_skill_score = None
-        task.fallback_to_llm = False
-        task.generated_skill_path = None
-        task.generated_skill_status = None
-        task.promotion_success_count = None
-        task.started_at = None
-        task.completed_at = None
-        if not task.llm_binding_snapshot:
-            snapshot = _build_llm_binding_snapshot(db)
-            task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
         db.commit()
         _record_task_event(
             task.id,
             project_id=task.project_id,
-            event_type="task_requeued",
-            summary="任务已按原任务 ID 重新入队",
-            stage_key="pending",
-            status=TaskStatus.PENDING.value,
-            detail={"retry_mode": "inplace"},
+            event_type="task_retry_requested",
+            summary="任务重试已受理，正在后台重置工作目录",
+            stage_key="retry_preparing",
+            status=TaskStatus.RETRY_PREPARING.value,
+            detail={"retry_mode": "inplace_async"},
             created_by="task_manager",
         )
-        return True, task.id, "任务已按原任务 ID 重新入队"
+        try:
+            enqueue_workspace_cleanup(
+                task.id,
+                task.project_id,
+                reason="task_retry_reset",
+                created_by="task_manager",
+            )
+        except Exception as exc:
+            _fail_retry_preparing_task(task.id, f"异步重试任务入队失败: {exc}")
+            return False, None, f"任务重试入队失败: {exc}"
+        return True, task.id, "任务重试已受理，后台正在重置工作目录"
     finally:
         db.close()
 
@@ -1050,6 +1105,7 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
                     UnpackTask.id == task_id,
                     UnpackTask.status.notin_(
                         [
+                            TaskStatus.RETRY_PREPARING.value,
                             TaskStatus.RUNNING.value,
                             TaskStatus.CANCELLING.value,
                         ]
@@ -1287,6 +1343,236 @@ def _schedule_pending_tasks() -> None:
             _futures[task_id] = future
 
 
+def _fail_retry_preparing_task(task_id: str, error_message: str) -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+
+    normalized_error = str(error_message or "").strip() or "异步重试准备失败"
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is None or task.status != TaskStatus.RETRY_PREPARING.value:
+            return
+        task.status = TaskStatus.FAILED.value
+        task.current_stage = "retry_preparing"
+        task.completed_at = now_local()
+        task.last_progress_at = task.completed_at
+        task.result_status = "failed"
+        task.result_message = f"任务重试准备失败：{normalized_error}"
+        task.error_message = normalized_error
+        db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type="task_retry_prepare_failed",
+            summary=f"任务重试准备失败：{normalized_error}",
+            stage_key="retry_preparing",
+            status=task.status,
+            detail={"reason": normalized_error},
+            created_by="task_manager",
+        )
+        _write_task_result_cache(task_id)
+    finally:
+        db.close()
+
+
+def _derive_run_root_from_output_path(output_path: str) -> Path:
+    output_root = Path(str(output_path or "").strip())
+    if not str(output_root):
+        return Path("/tmp")
+    return output_root.parent / "run" if output_root.name == "output" else output_root.parent / "run"
+
+
+def _read_session_count(run_root: Path) -> int:
+    index_path = run_root / "sessions" / "index.json"
+    if not index_path.exists():
+        return 0
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        return 0
+    return sum(1 for item in raw_items if isinstance(item, dict))
+
+
+def _safe_read_text(path: Path) -> Optional[str]:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip() or None
+    except Exception:
+        return None
+
+
+def _write_task_result_cache(task_id: str) -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is None:
+            return
+
+        output_root = Path(str(task.output_path or "").strip())
+        run_root = _derive_run_root_from_output_path(task.output_path or "")
+        summary_path = output_root / "summary.md"
+        reason_path = output_root / "reason.md"
+        tokens_summary_path = run_root / "round_000" / "tokens_summary.json"
+
+        warnings: list[str] = []
+        task_status = str(task.status or "").strip() or "unknown"
+        available = task_status in {
+            TaskStatus.SUCCESS.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+        }
+        if not output_root.exists() or not output_root.is_dir():
+            warnings.append("输出目录不存在")
+            available = False
+
+        output_stats = {
+            "output_file_count": 0,
+            "output_dir_count": 0,
+            "output_total_size_bytes": 0,
+            "largest_file_path": None,
+            "largest_file_size_bytes": 0,
+            "top_level_entry_count": 0,
+            "top_level_entries": [],
+            "file_extension_breakdown": [],
+            "largest_files": [],
+            "deepest_path": None,
+            "avg_file_size_bytes": 0,
+            "small_file_count": 0,
+            "medium_file_count": 0,
+            "large_file_count": 0,
+        }
+        if output_root.exists() and output_root.is_dir():
+            output_stats = scan_output_tree(output_root)
+
+        summary_text = _safe_read_text(summary_path)
+        reason_text = _safe_read_text(reason_path)
+        if summary_path.exists() and not summary_text:
+            warnings.append("summary.md 存在但为空")
+        if reason_path.exists() and not reason_text:
+            warnings.append("reason.md 存在但为空")
+
+        session_count = _read_session_count(run_root)
+        if (run_root / "sessions" / "index.json").exists() and session_count == 0:
+            warnings.append("会话索引存在但未解析到任何会话")
+
+        started_at = isoformat_local(task.started_at)
+        completed_at = isoformat_local(task.completed_at)
+        duration_seconds: Optional[int] = None
+        if task.started_at and task.completed_at:
+            try:
+                duration_seconds = max(0, int((task.completed_at - task.started_at).total_seconds()))
+            except Exception:
+                duration_seconds = None
+
+        payload = {
+            "schema_version": 1,
+            "task_id": task.id,
+            "available": available,
+            "status": task_status,
+            "output_root": str(output_root) if str(output_root) else None,
+            "run_root": str(run_root),
+            "summary_path": str(summary_path) if summary_path.exists() else None,
+            "reason_path": str(reason_path) if reason_path.exists() else None,
+            "tokens_summary_path": str(tokens_summary_path) if tokens_summary_path.exists() else None,
+            "summary_text": summary_text,
+            "reason_text": reason_text,
+            "warnings": warnings,
+            "summary": {
+                **output_stats,
+                "matched_skill": str(task.matched_skill or "").strip() or None,
+                "fallback_to_llm": bool(task.fallback_to_llm),
+                "generated_skill_path": str(task.generated_skill_path or "").strip() or None,
+                "promotion_success_count": int(task.promotion_success_count or 0),
+                "executor_rounds": int(task.rounds or 0),
+                "session_count": session_count,
+                "event_count": 0,
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "duration_seconds": duration_seconds,
+            },
+        }
+        atomic_write_json(run_root / TASK_RESULT_CACHE_FILENAME, payload)
+    finally:
+        db.close()
+
+
+def _run_task_result_cache_refresh(task_id: str) -> None:
+    from app.model import UnpackTask, get_db_session
+
+    try:
+        _write_task_result_cache(task_id)
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+            if task is not None:
+                _record_task_event_from_row(
+                    task,
+                    event_type="task_result_cache_refreshed",
+                    summary="任务结果缓存已刷新",
+                    stage_key=task.current_stage,
+                    status=task.status,
+                    created_by="task_manager",
+                )
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.warning("failed to refresh task result cache for %s: %s", task_id, exc)
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+            if task is not None:
+                _record_task_event_from_row(
+                    task,
+                    event_type="task_result_cache_refresh_failed",
+                    summary=f"任务结果缓存刷新失败：{exc}",
+                    stage_key=task.current_stage,
+                    status=task.status,
+                    detail={"reason": str(exc)},
+                    created_by="task_manager",
+                )
+        finally:
+            db.close()
+        raise
+    finally:
+        with _active_result_cache_refreshes_lock:
+            _active_result_cache_refreshes.discard(task_id)
+
+
+def request_task_result_cache_refresh(task_id: str) -> tuple[bool, str]:
+    from app.model import UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is None:
+            return False, "任务不存在"
+        with _active_result_cache_refreshes_lock:
+            if task_id in _active_result_cache_refreshes:
+                return True, "结果缓存刷新已在后台执行中"
+            _active_result_cache_refreshes.add(task_id)
+        _record_task_event_from_row(
+            task,
+            event_type="task_result_cache_refresh_requested",
+            summary="任务结果缓存刷新已受理",
+            stage_key=task.current_stage,
+            status=task.status,
+            created_by="task_manager",
+        )
+    finally:
+        db.close()
+
+    try:
+        get_executor().submit(_run_task_result_cache_refresh, task_id)
+    except Exception:
+        with _active_result_cache_refreshes_lock:
+            _active_result_cache_refreshes.discard(task_id)
+        raise
+    return True, "结果缓存刷新已受理，后台正在更新"
+
+
 def _run_claimed_task(task_id: str) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id, refresh_worker_active_tasks
@@ -1387,6 +1673,7 @@ def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> No
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
+        _write_task_result_cache(task_id)
     finally:
         db.close()
 
@@ -1409,6 +1696,10 @@ def _update_task_result(task_id: str, result: dict) -> None:
             task.status = TaskStatus.SUCCESS.value
             event_type = "task_succeeded"
             summary = "任务执行成功"
+        elif result_status == "max_retries_reached" and get_max_retries_reached_action() == "success":
+            task.status = TaskStatus.SUCCESS.value
+            event_type = "task_succeeded"
+            summary = "任务达到最大重试次数，按配置判定为通过"
         else:
             task.status = TaskStatus.FAILED.value
             event_type = "task_failed"
@@ -1445,6 +1736,7 @@ def _update_task_result(task_id: str, result: dict) -> None:
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
+        _write_task_result_cache(task_id)
     finally:
         db.close()
 
@@ -1477,6 +1769,7 @@ def _update_task_error(task_id: str, error: str) -> None:
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
+        _write_task_result_cache(task_id)
     finally:
         db.close()
 

@@ -204,6 +204,93 @@ class TaskEventListResponse(BaseModel):
     items: List[TaskEventResponse]
 
 
+class TaskMetricsTaskResponse(BaseModel):
+    status: str
+    result_status: Optional[str] = None
+    current_stage: Optional[str] = None
+    owner_id: Optional[str] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    last_progress_at: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    queue_wait_seconds: Optional[int] = None
+    running_seconds: Optional[int] = None
+
+
+class TaskMetricsResourceResponse(BaseModel):
+    available: bool
+    pod_name: Optional[str] = None
+    namespace: Optional[str] = None
+    cpu_millicores: Optional[int] = None
+    memory_mib: Optional[int] = None
+    pod_cpu_limit_millicores: Optional[int] = None
+    pod_memory_limit_mib: Optional[int] = None
+    cpu_usage_percent: Optional[float] = None
+    memory_usage_percent: Optional[float] = None
+    containers: List[TaskResourceContainerResponse] = []
+    message: Optional[str] = None
+
+
+class TaskMetricsProgressResponse(BaseModel):
+    current_phase: Optional[str] = None
+    current_round: Optional[int] = None
+    total_rounds: Optional[int] = None
+    phase_count: int = 0
+    completed_phase_count: int = 0
+    failed_phase_count: int = 0
+    running_phase_count: int = 0
+
+
+class TaskMetricsEventsResponse(BaseModel):
+    event_count: int = 0
+    latest_event_type: Optional[str] = None
+    latest_event_summary: Optional[str] = None
+    latest_event_at: Optional[str] = None
+
+
+class TaskMetricsSessionsResponse(BaseModel):
+    session_count: int = 0
+    running_session_count: int = 0
+    failed_session_count: int = 0
+    closed_session_count: int = 0
+
+
+class TaskMetricsResultResponse(BaseModel):
+    cache_available: bool
+    cache_updated_at: Optional[str] = None
+    output_file_count: int = 0
+    output_dir_count: int = 0
+    output_total_size_bytes: int = 0
+    largest_file_size_bytes: int = 0
+    top_level_entry_count: int = 0
+    small_file_count: int = 0
+    medium_file_count: int = 0
+    large_file_count: int = 0
+    executor_rounds: int = 0
+    fallback_to_llm: bool = False
+    matched_skill: Optional[str] = None
+
+
+class TaskMetricsHealthResponse(BaseModel):
+    is_terminal: bool
+    has_owner: bool
+    resource_available: bool
+    result_cache_available: bool
+    warnings: List[str] = []
+
+
+class TaskMetricsResponse(BaseModel):
+    task_id: str
+    task: TaskMetricsTaskResponse
+    resource: TaskMetricsResourceResponse
+    progress: TaskMetricsProgressResponse
+    events: TaskMetricsEventsResponse
+    sessions: TaskMetricsSessionsResponse
+    result: TaskMetricsResultResponse
+    health: TaskMetricsHealthResponse
+
+
 class TaskListResponse(BaseModel):
     total: int
     offset: int

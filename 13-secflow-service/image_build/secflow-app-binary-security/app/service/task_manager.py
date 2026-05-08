@@ -720,6 +720,143 @@ class TaskManager:
             )
         db.commit()
 
+    async def sync_downstream_status(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        stage_name: str | None = None,
+        item_id: str | None = None,
+        force: bool = False,
+        token: str | None = None,
+    ) -> BinarySecurityActionResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        query = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id)
+        if stage_name:
+            if stage_name not in self._stage_sequence_for_task(task):
+                raise ValidationError(f"无效阶段: {stage_name}")
+            query = query.filter(BinarySecurityStageItem.stage_name == stage_name)
+        if item_id:
+            query = query.filter(BinarySecurityStageItem.id == item_id)
+        items = query.order_by(BinarySecurityStageItem.created_at.asc()).all()
+        if item_id and not items:
+            raise NotFoundError("阶段子任务不存在")
+
+        self._record_event(
+            db,
+            task,
+            "downstream_status_sync_requested",
+            "请求同步下游子任务状态",
+            stage_name=stage_name,
+            payload={"stage_name": stage_name, "item_id": item_id, "force": force},
+        )
+        db.commit()
+
+        synced_count = 0
+        skipped_count = 0
+        failed_count = 0
+        touched_stages: set[str] = set()
+        auth_token = token or self._service_token()
+        for item in items:
+            if not item.downstream_service or not item.downstream_task_id:
+                skipped_count += 1
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_status_sync_skipped",
+                    "跳过同步：子任务缺少下游服务或任务ID",
+                    level="warning",
+                    stage_name=item.stage_name,
+                    item=item,
+                )
+                continue
+            before_status = item.status
+            try:
+                payload = await self._fetch_downstream_task_payload(task, item, auth_token)
+                downstream_status = str(payload.get("status") or "").lower()
+                mapped_status = self._map_downstream_status(downstream_status)
+                if not mapped_status:
+                    skipped_count += 1
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_status_sync_skipped",
+                        f"跳过同步：无法识别下游状态 {downstream_status or '-'}",
+                        level="warning",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "downstream_service": item.downstream_service,
+                            "downstream_task_id": item.downstream_task_id,
+                            "downstream_status": downstream_status,
+                        },
+                    )
+                    continue
+                if force or mapped_status != before_status:
+                    item.status = mapped_status
+                    item.error_message = None if mapped_status in {"queued", "running", "success"} else (
+                        payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
+                    )
+                    if mapped_status in {"queued", "running"}:
+                        item.finished_at = None
+                        item.started_at = item.started_at or _now()
+                    else:
+                        item.finished_at = item.finished_at or _now()
+                    item.result = {
+                        **(item.result or {}),
+                        "downstream": self._lightweight_downstream_payload(payload),
+                        "downstream_status_synced_at": _now().isoformat(),
+                    }
+                    touched_stages.add(item.stage_name)
+                    synced_count += 1
+                else:
+                    skipped_count += 1
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_status_synced" if (force or mapped_status != before_status) else "downstream_status_sync_skipped",
+                    "下游子任务状态已同步" if (force or mapped_status != before_status) else "下游子任务状态一致，无需同步",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        "downstream_service": item.downstream_service,
+                        "downstream_task_id": item.downstream_task_id,
+                        "before_status": before_status,
+                        "downstream_status": downstream_status,
+                        "after_status": mapped_status,
+                    },
+                )
+            except Exception as exc:
+                failed_count += 1
+                self._record_event(
+                    db,
+                    task,
+                    "downstream_status_sync_failed",
+                    f"同步下游子任务状态失败: {exc}",
+                    level="warning",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        "downstream_service": item.downstream_service,
+                        "downstream_task_id": item.downstream_task_id,
+                        "error": str(exc),
+                    },
+                )
+        for current_stage in touched_stages:
+            self._refresh_stage_run_from_items(db, task, current_stage)
+        if touched_stages:
+            self._refresh_task_status_after_sync(db, task)
+            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+        db.commit()
+        return BinarySecurityActionResponse(
+            task_id=task.id,
+            message=f"下游状态同步完成：更新 {synced_count} 个，跳过 {skipped_count} 个，失败 {failed_count} 个",
+            synced_downstream_count=synced_count,
+            skipped_downstream_count=skipped_count,
+            failed_downstream_count=failed_count,
+        )
+
     def get_project_config(self, db: Session, project_id: str) -> BinarySecurityProjectConfigResponse:
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
         config = BinarySecurityProjectConfigPayload(**(row.config if row else {}))
@@ -1484,6 +1621,8 @@ class TaskManager:
             key = f"{item.status}_items"
             if key in counts:
                 counts[key] += 1
+            elif item.status in {"pending", "queued", "dispatching"}:
+                counts["running_items"] += 1
         return counts
 
     def _task_response(self, db: Session, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> BinarySecurityTaskResponse:
@@ -1599,6 +1738,99 @@ class TaskManager:
     def _stage_expected_service(self, stage_name: str) -> str | None:
         mapping = STAGE_RETRY_ENDPOINTS.get(stage_name)
         return mapping[0] if mapping else None
+
+    async def _fetch_downstream_task_payload(self, task: BinarySecurityTask, item: BinarySecurityStageItem, token: str) -> dict[str, Any]:
+        task_id = str(item.downstream_task_id or "").strip()
+        if not task_id:
+            raise ValidationError("缺少下游任务ID")
+        if item.downstream_service == "firmware_unpacker":
+            return await get_firmware_unpacker_client().get_task(task.project_id, task_id, token or "")
+        if item.downstream_service == "system_analyse":
+            return await get_system_analyse_client().get_task(task_id)
+        if item.downstream_service == "binary_to_source":
+            project_id = (item.result or {}).get("project_id") or task.project_id
+            return await get_binary_to_source_client().get_task(project_id, task_id, token or "")
+        if item.downstream_service == "entry_analyse":
+            return await get_entry_analyse_client().get_task(task_id)
+        if item.downstream_service == "dataflow_analyse":
+            return await get_dataflow_analyse_client().get_task(task_id)
+        if item.downstream_service == "dataflow_vuln_scanner":
+            return await get_dataflow_vuln_scanner_client().get_task(task_id, token or "")
+        raise ValidationError(f"未知下游服务: {item.downstream_service}")
+
+    def _map_downstream_status(self, status: str) -> str | None:
+        normalized = (status or "").lower()
+        if normalized in {"pending", "queued", "created", "dispatching", "ready", "ready_to_start"}:
+            return "queued"
+        if normalized in {"running", "processing", "in_progress", "cancelling", "started"}:
+            return "running"
+        if normalized in {"success", "passed", "completed", "complete", "done"}:
+            return "success"
+        if normalized == "partial_success":
+            return "partial_success"
+        if normalized in {"failed", "error", "failure"}:
+            return "failed"
+        if normalized in {"cancelled", "canceled"}:
+            return "cancelled"
+        return None
+
+    def _aggregate_item_statuses(self, statuses: list[str]) -> str:
+        if not statuses:
+            return "pending"
+        active = {"pending", "queued", "running", "dispatching"}
+        if any(status in active for status in statuses):
+            return "running"
+        if all(status == "success" for status in statuses):
+            return "success"
+        if any(status == "success" for status in statuses) and any(status in {"failed", "cancelled", "partial_success"} for status in statuses):
+            return "partial_success"
+        if all(status == "cancelled" for status in statuses):
+            return "cancelled"
+        if any(status in {"failed", "partial_success"} for status in statuses):
+            return "failed"
+        return statuses[0]
+
+    def _refresh_stage_run_from_items(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
+        stage_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == stage_name,
+        ).first()
+        if not stage_run:
+            return
+        items = self._stage_items(db, task.id, stage_name)
+        status = self._aggregate_item_statuses([item.status for item in items])
+        stage_run.status = status
+        stage_run.counts = self._stage_counts(db, stage_run)
+        stage_run.last_error = next((item.error_message for item in items if item.status == "failed" and item.error_message), None)
+        stage_run.output_summary = {
+            **(stage_run.output_summary or {}),
+            "status_synced": True,
+            "sync_status": status,
+            **stage_run.counts,
+        }
+        if status in {"running", "pending", "queued"}:
+            stage_run.finished_at = None
+            stage_run.started_at = stage_run.started_at or _now()
+        else:
+            stage_run.finished_at = stage_run.finished_at or _now()
+        if stage_name == "firmware_unpack":
+            task.metrics = {
+                **(task.metrics or {}),
+                "unpacked_firmware_count": int(stage_run.counts.get("success_items", 0)),
+                "failed_firmware_count": int(stage_run.counts.get("failed_items", 0)),
+            }
+
+    def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        statuses = [run.status for run in stage_runs if run.status != "skipped"]
+        if any(status in {"running", "pending", "queued"} for status in statuses):
+            task.status = "running"
+            task.finished_at = None
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.last_error = None
+            return
+        self._finalize_task(db, task)
 
     def _stage_items(self, db: Session, task_id: str, stage_name: str) -> list[BinarySecurityStageItem]:
         return db.query(BinarySecurityStageItem).filter(
@@ -2271,11 +2503,13 @@ class TaskManager:
             item.finished_at = _now()
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             result = {
-                **firmware,
+                **self._lightweight_system_analysis_input(firmware),
                 "artifact_root": str(materialized),
+                "archive_root": str(materialized),
                 "modules": modules,
-                "system_analysis_result": result_payload,
-                "downstream": payload,
+                "module_count": len(modules),
+                "downstream": self._lightweight_downstream_payload(payload),
+                "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
             }
             item.result = result
             item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized)}
@@ -2283,13 +2517,78 @@ class TaskManager:
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
             if "item" in locals():
+                session.rollback()
+                item = session.merge(item)
                 item.status = "failed"
                 item.error_message = str(exc)
                 item.finished_at = _now()
+                item.result = {
+                    **self._lightweight_system_analysis_input(firmware),
+                    "error": str(exc),
+                    "downstream_task_id": item.downstream_task_id,
+                }
                 session.commit()
             return {"status": "failed", "error": str(exc), "item": firmware}
         finally:
             session.close()
+
+    def _lightweight_system_analysis_input(self, firmware: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "firmware_key": firmware.get("firmware_key"),
+            "firmware_name": firmware.get("firmware_name"),
+            "filename": firmware.get("filename"),
+            "unpacked_root": firmware.get("unpacked_root"),
+            "source_root": firmware.get("source_root") or firmware.get("unpacked_root"),
+            "task_type": firmware.get("task_type", TASK_TYPE_BINARY),
+        }
+
+    def _lightweight_downstream_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        payload = payload or {}
+        keys = [
+            "task_id",
+            "id",
+            "project_id",
+            "status",
+            "error",
+            "error_message",
+            "message",
+            "output_path",
+            "workspace_root",
+            "created_at",
+            "updated_at",
+            "started_at",
+            "finished_at",
+        ]
+        return {key: payload.get(key) for key in keys if payload.get(key) is not None}
+
+    def _lightweight_system_analysis_result(self, result_payload: dict[str, Any] | None) -> dict[str, Any]:
+        payload = result_payload or {}
+        summary = dict(payload.get("summary") or {})
+        modules = []
+        for module in list(payload.get("modules") or []):
+            modules.append(
+                {
+                    "module_name": module.get("module_name"),
+                    "rank": module.get("rank"),
+                    "risk_level": module.get("risk_level"),
+                    "risk_score": module.get("risk_score"),
+                    "file_count": module.get("file_count"),
+                    "module_dir_path": module.get("module_dir_path"),
+                    "module_report_path": module.get("module_report_path"),
+                    "files_list_path": module.get("files_list_path"),
+                }
+            )
+        return {
+            "available": payload.get("available"),
+            "status": payload.get("status"),
+            "output_root": payload.get("output_root"),
+            "final_report_path": payload.get("final_report_path"),
+            "modules_list_path": payload.get("modules_list_path"),
+            "summary": summary,
+            "module_count": len(modules),
+            "modules": modules,
+            "warnings": payload.get("warnings") or [],
+        }
 
     def _parse_system_analysis_modules(self, root: Path, firmware: dict[str, Any], result_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         result_payload = result_payload or {}
