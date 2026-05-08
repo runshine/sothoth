@@ -39,6 +39,11 @@ data:
       get_project_path: "/api/project"
       timeout: 10
 
+    configcenter_service:
+      enabled: true
+      base_url: "http://secflow-platform-configcenter/api/configcenter"
+      timeout: 30
+
     service:
       max_background_workers: 8
       task_retention_days: 7

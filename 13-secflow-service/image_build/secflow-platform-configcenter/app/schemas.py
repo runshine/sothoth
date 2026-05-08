@@ -225,6 +225,7 @@ class LlmProviderServiceListItem(BaseModel):
     file_bindings: List[LlmProviderFileBinding]
     extra_config: Dict[str, Any]
     description: Optional[str] = None
+    updated_at: Optional[str] = None
 
 
 class LlmProviderServiceListResponse(BaseModel):
@@ -315,4 +316,5 @@ def build_service_payload(item) -> LlmProviderServiceListItem:
         file_bindings=item.file_bindings or [],
         extra_config=item.extra_config or {},
         description=item.description,
+        updated_at=item.updated_at.isoformat() if isinstance(item.updated_at, datetime) else None,
     )

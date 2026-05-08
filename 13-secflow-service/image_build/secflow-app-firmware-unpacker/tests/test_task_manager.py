@@ -10,7 +10,8 @@ from app.config import reload_config
 from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session, init_database
 import app.model as model_module
 import app.services.task_manager as task_manager_module
-from app.services.task_manager import prepare_task_workspace, resolve_task_runtime_paths
+from app.model import ServiceConfig
+from app.services.task_manager import prepare_task_workspace, resolve_task_runtime_paths, submit_unpack_task
 
 
 class TaskManagerWorkspaceTests(unittest.TestCase):
@@ -217,6 +218,105 @@ class TaskManagerLeaseTests(unittest.TestCase):
             task = db.query(UnpackTask).filter(UnpackTask.id == "t-stale").first()
             self.assertEqual(TaskStatus.CANCELLED.value, task.status)
             self.assertIn("owner restarted", task.result_message or "")
+        finally:
+            db.close()
+
+
+class TaskManagerLlmSnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.root = root
+        self.firmware = root / "firmware.bin"
+        self.firmware.write_bytes(b"firmware")
+        config_path = root / "config.yaml"
+        db_path = root / "tasks.db"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "database": {
+                        "type": "sqlite",
+                        "path": str(db_path),
+                        "table_prefix": "secflow_app_firmware_unpacker_",
+                    },
+                    "configcenter_service": {
+                        "enabled": True,
+                        "base_url": "http://configcenter/api/configcenter",
+                        "timeout": 30,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        reload_config(str(config_path))
+        model_module._engine = None
+        model_module._SessionFactory = None
+        init_database()
+
+    def tearDown(self):
+        model_module._engine = None
+        model_module._SessionFactory = None
+        self._tmp.cleanup()
+
+    def test_submit_task_freezes_llm_binding_snapshot_immediately(self):
+        provider_keys = {
+            "llm_provider_key_executor": "provider-executor-v1",
+            "llm_provider_key_reviewer": "provider-reviewer-v1",
+            "llm_provider_key_cleaner": "provider-cleaner-v1",
+            "llm_provider_key_skill_author": "provider-author-v1",
+            "llm_provider_key_skill_executor": "provider-skill-v1",
+        }
+        provider_payloads = {
+            provider_key: {
+                "provider_key": provider_key,
+                "provider_type": "openai-compatible",
+                "api_base": f"http://llm.local/{provider_key}",
+                "api_key": f"secret-{provider_key}",
+                "model": f"model-{provider_key}",
+                "env_bindings": {"TRACE_ID": provider_key},
+                "updated_at": "2026-05-08T00:00:00",
+            }
+            for provider_key in provider_keys.values()
+        }
+
+        class _FakeClient:
+            def get_llm_provider(self, provider_key: str):
+                return provider_payloads[provider_key]
+
+        db = get_db_session()
+        try:
+            for key, value in provider_keys.items():
+                row = db.query(ServiceConfig).filter(ServiceConfig.key == key).first()
+                row.value = value
+            db.commit()
+        finally:
+            db.close()
+
+        with patch("app.services.task_manager.PROJECT_FILES_ROOT", self.root / "data"), \
+             patch("app.services.configcenter.get_configcenter_client", return_value=_FakeClient()):
+            created = submit_unpack_task(
+                firmware_path=str(self.firmware),
+                project_id="p1",
+            )
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == created["task_id"]).first()
+            snapshot = json.loads(task.llm_binding_snapshot)
+            self.assertEqual("provider-executor-v1", snapshot["roles"]["executor"]["provider_key"])
+            self.assertEqual("provider-reviewer-v1", snapshot["roles"]["reviewer"]["provider_key"])
+
+            row = db.query(ServiceConfig).filter(ServiceConfig.key == "llm_provider_key_executor").first()
+            row.value = "provider-executor-v2"
+            db.commit()
+        finally:
+            db.close()
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == created["task_id"]).first()
+            snapshot = json.loads(task.llm_binding_snapshot)
+            self.assertEqual("provider-executor-v1", snapshot["roles"]["executor"]["provider_key"])
         finally:
             db.close()
 

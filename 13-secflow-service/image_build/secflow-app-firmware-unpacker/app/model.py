@@ -74,6 +74,7 @@ class UnpackTask(Base):
     generated_skill_path = Column(String(512), nullable=True)
     generated_skill_status = Column(String(32), nullable=True)
     promotion_success_count = Column(Integer, nullable=True)
+    llm_binding_snapshot = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
@@ -275,6 +276,7 @@ def _ensure_unpack_task_columns() -> None:
         "generated_skill_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_path VARCHAR(512)",
         "generated_skill_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_status VARCHAR(32)",
         "promotion_success_count": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN promotion_success_count INTEGER",
+        "llm_binding_snapshot": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN llm_binding_snapshot TEXT",
     }
 
     with engine.begin() as conn:

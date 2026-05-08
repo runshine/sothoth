@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import signal
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any, Callable, Optional
 
 from app.logging_utils import log_event
 from app.preprocess import detect_format, run_preprocess
+from app.services.configcenter import get_configcenter_client
 from app.skill_store import (
     DEFAULT_PROMOTION_THRESHOLD,
     compute_family_id,
@@ -47,6 +49,15 @@ AUTHOR_PROMPT_TMPL = AGENT_DIR / "prompt" / "author-firmware-skill.md"
 
 TOOLS_DIR = Path(os.environ.get("UNPACKER_TOOLS_DIR", "/data/secflow-app-firmware-unpacker/tools"))
 LOG_OUTPUT_DIR = Path(os.environ.get("UNPACKER_LOG_DIR", "/workspace/log_output"))
+PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR"
+PI_MODELS_JSON_ENV = "PI_MODELS_JSON"
+ROLE_CONFIG_KEYS = {
+    "executor": "llm_provider_key_executor",
+    "reviewer": "llm_provider_key_reviewer",
+    "cleaner": "llm_provider_key_cleaner",
+    "skill_author": "llm_provider_key_skill_author",
+    "skill_executor": "llm_provider_key_skill_executor",
+}
 
 
 def _get_max_retries() -> int:
@@ -67,6 +78,128 @@ def _preview_text(text: str, limit: int = 240) -> str:
     if len(compact) <= limit:
         return compact
     return compact[:limit] + "..."
+
+
+def _provider_api(provider_type: str) -> str:
+    normalized = str(provider_type or "").strip().lower()
+    if normalized == "anthropic":
+        return "anthropic-messages"
+    return "openai-completions"
+
+
+def _provider_base_env(provider: dict[str, Any]) -> dict[str, str]:
+    provider_type = str(provider.get("provider_type") or "").strip().lower()
+    api_base = str(provider.get("api_base") or "").strip()
+    api_key = str(provider.get("api_key") or "").strip()
+    model = str(provider.get("model") or "").strip()
+    api_version = str(provider.get("api_version") or "").strip()
+
+    if provider_type == "openai-compatible":
+        return {"OPENAI_BASE_URL": api_base, "OPENAI_API_KEY": api_key, "OPENAI_MODEL": model}
+    if provider_type == "azure-openai":
+        return {
+            "AZURE_OPENAI_ENDPOINT": api_base,
+            "AZURE_OPENAI_API_KEY": api_key,
+            "AZURE_OPENAI_API_VERSION": api_version,
+            "AZURE_OPENAI_DEPLOYMENT": model,
+        }
+    if provider_type == "anthropic":
+        return {"ANTHROPIC_BASE_URL": api_base, "ANTHROPIC_AUTH_TOKEN": api_key, "ANTHROPIC_MODEL": model}
+    if provider_type == "deepseek":
+        return {"DEEPSEEK_BASE_URL": api_base, "DEEPSEEK_API_KEY": api_key, "DEEPSEEK_MODEL": model}
+    if provider_type == "qwen":
+        return {"QWEN_BASE_URL": api_base, "QWEN_API_KEY": api_key, "QWEN_MODEL": model}
+    if provider_type == "ollama":
+        return {"OLLAMA_BASE_URL": api_base, "OLLAMA_MODEL": model}
+    if provider_type == "moonshot":
+        return {"MOONSHOT_BASE_URL": api_base, "MOONSHOT_API_KEY": api_key, "MOONSHOT_MODEL": model}
+    return {"LLM_BASE_URL": api_base, "LLM_API_KEY": api_key, "LLM_MODEL": model}
+
+
+def _normalize_provider_env_bindings(provider: dict[str, Any]) -> dict[str, str]:
+    merged = {
+        key: value
+        for key, value in _provider_base_env(provider).items()
+        if str(key or "").strip()
+    }
+    custom_bindings = provider.get("env_bindings") if isinstance(provider.get("env_bindings"), dict) else {}
+    for raw_key, raw_value in custom_bindings.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        merged[key] = "" if raw_value is None else str(raw_value)
+    return merged
+
+
+def _detect_api_key_env_name(env_map: dict[str, str]) -> str:
+    for key in (
+        "OPENAI_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "AZURE_OPENAI_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "QWEN_API_KEY",
+        "MOONSHOT_API_KEY",
+        "LLM_API_KEY",
+    ):
+        if key in env_map:
+            return key
+    return "OPENAI_API_KEY"
+
+
+def _resolve_provider_model(provider_key: str, configured_model: str, explicit_model: str | None) -> str:
+    requested = str(explicit_model or "").strip()
+    provider_default_model = str(configured_model or "").strip()
+    if not requested:
+        if not provider_default_model:
+            raise ValueError(f"LLM Provider {provider_key} 缺少默认 model")
+        return provider_default_model
+    if "/" in requested:
+        prefix, _, model_id = requested.partition("/")
+        if str(prefix).strip() != provider_key:
+            raise ValueError(
+                f"显式模型 {requested} 与当前角色绑定的 Provider {provider_key} 不一致"
+            )
+        normalized_model = str(model_id or "").strip()
+        if not normalized_model:
+            raise ValueError(f"显式模型 {requested} 缺少 model_id")
+        return normalized_model
+    return requested
+
+
+def _build_models_json(provider: dict[str, Any], resolved_model: str) -> dict[str, Any]:
+    provider_key = str(provider.get("provider_key") or "").strip()
+    api_base = str(provider.get("api_base") or "").strip()
+    if not provider_key or not api_base or not resolved_model:
+        raise ValueError("LLM Provider缺少provider_key/api_base/model")
+    api_key_env = _detect_api_key_env_name(_normalize_provider_env_bindings(provider))
+    return {
+        "providers": {
+            provider_key: {
+                "baseUrl": api_base.rstrip("/"),
+                "api": _provider_api(str(provider.get("provider_type") or "")),
+                "apiKey": api_key_env,
+                "models": [
+                    {
+                        "id": resolved_model,
+                        "name": resolved_model,
+                        "reasoning": False,
+                        "input": ["text"],
+                        "contextWindow": 128000,
+                        "maxTokens": provider.get("max_tokens") or 16384,
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                    }
+                ],
+            }
+        }
+    }
+
+
+def _build_settings_json(provider_key: str, resolved_model: str) -> dict[str, Any]:
+    return {
+        "defaultProvider": provider_key,
+        "defaultModel": resolved_model,
+        "retry": {"enabled": True},
+    }
 
 
 def load_agent_def(md_path: str) -> dict:
@@ -133,37 +266,144 @@ class PiRpcClient:
             args.extend(["--tools", ",".join(tools)])
         return args
 
-    def __init__(self, *, system_prompt_file=None, model=None, tools=None, cwd=None):
+    def __init__(self, *, system_prompt_file=None, model=None, tools=None, cwd=None, provider_role: str | None = None, llm_binding_snapshot: dict[str, Any] | None = None):
         self._cwd = self.resolve_cwd(cwd)
         self._system_prompt_file = system_prompt_file
         self._model = model
         self._tools = tools
+        self._provider_role = str(provider_role or "").strip() or None
+        self._llm_binding_snapshot = llm_binding_snapshot or None
+        self._provider_runtime: dict[str, Any] | None = None
+        self._agent_dir: Path | None = None
+        self._agent_tmp_root: Path | None = None
         self._start()
 
+    def _resolve_provider_runtime(self) -> dict[str, Any] | None:
+        if self._provider_role is None:
+            return None
+        if self._provider_runtime is not None:
+            return self._provider_runtime
+
+        config_key = ROLE_CONFIG_KEYS.get(self._provider_role)
+        if not config_key:
+            raise ValueError(f"未知 LLM Provider 角色: {self._provider_role}")
+
+        if self._llm_binding_snapshot:
+            roles = self._llm_binding_snapshot.get("roles") if isinstance(self._llm_binding_snapshot.get("roles"), dict) else {}
+            provider = roles.get(self._provider_role) if isinstance(roles.get(self._provider_role), dict) else None
+            if provider is None:
+                raise ValueError(f"任务 LLM 快照缺少角色 {self._provider_role} 的配置")
+            provider_key = str(provider.get("provider_key") or "").strip()
+            if not provider_key:
+                raise ValueError(f"任务 LLM 快照中的角色 {self._provider_role} 缺少 provider_key")
+            resolved_model = _resolve_provider_model(
+                provider_key,
+                str(provider.get("model") or "").strip(),
+                self._model,
+            )
+            env_map = _normalize_provider_env_bindings(provider)
+            env_map["SECFLOW_LLM_PROVIDER_KEY"] = provider_key
+            env_map["SECFLOW_LLM_PROVIDER_TYPE"] = str(provider.get("provider_type") or "").strip()
+            env_map["SECFLOW_LLM_MODEL"] = resolved_model
+            self._provider_runtime = {
+                "provider_key": provider_key,
+                "provider_type": str(provider.get("provider_type") or "").strip(),
+                "resolved_model": resolved_model,
+                "env": env_map,
+                "models_json": _build_models_json(provider, resolved_model),
+                "settings_json": _build_settings_json(provider_key, resolved_model),
+            }
+            return self._provider_runtime
+
+        from app.model import get_config_value, get_db_session
+
+        db = get_db_session()
+        try:
+            provider_key = str(get_config_value(db, config_key, default="") or "").strip()
+        finally:
+            db.close()
+        if not provider_key:
+            raise ValueError(f"未配置角色 {self._provider_role} 的 LLM Provider")
+
+        provider = get_configcenter_client().get_llm_provider(provider_key)
+        resolved_model = _resolve_provider_model(
+            provider_key,
+            str(provider.get("model") or "").strip(),
+            self._model,
+        )
+        env_map = _normalize_provider_env_bindings(provider)
+        env_map["SECFLOW_LLM_PROVIDER_KEY"] = provider_key
+        env_map["SECFLOW_LLM_PROVIDER_TYPE"] = str(provider.get("provider_type") or "").strip()
+        env_map["SECFLOW_LLM_MODEL"] = resolved_model
+        self._provider_runtime = {
+            "provider_key": provider_key,
+            "provider_type": str(provider.get("provider_type") or "").strip(),
+            "resolved_model": resolved_model,
+            "env": env_map,
+            "models_json": _build_models_json(provider, resolved_model),
+            "settings_json": _build_settings_json(provider_key, resolved_model),
+        }
+        return self._provider_runtime
+
+    def _prepare_agent_dir(self) -> tuple[Path | None, dict[str, str]]:
+        runtime = self._resolve_provider_runtime()
+        if runtime is None:
+            return None, {}
+        tmp_root = Path(tempfile.mkdtemp(prefix=f"fw-pi-{self._provider_role or 'runtime'}-"))
+        agent_dir = tmp_root / "agent"
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        (agent_dir / "models.json").write_text(
+            json.dumps(runtime["models_json"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (agent_dir / "settings.json").write_text(
+            json.dumps(runtime["settings_json"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        (agent_dir / "auth.json").write_text("{}", encoding="utf-8")
+        self._agent_tmp_root = tmp_root
+        self._agent_dir = agent_dir
+        return agent_dir, dict(runtime["env"])
+
     def _start(self):
-        args = self.build_args(
-            system_prompt_file=self._system_prompt_file,
-            model=self._model,
-            tools=self._tools,
-        )
-        log_event(
-            log,
-            logging.INFO,
-            "starting pi rpc process",
-            event="pi_process_start",
-            command=" ".join(args),
-            cwd=self._cwd,
-        )
-        self.proc = subprocess.Popen(
-            args,
-            cwd=self._cwd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        self.send({"type": "set_auto_retry", "enabled": True})
+        try:
+            agent_dir, runtime_env = self._prepare_agent_dir()
+            resolved_model = self._provider_runtime["resolved_model"] if self._provider_runtime else self._model
+            args = self.build_args(
+                system_prompt_file=self._system_prompt_file,
+                model=resolved_model,
+                tools=self._tools,
+            )
+            env = os.environ.copy()
+            if agent_dir is not None:
+                env[PI_AGENT_DIR_ENV] = str(agent_dir)
+                env[PI_MODELS_JSON_ENV] = str(agent_dir / "models.json")
+                env.update(runtime_env)
+            log_event(
+                log,
+                logging.INFO,
+                "starting pi rpc process",
+                event="pi_process_start",
+                command=" ".join(args),
+                cwd=self._cwd,
+                role=self._provider_role,
+                provider_key=(self._provider_runtime or {}).get("provider_key"),
+                model=resolved_model,
+            )
+            self.proc = subprocess.Popen(
+                args,
+                cwd=self._cwd,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            self.send({"type": "set_auto_retry", "enabled": True})
+        except Exception:
+            self._cleanup_agent_dir()
+            raise
 
     def _respawn(self):
         log_event(
@@ -321,33 +561,43 @@ class PiRpcClient:
         return None
 
     def close(self):
-        if self.proc.poll() is not None:
-            return
         try:
-            pgid = os.getpgid(self.proc.pid)
-        except Exception:
-            pgid = None
-        try:
-            self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                self.proc.terminate()
-        except Exception:
-            self.proc.terminate()
-        try:
-            self.proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
+            if self.proc.poll() is not None:
+                return
+            try:
+                pgid = os.getpgid(self.proc.pid)
+            except Exception:
+                pgid = None
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
             try:
                 if pgid is not None:
-                    os.killpg(pgid, signal.SIGKILL)
+                    os.killpg(pgid, signal.SIGTERM)
                 else:
-                    self.proc.kill()
-            finally:
-                self.proc.wait()
+                    self.proc.terminate()
+            except Exception:
+                self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    if pgid is not None:
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        self.proc.kill()
+                finally:
+                    self.proc.wait()
+        finally:
+            self._cleanup_agent_dir()
+
+    def _cleanup_agent_dir(self) -> None:
+        if self._agent_tmp_root is None:
+            return
+        shutil.rmtree(self._agent_tmp_root, ignore_errors=True)
+        self._agent_tmp_root = None
+        self._agent_dir = None
 
 
 def get_log_dir(output_path: str) -> Path:
@@ -475,12 +725,15 @@ def _run_reviewer(
     suffix: str,
     val_def: dict[str, Any],
     val_sp: str,
+    llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> tuple[bool, str]:
     validator = PiRpcClient(
         system_prompt_file=val_sp,
         model=val_def["model"],
         tools=val_def["tools"],
+        provider_role="reviewer",
+        llm_binding_snapshot=llm_binding_snapshot,
     )
     if bind_cancel_client:
         bind_cancel_client(validator)
@@ -515,6 +768,7 @@ def _run_skill_unpack(
     log_dir: Path | None,
     val_def: dict[str, Any],
     val_sp: str,
+    llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> dict[str, Any]:
     skill_sp = _write_system_prompt(str(skill_meta.get("system_prompt") or ""), "firmware-skill-")
@@ -522,6 +776,8 @@ def _run_skill_unpack(
         system_prompt_file=skill_sp,
         model=skill_meta.get("model"),
         tools=skill_meta.get("tools"),
+        provider_role="skill_executor",
+        llm_binding_snapshot=llm_binding_snapshot,
     )
     if bind_cancel_client:
         bind_cancel_client(executor)
@@ -535,6 +791,7 @@ def _run_skill_unpack(
             "skill",
             val_def,
             val_sp,
+            llm_binding_snapshot=llm_binding_snapshot,
             bind_cancel_client=bind_cancel_client,
         )
         result = {
@@ -575,12 +832,15 @@ def _run_generic_unpack(
     val_def: dict[str, Any],
     exec_sp: str,
     val_sp: str,
+    llm_binding_snapshot: dict[str, Any] | None = None,
 ) -> tuple[bool, int, str]:
     max_retries = _get_max_retries()
     executor = PiRpcClient(
         system_prompt_file=exec_sp,
         model=exec_def["model"],
         tools=exec_def["tools"],
+        provider_role="executor",
+        llm_binding_snapshot=llm_binding_snapshot,
     )
     cancel_check(executor)
     passed = False
@@ -604,6 +864,7 @@ def _run_generic_unpack(
                 f"round_{attempt}",
                 val_def,
                 val_sp,
+                llm_binding_snapshot=llm_binding_snapshot,
                 bind_cancel_client=cancel_check,
             )
             log_event(
@@ -645,6 +906,7 @@ def _generate_candidate_skill(
     features: dict[str, Any],
     review_result: str,
     log_dir: Path | None,
+    llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> dict[str, Any] | None:
     try:
@@ -668,6 +930,8 @@ def _generate_candidate_skill(
             system_prompt_file=author_sp,
             model=author_def["model"],
             tools=author_def["tools"],
+            provider_role="skill_author",
+            llm_binding_snapshot=llm_binding_snapshot,
         )
         if bind_cancel_client:
             bind_cancel_client(author)
@@ -710,6 +974,7 @@ def _generate_candidate_skill(
 def _run_cleaner(
     output_path: str,
     log_dir: Path | None = None,
+    llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> str:
     clean_def = load_agent_def(CLEAN_AGENT_DEF)
@@ -719,6 +984,8 @@ def _run_cleaner(
         system_prompt_file=clean_sp,
         model=clean_def["model"],
         tools=clean_def["tools"],
+        provider_role="cleaner",
+        llm_binding_snapshot=llm_binding_snapshot,
     )
     if bind_cancel_client:
         bind_cancel_client(cleaner)
@@ -744,6 +1011,7 @@ def _run_cleaner(
 def run_unpack(
     firmware_path: str,
     output_path: str,
+    llm_binding_snapshot: dict[str, Any] | None = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
@@ -885,6 +1153,7 @@ def run_unpack(
                 log_dir,
                 val_def,
                 val_sp,
+                llm_binding_snapshot=llm_binding_snapshot,
                 bind_cancel_client=_bind_cancel_client,
             )
             if skill_result.get("success"):
@@ -916,6 +1185,7 @@ def run_unpack(
                 val_def,
                 exec_sp,
                 val_sp,
+                llm_binding_snapshot=llm_binding_snapshot,
             )
             passed = generic_passed
             if passed:
@@ -926,12 +1196,18 @@ def run_unpack(
                     features,
                     last_reason or '{"result":"success"}',
                     log_dir,
+                    llm_binding_snapshot=llm_binding_snapshot,
                     bind_cancel_client=_bind_cancel_client,
                 )
 
         _check_cancel()
         _report_progress("cleanup")
-        _run_cleaner(output_path, log_dir=log_dir, bind_cancel_client=_bind_cancel_client)
+        _run_cleaner(
+            output_path,
+            log_dir=log_dir,
+            llm_binding_snapshot=llm_binding_snapshot,
+            bind_cancel_client=_bind_cancel_client,
+        )
         _write_token_summary(log_dir)
 
     except RuntimeError as exc:

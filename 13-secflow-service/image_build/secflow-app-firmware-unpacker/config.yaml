@@ -38,6 +38,11 @@ project_service:
   get_project_path: "/api/project"
   timeout: 10
 
+configcenter_service:
+  enabled: true
+  base_url: "http://secflow-platform-configcenter/api/configcenter"
+  timeout: 30
+
 # 服务运行时配置
 service:
   max_background_workers: 8

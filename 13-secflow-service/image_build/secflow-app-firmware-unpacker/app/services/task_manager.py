@@ -291,6 +291,59 @@ def _mark_task_stage(task_id: str, stage: str) -> None:
         db.close()
 
 
+def _build_llm_binding_snapshot(db) -> dict:
+    from app.services.configcenter import get_configcenter_client
+
+    from app.unpacker_engine import ROLE_CONFIG_KEYS
+
+    from app.model import get_config_value
+
+    roles: dict[str, dict] = {}
+    client = get_configcenter_client()
+    for role, config_key in ROLE_CONFIG_KEYS.items():
+        provider_key = str(get_config_value(db, config_key, default="") or "").strip()
+        if not provider_key:
+            raise ValueError(f"未配置角色 {role} 的 LLM Provider")
+        provider = client.get_llm_provider(provider_key)
+        roles[role] = {
+            "provider_key": str(provider.get("provider_key") or "").strip(),
+            "provider_type": str(provider.get("provider_type") or "").strip(),
+            "api_base": str(provider.get("api_base") or "").strip(),
+            "api_key": str(provider.get("api_key") or "").strip(),
+            "model": str(provider.get("model") or "").strip(),
+            "api_version": str(provider.get("api_version") or "").strip(),
+            "max_tokens": provider.get("max_tokens"),
+            "env_bindings": provider.get("env_bindings") if isinstance(provider.get("env_bindings"), dict) else {},
+            "updated_at": str(provider.get("updated_at") or "").strip() or None,
+        }
+
+    return {
+        "version": 1,
+        "frozen_at": datetime.utcnow().isoformat(),
+        "roles": roles,
+    }
+
+
+def _freeze_task_llm_binding_snapshot(task_id: str) -> dict:
+    from app.model import UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is None:
+            raise ValueError(f"任务不存在: {task_id}")
+        if task.llm_binding_snapshot:
+            return json.loads(task.llm_binding_snapshot)
+
+        snapshot = _build_llm_binding_snapshot(db)
+        task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
+        task.last_progress_at = datetime.utcnow()
+        db.commit()
+        return snapshot
+    finally:
+        db.close()
+
+
 def _renew_task_lease(task_id: str, *, stage: Optional[str] = None) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id
@@ -491,6 +544,7 @@ def submit_unpack_task(
     prepared = prepare_task_workspace(normalized_project_id, task_id, firmware_path)
     db = get_db_session()
     try:
+        llm_binding_snapshot = _build_llm_binding_snapshot(db)
         db.add(
             UnpackTask(
                 id=task_id,
@@ -505,6 +559,7 @@ def submit_unpack_task(
                 firmware_path=firmware_path,
                 output_path=prepared["output_path"],
                 status=TaskStatus.PENDING.value,
+                llm_binding_snapshot=json.dumps(llm_binding_snapshot, ensure_ascii=False),
                 current_stage="pending",
                 last_progress_at=datetime.utcnow(),
             )
@@ -835,10 +890,13 @@ def _run_claimed_task(task_id: str) -> None:
             _mark_task_cancelled(task_id, reason="cancel requested before execution")
             return
 
+        llm_binding_snapshot = _freeze_task_llm_binding_snapshot(task_id)
+
         os.makedirs(runtime_paths["output_path"], exist_ok=True)
         result = run_unpack(
             runtime_paths["input_path"],
             runtime_paths["output_path"],
+            llm_binding_snapshot=llm_binding_snapshot,
             cancel_check=lambda: _should_cancel(task_id),
             register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),
             progress_callback=lambda stage: _renew_task_lease(task_id, stage=stage),
