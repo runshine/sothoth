@@ -72,6 +72,14 @@ class ProjectServiceConfig(BaseModel):
         return f"http://{self.host}:{self.port}{self.get_project_path}"
 
 
+class ConfigCenterServiceConfig(BaseModel):
+    """Config center service configuration."""
+
+    enabled: bool = True
+    base_url: str = "http://secflow-platform-configcenter/api/configcenter"
+    timeout: int = 30
+
+
 class ServiceConfig(BaseModel):
     """Service runtime configuration."""
 
@@ -154,6 +162,7 @@ class Config(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
+    configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)

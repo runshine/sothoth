@@ -22,6 +22,7 @@ from app.schemas import (
     ConfigListResponse,
     ConfigUpdateRequest,
     HealthResponse,
+    LlmProviderSummaryListResponse,
     ReadyResponse,
     TaskListResponse,
     TaskProgressResponse,
@@ -32,6 +33,7 @@ from app.schemas import (
     UnpackRequest,
 )
 from app.services.pod_metrics import get_pod_resource_usage
+from app.services.configcenter import get_configcenter_client
 from app.services.task_manager import cancel_task, delete_tasks, retry_task, submit_unpack_task
 from app.services.worker import get_cluster_snapshot, get_worker_id
 from app.skill_store import list_skills
@@ -507,6 +509,32 @@ def _list_tools() -> dict:
     return {"total": len(items), "items": items}
 
 
+def _list_llm_provider_summaries() -> dict:
+    payload = get_configcenter_client().list_llm_providers()
+    raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        items.append(
+            {
+                "provider_key": str(item.get("provider_key") or "").strip(),
+                "display_name": str(item.get("display_name") or "").strip(),
+                "provider_type": str(item.get("provider_type") or "").strip(),
+                "enabled": bool(item.get("enabled", False)),
+                "is_default": bool(item.get("is_default", False)),
+                "model": str(item.get("model") or "").strip(),
+                "description": str(item.get("description") or "").strip() or None,
+                "updated_at": str(item.get("updated_at") or "").strip() or None,
+            }
+        )
+    return {
+        "total": len(items),
+        "default_provider_key": str(payload.get("default_provider_key") or "").strip() or None,
+        "items": items,
+    }
+
+
 @router.get("/health", response_model=HealthResponse)
 @router.get("/api/app/firmware-unpacker/health", response_model=HealthResponse)
 async def health_check():
@@ -531,6 +559,16 @@ async def get_runtime_config(
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
     return _get_config_entries()
+
+
+@router.get(
+    "/api/app/firmware-unpacker/llm/providers",
+    response_model=LlmProviderSummaryListResponse,
+)
+async def get_llm_provider_summaries(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _list_llm_provider_summaries()
 
 
 @router.get("/api/app/firmware-unpacker/tools", response_model=ToolListResponse)

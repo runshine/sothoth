@@ -188,6 +188,23 @@ class ConfigListResponse(BaseModel):
     items: List[ConfigEntryResponse]
 
 
+class LlmProviderSummaryResponse(BaseModel):
+    provider_key: str
+    display_name: str
+    provider_type: str
+    enabled: bool
+    is_default: bool
+    model: str
+    description: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class LlmProviderSummaryListResponse(BaseModel):
+    total: int
+    default_provider_key: Optional[str] = None
+    items: List[LlmProviderSummaryResponse]
+
+
 class ToolEntryResponse(BaseModel):
     filename: str
     path: str

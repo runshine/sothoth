@@ -178,6 +178,11 @@ DEFAULT_CONFIGS = [
     ("task_lease_seconds", "45", "int", "任务租约秒数"),
     ("task_lease_renew_interval_seconds", "10", "int", "任务租约续期间隔秒数"),
     ("cancel_timeout_seconds", "120", "int", "任务取消最长等待秒数"),
+    ("llm_provider_key_executor", "", "string", "固件解包 LLM 执行器角色的配置中心 Provider Key，必须显式配置"),
+    ("llm_provider_key_reviewer", "", "string", "固件解包 LLM 评审器角色的配置中心 Provider Key，必须显式配置"),
+    ("llm_provider_key_cleaner", "", "string", "固件解包 LLM 清理器角色的配置中心 Provider Key，必须显式配置"),
+    ("llm_provider_key_skill_author", "", "string", "固件解包 LLM 技能生成器角色的配置中心 Provider Key，必须显式配置"),
+    ("llm_provider_key_skill_executor", "", "string", "固件解包命中技能后的执行器角色的配置中心 Provider Key，必须显式配置"),
 ]
 
 
