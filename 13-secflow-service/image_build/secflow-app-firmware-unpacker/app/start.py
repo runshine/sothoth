@@ -29,8 +29,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _default_workers() -> int:
-    # Task cancel hooks live in-process. Keep a single Gunicorn worker so
-    # runtime cancellation requests always reach the executing task thread.
+    # Task runners are subprocesses, but concurrency limits are calculated per
+    # service process. Keep one Gunicorn worker by default to avoid Pod-level
+    # overcommit from multiple independent dispatchers.
     return 1
 
 

@@ -72,6 +72,11 @@ class TaskResponse(BaseModel):
     lease_expires_at: Optional[str] = None
     cancel_requested_at: Optional[str] = None
     last_progress_at: Optional[str] = None
+    runner_pid: Optional[int] = None
+    runner_started_at: Optional[str] = None
+    runner_heartbeat_at: Optional[str] = None
+    cancel_grace_deadline: Optional[str] = None
+    cancel_force_deadline: Optional[str] = None
     result_status: Optional[str] = None
     result_message: Optional[str] = None
     rounds: Optional[int] = None

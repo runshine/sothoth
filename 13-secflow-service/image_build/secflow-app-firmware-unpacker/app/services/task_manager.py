@@ -5,7 +5,11 @@ from __future__ import annotations
 import logging
 import json
 import os
+import signal
+import subprocess
+import sys
 import threading
+import uuid
 from math import floor
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -206,6 +210,27 @@ def _cancel_timeout_seconds() -> int:
     )
 
 
+def _cancel_grace_seconds() -> int:
+    return max(
+        1,
+        _runtime_config_int(
+            "cancel_grace_seconds",
+            default=int(get_config().worker.cancel_grace_seconds),
+        ),
+    )
+
+
+def _cancel_force_seconds() -> int:
+    grace = _cancel_grace_seconds()
+    return max(
+        grace + 1,
+        _runtime_config_int(
+            "cancel_force_seconds",
+            default=int(get_config().worker.cancel_force_seconds),
+        ),
+    )
+
+
 def _cleanup_job_lease_seconds() -> int:
     return max(30, _task_lease_seconds())
 
@@ -241,6 +266,89 @@ def _active_future_count() -> int:
     _cleanup_completed_futures()
     with _futures_lock:
         return sum(1 for future in _futures.values() if not future.done())
+
+
+def _is_process_alive(pid: Optional[int]) -> bool:
+    if not pid or int(pid) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _signal_runner_process(pid: Optional[int], sig: int) -> bool:
+    if not pid or int(pid) <= 0:
+        return False
+    try:
+        pgid = os.getpgid(int(pid))
+        os.killpg(pgid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        try:
+            os.kill(int(pid), sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except Exception as exc:
+            logger.warning("failed to signal task runner pid=%s sig=%s: %s", pid, sig, exc)
+            return False
+
+
+def _signal_task_runner(task, sig: int, *, event_type: str, summary: str) -> bool:
+    sent = _signal_runner_process(getattr(task, "runner_pid", None), sig)
+    if sent:
+        _record_task_event_from_row(
+            task,
+            event_type=event_type,
+            summary=summary,
+            stage_key=getattr(task, "current_stage", None),
+            status=getattr(task, "status", None),
+            detail={"runner_pid": getattr(task, "runner_pid", None), "signal": sig},
+            owner_id=getattr(task, "owner_id", None),
+            created_by="task_manager",
+        )
+    return sent
+
+
+def _clear_cancel_grace_deadline(task_id: str) -> None:
+    from app.model import UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is not None:
+            task.cancel_grace_deadline = None
+            db.commit()
+    finally:
+        db.close()
+
+
+def _active_runner_count() -> int:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        rows = (
+            db.query(UnpackTask.id, UnpackTask.runner_pid)
+            .filter(
+                UnpackTask.owner_id == owner_id,
+                UnpackTask.status.in_([TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]),
+            )
+            .all()
+        )
+    finally:
+        db.close()
+    return sum(1 for _, pid in rows if _is_process_alive(pid))
 
 
 def _register_cancel_hook(task_id: str, hook) -> None:
@@ -334,7 +442,7 @@ def _trigger_cancel_hook(task_id: str) -> None:
 
 
 def get_local_active_task_count() -> int:
-    return _active_future_count()
+    return _active_runner_count()
 
 
 def recover_stale_owned_tasks() -> None:
@@ -357,15 +465,10 @@ def recover_stale_owned_tasks() -> None:
     finally:
         db.close()
 
-    with _futures_lock:
-        local_task_ids = {
-            task_id for task_id, future in _futures.items() if not future.done()
-        }
-
     for task in tasks:
-        if task.id in local_task_ids:
+        if _is_process_alive(task.runner_pid):
             continue
-        reason = "owner restarted without active future"
+        reason = "owner restarted without active runner process"
         if task.status == TaskStatus.CANCELLING.value:
             _mark_task_cancelled(task.id, reason=reason)
         else:
@@ -463,27 +566,35 @@ def _freeze_task_llm_binding_snapshot(task_id: str) -> dict:
 
 
 def _renew_task_lease(task_id: str, *, stage: Optional[str] = None) -> None:
-    from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.worker import get_worker_id
 
-    owner_id = get_worker_id()
+    _renew_task_lease_for_owner(task_id, owner_id=get_worker_id(), run_token=None, stage=stage)
+
+
+def _renew_task_lease_for_owner(
+    task_id: str,
+    *,
+    owner_id: str,
+    run_token: Optional[str],
+    stage: Optional[str] = None,
+) -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+
     db = get_db_session()
     try:
-        task = (
-            db.query(UnpackTask)
-            .filter(
-                UnpackTask.id == task_id,
-                UnpackTask.owner_id == owner_id,
-                UnpackTask.status.in_(
-                    [TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
-                ),
-            )
-            .first()
+        query = db.query(UnpackTask).filter(
+            UnpackTask.id == task_id,
+            UnpackTask.owner_id == owner_id,
+            UnpackTask.status == TaskStatus.RUNNING.value,
         )
+        if run_token:
+            query = query.filter(UnpackTask.run_token == run_token)
+        task = query.first()
         if task is None:
             return
         previous_stage = str(task.current_stage or "").strip() or None
         task.lease_expires_at = _lease_deadline()
+        task.runner_heartbeat_at = now_local()
         task.last_progress_at = now_local()
         if stage:
             task.current_stage = stage
@@ -531,6 +642,12 @@ def _finalize_orphaned_task(task_id: str, reason: str) -> None:
         previous_owner_id = task.owner_id
         task.owner_id = None
         task.lease_expires_at = None
+        task.runner_pid = None
+        task.runner_started_at = None
+        task.runner_heartbeat_at = None
+        task.run_token = None
+        task.cancel_grace_deadline = None
+        task.cancel_force_deadline = None
         task.completed_at = now_local()
         task.last_progress_at = now_local()
         db.commit()
@@ -796,6 +913,12 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
                     task.current_stage = "pending"
                     task.lease_expires_at = None
                     task.cancel_requested_at = None
+                    task.runner_pid = None
+                    task.runner_started_at = None
+                    task.runner_heartbeat_at = None
+                    task.run_token = None
+                    task.cancel_grace_deadline = None
+                    task.cancel_force_deadline = None
                     task.last_progress_at = now_local()
                     task.result_status = None
                     task.result_message = None
@@ -975,6 +1098,7 @@ def submit_unpack_task(
 
 def cancel_task(task_id: str) -> tuple[bool, str]:
     from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
 
     db = get_db_session()
     try:
@@ -988,6 +1112,12 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
             task.result_status = "cancelled"
             task.result_message = "Task was cancelled before execution"
             task.completed_at = now_local()
+            task.cancel_grace_deadline = None
+            task.cancel_force_deadline = None
+            task.runner_pid = None
+            task.runner_started_at = None
+            task.runner_heartbeat_at = None
+            task.run_token = None
             db.commit()
             _record_task_event_from_row(
                 task,
@@ -1009,9 +1139,12 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
             )
             return True, "取消请求已提交"
         elif task.status in (TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value):
+            now = now_local()
             task.status = TaskStatus.CANCELLING.value
-            task.cancel_requested_at = task.cancel_requested_at or now_local()
-            task.last_progress_at = now_local()
+            task.cancel_requested_at = task.cancel_requested_at or now
+            task.cancel_grace_deadline = task.cancel_grace_deadline or (now + timedelta(seconds=_cancel_grace_seconds()))
+            task.cancel_force_deadline = task.cancel_force_deadline or (now + timedelta(seconds=_cancel_force_seconds()))
+            task.last_progress_at = now
             trigger_runtime_cancel = True
         elif task.status == TaskStatus.CANCELLED.value:
             return True, "任务已取消"
@@ -1028,6 +1161,13 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
             created_by="task_manager",
         )
         if trigger_runtime_cancel:
+            if str(task.owner_id or "").strip() == get_worker_id() and task.runner_pid:
+                _signal_task_runner(
+                    task,
+                    signal.SIGTERM,
+                    event_type="cancel_sigterm_sent",
+                    summary="已向任务执行进程发送 SIGTERM",
+                )
             _trigger_cancel_hook(task_id)
         return True, "取消请求已提交"
     finally:
@@ -1055,6 +1195,12 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
         task.current_stage = "retry_preparing"
         task.lease_expires_at = None
         task.cancel_requested_at = None
+        task.runner_pid = None
+        task.runner_started_at = None
+        task.runner_heartbeat_at = None
+        task.run_token = None
+        task.cancel_grace_deadline = None
+        task.cancel_force_deadline = None
         task.last_progress_at = now_local()
         task.result_status = None
         task.result_message = "正在后台重置任务目录并准备重试"
@@ -1169,6 +1315,24 @@ def _should_cancel(task_id: str) -> bool:
         db.close()
 
 
+def _should_cancel_run(task_id: str, run_token: Optional[str]) -> bool:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is None:
+            return True
+        if run_token and task.run_token != run_token:
+            return True
+        return task.status in (
+            TaskStatus.CANCELLING.value,
+            TaskStatus.CANCELLED.value,
+        )
+    finally:
+        db.close()
+
+
 def recover_orphaned_tasks() -> None:
     from app.model import TaskStatus, UnpackTask, WorkerInstance, get_db_session
     from app.services.worker import get_worker_id
@@ -1200,18 +1364,14 @@ def recover_orphaned_tasks() -> None:
         db.close()
 
     current_owner = get_worker_id()
-    with _futures_lock:
-        local_active = {
-            task_id for task_id, future in _futures.items() if not future.done()
-        }
 
     for task in tasks:
         owner_id = str(task.owner_id or "").strip()
-        if owner_id == current_owner and task.id in local_active:
-            continue
         cancel_requested_at = task.cancel_requested_at
         lease_expired = task.lease_expires_at is None or task.lease_expires_at < now
         owner_missing = not owner_id or owner_id not in active_owner_ids
+        local_owned = owner_id == current_owner
+        runner_alive = _is_process_alive(task.runner_pid) if local_owned else True
         cancel_timed_out = bool(
             cancel_requested_at
             and cancel_requested_at + timedelta(seconds=_cancel_timeout_seconds()) < now
@@ -1220,8 +1380,37 @@ def recover_orphaned_tasks() -> None:
             task.last_progress_at
             and task.last_progress_at + timedelta(seconds=_cancel_timeout_seconds()) < now
         )
+        if task.status == TaskStatus.CANCELLING.value and local_owned:
+            if not runner_alive:
+                _mark_task_cancelled(task.id, reason="Task runner exited while cancelling")
+                continue
+            if task.cancel_grace_deadline and task.cancel_grace_deadline <= now:
+                sent = _signal_task_runner(
+                    task,
+                    signal.SIGTERM,
+                    event_type="cancel_sigterm_sent",
+                    summary="已向任务执行进程发送 SIGTERM",
+                )
+                if sent:
+                    _clear_cancel_grace_deadline(task.id)
+            if (
+                (task.cancel_force_deadline and task.cancel_force_deadline <= now)
+                or cancel_timed_out
+                or progress_stale
+                or lease_expired
+            ):
+                _signal_task_runner(
+                    task,
+                    signal.SIGKILL,
+                    event_type="cancel_sigkill_sent",
+                    summary="已向任务执行进程发送 SIGKILL",
+                )
+                _mark_task_cancelled(task.id, reason="Task cancelled after force kill deadline")
+            continue
         if task.status == TaskStatus.CANCELLING.value and (cancel_timed_out or owner_missing or lease_expired or progress_stale):
             _mark_task_cancelled(task.id, reason="Task cancelled after owner lost or timeout")
+        elif task.status == TaskStatus.RUNNING.value and local_owned and not runner_alive:
+            _finalize_orphaned_task(task.id, reason="Task runner process exited unexpectedly")
         elif task.status == TaskStatus.RUNNING.value and (owner_missing or lease_expired):
             _finalize_orphaned_task(task.id, reason="Task lease expired or owner lost")
 
@@ -1231,8 +1420,10 @@ def _claim_task(task_id: str) -> bool:
     from app.services.worker import get_worker_id
 
     owner_id = get_worker_id()
+    run_token = uuid.uuid4().hex
     db = get_db_session()
     try:
+        now = now_local()
         updated = (
             db.query(UnpackTask)
             .filter(
@@ -1246,8 +1437,14 @@ def _claim_task(task_id: str) -> bool:
                     UnpackTask.current_stage: "queued",
                     UnpackTask.lease_expires_at: _lease_deadline(),
                     UnpackTask.cancel_requested_at: None,
-                    UnpackTask.last_progress_at: now_local(),
-                    UnpackTask.started_at: now_local(),
+                    UnpackTask.last_progress_at: now,
+                    UnpackTask.runner_pid: None,
+                    UnpackTask.runner_started_at: None,
+                    UnpackTask.runner_heartbeat_at: None,
+                    UnpackTask.run_token: run_token,
+                    UnpackTask.cancel_grace_deadline: None,
+                    UnpackTask.cancel_force_deadline: None,
+                    UnpackTask.started_at: now,
                     UnpackTask.completed_at: None,
                     UnpackTask.error_message: None,
                     UnpackTask.result_status: None,
@@ -1266,7 +1463,7 @@ def _claim_task(task_id: str) -> bool:
                     summary="任务已被当前 owner 认领",
                     stage_key="queued",
                     status=task.status,
-                    detail={"owner_id": owner_id},
+                    detail={"owner_id": owner_id, "run_token_present": True},
                     owner_id=owner_id,
                     created_by="task_manager",
                 )
@@ -1295,6 +1492,12 @@ def _reset_claim(task_id: str) -> None:
                     UnpackTask.current_stage: "pending",
                     UnpackTask.lease_expires_at: None,
                     UnpackTask.cancel_requested_at: None,
+                    UnpackTask.runner_pid: None,
+                    UnpackTask.runner_started_at: None,
+                    UnpackTask.runner_heartbeat_at: None,
+                    UnpackTask.run_token: None,
+                    UnpackTask.cancel_grace_deadline: None,
+                    UnpackTask.cancel_force_deadline: None,
                     UnpackTask.started_at: None,
                     UnpackTask.last_progress_at: now_local(),
                 },
@@ -1306,10 +1509,96 @@ def _reset_claim(task_id: str) -> None:
         db.close()
 
 
+def _launch_task_runner(task_id: str) -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id, refresh_worker_active_tasks
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        task = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.id == task_id,
+                UnpackTask.owner_id == owner_id,
+                UnpackTask.status == TaskStatus.RUNNING.value,
+            )
+            .first()
+        )
+        if task is None or not task.run_token:
+            raise RuntimeError(f"任务未被当前 owner 正确认领: {task_id}")
+        run_token = task.run_token
+    finally:
+        db.close()
+
+    env = os.environ.copy()
+    project_root = str(Path(__file__).resolve().parents[2])
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = project_root if not existing_pythonpath else f"{project_root}{os.pathsep}{existing_pythonpath}"
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "app.task_runner",
+            "--task-id",
+            task_id,
+            "--owner-id",
+            owner_id,
+            "--run-token",
+            run_token,
+        ],
+        cwd=project_root,
+        env=env,
+        start_new_session=True,
+    )
+
+    now = now_local()
+    db = get_db_session()
+    try:
+        updated = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.id == task_id,
+                UnpackTask.owner_id == owner_id,
+                UnpackTask.run_token == run_token,
+                UnpackTask.status == TaskStatus.RUNNING.value,
+            )
+            .update(
+                {
+                    UnpackTask.runner_pid: proc.pid,
+                    UnpackTask.runner_started_at: now,
+                    UnpackTask.runner_heartbeat_at: now,
+                    UnpackTask.lease_expires_at: _lease_deadline(now),
+                    UnpackTask.last_progress_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        if not updated:
+            _signal_runner_process(proc.pid, signal.SIGTERM)
+            raise RuntimeError(f"任务状态已变化，已停止新 runner: {task_id}")
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is not None:
+            _record_task_event_from_row(
+                task,
+                event_type="runner_started",
+                summary="任务独立执行进程已启动",
+                stage_key=task.current_stage,
+                status=task.status,
+                detail={"runner_pid": proc.pid, "run_token_present": True},
+                owner_id=owner_id,
+                created_by="task_manager",
+            )
+    finally:
+        db.close()
+    refresh_worker_active_tasks()
+
+
 def _schedule_pending_tasks() -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
-    available_slots = _runtime_max_concurrent() - _active_future_count()
+    available_slots = _runtime_max_concurrent() - _active_runner_count()
     if available_slots <= 0:
         return
 
@@ -1330,17 +1619,15 @@ def _schedule_pending_tasks() -> None:
         db.close()
 
     for task_id in candidate_ids:
-        if _runtime_max_concurrent() - _active_future_count() <= 0:
+        if _runtime_max_concurrent() - _active_runner_count() <= 0:
             break
         if not _claim_task(task_id):
             continue
         try:
-            future = get_executor().submit(_run_claimed_task, task_id)
+            _launch_task_runner(task_id)
         except Exception:
             _reset_claim(task_id)
             raise
-        with _futures_lock:
-            _futures[task_id] = future
 
 
 def _fail_retry_preparing_task(task_id: str, error_message: str) -> None:
@@ -1574,17 +1861,33 @@ def request_task_result_cache_refresh(task_id: str) -> tuple[bool, str]:
 
 
 def _run_claimed_task(task_id: str) -> None:
-    from app.model import TaskStatus, UnpackTask, get_db_session
-    from app.services.worker import get_worker_id, refresh_worker_active_tasks
-    from app.unpacker_engine import run_unpack
+    from app.model import UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
 
     owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        run_token = task.run_token if task is not None else None
+    finally:
+        db.close()
+    if not run_token:
+        return
+    run_claimed_task_process(task_id, owner_id=owner_id, run_token=run_token)
+
+
+def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> None:
+    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.unpacker_engine import run_unpack
+
     db = get_db_session()
     try:
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if task is None:
             return
         if task.owner_id != owner_id:
+            return
+        if task.run_token != run_token:
             return
         runtime_paths = resolve_task_runtime_paths(
             task_id=task.id,
@@ -1595,9 +1898,8 @@ def _run_claimed_task(task_id: str) -> None:
     finally:
         db.close()
 
-    refresh_worker_active_tasks()
     try:
-        if _should_cancel(task_id):
+        if _should_cancel_run(task_id, run_token):
             _mark_task_cancelled(task_id, reason="cancel requested before execution")
             return
 
@@ -1620,9 +1922,14 @@ def _run_claimed_task(task_id: str) -> None:
             firmware_path=runtime_paths["input_path"],
             output_path=runtime_paths["output_path"],
             llm_binding_snapshot=llm_binding_snapshot,
-            cancel_check=lambda: _should_cancel(task_id),
+            cancel_check=lambda: _should_cancel_run(task_id, run_token),
             register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),
-            progress_callback=lambda stage: _renew_task_lease(task_id, stage=stage),
+            progress_callback=lambda stage: _renew_task_lease_for_owner(
+                task_id,
+                owner_id=owner_id,
+                run_token=run_token,
+                stage=stage,
+            ),
             event_callback=lambda event_type, summary, **kwargs: _record_task_event(
                 task_id,
                 project_id=task.project_id,
@@ -1635,15 +1942,12 @@ def _run_claimed_task(task_id: str) -> None:
                 created_by=kwargs.pop("created_by", "unpacker_engine"),
             ),
         )
-        _update_task_result(task_id, result)
+        _update_task_result(task_id, result, run_token=run_token)
     except Exception as exc:
         logger.exception("task %s failed with exception: %s", task_id, exc)
-        _update_task_error(task_id, str(exc))
+        _update_task_error(task_id, str(exc), run_token=run_token)
     finally:
         _register_cancel_hook(task_id, None)
-        with _futures_lock:
-            _futures.pop(task_id, None)
-        refresh_worker_active_tasks()
 
 
 def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> None:
@@ -1660,6 +1964,12 @@ def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> No
         task.result_message = reason
         task.owner_id = None
         task.lease_expires_at = None
+        task.runner_pid = None
+        task.runner_started_at = None
+        task.runner_heartbeat_at = None
+        task.run_token = None
+        task.cancel_grace_deadline = None
+        task.cancel_force_deadline = None
         task.completed_at = now_local()
         task.last_progress_at = now_local()
         db.commit()
@@ -1678,13 +1988,18 @@ def _mark_task_cancelled(task_id: str, reason: str = "Task was cancelled") -> No
         db.close()
 
 
-def _update_task_result(task_id: str, result: dict) -> None:
+def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] = None) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
     try:
-        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        query = db.query(UnpackTask).filter(UnpackTask.id == task_id)
+        if run_token:
+            query = query.filter(UnpackTask.run_token == run_token)
+        task = query.first()
         if task is None:
+            return
+        if task.status not in (TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value):
             return
 
         result_status = str(result.get("status") or "").lower()
@@ -1708,6 +2023,12 @@ def _update_task_result(task_id: str, result: dict) -> None:
         previous_owner_id = task.owner_id
         task.owner_id = None
         task.lease_expires_at = None
+        task.runner_pid = None
+        task.runner_started_at = None
+        task.runner_heartbeat_at = None
+        task.run_token = None
+        task.cancel_grace_deadline = None
+        task.cancel_force_deadline = None
         task.result_status = result.get("status")
         task.result_message = result.get("message")
         task.rounds = result.get("rounds")
@@ -1741,18 +2062,29 @@ def _update_task_result(task_id: str, result: dict) -> None:
         db.close()
 
 
-def _update_task_error(task_id: str, error: str) -> None:
+def _update_task_error(task_id: str, error: str, *, run_token: Optional[str] = None) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
     try:
-        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        query = db.query(UnpackTask).filter(UnpackTask.id == task_id)
+        if run_token:
+            query = query.filter(UnpackTask.run_token == run_token)
+        task = query.first()
         if task is None:
+            return
+        if task.status not in (TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value):
             return
         task.status = TaskStatus.CANCELLED.value if task.status == TaskStatus.CANCELLING.value else TaskStatus.FAILED.value
         previous_owner_id = task.owner_id
         task.owner_id = None
         task.lease_expires_at = None
+        task.runner_pid = None
+        task.runner_started_at = None
+        task.runner_heartbeat_at = None
+        task.run_token = None
+        task.cancel_grace_deadline = None
+        task.cancel_force_deadline = None
         task.result_status = "cancelled" if task.status == TaskStatus.CANCELLED.value else "failed"
         task.result_message = error if task.status == TaskStatus.CANCELLED.value else task.result_message
         task.error_message = error
@@ -1816,6 +2148,31 @@ def stop() -> None:
 
 def shutdown() -> None:
     global _executor
+
+    from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        tasks = (
+            db.query(UnpackTask)
+            .filter(
+                UnpackTask.owner_id == owner_id,
+                UnpackTask.status.in_([TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]),
+            )
+            .all()
+        )
+    finally:
+        db.close()
+    for task in tasks:
+        if _is_process_alive(task.runner_pid):
+            _signal_task_runner(
+                task,
+                signal.SIGTERM,
+                event_type="runner_shutdown_sigterm_sent",
+                summary="服务停止，已向任务执行进程发送 SIGTERM",
+            )
 
     _cleanup_completed_futures()
     if _executor is not None:

@@ -65,6 +65,12 @@ class UnpackTask(Base):
     lease_expires_at = Column(DateTime, nullable=True, index=True)
     cancel_requested_at = Column(DateTime, nullable=True)
     last_progress_at = Column(DateTime, nullable=True)
+    runner_pid = Column(Integer, nullable=True, index=True)
+    runner_started_at = Column(DateTime, nullable=True)
+    runner_heartbeat_at = Column(DateTime, nullable=True)
+    run_token = Column(String(64), nullable=True, index=True)
+    cancel_grace_deadline = Column(DateTime, nullable=True)
+    cancel_force_deadline = Column(DateTime, nullable=True)
     result_status = Column(String(32), nullable=True)
     result_message = Column(Text, nullable=True)
     rounds = Column(Integer, nullable=True)
@@ -108,6 +114,11 @@ class UnpackTask(Base):
             "lease_expires_at": isoformat_local(self.lease_expires_at),
             "cancel_requested_at": isoformat_local(self.cancel_requested_at),
             "last_progress_at": isoformat_local(self.last_progress_at),
+            "runner_pid": self.runner_pid,
+            "runner_started_at": isoformat_local(self.runner_started_at),
+            "runner_heartbeat_at": isoformat_local(self.runner_heartbeat_at),
+            "cancel_grace_deadline": isoformat_local(self.cancel_grace_deadline),
+            "cancel_force_deadline": isoformat_local(self.cancel_force_deadline),
             "result_status": self.result_status,
             "result_message": self.result_message,
             "rounds": self.rounds,
@@ -256,6 +267,8 @@ DEFAULT_CONFIGS = [
     ("task_lease_seconds", "45", "int", "任务租约秒数"),
     ("task_lease_renew_interval_seconds", "10", "int", "任务租约续期间隔秒数"),
     ("cancel_timeout_seconds", "120", "int", "任务取消最长等待秒数"),
+    ("cancel_grace_seconds", "10", "int", "取消后发送 SIGTERM 的宽限秒数"),
+    ("cancel_force_seconds", "30", "int", "取消后强制 SIGKILL 的最长等待秒数"),
     ("llm_config_file_key_executor", "", "string", "固件解包通用执行器角色绑定的 models.json 配置文件 key"),
     ("llm_model_executor", "", "string", "固件解包通用执行器角色绑定的模型；留空则使用配置文件默认模型"),
     ("llm_config_file_key_reviewer", "", "string", "固件解包评审器角色绑定的 models.json 配置文件 key"),
@@ -353,6 +366,12 @@ def _ensure_unpack_task_columns() -> None:
         "lease_expires_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN lease_expires_at DATETIME",
         "cancel_requested_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN cancel_requested_at DATETIME",
         "last_progress_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN last_progress_at DATETIME",
+        "runner_pid": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN runner_pid INTEGER",
+        "runner_started_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN runner_started_at DATETIME",
+        "runner_heartbeat_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN runner_heartbeat_at DATETIME",
+        "run_token": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN run_token VARCHAR(64)",
+        "cancel_grace_deadline": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN cancel_grace_deadline DATETIME",
+        "cancel_force_deadline": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN cancel_force_deadline DATETIME",
         "matched_skill": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill VARCHAR(512)",
         "matched_skill_version": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill_version INTEGER",
         "matched_skill_score": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN matched_skill_score INTEGER",

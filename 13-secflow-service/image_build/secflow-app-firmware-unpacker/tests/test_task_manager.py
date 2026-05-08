@@ -212,6 +212,112 @@ class TaskManagerLeaseTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_schedule_pending_task_starts_subprocess_runner(self):
+        self._add_task("t-spawn", status=TaskStatus.PENDING.value)
+
+        class _FakePopen:
+            def __init__(self, args, **kwargs):
+                self.args = args
+                self.kwargs = kwargs
+                self.pid = 4321
+
+        launched = []
+
+        def _fake_popen(args, **kwargs):
+            proc = _FakePopen(args, **kwargs)
+            launched.append(proc)
+            return proc
+
+        with patch("app.services.task_manager.subprocess.Popen", side_effect=_fake_popen):
+            task_manager_module._schedule_pending_tasks()
+
+        self.assertEqual(1, len(launched))
+        self.assertIn("-m", launched[0].args)
+        self.assertIn("app.task_runner", launched[0].args)
+        self.assertTrue(launched[0].kwargs.get("start_new_session"))
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-spawn").first()
+            self.assertEqual(TaskStatus.RUNNING.value, task.status)
+            self.assertEqual("pod-a:123:owner", task.owner_id)
+            self.assertEqual(4321, task.runner_pid)
+            self.assertIsNotNone(task.runner_started_at)
+            self.assertIsNotNone(task.runner_heartbeat_at)
+            self.assertIsNotNone(task.run_token)
+        finally:
+            db.close()
+
+    def test_cancel_running_task_sets_deadlines_and_signals_runner(self):
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTask(
+                    id="t-cancel-running",
+                    project_id="p1",
+                    firmware_path="/tmp/fw.bin",
+                    output_path="/tmp/output",
+                    status=TaskStatus.RUNNING.value,
+                    owner_id="pod-a:123:owner",
+                    current_stage="llm_unpack",
+                    runner_pid=4321,
+                    run_token="token-new",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with patch("app.services.task_manager._signal_runner_process", return_value=True) as mocked_signal:
+            ok, message = task_manager_module.cancel_task("t-cancel-running")
+
+        self.assertTrue(ok)
+        self.assertIn("取消", message)
+        mocked_signal.assert_called_with(4321, task_manager_module.signal.SIGTERM)
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-cancel-running").first()
+            self.assertEqual(TaskStatus.CANCELLING.value, task.status)
+            self.assertIsNotNone(task.cancel_requested_at)
+            self.assertIsNotNone(task.cancel_grace_deadline)
+            self.assertIsNotNone(task.cancel_force_deadline)
+        finally:
+            db.close()
+
+    def test_stale_run_token_cannot_overwrite_current_task(self):
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTask(
+                    id="t-token-guard",
+                    project_id="p1",
+                    firmware_path="/tmp/fw.bin",
+                    output_path="/tmp/output",
+                    status=TaskStatus.RUNNING.value,
+                    owner_id="pod-a:123:owner",
+                    current_stage="llm_unpack",
+                    run_token="token-current",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        task_manager_module._update_task_result(
+            "t-token-guard",
+            {"status": "success", "message": "should be ignored"},
+            run_token="token-stale",
+        )
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-token-guard").first()
+            self.assertEqual(TaskStatus.RUNNING.value, task.status)
+            self.assertEqual("token-current", task.run_token)
+            self.assertIsNone(task.completed_at)
+        finally:
+            db.close()
 
     def test_recover_orphaned_running_task_marks_failed(self):
         from datetime import datetime, timedelta

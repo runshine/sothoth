@@ -97,6 +97,8 @@ class WorkerConfig(BaseModel):
     task_lease_seconds: int = 45
     task_lease_renew_interval_seconds: int = 10
     cancel_timeout_seconds: int = 120
+    cancel_grace_seconds: int = 10
+    cancel_force_seconds: int = 30
 
 
 class RegistryMenuLevelConfig(BaseModel):
