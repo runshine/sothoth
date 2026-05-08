@@ -373,35 +373,57 @@ def _mark_task_stage(task_id: str, stage: str) -> None:
         db.close()
 
 
+def _parse_llm_binding_snapshot(snapshot_raw: str | None) -> dict | None:
+    if not snapshot_raw:
+        return None
+    try:
+        payload = json.loads(snapshot_raw)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _build_llm_binding_snapshot(db) -> dict:
     from app.services.configcenter import get_configcenter_client
-
-    from app.unpacker_engine import ROLE_CONFIG_KEYS
+    from app.unpacker_engine import (
+        ROLE_CONFIG_FILE_KEYS,
+        ROLE_MODEL_CONFIG_KEYS,
+        _build_settings_json,
+        _resolve_provider_selector,
+    )
 
     from app.model import get_config_value
 
     roles: dict[str, dict] = {}
     client = get_configcenter_client()
-    for role, config_key in ROLE_CONFIG_KEYS.items():
-        provider_key = str(get_config_value(db, config_key, default="") or "").strip()
-        if not provider_key:
-            raise ValueError(f"未配置角色 {role} 的 LLM Provider")
-        provider = client.get_llm_provider(provider_key)
+    frozen_at = datetime.utcnow().isoformat()
+    for role, config_key in ROLE_CONFIG_FILE_KEYS.items():
+        config_file_key = str(get_config_value(db, config_key, default="") or "").strip()
+        if not config_file_key:
+            raise ValueError(f"LLM 角色 {role} 未配置 config_file_key")
+
+        config_file = client.get_llm_config_file(config_file_key)
+        configured_model = str(get_config_value(db, ROLE_MODEL_CONFIG_KEYS.get(role, ""), default="") or "").strip()
+        selected_provider_key, resolved_model, model_selector = _resolve_provider_selector(
+            config_file_key,
+            str(config_file.get("default_model") or "").strip(),
+            configured_model or None,
+        )
         roles[role] = {
-            "provider_key": str(provider.get("provider_key") or "").strip(),
-            "provider_type": str(provider.get("provider_type") or "").strip(),
-            "api_base": str(provider.get("api_base") or "").strip(),
-            "api_key": str(provider.get("api_key") or "").strip(),
-            "model": str(provider.get("model") or "").strip(),
-            "api_version": str(provider.get("api_version") or "").strip(),
-            "max_tokens": provider.get("max_tokens"),
-            "env_bindings": provider.get("env_bindings") if isinstance(provider.get("env_bindings"), dict) else {},
-            "updated_at": str(provider.get("updated_at") or "").strip() or None,
+            "config_file_key": config_file_key,
+            "provider_key": selected_provider_key,
+            "display_name": str(config_file.get("display_name") or "").strip() or config_file_key,
+            "model": resolved_model,
+            "model_selector": model_selector,
+            "models_json": config_file.get("models_json"),
+            "settings_json": _build_settings_json(selected_provider_key, "auto"),
+            "frozen_at": frozen_at,
+            "updated_at": str(config_file.get("updated_at") or "").strip() or None,
         }
 
     return {
-        "version": 1,
-        "frozen_at": datetime.utcnow().isoformat(),
+        "version": 2,
+        "frozen_at": frozen_at,
         "roles": roles,
     }
 
@@ -674,6 +696,7 @@ def submit_unpack_task(
     firmware_path: str,
     output_path: Optional[str] = None,
     project_id: Optional[str] = None,
+    llm_binding_snapshot: Optional[dict] = None,
     task_origin_type: Optional[str] = None,
     parent_project_id: Optional[str] = None,
     parent_task_id: Optional[str] = None,
@@ -694,7 +717,7 @@ def submit_unpack_task(
     prepared = prepare_task_workspace(normalized_project_id, task_id, firmware_path)
     db = get_db_session()
     try:
-        llm_binding_snapshot = _build_llm_binding_snapshot(db)
+        effective_snapshot = llm_binding_snapshot or _build_llm_binding_snapshot(db)
         db.add(
             UnpackTask(
                 id=task_id,
@@ -709,7 +732,7 @@ def submit_unpack_task(
                 firmware_path=firmware_path,
                 output_path=prepared["output_path"],
                 status=TaskStatus.PENDING.value,
-                llm_binding_snapshot=json.dumps(llm_binding_snapshot, ensure_ascii=False),
+                llm_binding_snapshot=json.dumps(effective_snapshot, ensure_ascii=False),
                 current_stage="pending",
                 last_progress_at=datetime.utcnow(),
             )
@@ -726,6 +749,7 @@ def submit_unpack_task(
                 "firmware_path": firmware_path,
                 "output_path": prepared["output_path"],
                 "task_origin_type": normalized_origin_type,
+                "llm_binding_snapshot_frozen_at": effective_snapshot.get("frozen_at") if isinstance(effective_snapshot, dict) else None,
             },
             created_by="task_manager",
         )
@@ -818,6 +842,7 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
         new_task = submit_unpack_task(
             firmware_path=task.firmware_path,
             project_id=task.project_id,
+            llm_binding_snapshot=_parse_llm_binding_snapshot(task.llm_binding_snapshot),
             task_origin_type=task.task_origin_type,
             parent_project_id=task.parent_project_id,
             parent_task_id=task.parent_task_id,
@@ -1143,8 +1168,9 @@ def _run_claimed_task(task_id: str) -> None:
 
         os.makedirs(runtime_paths["output_path"], exist_ok=True)
         result = run_unpack(
-            runtime_paths["input_path"],
-            runtime_paths["output_path"],
+            task_id=task_id,
+            firmware_path=runtime_paths["input_path"],
+            output_path=runtime_paths["output_path"],
             llm_binding_snapshot=llm_binding_snapshot,
             cancel_check=lambda: _should_cancel(task_id),
             register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),

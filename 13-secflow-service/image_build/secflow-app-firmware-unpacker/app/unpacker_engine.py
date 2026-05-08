@@ -30,6 +30,7 @@ from app.skill_store import (
 
 log = logging.getLogger("unpacker.engine")
 debug_mode = True
+_STREAM_LOG_STATE: dict[str, dict[str, Any]] = {}
 
 AGENT_DIR = Path(
     os.environ.get(
@@ -52,15 +53,20 @@ AUTHOR_PROMPT_TMPL = AGENT_DIR / "prompt" / "author-firmware-skill.md"
 TOOLS_DIR = Path(os.environ.get("UNPACKER_TOOLS_DIR", "/data/secflow-app-firmware-unpacker/tools"))
 LOG_OUTPUT_DIR = Path(os.environ.get("UNPACKER_LOG_DIR", "/workspace/log_output"))
 PI_AGENT_DIR_ENV = "PI_CODING_AGENT_DIR"
-PI_MODELS_JSON_ENV = "PI_MODELS_JSON"
-ROLE_CONFIG_KEYS = {
-    "executor": "llm_provider_key_executor",
-    "reviewer": "llm_provider_key_reviewer",
-    "cleaner": "llm_provider_key_cleaner",
-    "skill_author": "llm_provider_key_skill_author",
-    "skill_executor": "llm_provider_key_skill_executor",
+ROLE_CONFIG_FILE_KEYS = {
+    "executor": "llm_config_file_key_executor",
+    "reviewer": "llm_config_file_key_reviewer",
+    "cleaner": "llm_config_file_key_cleaner",
+    "skill_author": "llm_config_file_key_skill_author",
+    "skill_executor": "llm_config_file_key_skill_executor",
 }
-
+ROLE_MODEL_CONFIG_KEYS = {
+    "executor": "llm_model_executor",
+    "reviewer": "llm_model_reviewer",
+    "cleaner": "llm_model_cleaner",
+    "skill_author": "llm_model_skill_author",
+    "skill_executor": "llm_model_skill_executor",
+}
 
 def _get_max_retries() -> int:
     try:
@@ -82,85 +88,17 @@ def _preview_text(text: str, limit: int = 240) -> str:
     return compact[:limit] + "..."
 
 
-def _provider_api(provider_type: str) -> str:
-    normalized = str(provider_type or "").strip().lower()
-    if normalized == "anthropic":
-        return "anthropic-messages"
-    return "openai-completions"
-
-
-def _provider_base_env(provider: dict[str, Any]) -> dict[str, str]:
-    provider_type = str(provider.get("provider_type") or "").strip().lower()
-    api_base = str(provider.get("api_base") or "").strip()
-    api_key = str(provider.get("api_key") or "").strip()
-    model = str(provider.get("model") or "").strip()
-    api_version = str(provider.get("api_version") or "").strip()
-
-    if provider_type == "openai-compatible":
-        return {"OPENAI_BASE_URL": api_base, "OPENAI_API_KEY": api_key, "OPENAI_MODEL": model}
-    if provider_type == "azure-openai":
-        return {
-            "AZURE_OPENAI_ENDPOINT": api_base,
-            "AZURE_OPENAI_API_KEY": api_key,
-            "AZURE_OPENAI_API_VERSION": api_version,
-            "AZURE_OPENAI_DEPLOYMENT": model,
-        }
-    if provider_type == "anthropic":
-        return {"ANTHROPIC_BASE_URL": api_base, "ANTHROPIC_AUTH_TOKEN": api_key, "ANTHROPIC_MODEL": model}
-    if provider_type == "deepseek":
-        return {"DEEPSEEK_BASE_URL": api_base, "DEEPSEEK_API_KEY": api_key, "DEEPSEEK_MODEL": model}
-    if provider_type == "qwen":
-        return {"QWEN_BASE_URL": api_base, "QWEN_API_KEY": api_key, "QWEN_MODEL": model}
-    if provider_type == "ollama":
-        return {"OLLAMA_BASE_URL": api_base, "OLLAMA_MODEL": model}
-    if provider_type == "moonshot":
-        return {"MOONSHOT_BASE_URL": api_base, "MOONSHOT_API_KEY": api_key, "MOONSHOT_MODEL": model}
-    return {"LLM_BASE_URL": api_base, "LLM_API_KEY": api_key, "LLM_MODEL": model}
-
-
-def _normalize_provider_env_bindings(provider: dict[str, Any]) -> dict[str, str]:
-    merged = {
-        key: value
-        for key, value in _provider_base_env(provider).items()
-        if str(key or "").strip()
-    }
-    custom_bindings = provider.get("env_bindings") if isinstance(provider.get("env_bindings"), dict) else {}
-    for raw_key, raw_value in custom_bindings.items():
-        key = str(raw_key or "").strip()
-        if not key:
-            continue
-        merged[key] = "" if raw_value is None else str(raw_value)
-    return merged
-
-
-def _detect_api_key_env_name(env_map: dict[str, str]) -> str:
-    for key in (
-        "OPENAI_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "AZURE_OPENAI_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "QWEN_API_KEY",
-        "MOONSHOT_API_KEY",
-        "LLM_API_KEY",
-    ):
-        if key in env_map:
-            return key
-    return "OPENAI_API_KEY"
-
-
 def _resolve_provider_model(provider_key: str, configured_model: str, explicit_model: str | None) -> str:
     requested = str(explicit_model or "").strip()
     provider_default_model = str(configured_model or "").strip()
     if not requested:
         if not provider_default_model:
             raise ValueError(f"LLM Provider {provider_key} 缺少默认 model")
+        if "/" in provider_default_model:
+            _, _, provider_default_model = provider_default_model.partition("/")
         return provider_default_model
     if "/" in requested:
-        prefix, _, model_id = requested.partition("/")
-        if str(prefix).strip() != provider_key:
-            raise ValueError(
-                f"显式模型 {requested} 与当前角色绑定的 Provider {provider_key} 不一致"
-            )
+        _, _, model_id = requested.partition("/")
         normalized_model = str(model_id or "").strip()
         if not normalized_model:
             raise ValueError(f"显式模型 {requested} 缺少 model_id")
@@ -168,32 +106,30 @@ def _resolve_provider_model(provider_key: str, configured_model: str, explicit_m
     return requested
 
 
-def _build_models_json(provider: dict[str, Any], resolved_model: str) -> dict[str, Any]:
-    provider_key = str(provider.get("provider_key") or "").strip()
-    api_base = str(provider.get("api_base") or "").strip()
-    if not provider_key or not api_base or not resolved_model:
-        raise ValueError("LLM Provider缺少provider_key/api_base/model")
-    api_key_env = _detect_api_key_env_name(_normalize_provider_env_bindings(provider))
-    return {
-        "providers": {
-            provider_key: {
-                "baseUrl": api_base.rstrip("/"),
-                "api": _provider_api(str(provider.get("provider_type") or "")),
-                "apiKey": api_key_env,
-                "models": [
-                    {
-                        "id": resolved_model,
-                        "name": resolved_model,
-                        "reasoning": False,
-                        "input": ["text"],
-                        "contextWindow": 128000,
-                        "maxTokens": provider.get("max_tokens") or 16384,
-                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                    }
-                ],
-            }
-        }
-    }
+def _resolve_provider_selector(provider_key: str, configured_model: str, explicit_model: str | None) -> tuple[str, str, str]:
+    requested = str(explicit_model or "").strip()
+    provider_default_model = str(configured_model or "").strip()
+    if requested:
+        if "/" in requested:
+            selected_provider, _, selected_model = requested.partition("/")
+            selected_provider = str(selected_provider or "").strip() or provider_key
+            selected_model = str(selected_model or "").strip()
+            if not selected_model:
+                raise ValueError(f"显式模型 {requested} 缺少 model_id")
+            return selected_provider, selected_model, f"{selected_provider}/{selected_model}"
+        resolved_model = _resolve_provider_model(provider_key, provider_default_model, requested)
+        return provider_key, resolved_model, f"{provider_key}/{resolved_model}"
+    if provider_default_model:
+        if "/" in provider_default_model:
+            selected_provider, _, selected_model = provider_default_model.partition("/")
+            selected_provider = str(selected_provider or "").strip() or provider_key
+            selected_model = str(selected_model or "").strip()
+            if not selected_model:
+                raise ValueError(f"默认模型 {provider_default_model} 缺少 model_id")
+            return selected_provider, selected_model, f"{selected_provider}/{selected_model}"
+        resolved_model = _resolve_provider_model(provider_key, provider_default_model, None)
+        return provider_key, resolved_model, f"{provider_key}/{resolved_model}"
+    raise ValueError(f"LLM Provider {provider_key} 缺少默认 model")
 
 
 def _build_settings_json(provider_key: str, resolved_model: str) -> dict[str, Any]:
@@ -439,6 +375,7 @@ class PiRpcClient:
         session_phase: str | None = None,
         session_round: int | None = None,
         session_skill_name: str | None = None,
+        task_id: str | None = None,
     ):
         self._cwd = self.resolve_cwd(cwd)
         self._system_prompt_file = system_prompt_file
@@ -456,6 +393,7 @@ class PiRpcClient:
         self._session_phase = str(session_phase or "").strip() or None
         self._session_round = session_round
         self._session_skill_name = str(session_skill_name or "").strip() or None
+        self._task_id = str(task_id or "").strip() or None
         self._session_status = "created"
         self._register_session("created")
         self._start()
@@ -491,64 +429,67 @@ class PiRpcClient:
         if self._provider_runtime is not None:
             return self._provider_runtime
 
-        config_key = ROLE_CONFIG_KEYS.get(self._provider_role)
+        config_key = ROLE_CONFIG_FILE_KEYS.get(self._provider_role)
         if not config_key:
             raise ValueError(f"未知 LLM Provider 角色: {self._provider_role}")
 
         if self._llm_binding_snapshot:
             roles = self._llm_binding_snapshot.get("roles") if isinstance(self._llm_binding_snapshot.get("roles"), dict) else {}
             provider = roles.get(self._provider_role) if isinstance(roles.get(self._provider_role), dict) else None
-            if provider is None:
-                raise ValueError(f"任务 LLM 快照缺少角色 {self._provider_role} 的配置")
-            provider_key = str(provider.get("provider_key") or "").strip()
-            if not provider_key:
-                raise ValueError(f"任务 LLM 快照中的角色 {self._provider_role} 缺少 provider_key")
-            resolved_model = _resolve_provider_model(
-                provider_key,
-                str(provider.get("model") or "").strip(),
-                self._model,
+            if provider is not None:
+                provider_key = str(provider.get("config_file_key") or provider.get("provider_key") or "").strip()
+                if provider_key:
+                    configured_model = str(provider.get("model_selector") or provider.get("model") or "").strip()
+                    selected_provider_key, resolved_model, cli_model = _resolve_provider_selector(
+                        provider_key,
+                        configured_model,
+                        self._model,
+                    )
+                    self._provider_runtime = {
+                        "config_file_key": str(provider.get("config_file_key") or provider_key).strip() or provider_key,
+                        "provider_key": provider_key,
+                        "resolved_model": resolved_model,
+                        "cli_model": cli_model,
+                        "env": {},
+                        "models_json": provider.get("models_json") if isinstance(provider.get("models_json"), dict) else {},
+                        "settings_json": provider.get("settings_json") if isinstance(provider.get("settings_json"), dict) else _build_settings_json(provider_key, resolved_model),
+                    }
+                    return self._provider_runtime
+            log.warning(
+                "llm binding snapshot missing usable provider for role %s, fallback to runtime defaults",
+                self._provider_role,
             )
-            env_map = _normalize_provider_env_bindings(provider)
-            env_map["SECFLOW_LLM_PROVIDER_KEY"] = provider_key
-            env_map["SECFLOW_LLM_PROVIDER_TYPE"] = str(provider.get("provider_type") or "").strip()
-            env_map["SECFLOW_LLM_MODEL"] = resolved_model
-            self._provider_runtime = {
-                "provider_key": provider_key,
-                "provider_type": str(provider.get("provider_type") or "").strip(),
-                "resolved_model": resolved_model,
-                "env": env_map,
-                "models_json": _build_models_json(provider, resolved_model),
-                "settings_json": _build_settings_json(provider_key, resolved_model),
-            }
-            return self._provider_runtime
+            return None
 
         from app.model import get_config_value, get_db_session
 
         db = get_db_session()
         try:
             provider_key = str(get_config_value(db, config_key, default="") or "").strip()
+            configured_model = str(get_config_value(db, ROLE_MODEL_CONFIG_KEYS.get(self._provider_role, ""), default="") or "").strip()
         finally:
             db.close()
         if not provider_key:
-            raise ValueError(f"未配置角色 {self._provider_role} 的 LLM Provider")
+            log.warning(
+                "runtime llm provider for role %s is not configured, fallback to default agent runtime",
+                self._provider_role,
+            )
+            return None
 
-        provider = get_configcenter_client().get_llm_provider(provider_key)
-        resolved_model = _resolve_provider_model(
+        provider = get_configcenter_client().get_llm_config_file(provider_key)
+        selected_provider_key, resolved_model, cli_model = _resolve_provider_selector(
             provider_key,
-            str(provider.get("model") or "").strip(),
+            configured_model or str(provider.get("default_model") or "").strip(),
             self._model,
         )
-        env_map = _normalize_provider_env_bindings(provider)
-        env_map["SECFLOW_LLM_PROVIDER_KEY"] = provider_key
-        env_map["SECFLOW_LLM_PROVIDER_TYPE"] = str(provider.get("provider_type") or "").strip()
-        env_map["SECFLOW_LLM_MODEL"] = resolved_model
         self._provider_runtime = {
-            "provider_key": provider_key,
-            "provider_type": str(provider.get("provider_type") or "").strip(),
+            "config_file_key": provider_key,
+            "provider_key": selected_provider_key,
             "resolved_model": resolved_model,
-            "env": env_map,
-            "models_json": _build_models_json(provider, resolved_model),
-            "settings_json": _build_settings_json(provider_key, resolved_model),
+            "cli_model": cli_model,
+            "env": {},
+            "models_json": provider.get("models_json") if isinstance(provider.get("models_json"), dict) else {},
+            "settings_json": _build_settings_json(selected_provider_key, "auto"),
         }
         return self._provider_runtime
 
@@ -556,8 +497,10 @@ class PiRpcClient:
         runtime = self._resolve_provider_runtime()
         if runtime is None:
             return None, {}
-        tmp_root = Path(tempfile.mkdtemp(prefix=f"fw-pi-{self._provider_role or 'runtime'}-"))
-        agent_dir = tmp_root / "agent"
+        agent_root = Path.home() / ".pi" / "agent"
+        task_dir_name = self._task_id or f"adhoc-{os.getpid()}"
+        config_file_key = str(runtime.get("config_file_key") or runtime.get("provider_key") or "default").replace("/", "_")
+        agent_dir = agent_root / "secflow-app-firmware-unpacker" / "tasks" / task_dir_name / "configs" / config_file_key
         agent_dir.mkdir(parents=True, exist_ok=True)
         (agent_dir / "models.json").write_text(
             json.dumps(runtime["models_json"], ensure_ascii=False, indent=2),
@@ -568,14 +511,14 @@ class PiRpcClient:
             encoding="utf-8",
         )
         (agent_dir / "auth.json").write_text("{}", encoding="utf-8")
-        self._agent_tmp_root = tmp_root
+        self._agent_tmp_root = agent_dir.parent
         self._agent_dir = agent_dir
         return agent_dir, dict(runtime["env"])
 
     def _start(self):
         try:
             agent_dir, runtime_env = self._prepare_agent_dir()
-            resolved_model = self._provider_runtime["resolved_model"] if self._provider_runtime else self._model
+            resolved_model = self._provider_runtime["cli_model"] if self._provider_runtime else self._model
             args = self.build_args(
                 system_prompt_file=self._system_prompt_file,
                 model=resolved_model,
@@ -586,7 +529,6 @@ class PiRpcClient:
             env = os.environ.copy()
             if agent_dir is not None:
                 env[PI_AGENT_DIR_ENV] = str(agent_dir)
-                env[PI_MODELS_JSON_ENV] = str(agent_dir / "models.json")
                 env.update(runtime_env)
             log_event(
                 log,
@@ -598,6 +540,7 @@ class PiRpcClient:
                 role=self._provider_role,
                 provider_key=(self._provider_runtime or {}).get("provider_key"),
                 model=resolved_model,
+                pi_coding_agent_dir=str(agent_dir) if agent_dir is not None else None,
             )
             self.proc = subprocess.Popen(
                 args,
@@ -825,9 +768,9 @@ class PiRpcClient:
             self._cleanup_agent_dir()
 
     def _cleanup_agent_dir(self) -> None:
-        if self._agent_tmp_root is None:
+        if self._agent_dir is None:
             return
-        shutil.rmtree(self._agent_tmp_root, ignore_errors=True)
+        shutil.rmtree(self._agent_dir, ignore_errors=True)
         self._agent_tmp_root = None
         self._agent_dir = None
 
@@ -1100,25 +1043,50 @@ def _append_stage_log(log_dir: Path | None, filename: str, message: str, **field
 
 
 def _append_stream_delta(log_dir: Path | None, filename: str, actor: str, event: dict[str, Any]) -> None:
-    if log_dir is None or event.get("type") != "message_update":
+    if log_dir is None:
         return
-    delta_info = event.get("assistantMessageEvent", {})
-    delta_type = str(delta_info.get("type") or "").strip()
-    delta = str(delta_info.get("delta") or "").rstrip()
-    if not delta_type or not delta:
+    event_type = str(event.get("type") or "").strip()
+    log_path = log_dir / filename
+    state_key = f"{log_path}:{actor}"
+    state = _STREAM_LOG_STATE.setdefault(
+        state_key,
+        {"open": False, "delta_type": None},
+    )
+
+    if event_type == "message_update":
+        delta_info = event.get("assistantMessageEvent", {})
+        delta_type = str(delta_info.get("type") or "").strip()
+        delta = str(delta_info.get("delta") or "")
+        if not delta_type or not delta:
+            return
+
+        label_map = {
+            "thinking_delta": "thinking",
+            "text_delta": "assistant",
+            "toolcall_delta": "toolcall",
+        }
+        rendered_type = label_map.get(delta_type, delta_type)
+        with log_path.open("a", encoding="utf-8") as fh:
+            if state.get("open") and state.get("delta_type") != delta_type:
+                fh.write("\n")
+                state["open"] = False
+            if not state.get("open"):
+                stamp = datetime.utcnow().isoformat()
+                fh.write(f"[{stamp}] [stream][{actor}][{rendered_type}] ")
+                state["open"] = True
+                state["delta_type"] = delta_type
+            fh.write(delta.replace("\r\n", "\n").replace("\r", "\n"))
         return
-    for line in delta.splitlines():
-        text = line.rstrip()
-        if not text:
-            continue
-        _append_stage_log(
-            log_dir,
-            filename,
-            f"[stream][{actor}][{delta_type}] {text}",
-        )
+
+    if event_type in {"message_end", "agent_end"} and state.get("open"):
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write("\n\n")
+        state["open"] = False
+        state["delta_type"] = None
 
 
 def _run_reviewer(
+    task_id: str,
     firmware_path: str,
     output_path: str,
     log_dir: Path | None,
@@ -1158,6 +1126,7 @@ def _run_reviewer(
         session_phase=session_artifacts["phase"],
         session_round=session_artifacts["round"],
         session_skill_name=session_artifacts["skill_name"],
+        task_id=task_id,
     )
     if bind_cancel_client:
         bind_cancel_client(validator)
@@ -1194,6 +1163,7 @@ def _write_system_prompt(content: str, prefix: str) -> str:
 
 
 def _run_skill_unpack(
+    task_id: str,
     skill_meta: dict[str, Any],
     firmware_path: str,
     output_path: str,
@@ -1236,6 +1206,7 @@ def _run_skill_unpack(
         session_phase=session_artifacts["phase"],
         session_round=session_artifacts["round"],
         session_skill_name=session_artifacts["skill_name"],
+        task_id=task_id,
     )
     if bind_cancel_client:
         bind_cancel_client(executor)
@@ -1243,6 +1214,7 @@ def _run_skill_unpack(
         exec_result = executor.prompt(render_prompt(EXEC_FIRST_TMPL, firmware_path, output_path))
         _save_agent_log(executor, log_dir, "skill_executor")
         passed, review_result = _run_reviewer(
+            task_id,
             firmware_path,
             output_path,
             log_dir,
@@ -1290,6 +1262,7 @@ def _run_skill_unpack(
 
 
 def _run_generic_unpack(
+    task_id: str,
     firmware_path: str,
     output_path: str,
     log_dir: Path | None,
@@ -1330,6 +1303,7 @@ def _run_generic_unpack(
         session_phase=session_artifacts["phase"],
         session_round=session_artifacts["round"],
         session_skill_name=session_artifacts["skill_name"],
+        task_id=task_id,
     )
     cancel_check(executor)
     passed = False
@@ -1362,6 +1336,7 @@ def _run_generic_unpack(
                     session_phase=round_artifacts["phase"],
                     session_round=round_artifacts["round"],
                     session_skill_name=round_artifacts["skill_name"],
+                    task_id=task_id,
                 )
                 cancel_check(executor)
             exec_msg = render_prompt(
@@ -1408,6 +1383,7 @@ def _run_generic_unpack(
                         transcript_file=transcript_path.name,
                     )
             passed, verify_result = _run_reviewer(
+                task_id,
                 firmware_path,
                 output_path,
                 log_dir,
@@ -1481,6 +1457,7 @@ def _extract_markdown_document(text: str) -> str:
 
 
 def _generate_candidate_skill(
+    task_id: str,
     firmware_path: str,
     output_path: str,
     features: dict[str, Any],
@@ -1534,6 +1511,7 @@ def _generate_candidate_skill(
             session_phase=session_artifacts["phase"],
             session_round=session_artifacts["round"],
             session_skill_name=session_artifacts["skill_name"],
+            task_id=task_id,
         )
         if bind_cancel_client:
             bind_cancel_client(author)
@@ -1588,6 +1566,7 @@ def _generate_candidate_skill(
 
 
 def _run_cleaner(
+    task_id: str,
     output_path: str,
     log_dir: Path | None = None,
     llm_binding_snapshot: dict[str, Any] | None = None,
@@ -1623,6 +1602,7 @@ def _run_cleaner(
         session_phase=session_artifacts["phase"],
         session_round=session_artifacts["round"],
         session_skill_name=session_artifacts["skill_name"],
+        task_id=task_id,
     )
     if bind_cancel_client:
         bind_cancel_client(cleaner)
@@ -1668,6 +1648,7 @@ def _run_cleaner(
 
 
 def run_unpack(
+    task_id: str,
     firmware_path: str,
     output_path: str,
     llm_binding_snapshot: dict[str, Any] | None = None,
@@ -1854,6 +1835,7 @@ def run_unpack(
                 family_id=skill_meta.get("family_id"),
             )
             skill_result = _run_skill_unpack(
+                task_id,
                 skill_meta,
                 firmware_path,
                 output_path,
@@ -1902,6 +1884,7 @@ def run_unpack(
         if not passed:
             _report_progress("llm_unpack")
             generic_passed, final_round, last_reason = _run_generic_unpack(
+                task_id,
                 firmware_path,
                 output_path,
                 log_dir,
@@ -1917,6 +1900,7 @@ def run_unpack(
             if passed:
                 _report_progress("review")
                 generated_skill = _generate_candidate_skill(
+                    task_id,
                     firmware_path,
                     output_path,
                     features,
@@ -1937,6 +1921,7 @@ def run_unpack(
         _check_cancel()
         _report_progress("cleanup")
         _run_cleaner(
+            task_id,
             output_path,
             log_dir=log_dir,
             llm_binding_snapshot=llm_binding_snapshot,

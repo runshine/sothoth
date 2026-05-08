@@ -23,6 +23,7 @@ from app.schemas import (
     ConfigListResponse,
     ConfigUpdateRequest,
     HealthResponse,
+    LlmConfigFileSummaryListResponse,
     LlmProviderSummaryListResponse,
     ReadyResponse,
     TaskEventListResponse,
@@ -685,6 +686,38 @@ def _list_llm_provider_summaries() -> dict:
     }
 
 
+def _list_llm_config_file_summaries() -> dict:
+    payload = get_configcenter_client().list_llm_config_files()
+    raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        model_options_raw = item.get("model_options") if isinstance(item.get("model_options"), list) else []
+        items.append(
+            {
+                "config_file_key": str(item.get("config_file_key") or "").strip(),
+                "display_name": str(item.get("display_name") or "").strip(),
+                "provider_type": str(item.get("provider_type") or "").strip(),
+                "enabled": bool(item.get("enabled", False)),
+                "is_default": bool(item.get("is_default", False)),
+                "default_model": str(item.get("default_model") or "").strip() or None,
+                "description": str(item.get("description") or "").strip() or None,
+                "updated_at": str(item.get("updated_at") or "").strip() or None,
+                "model_options": [
+                    {
+                        "value": str(option.get("value") or "").strip(),
+                        "label": str(option.get("label") or option.get("value") or "").strip(),
+                        "source": str(option.get("source") or "").strip() or None,
+                    }
+                    for option in model_options_raw
+                    if isinstance(option, dict) and str(option.get("value") or "").strip()
+                ],
+            }
+        )
+    return {"total": len(items), "items": items}
+
+
 @router.get("/health", response_model=HealthResponse)
 @router.get("/api/app/firmware-unpacker/health", response_model=HealthResponse)
 async def health_check():
@@ -719,6 +752,16 @@ async def get_llm_provider_summaries(
     subject_and_token: tuple[dict, str] = Depends(get_current_subject),
 ):
     return _list_llm_provider_summaries()
+
+
+@router.get(
+    "/api/app/firmware-unpacker/llm/config-files",
+    response_model=LlmConfigFileSummaryListResponse,
+)
+async def get_llm_config_file_summaries(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _list_llm_config_file_summaries()
 
 
 @router.get("/api/app/firmware-unpacker/tools", response_model=ToolListResponse)

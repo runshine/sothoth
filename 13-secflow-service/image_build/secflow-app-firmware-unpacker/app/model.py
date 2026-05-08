@@ -218,11 +218,16 @@ DEFAULT_CONFIGS = [
     ("task_lease_seconds", "45", "int", "任务租约秒数"),
     ("task_lease_renew_interval_seconds", "10", "int", "任务租约续期间隔秒数"),
     ("cancel_timeout_seconds", "120", "int", "任务取消最长等待秒数"),
-    ("llm_provider_key_executor", "", "string", "固件解包 LLM 执行器角色的配置中心 Provider Key，必须显式配置"),
-    ("llm_provider_key_reviewer", "", "string", "固件解包 LLM 评审器角色的配置中心 Provider Key，必须显式配置"),
-    ("llm_provider_key_cleaner", "", "string", "固件解包 LLM 清理器角色的配置中心 Provider Key，必须显式配置"),
-    ("llm_provider_key_skill_author", "", "string", "固件解包 LLM 技能生成器角色的配置中心 Provider Key，必须显式配置"),
-    ("llm_provider_key_skill_executor", "", "string", "固件解包命中技能后的执行器角色的配置中心 Provider Key，必须显式配置"),
+    ("llm_config_file_key_executor", "", "string", "固件解包通用执行器角色绑定的 models.json 配置文件 key"),
+    ("llm_model_executor", "", "string", "固件解包通用执行器角色绑定的模型；留空则使用配置文件默认模型"),
+    ("llm_config_file_key_reviewer", "", "string", "固件解包评审器角色绑定的 models.json 配置文件 key"),
+    ("llm_model_reviewer", "", "string", "固件解包评审器角色绑定的模型；留空则使用配置文件默认模型"),
+    ("llm_config_file_key_cleaner", "", "string", "固件解包清理器角色绑定的 models.json 配置文件 key"),
+    ("llm_model_cleaner", "", "string", "固件解包清理器角色绑定的模型；留空则使用配置文件默认模型"),
+    ("llm_config_file_key_skill_author", "", "string", "固件解包技能生成器角色绑定的 models.json 配置文件 key"),
+    ("llm_model_skill_author", "", "string", "固件解包技能生成器角色绑定的模型；留空则使用配置文件默认模型"),
+    ("llm_config_file_key_skill_executor", "", "string", "固件解包命中技能执行器角色绑定的 models.json 配置文件 key"),
+    ("llm_model_skill_executor", "", "string", "固件解包命中技能执行器角色绑定的模型；留空则使用配置文件默认模型"),
 ]
 
 

@@ -234,6 +234,29 @@ class LlmProviderSummaryListResponse(BaseModel):
     items: List[LlmProviderSummaryResponse]
 
 
+class LlmConfigFileModelOptionResponse(BaseModel):
+    value: str
+    label: str
+    source: Optional[str] = None
+
+
+class LlmConfigFileSummaryResponse(BaseModel):
+    config_file_key: str
+    display_name: str
+    provider_type: str
+    enabled: bool
+    is_default: bool
+    default_model: Optional[str] = None
+    description: Optional[str] = None
+    updated_at: Optional[str] = None
+    model_options: List[LlmConfigFileModelOptionResponse] = []
+
+
+class LlmConfigFileSummaryListResponse(BaseModel):
+    total: int
+    items: List[LlmConfigFileSummaryResponse]
+
+
 class ToolEntryResponse(BaseModel):
     filename: str
     path: str
