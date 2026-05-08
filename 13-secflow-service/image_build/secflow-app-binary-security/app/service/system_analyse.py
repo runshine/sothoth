@@ -29,6 +29,9 @@ class SystemAnalyseClient(JsonHttpClient):
     async def get_task(self, task_id: str) -> dict:
         return await self.get(f"/tasks/{task_id}")
 
+    async def get_task_result(self, task_id: str) -> dict:
+        return await self.get(f"/tasks/{task_id}/result")
+
     async def cancel_task(self, task_id: str) -> dict:
         return await self.post(f"/tasks/{task_id}/cancel")
 

@@ -33,6 +33,8 @@ class TaskPolicyOverrides(BaseModel):
     max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
     continue_on_item_failure: Optional[bool] = None
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
+    module_selection_mode: Optional[str] = None
+    module_risk_levels: Optional[list[str]] = None
 
 
 class BinarySecurityTaskCreate(BaseModel):
@@ -59,6 +61,8 @@ class BinarySecurityStageSummary(BaseModel):
     sequence_no: int
     status: str
     retry_count: int = 0
+    retry_supported: bool = False
+    retry_reason: Optional[str] = None
     total_items: int = 0
     success_items: int = 0
     failed_items: int = 0
@@ -87,11 +91,19 @@ class BinarySecurityTaskResponse(BaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     high_risk_module_count: int = 0
+    medium_risk_module_count: int = 0
+    low_risk_module_count: int = 0
+    candidate_module_count: int = 0
+    selected_module_count: int = 0
+    selected_risk_levels: list[str] = Field(default_factory=list)
+    module_selection_mode: str = "auto"
     entry_count: int = 0
     vuln_result_count: int = 0
     firmware_item_count: int = 0
     unpacked_firmware_count: int = 0
     failed_firmware_count: int = 0
+    task_retry_supported: bool = False
+    task_retry_reason: Optional[str] = None
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
 
 
@@ -170,6 +182,21 @@ class BinarySecurityActionResponse(BaseModel):
     cancelled_downstream_count: int = 0
     deleted_downstream_count: int = 0
     cleanup_status: Optional[str] = None
+
+
+class BinarySecurityModuleSelectionResponse(BaseModel):
+    task_id: str
+    status: str
+    selection_mode: str = "auto"
+    risk_levels: list[str] = Field(default_factory=list)
+    requires_confirmation: bool = False
+    system_analysis_modules: list[dict[str, Any]] = Field(default_factory=list)
+    candidate_modules: list[dict[str, Any]] = Field(default_factory=list)
+    selected_modules: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class BinarySecurityModuleSelectionConfirmPayload(BaseModel):
+    selected_module_keys: list[str] = Field(default_factory=list)
 
 
 class BinarySecurityProjectConfigPayload(BaseModel):

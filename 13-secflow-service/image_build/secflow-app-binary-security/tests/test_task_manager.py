@@ -1,15 +1,20 @@
+import asyncio
 import tempfile
 import unittest
 import zipfile
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from app.model import (
     BinarySecurityEvent,
+    BinarySecurityStageItem,
+    BinarySecurityStageRun,
     BinarySecurityTask,
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
 )
-from app.service.task_manager import TaskManager
+from app.service.task_manager import TaskManager, _now
 
 
 class _FakeQuery:
@@ -19,11 +24,20 @@ class _FakeQuery:
     def filter(self, *args, **kwargs):
         return self
 
+    def order_by(self, *args, **kwargs):
+        return self
+
     def all(self):
         return list(self._rows)
 
     def first(self):
         return self._rows[0] if self._rows else None
+
+    def scalar(self):
+        row = self.first()
+        if isinstance(row, (list, tuple)):
+            return row[0] if row else None
+        return row
 
 
 class _FakeDb:
@@ -40,6 +54,20 @@ class _FakeDb:
 
     def commit(self):
         self.commits += 1
+
+
+class _ModelAwareDb:
+    def __init__(self, *, stage_runs=None, stage_items=None):
+        self.stage_runs = list(stage_runs or [])
+        self.stage_items = list(stage_items or [])
+
+    def query(self, model, *args, **kwargs):
+        model_name = getattr(model, "__name__", "")
+        if model_name == "BinarySecurityStageRun":
+            return _FakeQuery(self.stage_runs)
+        if model_name == "BinarySecurityStageItem":
+            return _FakeQuery(self.stage_items)
+        return _FakeQuery([])
 
 
 class _StageRun:
@@ -189,7 +217,7 @@ class TaskManagerTests(unittest.TestCase):
     def test_source_entry_analysis_inputs_come_from_high_risk_modules(self):
         task = BinarySecurityTask(id="s1", project_id="p1", name="source-task", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/src", output_root="/o", workspace_root="/w")
         task.summary = {
-            "high_risk_modules": [
+            "selected_modules": [
                 {"module_key": "m1", "module_name": "module1", "source_dir": "/src/module1"},
             ],
             "b2s_results": [
@@ -201,6 +229,70 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual(1, len(rows))
         self.assertEqual("m1", rows[0]["module_key"])
+
+    def test_filter_candidate_modules_by_risk_levels(self):
+        modules = [
+            {"module_key": "h1", "risk_level": "高"},
+            {"module_key": "m1", "risk_level": "中"},
+            {"module_key": "l1", "risk_level": "低"},
+        ]
+
+        rows = self.manager._filter_candidate_modules(modules, ["高", "中"])
+
+        self.assertEqual(["h1", "m1"], [row["module_key"] for row in rows])
+
+    def test_confirm_module_selection_updates_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_SOURCE,
+            status="pending_module_confirmation",
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "candidate_modules": [
+                {"module_key": "m1", "module_name": "module1", "risk_level": "高"},
+                {"module_key": "m2", "module_name": "module2", "risk_level": "中"},
+            ],
+            "selected_modules": [],
+        }
+        task.policy = {"module_selection_mode": "manual_confirm", "module_risk_levels": ["高", "中"]}
+
+        class _TaskDb(_FakeDb):
+            def __init__(self, task_row):
+                super().__init__([task_row])
+                self.task_row = task_row
+
+            def query(self, model, *args, **kwargs):
+                class _Query(_FakeQuery):
+                    def filter(self, *args, **kwargs):
+                        return self
+                    def order_by(self, *args, **kwargs):
+                        return self
+                if getattr(model, "__name__", "") == "BinarySecurityTask":
+                    return _Query([self.task_row])
+                if getattr(model, "__name__", "") == "BinarySecurityStageRun":
+                    return _Query([])
+                return _Query([])
+
+        db = _TaskDb(task)
+        detail = self.manager.confirm_module_selection(
+            db,
+            project_id="p1",
+            task_id="t1",
+            selected_module_keys=["m2"],
+        )
+
+        self.assertEqual("pending", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual(1, task.metrics["selected_module_count"])
+        self.assertEqual(["m2"], [item["module_key"] for item in task.summary["selected_modules"]])
+        self.assertEqual(1, detail.selected_module_count)
 
     def test_normalize_source_input_files_rejects_duplicate_relative_paths(self):
         with self.assertRaisesRegex(Exception, "重复文件名"):
@@ -249,9 +341,11 @@ class TaskManagerTests(unittest.TestCase):
                 "temp_upload_dir": "/app/secflow-app-binary-security/s1/run/upload-tmp",
             }
 
-            files, total_bytes, extracted_count = self.manager._materialize_source_archives(
-                task,
-                [{"filename": "source.zip", "relative_path": "source.zip"}],
+            files, total_bytes, extracted_count = asyncio.run(
+                self.manager._materialize_source_archives(
+                    task,
+                    [{"filename": "source.zip", "relative_path": "source.zip"}],
+                )
             )
 
             self.assertEqual(1, len(files))
@@ -350,6 +444,207 @@ class TaskManagerTests(unittest.TestCase):
             ],
             refs,
         )
+
+    def test_stage_retry_support_requires_downstream_task_id(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_run = SimpleNamespace(task_id="task1", stage_name="firmware_unpack", status="failed")
+        stage_item = SimpleNamespace(
+            task_id="task1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            parent_key="fw1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id=None,
+            created_at=1,
+        )
+
+        supported, reason = self.manager._stage_retry_support(
+            _ModelAwareDb(stage_runs=[stage_run], stage_items=[stage_item]),
+            task,
+            "firmware_unpack",
+        )
+
+        self.assertFalse(supported)
+        self.assertIn("缺少下游任务ID", reason or "")
+
+    def test_stage_retry_support_rejects_duplicate_history_items(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_run = SimpleNamespace(task_id="task1", stage_name="firmware_unpack", status="failed")
+        item1 = SimpleNamespace(
+            task_id="task1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            parent_key="fw1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="down-1",
+            created_at=1,
+        )
+        item2 = SimpleNamespace(
+            task_id="task1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            parent_key="fw1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="down-2",
+            created_at=2,
+        )
+
+        supported, reason = self.manager._stage_retry_support(
+            _ModelAwareDb(stage_runs=[stage_run], stage_items=[item1, item2]),
+            task,
+            "firmware_unpack",
+        )
+
+        self.assertFalse(supported)
+        self.assertIn("重复历史 item", reason or "")
+
+    def test_task_retry_support_targets_first_failed_stage(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_runs = [
+            SimpleNamespace(task_id="task1", stage_name="firmware_unpack", status="success"),
+            SimpleNamespace(task_id="task1", stage_name="system_analysis", status="failed"),
+        ]
+        stage_items = [
+            SimpleNamespace(
+                task_id="task1",
+                stage_name="system_analysis",
+                item_key="fw1",
+                parent_key="fw1",
+                downstream_service="system_analyse",
+                downstream_task_id="sa-1",
+                created_at=1,
+            ),
+        ]
+
+        supported, reason, stage_name = self.manager._task_retry_support(
+            _ModelAwareDb(stage_runs=stage_runs, stage_items=stage_items),
+            task,
+        )
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+        self.assertEqual("system_analysis", stage_name)
+
+    def test_reclaim_stale_running_task_marks_stage_and_items_failed(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="firmware_unpack",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.dispatch_started_at = _now()
+        task.updated_at = task.dispatch_started_at - timedelta(seconds=360)
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="firmware_unpack",
+            item_key="fw1",
+            status="running",
+        )
+
+        class _ReclaimDb(_FakeDb):
+            def query(self, model, *args, **kwargs):
+                model_name = getattr(model, "__name__", "")
+                if model_name == "BinarySecurityTask":
+                    return _FakeQuery([task])
+                if model_name == "BinarySecurityStageRun":
+                    return _FakeQuery([stage_run])
+                if model_name == "BinarySecurityStageItem":
+                    return _FakeQuery([item])
+                return _FakeQuery([])
+
+            def flush(self):
+                pass
+
+        original_loader = self.manager._load_service_config
+        self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
+        try:
+            reclaimed = self.manager._reclaim_stale_running_locked(_ReclaimDb())
+        finally:
+            self.manager._load_service_config = original_loader
+
+        self.assertTrue(reclaimed)
+        self.assertEqual("failed", task.status)
+        self.assertEqual("failed", stage_run.status)
+        self.assertEqual("failed", item.status)
+        self.assertIsNotNone(task.finished_at)
+        self.assertIn("心跳超时", task.last_error or "")
+
+    def test_run_stage_pool_retries_existing_path_after_first_failure(self):
+        calls: list[bool] = []
+
+        async def runner(item, retrying=False):
+            del item
+            calls.append(bool(retrying))
+            if len(calls) < 3:
+                return {"status": "failed"}
+            return {"status": "success"}
+
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+
+        original_is_cancelled = self.manager._is_task_cancelled
+        self.manager._is_task_cancelled = lambda task_id: False
+        results = asyncio.run(self.manager._run_stage_pool(task, [{"id": 1}], 1, runner, retries=2))
+        self.manager._is_task_cancelled = original_is_cancelled
+
+        self.assertEqual("success", results[0]["status"])
+        self.assertEqual([False, True, True], calls)
 
 
 if __name__ == "__main__":

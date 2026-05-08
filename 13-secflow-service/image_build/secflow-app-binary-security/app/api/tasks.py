@@ -12,6 +12,8 @@ from app.model import get_db
 from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityArtifactsResponse,
+    BinarySecurityModuleSelectionConfirmPayload,
+    BinarySecurityModuleSelectionResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
@@ -210,15 +212,30 @@ async def retry_stage(
     return BinarySecurityActionResponse(task_id=task_id, message=f"阶段 {stage_name} 已重新排队")
 
 
-@router.post("/projects/{project_id}/tasks/{task_id}/resume", response_model=BinarySecurityActionResponse)
-async def resume_task(
+@router.get("/projects/{project_id}/tasks/{task_id}/module-selection", response_model=BinarySecurityModuleSelectionResponse)
+async def get_module_selection(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    get_task_manager().resume_task(db, project_id=project_id, task_id=task_id)
-    return BinarySecurityActionResponse(task_id=task_id, message="任务已继续执行")
+    return get_task_manager().get_module_selection(db, project_id=project_id, task_id=task_id)
+
+
+@router.post("/projects/{project_id}/tasks/{task_id}/module-selection/confirm", response_model=BinarySecurityTaskDetailResponse)
+async def confirm_module_selection(
+    project_id: str,
+    task_id: str,
+    payload: BinarySecurityModuleSelectionConfirmPayload,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().confirm_module_selection(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        selected_module_keys=payload.selected_module_keys,
+    )
 
 
 @router.get("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
