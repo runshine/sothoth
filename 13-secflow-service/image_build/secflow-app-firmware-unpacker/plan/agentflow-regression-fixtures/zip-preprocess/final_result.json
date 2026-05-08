@@ -1,0 +1,23 @@
+{
+  "status": "success",
+  "message": "Unpacking verified successfully",
+  "rounds": 0,
+  "matched_skill": null,
+  "matched_skill_version": null,
+  "matched_skill_score": null,
+  "fallback_to_llm": false,
+  "generated_skill_path": null,
+  "generated_skill_status": null,
+  "promotion_success_count": null,
+  "agentflow_run_id": "fixture-zip-preprocess",
+  "node_attempts": {
+    "preprocess": {
+      "attempt_count": 1,
+      "duration_seconds": 0.1
+    }
+  },
+  "failure_summary": {
+    "failed_nodes": []
+  },
+  "total_tokens": 0
+}

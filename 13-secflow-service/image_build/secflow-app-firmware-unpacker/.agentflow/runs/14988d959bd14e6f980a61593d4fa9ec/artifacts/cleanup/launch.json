@@ -1,0 +1,16 @@
+{
+  "attempt": 1,
+  "kind": "process",
+  "command": [
+    "python3",
+    "-c",
+    "import hashlib\nimport json\nfrom pathlib import Path\n\npayload = json.loads(r'''{\"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}''')\noutput = Path(payload['output_path'])\nremoved_files = []\nremoved_dirs = []\nfor path in sorted(output.rglob('*')):\n    try:\n        if path.is_file() and path.stat().st_size == 0:\n            path.unlink()\n            removed_files.append(str(path.relative_to(output)))\n    except OSError:\n        continue\nfor path in sorted([p for p in output.rglob('*') if p.is_dir()], reverse=True):\n    try:\n        if any(path.iterdir()):\n            continue\n        path.rmdir()\n        removed_dirs.append(str(path.relative_to(output)))\n    except OSError:\n        continue\nprint(json.dumps({'removed_files': removed_files, 'removed_dirs': removed_dirs}, ensure_ascii=False))"
+  ],
+  "env": {
+    "PYTHONPATH": "/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker:/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/app:.:app:agentflow"
+  },
+  "cwd": "/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc",
+  "stdin": null,
+  "runtime_files": [],
+  "payload": null
+}

@@ -1,0 +1,20 @@
+{
+  "attempt": 1,
+  "kind": "process",
+  "command": [
+    "pi",
+    "--print",
+    "--mode",
+    "json",
+    "--no-session",
+    "--tools",
+    "read,bash,edit,write,grep,find,ls",
+    "--append-system-prompt",
+    "/tmp/tmp24nv8ikq.md"
+  ],
+  "env": {},
+  "cwd": "/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-rerun-unified/S6730_V200R024C00SPC500.cc",
+  "stdin": "Output protocol: print exactly one final marker line when skipping.\n- If Preprocess contains JSON with success=true, do not call tools and print exactly: AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_BY_PREPROCESS\n- If Skill gate contains matched=false, do not call tools and print exactly: AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_NO_SKILL\nOtherwise read only the matched skill file path shown by Skill gate and use that file as the reusable skill guidance. Do not read the full feature match JSON.\nMandatory runtime constraints override the skill guidance:\n- Never run recursive extraction that can explode the output tree. Do not use `binwalk -eM` or `binwalk -e -M`.\n- Run binwalk as `binwalk \"$firmware\" > \"$output/binwalk.txt\"` and inspect it only with bounded shell commands such as `grep ... | head` or `sed -n`.\n- For byte-offset `dd` extraction, use `bs=4M iflag=skip_bytes,count_bytes skip=<offset> count=<size> status=none`; do not use `bs=1` for large payloads.\n- Keep large extracted trees under `$output/binwalk_extract`; do not recursively copy the whole tree back into `$output`.\n- After writing a non-empty `$output/summary.txt`, stop immediately and print exactly: AGENTFLOW_SKILL_DONE.\nTask variables:\n$input = /home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2\n$firmware = /home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\n$output = /home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-rerun-unified/S6730_V200R024C00SPC500.cc/output\nUse $output exactly as the output directory. Do not write results to its parent directory.\nSkill gate: AGENTFLOW_SKILL_GATE matched=false reason=SKIPPED_NO_SKILL\nPreprocess: {\"success\": false, \"method\": null}",
+  "runtime_files": [],
+  "payload": null
+}

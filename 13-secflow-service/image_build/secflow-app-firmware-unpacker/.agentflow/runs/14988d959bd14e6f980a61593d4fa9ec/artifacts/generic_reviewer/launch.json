@@ -1,0 +1,16 @@
+{
+  "attempt": 1,
+  "kind": "process",
+  "command": [
+    "python3",
+    "-c",
+    "import json\nfrom pathlib import Path\n\npayload = json.loads(r'''{\"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}''')\nexecutor_status = r'''completed'''.strip()\nexecutor_output = r'''AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_BY_SKILL_SUCCESS'''\nif 'AGENTFLOW_EXECUTOR_SKIPPED' in executor_output or 'SKIPPED' in executor_output:\n    reason = 'SKIPPED'\n    if 'reason=' in executor_output:\n        reason = executor_output.split('reason=', 1)[1].split()[0].strip()\n    print(f'AGENTFLOW_REVIEW_SKIPPED reason={reason}')\nelif executor_status != 'completed':\n    print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=executor_failed')\nelse:\n    output = Path(payload['output_path'])\n    summary = output / 'summary.txt'\n    artifacts = [p for p in output.rglob('*') if p.is_file() and p.name not in {'summary.txt', 'reason.txt'}]\n    if not summary.is_file() or summary.stat().st_size == 0:\n        print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=missing_summary')\n    elif not artifacts:\n        print('AGENTFLOW_REVIEW_FAIL category=CONTENT_MISSING reason=empty_output')\n    else:\n        print('AGENTFLOW_REVIEW_SUCCESS')"
+  ],
+  "env": {
+    "PYTHONPATH": "/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker:/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/app:.:app:agentflow"
+  },
+  "cwd": "/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc",
+  "stdin": null,
+  "runtime_files": [],
+  "payload": null
+}

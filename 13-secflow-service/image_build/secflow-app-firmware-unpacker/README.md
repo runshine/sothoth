@@ -75,13 +75,15 @@ agentflow:
 - `AGENTFLOW_GRAPH_OPTIMIZATION_ENABLED=false`
 - `AGENTFLOW_GRAPH_OPTIMIZATION_ROUNDS=1`
 
-AgentFlow 运行日志写入任务 `run/agentflow/runs/<run_id>/`，任务响应会返回 `agentflow_run_id` 和 `run_path`。图级优化只会在 `profile` 为 `test` 或 `staging` 且显式开启优化轮次时运行；优化产物由 AgentFlow 写入对应 run 目录。
+AgentFlow 运行日志统一写入 `agentflow.runs_dir/<run_id>/`，任务目录 `run/` 仅保留 `agentflow_run_id.txt`、`agentflow_run_dir.txt`、阶段日志和最终结果。任务响应会返回 `agentflow_run_id`、`agentflow_run_dir` 和任务日志目录 `run_path`。图级优化只会在 `profile` 为 `test` 或 `staging` 且显式开启优化轮次时运行；优化产物由 AgentFlow 写入统一 run 目录。
 
 离线回归评测入口：
 
 ```bash
 scripts/agentflow_regression_eval.py --manifest plan/agentflow-regression-samples.json
 ```
+
+该命令会读取固定样本 manifest、校验每个样本的期望结果，并按 manifest 中的阈值执行门禁；不通过时返回非零退出码。
 
 从已归档 run 手工沉淀候选 skill：
 

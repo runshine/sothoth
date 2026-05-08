@@ -168,9 +168,13 @@ assert detail["agentflow_run_id"], detail
 assert agentflow["status"] == "completed", agentflow
 
 run_path = root / "files" / Path(detail["run_path"]).relative_to("/data/files")
+assert detail["agentflow_run_dir"] == agentflow["agentflow_run_dir"], (detail, agentflow)
+agentflow_run_dir = root / "files" / Path(agentflow["agentflow_run_dir"]).relative_to("/data/files")
 output_path = root / "files" / Path(detail["output_path"]).relative_to("/data/files")
 assert (run_path / "final_result.json").is_file(), run_path
-assert (run_path / "agentflow" / "runs" / detail["agentflow_run_id"] / "run.json").is_file(), run_path
+assert (run_path / "agentflow_run_id.txt").is_file(), run_path
+assert (run_path / "agentflow_run_dir.txt").is_file(), run_path
+assert (agentflow_run_dir / "run.json").is_file(), agentflow_run_dir
 assert (output_path / "etc" / "version.txt").is_file(), output_path
 
 print(json.dumps({

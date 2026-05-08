@@ -1,4 +1,41 @@
 {
   "description": "Fixed firmware regression samples for AgentFlow self-evolution gates.",
-  "samples": []
+  "thresholds": {
+    "min_success_rate": 1.0,
+    "max_avg_rounds": 1.0,
+    "max_avg_token_count": 1000,
+    "max_fallback_to_llm_rate": 0.34
+  },
+  "samples": [
+    {
+      "id": "zip-preprocess",
+      "variant": "original",
+      "result_path": "plan/agentflow-regression-fixtures/zip-preprocess/final_result.json",
+      "tokens_path": "plan/agentflow-regression-fixtures/zip-preprocess/tokens_summary.json",
+      "duration_seconds": 0.1,
+      "expected_status": "success",
+      "expected_fallback_to_llm": false,
+      "expected_generated_skill": false
+    },
+    {
+      "id": "skill-hit",
+      "variant": "tuned-skill",
+      "result_path": "plan/agentflow-regression-fixtures/skill-hit/final_result.json",
+      "tokens_path": "plan/agentflow-regression-fixtures/skill-hit/tokens_summary.json",
+      "duration_seconds": 0.3,
+      "expected_status": "success",
+      "expected_fallback_to_llm": false,
+      "expected_generated_skill": false
+    },
+    {
+      "id": "skill-fallback-author",
+      "variant": "fallback-skill-author",
+      "result_path": "plan/agentflow-regression-fixtures/skill-fallback-author/final_result.json",
+      "tokens_path": "plan/agentflow-regression-fixtures/skill-fallback-author/tokens_summary.json",
+      "duration_seconds": 0.7,
+      "expected_status": "success",
+      "expected_fallback_to_llm": true,
+      "expected_generated_skill": true
+    }
+  ]
 }

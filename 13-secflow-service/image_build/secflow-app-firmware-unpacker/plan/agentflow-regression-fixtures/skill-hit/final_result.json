@@ -1,0 +1,27 @@
+{
+  "status": "success",
+  "message": "Unpacking verified successfully",
+  "rounds": 0,
+  "matched_skill": "tools/matched-bin.md",
+  "matched_skill_version": 1,
+  "matched_skill_score": 95,
+  "fallback_to_llm": false,
+  "generated_skill_path": null,
+  "generated_skill_status": null,
+  "promotion_success_count": 1,
+  "agentflow_run_id": "fixture-skill-hit",
+  "node_attempts": {
+    "skill_executor": {
+      "attempt_count": 1,
+      "duration_seconds": 0.2
+    },
+    "skill_reviewer": {
+      "attempt_count": 1,
+      "duration_seconds": 0.1
+    }
+  },
+  "failure_summary": {
+    "failed_nodes": []
+  },
+  "total_tokens": 320
+}

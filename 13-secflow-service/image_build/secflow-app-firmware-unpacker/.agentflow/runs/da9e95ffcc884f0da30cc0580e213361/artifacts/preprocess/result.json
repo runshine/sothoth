@@ -1,0 +1,50 @@
+{
+  "node_id": "preprocess",
+  "status": "completed",
+  "started_at": "2026-05-08T14:31:46.254426+00:00",
+  "finished_at": "2026-05-08T14:31:46.310774+00:00",
+  "exit_code": 0,
+  "final_response": "{\"success\": false, \"method\": null}",
+  "output": "{\"success\": false, \"method\": null}",
+  "stdout_lines": [
+    "{\"success\": false, \"method\": null}"
+  ],
+  "stderr_lines": [],
+  "trace_events": [
+    {
+      "timestamp": "2026-05-08T14:31:46.305319+00:00",
+      "node_id": "preprocess",
+      "agent": "python",
+      "attempt": 1,
+      "source": "stdout",
+      "kind": "stdout",
+      "title": "stdout",
+      "content": "{\"success\": false, \"method\": null}",
+      "raw": "{\"success\": false, \"method\": null}"
+    }
+  ],
+  "success": true,
+  "success_details": [
+    "no success criteria configured"
+  ],
+  "current_attempt": 1,
+  "attempts": [
+    {
+      "number": 1,
+      "status": "completed",
+      "started_at": "2026-05-08T14:31:46.257338+00:00",
+      "finished_at": "2026-05-08T14:31:46.310774+00:00",
+      "exit_code": 0,
+      "final_response": "{\"success\": false, \"method\": null}",
+      "output": "{\"success\": false, \"method\": null}",
+      "success": true,
+      "success_details": [
+        "no success criteria configured"
+      ]
+    }
+  ],
+  "tick_count": 0,
+  "last_tick_started_at": null,
+  "next_scheduled_at": null,
+  "diff": null
+}

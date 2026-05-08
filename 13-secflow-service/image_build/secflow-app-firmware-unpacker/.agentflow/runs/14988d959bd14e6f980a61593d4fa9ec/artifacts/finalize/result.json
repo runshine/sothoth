@@ -1,0 +1,50 @@
+{
+  "node_id": "finalize",
+  "status": "completed",
+  "started_at": "2026-05-08T14:39:03.696357+00:00",
+  "finished_at": "2026-05-08T14:39:03.725467+00:00",
+  "exit_code": 0,
+  "final_response": "{\"firmware_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\", \"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}",
+  "output": "{\"firmware_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\", \"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}",
+  "stdout_lines": [
+    "{\"firmware_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\", \"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}"
+  ],
+  "stderr_lines": [],
+  "trace_events": [
+    {
+      "timestamp": "2026-05-08T14:39:03.722248+00:00",
+      "node_id": "finalize",
+      "agent": "python",
+      "attempt": 1,
+      "source": "stdout",
+      "kind": "stdout",
+      "title": "stdout",
+      "content": "{\"firmware_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\", \"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}",
+      "raw": "{\"firmware_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\", \"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}"
+    }
+  ],
+  "success": true,
+  "success_details": [
+    "no success criteria configured"
+  ],
+  "current_attempt": 1,
+  "attempts": [
+    {
+      "number": 1,
+      "status": "completed",
+      "started_at": "2026-05-08T14:39:03.700547+00:00",
+      "finished_at": "2026-05-08T14:39:03.725467+00:00",
+      "exit_code": 0,
+      "final_response": "{\"firmware_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\", \"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}",
+      "output": "{\"firmware_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\", \"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\"}",
+      "success": true,
+      "success_details": [
+        "no success criteria configured"
+      ]
+    }
+  ],
+  "tick_count": 0,
+  "last_tick_started_at": null,
+  "next_scheduled_at": null,
+  "diff": null
+}

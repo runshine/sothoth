@@ -1,0 +1,16 @@
+{
+  "attempt": 1,
+  "kind": "process",
+  "command": [
+    "python3",
+    "-c",
+    "import json\nfrom pathlib import Path\n\npayload = json.loads(r'''{\"firmware_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/targets/demo2/S6730_V200R024C00SPC500.cc\", \"output_path\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output\", \"summary_file\": \"/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc/output/summary.txt\"}''')\noutput = Path(payload['output_path'])\nsummary = Path(payload['summary_file'])\nsummary.parent.mkdir(parents=True, exist_ok=True)\nif summary.exists() and summary.stat().st_size > 0:\n    print(json.dumps({'summary_written': False, 'summary_path': str(summary)}, ensure_ascii=False))\nelse:\n    files = sorted(p for p in output.rglob('*') if p.is_file() and p.name != 'summary.txt')\n    lines = [\n        f\"Firmware: {payload['firmware_path']}\",\n        'Observed artifacts:',\n    ]\n    if files:\n        for path in files:\n            rel = path.relative_to(output)\n            lines.append(f'- {rel} ({path.stat().st_size} bytes)')\n        lines.extend([\n            '',\n            'Summary: embedded ELF image detected at offset 0x400 after a 1024-byte zero padding header. The unpacked output contains the extracted binary and inspection metadata.',\n            'Skill Reuse Notes: look for a zero-filled header followed by an ELF magic at a fixed offset, then extract from that offset and record the ELF metadata and strings.',\n        ])\n    else:\n        lines.extend([\n            '- no extraction artifacts were produced by the executor',\n            '',\n            'Summary: the run did not produce recoverable components.',\n            'Skill Reuse Notes: if the unpacker emits no artifacts, record the blocker in summary.txt instead of leaving the output directory empty.',\n        ])\n    summary.write_text('\\n'.join(lines) + '\\n', encoding='utf-8')\n    print(json.dumps({'summary_written': True, 'summary_path': str(summary), 'artifact_count': len(files)}, ensure_ascii=False))"
+  ],
+  "env": {
+    "PYTHONPATH": "/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker:/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/app:.:app:agentflow"
+  },
+  "cwd": "/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/unpacked-demo2-skill-rerun-unified/S6730_V200R024C00SPC500.cc",
+  "stdin": null,
+  "runtime_files": [],
+  "payload": null
+}

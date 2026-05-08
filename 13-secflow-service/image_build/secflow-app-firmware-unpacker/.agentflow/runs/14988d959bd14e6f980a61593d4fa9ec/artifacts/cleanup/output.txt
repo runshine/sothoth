@@ -1,0 +1,1 @@
+{"removed_files": [], "removed_dirs": ["binwalk_extract"]}

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize fixed-sample AgentFlow firmware unpack regression results."""
+"""Gate fixed-sample AgentFlow firmware unpack regression results."""
 
 from __future__ import annotations
 
@@ -20,7 +20,9 @@ def _result_for_sample(sample: dict[str, Any]) -> dict[str, Any]:
     tokens_path = sample.get("tokens_path")
     tokens = _read_json(Path(tokens_path)) if tokens_path else {}
     grand_total = tokens.get("grand_total") if isinstance(tokens, dict) else {}
-    return {
+    if not isinstance(grand_total, dict):
+        grand_total = {}
+    row = {
         "id": sample.get("id") or result_path.parent.name,
         "variant": sample.get("variant", "default"),
         "status": result.get("status"),
@@ -30,6 +32,13 @@ def _result_for_sample(sample: dict[str, Any]) -> dict[str, Any]:
         "generated_skill": bool(result.get("generated_skill_path")),
         "fallback_to_llm": bool(result.get("fallback_to_llm")),
     }
+    if "expected_status" in sample:
+        row["expected_status"] = sample["expected_status"]
+    if "expected_fallback_to_llm" in sample:
+        row["expected_fallback_to_llm"] = bool(sample["expected_fallback_to_llm"])
+    if "expected_generated_skill" in sample:
+        row["expected_generated_skill"] = bool(sample["expected_generated_skill"])
+    return row
 
 
 def _avg(values: list[float]) -> float:
@@ -42,7 +51,7 @@ def summarize(manifest_path: Path) -> dict[str, Any]:
     total = len(rows)
     successes = [row for row in rows if row["status"] == "success"]
     durations = [float(row["duration_seconds"]) for row in rows if row.get("duration_seconds") is not None]
-    summary = {
+    summary: dict[str, Any] = {
         "sample_count": total,
         "success_count": len(successes),
         "success_rate": round(len(successes) / total, 4) if total else 0.0,
@@ -59,6 +68,60 @@ def summarize(manifest_path: Path) -> dict[str, Any]:
         ) if total else 0.0,
         "items": rows,
     }
+    thresholds = manifest.get("thresholds") or {}
+    expectation_failures = []
+    for row in rows:
+        expected_status = row.get("expected_status")
+        if expected_status is not None and row["status"] != expected_status:
+            expectation_failures.append(
+                {
+                    "id": row["id"],
+                    "variant": row["variant"],
+                    "field": "status",
+                    "expected": expected_status,
+                    "actual": row["status"],
+                }
+            )
+        expected_fallback = row.get("expected_fallback_to_llm")
+        if expected_fallback is not None and row["fallback_to_llm"] != expected_fallback:
+            expectation_failures.append(
+                {
+                    "id": row["id"],
+                    "variant": row["variant"],
+                    "field": "fallback_to_llm",
+                    "expected": expected_fallback,
+                    "actual": row["fallback_to_llm"],
+                }
+            )
+        expected_generated = row.get("expected_generated_skill")
+        if expected_generated is not None and row["generated_skill"] != expected_generated:
+            expectation_failures.append(
+                {
+                    "id": row["id"],
+                    "variant": row["variant"],
+                    "field": "generated_skill",
+                    "expected": expected_generated,
+                    "actual": row["generated_skill"],
+                }
+            )
+
+    threshold_failures = []
+    for metric, limit in thresholds.items():
+        if metric.startswith("min_"):
+            actual_metric = metric[4:]
+            actual = summary.get(actual_metric)
+            if actual is None or float(actual) < float(limit):
+                threshold_failures.append({"metric": actual_metric, "operator": ">=", "expected": limit, "actual": actual})
+        elif metric.startswith("max_"):
+            actual_metric = metric[4:]
+            actual = summary.get(actual_metric)
+            if actual is None or float(actual) > float(limit):
+                threshold_failures.append({"metric": actual_metric, "operator": "<=", "expected": limit, "actual": actual})
+
+    summary["thresholds"] = thresholds
+    summary["expectation_failures"] = expectation_failures
+    summary["threshold_failures"] = threshold_failures
+    summary["gate_passed"] = bool(total) and not expectation_failures and not threshold_failures
     return summary
 
 
@@ -70,6 +133,7 @@ def main() -> int:
         help="JSON file with samples containing result_path and optional tokens_path.",
     )
     parser.add_argument("--output", default="", help="Optional summary JSON output path.")
+    parser.add_argument("--no-fail", action="store_true", help="Print the summary without failing when the gate does not pass.")
     args = parser.parse_args()
 
     summary = summarize(Path(args.manifest))
@@ -77,7 +141,7 @@ def main() -> int:
     if args.output:
         Path(args.output).write_text(payload + "\n", encoding="utf-8")
     print(payload)
-    return 0
+    return 0 if args.no_fail or summary["gate_passed"] else 1
 
 
 if __name__ == "__main__":

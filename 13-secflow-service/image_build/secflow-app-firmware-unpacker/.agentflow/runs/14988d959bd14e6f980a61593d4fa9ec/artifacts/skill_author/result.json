@@ -1,0 +1,50 @@
+{
+  "node_id": "skill_author",
+  "status": "completed",
+  "started_at": "2026-05-08T14:39:03.623447+00:00",
+  "finished_at": "2026-05-08T14:39:03.654177+00:00",
+  "exit_code": 0,
+  "final_response": "SKIPPED_NO_GENERIC_SUCCESS",
+  "output": "SKIPPED_NO_GENERIC_SUCCESS",
+  "stdout_lines": [
+    "SKIPPED_NO_GENERIC_SUCCESS"
+  ],
+  "stderr_lines": [],
+  "trace_events": [
+    {
+      "timestamp": "2026-05-08T14:39:03.650806+00:00",
+      "node_id": "skill_author",
+      "agent": "python",
+      "attempt": 1,
+      "source": "stdout",
+      "kind": "stdout",
+      "title": "stdout",
+      "content": "SKIPPED_NO_GENERIC_SUCCESS",
+      "raw": "SKIPPED_NO_GENERIC_SUCCESS"
+    }
+  ],
+  "success": true,
+  "success_details": [
+    "no success criteria configured"
+  ],
+  "current_attempt": 1,
+  "attempts": [
+    {
+      "number": 1,
+      "status": "completed",
+      "started_at": "2026-05-08T14:39:03.628120+00:00",
+      "finished_at": "2026-05-08T14:39:03.654177+00:00",
+      "exit_code": 0,
+      "final_response": "SKIPPED_NO_GENERIC_SUCCESS",
+      "output": "SKIPPED_NO_GENERIC_SUCCESS",
+      "success": true,
+      "success_details": [
+        "no success criteria configured"
+      ]
+    }
+  ],
+  "tick_count": 0,
+  "last_tick_started_at": null,
+  "next_scheduled_at": null,
+  "diff": null
+}

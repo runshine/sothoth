@@ -1,0 +1,41 @@
+{
+  "status": "success",
+  "message": "Unpacking verified successfully",
+  "rounds": 1,
+  "matched_skill": "tools/matched-bin.md",
+  "matched_skill_version": 1,
+  "matched_skill_score": 80,
+  "fallback_to_llm": true,
+  "generated_skill_path": "tools/generated-bin__candidate__fixture.md",
+  "generated_skill_status": "candidate",
+  "promotion_success_count": 0,
+  "agentflow_run_id": "fixture-skill-fallback-author",
+  "node_attempts": {
+    "skill_executor": {
+      "attempt_count": 1,
+      "duration_seconds": 0.2
+    },
+    "generic_executor": {
+      "attempt_count": 1,
+      "duration_seconds": 0.4
+    },
+    "generic_reviewer": {
+      "attempt_count": 1,
+      "duration_seconds": 0.1
+    }
+  },
+  "failure_summary": {
+    "failed_nodes": [
+      {
+        "node_id": "skill_reviewer",
+        "status": "failed",
+        "attempts": 1,
+        "classification": {
+          "category": "STRUCTURAL_FAILURE",
+          "reason": "skill output invalid"
+        }
+      }
+    ]
+  },
+  "total_tokens": 730
+}

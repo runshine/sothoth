@@ -94,13 +94,37 @@ def _feature_match_code(ctx: dict[str, Any]) -> str:
         "        'matched_skill_score': skill_score,\n"
         "        'matched_status': skill_match.get('matched_status'),\n"
         "        'reasons': skill_match.get('reasons'),\n"
-        "        'system_prompt': skill_meta.get('system_prompt') if skill_meta else None,\n"
         "    }\n"
         "except Exception as exc:\n"
         "    result = {'features': {}, 'matched_skill': None, 'matched_skill_score': 0, 'error': str(exc)}\n"
         "Path(payload['output_file']).parent.mkdir(parents=True, exist_ok=True)\n"
         "Path(payload['output_file']).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')\n"
-        "print(json.dumps(result, ensure_ascii=False))\n"
+        "summary = {k: result.get(k) for k in ('matched_skill', 'matched_skill_version', 'matched_skill_score', 'matched_status', 'reasons', 'error') if k in result}\n"
+        "summary['feature_family_id'] = (result.get('features') or {}).get('family_id')\n"
+        "summary['feature_count_binwalk_sigs'] = len((result.get('features') or {}).get('binwalk_sigs') or [])\n"
+        "print(json.dumps(summary, ensure_ascii=False))\n"
+    )
+
+
+def _skill_gate_code(ctx: dict[str, Any]) -> str:
+    payload = {
+        "feature_match_output_file": ctx["feature_match_output_file"],
+    }
+    return (
+        "import json\n"
+        "from pathlib import Path\n\n"
+        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
+        "try:\n"
+        "    data = json.loads(Path(payload['feature_match_output_file']).read_text(encoding='utf-8'))\n"
+        "except Exception as exc:\n"
+        "    print(f'AGENTFLOW_SKILL_GATE matched=false reason=FEATURE_MATCH_UNREADABLE error={exc}')\n"
+        "else:\n"
+        "    matched = data.get('matched_skill')\n"
+        "    if matched:\n"
+        "        print(f'AGENTFLOW_SKILL_GATE matched=true skill={matched}')\n"
+        "    else:\n"
+        "        reason = data.get('matched_status') or 'SKIPPED_NO_SKILL'\n"
+        "        print(f'AGENTFLOW_SKILL_GATE matched=false reason={reason}')\n"
     )
 
 
@@ -159,37 +183,35 @@ def _cleanup_output_code(ctx: dict[str, Any]) -> str:
         "removed_files = []\n"
         "removed_dirs = []\n"
         "for path in sorted(output.rglob('*')):\n"
-        "    if path.is_file() and path.stat().st_size == 0:\n"
-        "        path.unlink()\n"
-        "        removed_files.append(str(path.relative_to(output)))\n"
-        "files = [p for p in output.rglob('*') if p.is_file() and p.name not in {'summary.txt', 'reason.txt'}]\n"
-        "seen = {}\n"
-        "for path in sorted(files):\n"
-        "    digest = hashlib.md5(path.read_bytes()).hexdigest()\n"
-        "    key = (path.stat().st_size, digest)\n"
-        "    if key in seen:\n"
-        "        path.unlink()\n"
-        "        removed_files.append(str(path.relative_to(output)))\n"
-        "    else:\n"
-        "        seen[key] = path\n"
+        "    try:\n"
+        "        if path.is_file() and path.stat().st_size == 0:\n"
+        "            path.unlink()\n"
+        "            removed_files.append(str(path.relative_to(output)))\n"
+        "    except OSError:\n"
+        "        continue\n"
         "for path in sorted([p for p in output.rglob('*') if p.is_dir()], reverse=True):\n"
         "    try:\n"
-        "        next(path.iterdir())\n"
-        "    except StopIteration:\n"
+        "        if any(path.iterdir()):\n"
+        "            continue\n"
         "        path.rmdir()\n"
         "        removed_dirs.append(str(path.relative_to(output)))\n"
+        "    except OSError:\n"
+        "        continue\n"
         "print(json.dumps({'removed_files': removed_files, 'removed_dirs': removed_dirs}, ensure_ascii=False))\n"
     )
 
 
 def _skill_review_code() -> str:
     return (
+        "executor_status = r'''{{ nodes.skill_executor.status }}'''.strip()\n"
         "executor_output = r'''{{ nodes.skill_executor.output }}'''\n"
         "if 'AGENTFLOW_EXECUTOR_SKIPPED' in executor_output or 'SKIPPED' in executor_output:\n"
         "    reason = 'SKIPPED_NO_SKILL'\n"
         "    if 'reason=' in executor_output:\n"
         "        reason = executor_output.split('reason=', 1)[1].split()[0].strip()\n"
         "    print(f'AGENTFLOW_REVIEW_SKIPPED reason={reason}')\n"
+        "elif executor_status != 'completed':\n"
+        "    print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=executor_failed')\n"
         "elif any(token in executor_output.lower() for token in ('fail', 'failed', 'invalid', 'error')):\n"
         "    print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=executor_reported_failure')\n"
         "elif executor_output.strip():\n"
@@ -207,12 +229,15 @@ def _generic_review_code(ctx: dict[str, Any]) -> str:
         "import json\n"
         "from pathlib import Path\n\n"
         f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
+        "executor_status = r'''{{ nodes.generic_executor.status }}'''.strip()\n"
         "executor_output = r'''{{ nodes.generic_executor.output }}'''\n"
         "if 'AGENTFLOW_EXECUTOR_SKIPPED' in executor_output or 'SKIPPED' in executor_output:\n"
         "    reason = 'SKIPPED'\n"
         "    if 'reason=' in executor_output:\n"
         "        reason = executor_output.split('reason=', 1)[1].split()[0].strip()\n"
         "    print(f'AGENTFLOW_REVIEW_SKIPPED reason={reason}')\n"
+        "elif executor_status != 'completed':\n"
+        "    print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=executor_failed')\n"
         "else:\n"
         "    output = Path(payload['output_path'])\n"
         "    summary = output / 'summary.txt'\n"
@@ -230,6 +255,7 @@ def _skill_author_code(ctx: dict[str, Any]) -> str:
     payload = {
         "feature_match_output_file": ctx["feature_match_output_file"],
         "output_path": ctx["output_path"],
+        "skill_author_output_file": ctx["skill_author_output_file"],
     }
     return (
         "import json\n"
@@ -272,7 +298,9 @@ def _skill_author_code(ctx: dict[str, Any]) -> str:
         "Source summary:\n"
         "{summary_text}\n"
         "'''\n"
-        "    print(doc)\n"
+        "    Path(payload['skill_author_output_file']).parent.mkdir(parents=True, exist_ok=True)\n"
+        "    Path(payload['skill_author_output_file']).write_text(doc, encoding='utf-8')\n"
+        "    print(f\"AGENTFLOW_SKILL_AUTHOR_WRITTEN path={payload['skill_author_output_file']}\")\n"
     )
 
 
@@ -311,25 +339,37 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_only",
             env=_python_node_env(),
         )
+        skill_gate = python_node(
+            task_id="skill_gate",
+            code=_skill_gate_code(ctx),
+            tools="read_only",
+            env=_python_node_env(),
+        )
         skill_executor = pi(
             task_id="skill_executor",
             prompt=(
                 "Output protocol: print exactly one final marker line when skipping.\n"
                 "- If Preprocess contains JSON with success=true, do not call tools and print exactly: AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_BY_PREPROCESS\n"
-                "- If Context has no matched_skill, do not call tools and print exactly: AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_NO_SKILL\n"
-                "Otherwise use the system_prompt from feature_match as the reusable skill guidance.\n"
+                "- If Skill gate contains matched=false, do not call tools and print exactly: AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_NO_SKILL\n"
+                "Otherwise read only the matched skill file path shown by Skill gate and use that file as the reusable skill guidance. Do not read the full feature match JSON.\n"
+                "Mandatory runtime constraints override the skill guidance:\n"
+                "- Never run recursive extraction that can explode the output tree. Do not use `binwalk -eM` or `binwalk -e -M`.\n"
+                "- Run binwalk as `binwalk \"$firmware\" > \"$output/binwalk.txt\"` and inspect it only with bounded shell commands such as `grep ... | head` or `sed -n`.\n"
+                "- For byte-offset `dd` extraction, use `bs=4M iflag=skip_bytes,count_bytes skip=<offset> count=<size> status=none`; do not use `bs=1` for large payloads.\n"
+                "- Keep large extracted trees under `$output/binwalk_extract`; do not recursively copy the whole tree back into `$output`.\n"
+                "- After writing a non-empty `$output/summary.txt`, stop immediately and print exactly: AGENTFLOW_SKILL_DONE.\n"
                 "Task variables:\n"
                 f"$input = {_input_path(ctx)}\n"
                 f"$firmware = {ctx['firmware_path']}\n"
                 f"$output = {ctx['output_path']}\n"
                 "Use $output exactly as the output directory. Do not write results to its parent directory.\n"
-                "Context: {{ nodes.feature_match.output }}\n"
+                "Skill gate: {{ nodes.skill_gate.output }}\n"
                 "Preprocess: {{ nodes.preprocess.output }}\n"
             ),
             tools="read_write",
             model=ctx.get("executor_model"),
             extra_args=ctx.get("executor_extra_args", []),
-            timeout_seconds=_node_timeout(ctx),
+            timeout_seconds=None,
         )
         skill_reviewer = python_node(
             task_id="skill_reviewer",
@@ -345,7 +385,17 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
                 "Output protocol: print exactly one final marker line when skipping.\n"
                 "- If Preprocess contains JSON with success=true, do not call tools and print exactly: AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_BY_PREPROCESS\n"
                 "- If Skill review contains AGENTFLOW_REVIEW_SUCCESS, do not call tools and print exactly: AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_BY_SKILL_SUCCESS\n"
+                "- If `$output/summary.txt` already exists and is non-empty, do not call tools and print exactly: AGENTFLOW_GENERIC_DONE reason=SUMMARY_EXISTS\n"
                 "Unpack the firmware. Use the retry context when present.\n"
+                "Required execution plan, in order:\n"
+                "1. Inspect the firmware with `file \"$firmware\"` and `strings -a -n 8 \"$firmware\" | head -200`.\n"
+                "2. Run plain binwalk first, but redirect the full scan to `$output/binwalk.txt`: `binwalk \"$firmware\" > \"$output/binwalk.txt\"`. Never read the full binwalk file through an agent read tool. Inspect it only with bounded shell commands such as `sed -n '1,220p' \"$output/binwalk.txt\"`, `grep -Ei 'squashfs|uImage|zip|7-zip|cpio|tar' \"$output/binwalk.txt\" | head -80`, or `tail -80 \"$output/binwalk.txt\"`.\n"
+                "3. Extract only targeted payloads into `$output/binwalk_extract` or a small subdirectory of `$output`, one component at a time, using `dd`, `7z x`, `unzip`, `tar -xf`, `gzip -dc`, `xz -dc`, or `cpio -idmv` as appropriate.\n"
+                "For `dd` extractions at byte offsets, do not use `bs=1` for large payloads. Use byte-accurate flags with a large block size, for example: `dd if=\"$firmware\" of=\"$output/binwalk_extract/name.img\" bs=4M iflag=skip_bytes,count_bytes skip=<offset> count=<size> status=none`.\n"
+                "4. Prefer the main squashfs image, any uImage, and any obvious archive at a fixed offset. Do not recurse into every discovered blob.\n"
+                "5. After extraction, copy the most relevant recovered files into `$output` and keep `summary.txt` at `$output/summary.txt`.\n"
+                "Do not recursively copy `$output/binwalk_extract` back into `$output`; that duplicates large trees. Keep extracted trees where they are and copy only a few high-value top-level artifacts when needed.\n"
+                "Hard limit: never run recursive extraction that can explode the output tree. Do not use `binwalk -eM`. If a targeted extraction is not possible, record the blocker in `summary.txt` and stop.\n"
                 "Task variables:\n"
                 f"$input = {_input_path(ctx)}\n"
                 f"$firmware = {ctx['firmware_path']}\n"
@@ -353,6 +403,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
                 "Analyze the current firmware file at $firmware first. Use $input only as supporting context.\n"
                 "Write every extraction artifact and $output/summary.txt under $output exactly; do not write to the parent directory.\n"
                 "Always create $output/summary.txt before finishing, even if no extractable components are found. If nothing can be extracted, record that clearly and stop.\n"
+                "After writing a non-empty `$output/summary.txt`, stop immediately and print exactly: AGENTFLOW_GENERIC_DONE. Do not continue exploring, reading, extracting, or analyzing after summary.txt is written.\n"
                 "Scope limit: this is a firmware unpacking task, not a vulnerability analysis task. "
                 "Use file/binwalk/readelf/strings only as needed to identify and extract components. "
                 "Do not perform full disassembly, exploit analysis, or extended reverse engineering. "
@@ -364,7 +415,19 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_write",
             model=ctx.get("executor_model"),
             extra_args=ctx.get("executor_extra_args", []),
-            timeout_seconds=_node_timeout(ctx),
+            timeout_seconds=None,
+            skip_if=[
+                {
+                    "kind": "node_output_contains",
+                    "node_id": "skill_reviewer",
+                    "value": "AGENTFLOW_REVIEW_SUCCESS",
+                },
+                {
+                    "kind": "node_output_contains",
+                    "node_id": "skill_reviewer",
+                    "value": "SKIPPED_BY_PREPROCESS",
+                },
+            ],
         )
         output_summary = python_node(
             task_id="output_summary",
@@ -407,7 +470,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             env=_python_node_env(),
         )
 
-        preprocess >> feature_match >> skill_executor >> skill_reviewer
+        preprocess >> feature_match >> skill_gate >> skill_executor >> skill_reviewer
         skill_reviewer.on_failure >> generic_executor
         skill_reviewer >> generic_executor
         generic_executor >> output_summary >> generic_reviewer

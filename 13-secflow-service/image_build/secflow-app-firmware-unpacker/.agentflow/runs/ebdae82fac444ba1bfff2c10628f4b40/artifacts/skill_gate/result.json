@@ -1,0 +1,50 @@
+{
+  "node_id": "skill_gate",
+  "status": "completed",
+  "started_at": "2026-05-08T14:56:03.191627+00:00",
+  "finished_at": "2026-05-08T14:56:03.218933+00:00",
+  "exit_code": 0,
+  "final_response": "AGENTFLOW_SKILL_GATE matched=true skill=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/tools/cc-00000000-lzma-compressed-data-properties__active__v1.md",
+  "output": "AGENTFLOW_SKILL_GATE matched=true skill=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/tools/cc-00000000-lzma-compressed-data-properties__active__v1.md",
+  "stdout_lines": [
+    "AGENTFLOW_SKILL_GATE matched=true skill=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/tools/cc-00000000-lzma-compressed-data-properties__active__v1.md"
+  ],
+  "stderr_lines": [],
+  "trace_events": [
+    {
+      "timestamp": "2026-05-08T14:56:03.215698+00:00",
+      "node_id": "skill_gate",
+      "agent": "python",
+      "attempt": 1,
+      "source": "stdout",
+      "kind": "stdout",
+      "title": "stdout",
+      "content": "AGENTFLOW_SKILL_GATE matched=true skill=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/tools/cc-00000000-lzma-compressed-data-properties__active__v1.md",
+      "raw": "AGENTFLOW_SKILL_GATE matched=true skill=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/tools/cc-00000000-lzma-compressed-data-properties__active__v1.md"
+    }
+  ],
+  "success": true,
+  "success_details": [
+    "no success criteria configured"
+  ],
+  "current_attempt": 1,
+  "attempts": [
+    {
+      "number": 1,
+      "status": "completed",
+      "started_at": "2026-05-08T14:56:03.193600+00:00",
+      "finished_at": "2026-05-08T14:56:03.218933+00:00",
+      "exit_code": 0,
+      "final_response": "AGENTFLOW_SKILL_GATE matched=true skill=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/tools/cc-00000000-lzma-compressed-data-properties__active__v1.md",
+      "output": "AGENTFLOW_SKILL_GATE matched=true skill=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/tools/cc-00000000-lzma-compressed-data-properties__active__v1.md",
+      "success": true,
+      "success_details": [
+        "no success criteria configured"
+      ]
+    }
+  ],
+  "tick_count": 0,
+  "last_tick_started_at": null,
+  "next_scheduled_at": null,
+  "diff": null
+}

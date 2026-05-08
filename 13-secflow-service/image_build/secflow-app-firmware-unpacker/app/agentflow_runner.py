@@ -65,6 +65,18 @@ def _node_output(record: Any, node_id: str) -> str:
     return str(node.output or node.final_response or "")
 
 
+def _node_status(record: Any, node_id: str) -> str:
+    node = record.nodes.get(node_id)
+    if node is None:
+        return ""
+    status = getattr(getattr(node, "status", None), "value", getattr(node, "status", None))
+    if status:
+        return str(status)
+    if getattr(node, "output", None) or getattr(node, "final_response", None) or getattr(node, "attempts", None):
+        return "completed"
+    return ""
+
+
 def _cached_run(store: Any, run_id: str) -> Any:
     runs = getattr(store, "_runs", None)
     if isinstance(runs, dict) and run_id in runs:
@@ -173,23 +185,73 @@ def _failure_summary(record: Any) -> dict[str, Any]:
     return {"failed_nodes": failed_nodes}
 
 
-def _sum_token_fields(payload: Any, totals: dict[str, int]) -> None:
+_TOKEN_ALIASES = {
+    "prompt_tokens": "prompt_tokens",
+    "input_tokens": "prompt_tokens",
+    "input": "prompt_tokens",
+    "completion_tokens": "completion_tokens",
+    "output_tokens": "completion_tokens",
+    "output": "completion_tokens",
+    "total_tokens": "total_tokens",
+    "totalTokens": "total_tokens",
+}
+
+_FINAL_TOKEN_EVENT_TYPES = {
+    "message_end",
+    "turn_end",
+    "agent_end",
+}
+
+
+def _token_usage_from_dict(payload: dict[str, Any]) -> dict[str, int] | None:
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    found = False
+    for key, value in payload.items():
+        normalized = _TOKEN_ALIASES.get(str(key))
+        if normalized and isinstance(value, int):
+            totals[normalized] += int(value)
+            found = True
+    if not found:
+        return None
+    if totals["total_tokens"] == 0:
+        totals["total_tokens"] = totals["prompt_tokens"] + totals["completion_tokens"]
+    return totals
+
+
+def _response_id_near_usage(payload: dict[str, Any]) -> str | None:
+    for key in ("responseId", "response_id", "id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _collect_token_usages(payload: Any, response_id: str | None = None) -> list[tuple[str | None, dict[str, int]]]:
+    usages: list[tuple[str | None, dict[str, int]]] = []
     if isinstance(payload, dict):
-        aliases = {
-            "prompt_tokens": "prompt_tokens",
-            "input_tokens": "prompt_tokens",
-            "completion_tokens": "completion_tokens",
-            "output_tokens": "completion_tokens",
-            "total_tokens": "total_tokens",
-        }
+        response_id = _response_id_near_usage(payload) or response_id
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            totals = _token_usage_from_dict(usage)
+            if totals is not None:
+                usages.append((response_id, totals))
+        else:
+            totals = _token_usage_from_dict(payload)
+            if totals is not None:
+                usages.append((response_id, totals))
         for key, value in payload.items():
-            normalized = aliases.get(str(key))
-            if normalized and isinstance(value, int):
-                totals[normalized] = totals.get(normalized, 0) + int(value)
-            _sum_token_fields(value, totals)
+            if key == "usage":
+                continue
+            usages.extend(_collect_token_usages(value, response_id))
     elif isinstance(payload, list):
         for item in payload:
-            _sum_token_fields(item, totals)
+            usages.extend(_collect_token_usages(item, response_id))
+    return usages
+
+
+def _add_token_totals(target: dict[str, int], value: dict[str, int]) -> None:
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        target[key] = target.get(key, 0) + int(value.get(key, 0) or 0)
 
 
 def _token_summary(record: Any) -> dict[str, Any]:
@@ -197,10 +259,28 @@ def _token_summary(record: Any) -> dict[str, Any]:
     grand_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     for node_id, node in getattr(record, "nodes", {}).items():
         totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-        for event in getattr(node, "trace_events", []) or []:
-            _sum_token_fields(getattr(event, "raw", None), totals)
-        if totals["total_tokens"] == 0:
-            totals["total_tokens"] = totals["prompt_tokens"] + totals["completion_tokens"]
+        anonymous_samples: list[dict[str, int]] = []
+        by_response: dict[str, tuple[int, dict[str, int]]] = {}
+        for index, event in enumerate(getattr(node, "trace_events", []) or []):
+            raw = getattr(event, "raw", None)
+            raw_type = raw.get("type") if isinstance(raw, dict) else None
+            event_type = str(getattr(event, "kind", None) or raw_type or "")
+            priority = 1 if event_type in _FINAL_TOKEN_EVENT_TYPES else 0
+            for response_id, usage in _collect_token_usages(raw):
+                if not any(usage.values()):
+                    continue
+                if response_id:
+                    current = by_response.get(response_id)
+                    current_score = current[0] if current else -1
+                    score = priority * 1_000_000 + index
+                    if current is None or score >= current_score:
+                        by_response[response_id] = (score, usage)
+                elif priority:
+                    anonymous_samples.append(usage)
+        for _, usage in by_response.values():
+            _add_token_totals(totals, usage)
+        for usage in anonymous_samples:
+            _add_token_totals(totals, usage)
         nodes[node_id] = totals
         for key, value in totals.items():
             grand_total[key] = grand_total.get(key, 0) + int(value or 0)
@@ -304,6 +384,7 @@ def run_unpack_agentflow(
             "graph_optimization_rounds": int(getattr(config.agentflow, "graph_optimization_rounds", 1) or 1),
             "preprocess_output_file": str(run_root / "preprocess.json"),
             "feature_match_output_file": str(run_root / "feature-match.json"),
+            "skill_author_output_file": str(run_root / "generated_skill.md"),
             "final_result_file": str(run_root / "final_result.json"),
             "executor_model": exec_def.get("model"),
             "review_model": val_def.get("model"),
@@ -324,6 +405,7 @@ def run_unpack_agentflow(
 
     if log_dir is not None:
         _write_text(log_dir / "agentflow_run_id.txt", "")
+        _write_text(log_dir / "agentflow_run_dir.txt", "")
 
     _check_cancel()
 
@@ -358,8 +440,6 @@ def run_unpack_agentflow(
         )
         pipeline = build_firmware_unpack_pipeline(ctx)
         run_store_dir = Path(config.agentflow.runs_dir)
-        if log_dir is not None:
-            run_store_dir = log_dir / "agentflow" / "runs"
         store = RunStore(run_store_dir)
         orchestrator = Orchestrator(store=store, max_concurrent_runs=config.agentflow.max_concurrent_runs)
 
@@ -367,6 +447,7 @@ def run_unpack_agentflow(
             record = await orchestrator.submit(pipeline)
             if log_dir is not None:
                 _write_text(log_dir / "agentflow_run_id.txt", record.id)
+                _write_text(log_dir / "agentflow_run_dir.txt", str(run_store_dir / record.id))
             while True:
                 if cancel_check and cancel_check():
                     await orchestrator.cancel(record.id)
@@ -386,10 +467,22 @@ def run_unpack_agentflow(
             generic_output = _node_output(current, "generic_executor")
             generic_review = _node_output(current, "generic_reviewer")
             author_output = _node_output(current, "skill_author")
+            author_output_file = Path(ctx.get("skill_author_output_file") or "")
+            if author_output_file.is_file():
+                author_output = author_output_file.read_text(encoding="utf-8", errors="replace")
 
             preprocess_passed = bool(_json_output(preprocess_output).get("success"))
-            skill_passed = _review_success(skill_review, _is_review_success)
-            generic_passed = bool(generic_output.strip()) and _review_success(generic_review, _is_review_success)
+            skill_status = _node_status(current, "skill_executor")
+            skill_passed = (
+                skill_status not in {"failed", "cancelled"}
+                and _review_success(skill_review, _is_review_success)
+            )
+            generic_status = _node_status(current, "generic_executor")
+            generic_passed = (
+                generic_status not in {"failed", "cancelled"}
+                and bool(generic_output.strip())
+                and _review_success(generic_review, _is_review_success)
+            )
             passed = preprocess_passed or skill_passed or generic_passed
             rounds = 0 if preprocess_passed or skill_passed else _node_attempts(current, "generic_executor")
             node_attempts = _node_attempt_map(current)
@@ -436,6 +529,7 @@ def run_unpack_agentflow(
                     else generated_skill.get("promotion_success_count") if generated_skill else None
                 ),
                 "agentflow_run_id": current.id,
+                "agentflow_run_dir": str(run_store_dir / current.id),
                 "run_path": str(log_dir) if log_dir else None,
                 "node_attempts": node_attempts,
                 "failure_summary": failure_summary,

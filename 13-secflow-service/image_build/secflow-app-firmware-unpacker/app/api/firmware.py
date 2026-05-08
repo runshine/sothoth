@@ -84,9 +84,21 @@ def _get_task_or_404(task_id: str) -> dict:
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if not task:
             raise NotFoundError("任务", task_id)
-        return task.to_dict()
+        return _with_agentflow_run_dir(task.to_dict())
     finally:
         db.close()
+
+
+def _with_agentflow_run_dir(task: dict) -> dict:
+    run_id = str(task.get("agentflow_run_id") or "").strip()
+    if not run_id:
+        task["agentflow_run_dir"] = None
+        return task
+
+    from app.config import get_config
+
+    task["agentflow_run_dir"] = str(Path(get_config().agentflow.runs_dir) / run_id)
+    return task
 
 
 def _get_task_resource_usage(task_id: str) -> dict:
@@ -121,23 +133,33 @@ def _get_task_resource_usage(task_id: str) -> dict:
 
 
 def _get_task_agentflow_status(task_id: str) -> dict:
+    from app.config import get_config
+
     task = _get_task_or_404(task_id)
     run_id = str(task.get("agentflow_run_id") or "").strip() or None
     run_path = str(task.get("run_path") or "").strip()
     run_json = None
-    if run_id and run_path:
-        candidate = Path(run_path) / "agentflow" / "runs" / run_id / "run.json"
-        if candidate.is_file():
-            try:
-                run_json = json.loads(candidate.read_text(encoding="utf-8"))
-            except Exception:
-                run_json = None
+    agentflow_run_dir = None
+    if run_id:
+        candidate_dirs = [Path(get_config().agentflow.runs_dir) / run_id]
+        if run_path:
+            candidate_dirs.append(Path(run_path) / "agentflow" / "runs" / run_id)
+        for candidate_dir in candidate_dirs:
+            candidate = candidate_dir / "run.json"
+            if candidate.is_file():
+                try:
+                    run_json = json.loads(candidate.read_text(encoding="utf-8"))
+                    agentflow_run_dir = str(candidate_dir)
+                    break
+                except Exception:
+                    run_json = None
     run_dir = Path(run_path) if run_path else None
     final_result = _read_json_file(run_dir / "final_result.json") if run_dir else None
     tokens_summary = _read_json_file(run_dir / "tokens_summary.json") if run_dir else None
     return {
         "task_id": task_id,
         "agentflow_run_id": run_id,
+        "agentflow_run_dir": agentflow_run_dir,
         "run_path": run_path or None,
         "status": run_json.get("status") if isinstance(run_json, dict) else None,
         "nodes": run_json.get("nodes") if isinstance(run_json, dict) else None,
@@ -447,7 +469,7 @@ def _list_tasks(
             "total": total,
             "offset": offset,
             "limit": limit,
-            "items": [task.to_dict() for task in tasks],
+            "items": [_with_agentflow_run_dir(task.to_dict()) for task in tasks],
         }
     finally:
         db.close()

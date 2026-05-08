@@ -1,0 +1,3 @@
+I'll unpack the firmware following the matched skill guidance. Let me start by reading the skill file and then analyzing the firmware.
+Now I'll follow the skill to extract the Huawei S6730 .cc firmware.
+AGENTFLOW_SKILL_DONE
