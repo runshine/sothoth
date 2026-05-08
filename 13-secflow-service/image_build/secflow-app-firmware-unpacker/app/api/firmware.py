@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -586,21 +587,128 @@ def _read_json_index_items(path: Path) -> list[dict]:
     return [item for item in raw_items if isinstance(item, dict)]
 
 
-def _scan_output_tree(output_root: Path) -> tuple[int, int, int, Optional[str], int, int]:
+def _normalize_extension(path: Path) -> str:
+    suffix = str(path.suffix or "").strip().lower()
+    return suffix or "(none)"
+
+
+def _relative_depth(output_root: Path, path: Path) -> int:
+    try:
+        relative = path.relative_to(output_root)
+    except Exception:
+        return 0
+    parts = [part for part in relative.parts if part not in {"", "."}]
+    return len(parts)
+
+
+def _entry_sort_key(item: dict) -> tuple[int, int, str]:
+    return (
+        -int(item.get("total_size_bytes") or 0),
+        -int(item.get("file_count") or 0),
+        str(item.get("name") or ""),
+    )
+
+
+def _scan_path_tree(root_path: Path) -> tuple[int, int, int]:
+    file_count = 0
+    dir_count = 0
+    total_size = 0
+
+    if not root_path.exists():
+        return file_count, dir_count, total_size
+
+    if root_path.is_file() and not root_path.is_symlink():
+        try:
+            return 1, 0, root_path.stat().st_size
+        except Exception:
+            return 0, 0, 0
+
+    if not root_path.is_dir():
+        return 0, 0, 0
+
+    for current_root, dirs, files in os.walk(root_path, followlinks=False):
+        current_path = Path(current_root)
+        real_dirs: list[str] = []
+        for directory in dirs:
+            path = current_path / directory
+            if path.is_symlink():
+                continue
+            dir_count += 1
+            real_dirs.append(directory)
+        dirs[:] = real_dirs
+
+        for filename in files:
+            path = current_path / filename
+            if path.is_symlink():
+                continue
+            try:
+                size = path.stat().st_size
+            except Exception:
+                continue
+            file_count += 1
+            total_size += size
+
+    return file_count, dir_count, total_size
+
+
+def _scan_output_tree(output_root: Path) -> dict:
     file_count = 0
     dir_count = 0
     total_size = 0
     largest_file_path: Optional[str] = None
     largest_file_size = 0
     top_level_entry_count = 0
+    largest_files: list[dict] = []
+    extension_stats: dict[str, dict[str, int | str]] = defaultdict(
+        lambda: {"extension": "(none)", "file_count": 0, "total_size_bytes": 0}
+    )
+    top_level_entries: list[dict] = []
+    deepest_path: Optional[str] = None
+    deepest_depth = 0
+    small_file_count = 0
+    medium_file_count = 0
+    large_file_count = 0
 
     if not output_root.exists() or not output_root.is_dir():
-        return file_count, dir_count, total_size, largest_file_path, largest_file_size, top_level_entry_count
+        return {
+            "output_file_count": file_count,
+            "output_dir_count": dir_count,
+            "output_total_size_bytes": total_size,
+            "largest_file_path": largest_file_path,
+            "largest_file_size_bytes": largest_file_size,
+            "top_level_entry_count": top_level_entry_count,
+            "top_level_entries": top_level_entries,
+            "file_extension_breakdown": [],
+            "largest_files": [],
+            "deepest_path": None,
+            "avg_file_size_bytes": 0,
+            "small_file_count": small_file_count,
+            "medium_file_count": medium_file_count,
+            "large_file_count": large_file_count,
+        }
 
+    top_level_paths: list[Path] = []
     try:
-        top_level_entry_count = sum(1 for _ in output_root.iterdir())
+        top_level_paths = list(output_root.iterdir())
+        top_level_entry_count = len(top_level_paths)
     except Exception:
         top_level_entry_count = 0
+        top_level_paths = []
+
+    for top_level_path in top_level_paths:
+        if top_level_path.is_symlink():
+            continue
+        kind = "dir" if top_level_path.is_dir() else "file"
+        file_stats = _scan_path_tree(top_level_path)
+        top_level_entries.append(
+            {
+                "name": top_level_path.name,
+                "kind": kind,
+                "file_count": int(file_stats[0]),
+                "dir_count": int(file_stats[1]),
+                "total_size_bytes": int(file_stats[2]),
+            }
+        )
 
     for root, dirs, files in os.walk(output_root, followlinks=False):
         root_path = Path(root)
@@ -611,6 +719,10 @@ def _scan_output_tree(output_root: Path) -> tuple[int, int, int, Optional[str], 
                 continue
             dir_count += 1
             real_dirs.append(directory)
+            depth = _relative_depth(output_root, path)
+            if depth > deepest_depth:
+                deepest_depth = depth
+                deepest_path = str(path)
         dirs[:] = real_dirs
 
         for filename in files:
@@ -626,16 +738,65 @@ def _scan_output_tree(output_root: Path) -> tuple[int, int, int, Optional[str], 
             if size > largest_file_size:
                 largest_file_size = size
                 largest_file_path = str(path)
+            depth = _relative_depth(output_root, path)
+            if depth > deepest_depth:
+                deepest_depth = depth
+                deepest_path = str(path)
 
-    return file_count, dir_count, total_size, largest_file_path, largest_file_size, top_level_entry_count
+            if size < 4 * 1024:
+                small_file_count += 1
+            elif size < 1024 * 1024:
+                medium_file_count += 1
+            else:
+                large_file_count += 1
+
+            extension = _normalize_extension(path)
+            stats = extension_stats[extension]
+            stats["extension"] = extension
+            stats["file_count"] = int(stats["file_count"]) + 1
+            stats["total_size_bytes"] = int(stats["total_size_bytes"]) + size
+            largest_files.append({"path": str(path), "size_bytes": size})
+
+    top_level_entries.sort(key=_entry_sort_key)
+    file_extension_breakdown = sorted(
+        extension_stats.values(),
+        key=lambda item: (
+            -int(item.get("total_size_bytes") or 0),
+            -int(item.get("file_count") or 0),
+            str(item.get("extension") or ""),
+        ),
+    )
+    largest_files.sort(key=lambda item: (-int(item.get("size_bytes") or 0), str(item.get("path") or "")))
+    avg_file_size_bytes = int(total_size / file_count) if file_count > 0 else 0
+
+    return {
+        "output_file_count": file_count,
+        "output_dir_count": dir_count,
+        "output_total_size_bytes": total_size,
+        "largest_file_path": largest_file_path,
+        "largest_file_size_bytes": largest_file_size,
+        "top_level_entry_count": top_level_entry_count,
+        "top_level_entries": top_level_entries,
+        "file_extension_breakdown": file_extension_breakdown,
+        "largest_files": largest_files[:10],
+        "deepest_path": (
+            {"path": deepest_path, "depth": deepest_depth}
+            if deepest_path is not None
+            else None
+        ),
+        "avg_file_size_bytes": avg_file_size_bytes,
+        "small_file_count": small_file_count,
+        "medium_file_count": medium_file_count,
+        "large_file_count": large_file_count,
+    }
 
 
 def _get_task_result(task_id: str) -> dict:
     task = _get_task_or_404(task_id)
     output_root = Path(str(task.get("output_path") or "").strip())
     run_root = _derive_run_path(task)
-    summary_path = run_root / "summary.txt"
-    reason_path = run_root / "reason.txt"
+    summary_path = output_root / "summary.txt"
+    reason_path = output_root / "reason.txt"
     tokens_summary_path = run_root / "tokens_summary.json"
     sessions_index_path = run_root / "sessions" / "index.json"
 
@@ -649,21 +810,24 @@ def _get_task_result(task_id: str) -> dict:
         warnings.append("输出目录不存在")
         available = False
 
-    output_file_count = 0
-    output_dir_count = 0
-    output_total_size_bytes = 0
-    largest_file_path: Optional[str] = None
-    largest_file_size_bytes = 0
-    top_level_entry_count = 0
+    output_stats = {
+        "output_file_count": 0,
+        "output_dir_count": 0,
+        "output_total_size_bytes": 0,
+        "largest_file_path": None,
+        "largest_file_size_bytes": 0,
+        "top_level_entry_count": 0,
+        "top_level_entries": [],
+        "file_extension_breakdown": [],
+        "largest_files": [],
+        "deepest_path": None,
+        "avg_file_size_bytes": 0,
+        "small_file_count": 0,
+        "medium_file_count": 0,
+        "large_file_count": 0,
+    }
     if output_root.exists() and output_root.is_dir():
-        (
-            output_file_count,
-            output_dir_count,
-            output_total_size_bytes,
-            largest_file_path,
-            largest_file_size_bytes,
-            top_level_entry_count,
-        ) = _scan_output_tree(output_root)
+        output_stats = _scan_output_tree(output_root)
 
     summary_text = _read_text_file(summary_path).strip() or None
     reason_text = _read_text_file(reason_path).strip() or None
@@ -696,12 +860,7 @@ def _get_task_result(task_id: str) -> dict:
         "reason_text": reason_text,
         "warnings": warnings,
         "summary": {
-            "output_file_count": output_file_count,
-            "output_dir_count": output_dir_count,
-            "output_total_size_bytes": output_total_size_bytes,
-            "largest_file_path": largest_file_path,
-            "largest_file_size_bytes": largest_file_size_bytes,
-            "top_level_entry_count": top_level_entry_count,
+            **output_stats,
             "matched_skill": str(task.get("matched_skill") or "").strip() or None,
             "fallback_to_llm": bool(task.get("fallback_to_llm")),
             "generated_skill_path": str(task.get("generated_skill_path") or "").strip() or None,

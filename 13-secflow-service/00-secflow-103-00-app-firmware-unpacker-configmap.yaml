@@ -44,8 +44,8 @@ data:
       task_retention_days: 7
 
     worker:
-      heartbeat_interval_seconds: 15
-      dead_threshold_seconds: 90
+      heartbeat_interval_seconds: 30
+      dead_threshold_seconds: 300
       claim_interval_seconds: 2
       claim_batch_size: 8
 

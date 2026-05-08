@@ -144,12 +144,20 @@ class TaskLogResponse(BaseModel):
 
 
 class TaskResultSummaryResponse(BaseModel):
+    top_level_entries: List[dict] = []
+    file_extension_breakdown: List[dict] = []
+    largest_files: List[dict] = []
+    deepest_path: Optional[dict] = None
     output_file_count: int = 0
     output_dir_count: int = 0
     output_total_size_bytes: int = 0
     largest_file_path: Optional[str] = None
     largest_file_size_bytes: int = 0
     top_level_entry_count: int = 0
+    avg_file_size_bytes: int = 0
+    small_file_count: int = 0
+    medium_file_count: int = 0
+    large_file_count: int = 0
     matched_skill: Optional[str] = None
     fallback_to_llm: bool = False
     generated_skill_path: Optional[str] = None

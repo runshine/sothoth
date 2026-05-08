@@ -90,8 +90,8 @@ class ServiceConfig(BaseModel):
 class WorkerConfig(BaseModel):
     """Worker runtime configuration."""
 
-    heartbeat_interval_seconds: int = 15
-    dead_threshold_seconds: int = 90
+    heartbeat_interval_seconds: int = 30
+    dead_threshold_seconds: int = 300
     claim_interval_seconds: int = 2
     claim_batch_size: int = 8
     task_lease_seconds: int = 45

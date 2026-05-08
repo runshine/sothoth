@@ -486,16 +486,6 @@ def _renew_task_lease(task_id: str, *, stage: Optional[str] = None) -> None:
                 owner_id=owner_id,
                 created_by="task_manager",
             )
-        _record_task_event_from_row(
-            task,
-            event_type="lease_renewed",
-            summary="任务租约已续期",
-            stage_key=str(task.current_stage or "").strip() or None,
-            status=task.status,
-            detail={"lease_expires_at": task.lease_expires_at.isoformat() if task.lease_expires_at else None},
-            owner_id=owner_id,
-            created_by="task_manager",
-        )
     finally:
         db.close()
 
