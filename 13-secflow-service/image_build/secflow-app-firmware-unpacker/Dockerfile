@@ -85,20 +85,7 @@ RUN mkdir -p /root/.pi/agent && cat > /root/.pi/agent/settings.json <<'PICONF'
 }
 PICONF
 
-RUN cat > /root/.pi/agent/models.json <<'PICONF'
-{
-  "providers": {
-    "my_llm": {
-      "baseUrl": "http://172.31.29.10:8000/v1/",
-      "api": "openai-completions",
-      "apiKey": "sk-12345678",
-      "models": [
-        { "id": "zai-org/GLM-5" }
-      ]
-    }
-  }
-}
-PICONF
+COPY models.json /root/.pi/agent/models.json
 
 COPY app/ /app/app/
 COPY config.yaml /app/config.yaml

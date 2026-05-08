@@ -12,6 +12,23 @@
 - `GET /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/agentflow`
 - `DELETE /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}`
 
+AgentFlow Web API 在本服务 REST 前缀下同步暴露，保留原始 `/api/runs` 后缀：
+
+- `GET /api/app/firmware-unpacker/api/examples/default`
+- `POST /api/app/firmware-unpacker/api/runs/validate`
+- `POST /api/app/firmware-unpacker/api/runs`
+- `GET /api/app/firmware-unpacker/api/runs`
+- `GET /api/app/firmware-unpacker/api/runs/{run_id}`
+- `POST /api/app/firmware-unpacker/api/runs/{run_id}/cancel`
+- `POST /api/app/firmware-unpacker/api/runs/{run_id}/rerun`
+- `GET /api/app/firmware-unpacker/api/runs/{run_id}/events`
+- `GET /api/app/firmware-unpacker/api/runs/{run_id}/artifacts/{node_id}/{name}`
+- `GET /api/app/firmware-unpacker/api/runs/{run_id}/scratchboard`
+- `GET /api/app/firmware-unpacker/api/runs/{run_id}/stream`
+- `GET /api/app/firmware-unpacker/api/health`
+
+同时提供等价别名 `/api/app/firmware-unpacker/agentflow/...`。
+
 兼容保留的旧接口：
 
 - `POST /api/app/firmware-unpacker/unpack`

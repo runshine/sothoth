@@ -44,7 +44,7 @@ VAL_PROMPT_TMPL = AGENT_DIR / "prompt" / "review-firmware-unpack.md"
 CLEAN_PROMPT_TMPL = AGENT_DIR / "prompt" / "cleanup-firmware.md"
 AUTHOR_PROMPT_TMPL = AGENT_DIR / "prompt" / "author-firmware-skill.md"
 
-TOOLS_DIR = Path(os.environ.get("UNPACKER_TOOLS_DIR", "/data/tools"))
+TOOLS_DIR = Path(os.environ.get("UNPACKER_TOOLS_DIR", "/data/secflow-app-firmware-unpacker/tools"))
 LOG_OUTPUT_DIR = Path(os.environ.get("UNPACKER_LOG_DIR", "/workspace/log_output"))
 
 
@@ -458,16 +458,23 @@ def _run_reviewer(
     suffix: str,
     val_def: dict[str, Any],
     val_sp: str,
+    bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> tuple[bool, str]:
     validator = PiRpcClient(
         system_prompt_file=val_sp,
         model=val_def["model"],
         tools=val_def["tools"],
     )
-    verify_result = validator.prompt(render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path))
-    _save_agent_log(validator, log_dir, f"verifier_{suffix}")
-    validator.close()
-    return _is_review_success(verify_result), verify_result
+    if bind_cancel_client:
+        bind_cancel_client(validator)
+    try:
+        verify_result = validator.prompt(render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path))
+        _save_agent_log(validator, log_dir, f"verifier_{suffix}")
+        return _is_review_success(verify_result), verify_result
+    finally:
+        if bind_cancel_client:
+            bind_cancel_client(None)
+        validator.close()
 
 
 def _write_system_prompt(content: str, prefix: str) -> str:
@@ -491,6 +498,7 @@ def _run_skill_unpack(
     log_dir: Path | None,
     val_def: dict[str, Any],
     val_sp: str,
+    bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> dict[str, Any]:
     skill_sp = _write_system_prompt(str(skill_meta.get("system_prompt") or ""), "firmware-skill-")
     executor = PiRpcClient(
@@ -498,6 +506,8 @@ def _run_skill_unpack(
         model=skill_meta.get("model"),
         tools=skill_meta.get("tools"),
     )
+    if bind_cancel_client:
+        bind_cancel_client(executor)
     try:
         exec_result = executor.prompt(render_prompt(EXEC_FIRST_TMPL, firmware_path, output_path))
         _save_agent_log(executor, log_dir, "skill_executor")
@@ -508,6 +518,7 @@ def _run_skill_unpack(
             "skill",
             val_def,
             val_sp,
+            bind_cancel_client=bind_cancel_client,
         )
         result = {
             "success": passed,
@@ -529,6 +540,8 @@ def _run_skill_unpack(
         )
         return result
     finally:
+        if bind_cancel_client:
+            bind_cancel_client(None)
         executor.close()
         try:
             Path(skill_sp).unlink()
@@ -552,6 +565,7 @@ def _run_generic_unpack(
         model=exec_def["model"],
         tools=exec_def["tools"],
     )
+    cancel_check(executor)
     passed = False
     final_round = 0
     last_reason = ""
@@ -573,6 +587,7 @@ def _run_generic_unpack(
                 f"round_{attempt}",
                 val_def,
                 val_sp,
+                bind_cancel_client=cancel_check,
             )
             log_event(
                 log,
@@ -595,6 +610,7 @@ def _run_generic_unpack(
             last_reason = verify_result
         return passed, final_round, last_reason
     finally:
+        cancel_check(None)
         executor.close()
 
 
@@ -612,6 +628,7 @@ def _generate_candidate_skill(
     features: dict[str, Any],
     review_result: str,
     log_dir: Path | None,
+    bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
 ) -> dict[str, Any] | None:
     try:
         author_def = load_agent_def(AUTHOR_AGENT_DEF)
@@ -635,10 +652,14 @@ def _generate_candidate_skill(
             model=author_def["model"],
             tools=author_def["tools"],
         )
+        if bind_cancel_client:
+            bind_cancel_client(author)
         try:
             raw_doc = author.prompt(prompt)
             _save_agent_log(author, log_dir, "skill_author")
         finally:
+            if bind_cancel_client:
+                bind_cancel_client(None)
             author.close()
             try:
                 Path(author_sp).unlink()
@@ -669,7 +690,11 @@ def _generate_candidate_skill(
         return None
 
 
-def _run_cleaner(output_path: str, log_dir: Path | None = None) -> str:
+def _run_cleaner(
+    output_path: str,
+    log_dir: Path | None = None,
+    bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
+) -> str:
     clean_def = load_agent_def(CLEAN_AGENT_DEF)
     clean_sp = "/tmp/firmware-extract-cleanup.md"
     Path(clean_sp).write_text(clean_def["system_prompt"])
@@ -678,19 +703,25 @@ def _run_cleaner(output_path: str, log_dir: Path | None = None) -> str:
         model=clean_def["model"],
         tools=clean_def["tools"],
     )
-    clean_msg = render_prompt(CLEAN_PROMPT_TMPL, output_path, "")
-    log_event(log, logging.INFO, "cleanup started", event="cleanup_start")
-    result = cleaner.prompt(clean_msg)
-    _save_agent_log(cleaner, log_dir, "cleaner")
-    cleaner.close()
-    log_event(
-        log,
-        logging.INFO,
-        "cleanup completed",
-        event="cleanup_complete",
-        response_preview=_preview_text(result),
-    )
-    return result
+    if bind_cancel_client:
+        bind_cancel_client(cleaner)
+    try:
+        clean_msg = render_prompt(CLEAN_PROMPT_TMPL, output_path, "")
+        log_event(log, logging.INFO, "cleanup started", event="cleanup_start")
+        result = cleaner.prompt(clean_msg)
+        _save_agent_log(cleaner, log_dir, "cleaner")
+        log_event(
+            log,
+            logging.INFO,
+            "cleanup completed",
+            event="cleanup_complete",
+            response_preview=_preview_text(result),
+        )
+        return result
+    finally:
+        if bind_cancel_client:
+            bind_cancel_client(None)
+        cleaner.close()
 
 
 def run_unpack(
@@ -699,6 +730,7 @@ def run_unpack(
     cancel_check: Optional[Callable[[], bool]] = None,
     task_id: str | None = None,
     project_id: str | None = None,
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
 ) -> dict:
     """Execute the AgentFlow firmware unpacking pipeline."""
 

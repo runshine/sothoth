@@ -19,6 +19,7 @@ for candidate in (_project_root, _app_dir):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.agentflow_runs import router as agentflow_runs_router
 from app.api.firmware import router as firmware_router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
@@ -133,6 +134,7 @@ app.add_middleware(
 )
 
 setup_exception_handlers(app)
+app.include_router(agentflow_runs_router)
 app.include_router(firmware_router)
 
 

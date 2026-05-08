@@ -8,6 +8,7 @@ on:
     paths:
       - .github/workflows/build-secflow-app-system-analyse-image.yaml
       - 13-secflow-service/image_build/secflow-app-system-analyse/**
+      - 13-secflow-service/image_build/secflow-app-system-analyse
 
 jobs:
   prepare:

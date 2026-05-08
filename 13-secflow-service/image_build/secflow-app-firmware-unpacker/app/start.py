@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Startup script — launches Gunicorn with a threaded WSGI adapter."""
+"""Startup script — launches Gunicorn with an ASGI worker."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ if __name__ == "__main__":
         "--threads",
         str(threads),
         "--worker-class",
-        "gthread",
+        "uvicorn.workers.UvicornWorker",
         "--timeout",
         str(timeout),
         "--keep-alive",
@@ -65,6 +65,6 @@ if __name__ == "__main__":
         "--error-logfile",
         "-",
         "--capture-output",
-        "app.wsgi:app",
+        "app.main:app",
     ]
     gunicorn.app.wsgiapp.run()

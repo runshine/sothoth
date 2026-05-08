@@ -4,62 +4,6 @@ metadata:
   name: secflow-app-dataflow-analyse-config
   namespace: secflow-ns
 data:
-  config.json: |
-    {
-      "max_rounds": 3,
-      "min_rounds": 2,
-      "pass_threshold": 1,
-      "agent_max_retries": 100,
-      "agent_retry_delay": 30,
-      "pi_max_retries": -1,
-      "pi_retry_delay": 10,
-      "max_trace_depth": 5,
-      "callee_concurrency": -1,
-      "workers": {
-        "default_tools": ["read", "bash", "edit", "write", "find"],
-        "system_prompt_dir": "/opt/data_flow_analyse/prompts/workers",
-        "default_thinking_level": "off",
-        "agents": [
-          {"model": "icsl_vllm_1/zai-org/GLM-5"}
-        ]
-      },
-      "judges": {
-        "default_tools": ["read", "bash", "find"],
-        "system_prompt_dir": "/opt/data_flow_analyse/prompts/judges",
-        "default_thinking_level": "off",
-        "agents": [
-          {"model": "icsl_vllm_1/zai-org/GLM-5"}
-        ]
-      },
-      "output_dir": "/data/output",
-      "archive_dir": "/data/output",
-      "result_dir": "/data/output"
-    }
-
-  models.json: |
-    {
-      "providers": {
-        "icsl_vllm_1": {
-          "baseUrl": "http://172.31.29.10:8000/v1/",
-          "api": "openai-completions",
-          "apiKey": "1234",
-          "models": [{"id": "zai-org/GLM-5", "reasoning": true}]
-        },
-        "icsl_vllm_2": {
-          "baseUrl": "http://172.31.29.10:8003/v1/",
-          "api": "openai-completions",
-          "apiKey": "12345",
-          "models": [{"id": "MiniMax/MiniMax-M2.5", "reasoning": true}]
-        },
-        "gptplus_glm": {
-          "baseUrl": "https://az.gptplus5.com/v1",
-          "api": "openai-completions",
-          "apiKey": "sk-8zyyvaRQ6QlQzwONikzreTNlRqbLBokuUFH70Akk0AMTcF6y",
-          "models": [{"id": "glm-5.1", "reasoning": true}]
-        }
-      }
-    }
-
   service.yaml: |
     database:
       host: "mysql.sothothv2-ns.svc.cluster.local"
@@ -111,6 +55,10 @@ data:
       host: "0.0.0.0"
       port: 8080
       debug: false
+
+    configcenter_service:
+      base_url: "http://secflow-platform-configcenter/api/configcenter"
+      timeout: 30
 
     logging:
       level: "INFO"

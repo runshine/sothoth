@@ -1,0 +1,15 @@
+{
+  "providers": {
+    "gaiasec": {
+      "baseUrl": "http://gaiasec.ai.icsl.huawei.com",
+      "api": "openai-completions",
+      "apiKey": "qq111111",
+      "models": [
+        { "id": "auto" },
+        { "id": "max" },
+        { "id": "pro" },
+        { "id": "mini" }
+      ]
+    }
+  }
+}
