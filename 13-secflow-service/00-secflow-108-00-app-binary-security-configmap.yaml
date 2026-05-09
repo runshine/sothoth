@@ -36,10 +36,14 @@ data:
       require_input_exists: true
 
     scheduler:
+      enabled: true
       poll_interval_seconds: 5
       task_concurrency: 2
       stage_poll_interval_seconds: 5
       shutdown_grace_seconds: 10
+      downstream_sync_concurrency: 8
+      downstream_action_concurrency: 8
+      downstream_request_timeout_seconds: 120
 
     runtime_policy:
       max_stage_parallelism: 4

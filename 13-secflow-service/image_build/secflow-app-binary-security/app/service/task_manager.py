@@ -307,7 +307,7 @@ class TaskManager:
         output_root = self._resolve_output_root(workspace_root, payload.output_root)
         input_dir = workspace_root / "input"
         run_dir = workspace_root / "run"
-        self._init_workspace(workspace_root)
+        await self._init_workspace_async(workspace_root)
         await self._ensure_task_directories(project_id, task_id, authorization_token)
         metadata_path = input_dir / "task-metadata.json"
         policy = self._merge_policy(db, project_id, payload.policy_overrides.model_dump(exclude_none=True), payload.stage_options)
@@ -361,7 +361,7 @@ class TaskManager:
         task.stage_summary = {}
         db.add(task)
         db.commit()
-        self._write_task_metadata(task, metadata_path, status="pending_upload")
+        await self._write_task_metadata_async(task, metadata_path, status="pending_upload")
         self._record_event(db, task, "task_created", f"创建任务 {task.id}", payload={"input_files": input_files})
         self._record_event(db, task, "task_upload_pending", "任务创建完成，等待上传文件")
         db.commit()
@@ -403,9 +403,9 @@ class TaskManager:
                 filename = str(file_info["filename"])
                 relative_path = str(file_info.get("relative_path") or filename).strip().replace("\\", "/")
                 local_path = input_dir / relative_path
-                if not local_path.is_file():
+                if not await asyncio.to_thread(local_path.is_file):
                     raise ValidationError(f"上传文件缺失: {relative_path}")
-                stat = local_path.stat()
+                stat = await asyncio.to_thread(local_path.stat)
                 total_bytes += stat.st_size
                 actual_files.append(
                     {
@@ -429,7 +429,7 @@ class TaskManager:
             "input_total_bytes": total_bytes,
             "firmware_item_count": len(actual_files),
         }
-        self._write_task_metadata(task, input_dir / "task-metadata.json", status="ready_to_start")
+        await self._write_task_metadata_async(task, input_dir / "task-metadata.json", status="ready_to_start")
         self._record_event(db, task, "task_upload_completed", "输入文件上传完成", payload={"uploaded_files": len(actual_files)})
         self._record_event(db, task, "task_ready_to_start", "任务已就绪，准备自动启动")
         db.commit()
@@ -648,19 +648,27 @@ class TaskManager:
             deleted_event_count=int(deleted_count or 0),
         )
 
-    def get_artifacts(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityArtifactsResponse:
+    def get_artifacts(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> BinarySecurityArtifactsResponse:
         task = self._task_or_404(db, project_id, task_id)
-        root = Path(task.workspace_root)
-        files = []
-        if root.exists():
-            for path in sorted(p for p in root.rglob("*") if p.is_file()):
-                files.append({"path": str(path.relative_to(root)), "size": path.stat().st_size})
+        page = self._list_artifact_page(Path(task.workspace_root), limit=max(1, limit), offset=max(0, offset))
         return BinarySecurityArtifactsResponse(
             task_id=task.id,
             workspace_root=task.workspace_root,
             output_root=task.output_root,
             fileserver_path=(task.summary or {}).get("fileserver_project_path"),
-            files=files,
+            total=page["total"],
+            limit=page["limit"],
+            offset=page["offset"],
+            has_more=page["has_more"],
+            files=page["files"],
         )
 
     async def cancel_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
@@ -679,7 +687,7 @@ class TaskManager:
         for item in running_items:
             item.status = "cancelled"
             item.finished_at = _now()
-        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
+        await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
         db.commit()
         token = self._service_token()
         await asyncio.gather(
@@ -706,7 +714,7 @@ class TaskManager:
             if item.status in {"pending", "queued", "running"}:
                 item.status = "cancelled"
                 item.finished_at = _now()
-        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
+        await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
         db.commit()
 
         await self._cancel_local_worker(task.id)
@@ -904,6 +912,7 @@ class TaskManager:
         failed_count = 0
         touched_stages: set[str] = set()
         auth_token = token or self._service_token()
+        ready_items: list[BinarySecurityStageItem] = []
         for item in items:
             item_stage_name = item.stage_name
             item_downstream_service = item.downstream_service
@@ -920,9 +929,23 @@ class TaskManager:
                     item=item,
                 )
                 continue
+            ready_items.append(item)
+
+        fetch_results = await self._run_with_limits(
+            ready_items,
+            lambda current_item: self._fetch_downstream_task_payload(task, current_item, auth_token),
+            concurrency=self.cfg.scheduler.downstream_sync_concurrency,
+            timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+        )
+        for item, payload, exc in fetch_results:
+            item_stage_name = item.stage_name
+            item_downstream_service = item.downstream_service
+            item_downstream_task_id = item.downstream_task_id
             before_status = item.status
             try:
-                payload = await self._fetch_downstream_task_payload(task, item, auth_token)
+                if exc is not None:
+                    raise exc
+                assert isinstance(payload, dict)
                 downstream_status = str(payload.get("status") or "").lower()
                 mapped_status = self._map_downstream_status(downstream_status)
                 if not mapped_status:
@@ -1029,7 +1052,7 @@ class TaskManager:
                 self._refresh_stage_run_from_items(db, task, current_stage)
         if touched_stages:
             self._refresh_task_status_after_sync(db, task)
-            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
         db.commit()
         return BinarySecurityActionResponse(
             task_id=task.id,
@@ -1805,6 +1828,9 @@ class TaskManager:
         for rel in ["input", "output", "run", "logs"]:
             ensure_dir(root / rel)
 
+    async def _init_workspace_async(self, root: Path) -> None:
+        await asyncio.to_thread(self._init_workspace, root)
+
     async def _ensure_task_directories(self, project_id: str, task_id: str, authorization_token: str) -> None:
         client = get_fileserver_client()
         await client.ensure_project_directory(project_id, "app", authorization_token)
@@ -1839,6 +1865,9 @@ class TaskManager:
                 },
             },
         )
+
+    async def _write_task_metadata_async(self, task: BinarySecurityTask, metadata_path: Path, *, status: str) -> None:
+        await asyncio.to_thread(self._write_task_metadata, task, metadata_path, status=status)
 
     def _normalize_input_files(self, files: list[BinarySecurityInputFile | dict[str, Any]], *, task_type: str) -> list[dict[str, Any]]:
         rows = []
@@ -1932,11 +1961,11 @@ class TaskManager:
     async def _wait_for_uploaded_file(self, path: Path, *, timeout_seconds: int = 10, interval_seconds: int = 1) -> bool:
         attempts = max(1, timeout_seconds // max(1, interval_seconds)) + 1
         for attempt in range(attempts):
-            if path.is_file():
+            if await asyncio.to_thread(path.is_file):
                 return True
             if attempt < attempts - 1:
                 await asyncio.sleep(interval_seconds)
-        return path.is_file()
+        return await asyncio.to_thread(path.is_file)
 
     async def _materialize_source_archives(self, task: BinarySecurityTask, declared: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int]:
         input_dir = ensure_dir(Path(task.workspace_root) / "input")
@@ -1949,10 +1978,10 @@ class TaskManager:
             temp_path = temp_dir / filename
             if not await self._wait_for_uploaded_file(temp_path, timeout_seconds=10, interval_seconds=1):
                 raise ValidationError(f"上传文件缺失: {filename}")
-            stat = temp_path.stat()
+            stat = await asyncio.to_thread(temp_path.stat)
             total_bytes += stat.st_size
-            extracted_count += self._safe_extract_archive(temp_path, input_dir)
-            temp_path.unlink(missing_ok=True)
+            extracted_count += await asyncio.to_thread(self._safe_extract_archive, temp_path, input_dir)
+            await asyncio.to_thread(temp_path.unlink, missing_ok=True)
             actual_files.append(
                 {
                     **file_info,
@@ -1965,8 +1994,8 @@ class TaskManager:
             )
         if extracted_count <= 0:
             raise ValidationError("源码压缩包解压后没有得到任何文件")
-        shutil.rmtree(temp_dir, ignore_errors=True)
-        ensure_dir(temp_dir)
+        await asyncio.to_thread(shutil.rmtree, temp_dir, True)
+        await asyncio.to_thread(ensure_dir, temp_dir)
         return actual_files, total_bytes, extracted_count
 
     def _merge_policy(self, db: Session, project_id: str, overrides: dict[str, Any], stage_options: dict[str, Any]) -> dict[str, Any]:
@@ -2969,6 +2998,27 @@ class TaskManager:
         task.metrics = metrics
         task.stage_summary = stage_summary
 
+    def _list_artifact_page(self, root: Path, *, limit: int, offset: int) -> dict[str, Any]:
+        files: list[dict[str, Any]] = []
+        total = 0
+        if root.exists():
+            for current_root, dirnames, filenames in os.walk(root):
+                dirnames.sort()
+                filenames.sort()
+                current_path = Path(current_root)
+                for filename in filenames:
+                    path = current_path / filename
+                    if total >= offset and len(files) < limit:
+                        files.append({"path": str(path.relative_to(root)), "size": path.stat().st_size})
+                    total += 1
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(files) < total,
+            "files": files,
+        }
+
     def _reset_stage_run_for_retry(self, stage_run: BinarySecurityStageRun, *, increment_retry: bool) -> None:
         stage_run.status = "pending"
         if increment_retry:
@@ -2980,6 +3030,31 @@ class TaskManager:
         stage_run.output_summary = {}
         stage_run.counts = {}
         stage_run.downstream_refs = {}
+
+    async def _run_with_limits(
+        self,
+        rows: list[Any],
+        worker,
+        *,
+        concurrency: int,
+        timeout_seconds: int | float | None,
+    ) -> list[tuple[Any, Any, Exception | None]]:
+        if not rows:
+            return []
+        semaphore = asyncio.Semaphore(max(1, int(concurrency or 1)))
+
+        async def _guarded(row: Any) -> tuple[Any, Any, Exception | None]:
+            async with semaphore:
+                try:
+                    if timeout_seconds and timeout_seconds > 0:
+                        result = await asyncio.wait_for(worker(row), timeout=float(timeout_seconds))
+                    else:
+                        result = await worker(row)
+                    return row, result, None
+                except Exception as exc:
+                    return row, None, exc
+
+        return await asyncio.gather(*(_guarded(row) for row in rows))
 
     async def _cancel_downstream(self, item: BinarySecurityStageItem, token: str | None) -> None:
         try:
@@ -3027,7 +3102,7 @@ class TaskManager:
             await asyncio.gather(worker, return_exceptions=True)
 
     async def _cancel_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
-        async def do_cancel(ref: dict[str, str]) -> bool:
+        for ref in refs:
             self._record_event(
                 db,
                 task,
@@ -3036,6 +3111,8 @@ class TaskManager:
                 stage_name=ref.get("stage_name"),
                 payload=ref,
             )
+
+        async def do_cancel(ref: dict[str, str]) -> bool:
             try:
                 if ref["service"] == "firmware_unpacker":
                     await get_firmware_unpacker_client().cancel_task(ref["task_id"], token or "")
@@ -3050,24 +3127,34 @@ class TaskManager:
                 elif ref["service"] == "dataflow_vuln_scanner":
                     await get_dataflow_vuln_scanner_client().cancel_task(ref["task_id"], token or "")
                 return True
-            except Exception as exc:
-                self._record_event(
-                    db,
-                    task,
-                    "downstream_cancel_failed",
-                    f"下游取消失败: {ref['service']}:{ref['task_id']} - {exc}",
-                    stage_name=ref.get("stage_name"),
-                    level="warning",
-                    payload={**ref, "error": str(exc)},
-                )
-                return False
-
-        results = await asyncio.gather(*(do_cancel(ref) for ref in refs), return_exceptions=False)
+            except Exception:
+                raise
         db.commit()
-        return sum(1 for ok in results if ok)
+        results = await self._run_with_limits(
+            refs,
+            do_cancel,
+            concurrency=self.cfg.scheduler.downstream_action_concurrency,
+            timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+        )
+        success_count = 0
+        for ref, ok, exc in results:
+            if exc is None and ok:
+                success_count += 1
+                continue
+            self._record_event(
+                db,
+                task,
+                "downstream_cancel_failed",
+                f"下游取消失败: {ref['service']}:{ref['task_id']} - {exc}",
+                stage_name=ref.get("stage_name"),
+                level="warning",
+                payload={**ref, "error": str(exc)},
+            )
+        db.commit()
+        return success_count
 
     async def _delete_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
-        async def do_delete(ref: dict[str, str]) -> bool:
+        for ref in refs:
             self._record_event(
                 db,
                 task,
@@ -3076,6 +3163,8 @@ class TaskManager:
                 stage_name=ref.get("stage_name"),
                 payload=ref,
             )
+
+        async def do_delete(ref: dict[str, str]) -> bool:
             try:
                 if ref["service"] == "firmware_unpacker":
                     await get_firmware_unpacker_client().delete_task(ref["task_id"], token or "")
@@ -3090,21 +3179,31 @@ class TaskManager:
                 elif ref["service"] == "dataflow_vuln_scanner":
                     await get_dataflow_vuln_scanner_client().delete_task(ref["task_id"], token or "")
                 return True
-            except Exception as exc:
-                self._record_event(
-                    db,
-                    task,
-                    "downstream_delete_failed",
-                    f"下游删除失败: {ref['service']}:{ref['task_id']} - {exc}",
-                    stage_name=ref.get("stage_name"),
-                    level="warning",
-                    payload={**ref, "error": str(exc)},
-                )
-                return False
-
-        results = await asyncio.gather(*(do_delete(ref) for ref in refs), return_exceptions=False)
+            except Exception:
+                raise
         db.commit()
-        return sum(1 for ok in results if ok)
+        results = await self._run_with_limits(
+            refs,
+            do_delete,
+            concurrency=self.cfg.scheduler.downstream_action_concurrency,
+            timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+        )
+        success_count = 0
+        for ref, ok, exc in results:
+            if exc is None and ok:
+                success_count += 1
+                continue
+            self._record_event(
+                db,
+                task,
+                "downstream_delete_failed",
+                f"下游删除失败: {ref['service']}:{ref['task_id']} - {exc}",
+                stage_name=ref.get("stage_name"),
+                level="warning",
+                payload={**ref, "error": str(exc)},
+            )
+        db.commit()
+        return success_count
 
     async def _cleanup_task_workspace(self, task: BinarySecurityTask, token: str | None) -> str:
         relative_path = f"app/secflow-app-binary-security/{task.id}"
@@ -3116,7 +3215,7 @@ class TaskManager:
         except Exception:
             cleanup_status = "fallback"
         try:
-            shutil.rmtree(workspace_root, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, workspace_root, True)
         except Exception:
             cleanup_status = "partial_failed"
         return cleanup_status
@@ -4565,6 +4664,7 @@ class TaskManager:
 
     def _aggregate_stage_items(self, db: Session, task: BinarySecurityTask, results: list[dict[str, Any]], summary_key: str) -> tuple[str, dict[str, Any]]:
         success = [result["item"] for result in results if result.get("status") == "success"]
+        compact_success = self._compact_stage_success_items(summary_key, success)
         failed = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "failed"]
         cancelled = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "cancelled"]
         if failed and success:
@@ -4576,18 +4676,128 @@ class TaskManager:
         else:
             status = "success"
         summary = {
-            "items": success,
+            "items": compact_success,
             "failed_items": failed,
             "cancelled_items": cancelled,
-            "success_count": len(success),
+            "success_count": len(compact_success),
             "failed_count": len(failed),
             "entry_count": 0,
             "vuln_result_count": 0,
             "error": failed[0].get("error") if failed else cancelled[0].get("error") if cancelled else None,
         }
-        task.summary = {**task.summary, summary_key: success}
+        task.summary = {**task.summary, summary_key: compact_success}
         db.commit()
         return status, summary
+
+    def _compact_stage_success_items(self, summary_key: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        compactors = {
+            "firmware_unpack_results": self._compact_firmware_unpack_summary_item,
+            "b2s_results": self._compact_b2s_summary_item,
+            "entry_results": self._compact_entry_summary_item,
+            "dataflow_results": self._compact_dataflow_summary_item,
+            "vuln_results": self._compact_vuln_summary_item,
+        }
+        compactor = compactors.get(summary_key)
+        if compactor is None:
+            return [dict(item) for item in items if isinstance(item, dict)]
+        return [compactor(item) for item in items if isinstance(item, dict)]
+
+    def _compact_firmware_unpack_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        unpacked_root = item.get("unpacked_root")
+        return {
+            "firmware_key": item.get("firmware_key"),
+            "firmware_name": item.get("firmware_name"),
+            "filename": item.get("filename"),
+            "input_path": item.get("input_path"),
+            "unpacked_root": unpacked_root,
+            "source_root": item.get("source_root") or unpacked_root,
+            "task_type": item.get("task_type", TASK_TYPE_BINARY),
+        }
+
+    def _compact_b2s_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "firmware_key": item.get("firmware_key"),
+            "firmware_name": item.get("firmware_name"),
+            "filename": item.get("filename"),
+            "unpacked_root": item.get("unpacked_root"),
+            "source_root": item.get("source_root"),
+            "module_key": item.get("module_key"),
+            "module_name": item.get("module_name"),
+            "module_dir": item.get("module_dir"),
+            "source_dir": item.get("source_dir"),
+            "module_report": item.get("module_report"),
+            "files_list": item.get("files_list"),
+        }
+
+    def _compact_entry_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "firmware_key": item.get("firmware_key"),
+            "firmware_name": item.get("firmware_name"),
+            "filename": item.get("filename"),
+            "unpacked_root": item.get("unpacked_root"),
+            "source_root": item.get("source_root"),
+            "module_key": item.get("module_key"),
+            "module_name": item.get("module_name"),
+            "module_dir": item.get("module_dir"),
+            "source_dir": item.get("source_dir"),
+            "artifact_root": item.get("artifact_root"),
+            "entries": self._compact_entry_rows(item.get("entries") or []),
+        }
+
+    def _compact_entry_rows(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            rows.append(
+                {
+                    "entry_key": entry.get("entry_key"),
+                    "firmware_key": entry.get("firmware_key"),
+                    "firmware_name": entry.get("firmware_name"),
+                    "module_key": entry.get("module_key"),
+                    "module_name": entry.get("module_name"),
+                    "file_name": entry.get("file_name"),
+                    "function_name": entry.get("function_name"),
+                    "line_no": entry.get("line_no"),
+                    "entry_file": entry.get("entry_file"),
+                    "source_dir": entry.get("source_dir"),
+                }
+            )
+        return rows
+
+    def _compact_dataflow_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "entry_key": item.get("entry_key"),
+            "firmware_key": item.get("firmware_key"),
+            "firmware_name": item.get("firmware_name"),
+            "module_key": item.get("module_key"),
+            "module_name": item.get("module_name"),
+            "file_name": item.get("file_name"),
+            "function_name": item.get("function_name"),
+            "line_no": item.get("line_no"),
+            "entry_file": item.get("entry_file"),
+            "source_dir": item.get("source_dir"),
+            "artifact_root": item.get("artifact_root"),
+            "data_flow_file": item.get("data_flow_file"),
+        }
+
+    def _compact_vuln_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
+        artifact_files = item.get("artifact_files") or []
+        return {
+            "entry_key": item.get("entry_key"),
+            "firmware_key": item.get("firmware_key"),
+            "firmware_name": item.get("firmware_name"),
+            "module_key": item.get("module_key"),
+            "module_name": item.get("module_name"),
+            "file_name": item.get("file_name"),
+            "function_name": item.get("function_name"),
+            "line_no": item.get("line_no"),
+            "source_dir": item.get("source_dir"),
+            "data_flow_file": item.get("data_flow_file"),
+            "workspace_root": item.get("workspace_root"),
+            "archive_root": item.get("archive_root"),
+            "artifact_file_count": len(artifact_files) if isinstance(artifact_files, list) else 0,
+        }
 
     def _lightweight_stage_failure(self, result: dict[str, Any]) -> dict[str, Any]:
         item = result.get("item") or {}

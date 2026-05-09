@@ -255,7 +255,20 @@ class TaskManagerTests(unittest.TestCase):
             db,
             task,
             results=[
-                {"status": "success", "item": {"id": "a"}},
+                {
+                    "status": "success",
+                    "item": {
+                        "firmware_key": "fw1",
+                        "firmware_name": "fw.bin",
+                        "filename": "fw.bin",
+                        "unpacked_root": "/tmp/unpacked",
+                        "source_root": "/tmp/unpacked",
+                        "module_key": "m1",
+                        "module_name": "openssl",
+                        "module_dir": "/tmp/unpacked/modules/openssl",
+                        "source_dir": "/tmp/archive/openssl",
+                    },
+                },
                 {"status": "failed", "item": {"id": "b"}, "error": "boom"},
             ],
             summary_key="b2s_results",
@@ -264,8 +277,174 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("partial_success", status)
         self.assertEqual(1, summary["success_count"])
         self.assertEqual(1, summary["failed_count"])
-        self.assertEqual([{"id": "a"}], task.summary["b2s_results"])
+        self.assertEqual(
+            [
+                {
+                    "firmware_key": "fw1",
+                    "firmware_name": "fw.bin",
+                    "filename": "fw.bin",
+                    "unpacked_root": "/tmp/unpacked",
+                    "source_root": "/tmp/unpacked",
+                    "module_key": "m1",
+                    "module_name": "openssl",
+                    "module_dir": "/tmp/unpacked/modules/openssl",
+                    "source_dir": "/tmp/archive/openssl",
+                    "module_report": None,
+                    "files_list": None,
+                }
+            ],
+            task.summary["b2s_results"],
+        )
         self.assertEqual(1, db.commits)
+
+    def test_aggregate_stage_items_compacts_b2s_results_for_summary_storage(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task.summary = {}
+        db = _FakeDb()
+
+        status, summary = self.manager._aggregate_stage_items(
+            db,
+            task,
+            results=[
+                {
+                    "status": "success",
+                    "item": {
+                        "firmware_key": "fw1",
+                        "firmware_name": "fw.bin",
+                        "filename": "fw.bin",
+                        "unpacked_root": "/tmp/unpacked",
+                        "source_root": "/tmp/unpacked",
+                        "module_key": "m1",
+                        "module_name": "openssl",
+                        "module_dir": "/tmp/unpacked/modules/openssl",
+                        "source_dir": "/tmp/archive/openssl",
+                        "module_report": "/tmp/archive/openssl/report.md",
+                        "files_list": "/tmp/archive/openssl/files.list",
+                        "generated_files": [f"/tmp/archive/openssl/{idx}.c" for idx in range(100)],
+                        "downstream": {"items": [{"huge": "x" * 1000} for _ in range(100)]},
+                    },
+                }
+            ],
+            summary_key="b2s_results",
+        )
+
+        self.assertEqual("success", status)
+        stored = task.summary["b2s_results"][0]
+        self.assertEqual("m1", stored["module_key"])
+        self.assertEqual("/tmp/archive/openssl", stored["source_dir"])
+        self.assertNotIn("generated_files", stored)
+        self.assertNotIn("downstream", stored)
+        self.assertEqual(stored, summary["items"][0])
+
+    def test_entry_results_keep_entries_but_drop_downstream_payload(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task.summary = {}
+        db = _FakeDb()
+
+        _, summary = self.manager._aggregate_stage_items(
+            db,
+            task,
+            results=[
+                {
+                    "status": "success",
+                    "item": {
+                        "module_key": "m1",
+                        "module_name": "openssl",
+                        "source_dir": "/tmp/archive/openssl",
+                        "artifact_root": "/tmp/archive/openssl/entry",
+                        "entries": [
+                            {
+                                "entry_key": "e1",
+                                "module_key": "m1",
+                                "module_name": "openssl",
+                                "file_name": "main.c",
+                                "function_name": "main",
+                                "line_no": "10",
+                                "source_dir": "/tmp/archive/openssl",
+                                "extra_blob": "x" * 4000,
+                            }
+                        ],
+                        "downstream": {"result": {"entries": [{"blob": "y" * 4000}]}},
+                    },
+                }
+            ],
+            summary_key="entry_results",
+        )
+
+        stored = task.summary["entry_results"][0]
+        self.assertEqual("e1", stored["entries"][0]["entry_key"])
+        self.assertNotIn("extra_blob", stored["entries"][0])
+        self.assertNotIn("downstream", stored)
+        self.assertEqual(stored, summary["items"][0])
+
+    def test_dataflow_results_keep_vuln_inputs_but_drop_downstream_payload(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task.summary = {}
+        db = _FakeDb()
+
+        self.manager._aggregate_stage_items(
+            db,
+            task,
+            results=[
+                {
+                    "status": "success",
+                    "item": {
+                        "entry_key": "e1",
+                        "module_key": "m1",
+                        "module_name": "openssl",
+                        "file_name": "main.c",
+                        "function_name": "main",
+                        "line_no": "10",
+                        "source_dir": "/tmp/archive/openssl",
+                        "data_flow_file": "/tmp/archive/openssl/dataflow.md",
+                        "artifact_root": "/tmp/archive/openssl/dataflow",
+                        "downstream": {"items": [{"blob": "z" * 4000}]},
+                    },
+                }
+            ],
+            summary_key="dataflow_results",
+        )
+
+        stored = task.summary["dataflow_results"][0]
+        self.assertEqual("/tmp/archive/openssl/dataflow.md", stored["data_flow_file"])
+        self.assertEqual("/tmp/archive/openssl", stored["source_dir"])
+        self.assertNotIn("downstream", stored)
+
+    def test_vuln_results_store_only_archive_summary(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task.summary = {}
+        db = _FakeDb()
+
+        self.manager._aggregate_stage_items(
+            db,
+            task,
+            results=[
+                {
+                    "status": "success",
+                    "item": {
+                        "entry_key": "e1",
+                        "module_key": "m1",
+                        "module_name": "openssl",
+                        "function_name": "main",
+                        "source_dir": "/tmp/archive/openssl",
+                        "data_flow_file": "/tmp/archive/openssl/dataflow.md",
+                        "workspace_root": "/tmp/workspace",
+                        "archive_root": "/tmp/archive/scan",
+                        "artifact_files": [f"/tmp/archive/scan/{idx}.json" for idx in range(50)],
+                        "artifacts": {"files": [{"blob": "x" * 4000}]},
+                        "downstream": {"result": {"blob": "y" * 4000}},
+                    },
+                }
+            ],
+            summary_key="vuln_results",
+        )
+
+        stored = task.summary["vuln_results"][0]
+        self.assertEqual(50, stored["artifact_file_count"])
+        self.assertEqual("/tmp/archive/scan", stored["archive_root"])
+        self.assertNotIn("artifact_files", stored)
+        self.assertNotIn("artifacts", stored)
+        self.assertNotIn("downstream", stored)
 
     def test_finalize_task_prefers_partial_success_after_vuln_stage(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
@@ -1254,6 +1433,69 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual(6, len(results))
         self.assertEqual(6, max_active)
+
+    def test_run_with_limits_respects_concurrency(self):
+        active = 0
+        max_active = 0
+
+        async def worker(value):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return value * 2
+
+        results = asyncio.run(
+            self.manager._run_with_limits(
+                [1, 2, 3, 4],
+                worker,
+                concurrency=2,
+                timeout_seconds=1,
+            )
+        )
+
+        self.assertEqual(2, max_active)
+        self.assertEqual([(1, 2, None), (2, 4, None), (3, 6, None), (4, 8, None)], results)
+
+    def test_run_with_limits_captures_timeout(self):
+        async def worker(value):
+            await asyncio.sleep(0.05)
+            return value
+
+        results = asyncio.run(
+            self.manager._run_with_limits(
+                [1],
+                worker,
+                concurrency=1,
+                timeout_seconds=0.01,
+            )
+        )
+
+        self.assertEqual(1, len(results))
+        row, payload, exc = results[0]
+        self.assertEqual(1, row)
+        self.assertIsNone(payload)
+        self.assertIsInstance(exc, TimeoutError)
+
+    def test_list_artifact_page_returns_paged_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index in range(5):
+                path = root / f"dir-{index}" / f"file-{index}.txt"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"payload-{index}", encoding="utf-8")
+
+            page = self.manager._list_artifact_page(root, limit=2, offset=1)
+
+        self.assertEqual(5, page["total"])
+        self.assertEqual(2, page["limit"])
+        self.assertEqual(1, page["offset"])
+        self.assertTrue(page["has_more"])
+        self.assertEqual(
+            ["dir-1/file-1.txt", "dir-2/file-2.txt"],
+            [entry["path"] for entry in page["files"]],
+        )
 
 
 if __name__ == "__main__":

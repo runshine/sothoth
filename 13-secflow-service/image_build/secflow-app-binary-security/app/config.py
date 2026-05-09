@@ -84,10 +84,14 @@ class StorageConfig(BaseModel):
 
 
 class SchedulerConfig(BaseModel):
+    enabled: bool = True
     poll_interval_seconds: int = 5
     task_concurrency: int = 2
     stage_poll_interval_seconds: int = 5
     shutdown_grace_seconds: int = 10
+    downstream_sync_concurrency: int = 8
+    downstream_action_concurrency: int = 8
+    downstream_request_timeout_seconds: int = 120
 
 
 class RuntimePolicyConfig(BaseModel):

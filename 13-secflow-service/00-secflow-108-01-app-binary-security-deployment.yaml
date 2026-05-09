@@ -8,10 +8,12 @@ spec:
   selector:
     matchLabels:
       name: secflow-app-binary-security
+      role: api
   template:
     metadata:
       labels:
         name: secflow-app-binary-security
+        role: api
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
@@ -23,6 +25,10 @@ spec:
               value: Asia/Shanghai
             - name: SECFLOW_BINARY_SECURITY_CONFIG
               value: /app/config.yaml
+            - name: SECFLOW_BINARY_SECURITY_ROLE
+              value: api
+            - name: SECFLOW_BINARY_SECURITY_ENABLE_SCHEDULER
+              value: "false"
             - name: CONFIG_PATH
               value: /app/config.yaml
             - name: POD_NAME

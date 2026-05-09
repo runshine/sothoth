@@ -70,7 +70,7 @@ async def ready_check():
 
 
 @router.get("/projects/{project_id}/tasks", response_model=BinarySecurityTaskListResponse)
-async def list_tasks(
+def list_tasks(
     project_id: str,
     status: Optional[str] = Query(None),
     task_type: Optional[str] = Query(None),
@@ -81,7 +81,7 @@ async def list_tasks(
 
 
 @router.post("/projects/{project_id}/tasks/prepare", response_model=BinarySecurityTaskPrepareResponse)
-async def prepare_task(
+def prepare_task(
     project_id: str,
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
@@ -131,7 +131,7 @@ async def complete_uploads(
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/start", response_model=BinarySecurityTaskDetailResponse)
-async def start_task(
+def start_task(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -141,7 +141,7 @@ async def start_task(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}", response_model=BinarySecurityTaskDetailResponse)
-async def get_task(
+def get_task(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -151,7 +151,7 @@ async def get_task(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/timeline", response_model=BinarySecurityTimelineResponse)
-async def get_timeline(
+def get_timeline(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -161,7 +161,7 @@ async def get_timeline(
 
 
 @router.delete("/projects/{project_id}/tasks/{task_id}/timeline", response_model=BinarySecurityActionResponse)
-async def clear_timeline(
+def clear_timeline(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -171,13 +171,15 @@ async def clear_timeline(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/artifacts", response_model=BinarySecurityArtifactsResponse)
-async def get_artifacts(
+def get_artifacts(
     project_id: str,
     task_id: str,
+    limit: int = Query(default=200, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return get_task_manager().get_artifacts(db, project_id=project_id, task_id=task_id)
+    return get_task_manager().get_artifacts(db, project_id=project_id, task_id=task_id, limit=limit, offset=offset)
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/cancel", response_model=BinarySecurityActionResponse)
@@ -201,7 +203,7 @@ async def delete_task(
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/retry", response_model=BinarySecurityActionResponse)
-async def retry_task(
+def retry_task(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -212,7 +214,7 @@ async def retry_task(
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/continue", response_model=BinarySecurityActionResponse)
-async def continue_task(
+def continue_task(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -223,7 +225,7 @@ async def continue_task(
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/retry", response_model=BinarySecurityActionResponse)
-async def retry_stage(
+def retry_stage(
     project_id: str,
     task_id: str,
     stage_name: str,
@@ -256,7 +258,7 @@ async def sync_downstream_status(
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/module-selection", response_model=BinarySecurityModuleSelectionResponse)
-async def get_module_selection(
+def get_module_selection(
     project_id: str,
     task_id: str,
     _: TokenUser = Depends(get_current_context),
@@ -266,7 +268,7 @@ async def get_module_selection(
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/module-selection/confirm", response_model=BinarySecurityTaskDetailResponse)
-async def confirm_module_selection(
+def confirm_module_selection(
     project_id: str,
     task_id: str,
     payload: BinarySecurityModuleSelectionConfirmPayload,
@@ -282,7 +284,7 @@ async def confirm_module_selection(
 
 
 @router.get("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
-async def get_project_config(
+def get_project_config(
     project_id: str,
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
@@ -291,7 +293,7 @@ async def get_project_config(
 
 
 @router.put("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
-async def put_project_config(
+def put_project_config(
     project_id: str,
     payload: BinarySecurityProjectConfigPayload,
     _: TokenUser = Depends(get_current_context),
@@ -301,7 +303,7 @@ async def put_project_config(
 
 
 @router.get("/service/config", response_model=BinarySecurityServiceConfigResponse)
-async def get_service_config(
+def get_service_config(
     _: TokenUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -309,7 +311,7 @@ async def get_service_config(
 
 
 @router.put("/service/config", response_model=BinarySecurityServiceConfigResponse)
-async def put_service_config(
+def put_service_config(
     payload: BinarySecurityServiceConfigPayload,
     _: TokenUser = Depends(get_current_user),
     db: Session = Depends(get_db),

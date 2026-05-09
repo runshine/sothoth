@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from urllib.error import HTTPError, URLError
@@ -26,6 +27,31 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+
+def _service_role() -> str:
+    raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or ""
+    normalized = str(raw_role).strip().lower()
+    return normalized if normalized in {"api", "worker"} else "all"
+
+
+def _scheduler_enabled() -> bool:
+    env_value = os.environ.get("SECFLOW_BINARY_SECURITY_ENABLE_SCHEDULER")
+    if env_value is not None:
+        return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
+    role = _service_role()
+    if role == "api":
+        return False
+    if role == "worker":
+        return True
+    return bool(get_config().scheduler.enabled)
+
+
+def _registry_enabled() -> bool:
+    role = _service_role()
+    if role == "worker":
+        return False
+    return bool(get_config().registry.enabled)
 
 
 def verify_auth_service_or_exit() -> None:
@@ -78,8 +104,10 @@ async def lifespan(_: FastAPI):
         with get_engine().connect() as conn:
             conn.exec_driver_sql("SELECT 1")
         verify_auth_service_or_exit()
-        await get_registry_service().start()
-        await get_task_manager().start()
+        if _registry_enabled():
+            await get_registry_service().start()
+        if _scheduler_enabled():
+            await get_task_manager().start()
     except Exception as exc:
         logger.exception("Binary Security 服务启动失败: %s", exc)
         sys.exit(1)
@@ -87,8 +115,10 @@ async def lifespan(_: FastAPI):
     logger.info("SecFlow Binary Security 服务启动成功")
     yield
     try:
-        await get_task_manager().stop()
-        await get_registry_service().stop()
+        if _scheduler_enabled():
+            await get_task_manager().stop()
+        if _registry_enabled():
+            await get_registry_service().stop()
     except Exception as exc:
         logger.warning("Binary Security 服务关闭警告: %s", exc)
 

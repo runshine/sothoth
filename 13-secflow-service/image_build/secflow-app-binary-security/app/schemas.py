@@ -235,6 +235,10 @@ class BinarySecurityArtifactsResponse(BaseModel):
     workspace_root: str
     output_root: str
     fileserver_path: Optional[str] = None
+    total: int = 0
+    limit: int = 200
+    offset: int = 0
+    has_more: bool = False
     files: list[BinarySecurityArtifactEntry] = Field(default_factory=list)
 
 
