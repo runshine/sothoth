@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.config import get_config
 from app.main import create_app
-from app.models.database import WorkflowDefinitionVersion, get_db_session
+from app.models.database import HistoryRun, WorkflowDefinitionVersion, WorkflowExecution, get_db_session
 
 
 def _wait_for_task_status(client: TestClient, task_id: str, expected: set[str] | None = None, timeout: float = 10.0) -> dict:
@@ -86,15 +86,15 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     assert detail_payload["attempts"]
     execution_id = detail_payload["attempts"][0]["execution_id"]
 
-    history_resolve = client.get(
-        "/api/dataflow-vuln-scanner/history-runs/by-task",
+    run_resolve = client.get(
+        "/api/dataflow-vuln-scanner/runs/by-task",
         params={"project_id": "default", "task_id": task_id, "execution_id": execution_id},
     )
-    assert history_resolve.status_code == 200
+    assert run_resolve.status_code == 200
 
-    history_detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{history_resolve.json()['history_run_id']}")
-    assert history_detail.status_code == 200
-    artifact_paths = [item["path"] for item in history_detail.json()["files"]]
+    run_detail = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}")
+    assert run_detail.status_code == 200
+    artifact_paths = [item["path"] for item in run_detail.json()["files"]]
     assert "input/task.md" in artifact_paths
     assert "run.log" in artifact_paths
 
@@ -304,21 +304,21 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     execution_id = payload["attempts"][0]["execution_id"]
     _wait_for_task_status(client, task_id)
 
-    history_resolve = client.get(
-        "/api/dataflow-vuln-scanner/history-runs/by-task",
+    run_resolve = client.get(
+        "/api/dataflow-vuln-scanner/runs/by-task",
         params={"project_id": "default", "task_id": task_id, "execution_id": execution_id},
     )
-    assert history_resolve.status_code == 200
-    history_detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{history_resolve.json()['history_run_id']}")
-    assert history_detail.status_code == 200
-    history_payload = history_detail.json()
-    assert history_payload["config"]["thinking"] == ""
-    assert "run_vuln_scan.py" in history_payload["command_display"]
-    assert "--model mock/model" in history_payload["command_display"]
-    assert "--run-name business-scan" in history_payload["command_display"]
-    assert history_payload["raw"]["dataflow_cli"]["command_display"] == history_payload["command_display"]
+    assert run_resolve.status_code == 200
+    run_detail = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}")
+    assert run_detail.status_code == 200
+    run_payload = run_detail.json()
+    assert run_payload["config"]["thinking"] == ""
+    assert "run_vuln_scan.py" in run_payload["command_display"]
+    assert "--model mock/model" in run_payload["command_display"]
+    assert "--run-name business-scan" in run_payload["command_display"]
+    assert run_payload["raw"]["dataflow_cli"]["command_display"] == run_payload["command_display"]
 
-    run_files = client.get(f"/api/dataflow-vuln-scanner/history-runs/{history_resolve.json()['history_run_id']}/files")
+    run_files = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}/files")
     assert run_files.status_code == 200
     file_paths = [item["path"] for item in run_files.json()]
     assert "input/task.md" in file_paths
@@ -404,6 +404,148 @@ def test_business_dataflow_task_uses_selected_runs_root(service_config_path, pat
     runtime_config = json.loads((expected_run_root / "config.json").read_text(encoding="utf-8"))
     assert runtime_config["global"]["workspace_root"] == str((expected_run_root / "workspace").resolve())
     assert runtime_config["execution"]["output_dir"] == str((expected_run_root / "output").resolve())
+
+
+def test_dataflow_run_resolve_by_task_reinitializes_missing_pending_run(
+    service_config_path,
+    patch_mock_agent_runtime,
+    monkeypatch,
+):
+    from pathlib import Path
+    import shutil
+
+    from app.api import tasks as task_api
+
+    class NoopScheduler:
+        def start_execution_now(self, execution_id):
+            return False
+
+    monkeypatch.setattr(task_api, "get_scheduler_service", lambda: NoopScheduler())
+
+    config = get_config()
+    project_root = Path(config.fileserver_service.data_mount_path)
+    case_root = project_root / "files" / "default" / "case-pending-resolve"
+    source_dir = case_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
+    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "pending resolve scan",
+            "data_flow": {"source": "project_filesystem", "path": "/case-pending-resolve/data_flow.md"},
+            "source_dir": {"source": "project_filesystem", "path": "/case-pending-resolve/source"},
+            "model": "mock/model",
+            "review_profile": "fast",
+            "max_review_cycles": 1,
+        },
+    )
+    assert task.status_code == 201
+    payload = task.json()
+    run_root = Path(payload["run_path"])
+    shutil.rmtree(run_root)
+
+    run_resolve = client.get(
+        "/api/dataflow-vuln-scanner/runs/by-task",
+        params={
+            "project_id": "default",
+            "task_id": payload["task_id"],
+            "execution_id": payload["latest_execution_id"],
+        },
+    )
+    assert run_resolve.status_code == 200
+    assert run_resolve.json()["linked_task_id"] == payload["task_id"]
+    assert run_root.is_dir()
+    assert (run_root / "input" / "task.md").is_file()
+
+
+def test_dataflow_run_resolve_by_task_recovers_from_metadata_when_workspace_root_missing(
+    service_config_path,
+    patch_mock_agent_runtime,
+    monkeypatch,
+):
+    from pathlib import Path
+
+    from app.api import tasks as task_api
+    from app.services.history_run_service import get_history_run_service
+
+    class NoopScheduler:
+        def start_execution_now(self, execution_id):
+            return False
+
+    monkeypatch.setattr(task_api, "get_scheduler_service", lambda: NoopScheduler())
+
+    config = get_config()
+    project_root = Path(config.fileserver_service.data_mount_path)
+    case_root = project_root / "files" / "default" / "case-metadata-resolve"
+    source_dir = case_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
+    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "metadata resolve scan",
+            "data_flow": {"source": "project_filesystem", "path": "/case-metadata-resolve/data_flow.md"},
+            "source_dir": {"source": "project_filesystem", "path": "/case-metadata-resolve/source"},
+            "model": "mock/model",
+            "review_profile": "fast",
+            "max_review_cycles": 1,
+        },
+    )
+    assert task.status_code == 201
+    payload = task.json()
+    task_id = payload["task_id"]
+    execution_id = payload["latest_execution_id"]
+    run_root = Path(payload["run_path"]).resolve()
+
+    db = get_db_session()
+    try:
+        for record in db.query(HistoryRun).filter(HistoryRun.linked_task_id == task_id).all():
+            get_history_run_service()._delete_children(db, record.id)
+            db.delete(record)
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        execution.workspace_root = None
+        db.add(execution)
+        db.commit()
+    finally:
+        db.close()
+
+    run_resolve = client.get(
+        "/api/dataflow-vuln-scanner/runs/by-task",
+        params={
+            "project_id": "default",
+            "task_id": task_id,
+            "execution_id": execution_id,
+        },
+    )
+    assert run_resolve.status_code == 200
+    assert run_resolve.json()["linked_task_id"] == task_id
+    assert run_resolve.json()["linked_execution_id"] == execution_id
+    assert Path(run_resolve.json()["root_path"]) == run_root.parent
+
+    db = get_db_session()
+    try:
+        execution = db.get(WorkflowExecution, execution_id)
+        assert execution is not None
+        assert Path(execution.workspace_root).resolve() == run_root
+    finally:
+        db.close()
 
 
 def test_business_dataflow_task_rejects_output_dir_with_cli_launcher(service_config_path, patch_mock_agent_runtime):

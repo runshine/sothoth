@@ -4,7 +4,7 @@ import json
 import shlex
 import shutil
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -386,7 +386,7 @@ class HistoryRunService:
     def _history_run_or_404(self, db: Session, history_run_id: str) -> HistoryRun:
         record = db.get(HistoryRun, history_run_id)
         if record is None or record.source_type != "execution_workspace":
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run not found")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
         return record
 
     def _delete_children(self, db: Session, history_run_id: str) -> None:
@@ -404,7 +404,7 @@ class HistoryRunService:
         try:
             candidate.relative_to(project_root)
         except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="history run path escapes project root") from exc
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="run path escapes project root") from exc
         return candidate
 
     def _discover_execution_runs(self, db: Session, project_id: str) -> list[tuple[WorkflowExecution, Path]]:
@@ -725,7 +725,7 @@ class HistoryRunService:
         )
 
     def sync_project_history_runs(self, db: Session, project_id: str) -> None:
-        if not get_config().history_runs.enabled:
+        if not get_config().runs.enabled:
             return
         execution_runs = self._discover_execution_runs(db, project_id)
         linked_tasks_by_id: dict[str, TriggerTask] = {}
@@ -791,13 +791,12 @@ class HistoryRunService:
             HistoryRun.run_root_path == str(candidate.resolve()),
         ).first()
         if record is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run not found")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
         return record
 
     def _summary_payload(self, history_run: HistoryRun) -> dict[str, Any]:
         return {
             "run_id": history_run.id,
-            "history_run_id": history_run.id,
             "project_id": history_run.project_id,
             "source_type": history_run.source_type,
             "source_key": history_run.source_key,
@@ -1040,7 +1039,7 @@ class HistoryRunService:
             .first()
         )
         if cycle_row is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="history run cycle not found")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run cycle not found")
         global_reviews = (
             db.query(HistoryRunGlobalReview)
             .filter(HistoryRunGlobalReview.history_run_id == history_run.id, HistoryRunGlobalReview.cycle == cycle)
@@ -1160,7 +1159,7 @@ class HistoryRunService:
     def delete_history_run(self, db: Session, history_run: HistoryRun, *, allow_active: bool = False) -> None:
         run_root = self._managed_project_run_root(history_run.project_id, history_run.run_root_path)
         if _history_run_is_active(history_run) and not allow_active:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="history run is active and cannot be deleted")
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is active and cannot be deleted")
         self._delete_children(db, history_run.id)
         db.delete(history_run)
         db.flush()

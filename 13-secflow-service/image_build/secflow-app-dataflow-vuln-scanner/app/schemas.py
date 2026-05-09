@@ -175,7 +175,6 @@ class ScanTaskAttemptResponse(BaseModel):
     attempt_no: int
     status: str
     run_id: Optional[str] = None
-    history_run_id: Optional[str] = None
     owner_pod_id: Optional[str]
     lease_expires_at: Optional[datetime]
     process_pid: Optional[int] = None
@@ -284,10 +283,6 @@ class RunRetryRequest(BaseModel):
     clean_workspace: bool = False
 
 
-class HistoryRunRetryRequest(RunRetryRequest):
-    pass
-
-
 class RunMutationResponse(BaseModel):
     success: bool = True
     run_id: str
@@ -299,10 +294,6 @@ class RunMutationResponse(BaseModel):
     process_pid: Optional[int] = None
     process_host: Optional[str] = None
     process_signal: Optional[str] = None
-
-
-class HistoryRunMutationResponse(RunMutationResponse):
-    history_run_id: str
 
 
 class HealthResponse(BaseModel):
@@ -340,10 +331,6 @@ class RunSummaryResponse(BaseModel):
     updated_at: Optional[str] = None
 
 
-class HistoryRunSummaryResponse(RunSummaryResponse):
-    history_run_id: str
-
-
 class RunFileResponse(BaseModel):
     category: str
     path: str
@@ -351,10 +338,6 @@ class RunFileResponse(BaseModel):
     size: int
     mtime: float
     type: str
-
-
-class HistoryRunFileResponse(RunFileResponse):
-    pass
 
 
 class RunSessionResponse(BaseModel):
@@ -365,10 +348,6 @@ class RunSessionResponse(BaseModel):
     size: int = 0
     mtime: float = 0
     calls: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class HistoryRunSessionResponse(RunSessionResponse):
-    pass
 
 
 class RunDetailResponse(RunSummaryResponse):
@@ -388,12 +367,6 @@ class RunDetailResponse(RunSummaryResponse):
     raw: Dict[str, Any] = Field(default_factory=dict)
 
 
-class HistoryRunDetailResponse(RunDetailResponse):
-    history_run_id: str
-    files: List[HistoryRunFileResponse] = Field(default_factory=list)
-    sessions: List[HistoryRunSessionResponse] = Field(default_factory=list)
-
-
 class RunCycleResponse(BaseModel):
     cycle: int
     global_reviews: List[Dict[str, Any]] = Field(default_factory=list)
@@ -402,26 +375,14 @@ class RunCycleResponse(BaseModel):
     metrics: Dict[str, Any] = Field(default_factory=dict)
 
 
-class HistoryRunCycleResponse(RunCycleResponse):
-    pass
-
-
 class RunFileContentResponse(BaseModel):
     path: str
     type: str
     content: str
 
 
-class HistoryRunFileContentResponse(RunFileContentResponse):
-    pass
-
-
 class RunLogResponse(BaseModel):
     content: str
-
-
-class HistoryRunLogResponse(RunLogResponse):
-    pass
 
 
 class RunResolveResponse(BaseModel):
@@ -432,7 +393,3 @@ class RunResolveResponse(BaseModel):
     source_type: str
     linked_task_id: Optional[str] = None
     linked_execution_id: Optional[str] = None
-
-
-class HistoryRunResolveResponse(RunResolveResponse):
-    history_run_id: str

@@ -338,3 +338,94 @@ class TaskResultApiTests(unittest.TestCase):
         self.assertFalse(metrics["result"]["cache_available"])
         self.assertFalse(metrics["health"]["result_cache_available"])
         self.assertTrue(any("结果缓存不存在" in warning for warning in metrics["health"]["warnings"]))
+
+    def test_get_task_metrics_reports_round_observability_without_scanning_output(self):
+        task_root = self.root / "task-rounds"
+        output_root = task_root / "output"
+        run_root = task_root / "run"
+        output_root.mkdir(parents=True, exist_ok=True)
+        (run_root / "round_000").mkdir(parents=True, exist_ok=True)
+        self._add_task("t-rounds", output_root, status="success")
+        (run_root / "round_000" / "results.json").write_text(
+            json.dumps({"round": 0, "status": "ignored"}),
+            encoding="utf-8",
+        )
+        round1 = run_root / "round_001"
+        round1.mkdir(parents=True, exist_ok=True)
+        (round1 / "results.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "t-rounds",
+                    "round": 1,
+                    "status": "review_passed",
+                    "started_at": "2026-05-09T00:00:00",
+                    "completed_at": "2026-05-09T00:00:12",
+                    "duration_seconds": 12.5,
+                    "executor": {
+                        "duration_seconds": 8,
+                        "response_preview": "executor ok",
+                        "provider_role": "executor",
+                    },
+                    "reviewer": {
+                        "passed": True,
+                        "duration_seconds": 4.5,
+                        "review_preview": "review ok",
+                        "provider_role": "reviewer",
+                    },
+                    "tokens": {
+                        "executor": {"input": 10, "output": 20, "total": 30},
+                        "reviewer": {"input": 5, "output": 7, "total": 12},
+                        "round_total": {"input": 15, "output": 27, "total": 42, "cost": 0.03},
+                    },
+                    "output_snapshot": {
+                        "output_file_count": 4,
+                        "output_dir_count": 2,
+                        "output_total_size_bytes": 8192,
+                        "largest_file_size_bytes": 4096,
+                    },
+                    "output_delta": {
+                        "file_count_delta": 4,
+                        "dir_count_delta": 2,
+                        "size_bytes_delta": 8192,
+                        "baseline_round": None,
+                    },
+                    "artifacts": {
+                        "summary_present": True,
+                        "reason_present": False,
+                        "warnings": ["reason.md not generated yet"],
+                    },
+                    "context": {
+                        "matched_skill": None,
+                        "fallback_to_llm": True,
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        bad_round = run_root / "round_002"
+        bad_round.mkdir(parents=True, exist_ok=True)
+        (bad_round / "results.json").write_text("{bad json", encoding="utf-8")
+
+        with patch("app.api.firmware._scan_output_tree", side_effect=AssertionError("metrics must not scan output")):
+            metrics = _get_task_metrics("t-rounds")
+
+        rounds = metrics["rounds"]
+        self.assertTrue(rounds["available"])
+        self.assertEqual(1, rounds["round_count"])
+        self.assertEqual(1, rounds["completed_round_count"])
+        self.assertEqual(0, rounds["failed_round_count"])
+        self.assertEqual(1, rounds["latest_round"])
+        self.assertEqual(12.5, rounds["total_duration_seconds"])
+        self.assertEqual(42, rounds["total_tokens"])
+        self.assertEqual(0.03, rounds["total_cost"])
+        self.assertEqual(8192, rounds["output_growth_bytes"])
+        self.assertEqual({"review_passed": 1}, rounds["summary"]["status_counts"])
+        self.assertEqual(30, rounds["summary"]["stage_summary"]["llm_unpack"]["token_total"])
+        self.assertEqual(12, rounds["summary"]["stage_summary"]["review"]["token_total"])
+        self.assertEqual(1, len(rounds["items"]))
+        self.assertEqual(1, rounds["items"][0]["round"])
+        self.assertEqual(4, rounds["items"][0]["output_snapshot"]["output_file_count"])
+        self.assertTrue(rounds["items"][0]["reviewer"]["passed"])
+        self.assertTrue(any("round_002/results.json" in warning for warning in rounds["warnings"]))
+        self.assertTrue(any("round_002/results.json" in warning for warning in metrics["health"]["warnings"]))

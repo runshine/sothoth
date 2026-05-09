@@ -76,7 +76,7 @@ class FileserverServiceConfig(BaseModel):
     dataflow_subproject_name: str = "DATAFLOW_VULN_SCANNER"
 
 
-class HistoryRunsConfig(BaseModel):
+class RunsConfig(BaseModel):
     enabled: bool = True
 
 
@@ -142,7 +142,7 @@ class Config(BaseModel):
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     fileserver_service: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
-    history_runs: HistoryRunsConfig = Field(default_factory=HistoryRunsConfig)
+    runs: RunsConfig = Field(default_factory=RunsConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

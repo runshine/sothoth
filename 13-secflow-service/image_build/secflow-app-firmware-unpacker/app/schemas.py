@@ -277,6 +277,22 @@ class TaskMetricsResultResponse(BaseModel):
     matched_skill: Optional[str] = None
 
 
+class TaskMetricsRoundsResponse(BaseModel):
+    available: bool = False
+    round_count: int = 0
+    completed_round_count: int = 0
+    failed_round_count: int = 0
+    running_round: Optional[int] = None
+    total_duration_seconds: float = 0
+    total_tokens: int = 0
+    total_cost: float = 0
+    output_growth_bytes: int = 0
+    latest_round: Optional[int] = None
+    summary: dict = {}
+    items: List[dict] = []
+    warnings: List[str] = []
+
+
 class TaskMetricsHealthResponse(BaseModel):
     is_terminal: bool
     has_owner: bool
@@ -293,6 +309,7 @@ class TaskMetricsResponse(BaseModel):
     events: TaskMetricsEventsResponse
     sessions: TaskMetricsSessionsResponse
     result: TaskMetricsResultResponse
+    rounds: TaskMetricsRoundsResponse
     health: TaskMetricsHealthResponse
 
 

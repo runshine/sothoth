@@ -740,6 +740,244 @@ def _get_cached_result_metrics(run_root: Path) -> dict:
     }
 
 
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _round_metric_empty(warnings: Optional[list[str]] = None) -> dict:
+    return {
+        "available": False,
+        "round_count": 0,
+        "completed_round_count": 0,
+        "failed_round_count": 0,
+        "running_round": None,
+        "total_duration_seconds": 0.0,
+        "total_tokens": 0,
+        "total_cost": 0.0,
+        "output_growth_bytes": 0,
+        "latest_round": None,
+        "summary": {
+            "status_counts": {},
+            "stage_summary": {},
+        },
+        "items": [],
+        "warnings": list(warnings or []),
+    }
+
+
+def _normalize_round_tokens(payload: dict) -> dict:
+    source = payload if isinstance(payload, dict) else {}
+    input_tokens = _safe_int(source.get("input"))
+    output_tokens = _safe_int(source.get("output"))
+    cache_read = _safe_int(source.get("cache_read", source.get("cacheRead")))
+    cache_write = _safe_int(source.get("cache_write", source.get("cacheWrite")))
+    total = _safe_int(source.get("total"))
+    if total <= 0:
+        total = input_tokens + output_tokens + cache_read + cache_write
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "total": total,
+        "cost": _safe_float(source.get("cost")),
+    }
+
+
+def _token_total_from_mapping(value) -> int:
+    if not isinstance(value, dict):
+        return 0
+    return _normalize_round_tokens(value)["total"]
+
+
+def _round_number_from_dir(path: Path) -> Optional[int]:
+    name = path.name
+    if not name.startswith("round_"):
+        return None
+    try:
+        return int(name.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_round_metrics(run_root: Path) -> dict:
+    warnings: list[str] = []
+    if not run_root.exists() or not run_root.is_dir():
+        return _round_metric_empty()
+
+    items: list[dict] = []
+    for round_dir in _list_round_dirs(run_root):
+        round_id = _round_number_from_dir(round_dir)
+        if round_id is None or round_id == 0:
+            continue
+        result_path = round_dir / "results.json"
+        if not result_path.exists():
+            continue
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            warning = f"{result_path.relative_to(run_root)} 读取失败: {exc}"
+            warnings.append(warning)
+            continue
+        if not isinstance(payload, dict):
+            warnings.append(f"{result_path.relative_to(run_root)} 格式不是对象")
+            continue
+
+        executor = payload.get("executor") if isinstance(payload.get("executor"), dict) else {}
+        reviewer = payload.get("reviewer") if isinstance(payload.get("reviewer"), dict) else {}
+        tokens_payload = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
+        round_tokens = _normalize_round_tokens(
+            tokens_payload.get("round_total") if isinstance(tokens_payload.get("round_total"), dict) else {}
+        )
+        output_snapshot = payload.get("output_snapshot") if isinstance(payload.get("output_snapshot"), dict) else {}
+        output_delta = payload.get("output_delta") if isinstance(payload.get("output_delta"), dict) else {}
+        artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+
+        size_delta = _safe_int(
+            output_delta.get("size_bytes_delta", output_delta.get("output_total_size_bytes_delta"))
+        )
+        file_delta = _safe_int(
+            output_delta.get("file_count_delta", output_delta.get("output_file_count_delta"))
+        )
+        dir_delta = _safe_int(
+            output_delta.get("dir_count_delta", output_delta.get("output_dir_count_delta"))
+        )
+        item = {
+            "round": _safe_int(payload.get("round"), round_id),
+            "status": str(payload.get("status") or "unknown"),
+            "started_at": payload.get("started_at"),
+            "completed_at": payload.get("completed_at"),
+            "duration_seconds": _safe_float(payload.get("duration_seconds")),
+            "executor": {
+                "status": str(executor.get("status") or "completed"),
+                "duration_seconds": _safe_float(executor.get("duration_seconds")),
+                "response_preview": executor.get("response_preview"),
+                "provider_role": executor.get("provider_role"),
+                "session_file": executor.get("session_file"),
+            },
+            "reviewer": {
+                "passed": bool(reviewer.get("passed")),
+                "duration_seconds": _safe_float(reviewer.get("duration_seconds")),
+                "review_preview": reviewer.get("review_preview"),
+                "provider_role": reviewer.get("provider_role"),
+                "session_file": reviewer.get("session_file"),
+            },
+            "tokens": round_tokens,
+            "output_snapshot": {
+                "output_file_count": _safe_int(output_snapshot.get("output_file_count")),
+                "output_dir_count": _safe_int(output_snapshot.get("output_dir_count")),
+                "output_total_size_bytes": _safe_int(output_snapshot.get("output_total_size_bytes")),
+                "largest_file_size_bytes": _safe_int(output_snapshot.get("largest_file_size_bytes")),
+            },
+            "output_delta": {
+                "file_count_delta": file_delta,
+                "dir_count_delta": dir_delta,
+                "size_bytes_delta": size_delta,
+                "baseline_round": output_delta.get("baseline_round"),
+            },
+            "artifacts": {
+                "summary_present": bool(artifacts.get("summary_present")),
+                "reason_present": bool(artifacts.get("reason_present")),
+                "warnings": [
+                    str(item)
+                    for item in (artifacts.get("warnings") or [])
+                    if str(item).strip()
+                ],
+                "summary_preview": artifacts.get("summary_preview"),
+                "reason_preview": artifacts.get("reason_preview"),
+            },
+            "context": {
+                "matched_skill": context.get("matched_skill"),
+                "fallback_to_llm": bool(context.get("fallback_to_llm")),
+                "provider_role": context.get("provider_role") or executor.get("provider_role"),
+            },
+            "source_path": str(result_path),
+            "raw": payload,
+        }
+        items.append(item)
+
+    items.sort(key=lambda item: int(item.get("round") or 0))
+    if not items:
+        return _round_metric_empty(warnings)
+
+    status_counts: dict[str, int] = defaultdict(int)
+    completed = 0
+    failed = 0
+    running_round = None
+    total_duration = 0.0
+    total_tokens = 0
+    total_cost = 0.0
+    output_growth = 0
+    stage_summary = {
+        "llm_unpack": {"round_count": 0, "duration_seconds": 0.0, "token_total": 0},
+        "review": {"round_count": 0, "duration_seconds": 0.0, "token_total": 0},
+    }
+    for item in items:
+        status_value = str(item.get("status") or "unknown")
+        status_counts[status_value] += 1
+        if status_value in {"review_passed", "success", "completed"}:
+            completed += 1
+        elif status_value in {"review_failed", "failed", "error"}:
+            failed += 1
+        else:
+            running_round = item.get("round")
+        duration = _safe_float(item.get("duration_seconds"))
+        total_duration += duration
+        tokens = item.get("tokens") if isinstance(item.get("tokens"), dict) else {}
+        total_tokens += _safe_int(tokens.get("total"))
+        total_cost += _safe_float(tokens.get("cost"))
+        delta = item.get("output_delta") if isinstance(item.get("output_delta"), dict) else {}
+        output_growth += _safe_int(delta.get("size_bytes_delta"))
+
+        executor = item.get("executor") if isinstance(item.get("executor"), dict) else {}
+        reviewer = item.get("reviewer") if isinstance(item.get("reviewer"), dict) else {}
+        stage_summary["llm_unpack"]["round_count"] += 1
+        stage_summary["llm_unpack"]["duration_seconds"] += _safe_float(executor.get("duration_seconds"))
+        raw_tokens = item.get("raw", {}).get("tokens", {}) if isinstance(item.get("raw"), dict) else {}
+        stage_summary["llm_unpack"]["token_total"] += _token_total_from_mapping(
+            raw_tokens.get("executor") if isinstance(raw_tokens, dict) else {}
+        )
+        stage_summary["review"]["round_count"] += 1
+        stage_summary["review"]["duration_seconds"] += _safe_float(reviewer.get("duration_seconds"))
+        stage_summary["review"]["token_total"] += _token_total_from_mapping(
+            raw_tokens.get("reviewer") if isinstance(raw_tokens, dict) else {}
+        )
+
+    return {
+        "available": True,
+        "round_count": len(items),
+        "completed_round_count": completed,
+        "failed_round_count": failed,
+        "running_round": running_round,
+        "total_duration_seconds": round(total_duration, 3),
+        "total_tokens": total_tokens,
+        "total_cost": round(total_cost, 6),
+        "output_growth_bytes": output_growth,
+        "latest_round": items[-1].get("round"),
+        "summary": {
+            "status_counts": dict(status_counts),
+            "stage_summary": stage_summary,
+        },
+        "items": items,
+        "warnings": warnings,
+    }
+
+
 def _get_task_metrics(task_id: str) -> dict:
     task = _get_task_or_404(task_id)
     status_value = str(task.get("status") or "unknown")
@@ -820,6 +1058,9 @@ def _get_task_metrics(task_id: str) -> dict:
     if not result["cache_available"]:
         warnings.append("结果缓存不存在，请在结果页手动刷新或等待后台刷新")
 
+    rounds = _read_round_metrics(run_root)
+    warnings.extend(str(item) for item in rounds.get("warnings") or [] if str(item).strip())
+
     if not terminal and not owner_id:
         warnings.append("非终态任务缺少 owner")
 
@@ -843,6 +1084,7 @@ def _get_task_metrics(task_id: str) -> dict:
         "events": events,
         "sessions": sessions,
         "result": result,
+        "rounds": rounds,
         "health": {
             "is_terminal": terminal,
             "has_owner": bool(owner_id),
