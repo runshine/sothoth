@@ -66,11 +66,11 @@ spec:
               mountPath: /data
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "100m"
+              memory: "16Gi"
+              cpu: "4"
             limits:
-              memory: "2Gi"
-              cpu: "1000m"
+              memory: "32Gi"
+              cpu: "16"
           livenessProbe:
             httpGet:
               path: /api/app/firmware-unpacker/health

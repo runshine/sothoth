@@ -664,6 +664,70 @@ class TaskManager:
             cleanup_status=cleanup_status,
         )
 
+    def continue_task(self, db: Session, *, project_id: str, task_id: str) -> str:
+        task = self._task_or_404(db, project_id, task_id)
+        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+            raise ValidationError(f"当前任务状态不允许继续: {task.status}")
+        if task.status in {"pending", "dispatching", "running"}:
+            raise ValidationError(f"当前任务正在执行或排队中，不能手动继续: {task.status}")
+        if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+            raise ValidationError("当前任务等待模块确认，请先确认模块后继续")
+
+        stage_sequence = self._stage_sequence_for_task(task)
+        stage_runs = {
+            row.stage_name: row
+            for row in db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+            ).all()
+        }
+        target_stage = stage_sequence[0]
+        last_success_stage: str | None = None
+        for stage_name in stage_sequence:
+            run = stage_runs.get(stage_name)
+            if run and run.status in {"success", "skipped"}:
+                last_success_stage = stage_name
+                continue
+            target_stage = stage_name
+            break
+        else:
+            raise ValidationError("当前任务所有阶段都已成功，没有可继续的后续阶段")
+
+        target_index = stage_sequence.index(target_stage)
+        affected_stages = stage_sequence[target_index:]
+        self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
+        db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.stage_name.in_(affected_stages),
+        ).delete(synchronize_session=False)
+        for stage_name in affected_stages:
+            stage_run = stage_runs.get(stage_name)
+            if stage_run:
+                self._reset_stage_run_for_retry(stage_run, increment_retry=False)
+
+        task.status = "pending"
+        task.current_stage = target_stage
+        task.execution_mode = None
+        task.target_stage_name = None
+        task.last_error = None
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.finished_at = None
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
+        self._record_event(
+            db,
+            task,
+            "task_continue_requested",
+            f"手动继续任务，将从阶段 {target_stage} 开始推进",
+            stage_name=target_stage,
+            payload={
+                "target_stage": target_stage,
+                "last_success_stage": last_success_stage,
+                "cleared_stages": affected_stages,
+            },
+        )
+        db.commit()
+        return target_stage
+
     def retry_task(self, db: Session, *, project_id: str, task_id: str) -> None:
         task = self._task_or_404(db, project_id, task_id)
         supported, reason, stage_name = self._task_retry_support(db, task)
@@ -853,6 +917,14 @@ class TaskManager:
                             **(item.result or {}),
                             "archive_root": str(archived_dir),
                         }
+                    if mapped_status in {"success", "partial_success"}:
+                        await self._refresh_terminal_item_result_from_downstream(
+                            task,
+                            item,
+                            payload,
+                            mapped_status=mapped_status,
+                            archived_dir=archived_dir,
+                        )
                 self._record_event(
                     db,
                     task,
@@ -885,7 +957,10 @@ class TaskManager:
                     },
                 )
         for current_stage in touched_stages:
-            self._refresh_stage_run_from_items(db, task, current_stage)
+            if current_stage == "system_analysis":
+                self._refresh_system_analysis_stage_from_synced_items(db, task)
+            else:
+                self._refresh_stage_run_from_items(db, task, current_stage)
         if touched_stages:
             self._refresh_task_status_after_sync(db, task)
             self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
@@ -1799,6 +1874,62 @@ class TaskManager:
             return await get_dataflow_vuln_scanner_client().get_task(task_id, token or "")
         raise ValidationError(f"未知下游服务: {item.downstream_service}")
 
+    async def _refresh_terminal_item_result_from_downstream(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        payload: dict[str, Any],
+        *,
+        mapped_status: str,
+        archived_dir: Path | None,
+    ) -> None:
+        if item.stage_name != "system_analysis" or item.downstream_service != "system_analyse":
+            return
+        if mapped_status != "success":
+            return
+        result_payload: dict[str, Any] = {}
+        try:
+            result_payload = await get_system_analyse_client().get_task_result(str(item.downstream_task_id))
+        except Exception:
+            result_payload = {}
+        firmware = self._system_analysis_input_for_item(task, item)
+        artifact_root = archived_dir or self._service_output_dir(
+            task,
+            item.downstream_service or item.stage_name,
+            item.item_key,
+            item.downstream_task_id,
+        )
+        modules = self._parse_system_analysis_modules(artifact_root, firmware, result_payload)
+        item.result = {
+            **self._lightweight_system_analysis_input(firmware),
+            "artifact_root": str(artifact_root),
+            "archive_root": str(artifact_root),
+            "modules": self._lightweight_modules_for_storage(modules),
+            "module_count": len(modules),
+            "downstream": self._lightweight_downstream_payload(payload),
+            "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
+            "downstream_status_synced_at": _now().isoformat(),
+        }
+        item.output_ref = {
+            **(item.output_ref or {}),
+            "artifact_root": str(artifact_root),
+            "archive_root": str(artifact_root),
+        }
+
+    def _system_analysis_input_for_item(self, task: BinarySecurityTask, item: BinarySecurityStageItem) -> dict[str, Any]:
+        for candidate in self._system_analysis_inputs(task):
+            if str(candidate.get("firmware_key") or "") == str(item.item_key or ""):
+                return dict(candidate)
+        input_ref = dict(item.input_ref or {})
+        return {
+            "firmware_key": str(item.item_key or input_ref.get("firmware_key") or SOURCE_TASK_INPUT_KEY),
+            "firmware_name": str(item.item_name or task.name),
+            "filename": str(item.item_name or input_ref.get("filename") or item.item_key or "source-project"),
+            "unpacked_root": str(input_ref.get("input_path") or input_ref.get("unpacked_root") or Path(task.workspace_root) / "input"),
+            "source_root": str(input_ref.get("source_root") or input_ref.get("input_path") or Path(task.workspace_root) / "input"),
+            "task_type": self._task_type(task),
+        }
+
     def _map_downstream_status(self, status: str) -> str | None:
         normalized = (status or "").lower()
         if normalized in {"pending", "queued", "created", "dispatching", "ready", "ready_to_start"}:
@@ -1861,15 +1992,131 @@ class TaskManager:
                 "failed_firmware_count": int(stage_run.counts.get("failed_items", 0)),
             }
 
+    def _refresh_system_analysis_stage_from_synced_items(self, db: Session, task: BinarySecurityTask) -> None:
+        stage_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == "system_analysis",
+        ).first()
+        if not stage_run:
+            return
+        items = self._stage_items(db, task.id, "system_analysis")
+        success = []
+        failed = [
+            {"status": item.status, "error": item.error_message, "item_key": item.item_key}
+            for item in items
+            if item.status in {"failed", "cancelled"}
+        ]
+        all_modules: list[dict[str, Any]] = []
+        for item in items:
+            if item.status != "success":
+                continue
+            result = dict(item.result or {})
+            item_modules = self._system_analysis_modules_from_item(task, item)
+            all_modules.extend(item_modules)
+            success.append({**result, "modules": self._lightweight_modules_for_storage(item_modules), "module_count": len(item_modules)})
+        status = self._aggregate_item_statuses([item.status for item in items])
+        candidate_modules = self._filter_candidate_modules(all_modules, self._module_risk_levels(task))
+        selected_modules: list[dict[str, Any]] = []
+        if status in {"success", "partial_success"} and candidate_modules:
+            if self._module_selection_mode(task) == MODULE_SELECTION_MODE_AUTO:
+                selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO)
+            else:
+                task.status = TASK_STATUS_PENDING_MODULE_CONFIRMATION
+                self._record_event(
+                    db,
+                    task,
+                    "module_selection_required",
+                    "系统分析已同步完成，等待人工确认模块",
+                    stage_name="system_analysis",
+                    payload={"candidate_module_count": len(candidate_modules)},
+                )
+        if status in {"success", "partial_success"} and not candidate_modules:
+            status = "failed"
+            failed = failed or [{"status": "failed", "error": "没有匹配所选风险等级的模块"}]
+        summary = dict(task.summary or {})
+        summary.update(
+            {
+                "system_analysis_results": self._lightweight_system_analysis_items(success),
+                "system_analysis_modules": self._lightweight_modules_for_storage(all_modules),
+                "system_analysis_module_count": len(all_modules),
+                "candidate_modules": candidate_modules,
+                "selected_modules": selected_modules,
+                "high_risk_modules": selected_modules,
+            }
+        )
+        task.summary = summary
+        task.metrics = {
+            **(task.metrics or {}),
+            **self._module_metrics(all_modules, candidate_modules, selected_modules),
+        }
+        stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else status
+        stage_run.finished_at = None if stage_run.status in {"running", "pending", "queued"} else (stage_run.finished_at or _now())
+        stage_run.started_at = stage_run.started_at or _now()
+        stage_run.counts = self._stage_counts(db, stage_run)
+        stage_run.last_error = failed[0].get("error") if failed and status == "failed" else None
+        stage_run.output_summary = {
+            "items": success,
+            "failed_items": failed,
+            "success_count": len(success),
+            "failed_count": len(failed),
+            "module_count": len(all_modules),
+            "high_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "高"),
+            "medium_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "中"),
+            "low_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "低"),
+            "candidate_module_count": len(candidate_modules),
+            "selected_module_count": len(selected_modules),
+            "status_synced": True,
+            "sync_status": stage_run.status,
+            "error": stage_run.last_error,
+            **stage_run.counts,
+        }
+
     def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
+        if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.finished_at = None
+            return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs if run.status != "skipped"]
-        if any(status in {"running", "pending", "queued"} for status in statuses):
+        if any(status in {"running", "dispatching"} for status in statuses):
             task.status = "running"
+            task.finished_at = None
+            task.last_error = None
+            return
+        stage_retry_mode = task.execution_mode == "stage_retry" and bool(task.target_stage_name)
+        task_retry_mode = task.execution_mode == "task_retry" and bool(task.target_stage_name)
+        if stage_retry_mode:
+            task.execution_mode = None
+            task.target_stage_name = None
+            summary = dict(task.summary or {})
+            summary.pop("stage_retry_context", None)
+            task.summary = summary
+            self._finalize_task(db, task)
+            return
+        next_stage = self._next_incomplete_stage(db, task)
+        next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
+        next_stage_status = next_stage_run.status if next_stage_run else "pending"
+        if next_stage and next_stage_status in {"pending", "queued"} and not task_retry_mode:
+            task.status = "pending"
+            task.current_stage = next_stage
             task.finished_at = None
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.last_error = None
+            summary = dict(task.summary or {})
+            if summary.get("stale_from_stage") and next_stage in set(summary.get("stale_stages") or []):
+                summary["stale_stages"] = []
+                summary["stale_reason"] = None
+                summary["stale_from_stage"] = None
+                task.summary = summary
+            self._record_event(
+                db,
+                task,
+                "task_requeued_after_downstream_sync",
+                f"下游状态同步完成，任务继续进入阶段: {next_stage}",
+                stage_name=next_stage,
+            )
             return
         self._finalize_task(db, task)
 
@@ -2057,7 +2304,7 @@ class TaskManager:
             return False, f"阶段 {stage_name} 不支持安全重试: {reason}", stage_name
         return True, None, stage_name
 
-    def _clear_stage_outputs_from(self, task: BinarySecurityTask, stage_name: str) -> None:
+    def _clear_stage_outputs_from(self, task: BinarySecurityTask, stage_name: str, *, mark_stale: bool = True) -> None:
         summary = dict(task.summary or {})
         metrics = dict(task.metrics or {})
         stage_summary = dict(task.stage_summary or {})
@@ -2070,9 +2317,14 @@ class TaskManager:
                 summary.pop(summary_key, None)
             stage_summary.pop(current_stage, None)
             metrics.update(STAGE_METRIC_RESETTERS.get(current_stage, {}))
-        summary["stale_reason"] = "upstream_stage_retried"
-        summary["stale_from_stage"] = stage_name
-        summary["stale_stages"] = stage_sequence[stage_sequence.index(stage_name) + 1:]
+        if mark_stale:
+            summary["stale_reason"] = "upstream_stage_retried"
+            summary["stale_from_stage"] = stage_name
+            summary["stale_stages"] = stage_sequence[stage_sequence.index(stage_name) + 1:]
+        else:
+            summary.pop("stale_reason", None)
+            summary.pop("stale_from_stage", None)
+            summary.pop("stale_stages", None)
         task.summary = summary
         task.metrics = metrics
         task.stage_summary = stage_summary
@@ -2399,8 +2651,9 @@ class TaskManager:
         if not candidate_modules:
             task.summary = {
                 **task.summary,
-                "system_analysis_results": success,
-                "system_analysis_modules": all_modules,
+                "system_analysis_results": self._lightweight_system_analysis_items(success),
+                "system_analysis_modules": self._lightweight_modules_for_storage(all_modules),
+                "system_analysis_module_count": len(all_modules),
                 "candidate_modules": [],
                 "selected_modules": [],
                 "high_risk_modules": [],
@@ -2427,8 +2680,9 @@ class TaskManager:
         selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO) if selection_mode == MODULE_SELECTION_MODE_AUTO else []
         task.summary = {
             **task.summary,
-            "system_analysis_results": success,
-            "system_analysis_modules": all_modules,
+            "system_analysis_results": self._lightweight_system_analysis_items(success),
+            "system_analysis_modules": self._lightweight_modules_for_storage(all_modules),
+            "system_analysis_module_count": len(all_modules),
             "candidate_modules": candidate_modules,
             "selected_modules": selected_modules,
             "high_risk_modules": selected_modules,
@@ -2554,7 +2808,7 @@ class TaskManager:
                 **self._lightweight_system_analysis_input(firmware),
                 "artifact_root": str(materialized),
                 "archive_root": str(materialized),
-                "modules": modules,
+                "modules": self._lightweight_modules_for_storage(modules),
                 "module_count": len(modules),
                 "downstream": self._lightweight_downstream_payload(payload),
                 "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
@@ -2562,7 +2816,7 @@ class TaskManager:
             item.result = result
             item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized)}
             session.commit()
-            return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
+            return {"status": item.status, "item": {**result, "modules": modules}, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
             if "item" in locals():
                 session.rollback()
@@ -2611,21 +2865,13 @@ class TaskManager:
 
     def _lightweight_system_analysis_result(self, result_payload: dict[str, Any] | None) -> dict[str, Any]:
         payload = result_payload or {}
-        summary = dict(payload.get("summary") or {})
-        modules = []
-        for module in list(payload.get("modules") or []):
-            modules.append(
-                {
-                    "module_name": module.get("module_name"),
-                    "rank": module.get("rank"),
-                    "risk_level": module.get("risk_level"),
-                    "risk_score": module.get("risk_score"),
-                    "file_count": module.get("file_count"),
-                    "module_dir_path": module.get("module_dir_path"),
-                    "module_report_path": module.get("module_report_path"),
-                    "files_list_path": module.get("files_list_path"),
-                }
-            )
+        raw_summary = dict(payload.get("summary") or {})
+        summary = {
+            key: value
+            for key, value in raw_summary.items()
+            if isinstance(value, (int, float, bool)) or (isinstance(value, str) and len(value) <= 500)
+        }
+        modules = self._lightweight_modules_for_storage(list(payload.get("modules") or []))
         return {
             "available": payload.get("available"),
             "status": payload.get("status"),
@@ -2637,6 +2883,50 @@ class TaskManager:
             "modules": modules,
             "warnings": payload.get("warnings") or [],
         }
+
+    def _lightweight_system_analysis_items(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rows = []
+        for item in items:
+            row = dict(item)
+            row["modules"] = self._lightweight_modules_for_storage(list(row.get("modules") or []))
+            if "system_analysis_result" in row:
+                row["system_analysis_result"] = self._lightweight_system_analysis_result(row.get("system_analysis_result") or {})
+            rows.append(row)
+        return rows
+
+    def _lightweight_modules_for_storage(self, modules: list[dict[str, Any]], *, limit: int = 20) -> list[dict[str, Any]]:
+        rows = []
+        for module in modules[:limit]:
+            rows.append(
+                {
+                    "module_key": module.get("module_key"),
+                    "module_name": module.get("module_name"),
+                    "rank": module.get("rank"),
+                    "risk_level": module.get("risk_level"),
+                    "risk_score": module.get("risk_score"),
+                    "file_count": module.get("file_count"),
+                    "source_dir": module.get("source_dir"),
+                    "module_dir": module.get("module_dir") or module.get("module_dir_path"),
+                    "module_report": module.get("module_report") or module.get("module_report_path"),
+                    "files_list": module.get("files_list") or module.get("files_list_path"),
+                }
+            )
+        return rows
+
+    def _system_analysis_modules_from_item(self, task: BinarySecurityTask, item: BinarySecurityStageItem) -> list[dict[str, Any]]:
+        result = dict(item.result or {})
+        artifact_root = Path(str((item.output_ref or {}).get("archive_root") or result.get("archive_root") or result.get("artifact_root") or ""))
+        modules_file = artifact_root / "system_analysis_modules.json"
+        if modules_file.is_file():
+            try:
+                payload = json.loads(_read_text(modules_file) or "{}")
+                rows = payload.get("items") or []
+                if isinstance(rows, list):
+                    return [dict(row) for row in rows if isinstance(row, dict)]
+            except Exception:
+                pass
+        modules = result.get("modules") or []
+        return [dict(row) for row in modules if isinstance(row, dict)]
 
     def _parse_system_analysis_modules(self, root: Path, firmware: dict[str, Any], result_payload: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         result_payload = result_payload or {}
@@ -3228,6 +3518,8 @@ class TaskManager:
                     task.project_id,
                     f"{task.name}-{module['module_name']}-entry",
                     module["source_dir"],
+                    module["module_name"],
+                    module.get("source_root") or module.get("unpacked_root") or module["source_dir"],
                     _downstream_origin_payload(task, item),
                 )
             item.downstream_task_id = created.get("task_id") or item.downstream_task_id

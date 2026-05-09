@@ -67,7 +67,6 @@ from app.unpacker_engine_session import build_session_artifacts, update_session_
 
 
 log = logging.getLogger("unpacker.engine")
-debug_mode = True
 
 
 def _reviewer_session_name(suffix: str) -> tuple[str, int | None]:
@@ -920,13 +919,13 @@ def run_unpack(
         except Exception:
             pass
 
-    lease_activity_interval_seconds = 10.0
+    progress_activity_interval_seconds = 10.0
     last_activity_reported_at: dict[str, float] = {}
 
     def _report_activity(stage: str, *, force: bool = False) -> None:
         now_monotonic = time.monotonic()
         previous = last_activity_reported_at.get(stage)
-        if not force and previous is not None and (now_monotonic - previous) < lease_activity_interval_seconds:
+        if not force and previous is not None and (now_monotonic - previous) < progress_activity_interval_seconds:
             return
         last_activity_reported_at[stage] = now_monotonic
         _report_progress(stage)

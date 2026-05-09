@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ from app.model import ServiceConfig
 from app.schemas import UnpackRequest
 from app.services.task_manager import prepare_task_workspace, resolve_task_runtime_paths, submit_unpack_task
 from app.services.task_events import list_task_events
+from app.time_utils import now_local
 
 
 class _StubStream:
@@ -194,7 +196,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
         finally:
             db.close()
 
-    def test_claim_task_sets_owner_and_lease(self):
+    def test_claim_task_sets_owner_without_task_lease(self):
         self._add_task("t-claim", status=TaskStatus.PENDING.value)
 
         claimed = task_manager_module._claim_task("t-claim")
@@ -206,7 +208,7 @@ class TaskManagerLeaseTests(unittest.TestCase):
             self.assertEqual(TaskStatus.RUNNING.value, task.status)
             self.assertEqual("pod-a:123:owner", task.owner_id)
             self.assertEqual("queued", task.current_stage)
-            self.assertIsNotNone(task.lease_expires_at)
+            self.assertIsNone(task.lease_expires_at)
             events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-claim").all()
             self.assertTrue(any(event.event_type == "task_claimed" for event in events))
         finally:
@@ -337,7 +339,39 @@ class TaskManagerLeaseTests(unittest.TestCase):
             task = db.query(UnpackTask).filter(UnpackTask.id == "t-orphan").first()
             self.assertEqual(TaskStatus.FAILED.value, task.status)
             self.assertIsNone(task.owner_id)
-            self.assertIn("owner lost", (task.result_message or "") + (task.error_message or ""))
+            self.assertIn("owner pod lost", (task.result_message or "") + (task.error_message or ""))
+        finally:
+            db.close()
+
+    def test_recover_running_task_ignores_expired_task_lease_when_runner_alive(self):
+        from datetime import timedelta
+
+        self._add_worker("pod-a:123:owner", is_alive=True, last_heartbeat=now_local())
+        self._add_task(
+            "t-running-alive",
+            status=TaskStatus.RUNNING.value,
+            owner_id="pod-a:123:owner",
+            lease_expires_at=now_local() - timedelta(seconds=300),
+            last_progress_at=now_local() - timedelta(seconds=300),
+        )
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-running-alive").first()
+            task.runner_pid = os.getpid()
+            task.run_token = "token-current"
+            task.started_at = now_local() - timedelta(seconds=300)
+            db.commit()
+        finally:
+            db.close()
+
+        task_manager_module.recover_orphaned_tasks()
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-running-alive").first()
+            self.assertEqual(TaskStatus.RUNNING.value, task.status)
+            self.assertEqual("pod-a:123:owner", task.owner_id)
+            self.assertIsNotNone(task.runner_heartbeat_at)
         finally:
             db.close()
 

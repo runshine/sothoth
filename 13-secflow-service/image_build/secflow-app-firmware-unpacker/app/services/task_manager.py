@@ -190,16 +190,6 @@ def _task_lease_seconds() -> int:
     )
 
 
-def _task_lease_renew_interval_seconds() -> int:
-    return max(
-        5,
-        _runtime_config_int(
-            "task_lease_renew_interval_seconds",
-            default=int(get_config().worker.task_lease_renew_interval_seconds),
-        ),
-    )
-
-
 def _cancel_timeout_seconds() -> int:
     return max(
         15,
@@ -232,6 +222,8 @@ def _cancel_force_seconds() -> int:
 
 
 def _cleanup_job_lease_seconds() -> int:
+    # Compatibility: task_lease_seconds is deprecated for task execution, but
+    # still controls workspace cleanup job leases.
     return max(30, _task_lease_seconds())
 
 
@@ -239,8 +231,8 @@ def _cleanup_job_lease_deadline(now: Optional[datetime] = None) -> datetime:
     return (now or now_local()) + timedelta(seconds=_cleanup_job_lease_seconds())
 
 
-def _lease_deadline(now: Optional[datetime] = None) -> datetime:
-    return (now or now_local()) + timedelta(seconds=_task_lease_seconds())
+def _runner_start_grace_seconds() -> int:
+    return 60
 
 
 def get_executor() -> ThreadPoolExecutor:
@@ -565,13 +557,13 @@ def _freeze_task_llm_binding_snapshot(task_id: str) -> dict:
         db.close()
 
 
-def _renew_task_lease(task_id: str, *, stage: Optional[str] = None) -> None:
+def _update_task_progress(task_id: str, *, stage: Optional[str] = None) -> None:
     from app.services.worker import get_worker_id
 
-    _renew_task_lease_for_owner(task_id, owner_id=get_worker_id(), run_token=None, stage=stage)
+    _update_task_progress_for_owner(task_id, owner_id=get_worker_id(), run_token=None, stage=stage)
 
 
-def _renew_task_lease_for_owner(
+def _update_task_progress_for_owner(
     task_id: str,
     *,
     owner_id: str,
@@ -593,7 +585,6 @@ def _renew_task_lease_for_owner(
         if task is None:
             return
         previous_stage = str(task.current_stage or "").strip() or None
-        task.lease_expires_at = _lease_deadline()
         task.runner_heartbeat_at = now_local()
         task.last_progress_at = now_local()
         if stage:
@@ -615,7 +606,7 @@ def _renew_task_lease_for_owner(
         db.close()
 
 
-def _finalize_orphaned_task(task_id: str, reason: str) -> None:
+def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = False) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
@@ -651,26 +642,17 @@ def _finalize_orphaned_task(task_id: str, reason: str) -> None:
         task.completed_at = now_local()
         task.last_progress_at = now_local()
         db.commit()
-        _record_task_event_from_row(
-            task,
-            event_type="owner_lost",
-            summary="任务 owner 已失活",
-            stage_key=task.current_stage,
-            status=task.status,
-            detail={"reason": reason, "owner_id": previous_owner_id},
-            owner_id=previous_owner_id,
-            created_by="task_manager",
-        )
-        _record_task_event_from_row(
-            task,
-            event_type="lease_expired",
-            summary="任务租约已过期",
-            stage_key=task.current_stage,
-            status=task.status,
-            detail={"reason": reason},
-            owner_id=previous_owner_id,
-            created_by="task_manager",
-        )
+        if owner_lost:
+            _record_task_event_from_row(
+                task,
+                event_type="owner_lost",
+                summary="任务 owner 已失活",
+                stage_key=task.current_stage,
+                status=task.status,
+                detail={"reason": reason, "owner_id": previous_owner_id},
+                owner_id=previous_owner_id,
+                created_by="task_manager",
+            )
         _record_task_event_from_row(
             task,
             event_type="orphan_recovered",
@@ -1368,10 +1350,16 @@ def recover_orphaned_tasks() -> None:
     for task in tasks:
         owner_id = str(task.owner_id or "").strip()
         cancel_requested_at = task.cancel_requested_at
-        lease_expired = task.lease_expires_at is None or task.lease_expires_at < now
         owner_missing = not owner_id or owner_id not in active_owner_ids
         local_owned = owner_id == current_owner
-        runner_alive = _is_process_alive(task.runner_pid) if local_owned else True
+        runner_pid = getattr(task, "runner_pid", None)
+        runner_alive = _is_process_alive(runner_pid) if local_owned and runner_pid else False
+        runner_not_started = bool(
+            local_owned
+            and not runner_pid
+            and task.started_at
+            and task.started_at + timedelta(seconds=_runner_start_grace_seconds()) < now
+        )
         cancel_timed_out = bool(
             cancel_requested_at
             and cancel_requested_at + timedelta(seconds=_cancel_timeout_seconds()) < now
@@ -1381,6 +1369,9 @@ def recover_orphaned_tasks() -> None:
             and task.last_progress_at + timedelta(seconds=_cancel_timeout_seconds()) < now
         )
         if task.status == TaskStatus.CANCELLING.value and local_owned:
+            if runner_not_started:
+                _mark_task_cancelled(task.id, reason="Task runner was not started")
+                continue
             if not runner_alive:
                 _mark_task_cancelled(task.id, reason="Task runner exited while cancelling")
                 continue
@@ -1397,7 +1388,6 @@ def recover_orphaned_tasks() -> None:
                 (task.cancel_force_deadline and task.cancel_force_deadline <= now)
                 or cancel_timed_out
                 or progress_stale
-                or lease_expired
             ):
                 _signal_task_runner(
                     task,
@@ -1407,12 +1397,26 @@ def recover_orphaned_tasks() -> None:
                 )
                 _mark_task_cancelled(task.id, reason="Task cancelled after force kill deadline")
             continue
-        if task.status == TaskStatus.CANCELLING.value and (cancel_timed_out or owner_missing or lease_expired or progress_stale):
-            _mark_task_cancelled(task.id, reason="Task cancelled after owner lost or timeout")
-        elif task.status == TaskStatus.RUNNING.value and local_owned and not runner_alive:
-            _finalize_orphaned_task(task.id, reason="Task runner process exited unexpectedly")
-        elif task.status == TaskStatus.RUNNING.value and (owner_missing or lease_expired):
-            _finalize_orphaned_task(task.id, reason="Task lease expired or owner lost")
+        if task.status == TaskStatus.CANCELLING.value:
+            if owner_missing:
+                _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
+            elif cancel_timed_out or progress_stale:
+                _mark_task_cancelled(task.id, reason="Task cancelled after owner lost or timeout")
+            continue
+        if task.status == TaskStatus.RUNNING.value:
+            if owner_missing:
+                _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
+            elif local_owned and runner_not_started:
+                _finalize_orphaned_task(task.id, reason="Task runner was not started")
+            elif local_owned and not runner_alive:
+                _finalize_orphaned_task(task.id, reason="Task runner process exited unexpectedly")
+            elif local_owned and runner_alive:
+                _update_task_progress_for_owner(
+                    task.id,
+                    owner_id=owner_id,
+                    run_token=task.run_token,
+                    stage=None,
+                )
 
 
 def _claim_task(task_id: str) -> bool:
@@ -1435,7 +1439,7 @@ def _claim_task(task_id: str) -> bool:
                     UnpackTask.status: TaskStatus.RUNNING.value,
                     UnpackTask.owner_id: owner_id,
                     UnpackTask.current_stage: "queued",
-                    UnpackTask.lease_expires_at: _lease_deadline(),
+                    UnpackTask.lease_expires_at: None,
                     UnpackTask.cancel_requested_at: None,
                     UnpackTask.last_progress_at: now,
                     UnpackTask.runner_pid: None,
@@ -1568,7 +1572,7 @@ def _launch_task_runner(task_id: str) -> None:
                     UnpackTask.runner_pid: proc.pid,
                     UnpackTask.runner_started_at: now,
                     UnpackTask.runner_heartbeat_at: now,
-                    UnpackTask.lease_expires_at: _lease_deadline(now),
+                    UnpackTask.lease_expires_at: None,
                     UnpackTask.last_progress_at: now,
                 },
                 synchronize_session=False,
@@ -1898,6 +1902,13 @@ def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> 
     finally:
         db.close()
 
+    _update_task_progress_for_owner(
+        task_id,
+        owner_id=owner_id,
+        run_token=run_token,
+        stage="queued",
+    )
+
     try:
         if _should_cancel_run(task_id, run_token):
             _mark_task_cancelled(task_id, reason="cancel requested before execution")
@@ -1924,7 +1935,7 @@ def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> 
             llm_binding_snapshot=llm_binding_snapshot,
             cancel_check=lambda: _should_cancel_run(task_id, run_token),
             register_cancel_hook=lambda hook: _register_cancel_hook(task_id, hook),
-            progress_callback=lambda stage: _renew_task_lease_for_owner(
+            progress_callback=lambda stage: _update_task_progress_for_owner(
                 task_id,
                 owner_id=owner_id,
                 run_token=run_token,

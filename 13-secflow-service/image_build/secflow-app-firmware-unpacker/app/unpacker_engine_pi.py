@@ -24,7 +24,6 @@ from app.unpacker_engine_session import update_session_index
 
 
 log = logging.getLogger("unpacker.engine")
-debug_mode = True
 
 
 class PiRpcClient:
@@ -352,11 +351,6 @@ class PiRpcClient:
                         self._drain_active_turn()
                         raise RuntimeError("__PI_BUSY__")
                     raise RuntimeError(f"Prompt failed: {error}")
-
-                if debug_mode and event_type == "message_update":
-                    delta_info = event.get("assistantMessageEvent", {})
-                    if delta_info.get("type") in {"text_delta", "thinking_delta", "toolcall_delta"}:
-                        print(delta_info.get("delta", ""), end="", flush=True)
 
                 if stream_callback is not None:
                     try:

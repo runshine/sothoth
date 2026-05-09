@@ -13,15 +13,24 @@ class EntryAnalyseClient(JsonHttpClient):
         cfg = get_config().services.entry_analyse
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
 
-    async def create_task(self, project_id: str, task_name: str, input_path: str, origin: dict[str, Any] | None = None) -> dict:
+    async def create_task(
+        self,
+        project_id: str,
+        task_name: str,
+        input_path: str,
+        module_name: str,
+        source_path: str | None = None,
+        origin: dict[str, Any] | None = None,
+    ) -> dict:
         return await self.post(
             "/tasks",
             json_body={
                 "project_id": project_id,
                 "task_name": task_name,
                 "input_path": input_path,
+                "module_name": module_name,
+                "source_path": source_path,
                 "task_description": "由 binary security 编排器触发的入口分析任务",
-                "prompt_content": f"分析路径 `{input_path}` 下模块源码中的所有外部入口点，输出入口列表。",
                 **(origin or {}),
             },
         )

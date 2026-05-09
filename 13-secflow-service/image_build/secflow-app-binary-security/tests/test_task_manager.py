@@ -39,6 +39,11 @@ class _FakeQuery:
             return row[0] if row else None
         return row
 
+    def delete(self, synchronize_session=False):
+        count = len(self._rows)
+        self._rows.clear()
+        return count
+
 
 class _FakeDb:
     def __init__(self, rows=None):
@@ -57,17 +62,27 @@ class _FakeDb:
 
 
 class _ModelAwareDb:
-    def __init__(self, *, stage_runs=None, stage_items=None):
+    def __init__(self, *, tasks=None, stage_runs=None, stage_items=None):
+        self.tasks = list(tasks or [])
         self.stage_runs = list(stage_runs or [])
         self.stage_items = list(stage_items or [])
+        self.added = []
 
     def query(self, model, *args, **kwargs):
         model_name = getattr(model, "__name__", "")
+        if model_name == "BinarySecurityTask":
+            return _FakeQuery(self.tasks)
         if model_name == "BinarySecurityStageRun":
             return _FakeQuery(self.stage_runs)
         if model_name == "BinarySecurityStageItem":
             return _FakeQuery(self.stage_items)
         return _FakeQuery([])
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    def commit(self):
+        pass
 
 
 class _StageRun:
@@ -180,6 +195,182 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("partial_success", task.status)
         self.assertIsNotNone(task.finished_at)
         self.assertTrue(any(isinstance(obj, BinarySecurityEvent) for obj in db.added))
+
+    def test_refresh_task_status_after_sync_requeues_next_stage(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        db = _ModelAwareDb(stage_runs=[run])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("pending", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+
+    def test_refresh_task_status_after_sync_does_not_auto_retry_failed_stage(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runs = [
+            BinarySecurityStageRun(
+                id="sr1",
+                task_id="s1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr2",
+                task_id="s1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+            ),
+            BinarySecurityStageRun(
+                id="sr3",
+                task_id="s1",
+                project_id="p1",
+                stage_name="dataflow_analysis",
+                sequence_no=3,
+                status="pending",
+            ),
+        ]
+        db = _ModelAwareDb(stage_runs=runs)
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("partial_success", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertIsNotNone(task.finished_at)
+
+    def test_continue_task_starts_after_last_successful_stage(self):
+        workspace = Path(tempfile.mkdtemp())
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="partial_success",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root=str(workspace / "output"),
+            workspace_root=str(workspace),
+        )
+        task.summary = {
+            "selected_modules": [{"module_key": "m1"}],
+            "entry_results": [{"entry_key": "e1"}],
+            "stale_stages": ["entry_analysis"],
+        }
+        task.metrics = {"entry_count": 1, "vuln_result_count": 1}
+        task.stage_summary = {"system_analysis": {"status": "success"}, "entry_analysis": {"status": "failed"}}
+        runs = [
+            BinarySecurityStageRun(
+                id="sr1",
+                task_id="s1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="success",
+            ),
+            BinarySecurityStageRun(
+                id="sr2",
+                task_id="s1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+                last_error="boom",
+            ),
+            BinarySecurityStageRun(
+                id="sr3",
+                task_id="s1",
+                project_id="p1",
+                stage_name="dataflow_analysis",
+                sequence_no=3,
+                status="pending",
+            ),
+        ]
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=runs,
+            stage_items=[BinarySecurityStageItem(id="i1", task_id="s1", project_id="p1", stage_name="entry_analysis", item_key="m1")],
+        )
+
+        target_stage = self.manager.continue_task(db, project_id="p1", task_id="s1")
+
+        self.assertEqual("entry_analysis", target_stage)
+        self.assertEqual("pending", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertIsNone(task.finished_at)
+        self.assertNotIn("entry_results", task.summary)
+        self.assertNotIn("stale_stages", task.summary)
+        self.assertEqual("pending", runs[1].status)
+        self.assertEqual({}, runs[1].output_summary)
+
+    def test_refresh_task_status_after_stage_retry_finalizes_without_advancing(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            execution_mode="stage_retry",
+            target_stage_name="system_analysis",
+        )
+        task.summary = {"stale_stages": ["entry_analysis"], "stage_retry_context": {"system_analysis": {}}}
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        db = _ModelAwareDb(stage_runs=[run])
+
+        self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("partial_success", task.status)
+        self.assertEqual("system_analysis", task.current_stage)
+        self.assertIsNone(task.execution_mode)
+        self.assertIsNone(task.target_stage_name)
+        self.assertNotIn("stage_retry_context", task.summary)
 
     def test_stage_enabled_uses_policy_override(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")

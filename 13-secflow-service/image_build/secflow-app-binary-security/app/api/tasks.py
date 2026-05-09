@@ -201,6 +201,17 @@ async def retry_task(
     return BinarySecurityActionResponse(task_id=task_id, message="任务已重新排队")
 
 
+@router.post("/projects/{project_id}/tasks/{task_id}/continue", response_model=BinarySecurityActionResponse)
+async def continue_task(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    target_stage = get_task_manager().continue_task(db, project_id=project_id, task_id=task_id)
+    return BinarySecurityActionResponse(task_id=task_id, message=f"任务已重新排队，将从阶段 {target_stage} 继续")
+
+
 @router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/retry", response_model=BinarySecurityActionResponse)
 async def retry_stage(
     project_id: str,
