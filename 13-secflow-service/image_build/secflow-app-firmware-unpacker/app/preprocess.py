@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -14,10 +15,15 @@ from logging_utils import log_event
 
 log = logging.getLogger("unpacker.service")
 
+MAX_RECURSIVE_ITEMS = int(os.environ.get("UNPACKER_PREPROCESS_MAX_RECURSIVE_ITEMS", "80"))
+MAX_RECURSIVE_DEPTH = int(os.environ.get("UNPACKER_PREPROCESS_MAX_RECURSIVE_DEPTH", "4"))
+MAX_RECURSIVE_FILE_BYTES = int(os.environ.get("UNPACKER_PREPROCESS_MAX_RECURSIVE_FILE_BYTES", str(256 * 1024 * 1024)))
+
 
 def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
     if log_dir is None:
         return
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
     Path(log_dir, "stage1_preprocess.json").write_text(
         json.dumps(stage_entries, indent=2)
     )
@@ -295,6 +301,203 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
                 remaining -= len(chunk)
         return total
 
+    def _safe_name(path: Path) -> str:
+        sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name).strip("._")
+        return sanitized or "payload"
+
+    def _uimage_payload_info(path: Path) -> tuple[str, int] | None:
+        try:
+            with open(path, "rb") as fh:
+                header = fh.read(64)
+            if len(header) != 64 or header[:4] != b"\x27\x05\x19\x56":
+                return None
+            compression_map = {
+                0: "none",
+                1: "gzip",
+                2: "bzip2",
+                3: "lzma",
+                5: "lzop",
+                6: "lzma",
+                7: "xz",
+            }
+            return compression_map.get(header[31], f"unknown-{header[31]}"), int.from_bytes(header[12:16], "big")
+        except Exception:
+            return None
+
+    def _extract_uimage_payload(path: Path, dest_dir: Path) -> Path | None:
+        info = _uimage_payload_info(path)
+        if not info:
+            return None
+        compression, payload_size = info
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        raw_payload = dest_dir / f"{_safe_name(path)}.payload"
+        remaining = min(payload_size, max(0, path.stat().st_size - 64))
+        with open(path, "rb") as src, open(raw_payload, "wb") as out:
+            src.seek(64)
+            while remaining > 0:
+                chunk = src.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                out.write(chunk)
+                remaining -= len(chunk)
+        if raw_payload.stat().st_size == 0:
+            raw_payload.unlink(missing_ok=True)
+            return None
+
+        if compression == "none":
+            return raw_payload
+
+        suffix_by_compression = {
+            "gzip": ".gz",
+            "bzip2": ".bz2",
+            "xz": ".xz",
+            "lzma": ".lzma",
+            "lzop": ".lzo",
+        }
+        raw_payload.rename(raw_payload.with_suffix(raw_payload.suffix + suffix_by_compression.get(compression, ".bin")))
+        return raw_payload.with_suffix(raw_payload.suffix + suffix_by_compression.get(compression, ".bin"))
+
+    def _scan_elfs(root: Path) -> list[Path]:
+        elfs: list[Path] = []
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    if fh.read(4) == b"\x7fELF":
+                        elfs.append(path)
+            except Exception:
+                continue
+        return sorted(elfs)
+
+    def _make_tree_user_writable(root: Path) -> None:
+        try:
+            for path in root.rglob("*"):
+                try:
+                    mode = path.stat().st_mode
+                    if path.is_dir():
+                        path.chmod(mode | 0o700)
+                    else:
+                        path.chmod(mode | 0o600)
+                except OSError:
+                    continue
+            mode = root.stat().st_mode
+            root.chmod(mode | 0o700)
+        except OSError:
+            pass
+
+    def _recursive_extract(seed_files: list[Path]) -> dict:
+        extracted_root = Path(output_path) / "extracted"
+        queue: list[tuple[Path, int, Path]] = []
+        actions: list[dict] = []
+        blockers: list[str] = []
+        seen: set[Path] = set()
+
+        for path in seed_files:
+            if path.exists() and path.is_file():
+                queue.append((path, 0, extracted_root / path.stem))
+
+        while queue and len(actions) < MAX_RECURSIVE_ITEMS:
+            current, depth, dest_base = queue.pop(0)
+            resolved = current.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if depth > MAX_RECURSIVE_DEPTH:
+                blockers.append(f"{current}: skipped because max recursion depth {MAX_RECURSIVE_DEPTH} was reached")
+                continue
+            try:
+                if current.stat().st_size > MAX_RECURSIVE_FILE_BYTES:
+                    blockers.append(f"{current}: skipped because size exceeds {MAX_RECURSIVE_FILE_BYTES} bytes")
+                    continue
+            except OSError:
+                continue
+
+            fmt_info = detect_format(str(current))
+            item_fmt = fmt_info["fmt"]
+            file_desc = fmt_info.get("file_desc", "")
+            dest = dest_base
+            result_paths: list[Path] = []
+            proc = None
+
+            try:
+                if item_fmt == "squashfs":
+                    if not shutil.which("unsquashfs"):
+                        blockers.append(f"{current}: unsquashfs is not available")
+                        continue
+                    dest.mkdir(parents=True, exist_ok=True)
+                    proc = _run(["unsquashfs", "-no-xattrs", "-d", str(dest), str(current)], timeout=300)
+                    if proc.returncode == 0:
+                        _make_tree_user_writable(dest)
+                        result_paths.append(dest)
+                elif _uimage_payload_info(current):
+                    payload_dir = dest / "uimage_payload"
+                    payload = _extract_uimage_payload(current, payload_dir)
+                    if payload:
+                        result_paths.append(payload)
+                        queue.append((payload, depth + 1, payload_dir / payload.stem))
+                elif item_fmt == "cpio":
+                    dest.mkdir(parents=True, exist_ok=True)
+                    proc = _run(["sh", "-c", f"cd '{dest}' && cpio -idm --no-absolute-filenames < '{current.resolve()}'"], timeout=300)
+                    if proc.returncode == 0:
+                        result_paths.append(dest)
+                elif item_fmt == "zip":
+                    dest.mkdir(parents=True, exist_ok=True)
+                    proc = _run(["7z", "x", str(current), f"-o{dest}", "-y"], timeout=300)
+                    if proc.returncode == 0:
+                        result_paths.append(dest)
+                elif item_fmt == "7zip":
+                    dest.mkdir(parents=True, exist_ok=True)
+                    proc = _run(["7z", "x", str(current), f"-o{dest}", "-y"], timeout=300)
+                    if proc.returncode == 0:
+                        result_paths.append(dest)
+                elif item_fmt in ("gzip", "bzip2", "xz", "lzma"):
+                    tool_by_fmt = {
+                        "gzip": "gzip -dc",
+                        "bzip2": "bzip2 -dc",
+                        "xz": "xz -dc",
+                        "lzma": "lzma -dc",
+                    }
+                    out = dest.parent / f"{_safe_name(current)}.decompressed"
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    proc = _run(["sh", "-c", f"{tool_by_fmt[item_fmt]} '{current}' > '{out}'"], timeout=300)
+                    if proc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+                        result_paths.append(out)
+                        queue.append((out, depth + 1, out.parent / f"{out.stem}_extract"))
+
+                if result_paths:
+                    actions.append(
+                        {
+                            "input": str(current),
+                            "format": item_fmt or "uimage",
+                            "file_desc": file_desc,
+                            "outputs": [str(path) for path in result_paths],
+                        }
+                    )
+                    for root in result_paths:
+                        if root.is_dir():
+                            for nested in root.rglob("*"):
+                                if not nested.is_file():
+                                    continue
+                                nested_info = detect_format(str(nested))
+                                if nested_info["fmt"] in {"squashfs", "cpio", "zip", "7zip", "gzip", "bzip2", "xz", "lzma"} or _uimage_payload_info(nested):
+                                    queue.append((nested, depth + 1, root / f"{nested.stem}_extract"))
+                        elif root.is_file():
+                            nested_info = detect_format(str(root))
+                            if nested_info["fmt"] in {"squashfs", "cpio", "zip", "7zip", "gzip", "bzip2", "xz", "lzma"} or _uimage_payload_info(root):
+                                queue.append((root, depth + 1, root.parent / f"{root.stem}_extract"))
+                elif proc is not None and proc.returncode != 0:
+                    blockers.append(f"{current}: {item_fmt} extraction failed: {(proc.stderr or proc.stdout)[:160]}")
+            except Exception as exc:
+                blockers.append(f"{current}: extraction error: {exc}")
+
+        elf_paths = _scan_elfs(extracted_root) if extracted_root.exists() else []
+        return {
+            "actions": actions,
+            "blockers": blockers,
+            "elfs": [str(path) for path in elf_paths],
+        }
+
     def _extract_elf_at_offset(offset: int) -> dict | None:
         firmware_stem = Path(firmware_path).stem or "firmware"
         elf_out = Path(output_path) / f"{firmware_stem}_elf"
@@ -461,9 +664,11 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
             _record("glf binwalk slice extraction", proc)
             return None
 
+        recursive_result = _recursive_extract([Path(item["path"]) for item in extracted])
+
         summary_lines = [
             f"Firmware: {firmware_path}",
-            "Method: GLF wrapper extraction via file+binwalk",
+            "Method: GLF wrapper extraction via file+binwalk plus recursive payload extraction",
             f"file(1): {info.get('file_desc', '') or 'n/a'}",
             "",
             "Extracted artifacts:",
@@ -473,12 +678,43 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
             summary_lines.append(
                 f"- {rel} ({item['size']} bytes) from offset {item['offset']} - {item['description']}"
             )
+        if recursive_result["actions"]:
+            summary_lines.extend(["", "Recursive extraction:"])
+            for action in recursive_result["actions"]:
+                input_rel = Path(action["input"]).relative_to(output_path)
+                output_rels = []
+                for raw_output in action["outputs"]:
+                    output_path_obj = Path(raw_output)
+                    try:
+                        output_rels.append(str(output_path_obj.relative_to(output_path)))
+                    except ValueError:
+                        output_rels.append(str(output_path_obj))
+                summary_lines.append(
+                    f"- {input_rel} [{action['format']}] -> {', '.join(output_rels)}"
+                )
+        if recursive_result["elfs"]:
+            summary_lines.extend(["", f"ELF files found: {len(recursive_result['elfs'])}"])
+            for elf_path in recursive_result["elfs"][:80]:
+                elf = Path(elf_path)
+                try:
+                    rel = elf.relative_to(output_path)
+                except ValueError:
+                    rel = elf
+                summary_lines.append(f"- {rel}")
+            if len(recursive_result["elfs"]) > 80:
+                summary_lines.append(f"- ... {len(recursive_result['elfs']) - 80} more ELF files")
+        if recursive_result["blockers"]:
+            summary_lines.extend(["", "Unextracted or skipped nested payloads:"])
+            for blocker in recursive_result["blockers"][:40]:
+                summary_lines.append(f"- {blocker}")
         summary_lines.extend(
             [
                 "",
                 "Skill Reuse Notes:",
                 "- When the top-level header is vendor-specific GLF data, fall back to file(1) plus bounded binwalk scanning.",
-                "- Extract only top-level SquashFS and uImage payloads with fixed offsets and recorded sizes.",
+                "- Extract top-level SquashFS and uImage payloads with fixed offsets and recorded sizes.",
+                "- After slicing, run unsquashfs on filesystem images and strip the 64-byte uImage header to expose kernel or ramdisk payloads.",
+                "- Continue recursively into cpio, gzip, xz, lzma, zip, and 7z payloads until no more filesystem/archive containers remain.",
             ]
         )
         Path(output_path, "summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
@@ -486,9 +722,15 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
             "glf binwalk slice extraction",
             proc,
             success=True,
-            extra={"artifact_count": len(extracted), "artifacts": extracted},
+            extra={
+                "artifact_count": len(extracted),
+                "artifacts": extracted,
+                "recursive_action_count": len(recursive_result["actions"]),
+                "elf_count": len(recursive_result["elfs"]),
+                "recursive_blockers": recursive_result["blockers"],
+            },
         )
-        return _success("glf binwalk slice extraction")
+        return _success("glf recursive binwalk slice extraction")
 
     if fmt in (None, "elf"):
         elf_offset = _find_magic_offset(b"\x7fELF")

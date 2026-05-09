@@ -50,13 +50,7 @@ LOG_OUTPUT_DIR = Path(os.environ.get("UNPACKER_LOG_DIR", "/workspace/log_output"
 
 def _get_max_retries() -> int:
     try:
-        from app.model import get_config_value, get_db_session
-
-        db = get_db_session()
-        try:
-            return get_config_value(db, "max_retries", default=5)
-        finally:
-            db.close()
+        return int(os.environ.get("MAX_RETRIES", os.environ.get("AGENTFLOW_MAX_ITERATIONS", "5")))
     except Exception:
         return 5
 

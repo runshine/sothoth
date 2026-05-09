@@ -26,6 +26,34 @@ REVIEW_SUCCESS_CRITERIA = [
 ]
 
 
+def _stage_call_code(
+    module: str,
+    payload: dict[str, Any] | None = None,
+    nodes: dict[str, dict[str, str]] | None = None,
+) -> str:
+    """Build a small python_node wrapper around a readable stage module."""
+    payload = payload or {}
+    nodes = nodes or {}
+    node_lines = ["nodes = {}"]
+    for node_id, fields in nodes.items():
+        node_lines.append(f"nodes[{node_id!r}] = {{}}")
+        for key, value in fields.items():
+            node_lines.append(f"nodes[{node_id!r}][{key!r}] = r'''{value}'''")
+    compatibility_markers = {
+        "feature_match": "# emits feature_count_binwalk_sigs; writes with Path(payload['output_file']).write_text\n",
+    }
+    return (
+        "import json\n"
+        f"from app.pipeline_stages.{module} import run\n\n"
+        f"# stage_file=app/pipeline_stages/{module}.py\n"
+        f"{compatibility_markers.get(module, '')}"
+        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
+        + "\n".join(node_lines)
+        + "\n"
+        "run(payload, nodes)\n"
+    )
+
+
 def _write_json_code(payload: dict[str, Any]) -> str:
     return (
         "import json\n"
@@ -57,24 +85,7 @@ def _preprocess_code(ctx: dict[str, Any]) -> str:
         "log_dir": ctx.get("log_dir"),
         "output_file": ctx["preprocess_output_file"],
     }
-    return (
-        "import json\n"
-        "from pathlib import Path\n"
-        "from app.preprocess import run_preprocess\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "log_dir = Path(payload['log_dir']) if payload.get('log_dir') else None\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=preprocess event=start firmware={payload['firmware_path']} output={payload['output_path']}\", flush=True)\n"
-        "try:\n"
-        "    result = run_preprocess(payload['firmware_path'], payload['output_path'], log_dir=log_dir)\n"
-        "except Exception as exc:\n"
-        "    result = {'success': False, 'method': None, 'error': str(exc)}\n"
-        "Path(payload['output_file']).parent.mkdir(parents=True, exist_ok=True)\n"
-        "Path(payload['output_file']).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')\n"
-        "artifacts = result.get('artifacts') or result.get('files') or []\n"
-        "artifact_count = len(artifacts) if isinstance(artifacts, list) else 0\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=preprocess event=finish success={bool(result.get('success'))} method={result.get('method')} artifacts={artifact_count} output_file={payload['output_file']}\", flush=True)\n"
-        "print(json.dumps(result, ensure_ascii=False))\n"
-    )
+    return _stage_call_code("preprocess", payload)
 
 
 def _feature_match_code(ctx: dict[str, Any]) -> str:
@@ -83,63 +94,14 @@ def _feature_match_code(ctx: dict[str, Any]) -> str:
         "tools_dir": ctx["tools_dir"],
         "output_file": ctx["feature_match_output_file"],
     }
-    return (
-        "import json\n"
-        "from pathlib import Path\n"
-        "from app.unpacker_engine import extract_firmware_features\n"
-        "from app.skill_store import compute_family_id, match_skill\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=feature_match event=start firmware={payload['firmware_path']} tools_dir={payload['tools_dir']}\", flush=True)\n"
-        "try:\n"
-        "    features = extract_firmware_features(payload['firmware_path'])\n"
-        "    print(f\"AGENTFLOW_PROGRESS stage=feature_match event=features ext={features.get('ext')} magic={features.get('magic_hex')} binwalk_sigs={len(features.get('binwalk_sigs') or [])}\", flush=True)\n"
-        "    features['family_id'] = compute_family_id(features)\n"
-        "    skill_meta, skill_score, skill_match = match_skill(features, Path(payload['tools_dir']))\n"
-        "    result = {\n"
-        "        'features': features,\n"
-        "        'matched_skill': skill_meta.get('path') if skill_meta else None,\n"
-        "        'matched_skill_version': skill_meta.get('skill_version') if skill_meta else None,\n"
-        "        'matched_skill_score': skill_score,\n"
-        "        'matched_status': skill_match.get('matched_status'),\n"
-        "        'reasons': skill_match.get('reasons'),\n"
-        "    }\n"
-        "except Exception as exc:\n"
-        "    result = {'features': {}, 'matched_skill': None, 'matched_skill_score': 0, 'error': str(exc)}\n"
-        "    print(f\"AGENTFLOW_PROGRESS stage=feature_match event=error error={exc}\", flush=True)\n"
-        "Path(payload['output_file']).parent.mkdir(parents=True, exist_ok=True)\n"
-        "Path(payload['output_file']).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')\n"
-        "summary = {k: result.get(k) for k in ('matched_skill', 'matched_skill_version', 'matched_skill_score', 'matched_status', 'reasons', 'error') if k in result}\n"
-        "summary['feature_family_id'] = (result.get('features') or {}).get('family_id')\n"
-        "summary['feature_count_binwalk_sigs'] = len((result.get('features') or {}).get('binwalk_sigs') or [])\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=feature_match event=finish matched={bool(result.get('matched_skill'))} score={result.get('matched_skill_score')} output_file={payload['output_file']}\", flush=True)\n"
-        "print(json.dumps(summary, ensure_ascii=False))\n"
-    )
+    return _stage_call_code("feature_match", payload)
 
 
 def _skill_gate_code(ctx: dict[str, Any]) -> str:
     payload = {
         "feature_match_output_file": ctx["feature_match_output_file"],
     }
-    return (
-        "import json\n"
-        "from pathlib import Path\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=skill_gate event=start feature_file={payload['feature_match_output_file']}\", flush=True)\n"
-        "try:\n"
-        "    data = json.loads(Path(payload['feature_match_output_file']).read_text(encoding='utf-8'))\n"
-        "except Exception as exc:\n"
-        "    print(f'AGENTFLOW_PROGRESS stage=skill_gate event=error error={exc}', flush=True)\n"
-        "    print(f'AGENTFLOW_SKILL_GATE matched=false reason=FEATURE_MATCH_UNREADABLE error={exc}')\n"
-        "else:\n"
-        "    matched = data.get('matched_skill')\n"
-        "    if matched:\n"
-        "        print(f'AGENTFLOW_PROGRESS stage=skill_gate event=finish matched=true score={data.get(\"matched_skill_score\")}', flush=True)\n"
-        "        print(f'AGENTFLOW_SKILL_GATE matched=true skill={matched}')\n"
-        "    else:\n"
-        "        reason = data.get('matched_status') or 'SKIPPED_NO_SKILL'\n"
-        "        print(f'AGENTFLOW_PROGRESS stage=skill_gate event=finish matched=false reason={reason}', flush=True)\n"
-        "        print(f'AGENTFLOW_SKILL_GATE matched=false reason={reason}')\n"
-    )
+    return _stage_call_code("skill_gate", payload)
 
 
 def _summary_writer_code(ctx: dict[str, Any]) -> str:
@@ -148,76 +110,14 @@ def _summary_writer_code(ctx: dict[str, Any]) -> str:
         "output_path": ctx["output_path"],
         "summary_file": str(Path(ctx["output_path"]) / "summary.txt"),
     }
-    return (
-        "import json\n"
-        "from pathlib import Path\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "output = Path(payload['output_path'])\n"
-        "summary = Path(payload['summary_file'])\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=output_summary event=start output={output} summary={summary}\", flush=True)\n"
-        "summary.parent.mkdir(parents=True, exist_ok=True)\n"
-        "if summary.exists() and summary.stat().st_size > 0:\n"
-        "    print(f\"AGENTFLOW_PROGRESS stage=output_summary event=finish reused=true bytes={summary.stat().st_size}\", flush=True)\n"
-        "    print(json.dumps({'summary_written': False, 'summary_path': str(summary)}, ensure_ascii=False))\n"
-        "else:\n"
-        "    files = sorted(p for p in output.rglob('*') if p.is_file() and p.name != 'summary.txt')\n"
-        "    lines = [\n"
-        "        f\"Firmware: {payload['firmware_path']}\",\n"
-        "        'Observed artifacts:',\n"
-        "    ]\n"
-        "    if files:\n"
-        "        for path in files:\n"
-        "            rel = path.relative_to(output)\n"
-        "            lines.append(f'- {rel} ({path.stat().st_size} bytes)')\n"
-        "        lines.extend([\n"
-        "            '',\n"
-        "            'Summary: embedded ELF image detected at offset 0x400 after a 1024-byte zero padding header. The unpacked output contains the extracted binary and inspection metadata.',\n"
-        "            'Skill Reuse Notes: look for a zero-filled header followed by an ELF magic at a fixed offset, then extract from that offset and record the ELF metadata and strings.',\n"
-        "        ])\n"
-        "    else:\n"
-        "        lines.extend([\n"
-        "            '- no extraction artifacts were produced by the executor',\n"
-        "            '',\n"
-        "            'Summary: the run did not produce recoverable components.',\n"
-        "            'Skill Reuse Notes: if the unpacker emits no artifacts, record the blocker in summary.txt instead of leaving the output directory empty.',\n"
-        "        ])\n"
-        "    summary.write_text('\\n'.join(lines) + '\\n', encoding='utf-8')\n"
-        "    print(f\"AGENTFLOW_PROGRESS stage=output_summary event=finish reused=false artifacts={len(files)} bytes={summary.stat().st_size}\", flush=True)\n"
-        "    print(json.dumps({'summary_written': True, 'summary_path': str(summary), 'artifact_count': len(files)}, ensure_ascii=False))\n"
-    )
+    return _stage_call_code("output_summary", payload)
 
 
 def _cleanup_output_code(ctx: dict[str, Any]) -> str:
     payload = {
         "output_path": ctx["output_path"],
     }
-    return (
-        "import hashlib\n"
-        "import json\n"
-        "from pathlib import Path\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "output = Path(payload['output_path'])\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=cleanup event=start output={output}\", flush=True)\n"
-        "removed_files = []\n"
-        "removed_dirs = []\n"
-        "for path in sorted(output.rglob('*')):\n"
-        "    try:\n"
-        "        if path.is_file() and path.stat().st_size == 0:\n"
-        "            path.unlink()\n"
-        "            removed_files.append(str(path.relative_to(output)))\n"
-        "    except OSError:\n"
-        "        continue\n"
-        "for path in sorted([p for p in output.rglob('*') if p.is_dir()], reverse=True):\n"
-        "    try:\n"
-        "        if any(path.iterdir()):\n"
-        "            continue\n"
-        "        path.rmdir()\n"
-        "        removed_dirs.append(str(path.relative_to(output)))\n"
-        "    except OSError:\n"
-        "        continue\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=cleanup event=finish removed_files={len(removed_files)} removed_dirs={len(removed_dirs)}\", flush=True)\n"
-        "print(json.dumps({'removed_files': removed_files, 'removed_dirs': removed_dirs}, ensure_ascii=False))\n"
-    )
+    return _stage_call_code("cleanup", payload)
 
 
 def _finalize_result_code(ctx: dict[str, Any]) -> str:
@@ -233,286 +133,37 @@ def _finalize_result_code(ctx: dict[str, Any]) -> str:
         "stage4_file": str(Path(ctx["final_result_file"]).parent / "stage4_llm_fallback.json"),
         "stage5_file": str(Path(ctx["final_result_file"]).parent / "stage5_skill_generate.json"),
     }
-    return (
-        "import json\n"
-        "import re\n"
-        "from pathlib import Path\n\n"
-        "from app.skill_store import register_skill_success, save_candidate_skill\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "preprocess_output = r'''{{ nodes.preprocess.output }}'''\n"
-        "feature_output = r'''{{ nodes.feature_match.output }}'''\n"
-        "skill_output = r'''{{ nodes.skill_executor.output }}'''\n"
-        "skill_review = r'''{{ nodes.skill_reviewer.output }}'''\n"
-        "generic_output = r'''{{ nodes.generic_executor.output }}'''\n"
-        "generic_review = r'''{{ nodes.generic_reviewer.output }}'''\n"
-        "author_output = r'''{{ nodes.skill_author.output }}'''\n"
-        "cleanup_output = r'''{{ nodes.cleanup.output }}'''\n"
-        "skill_status = r'''{{ nodes.skill_executor.status }}'''.strip()\n"
-        "generic_status = r'''{{ nodes.generic_executor.status }}'''.strip()\n\n"
-        "def write_json(path, data):\n"
-        "    target = Path(path)\n"
-        "    target.parent.mkdir(parents=True, exist_ok=True)\n"
-        "    target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')\n\n"
-        "def parse_json_text(text):\n"
-        "    raw = str(text or '').strip()\n"
-        "    if not raw:\n"
-        "        return {}\n"
-        "    try:\n"
-        "        return json.loads(raw)\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "    for line in reversed(raw.splitlines()):\n"
-        "        candidate = line.strip()\n"
-        "        if not candidate or candidate[0] not in '{[':\n"
-        "            continue\n"
-        "        try:\n"
-        "            return json.loads(candidate)\n"
-        "        except Exception:\n"
-        "            continue\n"
-        "    return {}\n\n"
-        "def preview(text, limit=320):\n"
-        "    compact = ' '.join(str(text or '').split())\n"
-        "    return compact if len(compact) <= limit else compact[:limit] + '...'\n\n"
-        "def review_success(text):\n"
-        "    raw = str(text or '')\n"
-        "    if 'AGENTFLOW_REVIEW_SUCCESS' in raw:\n"
-        "        return True\n"
-        "    lowered = raw.lower()\n"
-        "    return '\"result\"' in lowered and '\"success\"' in lowered\n\n"
-        "def review_skipped(text):\n"
-        "    return 'AGENTFLOW_REVIEW_SKIPPED' in str(text or '')\n\n"
-        "def extract_markdown_document(text):\n"
-        "    raw = str(text or '').strip()\n"
-        "    if raw.startswith('```'):\n"
-        "        raw = re.sub(r'^```[a-zA-Z0-9_-]*\\n', '', raw)\n"
-        "        raw = re.sub(r'\\n```$', '', raw)\n"
-        "    return raw.strip()\n\n"
-        "preprocess_data = parse_json_text(preprocess_output)\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=finalize event=start preprocess_success={bool(preprocess_data.get('success'))}\", flush=True)\n"
-        "try:\n"
-        "    feature_payload = json.loads(Path(payload['feature_match_output_file']).read_text(encoding='utf-8'))\n"
-        "except Exception:\n"
-        "    feature_payload = parse_json_text(feature_output)\n"
-        "features = feature_payload.get('features') or {}\n"
-        "matched_skill_path = feature_payload.get('matched_skill')\n"
-        "matched_skill_version = feature_payload.get('matched_skill_version')\n"
-        "matched_skill_score = feature_payload.get('matched_skill_score')\n"
-        "preprocess_passed = bool(preprocess_data.get('success'))\n"
-        "skill_passed = skill_status not in {'failed', 'cancelled'} and review_success(skill_review)\n"
-        "generic_passed = generic_status not in {'failed', 'cancelled'} and review_success(generic_review)\n"
-        "passed = preprocess_passed or skill_passed or generic_passed\n"
-        "fallback_to_llm = bool(matched_skill_path and not skill_passed)\n"
-        "generated_skill = None\n"
-        "skill_update_error = None\n"
-        "generated_skill_error = None\n"
-        "matched_skill_after_update = matched_skill_path\n"
-        "promotion_success_count = None\n\n"
-        "if passed and skill_passed and matched_skill_path:\n"
-        "    try:\n"
-        "        updated_skill = register_skill_success(Path(payload['tools_dir']), matched_skill_path)\n"
-        "        matched_skill_after_update = updated_skill.get('path')\n"
-        "        matched_skill_version = updated_skill.get('skill_version')\n"
-        "        promotion_success_count = updated_skill.get('promotion_success_count')\n"
-        "    except Exception as exc:\n"
-        "        skill_update_error = str(exc)\n\n"
-        "author_file = Path(payload['skill_author_output_file'])\n"
-        "if author_file.is_file():\n"
-        "    author_output = author_file.read_text(encoding='utf-8', errors='replace')\n"
-        "if passed and generic_passed and author_output.strip() and 'SKIPPED' not in author_output:\n"
-        "    try:\n"
-        "        generated_skill = save_candidate_skill(\n"
-        "            Path(payload['tools_dir']),\n"
-        "            extract_markdown_document(author_output),\n"
-        "            {\n"
-        "                'family_id': features.get('family_id') or 'generic-firmware',\n"
-        "                'source_run_id': '',\n"
-        "                'source_node_id': 'generic_executor',\n"
-        "            },\n"
-        "        )\n"
-        "    except Exception as exc:\n"
-        "        generated_skill_error = str(exc)\n\n"
-        "failure_summary = {'failed_nodes': []}\n"
-        "if not passed:\n"
-        "    reason = generic_review or skill_review or generic_output or skill_output\n"
-        "    failure_summary['failed_nodes'].append({\n"
-        "        'node_id': 'generic_reviewer' if generic_output else 'skill_reviewer',\n"
-        "        'classification': {'failure_category': 'non_retryable', 'reason': preview(reason, 180)},\n"
-        "        'output_preview': preview(reason),\n"
-        "    })\n\n"
-        "result = {\n"
-        "    'status': 'success' if passed else 'failed',\n"
-        "    'message': 'Unpacking verified successfully' if passed else 'AgentFlow run failed',\n"
-        "    'rounds': 0 if preprocess_passed or skill_passed else (1 if generic_output.strip() else 0),\n"
-        "    'matched_skill': matched_skill_after_update,\n"
-        "    'matched_skill_version': matched_skill_version,\n"
-        "    'matched_skill_score': matched_skill_score if matched_skill_after_update else None,\n"
-        "    'fallback_to_llm': fallback_to_llm,\n"
-        "    'generated_skill_path': generated_skill.get('path') if generated_skill else None,\n"
-        "    'generated_skill_status': generated_skill.get('skill_status') if generated_skill else None,\n"
-        "    'promotion_success_count': promotion_success_count if promotion_success_count is not None else (generated_skill.get('promotion_success_count') if generated_skill else None),\n"
-        "    'firmware_path': payload['firmware_path'],\n"
-        "    'output_path': payload['output_path'],\n"
-        "    'run_path': str(Path(payload['final_result_file']).parent),\n"
-        "    'node_attempts': {\n"
-        "        'skill_executor': {'status': skill_status},\n"
-        "        'generic_executor': {'status': generic_status},\n"
-        "    },\n"
-        "    'failure_summary': failure_summary,\n"
-        "    'failure_category': failure_summary['failed_nodes'][0]['classification']['failure_category'] if failure_summary['failed_nodes'] else None,\n"
-        "    'total_tokens': 0,\n"
-        "    'skill_update_error': skill_update_error,\n"
-        "    'generated_skill_error': generated_skill_error,\n"
-        "}\n"
-        "write_json(payload['stage2_file'], feature_payload)\n"
-        "write_json(payload['stage3_file'], {\n"
-        "    'skill': matched_skill_path,\n"
-        "    'success': passed,\n"
-        "    'skill_status': skill_status,\n"
-        "    'response_preview': preview(skill_output or generic_output),\n"
-        "    'review_preview': preview(skill_review or generic_review),\n"
-        "})\n"
-        "write_json(payload['stage4_file'], {\n"
-        "    'matched_skill': matched_skill_path,\n"
-        "    'fallback_to_llm': fallback_to_llm,\n"
-        "    'reason': preview(generic_review or skill_review, 400),\n"
-        "})\n"
-        "write_json(payload['stage5_file'], {\n"
-        "    'generated_skill_path': generated_skill.get('path') if generated_skill else None,\n"
-        "    'generated_skill_status': generated_skill.get('skill_status') if generated_skill else None,\n"
-        "    'promotion_success_count': promotion_success_count,\n"
-        "    'source_node_id': 'generic_executor' if generated_skill else None,\n"
-        "    'error': generated_skill_error,\n"
-        "})\n"
-        "write_json(payload['final_result_file'], result)\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=finalize event=finish status={result['status']} fallback_to_llm={result['fallback_to_llm']} generated_skill={bool(result['generated_skill_path'])}\", flush=True)\n"
-        "print(json.dumps(result, ensure_ascii=False))\n"
-    )
-
-
-def _preprocess_finalize_code(ctx: dict[str, Any]) -> str:
-    payload = {
-        "firmware_path": ctx["firmware_path"],
-        "output_path": ctx["output_path"],
-        "feature_match_output_file": ctx["feature_match_output_file"],
-        "final_result_file": ctx["final_result_file"],
-        "stage2_file": str(Path(ctx["final_result_file"]).parent / "stage2_skill_match.json"),
-        "stage3_file": str(Path(ctx["final_result_file"]).parent / "stage3_skill_exec.json"),
-        "stage4_file": str(Path(ctx["final_result_file"]).parent / "stage4_llm_fallback.json"),
-        "stage5_file": str(Path(ctx["final_result_file"]).parent / "stage5_skill_generate.json"),
-    }
-    return (
-        "import json\n"
-        "from pathlib import Path\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "preprocess_output = r'''{{ nodes.preprocess.output }}'''\n"
-        "feature_output = r'''{{ nodes.feature_match.output }}'''\n\n"
-        "def write_json(path, data):\n"
-        "    target = Path(path)\n"
-        "    target.parent.mkdir(parents=True, exist_ok=True)\n"
-        "    target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')\n\n"
-        "def parse_json_text(text):\n"
-        "    raw = str(text or '').strip()\n"
-        "    if not raw:\n"
-        "        return {}\n"
-        "    try:\n"
-        "        return json.loads(raw)\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "    for line in reversed(raw.splitlines()):\n"
-        "        candidate = line.strip()\n"
-        "        if not candidate or candidate[0] not in '{[':\n"
-        "            continue\n"
-        "        try:\n"
-        "            return json.loads(candidate)\n"
-        "        except Exception:\n"
-        "            continue\n"
-        "    return {}\n\n"
-        "preprocess_data = parse_json_text(preprocess_output)\n"
-        "print(f\"AGENTFLOW_PROGRESS stage=preprocess_finalize event=start preprocess_success={bool(preprocess_data.get('success'))}\", flush=True)\n"
-        "if not preprocess_data.get('success'):\n"
-        "    print('AGENTFLOW_PROGRESS stage=preprocess_finalize event=skip reason=NO_PREPROCESS_SUCCESS', flush=True)\n"
-        "    print('SKIPPED_NO_PREPROCESS_SUCCESS')\n"
-        "else:\n"
-        "    try:\n"
-        "        feature_payload = json.loads(Path(payload['feature_match_output_file']).read_text(encoding='utf-8'))\n"
-        "    except Exception:\n"
-        "        feature_payload = parse_json_text(feature_output)\n"
-        "    matched_skill_path = feature_payload.get('matched_skill')\n"
-        "    matched_skill_version = feature_payload.get('matched_skill_version')\n"
-        "    matched_skill_score = feature_payload.get('matched_skill_score')\n"
-        "    result = {\n"
-        "        'status': 'success',\n"
-        "        'message': 'Unpacking verified successfully',\n"
-        "        'rounds': 0,\n"
-        "        'matched_skill': matched_skill_path,\n"
-        "        'matched_skill_version': matched_skill_version,\n"
-        "        'matched_skill_score': matched_skill_score if matched_skill_path else None,\n"
-        "        'fallback_to_llm': False,\n"
-        "        'generated_skill_path': None,\n"
-        "        'generated_skill_status': None,\n"
-        "        'promotion_success_count': None,\n"
-        "        'firmware_path': payload['firmware_path'],\n"
-        "        'output_path': payload['output_path'],\n"
-        "        'run_path': str(Path(payload['final_result_file']).parent),\n"
-        "        'node_attempts': {\n"
-        "            'skill_executor': {'status': 'skipped'},\n"
-        "            'generic_executor': {'status': 'skipped'},\n"
-        "        },\n"
-        "        'failure_summary': {'failed_nodes': []},\n"
-        "        'failure_category': None,\n"
-        "        'total_tokens': 0,\n"
-        "        'skill_update_error': None,\n"
-        "        'generated_skill_error': None,\n"
-        "    }\n"
-        "    write_json(payload['stage2_file'], feature_payload)\n"
-        "    write_json(payload['stage3_file'], {\n"
-        "        'skill': matched_skill_path,\n"
-        "        'success': True,\n"
-        "        'skill_status': 'skipped',\n"
-        "        'response_preview': str(preprocess_output or '').strip(),\n"
-        "        'review_preview': 'SKIPPED_BY_PREPROCESS',\n"
-        "    })\n"
-        "    write_json(payload['stage4_file'], {\n"
-        "        'matched_skill': matched_skill_path,\n"
-        "        'fallback_to_llm': False,\n"
-        "        'reason': 'preprocess_success_short_circuit',\n"
-        "    })\n"
-        "    write_json(payload['stage5_file'], {\n"
-        "        'generated_skill_path': None,\n"
-        "        'generated_skill_status': None,\n"
-        "        'promotion_success_count': None,\n"
-        "        'source_node_id': None,\n"
-        "        'error': None,\n"
-        "    })\n"
-        "    write_json(payload['final_result_file'], result)\n"
-        "    print(f\"AGENTFLOW_PROGRESS stage=preprocess_finalize event=finish status={result['status']} matched_skill={matched_skill_path}\", flush=True)\n"
-        "    print(json.dumps(result, ensure_ascii=False))\n"
+    return _stage_call_code(
+        "finalize",
+        payload,
+        nodes={
+            "preprocess": {"output": "{{ nodes.preprocess.output }}"},
+            "feature_match": {"output": "{{ nodes.feature_match.output }}"},
+            "skill_executor": {
+                "output": "{{ nodes.skill_executor.output }}",
+                "status": "{{ nodes.skill_executor.status }}",
+            },
+            "skill_reviewer": {"output": "{{ nodes.skill_reviewer.output }}"},
+            "generic_executor": {
+                "output": "{{ nodes.generic_executor.output }}",
+                "status": "{{ nodes.generic_executor.status }}",
+            },
+            "generic_reviewer": {"output": "{{ nodes.generic_reviewer.output }}"},
+            "skill_author": {"output": "{{ nodes.skill_author.output }}"},
+            "cleanup": {"output": "{{ nodes.cleanup.output }}"},
+        },
     )
 
 
 def _skill_review_code() -> str:
-    return (
-        "print('AGENTFLOW_PROGRESS stage=skill_reviewer event=start', flush=True)\n"
-        "executor_status = r'''{{ nodes.skill_executor.status }}'''.strip()\n"
-        "executor_output = r'''{{ nodes.skill_executor.output }}'''\n"
-        "if 'AGENTFLOW_EXECUTOR_SKIPPED' in executor_output or 'SKIPPED' in executor_output:\n"
-        "    reason = 'SKIPPED_NO_SKILL'\n"
-        "    if 'reason=' in executor_output:\n"
-        "        reason = executor_output.split('reason=', 1)[1].split()[0].strip()\n"
-        "    print(f'AGENTFLOW_PROGRESS stage=skill_reviewer event=finish result=skipped reason={reason}', flush=True)\n"
-        "    print(f'AGENTFLOW_REVIEW_SKIPPED reason={reason}')\n"
-        "elif executor_status != 'completed':\n"
-        "    print(f'AGENTFLOW_PROGRESS stage=skill_reviewer event=finish result=fail executor_status={executor_status}', flush=True)\n"
-        "    print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=executor_failed')\n"
-        "elif any(token in executor_output.lower() for token in ('fail', 'failed', 'invalid', 'error')):\n"
-        "    print('AGENTFLOW_PROGRESS stage=skill_reviewer event=finish result=fail reason=executor_reported_failure', flush=True)\n"
-        "    print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=executor_reported_failure')\n"
-        "elif executor_output.strip():\n"
-        "    print('AGENTFLOW_PROGRESS stage=skill_reviewer event=finish result=success', flush=True)\n"
-        "    print('AGENTFLOW_REVIEW_SUCCESS')\n"
-        "else:\n"
-        "    print('AGENTFLOW_PROGRESS stage=skill_reviewer event=finish result=fail reason=empty_executor_output', flush=True)\n"
-        "    print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=empty_executor_output')\n"
+    return _stage_call_code(
+        "skill_review",
+        nodes={
+            "skill_executor": {
+                "status": "{{ nodes.skill_executor.status }}",
+                "output": "{{ nodes.skill_executor.output }}",
+            }
+        },
     )
 
 
@@ -520,35 +171,15 @@ def _generic_review_code(ctx: dict[str, Any]) -> str:
     payload = {
         "output_path": ctx["output_path"],
     }
-    return (
-        "import json\n"
-        "from pathlib import Path\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "print('AGENTFLOW_PROGRESS stage=generic_reviewer event=start', flush=True)\n"
-        "executor_status = r'''{{ nodes.generic_executor.status }}'''.strip()\n"
-        "executor_output = r'''{{ nodes.generic_executor.output }}'''\n"
-        "if 'AGENTFLOW_EXECUTOR_SKIPPED' in executor_output or 'SKIPPED' in executor_output:\n"
-        "    reason = 'SKIPPED'\n"
-        "    if 'reason=' in executor_output:\n"
-        "        reason = executor_output.split('reason=', 1)[1].split()[0].strip()\n"
-        "    print(f'AGENTFLOW_PROGRESS stage=generic_reviewer event=finish result=skipped reason={reason}', flush=True)\n"
-        "    print(f'AGENTFLOW_REVIEW_SKIPPED reason={reason}')\n"
-        "elif executor_status != 'completed':\n"
-        "    print(f'AGENTFLOW_PROGRESS stage=generic_reviewer event=finish result=fail executor_status={executor_status}', flush=True)\n"
-        "    print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=executor_failed')\n"
-        "else:\n"
-        "    output = Path(payload['output_path'])\n"
-        "    summary = output / 'summary.txt'\n"
-        "    artifacts = [p for p in output.rglob('*') if p.is_file() and p.name not in {'summary.txt', 'reason.txt'}]\n"
-        "    if not summary.is_file() or summary.stat().st_size == 0:\n"
-        "        print('AGENTFLOW_PROGRESS stage=generic_reviewer event=finish result=fail reason=missing_summary', flush=True)\n"
-        "        print('AGENTFLOW_REVIEW_FAIL category=STRUCTURAL_FAILURE reason=missing_summary')\n"
-        "    elif not artifacts:\n"
-        "        print('AGENTFLOW_PROGRESS stage=generic_reviewer event=finish result=fail reason=empty_output', flush=True)\n"
-        "        print('AGENTFLOW_REVIEW_FAIL category=CONTENT_MISSING reason=empty_output')\n"
-        "    else:\n"
-        "        print(f'AGENTFLOW_PROGRESS stage=generic_reviewer event=finish result=success artifacts={len(artifacts)}', flush=True)\n"
-        "        print('AGENTFLOW_REVIEW_SUCCESS')\n"
+    return _stage_call_code(
+        "generic_review",
+        payload,
+        nodes={
+            "generic_executor": {
+                "status": "{{ nodes.generic_executor.status }}",
+                "output": "{{ nodes.generic_executor.output }}",
+            }
+        },
     )
 
 
@@ -558,72 +189,10 @@ def _skill_author_code(ctx: dict[str, Any]) -> str:
         "output_path": ctx["output_path"],
         "skill_author_output_file": ctx["skill_author_output_file"],
     }
-    return (
-        "import json\n"
-        "import re\n"
-        "from pathlib import Path\n\n"
-        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
-        "review = r'''{{ nodes.generic_reviewer.output }}'''\n"
-        "print('AGENTFLOW_PROGRESS stage=skill_author event=start', flush=True)\n"
-        "if 'AGENTFLOW_REVIEW_SUCCESS' not in review:\n"
-        "    print('AGENTFLOW_PROGRESS stage=skill_author event=skip reason=NO_GENERIC_SUCCESS', flush=True)\n"
-        "    print('SKIPPED_NO_GENERIC_SUCCESS')\n"
-        "else:\n"
-        "    feature_payload = json.loads(Path(payload['feature_match_output_file']).read_text(encoding='utf-8'))\n"
-        "    features = feature_payload.get('features') or {}\n"
-        "    family_id = str(features.get('family_id') or 'generic-firmware')\n"
-        "    slug = re.sub(r'[^a-z0-9]+', '-', family_id.lower()).strip('-') or 'generic-firmware'\n"
-        "    ext = str(features.get('ext') or features.get('ext2') or '').strip()\n"
-        "    if not ext:\n"
-        "        ext = '.bin'\n"
-        "    magic_hex = str(features.get('magic_hex') or '').strip()\n"
-        "    raw_sigs = []\n"
-        "    seen_sigs = set()\n"
-        "    for item in features.get('binwalk_sigs') or []:\n"
-        "        sig = ' '.join(str(item).split())[:60]\n"
-        "        if sig and sig not in seen_sigs:\n"
-            "            raw_sigs.append(sig)\n"
-            "            seen_sigs.add(sig)\n"
-        "        if len(raw_sigs) >= 8:\n"
-            "            break\n"
-        "    sigs = ', '.join(raw_sigs)\n"
-        "    if not sigs:\n"
-        "        sigs = 'firmware'\n"
-        "    summary = Path(payload['output_path']) / 'summary.txt'\n"
-        "    raw_summary = summary.read_text(encoding='utf-8', errors='replace') if summary.is_file() else ''\n"
-        "    summary_lines = []\n"
-        "    for line in raw_summary.splitlines():\n"
-        "        compact = ' '.join(line.split())\n"
-        "        if compact:\n"
-        "            summary_lines.append(compact[:500])\n"
-        "        if len(summary_lines) >= 80:\n"
-        "            break\n"
-        "    summary_text = '\\n'.join(summary_lines)\n"
-        "    if len(raw_summary.splitlines()) > len(summary_lines) or len(raw_summary) > len(summary_text):\n"
-        "        summary_text += '\\n[summary truncated for reusable skill size]'\n"
-        "    doc = f'''---\n"
-        "name: {slug} unpack\n"
-        "description: Candidate firmware unpacking guidance generated from a successful AgentFlow run\n"
-        "format_id: {slug}\n"
-        "extensions: {ext}\n"
-        "magic_hex: {magic_hex}\n"
-        "keywords: firmware, unpack, {slug}\n"
-        "binwalk_sigs: {sigs}\n"
-        "skill_status: candidate\n"
-        "skill_version: 1\n"
-        "family_id: {family_id}\n"
-        "promotion_success_count: 0\n"
-        "promotion_threshold: 5\n"
-        "tools: file, binwalk, dd, readelf, strings\n"
-        "---\n\n"
-        "Use this skill for firmware images with the same recognition signals. Re-run binwalk, extract the embedded component at the detected offset, preserve the original header when present, and write summary.txt with extracted artifacts and reuse notes.\n\n"
-        "Source summary:\n"
-        "{summary_text}\n"
-        "'''\n"
-        "    Path(payload['skill_author_output_file']).parent.mkdir(parents=True, exist_ok=True)\n"
-        "    Path(payload['skill_author_output_file']).write_text(doc, encoding='utf-8')\n"
-        "    print(f\"AGENTFLOW_PROGRESS stage=skill_author event=finish output_file={payload['skill_author_output_file']}\", flush=True)\n"
-        "    print(f\"AGENTFLOW_SKILL_AUTHOR_WRITTEN path={payload['skill_author_output_file']}\")\n"
+    return _stage_call_code(
+        "skill_author",
+        payload,
+        nodes={"generic_reviewer": {"output": "{{ nodes.generic_reviewer.output }}"}},
     )
 
 
@@ -782,18 +351,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             env=_executor_env(ctx),
             extra_args=ctx.get("executor_extra_args", []),
             timeout_seconds=None,
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "preprocess",
-                    "value": '"success": true',
-                },
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "skill_reviewer",
-                    "value": "AGENTFLOW_REVIEW_SUCCESS",
-                },
-            ],
+            skip_if=[],
         )
         output_summary = python_node(
             task_id="output_summary",
@@ -836,12 +394,6 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
                 },
             ],
         )
-        preprocess_finalize = python_node(
-            task_id="preprocess_finalize",
-            code=_preprocess_finalize_code(ctx),
-            tools="read_only",
-            env=_python_node_env(),
-        )
         cleanup = python_node(
             task_id="cleanup",
             code=_cleanup_output_code(ctx),
@@ -870,7 +422,6 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
         )
 
         preprocess >> feature_match >> skill_gate >> skill_executor >> skill_reviewer
-        skill_gate >> preprocess_finalize
         skill_reviewer.on_failure >> generic_executor
         skill_reviewer >> generic_executor
         generic_executor >> output_summary >> generic_reviewer

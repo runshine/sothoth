@@ -1,115 +1,59 @@
-# SecFlow Firmware Unpacker Service
+# SecFlow Firmware Unpacker
 
-固件解包微服务，基于 `pi coding agent` 执行固件提取任务，并按 SecFlow 现有应用型微服务的方式接入认证、项目服务和菜单注册中心。
+AgentFlow-only 固件解包入口。当前版本不提供 REST API、任务数据库、Worker 心跳或平台注册，只运行本地 AgentFlow pipeline。
 
-## 主要接口
+## 运行
 
-- `GET /api/app/firmware-unpacker/health`
-- `GET /api/app/firmware-unpacker/ready`
-- `POST /api/app/firmware-unpacker/projects/{project_id}/tasks`
-- `GET /api/app/firmware-unpacker/projects/{project_id}/tasks`
-- `GET /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}`
-- `GET /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/agentflow`
-- `DELETE /api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}`
+```bash
+FIRMWARE_PATH=/path/to/firmware.bin \
+OUTPUT_PATH=/path/to/output \
+RUN_PATH=/path/to/run \
+UNPACKER_TOOLS_DIR=/path/to/tools \
+python -m app.cli
+```
 
-AgentFlow Web API 在本服务 REST 前缀下同步暴露，保留原始 `/api/runs` 后缀：
+也可以使用镜像入口：
 
-- `GET /api/app/firmware-unpacker/api/examples/default`
-- `POST /api/app/firmware-unpacker/api/runs/validate`
-- `POST /api/app/firmware-unpacker/api/runs`
-- `GET /api/app/firmware-unpacker/api/runs`
-- `GET /api/app/firmware-unpacker/api/runs/{run_id}`
-- `POST /api/app/firmware-unpacker/api/runs/{run_id}/cancel`
-- `POST /api/app/firmware-unpacker/api/runs/{run_id}/rerun`
-- `GET /api/app/firmware-unpacker/api/runs/{run_id}/events`
-- `GET /api/app/firmware-unpacker/api/runs/{run_id}/artifacts/{node_id}/{name}`
-- `GET /api/app/firmware-unpacker/api/runs/{run_id}/scratchboard`
-- `GET /api/app/firmware-unpacker/api/runs/{run_id}/stream`
-- `GET /api/app/firmware-unpacker/api/health`
-
-同时提供等价别名 `/api/app/firmware-unpacker/agentflow/...`。
-
-兼容保留的旧接口：
-
-- `POST /api/app/firmware-unpacker/unpack`
-- `GET /api/app/firmware-unpacker/tasks`
-- `GET /api/app/firmware-unpacker/tasks/{task_id}`
-- `GET /api/app/firmware-unpacker/tasks/{task_id}/agentflow`
-- `DELETE /api/app/firmware-unpacker/tasks/{task_id}`
+```bash
+docker build -t secflow-app-firmware-unpacker .
+docker run --rm \
+  -e FIRMWARE_PATH=/data/input/fw.bin \
+  -e OUTPUT_PATH=/data/output \
+  -e RUN_PATH=/data/run \
+  -v /host/data:/data \
+  secflow-app-firmware-unpacker
+```
 
 ## 配置
 
-配置文件为 `config.yaml`，主要分为以下几段：
+配置文件默认为 `config.yaml`，也可通过 `CONFIG_PATH` 或 `FIRMWARE_UNPACKER_CONFIG` 指定。保留的配置只有：
 
-- `app`: 服务监听地址和端口
-- `database`: MySQL/SQLite 任务状态存储
-- `auth_service`: Token 校验与机机 Token
-- `project_service`: 项目权限校验
-- `service`: 线程池并发等运行参数
-- `agentflow`: 解包引擎运行目录、并发和节点超时配置
-- `registry`: 菜单注册中心配置
-- `logging`: 日志级别与格式
+- `agentflow`: run 目录、并发、节点超时、worktree 和图优化配置
+- `logging`: 日志级别和格式
 
-支持通过 `CONFIG_PATH` 或 `FIRMWARE_UNPACKER_CONFIG` 指定配置文件路径。
+常用环境变量：
 
-服务仅保留 AgentFlow 解包模式，配置示例：
+- `FIRMWARE_PATH`: 固件文件路径
+- `OUTPUT_PATH` 或 `FIRMWARE_OUTPUT`: 解包输出目录
+- `RUN_PATH`: 阶段日志目录
+- `UNPACKER_TOOLS_DIR`: 可复用 skill 目录
+- `AGENTFLOW_RUNS_DIR`: AgentFlow run store 目录
+- `AGENTFLOW_MAX_CONCURRENT_RUNS`: AgentFlow 并发
+- `AGENTFLOW_NODE_TIMEOUT_SECONDS`: Python 校验节点超时基准
+- `MAX_RETRIES` 或 `AGENTFLOW_MAX_ITERATIONS`: pipeline 最大重试轮数
 
-```yaml
-agentflow:
-  enabled: true
-  profile: "production"
-  runs_dir: "/data/files/.agentflow/runs"
-  max_concurrent_runs: 2
-  node_timeout_seconds: 1800
-  use_worktree: false
-  graph_optimization_enabled: false
-  graph_optimizer: "codex"
-  graph_optimization_rounds: 1
-```
+## 代码结构
 
-也可通过环境变量覆盖：
+- `app/cli.py`: AgentFlow-only 命令行入口
+- `app/agentflow_runner.py`: 提交 pipeline、等待结果、汇总 token 和 run artifact
+- `app/agentflow_pipeline.py`: AgentFlow 图装配
+- `app/pipeline_stages/*.py`: 各 Python 阶段实现
+- `app/preprocess.py`: 确定性预处理
+- `app/skill_store.py`: skill 匹配、生成和晋级
+- `app/agent/**`: pi agent system prompts 和 prompt 模板
 
-- `AGENTFLOW_RUNS_DIR=/data/files/.agentflow/runs`
-- `AGENTFLOW_MAX_CONCURRENT_RUNS=2`
-- `AGENTFLOW_PROFILE=staging`
-- `AGENTFLOW_GRAPH_OPTIMIZATION_ENABLED=false`
-- `AGENTFLOW_GRAPH_OPTIMIZATION_ROUNDS=1`
-
-AgentFlow 运行日志统一写入 `agentflow.runs_dir/<run_id>/`，任务目录 `run/` 仅保留 `agentflow_run_id.txt`、`agentflow_run_dir.txt`、阶段日志和最终结果。任务响应会返回 `agentflow_run_id`、`agentflow_run_dir` 和任务日志目录 `run_path`。图级优化只会在 `profile` 为 `test` 或 `staging` 且显式开启优化轮次时运行；优化产物由 AgentFlow 写入统一 run 目录。
-
-离线回归评测入口：
+离线回归评测：
 
 ```bash
 scripts/agentflow_regression_eval.py --manifest plan/agentflow-regression-samples.json
 ```
-
-该命令会读取固定样本 manifest、校验每个样本的期望结果，并按 manifest 中的阈值执行门禁；不通过时返回非零退出码。
-
-从已归档 run 手工沉淀候选 skill：
-
-```bash
-scripts/agentflow_evolve_skill_from_run.py --run-dir /path/to/run --node-id generic_executor --skill-document /path/to/skill.md --skills-dir /data/files/tools
-```
-
-## 构建与运行
-
-```bash
-docker build -t secflow-app-firmware-unpacker .
-docker run -p 8080:8080 secflow-app-firmware-unpacker
-```
-
-## Kubernetes
-
-服务目录下提供：
-
-- `k8s-configmap.yaml`
-- `k8s-deployment.yaml`
-- `k8s-serviceaccount.yaml`
-- `k8s-service.yaml`
-
-平台总装部署文件位于：
-
-- `13-secflow-service/00-secflow-103-00-app-firmware-unpacker-configmap.yaml`
-- `13-secflow-service/00-secflow-103-01-app-firmware-unpacker-serviceaccount.yaml`
-- `13-secflow-service/00-secflow-103-02-app-firmware-unpacker-deployment.yaml`
-- `13-secflow-service/00-secflow-103-03-app-firmware-unpacker-service.yaml`

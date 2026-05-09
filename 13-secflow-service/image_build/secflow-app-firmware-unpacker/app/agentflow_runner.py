@@ -409,10 +409,23 @@ def _archive_success_sample(log_dir: Path | None, record: Any, result: dict[str,
 
 
 def _json_output(text: str) -> dict[str, Any]:
-    try:
-        return json.loads(str(text or "").strip())
-    except Exception:
+    raw = str(text or "").strip()
+    if not raw:
         return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    for line in reversed(raw.splitlines()):
+        candidate = line.strip()
+        if not candidate or candidate[0] not in "{[":
+            continue
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            continue
+    return {}
 
 
 def _review_success(review_text: str, legacy_check: Callable[[str], bool]) -> bool:

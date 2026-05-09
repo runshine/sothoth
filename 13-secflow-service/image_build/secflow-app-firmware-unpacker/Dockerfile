@@ -1,7 +1,7 @@
 FROM ubuntu:24.04
 
 LABEL maintainer="icsl"
-LABEL description="Firmware unpacking microservice powered by pi coding agent"
+LABEL description="Firmware unpacking AgentFlow pipeline powered by pi coding agent"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV TZ=Asia/Shanghai
@@ -96,10 +96,5 @@ RUN mkdir -p /app/data \
 
 RUN python3 -c "import agentflow; print(agentflow.__file__)" \
     && pi --version
-
-EXPOSE 8080
-
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD python3 -c "from urllib.request import urlopen; urlopen('http://localhost:8080/api/app/firmware-unpacker/health', timeout=5)" || exit 1
 
 CMD ["/app/start.sh"]
