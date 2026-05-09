@@ -598,6 +598,124 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("pending", runs[1].status)
         self.assertEqual({}, runs[1].output_summary)
 
+    def test_continue_task_clears_archive_jobs_for_affected_stages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="s1",
+                project_id="p1",
+                name="source",
+                status="partial_success",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            runs = [
+                BinarySecurityStageRun(id="sr1", task_id="s1", project_id="p1", stage_name="system_analysis", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="s1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="failed"),
+            ]
+            archive_jobs = [
+                BinarySecurityArchiveJob(
+                    id="aj1",
+                    task_id="s1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    item_id="i1",
+                    archive_status="success",
+                )
+            ]
+            db = _ModelAwareDb(tasks=[task], stage_runs=runs, archive_jobs=archive_jobs)
+
+            self.manager.continue_task(db, project_id="p1", task_id="s1")
+
+            self.assertEqual([], db.archive_jobs)
+
+    def test_retry_task_clears_archive_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="vuln_scan",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            archive_jobs = [
+                BinarySecurityArchiveJob(
+                    id="aj1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_name="vuln_scan",
+                    item_id="i1",
+                    archive_status="success",
+                )
+            ]
+            db = _ModelAwareDb(tasks=[task], archive_jobs=archive_jobs)
+
+            self.manager.retry_task(db, project_id="p1", task_id="t1")
+
+            self.assertEqual("pending", task.status)
+            self.assertEqual([], db.archive_jobs)
+
+    def test_retry_stage_clears_archive_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="s1",
+                project_id="p1",
+                name="source",
+                status="failed",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="s1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="failed",
+            )
+            archive_jobs = [
+                BinarySecurityArchiveJob(
+                    id="aj1",
+                    task_id="s1",
+                    project_id="p1",
+                    stage_name="entry_analysis",
+                    item_id="i1",
+                    archive_status="failed",
+                )
+            ]
+            stage_items = [
+                BinarySecurityStageItem(
+                    id="i1",
+                    task_id="s1",
+                    project_id="p1",
+                    stage_run_id="sr1",
+                    stage_name="entry_analysis",
+                    item_key="module-1",
+                    status="failed",
+                )
+            ]
+            db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=stage_items, archive_jobs=archive_jobs)
+
+            self.manager.retry_stage(db, project_id="p1", task_id="s1", stage_name="entry_analysis")
+
+            self.assertEqual("pending", task.status)
+            self.assertEqual([], db.archive_jobs)
+
     def test_refresh_task_status_after_stage_retry_finalizes_without_advancing(self):
         task = BinarySecurityTask(
             id="s1",

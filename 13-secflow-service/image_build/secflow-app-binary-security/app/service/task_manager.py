@@ -771,6 +771,7 @@ class TaskManager:
             BinarySecurityStageItem.task_id == task.id,
             BinarySecurityStageItem.stage_name.in_(affected_stages),
         ).delete(synchronize_session=False)
+        self._clear_archive_jobs_for_stages(db, task.id, affected_stages)
         for stage_name in affected_stages:
             stage_run = stage_runs.get(stage_name)
             if stage_run:
@@ -820,6 +821,7 @@ class TaskManager:
             BinarySecurityStageItem.task_id == task.id,
             BinarySecurityStageItem.stage_name.in_(stage_sequence),
         ).delete(synchronize_session=False)
+        self._clear_archive_jobs_for_stages(db, task.id, stage_sequence)
         for current_stage in stage_sequence:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
@@ -853,6 +855,7 @@ class TaskManager:
         if not stage_run:
             raise ValidationError("目标阶段尚未执行，不能重试")
         self._clear_single_stage_outputs(task, stage_name)
+        self._clear_archive_jobs_for_stages(db, task.id, [stage_name])
         self._reset_stage_run_for_retry(stage_run, increment_retry=True)
 
         task.execution_mode = "stage_retry"
@@ -1060,6 +1063,20 @@ class TaskManager:
             synced_downstream_count=synced_count,
             skipped_downstream_count=skipped_count,
             failed_downstream_count=failed_count,
+        )
+
+    def _clear_archive_jobs_for_stages(self, db: Session, task_id: str, stage_names: list[str]) -> int:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return 0
+        return int(
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task_id,
+                BinarySecurityArchiveJob.stage_name.in_(normalized),
+            )
+            .delete(synchronize_session=False)
+            or 0
         )
 
     def _ensure_downstream_archive_job(
