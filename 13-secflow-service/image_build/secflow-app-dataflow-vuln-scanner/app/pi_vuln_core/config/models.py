@@ -24,7 +24,7 @@ class GlobalConfig(BaseModel):
     """全局配置"""
     workspace_root: str = "/workspace"
     log_level: str = "INFO"
-    max_workflow_retry: int = Field(default=3, ge=1)
+    max_workflow_retry: int = Field(default=1, ge=1)
     max_review_cycles: int = Field(default=6, ge=1)
     default_context_reset: bool = False
     parallel_result_review: bool = True

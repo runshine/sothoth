@@ -257,9 +257,9 @@ class WorkflowService:
             is_default=payload.is_default,
             enabled=payload.enabled,
             priority_default=payload.default_priority,
-            max_retry_count=payload.max_retry_count,
+            max_retry_count=0,
             workspace_base_dir=None,
-            execution_timeout_seconds=payload.execution_timeout_seconds,
+            execution_timeout_seconds=0,
             created_by=actor,
             updated_by=actor,
         )
@@ -315,10 +315,10 @@ class WorkflowService:
             definition.is_default = updates["is_default"]
         if "default_priority" in updates:
             definition.priority_default = updates["default_priority"]
-        if "max_retry_count" in updates:
-            definition.max_retry_count = updates["max_retry_count"]
-        if "execution_timeout_seconds" in updates:
-            definition.execution_timeout_seconds = updates["execution_timeout_seconds"]
+        # Hidden service-side retry/timeout controls are intentionally disabled.
+        # Retries remain explicit user actions at the Run/Task layer.
+        definition.max_retry_count = 0
+        definition.execution_timeout_seconds = 0
 
         definition.template_kind = template_kind
         definition.config_payload_json = normalized_payload

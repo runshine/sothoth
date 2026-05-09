@@ -1445,120 +1445,17 @@ class WorkerExecutor:
         }
 
     def _auto_remove_withdrawn_failed_results(self, ctx: WorkflowContext) -> list[str]:
-        if ctx.cycle <= 1 or not ctx.results_dir or not ctx.failed_result_snapshots:
-            return []
-
-        results_dir = Path(ctx.results_dir)
-        backup_root = Path(ctx.working_dir) / "removed_results" / f"cycle_{ctx.cycle:03d}"
-        removed: list[str] = []
-
-        for name in sorted(ctx.failed_result_snapshots):
-            result_path = results_dir / name
-            if not result_path.is_file():
-                continue
-
-            current_content = result_path.read_text(encoding="utf-8", errors="replace")
-            if not self._is_explicitly_withdrawn_result(current_content):
-                continue
-
-            backup_root.mkdir(parents=True, exist_ok=True)
-            backup_md = backup_root / name
-            backup_meta = backup_root / f"{Path(name).stem}.json"
-
-            backup_md.write_text(current_content, encoding="utf-8")
-            write_json(
-                backup_meta,
-                {
-                    "workflow_id": ctx.workflow_id,
-                    "task_id": ctx.task_id,
-                    "removed_in_cycle": ctx.cycle,
-                    "lifecycle_status": infer_result_lifecycle_from_text(
-                        current_content,
-                        name,
-                    ).get("status", "withdrawn"),
-                    "original_filename": name,
-                    "original_path": str(result_path),
-                    "backup_path": str(backup_md),
-                    "reason": ctx.failed_result_reasons.get(name)
-                    or "结果文件已显式撤回；框架在 summary 后自动迁移出 results/。",
-                },
-            )
-            result_path.unlink()
-            removed.append(name)
-
-        if removed:
-            logger.info(
-                "withdrawn_failed_results_auto_removed",
-                workflow_id=ctx.workflow_id,
-                task_id=ctx.task_id,
-                cycle=ctx.cycle,
-                count=len(removed),
-                files=removed,
-                backup_dir=str(backup_root),
-            )
-
-        return removed
+        # Do not silently remove result files based on lifecycle markers. A
+        # withdrawn / false-positive report is still part of the Run evidence
+        # trail; the inspector can mark it inactive without changing the user's
+        # file layout.
+        return []
 
     def _relocate_inactive_result_files(self, ctx: WorkflowContext) -> list[str]:
-        if not ctx.results_dir or not os.path.isdir(ctx.results_dir):
-            return []
-
-        results_dir = Path(ctx.results_dir)
-        removed_root = Path(ctx.working_dir) / "removed_results" / f"cycle_{ctx.cycle:03d}"
-        supporting_docs_dir = Path(self._supporting_docs_dir(ctx.working_dir))
-        moved: list[str] = []
-
-        for name in list_result_report_files(results_dir):
-            path = results_dir / name
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except FileNotFoundError:
-                continue
-            lifecycle = infer_result_lifecycle_from_text(content, name)
-            if bool(lifecycle.get("active", True)):
-                continue
-
-            bucket = str(lifecycle.get("delivery_bucket") or "removed_results")
-            if bucket == "supporting_docs":
-                supporting_docs_dir.mkdir(parents=True, exist_ok=True)
-                dst = supporting_docs_dir / name
-                if dst.exists() and dst.is_file():
-                    dst.unlink()
-                path.replace(dst)
-                moved.append(f"{name}->supporting_docs/{name}")
-                continue
-
-            removed_root.mkdir(parents=True, exist_ok=True)
-            backup_md = removed_root / name
-            backup_meta = removed_root / f"{Path(name).stem}.json"
-            if backup_md.exists():
-                backup_md.unlink()
-            path.replace(backup_md)
-            write_json(
-                backup_meta,
-                {
-                    "workflow_id": ctx.workflow_id,
-                    "task_id": ctx.task_id,
-                    "removed_in_cycle": ctx.cycle,
-                    "original_filename": name,
-                    "original_path": str(path),
-                    "backup_path": str(backup_md),
-                    "lifecycle_status": lifecycle.get("status", "inactive"),
-                    "signals": lifecycle.get("signals", []),
-                    "reason": "结果文件生命周期不是 active；框架自动迁移出 results/。",
-                },
-            )
-            moved.append(f"{name}->removed_results/{backup_md.parent.name}/{name}")
-
-        if moved:
-            logger.warning(
-                "inactive_result_files_relocated",
-                workflow_id=ctx.workflow_id,
-                task_id=ctx.task_id,
-                cycle=ctx.cycle,
-                files=moved,
-            )
-        return moved
+        # Lifecycle classification is metadata, not permission to mutate the
+        # Run. Keep inactive/superseded files in results/ and let the index/UI
+        # show their status explicitly.
+        return []
 
     def _backup_removed_failed_results(self, ctx: WorkflowContext) -> list[str]:
         if ctx.cycle <= 1 or not ctx.results_dir or not ctx.failed_result_snapshots:

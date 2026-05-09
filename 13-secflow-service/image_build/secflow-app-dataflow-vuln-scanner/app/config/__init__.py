@@ -111,7 +111,7 @@ class ServiceConfig(BaseModel):
     # timeout enforcement for the Pi process unless a caller explicitly opts in.
     default_execution_timeout_seconds: int = 0
     execution_cancel_check_interval_seconds: int = 1
-    trigger_retry_limit: int = 3
+    trigger_retry_limit: int = 0
     public_api_prefix: str = "/api/dataflow-vuln-scanner"
     default_entry_task_type: str = "package_list"
     default_artifact_subdir: str = "assets"
@@ -127,7 +127,6 @@ class SchedulerConfig(BaseModel):
     poll_interval_seconds: int = 2
     heartbeat_interval_seconds: int = 5
     worker_timeout_seconds: int = 20
-    lease_duration_seconds: int = 30
     cleanup_interval_seconds: int = 10
 
 

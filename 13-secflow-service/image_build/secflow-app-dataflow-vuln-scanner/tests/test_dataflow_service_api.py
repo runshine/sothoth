@@ -316,6 +316,8 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     assert "run_vuln_scan.py" in run_payload["command_display"]
     assert "--model mock/model" in run_payload["command_display"]
     assert "--run-name business-scan" in run_payload["command_display"]
+    assert "--timeout-max-retries 3" in run_payload["command_display"]
+    assert "--timeout-retry-interval-seconds 30" in run_payload["command_display"]
     assert run_payload["raw"]["dataflow_cli"]["command_display"] == run_payload["command_display"]
 
     run_files = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}/files")

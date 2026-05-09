@@ -166,7 +166,7 @@ class ProfileTemplateService:
                 runtime_config["rpc_stdout_abort_bytes"] = profile_policy.worker_rpc_stdout_abort_bytes
             elif agent.get("id") == "pi-advisor":
                 runtime_config["timeout_seconds"] = advisor_timeout
-                runtime_config["advisor_runtime_retries"] = 3
+                runtime_config["advisor_runtime_retries"] = 0
                 runtime_config["max_internal_turns"] = 0
                 runtime_config["rpc_stdout_trace_bytes"] = profile_policy.advisor_rpc_stdout_trace_bytes
                 runtime_config["rpc_stdout_abort_bytes"] = profile_policy.advisor_rpc_stdout_abort_bytes

@@ -29,7 +29,7 @@ class ScanProfileCreateRequest(BaseModel):
     is_default: bool = False
     enabled: bool = True
     default_priority: int = 100
-    max_retry_count: int = Field(default=3, ge=0)
+    max_retry_count: int = Field(default=0, ge=0)
     execution_timeout_seconds: int = Field(default=0, ge=0, description="Maximum service-managed run_vuln_scan.py process duration in seconds; 0 means unlimited / disabled.")
 
 
@@ -176,7 +176,6 @@ class ScanTaskAttemptResponse(BaseModel):
     status: str
     run_id: Optional[str] = None
     owner_pod_id: Optional[str]
-    lease_expires_at: Optional[datetime]
     process_pid: Optional[int] = None
     process_host: Optional[str] = None
     process_status: Optional[str] = None
@@ -330,6 +329,8 @@ class RunSummaryResponse(BaseModel):
     failed_count: int = 0
     workflow_mode: str = ""
     updated_at: Optional[str] = None
+    process_state: Dict[str, Any] = Field(default_factory=dict)
+    retry_command_display: Optional[str] = None
 
 
 class RunFileResponse(BaseModel):
@@ -348,6 +349,17 @@ class RunSessionResponse(BaseModel):
     jsonl_path: str = ""
     size: int = 0
     mtime: float = 0
+    event_count: int = 0
+    line_count: int = 0
+    warnings: List[str] = Field(default_factory=list)
+    display_name: str = ""
+    stage_group: str = ""
+    role_name: str = ""
+    watch_project_path: str = ""
+    model: str = ""
+    raw_model: str = ""
+    provider: str = ""
+    thinking: str = ""
     calls: List[Dict[str, Any]] = Field(default_factory=list)
 
 

@@ -142,7 +142,7 @@ def test_generate_config_uses_profile_default_budget_when_max_cycles_not_set(
     assert "max_wall_seconds" not in worker_runtime
     assert "no_progress_timeout_seconds" not in worker_runtime
     assert "max_retry_wall_seconds" not in worker_runtime
-    assert advisor_runtime["advisor_runtime_retries"] == 3
+    assert advisor_runtime["advisor_runtime_retries"] == 0
     assert advisor_runtime["max_internal_turns"] == 0
     assert advisor_runtime["rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").advisor_rpc_stdout_abort_bytes
     assert advisor_runtime["api_max_retries"] == 0

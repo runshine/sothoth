@@ -201,7 +201,7 @@ async def test_global_review_read_only_violation_fails_and_closes_reset_session(
                 "name": "Advisor Agent",
                 "type": "claude_code",
                 "reset_context": True,
-                "runtime_config": {},
+                "runtime_config": {"advisor_runtime_retries": 3},
             }
         ]
     )
@@ -281,7 +281,7 @@ async def test_global_review_runtime_error_is_framework_actionable(
                 "name": "Advisor Agent",
                 "type": "claude_code",
                 "reset_context": True,
-                "runtime_config": {},
+                "runtime_config": {"advisor_runtime_retries": 3},
             }
         ]
     )
@@ -363,7 +363,7 @@ async def test_global_review_runtime_timeout_retries_with_fresh_sessions(
                 "name": "Advisor Agent",
                 "type": "claude_code",
                 "reset_context": True,
-                "runtime_config": {},
+                "runtime_config": {"advisor_runtime_retries": 3},
             }
         ]
     )

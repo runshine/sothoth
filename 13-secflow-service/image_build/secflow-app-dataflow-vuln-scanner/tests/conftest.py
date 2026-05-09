@@ -67,7 +67,6 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
             "poll_interval_seconds": 1,
             "heartbeat_interval_seconds": 1,
             "worker_timeout_seconds": 2,
-            "lease_duration_seconds": 5,
             "cleanup_interval_seconds": 1,
         },
     }

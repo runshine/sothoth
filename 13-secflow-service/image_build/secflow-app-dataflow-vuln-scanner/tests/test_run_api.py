@@ -406,6 +406,11 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)
     monkeypatch.setattr(get_scheduler_service(), "start_execution_now", lambda execution_id: False)
+    monkeypatch.setattr(
+        type(get_execution_service()),
+        "_preflight_run_resume",
+        lambda self, run_index, payload: {"preview_path": "mock_resume_preview.json"},
+    )
     run_root = _project_runs_root() / "bound_resume_delete_20260508_010203"
     bound = _create_execution_bound_run(client, run_root)
 
@@ -413,29 +418,25 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
         f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
         json={"extra_cycles": 2},
     )
-    assert completed_retry_response.status_code == 409
-    assert "not retryable" in completed_retry_response.json()["detail"]
-
-    with get_db_session() as db:
-        run_index = db.get(RunIndex, bound["run_id"])
-        assert run_index is not None
-        run_index.status = "failed"
-        db.add(run_index)
-        db.commit()
-
-    retry_response = client.post(
-        f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
-        json={"extra_cycles": 2},
-    )
-    assert retry_response.status_code == 202
-    retry_payload = retry_response.json()
+    assert completed_retry_response.status_code == 202
+    retry_payload = completed_retry_response.json()
     assert retry_payload["status"] == "queued"
     assert retry_payload["linked_task_id"]
     assert retry_payload["linked_execution_id"]
 
     detail_queued = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail_queued.status_code == 200
-    assert detail_queued.json()["status"] == "queued"
+    detail_payload = detail_queued.json()
+    assert detail_payload["status"] == "queued"
+    assert detail_payload["process_state"]["can_retry"] is False
+    assert "--resume-run-dir" in detail_payload["retry_command_display"]
+
+    duplicate_retry_response = client.post(
+        f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
+        json={"extra_cycles": 2},
+    )
+    assert duplicate_retry_response.status_code == 409
+    assert "pending/queued" in duplicate_retry_response.json()["detail"]
 
     cancel_response = client.post(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/cancel")
     assert cancel_response.status_code == 200
@@ -448,6 +449,100 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
 
     missing_detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert missing_detail.status_code == 404
+
+
+def test_run_retry_rejects_live_process_state(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_retry_live_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "running"
+        execution.status = "running"
+        execution.process_status = "running"
+        trigger.status = "running"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+    service = get_execution_service()
+    fake_process = _FakeCliProcess()
+    service._register_cli_process(bound["execution_id"], fake_process)
+    try:
+        retry_response = client.post(
+            f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
+            json={"extra_cycles": 2},
+        )
+        assert retry_response.status_code == 409
+        assert "仍持有" in retry_response.json()["detail"]
+    finally:
+        service._forget_cli_process(bound["execution_id"], fake_process)
+
+
+def test_run_retry_allows_stale_running_heartbeat(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    monkeypatch.setattr(get_scheduler_service(), "start_execution_now", lambda execution_id: False)
+    monkeypatch.setattr(
+        type(get_execution_service()),
+        "_preflight_run_resume",
+        lambda self, run_index, payload: {"preview_path": "mock_resume_preview.json"},
+    )
+    run_root = _project_runs_root() / "bound_retry_stale_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+    _write_json(run_root / "_meta" / "process.json", {
+        "execution_id": bound["execution_id"],
+        "trigger_task_id": bound["task_id"],
+        "pid": 4242,
+        "pod_id": "old-pod",
+        "status": "running",
+        "heartbeat_at": "2026-04-28T01:02:03+08:00",
+    })
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "running"
+        execution.status = "running"
+        execution.process_status = "running"
+        trigger.status = "running"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+    retry_response = client.post(
+        f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
+        json={"extra_cycles": 2},
+    )
+    assert retry_response.status_code == 202
+    with get_db_session() as db:
+        old_execution = db.get(WorkflowExecution, bound["execution_id"])
+        assert old_execution is not None and old_execution.status == "failed"
+
+
+def test_run_retry_preflight_error_returns_frontend_message(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_retry_preflight_error_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        before_count = db.query(WorkflowExecution).filter(WorkflowExecution.trigger_task_id == bound["task_id"]).count()
+
+    retry_response = client.post(
+        f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
+        json={"extra_cycles": 2},
+    )
+    assert retry_response.status_code == 422
+    assert "resume preflight failed" in retry_response.json()["detail"]
+    with get_db_session() as db:
+        after_count = db.query(WorkflowExecution).filter(WorkflowExecution.trigger_task_id == bound["task_id"]).count()
+    assert after_count == before_count
 
 
 def test_run_cancel_active_run_signals_bound_process(service_config_path):
@@ -540,6 +635,11 @@ def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypat
     client = TestClient(app)
     run_root = _project_runs_root() / "bound_resume_cli_20260508_010203"
     bound = _create_execution_bound_run(client, run_root)
+    monkeypatch.setattr(
+        type(get_execution_service()),
+        "_preflight_run_resume",
+        lambda self, run_index, payload: {"preview_path": "mock_resume_preview.json"},
+    )
 
     with get_db_session() as db:
         run_index = db.get(RunIndex, bound["run_id"])

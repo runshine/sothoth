@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import inspect
+import json
 import os
 import posixpath
 import shutil
@@ -78,6 +78,7 @@ def _project_ids(principal: dict) -> set[str]:
 
 
 _ACTIVE_RUN_INDEX_STATUSES = {"pending", "queued", "running", "cancel_requested", "delete_requested"}
+_QUEUE_RUN_INDEX_STATUSES = {"pending", "queued"}
 _RETRYABLE_RUN_INDEX_STATUSES = {
     "cancelled",
     "failed",
@@ -390,7 +391,6 @@ class ExecutionService:
             status=execution.status,
             run_id=run_id,
             owner_pod_id=execution.owner_pod_id,
-            lease_expires_at=execution.lease_expires_at,
             process_pid=execution.process_pid,
             process_host=execution.process_host,
             process_status=execution.process_status,
@@ -442,6 +442,138 @@ class ExecutionService:
         if process is not None:
             self._forget_cli_process(execution_id, process)
         return None
+
+    def _process_heartbeat_stale_after_seconds(self) -> int:
+        cfg = get_config()
+        scheduler_seconds = max(int(getattr(cfg.scheduler, "heartbeat_interval_seconds", 0) or 0) * 3, 0)
+        cancel_poll_seconds = max(int(getattr(cfg.service, "execution_cancel_check_interval_seconds", 0) or 0) * 5, 0)
+        return max(scheduler_seconds, cancel_poll_seconds, 30)
+
+    def _parse_process_timestamp(self, value: Any) -> datetime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                return parsed.astimezone(UTC_PLUS_8).replace(tzinfo=None)
+            return parsed
+        except ValueError:
+            return None
+
+    def _read_run_process_file(self, run_root: str | Path | None) -> dict[str, Any]:
+        if not run_root:
+            return {}
+        path = Path(run_root) / "_meta" / "process.json"
+        if not path.is_file():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"read_error": f"failed to read {path}"}
+        return payload if isinstance(payload, dict) else {}
+
+    def _write_cli_process_file(
+        self,
+        *,
+        execution: WorkflowExecution,
+        trigger: TriggerTask,
+        cmd: list[str],
+        process: subprocess.Popen,
+        status_text: str,
+        return_code: int | None = None,
+    ) -> None:
+        if not execution.workspace_root:
+            return
+        current = now_local()
+        payload: dict[str, Any] = {
+            "execution_id": execution.id,
+            "trigger_task_id": trigger.id,
+            "pid": process.pid,
+            "pod_id": get_config().scheduler.pod_id,
+            "host_name": get_config().scheduler.host_name,
+            "command": cmd,
+            "command_display": _command_display(cmd),
+            "started_at": isoformat_local(execution.process_started_at or current) or "",
+            "status": status_text,
+            "updated_at": isoformat_local(current) or "",
+        }
+        if status_text in {"running", "timeout_requested", "stop_requested", "delete_requested"}:
+            payload["heartbeat_at"] = isoformat_local(current) or ""
+        if execution.process_finished_at:
+            payload["finished_at"] = isoformat_local(execution.process_finished_at) or ""
+        if return_code is not None:
+            payload["return_code"] = return_code
+        write_json(Path(execution.workspace_root) / "_meta" / "process.json", payload)
+
+    def _resume_command_payload_from_plan(self, *, plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+        argv, _ = self._build_dataflow_cli_argv(
+            plan=plan,
+            config_payload={},
+            request=request,
+            compiled_config={},
+            runtime_overrides={},
+        )
+        command = [sys.executable, str(Path(__file__).resolve().parents[2] / "run_vuln_scan.py"), *argv]
+        return {
+            "argv": argv,
+            "command": command,
+            "command_display": _command_display(command),
+        }
+
+    def _task_dataflow_cli_metadata(self, trigger: TriggerTask | None) -> dict[str, Any]:
+        if trigger is None:
+            return {}
+        try:
+            manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        except Exception:
+            return {}
+        for task in manifest.tasks:
+            metadata = dict(task.metadata or {})
+            cli_payload = metadata.get("dataflow_cli")
+            if isinstance(cli_payload, dict):
+                return dict(cli_payload)
+        return {}
+
+    def _command_payload_is_resume(self, payload: dict[str, Any]) -> bool:
+        command_items = payload.get("command") if isinstance(payload.get("command"), list) else []
+        argv_items = payload.get("argv") if isinstance(payload.get("argv"), list) else []
+        text = " ".join(str(item) for item in [*command_items, *argv_items, payload.get("command_display") or ""])
+        return "--resume-run-dir" in text or str(payload.get("mode") or "").lower() == "resume"
+
+    def _retry_command_display(
+        self,
+        db: Session,
+        *,
+        run_index,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+    ) -> str:
+        candidates: list[dict[str, Any]] = []
+        task_payload = self._task_dataflow_cli_metadata(trigger)
+        if task_payload:
+            candidates.append(task_payload)
+        if execution is not None:
+            event_payload = self._execution_command_payload(db, execution.id)
+            if event_payload:
+                candidates.append(event_payload)
+        process_payload = self._read_run_process_file(run_index.run_root_path)
+        if process_payload:
+            candidates.append(process_payload)
+        raw_summary = dict(run_index.raw_summary_json or {})
+        raw_cli = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
+        if raw_cli:
+            candidates.append(dict(raw_cli))
+        for payload in candidates:
+            if not self._command_payload_is_resume(payload):
+                continue
+            display = str(payload.get("command_display") or "").strip()
+            if display:
+                return display
+            command = payload.get("command") if isinstance(payload.get("command"), list) else payload.get("argv")
+            if isinstance(command, list) and command:
+                return _command_display([str(item) for item in command])
+        return ""
 
     def _signal_local_cli_process(
         self,
@@ -989,6 +1121,11 @@ class ExecutionService:
 
         model = str(config_payload.get("model") or request.get("model") or "").strip()
         review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
+        max_cycles = first_present_int(config_payload.get("max_review_cycles"), request.get("max_review_cycles"), default=0)
+        timeout_max_retries = first_present_int(config_payload.get("timeout_max_retries"), request.get("timeout_max_retries"), default=3)
+        timeout_retry_interval_seconds = first_present_int(config_payload.get("timeout_retry_interval_seconds"), request.get("timeout_retry_interval_seconds"), default=30)
+        result_review_concurrency = first_present_int(config_payload.get("result_review_concurrency"), request.get("result_review_concurrency"), default=3)
+
         if self._dataflow_cli_config_requires_file(request=request, runtime_overrides=runtime_overrides):
             fd, temp_config_path = tempfile.mkstemp(prefix="secflow-dataflow-cli-", suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -998,12 +1135,10 @@ class ExecutionService:
 
                 json.dump(json_payload, handle, ensure_ascii=False, indent=2)
             argv.extend(["--config", temp_config_path])
+            argv.extend(["--timeout-max-retries", str(max(timeout_max_retries, 1))])
+            argv.extend(["--timeout-retry-interval-seconds", str(max(timeout_retry_interval_seconds, 0))])
             return argv, temp_config_path
 
-        max_cycles = first_present_int(config_payload.get("max_review_cycles"), request.get("max_review_cycles"), default=0)
-        timeout_max_retries = first_present_int(config_payload.get("timeout_max_retries"), request.get("timeout_max_retries"), default=3)
-        timeout_retry_interval_seconds = first_present_int(config_payload.get("timeout_retry_interval_seconds"), request.get("timeout_retry_interval_seconds"), default=30)
-        result_review_concurrency = first_present_int(config_payload.get("result_review_concurrency"), request.get("result_review_concurrency"), default=3)
         if model:
             argv.extend(["--model", model])
         if max_cycles > 0:
@@ -1246,7 +1381,8 @@ class ExecutionService:
         execution.finished_at = now
         execution.output_manifest_path = output_manifest_path
         execution.output_task_count = output_task_count
-        execution.lease_expires_at = now
+        execution.lease_token = None
+        execution.lease_expires_at = None
         execution.current_stage_id = None
         if execution.process_status in {"running", "stop_requested", "delete_requested"}:
             execution.process_status = "exited"
@@ -1428,6 +1564,11 @@ class ExecutionService:
             request=request,
             execution_id=execution_id,
         )
+        if plan.get("mode") == "resume" or self._is_dataflow_cli_resume_request(request):
+            plan = {
+                **plan,
+                **self._resume_command_payload_from_plan(plan=plan, request=request),
+            }
         metadata["dataflow_cli"] = plan
         self._write_dataflow_cli_task_preview(plan)
         task.task_md_path = plan["task_md_path"]
@@ -1899,7 +2040,12 @@ class ExecutionService:
 
     def list_runs(self, db: Session, principal: dict, *, project_id: str) -> list[dict[str, Any]]:
         self._ensure_project_access(principal, project_id)
-        return get_run_index_service().list_runs(db, project_id)
+        payloads = get_run_index_service().list_runs(db, project_id)
+        enriched: list[dict[str, Any]] = []
+        for payload in payloads:
+            run_index = db.get(RunIndex, payload.get("run_id"))
+            enriched.append(self._enrich_run_payload(db, run_index, payload) if run_index is not None else payload)
+        return enriched
 
     def _run_index_resolve_response(self, run_index: RunIndex) -> dict[str, Any]:
         return {
@@ -1962,7 +2108,9 @@ class ExecutionService:
 
     def get_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
-        return get_run_index_service().get_run_detail(db, run_index)
+        payload = get_run_index_service().get_run_detail(db, run_index)
+        db.refresh(run_index)
+        return self._enrich_run_payload(db, run_index, payload)
 
     def get_run_cycle(self, db: Session, run_index_id: str, cycle: int, principal: dict) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
@@ -1996,6 +2144,205 @@ class ExecutionService:
         if trigger is not None and (execution is None or execution.trigger_task_id != trigger.id):
             execution = self._latest_execution_for_trigger(db, trigger.id)
         return trigger, execution
+
+    def _run_process_state(
+        self,
+        db: Session,
+        run_index,
+        *,
+        trigger: TriggerTask | None = None,
+        execution: WorkflowExecution | None = None,
+    ) -> dict[str, Any]:
+        trigger, execution = (trigger, execution) if (trigger is not None or execution is not None) else self._linked_run_index_runtime(db, run_index)
+        checked_at = now_local()
+        stale_after = self._process_heartbeat_stale_after_seconds()
+        base: dict[str, Any] = {
+            "checked_at": isoformat_local(checked_at) or "",
+            "stale_after_seconds": stale_after,
+            "run_status": str(run_index.status or ""),
+            "trigger_task_id": trigger.id if trigger is not None else run_index.linked_task_id,
+            "trigger_status": str(trigger.status or "") if trigger is not None else "",
+            "execution_id": execution.id if execution is not None else run_index.linked_execution_id,
+            "execution_status": str(execution.status or "") if execution is not None else "",
+            "process_status": str(execution.process_status or "") if execution is not None else "",
+            "can_retry": True,
+            "is_running": False,
+            "is_queued": False,
+            "reason": "未发现活跃 run_vuln_scan.py 进程，可以重试",
+            "source": "terminal_or_no_process",
+        }
+
+        run_status = str(run_index.status or "").strip().lower()
+        trigger_status = str(trigger.status or "").strip().lower() if trigger is not None else ""
+        execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
+        if run_status in _QUEUE_RUN_INDEX_STATUSES or trigger_status in _QUEUE_RUN_INDEX_STATUSES or execution_status in _QUEUE_RUN_INDEX_STATUSES:
+            base.update(
+                {
+                    "can_retry": False,
+                    "is_queued": True,
+                    "reason": "该 Run 已有 pending/queued 的执行或 resume 请求，不能重复重试",
+                    "source": "queued_execution",
+                }
+            )
+            return base
+
+        if execution is not None:
+            local_process = self._local_cli_process(execution.id)
+            if local_process is not None:
+                base.update(
+                    {
+                        "can_retry": False,
+                        "is_running": True,
+                        "pid": local_process.pid,
+                        "pod_id": get_config().scheduler.pod_id,
+                        "reason": "当前 Pod 仍持有 run_vuln_scan.py 进程，不能重试；如需停止请先取消 Run",
+                        "source": "local_process",
+                    }
+                )
+                return base
+
+        process_payload = self._read_run_process_file(run_index.run_root_path)
+        if process_payload:
+            heartbeat_at = self._parse_process_timestamp(
+                process_payload.get("heartbeat_at")
+                or process_payload.get("updated_at")
+                or process_payload.get("started_at")
+            )
+            heartbeat_age = int(max((checked_at - heartbeat_at).total_seconds(), 0)) if heartbeat_at else None
+            file_status = str(process_payload.get("status") or "").strip().lower()
+            base.update(
+                {
+                    "pid": process_payload.get("pid"),
+                    "pod_id": process_payload.get("pod_id") or "",
+                    "process_file_status": file_status,
+                    "process_file_execution_id": process_payload.get("execution_id") or "",
+                    "heartbeat_at": process_payload.get("heartbeat_at") or process_payload.get("updated_at") or "",
+                    "heartbeat_age_seconds": heartbeat_age,
+                }
+            )
+            if file_status in {"running", "timeout_requested", "stop_requested", "delete_requested"}:
+                if heartbeat_age is not None and heartbeat_age <= stale_after:
+                    base.update(
+                        {
+                            "can_retry": False,
+                            "is_running": True,
+                            "reason": "共享心跳显示 run_vuln_scan.py 仍在运行，不能重试；如需停止请先取消 Run",
+                            "source": "process_file_heartbeat",
+                        }
+                    )
+                    return base
+                base.update(
+                    {
+                        "can_retry": True,
+                        "is_running": False,
+                        "reason": "旧运行记录仍标记 active，但进程心跳已过期，可以通过 resume 重试",
+                        "source": "stale_process_heartbeat",
+                    }
+                )
+                return base
+
+        if run_status in _ACTIVE_RUN_INDEX_STATUSES or trigger_status in _ACTIVE_RUN_INDEX_STATUSES or execution_status in _ACTIVE_RUN_INDEX_STATUSES:
+            base.update(
+                {
+                    "can_retry": True,
+                    "is_running": False,
+                    "reason": "旧运行记录仍标记 active，但未发现本地进程或有效心跳，可以通过 resume 重试",
+                    "source": "stale_active_record",
+                }
+            )
+            return base
+
+        return base
+
+    def _enrich_run_payload(self, db: Session, run_index, payload: dict[str, Any]) -> dict[str, Any]:
+        trigger, execution = self._linked_run_index_runtime(db, run_index)
+        enriched = dict(payload)
+        enriched["process_state"] = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+        retry_command = self._retry_command_display(db, run_index=run_index, trigger=trigger, execution=execution)
+        enriched["retry_command_display"] = retry_command or None
+        return enriched
+
+    def _mark_stale_runtime_exited(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        message: str,
+    ) -> None:
+        now = now_local()
+        if execution is not None and self._run_index_status_is_active(execution.status):
+            execution.status = "failed"
+            execution.message = message
+            execution.finished_at = now
+            execution.process_status = "exited"
+            execution.process_finished_at = now
+            execution.lease_token = None
+            execution.lease_expires_at = None
+            db.add(execution)
+        if trigger is not None and self._run_index_status_is_active(trigger.status):
+            trigger.status = "failed"
+            trigger.message = message
+            trigger.finished_at = now
+            db.add(trigger)
+        db.flush()
+
+    def _preflight_run_resume(self, *, run_index, payload: RunRetryRequest) -> dict[str, Any]:
+        run_dir = Path(run_index.run_root_path)
+        if not run_dir.is_dir():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run directory not found")
+        try:
+            import run_vuln_scan as launcher
+            from app.pi_vuln_core.resume import build_resume_plan, rebuild_review_state
+
+            config_obj, plan = build_resume_plan(run_dir)
+            review_state = rebuild_review_state(plan.atomic_work_dir)
+            diagnostics = launcher._collect_resume_diagnostics(  # type: ignore[attr-defined]
+                plan.atomic_work_dir,
+                review_state=review_state,
+            )
+            current_model, current_thinking = launcher._extract_worker_runtime(config_obj)  # type: ignore[attr-defined]
+            display_model = self._normalize_model_override(model=payload.model, provider=payload.provider) if payload.model else current_model
+            display_thinking = launcher.resolve_profile_thinking(  # type: ignore[attr-defined]
+                display_model,
+                launcher._extract_review_profile_from_config_obj(config_obj),  # type: ignore[attr-defined]
+            ) or current_thinking
+            preview_path = launcher._write_resume_preview_file(  # type: ignore[attr-defined]
+                run_dir=str(run_dir.resolve()),
+                atomic_work_dir=plan.atomic_work_dir,
+                current_status=plan.current_status or "unknown",
+                completed_cycles=plan.completed_cycles,
+                extra_cycles=payload.extra_cycles,
+                worker_session_id=plan.worker_session_id,
+                timeout_detected=plan.timeout_detected,
+                timeout_call_dir=plan.timeout_call_dir,
+                timeout_agent_id=plan.timeout_agent_id,
+                timeout_error=plan.timeout_error,
+                resume_state=plan.resume_state,
+                checkpoint_cycle=plan.checkpoint_cycle,
+                checkpoint_phase=plan.checkpoint_phase,
+                checkpoint_step_key=plan.checkpoint_step_key,
+                checkpoint_status=plan.checkpoint_status,
+                model_display=launcher._format_model_display(display_model),  # type: ignore[attr-defined]
+                thinking=display_thinking,
+                task_file=plan.task_file,
+                diagnostics=diagnostics,
+            )
+            return {
+                "preview_path": preview_path,
+                "atomic_work_dir": plan.atomic_work_dir,
+                "current_status": plan.current_status,
+                "completed_cycles": plan.completed_cycles,
+                "extra_cycles": payload.extra_cycles,
+                "resume_total_cycle_limit": plan.completed_cycles + payload.extra_cycles,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"resume preflight failed: {exc}",
+            ) from exc
 
     def _wait_until_execution_inactive(self, db: Session, execution_id: str, *, timeout_seconds: float) -> bool:
         deadline = time.monotonic() + max(timeout_seconds, 0.0)
@@ -2288,20 +2635,25 @@ class ExecutionService:
         payload: RunRetryRequest,
     ) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
+        run_index = get_run_index_service().refresh_run_index(db, run_index)
         run_root = Path(run_index.run_root_path)
         if not run_root.is_dir():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run directory not found")
-        status_value = str(run_index.status or "").strip().lower()
-        if status_value in _ACTIVE_RUN_INDEX_STATUSES:
+
+        trigger, latest_execution = self._linked_run_index_runtime(db, run_index)
+        process_state = self._run_process_state(db, run_index, trigger=trigger, execution=latest_execution)
+        if not bool(process_state.get("can_retry")):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="run is still active; cancel it and wait until terminal before retry",
+                detail=str(process_state.get("reason") or "run_vuln_scan.py is still active; cannot retry"),
             )
-        if status_value not in _RETRYABLE_RUN_INDEX_STATUSES:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"run status is not retryable: {status_value or 'unknown'}",
-            )
+        preflight = self._preflight_run_resume(run_index=run_index, payload=payload)
+        self._mark_stale_runtime_exited(
+            db,
+            trigger=trigger,
+            execution=latest_execution,
+            message="previous run_vuln_scan.py process is no longer active; retrying via resume",
+        )
 
         definition = self._select_run_index_definition(db, run_index, principal)
         workflow_service = get_workflow_service()
@@ -2351,6 +2703,7 @@ class ExecutionService:
                 "project_id": run_index.project_id,
                 "run_root_path": run_index.run_root_path,
                 "extra_cycles": payload.extra_cycles,
+                "resume_preflight": preflight,
             },
         )
         return self._run_mutation_response(
@@ -2501,21 +2854,6 @@ class ExecutionService:
             increment_retry_count=False,
         )
 
-    def requeue_scan_task(self, db: Session, task_id: str, principal: dict, *, authorization_token: str | None = None) -> ScanTaskResponse:
-        trigger = self._trigger_or_404(db, task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        latest_execution = self._latest_execution_for_trigger(db, trigger.id)
-        if latest_execution is None or latest_execution.status not in {"orphaned", "failed", "cancelled"}:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task is not requeueable")
-        return self._create_retry_attempt_for_task(
-            db,
-            trigger=trigger,
-            principal=principal,
-            authorization_token=authorization_token,
-            recovery_reason="manual requeue requested",
-            increment_retry_count=False,
-        )
-
     def update_scan_task_priority(self, db: Session, task_id: str, principal: dict, priority: int) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
@@ -2555,46 +2893,6 @@ class ExecutionService:
         db.refresh(event)
         return event
 
-    def auto_requeue_orphaned_execution(self, db: Session, execution_id: str, *, reason: str) -> bool:
-        execution = self._execution_or_404(db, execution_id)
-        trigger = self._trigger_or_404(db, execution.trigger_task_id)
-        if execution.status != "orphaned":
-            execution.status = "orphaned"
-            execution.message = reason
-            execution.finished_at = now_local()
-            db.add(execution)
-        if trigger.retry_count >= trigger.max_retry_count:
-            trigger.status = "failed"
-            trigger.finished_at = now_local()
-            trigger.message = "max auto retry reached after orphaned execution"
-            db.add(trigger)
-            db.commit()
-            self.record_event(
-                db,
-                execution_id=execution.id,
-                event_type="execution_orphaned",
-                message=reason,
-                level="warning",
-            )
-            return False
-        system_principal = {"subject": "scheduler"}
-        self._create_retry_attempt_for_task(
-            db,
-            trigger=trigger,
-            principal=system_principal,
-            authorization_token=None,
-            recovery_reason=reason,
-            increment_retry_count=True,
-        )
-        self.record_event(
-            db,
-            execution_id=execution.id,
-            event_type="execution_orphaned",
-            message=reason,
-            level="warning",
-        )
-        return True
-
     def _invoke_run_vuln_scan_cli(
         self,
         *,
@@ -2630,20 +2928,13 @@ class ExecutionService:
         execution.process_finished_at = None
         db.add(execution)
         db.commit()
-        if execution.workspace_root:
-            write_json(
-                Path(execution.workspace_root) / "_meta" / "process.json",
-                {
-                    "execution_id": execution.id,
-                    "trigger_task_id": trigger.id,
-                    "pid": process.pid,
-                    "pod_id": get_config().scheduler.pod_id,
-                    "host_name": get_config().scheduler.host_name,
-                    "command": cmd,
-                    "started_at": now.isoformat(),
-                    "status": "running",
-                },
-            )
+        self._write_cli_process_file(
+            execution=execution,
+            trigger=trigger,
+            cmd=cmd,
+            process=process,
+            status_text="running",
+        )
         self.record_event(
             db,
             execution_id=execution.id,
@@ -2661,6 +2952,13 @@ class ExecutionService:
             timeout_seconds = int(execution_timeout_seconds or 0)
             while process.poll() is None:
                 time.sleep(max(1, int(get_config().service.execution_cancel_check_interval_seconds)))
+                self._write_cli_process_file(
+                    execution=execution,
+                    trigger=trigger,
+                    cmd=cmd,
+                    process=process,
+                    status_text="running",
+                )
                 db.expire(execution)
                 db.expire(trigger)
                 if timeout_seconds > 0 and time.monotonic() - started_monotonic >= timeout_seconds:
@@ -2671,6 +2969,13 @@ class ExecutionService:
                     db.add(trigger)
                     db.commit()
                     self._write_run_control_state(execution.workspace_root, status_text="timeout_requested", message=execution.message)
+                    self._write_cli_process_file(
+                        execution=execution,
+                        trigger=trigger,
+                        cmd=cmd,
+                        process=process,
+                        status_text="timeout_requested",
+                    )
                     try:
                         process.send_signal(signal.SIGINT)
                     except ProcessLookupError:
@@ -2689,6 +2994,13 @@ class ExecutionService:
                     execution.process_status = "delete_requested" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "stop_requested"
                     db.add(execution)
                     db.commit()
+                    self._write_cli_process_file(
+                        execution=execution,
+                        trigger=trigger,
+                        cmd=cmd,
+                        process=process,
+                        status_text=execution.process_status,
+                    )
                     try:
                         process.send_signal(signal.SIGINT)
                     except ProcessLookupError:
@@ -2712,21 +3024,14 @@ class ExecutionService:
                 execution.process_finished_at = now_local()
                 db.add(execution)
                 db.commit()
-                if execution.workspace_root:
-                    process_path = Path(execution.workspace_root) / "_meta" / "process.json"
-                    payload = {
-                        "execution_id": execution.id,
-                        "trigger_task_id": trigger.id,
-                        "pid": process.pid,
-                        "pod_id": get_config().scheduler.pod_id,
-                        "host_name": get_config().scheduler.host_name,
-                        "command": cmd,
-                        "started_at": execution.process_started_at.isoformat() if execution.process_started_at else "",
-                        "finished_at": execution.process_finished_at.isoformat() if execution.process_finished_at else "",
-                        "status": "exited",
-                        "return_code": process.returncode,
-                    }
-                    write_json(process_path, payload)
+                self._write_cli_process_file(
+                    execution=execution,
+                    trigger=trigger,
+                    cmd=cmd,
+                    process=process,
+                    status_text="exited",
+                    return_code=process.returncode,
+                )
             except Exception:
                 db.rollback()
 
@@ -2806,8 +3111,6 @@ class ExecutionService:
                 "execution": execution,
                 "trigger": trigger,
             }
-            if "execution_timeout_seconds" in inspect.signature(self._invoke_run_vuln_scan_cli).parameters:
-                invoke_kwargs["execution_timeout_seconds"] = definition.execution_timeout_seconds
             exit_code = self._invoke_run_vuln_scan_cli(**invoke_kwargs)
             db.refresh(execution)
             db.refresh(trigger)

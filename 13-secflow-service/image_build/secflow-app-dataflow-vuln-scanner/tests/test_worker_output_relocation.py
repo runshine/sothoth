@@ -144,7 +144,7 @@ def test_reconcile_results_after_rework_backs_up_removed_failed_results(tmp_path
     assert '"reason": "误报，已从最终结果删除"' in meta_text
 
 
-def test_reconcile_results_after_rework_auto_removes_explicitly_withdrawn_failed_results(tmp_path: Path):
+def test_reconcile_results_after_rework_keeps_explicitly_withdrawn_failed_results(tmp_path: Path):
     work_dir = tmp_path / "work"
     results_dir = work_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -176,15 +176,11 @@ def test_reconcile_results_after_rework_auto_removes_explicitly_withdrawn_failed
     executor = WorkerExecutor(agent_registry=None, recorder=None)  # type: ignore[arg-type]
     executor._reconcile_results_after_rework(ctx)
 
-    assert not (results_dir / "result_007.md").exists()
-    backup_dir = work_dir / "removed_results" / "cycle_002"
-    assert (backup_dir / "result_007.md").read_text(encoding="utf-8") == withdrawn_text
-    meta = json.loads((backup_dir / "result_007.json").read_text(encoding="utf-8"))
-    assert meta["original_filename"] == "result_007.md"
-    assert meta["reason"] == "底层问题不存在，报告应撤回"
+    assert (results_dir / "result_007.md").read_text(encoding="utf-8") == withdrawn_text
+    assert not (work_dir / "removed_results" / "cycle_002").exists()
 
 
-def test_reconcile_results_after_rework_relocates_chinese_retraction_variants(tmp_path: Path):
+def test_reconcile_results_after_rework_keeps_chinese_retraction_variants(tmp_path: Path):
     work_dir = tmp_path / "work"
     results_dir = work_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -214,11 +210,8 @@ def test_reconcile_results_after_rework_relocates_chinese_retraction_variants(tm
     executor = WorkerExecutor(agent_registry=None, recorder=None)  # type: ignore[arg-type]
     executor._reconcile_results_after_rework(ctx)
 
-    assert not (results_dir / "result_008.md").exists()
-    backup_dir = work_dir / "removed_results" / "cycle_003"
-    assert (backup_dir / "result_008.md").read_text(encoding="utf-8") == retraction
-    meta = json.loads((backup_dir / "result_008.json").read_text(encoding="utf-8"))
-    assert meta["lifecycle_status"] in {"withdrawn", "false_positive"}
+    assert (results_dir / "result_008.md").read_text(encoding="utf-8") == retraction
+    assert not (work_dir / "removed_results" / "cycle_003").exists()
 
 
 def test_relocate_misplaced_outputs_moves_supporting_docs_to_supporting_docs_dir(tmp_path: Path):

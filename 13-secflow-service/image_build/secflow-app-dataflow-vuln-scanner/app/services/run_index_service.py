@@ -28,6 +28,7 @@ from app.models.database import (
     run_source_hash,
 )
 from app.services.run_inspector import (
+    _session_runtime_metadata,
     inspect_cycle_detail,
     inspect_file,
     inspect_files,
@@ -362,6 +363,16 @@ def _run_index_is_active(record: RunIndex) -> bool:
 def _project_files_root(project_id: str) -> Path:
     config = get_config()
     return Path(config.fileserver_service.data_mount_path) / config.fileserver_service.project_files_dirname / str(project_id or "").strip()
+
+
+def _project_watch_path(project_id: str, absolute_path: str | Path) -> str:
+    try:
+        project_root = _project_files_root(project_id).resolve()
+        target = Path(absolute_path).resolve()
+        rel = target.relative_to(project_root)
+        return "/" + str(rel).replace("\\", "/")
+    except Exception:
+        return ""
 
 
 def _normalize_execution_request_root(root_path: str) -> Path:
@@ -1001,18 +1012,53 @@ class RunIndexService:
             .order_by(RunIndexSession.session_id.asc())
             .all()
         )
-        return [
-            {
-                "session_id": item.session_id,
-                "format": item.format,
-                "worker_id": item.worker_id,
-                "jsonl_path": item.jsonl_path,
-                "size": item.size,
-                "mtime": item.mtime,
-                "calls": list(item.calls_json or []),
-            }
-            for item in sessions
-        ]
+        rows: list[dict[str, Any]] = []
+        atomic = Path(run_index.atomic_work_path) if run_index.atomic_work_path else None
+        for item in sessions:
+            raw = dict(item.raw_json or {})
+            if item.format in {"jsonl", "hybrid"} and item.jsonl_path and "line_count" not in raw:
+                try:
+                    parsed_session = inspect_session_file(run_index.run_root_path, item.jsonl_path)
+                    raw["event_count"] = len(parsed_session.get("events") or [])
+                    raw["line_count"] = int(parsed_session.get("line_count") or 0)
+                    raw["warnings"] = list(parsed_session.get("warnings") or [])
+                except Exception:
+                    raw["event_count"] = 0
+                    raw["line_count"] = 0
+                    raw["warnings"] = ["会话文件解析失败"]
+            watch_project_path = str(raw.get("watch_project_path") or "")
+            if not watch_project_path and atomic and item.jsonl_path:
+                watch_project_path = _project_watch_path(run_index.project_id, atomic / item.jsonl_path)
+            runtime_meta: dict[str, Any] = {}
+            if item.format in {"jsonl", "hybrid"} and item.jsonl_path and (not raw.get("model") or not raw.get("thinking")):
+                try:
+                    session_file = (atomic / item.jsonl_path) if atomic else Path(run_index.run_root_path) / item.jsonl_path
+                    runtime_meta = _session_runtime_metadata(session_file.parent)
+                except Exception:
+                    runtime_meta = {}
+            rows.append(
+                {
+                    "session_id": item.session_id,
+                    "format": item.format,
+                    "worker_id": item.worker_id,
+                    "jsonl_path": item.jsonl_path,
+                    "size": item.size,
+                    "mtime": item.mtime,
+                    "event_count": int(raw.get("event_count") or 0),
+                    "line_count": int(raw.get("line_count") or 0),
+                    "warnings": list(raw.get("warnings") or []),
+                    "display_name": str(raw.get("display_name") or item.worker_id or item.session_id),
+                    "stage_group": str(raw.get("stage_group") or item.worker_id or "root"),
+                    "role_name": str(raw.get("role_name") or item.worker_id or ""),
+                    "watch_project_path": watch_project_path,
+                    "model": str(raw.get("model") or runtime_meta.get("model") or ""),
+                    "raw_model": str(raw.get("raw_model") or runtime_meta.get("raw_model") or raw.get("model") or runtime_meta.get("model") or ""),
+                    "provider": str(raw.get("provider") or runtime_meta.get("provider") or ""),
+                    "thinking": str(raw.get("thinking") or runtime_meta.get("thinking") or ""),
+                    "calls": list(item.calls_json or []),
+                }
+            )
+        return rows
 
     def list_run_files(self, db: Session, run_index: RunIndex, limit: int = 1200) -> list[dict[str, Any]]:
         run_index = self.refresh_run_index(db, run_index)

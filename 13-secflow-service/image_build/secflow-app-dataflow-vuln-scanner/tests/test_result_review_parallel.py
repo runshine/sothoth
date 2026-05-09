@@ -480,18 +480,16 @@ async def test_result_review_runtime_error_does_not_mark_report_failed(
     payload = json.loads(review_record.read_text(encoding="utf-8"))
     assert payload["parser_mode"] == "agent_error"
     assert payload["verdict"] == "ERROR"
-    assert "重试 3/3 次" in payload["feedback_detail"]
+    assert "review_runtime_retries" not in payload["feedback_detail"]
 
     runtime = registry.get("advisor-agent")
-    assert len(runtime.call_session_ids) == 4
-    assert len(set(runtime.call_session_ids)) == 4
-    assert runtime._sessions == {}
+    assert len(runtime.call_session_ids) == 1
 
     await registry.shutdown_all()
 
 
 @pytest.mark.asyncio
-async def test_result_review_runtime_timeout_retries_with_fresh_sessions(
+async def test_result_review_runtime_timeout_does_not_retry_by_default(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -528,24 +526,21 @@ async def test_result_review_runtime_timeout_retries_with_fresh_sessions(
 
     executor = ResultReviewExecutor(registry, ExecutionRecorder(str(tmp_path)))
     review_state = ReviewState()
-    all_passed, failed_items = await executor.execute(
-        advisors_cfg=[advisor],
-        task_file=str(task_file),
-        results_dir=str(results_dir),
-        work_dir=str(tmp_path),
-        cycle=1,
-        review_state=review_state,
-        parallel=False,
-        concurrency_limit=1,
-        advisor_sessions={},
-    )
-
-    assert all_passed is True
-    assert failed_items == []
+    with pytest.raises(ResultReviewFrameworkError):
+        await executor.execute(
+            advisors_cfg=[advisor],
+            task_file=str(task_file),
+            results_dir=str(results_dir),
+            work_dir=str(tmp_path),
+            cycle=1,
+            review_state=review_state,
+            parallel=False,
+            concurrency_limit=1,
+            advisor_sessions={},
+        )
 
     runtime = registry.get("advisor-agent")
-    assert runtime.call_session_ids == ["delay_1", "delay_2", "delay_3"]
-    assert runtime._sessions == {}
+    assert runtime.call_session_ids == ["delay_1"]
 
     review_record = (
         tmp_path
@@ -556,8 +551,8 @@ async def test_result_review_runtime_timeout_retries_with_fresh_sessions(
         / "result_fp_check.json"
     )
     payload = json.loads(review_record.read_text(encoding="utf-8"))
-    assert payload["passed"] is True
-    assert payload["parser_mode"] == "canonical_json"
+    assert payload["passed"] is False
+    assert payload["parser_mode"] == "agent_error"
 
     await registry.shutdown_all()
 
@@ -571,7 +566,7 @@ def test_run_vuln_scan_generate_config_enables_parallel_result_review(tmp_path: 
     assert config["global"]["parallel_result_review"] is True
     assert config["global"]["parallel_result_review_limit"] == 3
     advisor_runtime = config["agents"][1]["runtime_config"]
-    assert advisor_runtime["advisor_runtime_retries"] == 3
+    assert advisor_runtime["advisor_runtime_retries"] == 0
 
 
 def test_run_vuln_scan_generate_config_accepts_custom_result_review_concurrency(tmp_path: Path) -> None:

@@ -52,7 +52,7 @@ class WorkflowDefinition(Base):
     enabled = Column(Boolean, nullable=False, default=True)
     max_concurrency = Column(Integer, nullable=False, default=1)
     priority_default = Column(Integer, nullable=False, default=100)
-    max_retry_count = Column(Integer, nullable=False, default=3)
+    max_retry_count = Column(Integer, nullable=False, default=0)
     workspace_base_dir = Column(String(512))
     execution_timeout_seconds = Column(Integer, nullable=False, default=0)
     created_by = Column(String(128), nullable=False)
@@ -95,7 +95,7 @@ class TriggerTask(Base):
     status = Column(String(32), nullable=False, default="pending")
     submitted_by = Column(String(128), nullable=False)
     retry_count = Column(Integer, nullable=False, default=0)
-    max_retry_count = Column(Integer, nullable=False, default=3)
+    max_retry_count = Column(Integer, nullable=False, default=0)
     latest_execution_id = Column(String(64), nullable=True)
     started_at = Column(DateTime)
     finished_at = Column(DateTime)
@@ -391,7 +391,6 @@ INDEX_DEFINITIONS = [
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_project", "CREATE INDEX ix_dfvs_exec_project ON {table} (project_id)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_status", "CREATE INDEX ix_dfvs_exec_status ON {table} (status)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_owner", "CREATE INDEX ix_dfvs_exec_owner ON {table} (owner_pod_id)"),
-    (WorkflowExecution.__tablename__, "ix_dfvs_exec_lease", "CREATE INDEX ix_dfvs_exec_lease ON {table} (lease_expires_at)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_def_status", "CREATE INDEX ix_dfvs_exec_def_status ON {table} (workflow_definition_id, status)"),
     (WorkflowExecution.__tablename__, "ux_dfvs_exec_task_attempt", "CREATE UNIQUE INDEX ux_dfvs_exec_task_attempt ON {table} (trigger_task_id, attempt_no)"),
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_exec", "CREATE INDEX ix_dfvs_event_exec ON {table} (execution_id)"),
@@ -817,7 +816,7 @@ def run_auto_migrations() -> None:
         (tables["workflow_definition"], "template_kind", f"ALTER TABLE {tables['workflow_definition']} ADD COLUMN template_kind VARCHAR(64) NOT NULL DEFAULT 'vuln_scan_default'"),
         (tables["workflow_definition"], "config_payload_json", f"ALTER TABLE {tables['workflow_definition']} ADD COLUMN config_payload_json {_column_sql(dialect, 'JSON')} NULL"),
         (tables["workflow_definition"], "is_default", f"ALTER TABLE {tables['workflow_definition']} ADD COLUMN is_default BOOLEAN NOT NULL DEFAULT FALSE"),
-        (tables["workflow_definition"], "max_retry_count", f"ALTER TABLE {tables['workflow_definition']} ADD COLUMN max_retry_count INTEGER NOT NULL DEFAULT 3"),
+        (tables["workflow_definition"], "max_retry_count", f"ALTER TABLE {tables['workflow_definition']} ADD COLUMN max_retry_count INTEGER NOT NULL DEFAULT 0"),
         (tables["workflow_definition_version"], "config_payload_json", f"ALTER TABLE {tables['workflow_definition_version']} ADD COLUMN config_payload_json {_column_sql(dialect, 'JSON')} NULL"),
         (tables["workflow_definition_version"], "compiled_config_json", f"ALTER TABLE {tables['workflow_definition_version']} ADD COLUMN compiled_config_json {_column_sql(dialect, 'JSON')} NULL"),
         (tables["trigger_task"], "workflow_definition_version_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN workflow_definition_version_id VARCHAR(64) NULL"),
@@ -830,7 +829,7 @@ def run_auto_migrations() -> None:
         (tables["trigger_task"], "parent_stage_item_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_stage_item_id VARCHAR(64) NULL"),
         (tables["trigger_task"], "parent_stage_item_key", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_stage_item_key VARCHAR(255) NULL"),
         (tables["trigger_task"], "retry_count", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"),
-        (tables["trigger_task"], "max_retry_count", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN max_retry_count INTEGER NOT NULL DEFAULT 3"),
+        (tables["trigger_task"], "max_retry_count", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN max_retry_count INTEGER NOT NULL DEFAULT 0"),
         (tables["trigger_task"], "latest_execution_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN latest_execution_id VARCHAR(64) NULL"),
         (tables["workflow_execution"], "workflow_definition_version_id", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN workflow_definition_version_id VARCHAR(64) NULL"),
         (tables["workflow_execution"], "attempt_no", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 1"),
@@ -874,7 +873,7 @@ def run_auto_migrations() -> None:
             if _column_exists(inspector, tables['workflow_definition'], 'max_retry_count'):
                 connection.execute(text(
                     f"UPDATE {tables['workflow_definition']} "
-                    "SET max_retry_count = 3 WHERE max_retry_count IS NULL OR max_retry_count < 0"
+                    "SET max_retry_count = 0 WHERE max_retry_count IS NULL OR max_retry_count < 0"
                 ))
 
         if tables["workflow_definition_version"] in inspector.get_table_names():

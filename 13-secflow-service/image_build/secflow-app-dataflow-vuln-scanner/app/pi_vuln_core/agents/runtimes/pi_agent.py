@@ -350,6 +350,22 @@ class PiAgentRuntime(BaseAgentRuntime):
             return default
         return parsed if parsed >= 0 else default
 
+    def _runtime_bool(self, key: str, default: bool = True) -> bool:
+        value = self.runtime_config.get(key)
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        return default
+
     @staticmethod
     async def _terminate_process(proc, *, grace_seconds: float = 5.0) -> None:
         if proc is None or getattr(proc, "returncode", None) is not None:
@@ -1226,7 +1242,13 @@ class PiAgentRuntime(BaseAgentRuntime):
             call_dir=call_dir,
             command=command_display(cmd_args),
         )
-        await self._rpc_send(proc, {"type": "set_auto_retry", "enabled": True})
+        await self._rpc_send(
+            proc,
+            {
+                "type": "set_auto_retry",
+                "enabled": self._runtime_bool("pi_auto_retry", True),
+            },
+        )
         return proc
 
     async def _execute_once_rpc(

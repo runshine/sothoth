@@ -642,6 +642,7 @@ async def test_pi_agent_runtime_rpc_timeout_retry_resends_to_same_process_after_
     call_dir = next((tmp_path / "sessions" / "rpc_retry_session" / "calls").iterdir())
     response_payload = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
     assert response_payload["timeout_retry_interval_seconds"] == 0.25
+    assert response_payload["timeout_max_retries"] == 2
     assert response_payload["attempts"][0]["retry_kind"] == "pi_timeout_rpc_resend_same_process"
     assert response_payload["attempts"][0]["rpc_process_preserved"] is True
     assert response_payload["attempts"][0]["process_restarted"] is False

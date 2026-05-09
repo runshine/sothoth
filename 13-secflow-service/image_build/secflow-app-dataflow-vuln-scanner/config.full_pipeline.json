@@ -74,7 +74,7 @@
         "api_retry_delay": 10,
         "pi_max_retries": 0,
         "pi_retry_delay": 10,
-        "advisor_runtime_retries": 3,
+        "advisor_runtime_retries": 0,
         "max_internal_turns": 0,
         "rpc_stdout_trace_bytes": 4194304,
         "transport": "rpc",

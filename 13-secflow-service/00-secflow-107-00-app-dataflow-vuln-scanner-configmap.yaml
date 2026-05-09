@@ -73,7 +73,7 @@ data:
       workspace_base_dir: "/data/files"
       default_execution_timeout_seconds: 0
       execution_cancel_check_interval_seconds: 1
-      trigger_retry_limit: 3
+      trigger_retry_limit: 0
       public_api_prefix: "/api/dataflow-vuln-scanner"
       default_entry_task_type: "package_list"
       default_artifact_subdir: "assets"
@@ -86,7 +86,6 @@ data:
       poll_interval_seconds: 2
       heartbeat_interval_seconds: 5
       worker_timeout_seconds: 20
-      lease_duration_seconds: 30
       cleanup_interval_seconds: 10
 
     logging:

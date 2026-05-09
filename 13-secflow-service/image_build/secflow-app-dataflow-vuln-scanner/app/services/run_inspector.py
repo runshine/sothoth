@@ -232,6 +232,307 @@ def _find_atomic_work_dir(run_dir: Path) -> Path | None:
     return None
 
 
+_SESSION_THINKING_LEVEL_MAP = {
+    "off": "off",
+    "minimal": "minimal",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "x-high": "xhigh",
+    "xhigh": "xhigh",
+}
+
+
+def _nested_dict(value: dict[str, Any], key: str) -> dict[str, Any]:
+    nested = value.get(key)
+    return nested if isinstance(nested, dict) else {}
+
+
+def _first_string(*values: Any) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if value is not None and not isinstance(value, (dict, list, tuple, set)):
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
+def _nested_sdk_specific(*records: dict[str, Any]) -> dict[str, Any]:
+    for record in records:
+        sdk = _nested_dict(record, "sdk_specific")
+        if sdk:
+            return sdk
+        runtime = _nested_dict(record, "runtime_config")
+        runtime_sdk = _nested_dict(runtime, "sdk_specific")
+        if runtime_sdk:
+            return runtime_sdk
+    return {}
+
+
+def _parse_session_message_parts(content: Any) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    if isinstance(content, str):
+        parts.append({"type": "text", "text": content})
+        return parts
+    if not isinstance(content, list):
+        return parts
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        part_type = str(item.get("type") or "")
+        if part_type == "text":
+            parts.append({"type": "text", "text": item.get("text", "")})
+        elif part_type == "thinking":
+            parts.append({"type": "thinking", "text": item.get("thinking", item.get("text", ""))})
+        elif part_type == "toolCall":
+            parts.append(
+                {
+                    "type": "toolCall",
+                    "name": item.get("name", ""),
+                    "id": item.get("id", ""),
+                    "arguments": item.get("arguments", {}),
+                }
+            )
+        elif part_type == "toolResult":
+            parts.append({"type": "toolResult", "text": item.get("text", "")})
+        else:
+            parts.append({"type": "unknown", "detail": json.dumps(item, ensure_ascii=False)[:200]})
+    return parts
+
+
+def _map_session_jsonl_object(obj: dict[str, Any], raw_line: str, line_no: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    event_type = str(obj.get("type") or "")
+    timestamp = str(obj.get("timestamp") or "")
+    payload = _nested_dict(obj, "payload")
+    data = _nested_dict(obj, "data")
+    config = _nested_dict(obj, "config")
+    metadata = _nested_dict(obj, "metadata")
+    options = _nested_dict(obj, "options")
+    settings = _nested_dict(obj, "settings")
+    message = obj.get("message", {})
+    if not isinstance(message, dict):
+        message = {}
+    sdk = _nested_sdk_specific(obj, payload, data, config, metadata, options, settings)
+    model_provider = _first_string(
+        obj.get("provider"),
+        obj.get("modelProvider"),
+        obj.get("model_provider"),
+        payload.get("provider"),
+        data.get("provider"),
+        config.get("provider"),
+        metadata.get("provider"),
+        options.get("provider"),
+        settings.get("provider"),
+        message.get("provider"),
+        sdk.get("provider"),
+    )
+    model_id = _first_string(
+        obj.get("modelId"),
+        obj.get("modelID"),
+        obj.get("model_id"),
+        obj.get("model"),
+        obj.get("modelName"),
+        obj.get("model_name"),
+        payload.get("modelId"),
+        payload.get("model_id"),
+        payload.get("model"),
+        data.get("modelId"),
+        data.get("model_id"),
+        data.get("model"),
+        config.get("model"),
+        metadata.get("modelId"),
+        metadata.get("model_id"),
+        metadata.get("model"),
+        options.get("modelId"),
+        options.get("model_id"),
+        options.get("model"),
+        settings.get("modelId"),
+        settings.get("model_id"),
+        settings.get("model"),
+        message.get("modelId"),
+        message.get("model_id"),
+        message.get("model"),
+        sdk.get("model"),
+    )
+    thinking_level = _first_string(
+        obj.get("thinkingLevel"),
+        obj.get("thinking_level"),
+        obj.get("thinking"),
+        obj.get("reasoningEffort"),
+        obj.get("reasoning_effort"),
+        obj.get("level"),
+        payload.get("thinkingLevel"),
+        payload.get("thinking_level"),
+        payload.get("thinking"),
+        payload.get("reasoning_effort"),
+        payload.get("level"),
+        data.get("thinkingLevel"),
+        data.get("thinking_level"),
+        data.get("thinking"),
+        data.get("reasoning_effort"),
+        data.get("level"),
+        config.get("thinkingLevel"),
+        config.get("thinking_level"),
+        config.get("thinking"),
+        config.get("reasoning_effort"),
+        config.get("level"),
+        metadata.get("thinkingLevel"),
+        metadata.get("thinking_level"),
+        metadata.get("thinking"),
+        metadata.get("reasoning_effort"),
+        metadata.get("level"),
+        options.get("thinkingLevel"),
+        options.get("thinking_level"),
+        options.get("thinking"),
+        options.get("reasoning_effort"),
+        options.get("level"),
+        settings.get("thinkingLevel"),
+        settings.get("thinking_level"),
+        settings.get("thinking"),
+        settings.get("reasoning_effort"),
+        settings.get("level"),
+        message.get("thinkingLevel"),
+        message.get("thinking_level"),
+        message.get("thinking"),
+        message.get("reasoning_effort"),
+        message.get("level"),
+        sdk.get("thinking"),
+        sdk.get("reasoning_effort"),
+        sdk.get("level"),
+    )
+    if event_type == "session":
+        return {
+            "id": obj.get("id", ""),
+            "version": obj.get("version", ""),
+            "timestamp": timestamp,
+            "cwd": obj.get("cwd", ""),
+            "provider": model_provider,
+            "model": model_id,
+            "thinking": thinking_level,
+        }, None
+    if event_type in {"model_change", "model", "model_changed", "set_model"} or (model_id and not event_type.startswith("message")):
+        return None, {
+            "type": "model_change",
+            "line": line_no,
+            "event_index": line_no,
+            "timestamp": timestamp,
+            "display_timestamp": timestamp,
+            "provider": model_provider,
+            "modelId": model_id,
+            "raw_line": raw_line,
+        }
+    if event_type in {"thinking_level_change", "thinking_level", "thinking", "reasoning_effort_change", "reasoning_effort"} or (thinking_level and not event_type.startswith("message")):
+        level = thinking_level
+        return None, {
+            "type": "thinking_level_change",
+            "line": line_no,
+            "event_index": line_no,
+            "timestamp": timestamp,
+            "display_timestamp": timestamp,
+            "thinkingLevel": level,
+            "thinkingLevelClass": f"thinking-{_SESSION_THINKING_LEVEL_MAP.get(level.lower(), 'off')}",
+            "raw_line": raw_line,
+        }
+    if event_type in {"message", "message_end"}:
+        role = str(message.get("role") or "")
+        event = {
+            "type": "message",
+            "line": line_no,
+            "event_index": line_no,
+            "timestamp": timestamp,
+            "display_timestamp": timestamp,
+            "role": role,
+            "render_role": role,
+            "parts": _parse_session_message_parts(message.get("content", [])),
+            "raw_line": raw_line,
+        }
+        if role == "toolResult":
+            event["toolCallId"] = message.get("toolCallId") or message.get("tool_call_id") or ""
+            event["toolName"] = message.get("toolName") or message.get("tool_name") or ""
+            event["isError"] = bool(message.get("isError", message.get("is_error", False)))
+        return None, event
+    return None, {
+        "type": event_type or "unknown_event",
+        "line": line_no,
+        "event_index": line_no,
+        "timestamp": timestamp,
+        "display_timestamp": timestamp,
+        "summary": json.dumps(obj, ensure_ascii=False)[:200],
+        "raw_line": raw_line[:200],
+    }
+
+
+def _parse_session_jsonl_lines(lines: list[str]) -> dict[str, Any]:
+    events: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    session_meta: dict[str, Any] = {}
+    line_count = 0
+    for line_no, raw_line in enumerate(lines, 1):
+        line_count = line_no
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            warnings.append(f"第 {line_no} 行 JSON 解析失败")
+            events.append({"type": "raw", "line": line_no, "event_index": line_no, "raw_line": line[:200], "summary": line[:200]})
+            continue
+        if not isinstance(obj, dict):
+            events.append({"type": "raw", "line": line_no, "event_index": line_no, "raw_line": line[:200], "summary": line[:200]})
+            continue
+        mapped_meta, mapped_event = _map_session_jsonl_object(obj, line, line_no)
+        if mapped_meta is not None:
+            session_meta = mapped_meta
+        if mapped_event is not None:
+            events.append(mapped_event)
+    return {"session_meta": session_meta, "events": events, "warnings": warnings, "line_count": line_count}
+
+
+def _parse_session_jsonl_file(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as file:
+            return _parse_session_jsonl_lines(file.read().splitlines())
+    except Exception:
+        return {"session_meta": {}, "events": [], "warnings": ["会话文件读取失败"], "line_count": 0}
+
+
+def _session_display_name(worker_id: str, session_id: str, jsonl_path: str) -> str:
+    if worker_id:
+        return worker_id
+    if session_id:
+        return session_id
+    return Path(jsonl_path).name or "Session"
+
+
+def _session_runtime_metadata(session_dir: Path) -> dict[str, Any]:
+    calls_dir = session_dir / "calls"
+    if not calls_dir.is_dir():
+        return {}
+    for request_path in sorted(calls_dir.glob("*/request.json")):
+        request = _read_json(request_path)
+        if not request:
+            continue
+        model = _first_string(request.get("model"), request.get("raw_model"))
+        raw_model = _first_string(request.get("raw_model"), request.get("model"))
+        thinking = _first_string(request.get("thinking"), request.get("reasoning_effort"))
+        provider = _first_string(request.get("provider"))
+        if not provider and "/" in model:
+            provider = model.split("/", 1)[0]
+        command = request.get("command_argv")
+        return {
+            "model": model,
+            "raw_model": raw_model,
+            "provider": provider,
+            "thinking": thinking,
+            "command": command if isinstance(command, list) else [],
+            "command_display": str(request.get("command_display") or ""),
+        }
+    return {}
+
+
 def _summarize_global_review_advisors(config: dict[str, Any]) -> list[dict[str, Any]]:
     advisors: list[dict[str, Any]] = []
     for workflow in ((config.get("workflows") or {}).get("atomic") or []):
@@ -720,6 +1021,16 @@ def inspect_sessions(workspace_root: str | Path) -> list[dict[str, Any]]:
         parts = jsonl_file.relative_to(sessions_root).parts
         worker_id = parts[0] if len(parts) >= 2 else jsonl_file.stem
         stat = jsonl_file.stat()
+        parsed_session = _parse_session_jsonl_file(jsonl_file)
+        warnings = list(parsed_session.get("warnings") or [])
+        event_count = len(parsed_session.get("events") or [])
+        line_count = int(parsed_session.get("line_count") or 0)
+        runtime_meta = _session_runtime_metadata(jsonl_file.parent)
+        session_meta = parsed_session.get("session_meta") if isinstance(parsed_session.get("session_meta"), dict) else {}
+        model = _first_string(runtime_meta.get("model"), session_meta.get("model"))
+        raw_model = _first_string(runtime_meta.get("raw_model"), model)
+        provider = _first_string(runtime_meta.get("provider"), session_meta.get("provider"))
+        thinking = _first_string(runtime_meta.get("thinking"), session_meta.get("thinking"))
         sessions.append(
             {
                 "session_id": jsonl_file.stem,
@@ -728,6 +1039,16 @@ def inspect_sessions(workspace_root: str | Path) -> list[dict[str, Any]]:
                 "jsonl_path": rel_path,
                 "size": stat.st_size,
                 "mtime": stat.st_mtime,
+                "event_count": event_count,
+                "line_count": line_count,
+                "warnings": warnings,
+                "display_name": _session_display_name(worker_id, jsonl_file.stem, rel_path),
+                "stage_group": worker_id or "root",
+                "role_name": worker_id,
+                "model": model,
+                "raw_model": raw_model,
+                "provider": provider,
+                "thinking": thinking,
                 "calls": [],
             }
         )
@@ -854,7 +1175,7 @@ def inspect_files(workspace_root: str | Path, limit: int = 1200) -> list[dict[st
     return entries
 
 
-def inspect_file(workspace_root: str | Path, path: str) -> dict[str, Any]:
+def _resolve_run_file(workspace_root: str | Path, path: str) -> tuple[Path, Path]:
     run_dir = Path(workspace_root)
     if not run_dir.is_dir():
         raise HTTPException(404, "run workspace not found")
@@ -871,6 +1192,11 @@ def inspect_file(workspace_root: str | Path, path: str) -> dict[str, Any]:
             break
     if target is None:
         raise HTTPException(404, f"file not found: {path}")
+    return run_dir, target
+
+
+def inspect_file(workspace_root: str | Path, path: str) -> dict[str, Any]:
+    run_dir, target = _resolve_run_file(workspace_root, path)
     return {
         "path": str(target.relative_to(run_dir)),
         "type": _file_type(target),
@@ -879,62 +1205,19 @@ def inspect_file(workspace_root: str | Path, path: str) -> dict[str, Any]:
 
 
 def inspect_session_file(workspace_root: str | Path, path: str) -> dict[str, Any]:
-    file_payload = inspect_file(workspace_root, path)
-    if file_payload["type"] != "jsonl":
+    run_dir, target = _resolve_run_file(workspace_root, path)
+    if _file_type(target) != "jsonl":
         raise HTTPException(400, "not a .jsonl file")
-    events: list[dict[str, Any]] = []
-    session_meta: dict[str, Any] = {}
-    for line_no, line in enumerate(str(file_payload["content"]).splitlines(), 1):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            events.append({"type": "raw", "line": line_no, "text": line[:200]})
-            continue
-        event_type = obj.get("type", "")
-        if event_type == "session":
-            session_meta = {
-                "id": obj.get("id", ""),
-                "version": obj.get("version", ""),
-                "timestamp": obj.get("timestamp", ""),
-                "cwd": obj.get("cwd", ""),
-            }
-            continue
-        if event_type == "message":
-            message = obj.get("message", {})
-            content = message.get("content", [])
-            parts: list[dict[str, Any]] = []
-            if isinstance(content, str):
-                parts.append({"type": "text", "text": content})
-            elif isinstance(content, list):
-                for part in content:
-                    if not isinstance(part, dict):
-                        continue
-                    part_type = part.get("type", "")
-                    if part_type == "text":
-                        parts.append({"type": "text", "text": part.get("text", "")})
-                    elif part_type == "thinking":
-                        parts.append({"type": "thinking", "text": part.get("thinking", "")})
-                    elif part_type == "toolCall":
-                        parts.append({"type": "toolCall", "name": part.get("name", ""), "id": part.get("id", ""), "arguments": part.get("arguments", {})})
-                    elif part_type == "toolResult":
-                        parts.append({"type": "toolResult", "text": part.get("text", "")})
-                    else:
-                        parts.append({"type": "unknown", "detail": str(part)[:200]})
-            events.append(
-                {
-                    "type": "message",
-                    "line": line_no,
-                    "timestamp": obj.get("timestamp", ""),
-                    "role": message.get("role", ""),
-                    "parts": parts,
-                }
-            )
-            continue
-        events.append({"type": event_type or "unknown_event", "line": line_no, "summary": str(obj)[:200]})
-    return {"path": file_payload["path"], "session_meta": session_meta, "events": events}
+    content = _read_text(target)
+    parsed = _parse_session_jsonl_lines(content.splitlines())
+    return {
+        "path": str(target.relative_to(run_dir)),
+        "content": content,
+        "session_meta": parsed["session_meta"],
+        "events": parsed["events"],
+        "warnings": parsed["warnings"],
+        "line_count": parsed["line_count"],
+    }
 
 
 def inspect_log(workspace_root: str | Path, lines: int = 300) -> dict[str, str]:

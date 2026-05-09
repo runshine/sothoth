@@ -321,7 +321,7 @@ def generate_config(
                     "api_retry_delay": 10,
                     "pi_max_retries": 0,
                     "pi_retry_delay": 10,
-                    "advisor_runtime_retries": 3,
+                    "advisor_runtime_retries": 0,
                     "timeout_max_retries": effective_timeout_max_retries,
                     "timeout_retry_delay": effective_timeout_retry_interval_seconds,
                     "timeout_retry_interval_seconds": effective_timeout_retry_interval_seconds,
@@ -634,6 +634,25 @@ def _apply_profile_resolution_to_config(config: dict) -> None:
             )
     apply_profile_runtime_policy_to_config(config, profile_policy.name)
     apply_profile_thinking_to_config(config, profile_policy.name)
+
+
+def _apply_cli_timeout_retry_to_config(
+    config: dict,
+    *,
+    timeout_max_retries: int | None,
+    timeout_retry_interval_seconds: int | None,
+) -> None:
+    if timeout_max_retries is None and timeout_retry_interval_seconds is None:
+        return
+    effective_max_retries = max(int(timeout_max_retries if timeout_max_retries is not None else 3), 1)
+    effective_interval_seconds = max(int(timeout_retry_interval_seconds if timeout_retry_interval_seconds is not None else 30), 0)
+    for agent in config.get("agents") or []:
+        if not isinstance(agent, dict) or agent.get("type") != "pi_agent":
+            continue
+        runtime_config = agent.setdefault("runtime_config", {})
+        runtime_config["timeout_max_retries"] = effective_max_retries
+        runtime_config["timeout_retry_delay"] = effective_interval_seconds
+        runtime_config["timeout_retry_interval_seconds"] = effective_interval_seconds
 
 
 def _resolve_prompt_paths(config: dict) -> None:
@@ -1082,11 +1101,11 @@ def main(argv: list[str] | None = None):
         "--max-cycles", type=int, default=None,
         help="最大评审循环次数 (默认随 --review-profile: fast=1, balanced=6, audit=10；strict 映射 audit)")
     parser.add_argument(
-        "--timeout-max-retries", type=int, default=3,
-        help="Pi/provider 自身返回 timeout 时的最大处理次数 (默认: 3，仅未指定 -c 时生效)")
+        "--timeout-max-retries", type=int, default=None,
+        help="Pi/provider 自身返回 timeout 时的最大处理次数 (默认: 3；服务启动会显式传入)")
     parser.add_argument(
-        "--timeout-retry-interval-seconds", type=int, default=30,
-        help="Pi/provider 自身返回 timeout 后再次发送同一提示词前的等待秒数 (默认: 30，仅未指定 -c 时生效)")
+        "--timeout-retry-interval-seconds", type=int, default=None,
+        help="Pi/provider 自身返回 timeout 后再次发送同一提示词前的等待秒数 (默认: 30；服务启动会显式传入)")
     parser.add_argument(
         "--result-review-concurrency", type=int, default=3,
         help="结果评审并发上限 (默认: 3，仅未指定 -c 时生效)")
@@ -1208,10 +1227,6 @@ def main(argv: list[str] | None = None):
         print(f"  预览文件:   {preview_path}")
         print("═" * 60)
 
-        if plan.current_status == "completed":
-            print(f"✅ 该 run 已完成，无需继续: {run_dir}")
-            sys.exit(0)
-
         if args.dry_run_resume:
             print("ℹ️ dry-run-resume: 已生成 resume 预览，未实际继续执行。")
             sys.exit(0)
@@ -1270,11 +1285,11 @@ def main(argv: list[str] | None = None):
         print(f"❌ 源码目录不存在: {args.source_dir}", file=sys.stderr)
         sys.exit(1)
 
-    if args.timeout_max_retries < 1:
+    if args.timeout_max_retries is not None and args.timeout_max_retries < 1:
         print("❌ --timeout-max-retries 必须 >= 1", file=sys.stderr)
         sys.exit(1)
 
-    if args.timeout_retry_interval_seconds < 0:
+    if args.timeout_retry_interval_seconds is not None and args.timeout_retry_interval_seconds < 0:
         print("❌ --timeout-retry-interval-seconds 必须 >= 0", file=sys.stderr)
         sys.exit(1)
 
@@ -1316,6 +1331,11 @@ def main(argv: list[str] | None = None):
             task_file=task_file,
             run_name=args.run_name,
         )
+        _apply_cli_timeout_retry_to_config(
+            config,
+            timeout_max_retries=args.timeout_max_retries,
+            timeout_retry_interval_seconds=args.timeout_retry_interval_seconds,
+        )
         config_source = os.path.abspath(args.config)
     else:
         config = generate_config(
@@ -1328,8 +1348,8 @@ def main(argv: list[str] | None = None):
             thinking=args.thinking,
             result_review_concurrency=args.result_review_concurrency,
             review_profile=args.review_profile,
-            timeout_max_retries=args.timeout_max_retries,
-            timeout_retry_interval_seconds=args.timeout_retry_interval_seconds,
+            timeout_max_retries=args.timeout_max_retries if args.timeout_max_retries is not None else 3,
+            timeout_retry_interval_seconds=args.timeout_retry_interval_seconds if args.timeout_retry_interval_seconds is not None else 30,
         )
         config_source = "自动生成"
 

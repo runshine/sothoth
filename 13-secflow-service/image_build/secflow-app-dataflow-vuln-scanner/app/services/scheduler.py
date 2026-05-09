@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-import uuid
 from datetime import timedelta
 from typing import Any, Dict, List
 
@@ -53,7 +52,6 @@ class SchedulerService:
         self._tasks = [
             asyncio.create_task(self._heartbeat_loop(), name="scheduler-heartbeat"),
             asyncio.create_task(self._dispatch_loop(), name="scheduler-dispatch"),
-            asyncio.create_task(self._lease_loop(), name="scheduler-lease"),
             asyncio.create_task(self._cleanup_loop(), name="scheduler-cleanup"),
         ]
 
@@ -179,8 +177,6 @@ class SchedulerService:
             )
             for execution, trigger, _definition in candidates:
                 now = now_local()
-                lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)
-                lease_token = uuid.uuid4().hex
                 updated_execution = (
                     db.query(WorkflowExecution)
                     .filter(
@@ -192,8 +188,6 @@ class SchedulerService:
                         {
                             WorkflowExecution.status: "running",
                             WorkflowExecution.owner_pod_id: self.pod_id,
-                            WorkflowExecution.lease_token: lease_token,
-                            WorkflowExecution.lease_expires_at: lease_expires_at,
                             WorkflowExecution.started_at: now,
                             WorkflowExecution.message: f"started by {self.pod_id}",
                         },
@@ -238,8 +232,6 @@ class SchedulerService:
             if definition is None or not definition.enabled:
                 return None
             now = now_local()
-            lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)
-            lease_token = uuid.uuid4().hex
             updated_execution = (
                 db.query(WorkflowExecution)
                 .filter(
@@ -251,8 +243,6 @@ class SchedulerService:
                     {
                         WorkflowExecution.status: "running",
                         WorkflowExecution.owner_pod_id: self.pod_id,
-                        WorkflowExecution.lease_token: lease_token,
-                        WorkflowExecution.lease_expires_at: lease_expires_at,
                         WorkflowExecution.started_at: now,
                         WorkflowExecution.message: f"started immediately by {self.pod_id}",
                     },
@@ -324,32 +314,6 @@ class SchedulerService:
         self._running_tasks[execution_id] = thread
         thread.start()
 
-    async def _lease_loop(self) -> None:
-        interval = max(1, get_config().scheduler.lease_duration_seconds // 3)
-        while True:
-            await asyncio.sleep(interval)
-            await asyncio.to_thread(self._renew_local_leases)
-
-    def _renew_local_leases(self) -> None:
-        if not self._running_tasks:
-            return
-        db = get_db_session()
-        try:
-            now = now_local()
-            lease_expires_at = now + timedelta(seconds=get_config().scheduler.lease_duration_seconds)
-            for execution_id in list(self._running_tasks):
-                db.query(WorkflowExecution).filter(
-                    WorkflowExecution.id == execution_id,
-                    WorkflowExecution.owner_pod_id == self.pod_id,
-                    WorkflowExecution.status.in_(["running", "cancel_requested"]),
-                ).update(
-                    {WorkflowExecution.lease_expires_at: lease_expires_at},
-                    synchronize_session=False,
-                )
-            db.commit()
-        finally:
-            db.close()
-
     async def _cleanup_loop(self) -> None:
         interval = get_config().scheduler.cleanup_interval_seconds
         while True:
@@ -370,26 +334,6 @@ class SchedulerService:
                 worker.status = "offline"
                 db.add(worker)
 
-            expired_executions = (
-                db.query(WorkflowExecution)
-                .filter(
-                    WorkflowExecution.status == "running",
-                    WorkflowExecution.lease_expires_at.isnot(None),
-                    WorkflowExecution.lease_expires_at < now,
-                )
-                .all()
-            )
-            for execution in expired_executions:
-                execution.status = "orphaned"
-                execution.message = "execution lease expired"
-                execution.finished_at = now
-                db.add(execution)
-                db.flush()
-                get_execution_service().auto_requeue_orphaned_execution(
-                    db,
-                    execution.id,
-                    reason="execution lease expired; auto requeue scheduled",
-                )
             db.commit()
         finally:
             db.close()

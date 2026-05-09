@@ -786,7 +786,7 @@ curl -X POST http://127.0.0.1:8080/api/dataflow-vuln-scanner/profiles \
     "is_default": true,
     "enabled": true,
     "default_priority": 100,
-    "max_retry_count": 3,
+    "max_retry_count": 0,
     "execution_timeout_seconds": 0
   }'
 

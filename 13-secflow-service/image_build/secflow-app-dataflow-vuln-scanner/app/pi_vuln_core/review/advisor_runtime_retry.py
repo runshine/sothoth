@@ -7,7 +7,7 @@ from typing import Any
 from app.pi_vuln_core.agents.models import AgentResponse
 
 
-DEFAULT_REVIEW_RUNTIME_RETRIES = 3
+DEFAULT_REVIEW_RUNTIME_RETRIES = 0
 
 _RETRYABLE_REVIEW_ERROR_CODES = {
     "runtime_timeout",
@@ -22,7 +22,7 @@ _RETRYABLE_REVIEW_ERROR_PATTERNS = (
 
 
 def review_runtime_retry_limit(agent: Any) -> int:
-    """Return per-review runtime retry budget, defaulting to 3 fresh-session retries."""
+    """Return per-review runtime retry budget; default is no fresh-session retry."""
     runtime_config = getattr(agent, "runtime_config", {}) or {}
     raw_value = runtime_config.get(
         "review_runtime_retries",

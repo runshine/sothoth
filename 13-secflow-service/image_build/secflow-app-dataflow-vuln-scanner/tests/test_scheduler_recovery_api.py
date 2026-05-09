@@ -36,7 +36,7 @@ def _create_profile(db):
     )
 
 
-def test_cleanup_requeues_orphaned_execution(service_config_path):
+def test_cleanup_does_not_requeue_expired_running_execution(service_config_path):
     db = get_db_session()
     try:
         profile = _create_profile(db)
@@ -65,7 +65,7 @@ def test_cleanup_requeues_orphaned_execution(service_config_path):
         assert execution is not None
         execution.status = "running"
         execution.owner_pod_id = "dead-pod"
-        execution.lease_expires_at = datetime.utcnow() - timedelta(seconds=30)
+        execution.lease_expires_at = datetime.now() - timedelta(seconds=30)
         db.add(execution)
         trigger = db.get(TriggerTask, execution.trigger_task_id)
         assert trigger is not None
@@ -80,13 +80,13 @@ def test_cleanup_requeues_orphaned_execution(service_config_path):
     db = get_db_session()
     try:
         executions = db.query(WorkflowExecution).order_by(WorkflowExecution.attempt_no.asc()).all()
-        assert len(executions) == 2
-        assert executions[0].status == "orphaned"
-        assert executions[1].status == "pending"
+        assert len(executions) == 1
+        assert executions[0].status == "running"
+        assert executions[0].message == f"started by {scheduler.pod_id}"
         trigger = db.get(TriggerTask, executions[0].trigger_task_id)
         assert trigger is not None
-        assert trigger.retry_count == 1
-        assert trigger.latest_execution_id == executions[1].id
-        assert trigger.status == "pending"
+        assert trigger.retry_count == 0
+        assert trigger.latest_execution_id == executions[0].id
+        assert trigger.status == "running"
     finally:
         db.close()

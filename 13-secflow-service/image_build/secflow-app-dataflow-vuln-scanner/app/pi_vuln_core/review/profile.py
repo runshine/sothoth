@@ -472,7 +472,7 @@ def apply_profile_runtime_policy_to_config(
             runtime_config["rpc_stdout_trace_bytes"] = policy.worker_rpc_stdout_trace_bytes
             runtime_config["rpc_stdout_abort_bytes"] = policy.worker_rpc_stdout_abort_bytes
         elif agent_id == "pi-advisor":
-            runtime_config["advisor_runtime_retries"] = 3
+            runtime_config["advisor_runtime_retries"] = 0
             runtime_config["max_internal_turns"] = 0
             runtime_config["rpc_stdout_trace_bytes"] = policy.advisor_rpc_stdout_trace_bytes
             runtime_config["rpc_stdout_abort_bytes"] = policy.advisor_rpc_stdout_abort_bytes

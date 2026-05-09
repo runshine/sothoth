@@ -289,15 +289,6 @@ async def retry_task(task_id: str, subject=Depends(get_current_subject), db: Ses
     return get_execution_service().get_scan_task_summary(db, task_id, principal)
 
 
-@router.post("/tasks/{task_id}/requeue", response_model=ScanTaskResponse)
-async def requeue_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
-    principal, token = subject
-    updated = get_execution_service().requeue_scan_task(db, task_id, principal, authorization_token=token)
-    get_scheduler_service().start_execution_now(updated.latest_execution_id)
-    db.expire_all()
-    return get_execution_service().get_scan_task_summary(db, task_id, principal)
-
-
 @router.post("/tasks/{task_id}/priority", response_model=ScanTaskResponse)
 async def update_task_priority(
     task_id: str,
