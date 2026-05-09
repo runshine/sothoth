@@ -77,7 +77,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         reflection_passes_per_cycle=0,
         reflection_max_internal_turns=0,
         reflection_rpc_stdout_trace_bytes=512 * 1024,
-        reflection_rpc_stdout_abort_bytes=16 * 1024 * 1024,
+        reflection_rpc_stdout_abort_bytes=0,
         min_discovery_cycles_before_pass=1,
         progress_required_after_cycle=0,
         progress_no_signal_closure_streak=1,
@@ -86,10 +86,10 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         required_pattern_families=(),
         max_open_obligations_in_worker_prompt=8,
         worker_rpc_stdout_trace_bytes=2 * 1024 * 1024,
-        worker_rpc_stdout_abort_bytes=96 * 1024 * 1024,
+        worker_rpc_stdout_abort_bytes=0,
         advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=1 * 1024 * 1024,
-        advisor_rpc_stdout_abort_bytes=64 * 1024 * 1024,
+        advisor_rpc_stdout_abort_bytes=0,
         execution_goal="快速确认显性漏洞并生成 summary.md；不做评审返工或低风险穷尽。",
         closure_policy="fast 不进入评审 closure；summary.md 必须由 Worker 真实生成。",
         depth_lanes=(
@@ -112,7 +112,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         reflection_passes_per_cycle=1,
         reflection_max_internal_turns=0,
         reflection_rpc_stdout_trace_bytes=1 * 1024 * 1024,
-        reflection_rpc_stdout_abort_bytes=128 * 1024 * 1024,
+        reflection_rpc_stdout_abort_bytes=0,
         min_discovery_cycles_before_pass=1,
         progress_required_after_cycle=0,
         progress_no_signal_closure_streak=2,
@@ -125,10 +125,10 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         ),
         max_open_obligations_in_worker_prompt=24,
         worker_rpc_stdout_trace_bytes=4 * 1024 * 1024,
-        worker_rpc_stdout_abort_bytes=256 * 1024 * 1024,
+        worker_rpc_stdout_abort_bytes=0,
         advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=4 * 1024 * 1024,
-        advisor_rpc_stdout_abort_bytes=128 * 1024 * 1024,
+        advisor_rpc_stdout_abort_bytes=0,
         execution_goal="覆盖 STAR、高风险端点和关键 EXPORT/USED，优先挖出大部分中高危漏洞。",
         closure_policy="closure 只验证 active backlog、STAR 和高风险 open obligations，不重新无限发散。",
         depth_lanes=(
@@ -153,7 +153,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         reflection_passes_per_cycle=3,
         reflection_max_internal_turns=0,
         reflection_rpc_stdout_trace_bytes=2 * 1024 * 1024,
-        reflection_rpc_stdout_abort_bytes=256 * 1024 * 1024,
+        reflection_rpc_stdout_abort_bytes=0,
         min_discovery_cycles_before_pass=3,
         progress_required_after_cycle=3,
         progress_no_signal_closure_streak=1,
@@ -169,10 +169,10 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         ),
         max_open_obligations_in_worker_prompt=80,
         worker_rpc_stdout_trace_bytes=8 * 1024 * 1024,
-        worker_rpc_stdout_abort_bytes=512 * 1024 * 1024,
+        worker_rpc_stdout_abort_bytes=0,
         advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=8 * 1024 * 1024,
-        advisor_rpc_stdout_abort_bytes=256 * 1024 * 1024,
+        advisor_rpc_stdout_abort_bytes=0,
         execution_goal="深度审计关键数据流、变体和跨路径副作用；尽量挖出最多且最深的漏洞。",
         closure_policy="closure 优先验证 active backlog 与关键 obligations；无有效进展时收敛，external_blocked 必须显式保留。",
         depth_lanes=(
@@ -544,6 +544,12 @@ def _format_pattern_families(families: tuple[str, ...]) -> str:
     return ", ".join(labels.get(item, item) for item in families)
 
 
+def _format_abort_limit(limit_bytes: int) -> str:
+    if int(limit_bytes) <= 0:
+        return "不限制"
+    return f"{int(limit_bytes) // (1024 * 1024)}MB"
+
+
 def format_review_profile_policy(value: str | None, *, compact: bool = False) -> str:
     policy = get_review_profile_policy(value)
     completeness_thresholds = get_review_score_threshold_policy(policy.name, "global_completeness")
@@ -583,9 +589,9 @@ def format_review_profile_policy(value: str | None, *, compact: bool = False) ->
         f"- summary-only evidence: {'allowed' if policy.allow_summary_only_evidence else 'not sufficient'}",
         f"- 默认最大评审轮次: {policy.default_max_review_cycles}",
         "- 单轮 Worker 内部 turn 硬上限: 不限制",
-        f"- 单轮 Worker stdout 软上限: {policy.worker_rpc_stdout_abort_bytes // (1024 * 1024)}MB",
+        f"- 单轮 Worker stdout 软上限: {_format_abort_limit(policy.worker_rpc_stdout_abort_bytes)}",
         "- 单次 Advisor 内部 turn 硬上限: 不限制",
-        f"- 单次 Advisor stdout 软上限: {policy.advisor_rpc_stdout_abort_bytes // (1024 * 1024)}MB",
+        f"- 单次 Advisor stdout 软上限: {_format_abort_limit(policy.advisor_rpc_stdout_abort_bytes)}",
         f"- 全面性最终分数线: {_format_threshold_brief(completeness_thresholds)}",
         f"- 深入性最终分数线: {_format_threshold_brief(depth_thresholds)}",
         f"- 每轮反思 pass: {policy.reflection_passes_per_cycle}",

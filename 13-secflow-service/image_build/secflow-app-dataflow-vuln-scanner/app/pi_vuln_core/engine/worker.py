@@ -317,17 +317,21 @@ class WorkerExecutor:
                 return int(floor)
             return value
 
+        reflection_abort_bytes = 0
+        if policy.reflection_rpc_stdout_abort_bytes > 0:
+            reflection_abort_bytes = configured_int(
+                "reflection_rpc_stdout_abort_bytes",
+                policy.reflection_rpc_stdout_abort_bytes,
+                floor=policy.reflection_rpc_stdout_abort_bytes,
+            )
+
         return {
             "max_internal_turns": 0,
             "rpc_stdout_trace_bytes": configured_int(
                 "reflection_rpc_stdout_trace_bytes",
                 policy.reflection_rpc_stdout_trace_bytes,
             ),
-            "rpc_stdout_abort_bytes": configured_int(
-                "reflection_rpc_stdout_abort_bytes",
-                policy.reflection_rpc_stdout_abort_bytes,
-                floor=policy.reflection_rpc_stdout_abort_bytes,
-            ),
+            "rpc_stdout_abort_bytes": reflection_abort_bytes,
         }
 
     @staticmethod

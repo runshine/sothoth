@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from app.config import get_config
 from app.main import create_app
-from app.models.database import HistoryRun, WorkflowDefinitionVersion, WorkflowExecution, get_db_session
+from app.models.database import RunIndex, WorkflowDefinitionVersion, WorkflowExecution, get_db_session
 
 
 def _wait_for_task_status(client: TestClient, task_id: str, expected: set[str] | None = None, timeout: float = 10.0) -> dict:
@@ -474,7 +474,7 @@ def test_dataflow_run_resolve_by_task_recovers_from_metadata_when_workspace_root
     from pathlib import Path
 
     from app.api import tasks as task_api
-    from app.services.history_run_service import get_history_run_service
+    from app.services.run_index_service import get_run_index_service
 
     class NoopScheduler:
         def start_execution_now(self, execution_id):
@@ -515,8 +515,8 @@ def test_dataflow_run_resolve_by_task_recovers_from_metadata_when_workspace_root
 
     db = get_db_session()
     try:
-        for record in db.query(HistoryRun).filter(HistoryRun.linked_task_id == task_id).all():
-            get_history_run_service()._delete_children(db, record.id)
+        for record in db.query(RunIndex).filter(RunIndex.linked_task_id == task_id).all():
+            get_run_index_service()._delete_children(db, record.id)
             db.delete(record)
         execution = db.get(WorkflowExecution, execution_id)
         assert execution is not None

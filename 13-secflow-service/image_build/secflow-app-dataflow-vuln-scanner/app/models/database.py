@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from typing import Optional
 
@@ -15,8 +16,8 @@ _engine = None
 _SessionFactory = None
 
 MYSQL_INDEX_LENGTHS = {
-    "ix_dfvs_hr_source_key": {"source_key": 512},
-    "ix_dfvs_hrf_run_path": {"path": 512},
+    "ix_dfvs_ri_source_key": {"source_key": 512},
+    "ix_dfvs_rif_run_path": {"path": 512},
 }
 
 
@@ -26,6 +27,11 @@ def now_utc() -> datetime:
 
 def _prefix(name: str) -> str:
     return f"{get_config().database.table_prefix}{name}"
+
+
+def run_source_hash(source_type: str | None, source_key: str | None) -> str:
+    payload = f"{source_type or ''}\0{source_key or ''}".encode("utf-8", errors="surrogatepass")
+    return hashlib.sha256(payload).hexdigest()
 
 
 class WorkflowDefinition(Base):
@@ -142,13 +148,14 @@ class WorkflowExecutionEvent(Base):
     created_at = Column(DateTime, default=now_utc)
 
 
-class HistoryRun(Base):
-    __tablename__ = _prefix("history_run")
+class RunIndex(Base):
+    __tablename__ = _prefix("run_index")
 
     id = Column(String(64), primary_key=True)
     project_id = Column(String(64), nullable=False)
     source_type = Column(String(64), nullable=False)
     source_key = Column(String(1024), nullable=False)
+    source_hash = Column(String(64), nullable=False, default="")
     run_name = Column(String(255), nullable=False)
     run_root_path = Column(String(1024), nullable=False)
     atomic_work_path = Column(String(1024))
@@ -182,11 +189,11 @@ class HistoryRun(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
-class HistoryRunCycle(Base):
-    __tablename__ = _prefix("history_run_cycle")
+class RunIndexCycle(Base):
+    __tablename__ = _prefix("run_index_cycle")
 
     id = Column(String(64), primary_key=True)
-    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    run_index_id = Column(String(64), ForeignKey(f"{RunIndex.__tablename__}.id"), nullable=False)
     cycle = Column(Integer, nullable=False)
     timestamp = Column(String(128), nullable=False, default="")
     outcome = Column(String(64), nullable=False, default="")
@@ -207,11 +214,11 @@ class HistoryRunCycle(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
-class HistoryRunGlobalReview(Base):
-    __tablename__ = _prefix("history_run_global_review")
+class RunIndexGlobalReview(Base):
+    __tablename__ = _prefix("run_index_global_review")
 
     id = Column(String(64), primary_key=True)
-    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    run_index_id = Column(String(64), ForeignKey(f"{RunIndex.__tablename__}.id"), nullable=False)
     cycle = Column(Integer, nullable=False)
     advisor_id = Column(String(255), nullable=False, default="")
     path = Column(String(1024), nullable=False, default="")
@@ -232,11 +239,11 @@ class HistoryRunGlobalReview(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
-class HistoryRunResult(Base):
-    __tablename__ = _prefix("history_run_result")
+class RunIndexResult(Base):
+    __tablename__ = _prefix("run_index_result")
 
     id = Column(String(64), primary_key=True)
-    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    run_index_id = Column(String(64), ForeignKey(f"{RunIndex.__tablename__}.id"), nullable=False)
     filename = Column(String(255), nullable=False)
     path = Column(String(1024), nullable=False, default="")
     title = Column(String(512), nullable=False, default="")
@@ -263,11 +270,11 @@ class HistoryRunResult(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
-class HistoryRunResultReview(Base):
-    __tablename__ = _prefix("history_run_result_review")
+class RunIndexResultReview(Base):
+    __tablename__ = _prefix("run_index_result_review")
 
     id = Column(String(64), primary_key=True)
-    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    run_index_id = Column(String(64), ForeignKey(f"{RunIndex.__tablename__}.id"), nullable=False)
     cycle = Column(Integer, nullable=False)
     result_file = Column(String(255), nullable=False, default="")
     path = Column(String(1024), nullable=False, default="")
@@ -285,11 +292,11 @@ class HistoryRunResultReview(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
-class HistoryRunRemovedResult(Base):
-    __tablename__ = _prefix("history_run_removed_result")
+class RunIndexRemovedResult(Base):
+    __tablename__ = _prefix("run_index_removed_result")
 
     id = Column(String(64), primary_key=True)
-    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    run_index_id = Column(String(64), ForeignKey(f"{RunIndex.__tablename__}.id"), nullable=False)
     filename = Column(String(255), nullable=False, default="")
     path = Column(String(1024), nullable=False, default="")
     meta_path = Column(String(1024), nullable=False, default="")
@@ -302,11 +309,11 @@ class HistoryRunRemovedResult(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
-class HistoryRunSession(Base):
-    __tablename__ = _prefix("history_run_session")
+class RunIndexSession(Base):
+    __tablename__ = _prefix("run_index_session")
 
     id = Column(String(64), primary_key=True)
-    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    run_index_id = Column(String(64), ForeignKey(f"{RunIndex.__tablename__}.id"), nullable=False)
     session_id = Column(String(255), nullable=False)
     format = Column(String(32), nullable=False, default="")
     worker_id = Column(String(255), nullable=False, default="")
@@ -319,11 +326,11 @@ class HistoryRunSession(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
-class HistoryRunFile(Base):
-    __tablename__ = _prefix("history_run_file")
+class RunIndexFile(Base):
+    __tablename__ = _prefix("run_index_file")
 
     id = Column(String(64), primary_key=True)
-    history_run_id = Column(String(64), ForeignKey(f"{HistoryRun.__tablename__}.id"), nullable=False)
+    run_index_id = Column(String(64), ForeignKey(f"{RunIndex.__tablename__}.id"), nullable=False)
     category = Column(String(255), nullable=False, default="")
     path = Column(String(1024), nullable=False)
     name = Column(String(255), nullable=False)
@@ -354,14 +361,14 @@ MODEL_CLASSES = [
     TriggerTask,
     WorkflowExecution,
     WorkflowExecutionEvent,
-    HistoryRun,
-    HistoryRunCycle,
-    HistoryRunGlobalReview,
-    HistoryRunResult,
-    HistoryRunResultReview,
-    HistoryRunRemovedResult,
-    HistoryRunSession,
-    HistoryRunFile,
+    RunIndex,
+    RunIndexCycle,
+    RunIndexGlobalReview,
+    RunIndexResult,
+    RunIndexResultReview,
+    RunIndexRemovedResult,
+    RunIndexSession,
+    RunIndexFile,
     SchedulerWorker,
 ]
 
@@ -390,22 +397,23 @@ INDEX_DEFINITIONS = [
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_exec", "CREATE INDEX ix_dfvs_event_exec ON {table} (execution_id)"),
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_type", "CREATE INDEX ix_dfvs_event_type ON {table} (event_type)"),
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_created", "CREATE INDEX ix_dfvs_event_created ON {table} (created_at)"),
-    (HistoryRun.__tablename__, "ix_dfvs_hr_project", "CREATE INDEX ix_dfvs_hr_project ON {table} (project_id)"),
-    (HistoryRun.__tablename__, "ix_dfvs_hr_status", "CREATE INDEX ix_dfvs_hr_status ON {table} (status)"),
-    (HistoryRun.__tablename__, "ix_dfvs_hr_source_key", "CREATE UNIQUE INDEX ix_dfvs_hr_source_key ON {table} (source_key)"),
-    (HistoryRun.__tablename__, "ix_dfvs_hr_execution", "CREATE INDEX ix_dfvs_hr_execution ON {table} (linked_execution_id)"),
-    (HistoryRun.__tablename__, "ix_dfvs_hr_task", "CREATE INDEX ix_dfvs_hr_task ON {table} (linked_task_id)"),
-    (HistoryRun.__tablename__, "ix_dfvs_hr_project_started", "CREATE INDEX ix_dfvs_hr_project_started ON {table} (project_id, started_at)"),
-    (HistoryRunCycle.__tablename__, "ix_dfvs_hrc_run", "CREATE INDEX ix_dfvs_hrc_run ON {table} (history_run_id)"),
-    (HistoryRunCycle.__tablename__, "ix_dfvs_hrc_run_cycle", "CREATE UNIQUE INDEX ix_dfvs_hrc_run_cycle ON {table} (history_run_id, cycle)"),
-    (HistoryRunGlobalReview.__tablename__, "ix_dfvs_hrgr_run_cycle", "CREATE INDEX ix_dfvs_hrgr_run_cycle ON {table} (history_run_id, cycle)"),
-    (HistoryRunResult.__tablename__, "ix_dfvs_hrr_run", "CREATE INDEX ix_dfvs_hrr_run ON {table} (history_run_id)"),
-    (HistoryRunResult.__tablename__, "ix_dfvs_hrr_run_filename", "CREATE INDEX ix_dfvs_hrr_run_filename ON {table} (history_run_id, filename)"),
-    (HistoryRunResultReview.__tablename__, "ix_dfvs_hrrr_run_cycle", "CREATE INDEX ix_dfvs_hrrr_run_cycle ON {table} (history_run_id, cycle)"),
-    (HistoryRunRemovedResult.__tablename__, "ix_dfvs_hrrm_run", "CREATE INDEX ix_dfvs_hrrm_run ON {table} (history_run_id)"),
-    (HistoryRunSession.__tablename__, "ix_dfvs_hrs_run", "CREATE INDEX ix_dfvs_hrs_run ON {table} (history_run_id)"),
-    (HistoryRunFile.__tablename__, "ix_dfvs_hrf_run", "CREATE INDEX ix_dfvs_hrf_run ON {table} (history_run_id)"),
-    (HistoryRunFile.__tablename__, "ix_dfvs_hrf_run_path", "CREATE INDEX ix_dfvs_hrf_run_path ON {table} (history_run_id, path)"),
+    (RunIndex.__tablename__, "ix_dfvs_ri_project", "CREATE INDEX ix_dfvs_ri_project ON {table} (project_id)"),
+    (RunIndex.__tablename__, "ix_dfvs_ri_status", "CREATE INDEX ix_dfvs_ri_status ON {table} (status)"),
+    (RunIndex.__tablename__, "ux_dfvs_ri_source_hash", "CREATE UNIQUE INDEX ux_dfvs_ri_source_hash ON {table} (source_type, source_hash)"),
+    (RunIndex.__tablename__, "ix_dfvs_ri_source_key", "CREATE INDEX ix_dfvs_ri_source_key ON {table} (source_type, source_key)"),
+    (RunIndex.__tablename__, "ix_dfvs_ri_execution", "CREATE INDEX ix_dfvs_ri_execution ON {table} (linked_execution_id)"),
+    (RunIndex.__tablename__, "ix_dfvs_ri_task", "CREATE INDEX ix_dfvs_ri_task ON {table} (linked_task_id)"),
+    (RunIndex.__tablename__, "ix_dfvs_ri_project_started", "CREATE INDEX ix_dfvs_ri_project_started ON {table} (project_id, started_at)"),
+    (RunIndexCycle.__tablename__, "ix_dfvs_ric_run", "CREATE INDEX ix_dfvs_ric_run ON {table} (run_index_id)"),
+    (RunIndexCycle.__tablename__, "ix_dfvs_ric_run_cycle", "CREATE UNIQUE INDEX ix_dfvs_ric_run_cycle ON {table} (run_index_id, cycle)"),
+    (RunIndexGlobalReview.__tablename__, "ix_dfvs_rigr_run_cycle", "CREATE INDEX ix_dfvs_rigr_run_cycle ON {table} (run_index_id, cycle)"),
+    (RunIndexResult.__tablename__, "ix_dfvs_rir_run", "CREATE INDEX ix_dfvs_rir_run ON {table} (run_index_id)"),
+    (RunIndexResult.__tablename__, "ix_dfvs_rir_run_filename", "CREATE INDEX ix_dfvs_rir_run_filename ON {table} (run_index_id, filename)"),
+    (RunIndexResultReview.__tablename__, "ix_dfvs_rirr_run_cycle", "CREATE INDEX ix_dfvs_rirr_run_cycle ON {table} (run_index_id, cycle)"),
+    (RunIndexRemovedResult.__tablename__, "ix_dfvs_rirm_run", "CREATE INDEX ix_dfvs_rirm_run ON {table} (run_index_id)"),
+    (RunIndexSession.__tablename__, "ix_dfvs_ris_run", "CREATE INDEX ix_dfvs_ris_run ON {table} (run_index_id)"),
+    (RunIndexFile.__tablename__, "ix_dfvs_rif_run", "CREATE INDEX ix_dfvs_rif_run ON {table} (run_index_id)"),
+    (RunIndexFile.__tablename__, "ix_dfvs_rif_run_path", "CREATE INDEX ix_dfvs_rif_run_path ON {table} (run_index_id, path)"),
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_heartbeat", "CREATE INDEX ix_dfvs_worker_heartbeat ON {table} (last_heartbeat_at)"),
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_status", "CREATE INDEX ix_dfvs_worker_status ON {table} (status)"),
 ]
@@ -489,6 +497,311 @@ def _column_sql(dialect: str, sqltype: str) -> str:
     return sqltype
 
 
+def _quote(connection, identifier: str) -> str:
+    return connection.dialect.identifier_preparer.quote(identifier)
+
+
+def _legacy_run_table_name(suffix: str = "") -> str:
+    legacy_base = ("history" + "_run") + suffix
+    if RunIndex.__tablename__.endswith("run_index"):
+        return f"{RunIndex.__tablename__[:-len('run_index')]}{legacy_base}"
+    return _prefix(legacy_base)
+
+
+def _legacy_run_fk_column() -> str:
+    return "history" + "_run_id"
+
+
+def _drop_index_sql(connection, table_name: str, index_name: str) -> str:
+    if connection.dialect.name == "mysql":
+        return f"DROP INDEX {_quote(connection, index_name)} ON {_quote(connection, table_name)}"
+    return f"DROP INDEX {_quote(connection, index_name)}"
+
+
+def _table_columns(inspector, table_name: str) -> list[str]:
+    return [column["name"] for column in inspector.get_columns(table_name)]
+
+
+def _run_row_exists(connection, table_name: str, *, run_id: str, source_type: str, source_hash: str) -> bool:
+    return _target_run_id(
+        connection,
+        table_name,
+        run_id=run_id,
+        source_type=source_type,
+        source_hash=source_hash,
+    ) is not None
+
+
+def _target_run_id(connection, table_name: str, *, run_id: str, source_type: str, source_hash: str) -> str | None:
+    row = connection.execute(
+        text(
+            f"SELECT {_quote(connection, 'id')} FROM {_quote(connection, table_name)} "
+            f"WHERE {_quote(connection, 'id')} = :run_id "
+            f"OR ({_quote(connection, 'source_type')} = :source_type "
+            f"AND {_quote(connection, 'source_hash')} = :source_hash) "
+            "LIMIT 1"
+        ),
+        {"run_id": run_id, "source_type": source_type, "source_hash": source_hash},
+    ).mappings().first()
+    return str(row.get("id") or "") if row else None
+
+
+def _row_exists_by_id(connection, table_name: str, row_id: str) -> bool:
+    row = connection.execute(
+        text(
+            f"SELECT 1 FROM {_quote(connection, table_name)} "
+            f"WHERE {_quote(connection, 'id')} = :row_id LIMIT 1"
+        ),
+        {"row_id": row_id},
+    ).first()
+    return row is not None
+
+
+def _run_parent_exists(connection, table_name: str, run_id: str) -> bool:
+    return _row_exists_by_id(connection, table_name, run_id)
+
+
+def _legacy_run_id_map(connection, inspector) -> dict[str, str]:
+    table_names = set(inspector.get_table_names())
+    legacy_table = _legacy_run_table_name()
+    target_table = RunIndex.__tablename__
+    if legacy_table not in table_names or target_table not in table_names:
+        return {}
+    legacy_columns = set(_table_columns(inspector, legacy_table))
+    if not {"id", "source_type", "source_key"}.issubset(legacy_columns):
+        return {}
+    rows = connection.execute(
+        text(
+            f"SELECT {_quote(connection, 'id')}, {_quote(connection, 'source_type')}, {_quote(connection, 'source_key')} "
+            f"FROM {_quote(connection, legacy_table)}"
+        )
+    ).mappings()
+    mapping: dict[str, str] = {}
+    for row in rows:
+        legacy_id = str(row.get("id") or "")
+        source_type = str(row.get("source_type") or "")
+        source_key = str(row.get("source_key") or "")
+        if not legacy_id or not source_type or not source_key:
+            continue
+        target_id = _target_run_id(
+            connection,
+            target_table,
+            run_id=legacy_id,
+            source_type=source_type,
+            source_hash=run_source_hash(source_type, source_key),
+        )
+        if target_id:
+            mapping[legacy_id] = target_id
+    return mapping
+
+
+def _backfill_run_source_hash(connection, inspector) -> None:
+    table_name = RunIndex.__tablename__
+    table_names = set(inspector.get_table_names())
+    if table_name not in table_names or not _column_exists(inspector, table_name, "source_hash"):
+        return
+    rows = connection.execute(
+        text(
+            f"SELECT {_quote(connection, 'id')}, {_quote(connection, 'source_type')}, {_quote(connection, 'source_key')} "
+            f"FROM {_quote(connection, table_name)} "
+            f"WHERE {_quote(connection, 'source_hash')} IS NULL OR {_quote(connection, 'source_hash')} = ''"
+        )
+    ).mappings()
+    for row in rows:
+        source_hash = run_source_hash(str(row.get("source_type") or ""), str(row.get("source_key") or ""))
+        connection.execute(
+            text(
+                f"UPDATE {_quote(connection, table_name)} "
+                f"SET {_quote(connection, 'source_hash')} = :source_hash "
+                f"WHERE {_quote(connection, 'id')} = :run_id"
+            ),
+            {"source_hash": source_hash, "run_id": row.get("id")},
+        )
+
+
+def _drop_unique_source_key_index(connection, inspector) -> None:
+    table_name = RunIndex.__tablename__
+    table_names = set(inspector.get_table_names())
+    if table_name not in table_names:
+        return
+    for index in inspector.get_indexes(table_name):
+        if index.get("name") == "ix_dfvs_ri_source_key" and bool(index.get("unique")):
+            connection.execute(text(_drop_index_sql(connection, table_name, "ix_dfvs_ri_source_key")))
+            break
+
+
+LEGACY_RUN_CHILD_TABLES = [
+    ("_cycle", RunIndexCycle.__tablename__),
+    ("_global_review", RunIndexGlobalReview.__tablename__),
+    ("_result", RunIndexResult.__tablename__),
+    ("_result_review", RunIndexResultReview.__tablename__),
+    ("_removed_result", RunIndexRemovedResult.__tablename__),
+    ("_session", RunIndexSession.__tablename__),
+    ("_file", RunIndexFile.__tablename__),
+]
+
+
+def _copy_legacy_run_rows(connection, inspector) -> None:
+    table_names = set(inspector.get_table_names())
+    legacy_table = _legacy_run_table_name()
+    target_table = RunIndex.__tablename__
+    if legacy_table not in table_names or target_table not in table_names:
+        return
+    legacy_columns = _table_columns(inspector, legacy_table)
+    target_columns = _table_columns(inspector, target_table)
+    common_columns = [
+        column
+        for column in target_columns
+        if column in legacy_columns and column != "source_hash"
+    ]
+    required = {"id", "source_type", "source_key"}
+    if not required.issubset(set(common_columns)):
+        return
+    select_sql = ", ".join(_quote(connection, column) for column in common_columns)
+    rows = connection.execute(
+        text(f"SELECT {select_sql} FROM {_quote(connection, legacy_table)}")
+    ).mappings()
+    for row in rows:
+        run_id = str(row.get("id") or "")
+        source_type = str(row.get("source_type") or "")
+        source_key = str(row.get("source_key") or "")
+        if not run_id or not source_type or not source_key:
+            continue
+        source_hash = run_source_hash(source_type, source_key)
+        if _run_row_exists(
+            connection,
+            target_table,
+            run_id=run_id,
+            source_type=source_type,
+            source_hash=source_hash,
+        ):
+            continue
+        insert_columns = list(common_columns)
+        params = {column: row.get(column) for column in common_columns}
+        if "source_hash" in target_columns:
+            insert_columns.append("source_hash")
+            params["source_hash"] = source_hash
+        column_sql = ", ".join(_quote(connection, column) for column in insert_columns)
+        value_sql = ", ".join(f":{column}" for column in insert_columns)
+        connection.execute(
+            text(f"INSERT INTO {_quote(connection, target_table)} ({column_sql}) VALUES ({value_sql})"),
+            params,
+        )
+
+
+def _copy_legacy_run_child_rows(connection, inspector) -> None:
+    table_names = set(inspector.get_table_names())
+    target_parent_table = RunIndex.__tablename__
+    if target_parent_table not in table_names:
+        return
+    run_id_map = _legacy_run_id_map(connection, inspector)
+    legacy_fk = _legacy_run_fk_column()
+    for suffix, target_table in LEGACY_RUN_CHILD_TABLES:
+        legacy_table = _legacy_run_table_name(suffix)
+        if legacy_table not in table_names or target_table not in table_names:
+            continue
+        legacy_columns = _table_columns(inspector, legacy_table)
+        target_columns = _table_columns(inspector, target_table)
+        insert_columns: list[str] = []
+        select_expressions: list[str] = []
+        for target_column in target_columns:
+            legacy_column = legacy_fk if target_column == "run_index_id" else target_column
+            if legacy_column not in legacy_columns:
+                continue
+            insert_columns.append(target_column)
+            select_expressions.append(f"{_quote(connection, legacy_column)} AS {_quote(connection, target_column)}")
+        if "id" not in insert_columns or "run_index_id" not in insert_columns:
+            continue
+        rows = connection.execute(
+            text(
+                f"SELECT {', '.join(select_expressions)} "
+                f"FROM {_quote(connection, legacy_table)}"
+            )
+        ).mappings()
+        for row in rows:
+            row_id = str(row.get("id") or "")
+            run_id = str(row.get("run_index_id") or "")
+            if not row_id or not run_id:
+                continue
+            target_run_id = run_id_map.get(run_id, run_id)
+            if not _run_parent_exists(connection, target_parent_table, target_run_id):
+                continue
+            if _row_exists_by_id(connection, target_table, row_id):
+                continue
+            params = {column: row.get(column) for column in insert_columns}
+            params["run_index_id"] = target_run_id
+            column_sql = ", ".join(_quote(connection, column) for column in insert_columns)
+            value_sql = ", ".join(f":{column}" for column in insert_columns)
+            connection.execute(
+                text(f"INSERT INTO {_quote(connection, target_table)} ({column_sql}) VALUES ({value_sql})"),
+                params,
+            )
+
+
+def _legacy_table_rows_missing_in_target(connection, legacy_table: str, target_table: str) -> bool:
+    row = connection.execute(
+        text(
+            f"SELECT 1 FROM {_quote(connection, legacy_table)} legacy "
+            f"LEFT JOIN {_quote(connection, target_table)} target "
+            f"ON legacy.{_quote(connection, 'id')} = target.{_quote(connection, 'id')} "
+            f"WHERE target.{_quote(connection, 'id')} IS NULL LIMIT 1"
+        )
+    ).first()
+    return row is not None
+
+
+def _legacy_run_tables_fully_migrated(connection, inspector) -> bool:
+    table_names = set(inspector.get_table_names())
+    legacy_table = _legacy_run_table_name()
+    target_table = RunIndex.__tablename__
+    if legacy_table not in table_names:
+        return False
+    if target_table not in table_names:
+        return False
+    run_id_map = _legacy_run_id_map(connection, inspector)
+    legacy_ids = {
+        str(row.get("id") or "")
+        for row in connection.execute(
+            text(f"SELECT {_quote(connection, 'id')} FROM {_quote(connection, legacy_table)}")
+        ).mappings()
+    }
+    if any(legacy_id and legacy_id not in run_id_map for legacy_id in legacy_ids):
+        return False
+    for suffix, target_child_table in LEGACY_RUN_CHILD_TABLES:
+        legacy_child_table = _legacy_run_table_name(suffix)
+        if legacy_child_table not in table_names:
+            continue
+        if target_child_table not in table_names:
+            return False
+        if _legacy_table_rows_missing_in_target(connection, legacy_child_table, target_child_table):
+            return False
+    return True
+
+
+def _drop_legacy_run_tables(connection, inspector) -> None:
+    if not _legacy_run_tables_fully_migrated(connection, inspector):
+        return
+    table_names = set(inspector.get_table_names())
+    legacy_tables = [_legacy_run_table_name(suffix) for suffix, _ in reversed(LEGACY_RUN_CHILD_TABLES)]
+    legacy_tables.append(_legacy_run_table_name())
+    for table_name in legacy_tables:
+        if table_name in table_names:
+            connection.execute(text(f"DROP TABLE {_quote(connection, table_name)}"))
+
+
+def _migrate_legacy_run_tables(connection, inspector) -> None:
+    _backfill_run_source_hash(connection, inspector)
+    _copy_legacy_run_rows(connection, inspector)
+    inspector = inspect(connection)
+    _copy_legacy_run_child_rows(connection, inspector)
+    inspector = inspect(connection)
+    _backfill_run_source_hash(connection, inspector)
+    inspector = inspect(connection)
+    _drop_unique_source_key_index(connection, inspector)
+    inspector = inspect(connection)
+    _drop_legacy_run_tables(connection, inspector)
+
+
 def run_auto_migrations() -> None:
     engine = get_engine()
     dialect = engine.dialect.name
@@ -497,6 +810,7 @@ def run_auto_migrations() -> None:
         "workflow_definition_version": WorkflowDefinitionVersion.__tablename__,
         "trigger_task": TriggerTask.__tablename__,
         "workflow_execution": WorkflowExecution.__tablename__,
+        "run_index": RunIndex.__tablename__,
     }
 
     column_migrations = [
@@ -526,6 +840,7 @@ def run_auto_migrations() -> None:
         (tables["workflow_execution"], "process_status", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_status VARCHAR(32) NULL"),
         (tables["workflow_execution"], "process_started_at", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_started_at DATETIME NULL"),
         (tables["workflow_execution"], "process_finished_at", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_finished_at DATETIME NULL"),
+        (tables["run_index"], "source_hash", f"ALTER TABLE {tables['run_index']} ADD COLUMN source_hash VARCHAR(64) NOT NULL DEFAULT ''"),
     ]
     index_migrations = [
         (table_name, index_name, _render_index_sql(table_name, index_name, sql_template, dialect))
@@ -601,21 +916,24 @@ def run_auto_migrations() -> None:
                     "SET attempt_no = 1 WHERE attempt_no IS NULL OR attempt_no = 0"
                 ))
 
-        if dialect == "mysql" and HistoryRun.__tablename__ in inspector.get_table_names():
-            if _column_exists(inspector, HistoryRun.__tablename__, "log_tail_text"):
-                if _column_type_name(inspector, HistoryRun.__tablename__, "log_tail_text") != "MEDIUMTEXT":
+        if dialect == "mysql" and RunIndex.__tablename__ in inspector.get_table_names():
+            if _column_exists(inspector, RunIndex.__tablename__, "log_tail_text"):
+                if _column_type_name(inspector, RunIndex.__tablename__, "log_tail_text") != "MEDIUMTEXT":
                     connection.execute(text(
-                        f"ALTER TABLE {HistoryRun.__tablename__} "
+                        f"ALTER TABLE {RunIndex.__tablename__} "
                         "MODIFY COLUMN log_tail_text MEDIUMTEXT NULL"
                     ))
                     inspector = inspect(connection)
-            if _column_exists(inspector, HistoryRun.__tablename__, "source_mtime"):
-                if "DOUBLE" not in _column_type_name(inspector, HistoryRun.__tablename__, "source_mtime"):
+            if _column_exists(inspector, RunIndex.__tablename__, "source_mtime"):
+                if "DOUBLE" not in _column_type_name(inspector, RunIndex.__tablename__, "source_mtime"):
                     connection.execute(text(
-                        f"ALTER TABLE {HistoryRun.__tablename__} "
+                        f"ALTER TABLE {RunIndex.__tablename__} "
                         "MODIFY COLUMN source_mtime DOUBLE NOT NULL DEFAULT 0"
                     ))
                     inspector = inspect(connection)
+
+        inspector = inspect(connection)
+        _migrate_legacy_run_tables(connection, inspector)
 
         inspector = inspect(connection)
         for table_name, index_name, sql in index_migrations:

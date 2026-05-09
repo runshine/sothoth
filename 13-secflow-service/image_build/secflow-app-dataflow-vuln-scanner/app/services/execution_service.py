@@ -25,14 +25,14 @@ from app.artifacts.io import abs_path, ensure_dir, sanitize_name, write_json, wr
 from app.config import get_config
 from app.models.contracts import TaskItem, TaskManifest
 from app.models.database import (
-    HistoryRun,
-    HistoryRunCycle,
-    HistoryRunFile,
-    HistoryRunGlobalReview,
-    HistoryRunRemovedResult,
-    HistoryRunResult,
-    HistoryRunResultReview,
-    HistoryRunSession,
+    RunIndex,
+    RunIndexCycle,
+    RunIndexFile,
+    RunIndexGlobalReview,
+    RunIndexRemovedResult,
+    RunIndexResult,
+    RunIndexResultReview,
+    RunIndexSession,
     TriggerTask,
     WorkflowDefinition,
     WorkflowDefinitionVersion,
@@ -54,7 +54,7 @@ from app.schemas import (
     TriggerTaskInputTask,
 )
 from app.services.fileserver_client import get_fileserver_client
-from app.services.history_run_service import get_history_run_service
+from app.services.run_index_service import get_run_index_service
 from app.services.pi_vuln_adapter import (
     DbExecutionObserver,
     DbExecutionRecorder,
@@ -77,8 +77,8 @@ def _project_ids(principal: dict) -> set[str]:
     return set(principal.get("project_ids") or [])
 
 
-_ACTIVE_HISTORY_RUN_STATUSES = {"pending", "queued", "running", "cancel_requested", "delete_requested"}
-_RETRYABLE_HISTORY_RUN_STATUSES = {
+_ACTIVE_RUN_INDEX_STATUSES = {"pending", "queued", "running", "cancel_requested", "delete_requested"}
+_RETRYABLE_RUN_INDEX_STATUSES = {
     "cancelled",
     "failed",
     "interrupted",
@@ -207,8 +207,6 @@ class ExecutionService:
         return self._planned_run_root_for_trigger(trigger)
 
     def _run_locator_for_execution(self, execution: WorkflowExecution | None, trigger: TriggerTask | None = None) -> dict[str, str | None]:
-        if not self._trigger_uses_run_directory(trigger):
-            return {"run_name": None, "runs_root": None, "run_path": None}
         run_root = self._run_root_for_execution_or_trigger(execution, trigger)
         if run_root is None:
             return {"run_name": None, "runs_root": None, "run_path": None}
@@ -221,22 +219,23 @@ class ExecutionService:
     def _latest_run_summary_for_execution(self, db: Session, execution: WorkflowExecution | None, trigger: TriggerTask | None = None) -> dict[str, Any]:
         if execution is None:
             return {}
-        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
-        if history_run is None:
-            try:
-                history_run = self._ensure_history_run_for_execution(db, execution, trigger)
-            except Exception:
-                history_run = None
-        if history_run is None:
+        try:
+            run_index = get_run_index_service().get_run_index_by_execution(db, execution) if execution.workspace_root else None
+            if run_index is None:
+                run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+            if run_index is None:
+                return {}
+            return get_run_index_service().get_run_summary(db, run_index)
+        except Exception:
+            db.rollback()
             return {}
-        return get_history_run_service().get_history_run_summary(db, history_run)
 
-    def _ensure_history_run_for_execution(
+    def _ensure_run_index_for_execution(
         self,
         db: Session,
         execution: WorkflowExecution | None,
         trigger: TriggerTask | None = None,
-    ) -> HistoryRun | None:
+    ) -> RunIndex | None:
         if execution is None:
             return None
         run_root = self._run_root_for_execution_or_trigger(execution, trigger)
@@ -260,7 +259,7 @@ class ExecutionService:
                     pass
         if not run_root.is_dir():
             return None
-        return get_history_run_service().sync_run_path(
+        return get_run_index_service().sync_run_path(
             db,
             project_id=execution.project_id,
             run_root=run_root,
@@ -359,15 +358,19 @@ class ExecutionService:
                     artifact_refs.append(ArtifactRef.model_validate(item))
             runtime_overrides = dict(task_metadata.get("runtime_overrides") or {})
         attempts = []
-        history_service = get_history_run_service()
+        run_service = get_run_index_service()
         for item in self._list_executions_for_trigger(db, trigger.id):
-            history_run = history_service.get_history_run_by_execution(db, item) if item.workspace_root else None
-            if not task_markdown and history_run is not None:
+            try:
+                run_index = run_service.get_run_index_by_execution(db, item) if item.workspace_root else None
+            except Exception:
+                db.rollback()
+                run_index = None
+            if not task_markdown and run_index is not None:
                 try:
-                    task_markdown = (Path(history_run.run_root_path) / "input" / "task.md").read_text(encoding="utf-8")
+                    task_markdown = (Path(run_index.run_root_path) / "input" / "task.md").read_text(encoding="utf-8")
                 except (FileNotFoundError, TypeError):
                     task_markdown = ""
-            attempts.append(self._attempt_response(item, run_id=history_run.id if history_run else None))
+            attempts.append(self._attempt_response(item, run_id=run_index.id if run_index else None))
         payload = response.model_dump()
         payload["title"] = title
         return ScanTaskDetailResponse(
@@ -1536,10 +1539,10 @@ class ExecutionService:
             "process_signal": process_signal,
         }
 
-    def _history_run_status_is_active(self, status_text: str | None) -> bool:
-        return str(status_text or "").strip().lower() in _ACTIVE_HISTORY_RUN_STATUSES
+    def _run_index_status_is_active(self, status_text: str | None) -> bool:
+        return str(status_text or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES
 
-    def _adopted_history_run_task_status(self, status_text: str | None) -> str:
+    def _adopted_run_index_task_status(self, status_text: str | None) -> str:
         value = str(status_text or "").strip().lower()
         if value in {"pending", "queued", "running", "cancel_requested", "delete_requested", "failed", "cancelled", "orphaned"}:
             return value
@@ -1565,47 +1568,47 @@ class ExecutionService:
             return "failed"
         return value or "succeeded"
 
-    def _history_run_output_manifest_path(self, history_run) -> str | None:
-        atomic_work_path = str(history_run.atomic_work_path or "").strip()
+    def _run_index_output_manifest_path(self, run_index) -> str | None:
+        atomic_work_path = str(run_index.atomic_work_path or "").strip()
         if not atomic_work_path:
             return None
         candidate = Path(atomic_work_path) / "_meta" / "results_manifest.json"
         return abs_path(candidate) if candidate.exists() else None
 
-    def _history_run_adoption_manifest(self, history_run) -> dict[str, Any]:
+    def _run_index_adoption_manifest(self, run_index) -> dict[str, Any]:
         return TaskManifest(
             tasks=[
                 TaskItem(
                     task_id=_new_id("task"),
                     task_type="dataflow_vuln_scan_cli",
-                    title=f"Run {history_run.run_name}",
-                    task_md_path=abs_path(Path(history_run.run_root_path) / "input" / "task.md"),
+                    title=f"Run {run_index.run_name}",
+                    task_md_path=abs_path(Path(run_index.run_root_path) / "input" / "task.md"),
                     metadata={
                         "run_adoption": {
-                            "run_id": history_run.id,
-                            "source_type": history_run.source_type,
-                            "run_root_path": history_run.run_root_path,
+                            "run_id": run_index.id,
+                            "source_type": run_index.source_type,
+                            "run_root_path": run_index.run_root_path,
                             "adopted_at": isoformat_local(now_local()),
                         },
                         "runtime_overrides": {},
-                        "task_title": f"Run {history_run.run_name}",
+                        "task_title": f"Run {run_index.run_name}",
                     },
                     upstream_refs=[],
                 )
             ]
         ).model_dump(mode="json")
 
-    def _select_history_run_definition(self, db: Session, history_run, principal: dict) -> WorkflowDefinition:
+    def _select_run_index_definition(self, db: Session, run_index, principal: dict) -> WorkflowDefinition:
         workflow_service = get_workflow_service()
         candidate_ids: list[str] = []
-        if history_run.linked_task_id:
+        if run_index.linked_task_id:
             try:
-                trigger = self._trigger_or_404(db, history_run.linked_task_id)
+                trigger = self._trigger_or_404(db, run_index.linked_task_id)
                 candidate_ids.append(trigger.workflow_definition_id)
             except HTTPException:
                 pass
-        if history_run.profile_id:
-            candidate_ids.append(history_run.profile_id)
+        if run_index.profile_id:
+            candidate_ids.append(run_index.profile_id)
         for definition_id in candidate_ids:
             try:
                 definition = workflow_service._get_definition_or_404(db, definition_id)
@@ -1613,28 +1616,28 @@ class ExecutionService:
                 continue
             self._ensure_project_access(principal, definition.project_id)
             return definition
-        return workflow_service.get_or_create_default_profile_model(db, history_run.project_id, principal)
+        return workflow_service.get_or_create_default_profile_model(db, run_index.project_id, principal)
 
-    def _build_history_run_resume_request(self, *, history_run, payload: RunRetryRequest) -> dict[str, Any]:
+    def _build_run_index_resume_request(self, *, run_index, payload: RunRetryRequest) -> dict[str, Any]:
         return {
             "launcher": "run_vuln_scan.py",
-            "project_id": history_run.project_id,
-            "resume_run_dir": history_run.run_root_path,
+            "project_id": run_index.project_id,
+            "resume_run_dir": run_index.run_root_path,
             "resume_extra_cycles": payload.extra_cycles,
             "model": self._normalize_model_override(model=payload.model, provider=payload.provider),
             "provider": None,
             "clean_workspace": payload.clean_workspace,
             "options": {
-                "run_id": history_run.id,
+                "run_id": run_index.id,
                 "resume": True,
             },
         }
 
-    def _update_trigger_for_history_run_resume(
+    def _update_trigger_for_run_index_resume(
         self,
         *,
         trigger: TriggerTask,
-        history_run,
+        run_index,
         request: dict[str, Any],
     ) -> None:
         manifest = TaskManifest.model_validate(trigger.input_tasks_json)
@@ -1645,7 +1648,7 @@ class ExecutionService:
             first_task = TaskItem(
                 task_id=_new_id("task"),
                 task_type="dataflow_vuln_scan_cli",
-                title=f"Resume {history_run.run_name}",
+                title=f"Resume {run_index.run_name}",
                 task_md_path="",
                 metadata={},
                 upstream_refs=[],
@@ -1655,25 +1658,25 @@ class ExecutionService:
         metadata = dict(first_task.metadata or {})
         metadata["dataflow_scan_request"] = request
         metadata["run_retry"] = {
-            "run_id": history_run.id,
-            "source_type": history_run.source_type,
+            "run_id": run_index.id,
+            "source_type": run_index.source_type,
             "requested_at": isoformat_local(now_local()),
             "extra_cycles": extra_cycles,
         }
-        metadata["task_title"] = f"Resume {history_run.run_name}"
+        metadata["task_title"] = f"Resume {run_index.run_name}"
         first_task.task_type = "dataflow_vuln_scan_cli"
-        first_task.title = f"Resume {history_run.run_name}"
+        first_task.title = f"Resume {run_index.run_name}"
         first_task.metadata = metadata
         trigger.input_tasks_json = TaskManifest(tasks=[first_task, *remaining_tasks]).model_dump(mode="json")
         trigger.message = f"pending start: resume requested (+{extra_cycles} cycles)"
 
-    def _create_history_run_resume_task_record(
+    def _create_run_index_resume_task_record(
         self,
         db: Session,
         *,
         definition: WorkflowDefinition,
         definition_version: WorkflowDefinitionVersion,
-        history_run,
+        run_index,
         request: dict[str, Any],
         actor: str,
     ) -> tuple[TriggerTask, WorkflowExecution]:
@@ -1701,18 +1704,18 @@ class ExecutionService:
                 TaskItem(
                     task_id=_new_id("task"),
                     task_type="dataflow_vuln_scan_cli",
-                    title=f"Resume {history_run.run_name}",
-                    task_md_path=abs_path(Path(history_run.run_root_path) / "input" / "task.md"),
+                    title=f"Resume {run_index.run_name}",
+                    task_md_path=abs_path(Path(run_index.run_root_path) / "input" / "task.md"),
                     metadata={
                         "dataflow_scan_request": request,
                         "run_retry": {
-                            "run_id": history_run.id,
-                            "source_type": history_run.source_type,
+                            "run_id": run_index.id,
+                            "source_type": run_index.source_type,
                             "requested_at": isoformat_local(now_local()),
                             "extra_cycles": extra_cycles,
                         },
                         "runtime_overrides": {},
-                        "task_title": f"Resume {history_run.run_name}",
+                        "task_title": f"Resume {run_index.run_name}",
                     },
                     upstream_refs=[],
                 )
@@ -1844,7 +1847,7 @@ class ExecutionService:
         db.refresh(trigger)
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
         if latest_execution is not None and self._trigger_uses_run_directory(trigger):
-            self._ensure_history_run_for_execution(db, latest_execution, trigger)
+            self._ensure_run_index_for_execution(db, latest_execution, trigger)
             db.commit()
             db.refresh(trigger)
         if latest_execution is not None:
@@ -1889,30 +1892,30 @@ class ExecutionService:
         self._ensure_project_access(principal, trigger.project_id)
         return self._scan_task_response(db, trigger)
 
-    def _history_run_or_404(self, db: Session, history_run_id: str, principal: dict) -> Any:
-        history_run = get_history_run_service()._history_run_or_404(db, history_run_id)
-        self._ensure_project_access(principal, history_run.project_id)
-        return history_run
+    def _run_index_or_404(self, db: Session, run_index_id: str, principal: dict) -> Any:
+        run_index = get_run_index_service()._run_index_or_404(db, run_index_id)
+        self._ensure_project_access(principal, run_index.project_id)
+        return run_index
 
     def list_runs(self, db: Session, principal: dict, *, project_id: str) -> list[dict[str, Any]]:
         self._ensure_project_access(principal, project_id)
-        return get_history_run_service().list_history_runs(db, project_id)
+        return get_run_index_service().list_runs(db, project_id)
 
-    def _history_run_resolve_response(self, history_run: HistoryRun) -> dict[str, Any]:
+    def _run_index_resolve_response(self, run_index: RunIndex) -> dict[str, Any]:
         return {
-            "run_id": history_run.id,
-            "project_id": history_run.project_id,
-            "run_name": history_run.run_name,
-            "root_path": str(Path(history_run.run_root_path).resolve().parent),
-            "source_type": history_run.source_type,
-            "linked_task_id": history_run.linked_task_id,
-            "linked_execution_id": history_run.linked_execution_id,
+            "run_id": run_index.id,
+            "project_id": run_index.project_id,
+            "run_name": run_index.run_name,
+            "root_path": str(Path(run_index.run_root_path).resolve().parent),
+            "source_type": run_index.source_type,
+            "linked_task_id": run_index.linked_task_id,
+            "linked_execution_id": run_index.linked_execution_id,
         }
 
     def resolve_run(self, db: Session, principal: dict, *, project_id: str, run_name: str, root_path: str) -> dict[str, Any]:
         self._ensure_project_access(principal, project_id)
-        history_run = get_history_run_service().resolve_history_run(db, project_id=project_id, run_name=run_name, root_path=root_path)
-        return self._history_run_resolve_response(history_run)
+        run_index = get_run_index_service().resolve_run(db, project_id=project_id, run_name=run_name, root_path=root_path)
+        return self._run_index_resolve_response(run_index)
 
     def resolve_run_by_task(
         self,
@@ -1938,56 +1941,56 @@ class ExecutionService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="execution not found for task")
         else:
             execution = self._latest_execution_for_trigger(db, task_id)
-        get_history_run_service().sync_project_history_runs(db, project_id)
-        query = db.query(HistoryRun).filter(
-            HistoryRun.project_id == project_id,
-            HistoryRun.source_type == "execution_workspace",
-            HistoryRun.linked_task_id == task_id,
+        get_run_index_service().sync_project_runs(db, project_id)
+        query = db.query(RunIndex).filter(
+            RunIndex.project_id == project_id,
+            RunIndex.source_type == "execution_workspace",
+            RunIndex.linked_task_id == task_id,
         )
         if execution_id:
-            query = query.filter(HistoryRun.linked_execution_id == execution_id)
-        history_run = query.order_by(HistoryRun.started_at.desc(), HistoryRun.created_at.desc()).first()
-        if history_run is not None and not Path(history_run.run_root_path).is_dir():
-            history_run = None
-        if history_run is None:
-            history_run = self._ensure_history_run_for_execution(db, execution, trigger)
-            if history_run is not None:
+            query = query.filter(RunIndex.linked_execution_id == execution_id)
+        run_index = query.order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc()).first()
+        if run_index is not None and not Path(run_index.run_root_path).is_dir():
+            run_index = None
+        if run_index is None:
+            run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+            if run_index is not None:
                 db.commit()
-        if history_run is None:
+        if run_index is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found for task")
-        return self._history_run_resolve_response(history_run)
+        return self._run_index_resolve_response(run_index)
 
-    def get_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        return get_history_run_service().get_history_run_detail(db, history_run)
+    def get_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        return get_run_index_service().get_run_detail(db, run_index)
 
-    def get_run_cycle(self, db: Session, history_run_id: str, cycle: int, principal: dict) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        return get_history_run_service().get_history_run_cycle(db, history_run, cycle)
+    def get_run_cycle(self, db: Session, run_index_id: str, cycle: int, principal: dict) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        return get_run_index_service().get_run_cycle(db, run_index, cycle)
 
-    def list_run_sessions(self, db: Session, history_run_id: str, principal: dict) -> list[dict[str, Any]]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        return get_history_run_service().list_history_run_sessions(db, history_run)
+    def list_run_sessions(self, db: Session, run_index_id: str, principal: dict) -> list[dict[str, Any]]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        return get_run_index_service().list_run_sessions(db, run_index)
 
-    def list_run_files(self, db: Session, history_run_id: str, principal: dict, limit: int = 1200) -> list[dict[str, Any]]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        return get_history_run_service().list_history_run_files(db, history_run, limit=limit)
+    def list_run_files(self, db: Session, run_index_id: str, principal: dict, limit: int = 1200) -> list[dict[str, Any]]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        return get_run_index_service().list_run_files(db, run_index, limit=limit)
 
-    def get_run_file(self, db: Session, history_run_id: str, principal: dict, path: str) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        return get_history_run_service().get_history_run_file(db, history_run, path)
+    def get_run_file(self, db: Session, run_index_id: str, principal: dict, path: str) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        return get_run_index_service().get_run_file(db, run_index, path)
 
-    def get_run_session_file(self, db: Session, history_run_id: str, principal: dict, path: str) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        return get_history_run_service().get_history_run_session_file(db, history_run, path)
+    def get_run_session_file(self, db: Session, run_index_id: str, principal: dict, path: str) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        return get_run_index_service().get_run_session_file(db, run_index, path)
 
-    def get_run_log(self, db: Session, history_run_id: str, principal: dict, lines: int = 300) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        return get_history_run_service().get_history_run_log(db, history_run, lines=lines)
+    def get_run_log(self, db: Session, run_index_id: str, principal: dict, lines: int = 300) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        return get_run_index_service().get_run_log(db, run_index, lines=lines)
 
-    def _linked_history_run_runtime(self, db: Session, history_run) -> tuple[TriggerTask | None, WorkflowExecution | None]:
-        trigger = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
-        execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
+    def _linked_run_index_runtime(self, db: Session, run_index) -> tuple[TriggerTask | None, WorkflowExecution | None]:
+        trigger = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
+        execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
         if trigger is None and execution is not None:
             trigger = db.get(TriggerTask, execution.trigger_task_id)
         if trigger is not None and (execution is None or execution.trigger_task_id != trigger.id):
@@ -2001,7 +2004,7 @@ class ExecutionService:
             execution = db.get(WorkflowExecution, execution_id)
             if execution is None:
                 return True
-            if not self._history_run_status_is_active(execution.status):
+            if not self._run_index_status_is_active(execution.status):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -2027,17 +2030,17 @@ class ExecutionService:
                 db.delete(trigger)
         db.flush()
 
-    def delete_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        project_id = history_run.project_id
-        run_name = history_run.run_name
-        linked_task_id = history_run.linked_task_id
-        linked_execution_id = history_run.linked_execution_id
-        trigger, execution = self._linked_history_run_runtime(db, history_run)
+    def delete_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        project_id = run_index.project_id
+        run_name = run_index.run_name
+        linked_task_id = run_index.linked_task_id
+        linked_execution_id = run_index.linked_execution_id
+        trigger, execution = self._linked_run_index_runtime(db, run_index)
         stop_payload: dict[str, Any] = {"signal": None}
         process_pid = execution.process_pid if execution is not None else None
         process_host = execution.process_host if execution is not None else None
-        if execution is None and self._history_run_status_is_active(history_run.status):
+        if execution is None and self._run_index_status_is_active(run_index.status):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="active run is not linked to a managed execution; adopt/link it before deleting",
@@ -2053,7 +2056,7 @@ class ExecutionService:
                 trigger.finished_at = execution.finished_at
                 trigger.message = "deleted before dispatch"
                 db.add(trigger)
-        elif execution is not None and self._history_run_status_is_active(execution.status):
+        elif execution is not None and self._run_index_status_is_active(execution.status):
             execution.status = "delete_requested"
             execution.message = "delete requested; stopping run_vuln_scan.py"
             execution.process_status = "delete_requested"
@@ -2062,15 +2065,15 @@ class ExecutionService:
                 trigger.status = "delete_requested"
                 trigger.message = "delete requested; stopping run_vuln_scan.py"
                 db.add(trigger)
-            history_run = get_history_run_service().bind_runtime_state(
+            run_index = get_run_index_service().bind_runtime_state(
                 db,
-                history_run,
+                run_index,
                 linked_execution=execution,
                 linked_task=trigger,
-                profile_id=history_run.profile_id,
+                profile_id=run_index.profile_id,
                 status_text="delete_requested",
             )
-            self._write_run_control_state(history_run.run_root_path, status_text="delete_requested", message="delete requested")
+            self._write_run_control_state(run_index.run_root_path, status_text="delete_requested", message="delete requested")
             db.commit()
             stop_payload = self._signal_local_cli_process(execution.id, wait=True)
             process_pid = stop_payload.get("pid") or process_pid
@@ -2081,10 +2084,10 @@ class ExecutionService:
                     detail="run deletion requested but run_vuln_scan.py is still stopping; retry delete shortly",
                 )
             db.expire_all()
-            history_run = db.get(type(history_run), history_run_id)
-            if history_run is None:
+            run_index = db.get(type(run_index), run_index_id)
+            if run_index is None:
                 return self._run_mutation_response(
-                    run_id=history_run_id,
+                    run_id=run_index_id,
                     project_id=project_id,
                     status_text="deleted",
                     message=f"Run {run_name} deleted",
@@ -2095,10 +2098,10 @@ class ExecutionService:
                     process_signal=stop_payload.get("signal"),
                 )
         self._delete_linked_runtime_records(db, linked_task_id=linked_task_id, linked_execution_id=linked_execution_id)
-        get_history_run_service().delete_history_run(db, history_run, allow_active=True)
+        get_run_index_service().delete_run_index(db, run_index, allow_active=True)
         db.commit()
         return self._run_mutation_response(
-            run_id=history_run_id,
+            run_id=run_index_id,
             project_id=project_id,
             status_text="deleted",
             message=f"Run {run_name} deleted",
@@ -2109,14 +2112,14 @@ class ExecutionService:
             process_signal=stop_payload.get("signal"),
         )
 
-    def adopt_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        run_root = Path(history_run.run_root_path)
+    def adopt_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        run_root = Path(run_index.run_root_path)
         if not run_root.is_dir():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run directory not found")
 
-        trigger = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
-        execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
+        trigger = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
+        execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
         if trigger is None and execution is not None:
             trigger = db.get(TriggerTask, execution.trigger_task_id)
         if trigger is not None and execution is not None and execution.trigger_task_id != trigger.id:
@@ -2124,14 +2127,14 @@ class ExecutionService:
         if trigger is not None and execution is None:
             execution = self._latest_execution_for_trigger(db, trigger.id)
 
-        definition = self._select_history_run_definition(db, history_run, principal)
+        definition = self._select_run_index_definition(db, run_index, principal)
         definition_version = get_workflow_service().get_profile_version_model(db, definition.id)
         actor = _principal_id(principal)
-        task_status = self._adopted_history_run_task_status(history_run.status)
-        active = self._history_run_status_is_active(history_run.status)
-        started_at = history_run.started_at
-        finished_at = None if active else (history_run.finished_at or history_run.last_activity_at)
-        adoption_message = f"adopted Run {history_run.run_name}"
+        task_status = self._adopted_run_index_task_status(run_index.status)
+        active = self._run_index_status_is_active(run_index.status)
+        started_at = run_index.started_at
+        finished_at = None if active else (run_index.finished_at or run_index.last_activity_at)
+        adoption_message = f"adopted Run {run_index.run_name}"
 
         if trigger is None:
             trigger = TriggerTask(
@@ -2139,9 +2142,9 @@ class ExecutionService:
                 workflow_definition_id=definition.id,
                 workflow_definition_version_id=definition_version.id,
                 profile_id=definition.id,
-                project_id=history_run.project_id,
+                project_id=run_index.project_id,
                 trigger_type="manual",
-                input_tasks_json=self._history_run_adoption_manifest(history_run),
+                input_tasks_json=self._run_index_adoption_manifest(run_index),
                 priority=definition.priority_default,
                 status=task_status,
                 submitted_by=actor,
@@ -2157,8 +2160,8 @@ class ExecutionService:
             trigger.workflow_definition_id = definition.id
             trigger.workflow_definition_version_id = definition_version.id
             trigger.profile_id = definition.id
-            trigger.project_id = history_run.project_id
-            trigger.input_tasks_json = self._history_run_adoption_manifest(history_run)
+            trigger.project_id = run_index.project_id
+            trigger.input_tasks_json = self._run_index_adoption_manifest(run_index)
             trigger.status = task_status
             trigger.started_at = started_at
             trigger.finished_at = finished_at
@@ -2172,7 +2175,7 @@ class ExecutionService:
                 trigger_task_id=trigger.id,
                 workflow_definition_id=definition.id,
                 workflow_definition_version_id=definition_version.id,
-                project_id=history_run.project_id,
+                project_id=run_index.project_id,
                 attempt_no=(
                     db.query(WorkflowExecution)
                     .filter(WorkflowExecution.trigger_task_id == trigger.id)
@@ -2181,8 +2184,8 @@ class ExecutionService:
                 status=task_status,
                 recovery_reason="run adopted",
                 workspace_root=abs_path(run_root),
-                output_manifest_path=self._history_run_output_manifest_path(history_run),
-                output_task_count=history_run.result_count,
+                output_manifest_path=self._run_index_output_manifest_path(run_index),
+                output_task_count=run_index.result_count,
                 started_at=started_at,
                 finished_at=finished_at,
                 message=adoption_message,
@@ -2192,12 +2195,12 @@ class ExecutionService:
             execution.trigger_task_id = trigger.id
             execution.workflow_definition_id = definition.id
             execution.workflow_definition_version_id = definition_version.id
-            execution.project_id = history_run.project_id
+            execution.project_id = run_index.project_id
             execution.status = task_status
             execution.recovery_reason = execution.recovery_reason or "run adopted"
             execution.workspace_root = abs_path(run_root)
-            execution.output_manifest_path = self._history_run_output_manifest_path(history_run)
-            execution.output_task_count = history_run.result_count
+            execution.output_manifest_path = self._run_index_output_manifest_path(run_index)
+            execution.output_task_count = run_index.result_count
             execution.started_at = started_at
             execution.finished_at = finished_at
             execution.message = adoption_message
@@ -2206,13 +2209,13 @@ class ExecutionService:
 
         trigger.latest_execution_id = execution.id
         db.add(trigger)
-        history_run = get_history_run_service().bind_runtime_state(
+        run_index = get_run_index_service().bind_runtime_state(
             db,
-            history_run,
+            run_index,
             linked_execution=execution,
             linked_task=trigger,
             profile_id=definition.id,
-            status_text=history_run.status,
+            status_text=run_index.status,
         )
         db.commit()
         self.record_event(
@@ -2221,25 +2224,25 @@ class ExecutionService:
             event_type="run_adopted",
             message=adoption_message,
             payload_json={
-                "run_id": history_run.id,
-                "project_id": history_run.project_id,
-                "run_root_path": history_run.run_root_path,
+                "run_id": run_index.id,
+                "project_id": run_index.project_id,
+                "run_root_path": run_index.run_root_path,
             },
         )
         return self._run_mutation_response(
-            run_id=history_run.id,
-            project_id=history_run.project_id,
-            status_text=history_run.status,
+            run_id=run_index.id,
+            project_id=run_index.project_id,
+            status_text=run_index.status,
             message=adoption_message,
             linked_task_id=trigger.id,
             linked_execution_id=execution.id,
         )
 
-    def cancel_run(self, db: Session, history_run_id: str, principal: dict) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        if history_run.linked_task_id:
-            self.cancel_scan_task(db, history_run.linked_task_id, principal, signal_process=False)
-            trigger = self._trigger_or_404(db, history_run.linked_task_id)
+    def cancel_run(self, db: Session, run_index_id: str, principal: dict) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        if run_index.linked_task_id:
+            self.cancel_scan_task(db, run_index.linked_task_id, principal, signal_process=False)
+            trigger = self._trigger_or_404(db, run_index.linked_task_id)
             latest_execution = self._latest_execution_for_trigger(db, trigger.id)
             stop_payload = (
                 self._signal_local_cli_process(latest_execution.id, wait=False)
@@ -2254,23 +2257,23 @@ class ExecutionService:
             elif latest_execution.status == "pending":
                 status_text = "cancelled"
                 message = "Run cancelled before dispatch"
-            self._write_run_control_state(history_run.run_root_path, status_text=status_text, message=message)
-            history_run = get_history_run_service().bind_runtime_state(
+            self._write_run_control_state(run_index.run_root_path, status_text=status_text, message=message)
+            run_index = get_run_index_service().bind_runtime_state(
                 db,
-                history_run,
+                run_index,
                 linked_execution=latest_execution,
                 linked_task=trigger,
-                profile_id=history_run.profile_id,
+                profile_id=run_index.profile_id,
                 status_text=status_text,
             )
             db.commit()
             return self._run_mutation_response(
-                run_id=history_run.id,
-                project_id=history_run.project_id,
-                status_text=history_run.status,
+                run_id=run_index.id,
+                project_id=run_index.project_id,
+                status_text=run_index.status,
                 message=message,
-                linked_task_id=history_run.linked_task_id,
-                linked_execution_id=history_run.linked_execution_id,
+                linked_task_id=run_index.linked_task_id,
+                linked_execution_id=run_index.linked_execution_id,
                 process_pid=stop_payload.get("pid") or (latest_execution.process_pid if latest_execution else None),
                 process_host=latest_execution.process_host if latest_execution else None,
                 process_signal=stop_payload.get("signal"),
@@ -2280,36 +2283,36 @@ class ExecutionService:
     def retry_run(
         self,
         db: Session,
-        history_run_id: str,
+        run_index_id: str,
         principal: dict,
         payload: RunRetryRequest,
     ) -> dict[str, Any]:
-        history_run = self._history_run_or_404(db, history_run_id, principal)
-        run_root = Path(history_run.run_root_path)
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        run_root = Path(run_index.run_root_path)
         if not run_root.is_dir():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run directory not found")
-        status_value = str(history_run.status or "").strip().lower()
-        if status_value in _ACTIVE_HISTORY_RUN_STATUSES:
+        status_value = str(run_index.status or "").strip().lower()
+        if status_value in _ACTIVE_RUN_INDEX_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="run is still active; cancel it and wait until terminal before retry",
             )
-        if status_value not in _RETRYABLE_HISTORY_RUN_STATUSES:
+        if status_value not in _RETRYABLE_RUN_INDEX_STATUSES:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=f"run status is not retryable: {status_value or 'unknown'}",
             )
 
-        definition = self._select_history_run_definition(db, history_run, principal)
+        definition = self._select_run_index_definition(db, run_index, principal)
         workflow_service = get_workflow_service()
         definition_version = workflow_service.get_profile_version_model(db, definition.id)
-        request = self._build_history_run_resume_request(history_run=history_run, payload=payload)
+        request = self._build_run_index_resume_request(run_index=run_index, payload=payload)
         actor = _principal_id(principal)
 
-        trigger = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
+        trigger = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
         if trigger is not None:
             self._ensure_project_access(principal, trigger.project_id)
-            self._update_trigger_for_history_run_resume(trigger=trigger, history_run=history_run, request=request)
+            self._update_trigger_for_run_index_resume(trigger=trigger, run_index=run_index, request=request)
             db.add(trigger)
             execution = self._create_dataflow_cli_execution_attempt(
                 db,
@@ -2320,18 +2323,18 @@ class ExecutionService:
                 recovery_reason="manual run resume requested",
             )
         else:
-            trigger, execution = self._create_history_run_resume_task_record(
+            trigger, execution = self._create_run_index_resume_task_record(
                 db,
                 definition=definition,
                 definition_version=definition_version,
-                history_run=history_run,
+                run_index=run_index,
                 request=request,
                 actor=actor,
             )
 
-        history_run = get_history_run_service().bind_runtime_state(
+        run_index = get_run_index_service().bind_runtime_state(
             db,
-            history_run,
+            run_index,
             linked_execution=execution,
             linked_task=trigger,
             profile_id=definition.id,
@@ -2344,16 +2347,16 @@ class ExecutionService:
             event_type="execution_requeued",
             message="manual run resume requested",
             payload_json={
-                "run_id": history_run.id,
-                "project_id": history_run.project_id,
-                "run_root_path": history_run.run_root_path,
+                "run_id": run_index.id,
+                "project_id": run_index.project_id,
+                "run_root_path": run_index.run_root_path,
                 "extra_cycles": payload.extra_cycles,
             },
         )
         return self._run_mutation_response(
-            run_id=history_run.id,
-            project_id=history_run.project_id,
-            status_text=history_run.status,
+            run_id=run_index.id,
+            project_id=run_index.project_id,
+            status_text=run_index.status,
             message="Run resume started",
             linked_task_id=trigger.id,
             linked_execution_id=execution.id,
@@ -2404,26 +2407,26 @@ class ExecutionService:
                 trigger = self._trigger_or_404(db, task_id)
 
         executions = self._list_executions_for_trigger(db, trigger.id)
-        history_run_ids: set[str] = set()
+        run_index_ids: set[str] = set()
         workspace_roots: set[str] = set()
         for execution in executions:
             if execution.workspace_root:
                 workspace_roots.add(execution.workspace_root)
-            history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
-            if history_run:
-                history_run_ids.add(history_run.id)
-                if history_run.run_root_path:
-                    workspace_roots.add(history_run.run_root_path)
+            run_index = get_run_index_service().get_run_index_by_execution(db, execution) if execution.workspace_root else None
+            if run_index:
+                run_index_ids.add(run_index.id)
+                if run_index.run_root_path:
+                    workspace_roots.add(run_index.run_root_path)
 
-        if history_run_ids:
-            db.query(HistoryRunFile).filter(HistoryRunFile.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
-            db.query(HistoryRunSession).filter(HistoryRunSession.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
-            db.query(HistoryRunRemovedResult).filter(HistoryRunRemovedResult.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
-            db.query(HistoryRunResultReview).filter(HistoryRunResultReview.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
-            db.query(HistoryRunResult).filter(HistoryRunResult.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
-            db.query(HistoryRunGlobalReview).filter(HistoryRunGlobalReview.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
-            db.query(HistoryRunCycle).filter(HistoryRunCycle.history_run_id.in_(list(history_run_ids))).delete(synchronize_session=False)
-            db.query(HistoryRun).filter(HistoryRun.id.in_(list(history_run_ids))).delete(synchronize_session=False)
+        if run_index_ids:
+            db.query(RunIndexFile).filter(RunIndexFile.run_index_id.in_(list(run_index_ids))).delete(synchronize_session=False)
+            db.query(RunIndexSession).filter(RunIndexSession.run_index_id.in_(list(run_index_ids))).delete(synchronize_session=False)
+            db.query(RunIndexRemovedResult).filter(RunIndexRemovedResult.run_index_id.in_(list(run_index_ids))).delete(synchronize_session=False)
+            db.query(RunIndexResultReview).filter(RunIndexResultReview.run_index_id.in_(list(run_index_ids))).delete(synchronize_session=False)
+            db.query(RunIndexResult).filter(RunIndexResult.run_index_id.in_(list(run_index_ids))).delete(synchronize_session=False)
+            db.query(RunIndexGlobalReview).filter(RunIndexGlobalReview.run_index_id.in_(list(run_index_ids))).delete(synchronize_session=False)
+            db.query(RunIndexCycle).filter(RunIndexCycle.run_index_id.in_(list(run_index_ids))).delete(synchronize_session=False)
+            db.query(RunIndex).filter(RunIndex.id.in_(list(run_index_ids))).delete(synchronize_session=False)
 
         execution_ids = [execution.id for execution in executions]
         if execution_ids:
@@ -2780,7 +2783,7 @@ class ExecutionService:
             self._update_trigger_cli_task(trigger=trigger, metadata=metadata, task_md_path=plan["task_md_path"])
             db.add(trigger)
             db.commit()
-            get_history_run_service().sync_execution_run(db, execution)
+            get_run_index_service().sync_execution_run(db, execution)
             db.commit()
             self.record_event(
                 db,
@@ -2808,7 +2811,7 @@ class ExecutionService:
             exit_code = self._invoke_run_vuln_scan_cli(**invoke_kwargs)
             db.refresh(execution)
             db.refresh(trigger)
-            history_run = get_history_run_service().sync_execution_run(db, execution)
+            run_index = get_run_index_service().sync_execution_run(db, execution)
             output_summary = run_dir / "output" / "execution_summary.json"
             output_manifest = run_dir / "output" / "tasks.json"
             output_manifest_path = output_manifest if output_manifest.is_file() else output_summary if output_summary.is_file() else None
@@ -2835,10 +2838,10 @@ class ExecutionService:
                 execution_status=terminal_status,
                 message=message,
                 output_manifest_path=abs_path(output_manifest_path) if output_manifest_path else None,
-                output_task_count=int(history_run.result_count if history_run else 0),
+                output_task_count=int(run_index.result_count if run_index else 0),
             )
             db.commit()
-            get_history_run_service().sync_execution_run(db, execution)
+            get_run_index_service().sync_execution_run(db, execution)
             db.commit()
             event_type = "execution_finished"
             if terminal_status == "cancelled":
@@ -2942,7 +2945,7 @@ class ExecutionService:
                     "last_updated_at": isoformat_local(now_local()),
                 },
             )
-            get_history_run_service().sync_execution_run(db, execution)
+            get_run_index_service().sync_execution_run(db, execution)
             db.commit()
             log_path = attach_log_file(abs_path(workspace_root / "run.log"))
             self.record_event(
@@ -3001,7 +3004,7 @@ class ExecutionService:
                     "last_updated_at": isoformat_local(now_local()),
                 },
             )
-            get_history_run_service().sync_execution_run(db, execution)
+            get_run_index_service().sync_execution_run(db, execution)
             db.commit()
             self.record_event(
                 db,
@@ -3038,7 +3041,7 @@ class ExecutionService:
                             "last_updated_at": isoformat_local(now_local()),
                         },
                     )
-                    get_history_run_service().sync_execution_run(db, execution)
+                    get_run_index_service().sync_execution_run(db, execution)
                     db.commit()
                 self.record_event(
                     db,
@@ -3067,7 +3070,7 @@ class ExecutionService:
                         "last_updated_at": isoformat_local(now_local()),
                     },
                 )
-                get_history_run_service().sync_execution_run(db, execution)
+                get_run_index_service().sync_execution_run(db, execution)
                 db.commit()
             self.record_event(
                 db,

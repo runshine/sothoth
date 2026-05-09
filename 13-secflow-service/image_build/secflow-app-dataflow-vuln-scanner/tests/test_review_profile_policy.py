@@ -35,12 +35,15 @@ def test_review_profiles_have_monotonic_execution_budgets() -> None:
     assert audit.review_enabled is True
     assert [fast.default_max_review_cycles, balanced.default_max_review_cycles, audit.default_max_review_cycles] == [1, 6, 10]
     assert fast.max_worker_turns_per_cycle < balanced.max_worker_turns_per_cycle < audit.max_worker_turns_per_cycle
-    assert fast.worker_rpc_stdout_abort_bytes < balanced.worker_rpc_stdout_abort_bytes < audit.worker_rpc_stdout_abort_bytes
+    assert fast.worker_rpc_stdout_trace_bytes < balanced.worker_rpc_stdout_trace_bytes < audit.worker_rpc_stdout_trace_bytes
+    assert [fast.worker_rpc_stdout_abort_bytes, balanced.worker_rpc_stdout_abort_bytes, audit.worker_rpc_stdout_abort_bytes] == [0, 0, 0]
     assert [fast.advisor_max_internal_turns, balanced.advisor_max_internal_turns, audit.advisor_max_internal_turns] == [0, 0, 0]
-    assert fast.advisor_rpc_stdout_abort_bytes < balanced.advisor_rpc_stdout_abort_bytes < audit.advisor_rpc_stdout_abort_bytes
+    assert fast.advisor_rpc_stdout_trace_bytes < balanced.advisor_rpc_stdout_trace_bytes < audit.advisor_rpc_stdout_trace_bytes
+    assert [fast.advisor_rpc_stdout_abort_bytes, balanced.advisor_rpc_stdout_abort_bytes, audit.advisor_rpc_stdout_abort_bytes] == [0, 0, 0]
     assert fast.reflection_passes_per_cycle < balanced.reflection_passes_per_cycle < audit.reflection_passes_per_cycle
     assert [fast.reflection_max_internal_turns, balanced.reflection_max_internal_turns, audit.reflection_max_internal_turns] == [0, 0, 0]
-    assert fast.reflection_rpc_stdout_abort_bytes < balanced.reflection_rpc_stdout_abort_bytes < audit.reflection_rpc_stdout_abort_bytes
+    assert fast.reflection_rpc_stdout_trace_bytes < balanced.reflection_rpc_stdout_trace_bytes < audit.reflection_rpc_stdout_trace_bytes
+    assert [fast.reflection_rpc_stdout_abort_bytes, balanced.reflection_rpc_stdout_abort_bytes, audit.reflection_rpc_stdout_abort_bytes] == [0, 0, 0]
     assert fast.min_evidence_artifacts < balanced.min_evidence_artifacts < audit.min_evidence_artifacts
     assert len(fast.required_pattern_families) < len(balanced.required_pattern_families) < len(audit.required_pattern_families)
     assert fast.min_declared_extraction_ratio < balanced.min_declared_extraction_ratio <= audit.min_declared_extraction_ratio
@@ -343,7 +346,7 @@ def test_profile_template_runtime_overrides_cannot_lower_profile_runtime_budgets
     assert engine["reflection_rpc_stdout_abort_bytes"] == policy.reflection_rpc_stdout_abort_bytes
 
 
-def test_worker_reflection_stdout_abort_uses_profile_floor_for_stale_configs() -> None:
+def test_worker_reflection_stdout_abort_is_disabled_by_profile_even_for_stale_configs() -> None:
     wf_def = type(
         "WF",
         (),
@@ -364,10 +367,7 @@ def test_worker_reflection_stdout_abort_uses_profile_floor_for_stale_configs() -
 
     limits = WorkerExecutor._effective_reflection_runtime_limits(wf_def, ctx)
 
-    assert (
-        limits["rpc_stdout_abort_bytes"]
-        == get_review_profile_policy("balanced").reflection_rpc_stdout_abort_bytes
-    )
+    assert limits["rpc_stdout_abort_bytes"] == 0
 
 
 def test_profile_gate_requires_artifacts_and_pattern_family_evidence(tmp_path) -> None:

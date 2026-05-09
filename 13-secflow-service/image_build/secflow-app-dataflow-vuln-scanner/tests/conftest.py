@@ -76,12 +76,13 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     monkeypatch.setenv("SECFLOW_DATAFLOW_CLI_IN_PROCESS", "1")
     reset_config()
     reset_database_state()
-    from app.services import auth, execution_service, fileserver_client, project, scheduler, workflow_service
+    from app.services import auth, execution_service, fileserver_client, project, run_index_service, scheduler, workflow_service
 
     auth._auth_service = None
     execution_service._execution_service = None
     fileserver_client._fileserver_client = None
     project._project_service = None
+    run_index_service._run_index_service = None
     scheduler._scheduler_service = None
     workflow_service._workflow_service = None
     init_database()
@@ -92,5 +93,6 @@ def service_config_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     execution_service._execution_service = None
     fileserver_client._fileserver_client = None
     project._project_service = None
+    run_index_service._run_index_service = None
     scheduler._scheduler_service = None
     workflow_service._workflow_service = None

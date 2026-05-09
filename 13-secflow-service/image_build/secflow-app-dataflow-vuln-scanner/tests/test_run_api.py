@@ -7,19 +7,23 @@ import uuid
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy import inspect, text
 
 from app.config import get_config
 from app.main import create_app
 from app.models.database import (
-    HistoryRun,
+    RunIndex,
+    RunIndexCycle,
     TriggerTask,
     WorkflowDefinitionVersion,
     WorkflowExecution,
     WorkflowExecutionEvent,
     get_db_session,
+    init_database,
+    run_source_hash,
 )
 from app.services.execution_service import get_execution_service
-from app.services.history_run_service import get_history_run_service
+from app.services.run_index_service import get_run_index_service
 from app.services.scheduler import get_scheduler_service
 
 
@@ -231,14 +235,14 @@ def _create_execution_bound_run(client: TestClient, run_root: Path, *, title: st
         db.flush()
         trigger.latest_execution_id = execution.id
         db.add(trigger)
-        history_run = get_history_run_service().sync_execution_run(db, execution)
-        assert history_run is not None
+        run_index = get_run_index_service().sync_execution_run(db, execution)
+        assert run_index is not None
         db.commit()
         return {
             "profile_id": profile["profile_id"],
             "task_id": trigger.id,
             "execution_id": execution.id,
-            "run_id": history_run.id,
+            "run_id": run_index.id,
             "run_root": str(run_root.resolve()),
             "run_name": run_root.name,
         }
@@ -367,7 +371,7 @@ def test_run_reparses_when_atomic_work_path_was_stale(service_config_path):
     bound = _create_execution_bound_run(client, _project_runs_root() / "bound_atomic_refresh_20260508_010203")
 
     with get_db_session() as db:
-        row = db.get(HistoryRun, bound["run_id"])
+        row = db.get(RunIndex, bound["run_id"])
         assert row is not None
         row.atomic_work_path = ""
         row.cycles_used = 0
@@ -399,10 +403,10 @@ def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     assert "not retryable" in completed_retry_response.json()["detail"]
 
     with get_db_session() as db:
-        history_run = db.get(HistoryRun, bound["run_id"])
-        assert history_run is not None
-        history_run.status = "failed"
-        db.add(history_run)
+        run_index = db.get(RunIndex, bound["run_id"])
+        assert run_index is not None
+        run_index.status = "failed"
+        db.add(run_index)
         db.commit()
 
     retry_response = client.post(
@@ -438,16 +442,16 @@ def test_run_cancel_active_run_signals_bound_process(service_config_path):
     bound = _create_execution_bound_run(client, _project_runs_root() / "bound_cancel_active_20260508_010203")
 
     with get_db_session() as db:
-        history_run = db.get(HistoryRun, bound["run_id"])
+        run_index = db.get(RunIndex, bound["run_id"])
         execution = db.get(WorkflowExecution, bound["execution_id"])
         trigger = db.get(TriggerTask, bound["task_id"])
-        assert history_run is not None and execution is not None and trigger is not None
-        history_run.status = "running"
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "running"
         execution.status = "running"
         execution.process_pid = 4242
         execution.process_status = "running"
         trigger.status = "running"
-        db.add_all([history_run, execution, trigger])
+        db.add_all([run_index, execution, trigger])
         db.commit()
 
     fake_process = _FakeCliProcess()
@@ -464,9 +468,9 @@ def test_run_cancel_active_run_signals_bound_process(service_config_path):
 
     with get_db_session() as db:
         execution = db.get(WorkflowExecution, bound["execution_id"])
-        history_run = db.get(HistoryRun, bound["run_id"])
+        run_index = db.get(RunIndex, bound["run_id"])
         assert execution is not None and execution.status == "cancel_requested"
-        assert history_run is not None and history_run.status == "cancel_requested"
+        assert run_index is not None and run_index.status == "cancel_requested"
 
 
 def test_run_delete_active_run_stops_process_and_removes_records(service_config_path, monkeypatch):
@@ -476,16 +480,16 @@ def test_run_delete_active_run_stops_process_and_removes_records(service_config_
     bound = _create_execution_bound_run(client, run_root)
 
     with get_db_session() as db:
-        history_run = db.get(HistoryRun, bound["run_id"])
+        run_index = db.get(RunIndex, bound["run_id"])
         execution = db.get(WorkflowExecution, bound["execution_id"])
         trigger = db.get(TriggerTask, bound["task_id"])
-        assert history_run is not None and execution is not None and trigger is not None
-        history_run.status = "running"
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "running"
         execution.status = "running"
         execution.process_pid = 4242
         execution.process_status = "running"
         trigger.status = "running"
-        db.add_all([history_run, execution, trigger])
+        db.add_all([run_index, execution, trigger])
         db.add(WorkflowExecutionEvent(
             id="evt-active-delete",
             execution_id=bound["execution_id"],
@@ -511,7 +515,7 @@ def test_run_delete_active_run_stops_process_and_removes_records(service_config_
     assert not run_root.exists()
 
     with get_db_session() as db:
-        assert db.get(HistoryRun, bound["run_id"]) is None
+        assert db.get(RunIndex, bound["run_id"]) is None
         assert db.get(TriggerTask, bound["task_id"]) is None
         assert db.get(WorkflowExecution, bound["execution_id"]) is None
         assert db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id == bound["execution_id"]).count() == 0
@@ -524,10 +528,10 @@ def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypat
     bound = _create_execution_bound_run(client, run_root)
 
     with get_db_session() as db:
-        history_run = db.get(HistoryRun, bound["run_id"])
-        assert history_run is not None
-        history_run.status = "cancelled"
-        db.add(history_run)
+        run_index = db.get(RunIndex, bound["run_id"])
+        assert run_index is not None
+        run_index.status = "cancelled"
+        db.add(run_index)
         db.commit()
 
     captured: dict[str, list[str]] = {}
@@ -620,3 +624,233 @@ def test_run_sessions_expose_stdout_soft_limit_metadata(service_config_path):
     assert call["stdout_truncated"] is True
     assert call["stdout_soft_limit_exceeded"] is True
     assert call["events_truncated_count"] == 3
+
+
+def test_run_table_migration_copies_legacy_rows_and_hashes_source(service_config_path):
+    legacy_base = "history" + "_run"
+    legacy_fk = legacy_base + "_id"
+    legacy_run_table = RunIndex.__tablename__.replace("run_index", legacy_base)
+    legacy_cycle_table = RunIndexCycle.__tablename__.replace("run_index", legacy_base)
+    run_root = service_config_path.parent / "legacy_migrated_run"
+    run_root.mkdir(parents=True, exist_ok=True)
+
+    db = get_db_session()
+    try:
+        run_columns = [column.name for column in RunIndex.__table__.columns if column.name != "source_hash"]
+        run_select = ", ".join(run_columns)
+        db.execute(text(f"CREATE TABLE {legacy_run_table} AS SELECT {run_select} FROM {RunIndex.__tablename__} WHERE 0"))
+        run_values = {column: None for column in run_columns}
+        run_values.update({
+            "id": "ri-legacy-001",
+            "project_id": "default",
+            "source_type": "execution_workspace",
+            "source_key": str(run_root.resolve()),
+            "run_name": run_root.name,
+            "run_root_path": str(run_root.resolve()),
+            "status": "completed",
+            "duration_seconds": 12,
+            "model": "",
+            "provider": "",
+            "thinking": "",
+            "max_cycles": 1,
+            "cycles_used": 1,
+            "result_count": 0,
+            "passed_count": 0,
+            "failed_count": 0,
+            "workflow_mode": "",
+            "config_json": "{}",
+            "manifests_json": "{}",
+            "latest_issues_json": "[]",
+            "raw_summary_json": "{}",
+            "log_size_bytes": 0,
+            "source_mtime": 0,
+        })
+        db.execute(
+            text(
+                f"INSERT INTO {legacy_run_table} ({', '.join(run_columns)}) "
+                f"VALUES ({', '.join(f':{column}' for column in run_columns)})"
+            ),
+            run_values,
+        )
+
+        cycle_select = []
+        for column in RunIndexCycle.__table__.columns:
+            if column.name == "run_index_id":
+                cycle_select.append(f"{column.name} AS {legacy_fk}")
+            else:
+                cycle_select.append(column.name)
+        db.execute(
+            text(
+                f"CREATE TABLE {legacy_cycle_table} AS "
+                f"SELECT {', '.join(cycle_select)} FROM {RunIndexCycle.__tablename__} WHERE 0"
+            )
+        )
+        cycle_columns = [legacy_fk if column.name == "run_index_id" else column.name for column in RunIndexCycle.__table__.columns]
+        cycle_values = {column: None for column in cycle_columns}
+        cycle_values.update({
+            "id": "ric-legacy-001",
+            legacy_fk: "ri-legacy-001",
+            "cycle": 1,
+            "timestamp": "2026-05-08T01:02:03Z",
+            "outcome": "all_passed",
+            "workflow_mode": "discovery",
+            "global_passed": True,
+            "failed_advisor_id": "",
+            "failed_role_name": "",
+            "result_total": 0,
+            "result_passed": 0,
+            "result_failed": 0,
+            "scores_json": "{}",
+            "metrics_json": "{}",
+            "issues_json": "[]",
+            "plateau_status_json": "{}",
+            "raw_json": "{}",
+        })
+        db.execute(
+            text(
+                f"INSERT INTO {legacy_cycle_table} ({', '.join(cycle_columns)}) "
+                f"VALUES ({', '.join(f':{column}' for column in cycle_columns)})"
+            ),
+            cycle_values,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    init_database()
+
+    db = get_db_session()
+    try:
+        migrated = db.get(RunIndex, "ri-legacy-001")
+        assert migrated is not None
+        assert migrated.source_hash == run_source_hash("execution_workspace", str(run_root.resolve()))
+        assert db.query(RunIndexCycle).filter(RunIndexCycle.run_index_id == migrated.id).count() == 1
+        indexes = {item["name"]: item for item in inspect(db.bind).get_indexes(RunIndex.__tablename__)}
+        assert indexes["ux_dfvs_ri_source_hash"]["unique"] in (True, 1)
+        assert indexes["ix_dfvs_ri_source_key"].get("unique") in (False, 0, None)
+        tables = set(inspect(db.bind).get_table_names())
+        assert legacy_run_table not in tables
+        assert legacy_cycle_table not in tables
+    finally:
+        db.close()
+
+
+def test_run_sync_allows_long_common_prefix_source_keys(service_config_path):
+    common = service_config_path.parent / "long_prefix_runs"
+    for index in range(12):
+        common = common / f"segment_{index:02d}_{'a' * 42}"
+    run_one = common / "run_one"
+    run_two = common / "run_two"
+    assert len(str(common.resolve())) > 512
+    _create_run_workspace(run_one)
+    _create_run_workspace(run_two)
+
+    db = get_db_session()
+    try:
+        service = get_run_index_service()
+        first = service.sync_run_path(
+            db,
+            project_id="default",
+            run_root=run_one,
+            source_type="execution_workspace",
+        )
+        second = service.sync_run_path(
+            db,
+            project_id="default",
+            run_root=run_two,
+            source_type="execution_workspace",
+        )
+        db.commit()
+        assert first.id != second.id
+        assert first.source_hash != second.source_hash
+        records = db.query(RunIndex).filter(RunIndex.id.in_([first.id, second.id])).all()
+        assert len(records) == 2
+    finally:
+        db.close()
+
+
+def test_run_table_migration_drops_legacy_rows_already_synced_by_hash(service_config_path):
+    legacy_base = "history" + "_run"
+    legacy_run_table = RunIndex.__tablename__.replace("run_index", legacy_base)
+    run_root = service_config_path.parent / "legacy_already_synced_run"
+    run_root.mkdir(parents=True, exist_ok=True)
+    source_key = str(run_root.resolve())
+
+    db = get_db_session()
+    try:
+        existing = RunIndex(
+            id="ri-existing-001",
+            project_id="default",
+            source_type="execution_workspace",
+            source_key=source_key,
+            source_hash=run_source_hash("execution_workspace", source_key),
+            run_name=run_root.name,
+            run_root_path=source_key,
+            status="completed",
+            duration_seconds=0,
+            model="",
+            provider="",
+            thinking="",
+            max_cycles=0,
+            cycles_used=0,
+            result_count=0,
+            passed_count=0,
+            failed_count=0,
+            workflow_mode="",
+            config_json={},
+            manifests_json={},
+            latest_issues_json=[],
+            raw_summary_json={},
+            log_size_bytes=0,
+            source_mtime=0,
+        )
+        db.add(existing)
+        run_columns = [column.name for column in RunIndex.__table__.columns if column.name != "source_hash"]
+        db.execute(
+            text(
+                f"CREATE TABLE {legacy_run_table} AS "
+                f"SELECT {', '.join(run_columns)} FROM {RunIndex.__tablename__} WHERE 0"
+            )
+        )
+        legacy_values = {column: getattr(existing, column, None) for column in run_columns}
+        legacy_values["id"] = "ri-legacy-duplicate"
+        for column in ("config_json", "manifests_json", "latest_issues_json", "raw_summary_json"):
+            legacy_values[column] = json.dumps(legacy_values[column])
+        db.execute(
+            text(
+                f"INSERT INTO {legacy_run_table} ({', '.join(run_columns)}) "
+                f"VALUES ({', '.join(f':{column}' for column in run_columns)})"
+            ),
+            legacy_values,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    init_database()
+
+    db = get_db_session()
+    try:
+        assert db.get(RunIndex, "ri-existing-001") is not None
+        assert db.get(RunIndex, "ri-legacy-duplicate") is None
+        assert legacy_run_table not in set(inspect(db.bind).get_table_names())
+    finally:
+        db.close()
+
+
+def test_task_list_survives_run_summary_sync_failure(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_sync_failure_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root, title="sync failure tolerant")
+
+    def fail_sync(*args, **kwargs):
+        raise RuntimeError("simulated run index sync failure")
+
+    monkeypatch.setattr(get_run_index_service(), "get_run_index_by_execution", fail_sync)
+    response = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
+    assert response.status_code == 200
+    task = next(item for item in response.json() if item["task_id"] == bound["task_id"])
+    assert task["title"] == "sync failure tolerant"
+    assert task["run"]["name"] == bound["run_name"]
+    assert task["run"]["path"] == bound["run_root"]

@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from app.pi_vuln_core.review.profile import (

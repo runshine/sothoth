@@ -9,21 +9,23 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.models.database import (
-    HistoryRun,
-    HistoryRunCycle,
-    HistoryRunFile,
-    HistoryRunGlobalReview,
-    HistoryRunRemovedResult,
-    HistoryRunResult,
-    HistoryRunResultReview,
-    HistoryRunSession,
+    RunIndex,
+    RunIndexCycle,
+    RunIndexFile,
+    RunIndexGlobalReview,
+    RunIndexRemovedResult,
+    RunIndexResult,
+    RunIndexResultReview,
+    RunIndexSession,
     TriggerTask,
     WorkflowExecution,
     WorkflowExecutionEvent,
+    run_source_hash,
 )
 from app.services.run_inspector import (
     inspect_cycle_detail,
@@ -37,8 +39,8 @@ from app.services.run_inspector import (
 )
 from app.time_utils import UTC_PLUS_8, ensure_local, isoformat_local, now_local
 
-HISTORY_RUN_LOG_SUMMARY_MAX_CHARS = 32768
-_ACTIVE_HISTORY_RUN_STATUSES = {"running", "pending", "queued", "cancel_requested", "delete_requested"}
+RUN_INDEX_LOG_SUMMARY_MAX_CHARS = 32768
+_ACTIVE_RUN_INDEX_STATUSES = {"running", "pending", "queued", "cancel_requested", "delete_requested"}
 _SOURCE_MTIME_COMPARE_EPSILON = 1e-6
 
 
@@ -84,7 +86,7 @@ def _read_text_file(path: Path) -> str:
         return ""
 
 
-def _truncate_log_summary(content: str, max_chars: int = HISTORY_RUN_LOG_SUMMARY_MAX_CHARS) -> str:
+def _truncate_log_summary(content: str, max_chars: int = RUN_INDEX_LOG_SUMMARY_MAX_CHARS) -> str:
     text = str(content or "")
     if max_chars <= 0 or len(text) <= max_chars:
         return text
@@ -198,6 +200,19 @@ def _stored_source_mtime(value: Any) -> float:
 
 def _source_mtime_is_current(current_mtime: float, stored_mtime: Any) -> bool:
     return current_mtime <= (_stored_source_mtime(stored_mtime) + _SOURCE_MTIME_COMPARE_EPSILON)
+
+
+def _find_run_by_source(db: Session, *, source_type: str, source_key: str, source_hash: str) -> RunIndex | None:
+    record = db.query(RunIndex).filter(
+        RunIndex.source_type == source_type,
+        RunIndex.source_hash == source_hash,
+    ).first()
+    if record is not None:
+        return record
+    return db.query(RunIndex).filter(
+        RunIndex.source_type == source_type,
+        RunIndex.source_key == source_key,
+    ).first()
 
 
 def _task_markdown_for_run(run_root: Path) -> str:
@@ -330,7 +345,7 @@ def _detail_atomic_work_path(detail: dict[str, Any]) -> str:
     return str(detail.get("atomic_work_path") or detail.get("atomic_work_dir") or "").strip()
 
 
-def _history_run_needs_parser_resync(record: HistoryRun) -> bool:
+def _run_index_needs_parser_resync(record: RunIndex) -> bool:
     atomic_work_path = str(record.atomic_work_path or "").strip()
     if not atomic_work_path:
         return True
@@ -340,8 +355,8 @@ def _history_run_needs_parser_resync(record: HistoryRun) -> bool:
         return True
 
 
-def _history_run_is_active(record: HistoryRun) -> bool:
-    return str(record.status or "").strip().lower() in _ACTIVE_HISTORY_RUN_STATUSES
+def _run_index_is_active(record: RunIndex) -> bool:
+    return str(record.status or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES
 
 
 def _project_files_root(project_id: str) -> Path:
@@ -359,10 +374,10 @@ def _normalize_execution_request_root(root_path: str) -> Path:
     return target.resolve()
 
 
-class HistoryRunService:
+class RunIndexService:
     def _refresh_record_bindings(
         self,
-        record: HistoryRun,
+        record: RunIndex,
         *,
         project_id: str,
         source_type: str,
@@ -383,20 +398,20 @@ class HistoryRunService:
         elif linked_task is not None and linked_task.profile_id:
             record.profile_id = linked_task.profile_id
 
-    def _history_run_or_404(self, db: Session, history_run_id: str) -> HistoryRun:
-        record = db.get(HistoryRun, history_run_id)
+    def _run_index_or_404(self, db: Session, run_index_id: str) -> RunIndex:
+        record = db.get(RunIndex, run_index_id)
         if record is None or record.source_type != "execution_workspace":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
         return record
 
-    def _delete_children(self, db: Session, history_run_id: str) -> None:
-        db.query(HistoryRunCycle).filter(HistoryRunCycle.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunGlobalReview).filter(HistoryRunGlobalReview.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunResult).filter(HistoryRunResult.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunResultReview).filter(HistoryRunResultReview.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunRemovedResult).filter(HistoryRunRemovedResult.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunSession).filter(HistoryRunSession.history_run_id == history_run_id).delete(synchronize_session=False)
-        db.query(HistoryRunFile).filter(HistoryRunFile.history_run_id == history_run_id).delete(synchronize_session=False)
+    def _delete_children(self, db: Session, run_index_id: str) -> None:
+        db.query(RunIndexCycle).filter(RunIndexCycle.run_index_id == run_index_id).delete(synchronize_session=False)
+        db.query(RunIndexGlobalReview).filter(RunIndexGlobalReview.run_index_id == run_index_id).delete(synchronize_session=False)
+        db.query(RunIndexResult).filter(RunIndexResult.run_index_id == run_index_id).delete(synchronize_session=False)
+        db.query(RunIndexResultReview).filter(RunIndexResultReview.run_index_id == run_index_id).delete(synchronize_session=False)
+        db.query(RunIndexRemovedResult).filter(RunIndexRemovedResult.run_index_id == run_index_id).delete(synchronize_session=False)
+        db.query(RunIndexSession).filter(RunIndexSession.run_index_id == run_index_id).delete(synchronize_session=False)
+        db.query(RunIndexFile).filter(RunIndexFile.run_index_id == run_index_id).delete(synchronize_session=False)
 
     def _managed_project_run_root(self, project_id: str, run_root: str | Path) -> Path:
         project_root = _project_files_root(project_id).resolve()
@@ -423,8 +438,8 @@ class HistoryRunService:
                 items.append((execution, path))
         return items
 
-    def _sync_children(self, db: Session, history_run_id: str, detail: dict[str, Any], sessions: list[dict[str, Any]], files: list[dict[str, Any]]) -> None:
-        self._delete_children(db, history_run_id)
+    def _sync_children(self, db: Session, run_index_id: str, detail: dict[str, Any], sessions: list[dict[str, Any]], files: list[dict[str, Any]]) -> None:
+        self._delete_children(db, run_index_id)
 
         for cycle in detail.get("cycles") or []:
             cycle_no = int(cycle.get("cycle") or 0)
@@ -436,9 +451,9 @@ class HistoryRunService:
                 "metrics": {},
             }
             db.add(
-                HistoryRunCycle(
-                    id=_new_id("hrc"),
-                    history_run_id=history_run_id,
+                RunIndexCycle(
+                    id=_new_id("ric"),
+                    run_index_id=run_index_id,
                     cycle=cycle_no,
                     timestamp=str(cycle.get("timestamp") or ""),
                     outcome=str(cycle.get("outcome") or ""),
@@ -459,9 +474,9 @@ class HistoryRunService:
             )
             for review in cycle_detail.get("global_reviews") or []:
                 db.add(
-                    HistoryRunGlobalReview(
-                        id=_new_id("hrgr"),
-                        history_run_id=history_run_id,
+                    RunIndexGlobalReview(
+                        id=_new_id("rigr"),
+                        run_index_id=run_index_id,
                         cycle=cycle_no,
                         advisor_id=str(review.get("advisor_id") or ""),
                         path=str(review.get("path") or ""),
@@ -482,9 +497,9 @@ class HistoryRunService:
                 )
             for review in cycle_detail.get("result_reviews") or []:
                 db.add(
-                    HistoryRunResultReview(
-                        id=_new_id("hrrr"),
-                        history_run_id=history_run_id,
+                    RunIndexResultReview(
+                        id=_new_id("rirr"),
+                        run_index_id=run_index_id,
                         cycle=cycle_no,
                         result_file=str(review.get("result_file") or ""),
                         path=str(review.get("path") or ""),
@@ -503,9 +518,9 @@ class HistoryRunService:
 
         for result in detail.get("results") or []:
             db.add(
-                HistoryRunResult(
-                    id=_new_id("hrr"),
-                    history_run_id=history_run_id,
+                RunIndexResult(
+                    id=_new_id("rir"),
+                    run_index_id=run_index_id,
                     filename=str(result.get("filename") or ""),
                     path=str(result.get("path") or ""),
                     title=str(result.get("title") or ""),
@@ -533,9 +548,9 @@ class HistoryRunService:
 
         for result in detail.get("removed_results") or []:
             db.add(
-                HistoryRunRemovedResult(
-                    id=_new_id("hrrm"),
-                    history_run_id=history_run_id,
+                RunIndexRemovedResult(
+                    id=_new_id("rirm"),
+                    run_index_id=run_index_id,
                     filename=str(result.get("filename") or ""),
                     path=str(result.get("path") or ""),
                     meta_path=str(result.get("meta_path") or ""),
@@ -549,9 +564,9 @@ class HistoryRunService:
 
         for session in sessions:
             db.add(
-                HistoryRunSession(
-                    id=_new_id("hrs"),
-                    history_run_id=history_run_id,
+                RunIndexSession(
+                    id=_new_id("ris"),
+                    run_index_id=run_index_id,
                     session_id=str(session.get("session_id") or ""),
                     format=str(session.get("format") or ""),
                     worker_id=str(session.get("worker_id") or ""),
@@ -565,9 +580,9 @@ class HistoryRunService:
 
         for entry in files:
             db.add(
-                HistoryRunFile(
-                    id=_new_id("hrf"),
-                    history_run_id=history_run_id,
+                RunIndexFile(
+                    id=_new_id("rif"),
+                    run_index_id=run_index_id,
                     category=str(entry.get("category") or ""),
                     path=str(entry.get("path") or ""),
                     name=str(entry.get("name") or ""),
@@ -587,18 +602,21 @@ class HistoryRunService:
         linked_execution: WorkflowExecution | None = None,
         linked_task: TriggerTask | None = None,
         profile_id: str | None = None,
-    ) -> HistoryRun:
+    ) -> RunIndex:
         run_root = run_root.resolve()
         if not run_root.is_dir():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"run root not found: {run_root}")
 
         source_key = str(run_root)
-        record = db.query(HistoryRun).filter(
-            HistoryRun.source_key == source_key,
-            HistoryRun.source_type == source_type,
-        ).first()
+        source_hash = run_source_hash(source_type, source_key)
+        record = _find_run_by_source(
+            db,
+            source_type=source_type,
+            source_key=source_key,
+            source_hash=source_hash,
+        )
         stored_source_mtime = _stored_source_mtime(record.source_mtime) if record is not None else 0.0
-        if record is not None and not _history_run_is_active(record) and not _history_run_needs_parser_resync(record):
+        if record is not None and not _run_index_is_active(record) and not _run_index_needs_parser_resync(record):
             hint_mtime = _compute_source_mtime_hint(run_root, record.atomic_work_path)
             if _source_mtime_is_current(hint_mtime, stored_source_mtime):
                 self._refresh_record_bindings(
@@ -609,11 +627,13 @@ class HistoryRunService:
                     linked_task=linked_task,
                     profile_id=profile_id,
                 )
+                record.source_key = source_key
+                record.source_hash = source_hash
                 db.add(record)
                 db.flush()
                 return record
         source_mtime = _compute_source_mtime(run_root)
-        if record is not None and _source_mtime_is_current(source_mtime, stored_source_mtime) and not _history_run_needs_parser_resync(record):
+        if record is not None and _source_mtime_is_current(source_mtime, stored_source_mtime) and not _run_index_needs_parser_resync(record):
             self._refresh_record_bindings(
                 record,
                 project_id=project_id,
@@ -622,6 +642,8 @@ class HistoryRunService:
                 linked_task=linked_task,
                 profile_id=profile_id,
             )
+            record.source_key = source_key
+            record.source_hash = source_hash
             db.add(record)
             db.flush()
             return record
@@ -658,56 +680,83 @@ class HistoryRunService:
             raw_summary["command_display"] = command_payload.get("command_display") or ""
 
         if record is None:
-            record = db.query(HistoryRun).filter(
-                HistoryRun.source_key == source_key,
-                HistoryRun.source_type == source_type,
-            ).first()
+            record = _find_run_by_source(
+                db,
+                source_type=source_type,
+                source_key=source_key,
+                source_hash=source_hash,
+            )
         if record is None:
-            record = HistoryRun(id=_new_id("hr"))
+            record = RunIndex(id=_new_id("ri"))
 
-        self._refresh_record_bindings(
-            record,
-            project_id=project_id,
-            source_type=source_type,
-            linked_execution=linked_execution,
-            linked_task=linked_task,
-            profile_id=profile_id,
-        )
-        record.source_key = source_key
-        record.run_name = str(summary.get("name") or run_root.name)
-        record.run_root_path = str(run_root)
-        record.atomic_work_path = atomic_work_path
-        record.status = str(summary.get("status") or "pending")
-        record.started_at = started_at
-        record.finished_at = finished_at
-        record.duration_seconds = int(summary.get("duration_seconds") or 0)
-        record.last_activity_at = last_activity_at
-        record.model = str(summary.get("model") or "")
-        record.provider = str(summary.get("provider") or "")
-        record.thinking = str(summary.get("thinking") or "")
-        record.max_cycles = int(summary.get("max_cycles") or 0)
-        record.cycles_used = int(summary.get("cycles_used") or 0)
-        record.result_count = int(summary.get("result_count") or 0)
-        record.passed_count = int(summary.get("passed_count") or 0)
-        record.failed_count = int(summary.get("failed_count") or 0)
-        record.workflow_mode = str(summary.get("workflow_mode") or "")
-        record.error = str(detail.get("error") or "")
-        record.config_json = dict(detail.get("config") or {})
-        record.manifests_json = dict(detail.get("manifests") or {})
-        record.latest_issues_json = list(detail.get("latest_issues") or [])
-        record.raw_summary_json = raw_summary
-        record.log_tail_text = _truncate_log_summary(run_log)
-        record.log_size_bytes = log_path.stat().st_size if log_path.is_file() else 0
-        record.source_mtime = source_mtime
-        record.last_synced_at = now_local()
-        db.add(record)
-        db.flush()
+        def apply_payload(target: RunIndex) -> None:
+            self._refresh_record_bindings(
+                target,
+                project_id=project_id,
+                source_type=source_type,
+                linked_execution=linked_execution,
+                linked_task=linked_task,
+                profile_id=profile_id,
+            )
+            target.source_key = source_key
+            target.source_hash = source_hash
+            target.run_name = str(summary.get("name") or run_root.name)
+            target.run_root_path = str(run_root)
+            target.atomic_work_path = atomic_work_path
+            target.status = str(summary.get("status") or "pending")
+            target.started_at = started_at
+            target.finished_at = finished_at
+            target.duration_seconds = int(summary.get("duration_seconds") or 0)
+            target.last_activity_at = last_activity_at
+            target.model = str(summary.get("model") or "")
+            target.provider = str(summary.get("provider") or "")
+            target.thinking = str(summary.get("thinking") or "")
+            target.max_cycles = int(summary.get("max_cycles") or 0)
+            target.cycles_used = int(summary.get("cycles_used") or 0)
+            target.result_count = int(summary.get("result_count") or 0)
+            target.passed_count = int(summary.get("passed_count") or 0)
+            target.failed_count = int(summary.get("failed_count") or 0)
+            target.workflow_mode = str(summary.get("workflow_mode") or "")
+            target.error = str(detail.get("error") or "")
+            target.config_json = dict(detail.get("config") or {})
+            target.manifests_json = dict(detail.get("manifests") or {})
+            target.latest_issues_json = list(detail.get("latest_issues") or [])
+            target.raw_summary_json = raw_summary
+            target.log_tail_text = _truncate_log_summary(run_log)
+            target.log_size_bytes = log_path.stat().st_size if log_path.is_file() else 0
+            target.source_mtime = source_mtime
+            target.last_synced_at = now_local()
+
+        apply_payload(record)
+        try:
+            with db.begin_nested():
+                db.add(record)
+                db.flush()
+        except IntegrityError:
+            with db.no_autoflush:
+                existing = _find_run_by_source(
+                    db,
+                    source_type=source_type,
+                    source_key=source_key,
+                    source_hash=source_hash,
+                )
+            if existing is None:
+                raise
+            if existing is not record:
+                try:
+                    db.expunge(record)
+                except Exception:
+                    pass
+            record = existing
+            apply_payload(record)
+            db.add(record)
+            db.flush()
         detail["path"] = str(run_root)
         self._sync_children(db, record.id, detail, sessions, files)
         db.flush()
         return record
 
-    def sync_execution_run(self, db: Session, execution: WorkflowExecution) -> HistoryRun | None:
+    def sync_execution_run(self, db: Session, execution: WorkflowExecution) -> RunIndex | None:
         if not execution.workspace_root:
             return None
         run_root = Path(execution.workspace_root)
@@ -724,7 +773,7 @@ class HistoryRunService:
             profile_id=linked_task.profile_id if linked_task else None,
         )
 
-    def sync_project_history_runs(self, db: Session, project_id: str) -> None:
+    def sync_project_runs(self, db: Session, project_id: str) -> None:
         if not get_config().runs.enabled:
             return
         execution_runs = self._discover_execution_runs(db, project_id)
@@ -737,99 +786,103 @@ class HistoryRunService:
             }
         for execution, run_root in execution_runs:
             linked_task = linked_tasks_by_id.get(execution.trigger_task_id)
-            self.sync_run_path(
-                db,
-                project_id=project_id,
-                run_root=run_root,
-                source_type="execution_workspace",
-                linked_execution=execution,
-                linked_task=linked_task,
-                profile_id=linked_task.profile_id if linked_task else None,
-            )
+            try:
+                with db.begin_nested():
+                    self.sync_run_path(
+                        db,
+                        project_id=project_id,
+                        run_root=run_root,
+                        source_type="execution_workspace",
+                        linked_execution=execution,
+                        linked_task=linked_task,
+                        profile_id=linked_task.profile_id if linked_task else None,
+                    )
+            except Exception:
+                continue
         db.commit()
 
-    def refresh_history_run(self, db: Session, history_run: HistoryRun) -> HistoryRun:
-        run_root = Path(history_run.run_root_path)
+    def refresh_run_index(self, db: Session, run_index: RunIndex) -> RunIndex:
+        run_root = Path(run_index.run_root_path)
         if not run_root.is_dir():
-            return history_run
-        stored_source_mtime = _stored_source_mtime(history_run.source_mtime)
-        if not _history_run_is_active(history_run) and not _history_run_needs_parser_resync(history_run):
-            hint_mtime = _compute_source_mtime_hint(run_root, history_run.atomic_work_path)
+            return run_index
+        stored_source_mtime = _stored_source_mtime(run_index.source_mtime)
+        if not _run_index_is_active(run_index) and not _run_index_needs_parser_resync(run_index):
+            hint_mtime = _compute_source_mtime_hint(run_root, run_index.atomic_work_path)
             if _source_mtime_is_current(hint_mtime, stored_source_mtime):
-                return history_run
+                return run_index
         current_mtime = _compute_source_mtime(run_root)
-        if _source_mtime_is_current(current_mtime, stored_source_mtime) and not _history_run_needs_parser_resync(history_run):
-            return history_run
-        linked_execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
-        linked_task = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
-        history_run = self.sync_run_path(
+        if _source_mtime_is_current(current_mtime, stored_source_mtime) and not _run_index_needs_parser_resync(run_index):
+            return run_index
+        linked_execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
+        linked_task = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
+        run_index = self.sync_run_path(
             db,
-            project_id=history_run.project_id,
+            project_id=run_index.project_id,
             run_root=run_root,
-            source_type=history_run.source_type,
+            source_type=run_index.source_type,
             linked_execution=linked_execution,
             linked_task=linked_task,
-            profile_id=history_run.profile_id,
+            profile_id=run_index.profile_id,
         )
         db.commit()
-        return history_run
+        return run_index
 
-    def resolve_history_run(self, db: Session, *, project_id: str, run_name: str, root_path: str) -> HistoryRun:
+    def resolve_run(self, db: Session, *, project_id: str, run_name: str, root_path: str) -> RunIndex:
         normalized_root = _normalize_execution_request_root(root_path)
         candidate = normalized_root / run_name
-        record = db.query(HistoryRun).filter(
-            HistoryRun.project_id == project_id,
-            HistoryRun.source_type == "execution_workspace",
-            HistoryRun.run_root_path == str(candidate.resolve()),
+        record = db.query(RunIndex).filter(
+            RunIndex.project_id == project_id,
+            RunIndex.source_type == "execution_workspace",
+            RunIndex.run_root_path == str(candidate.resolve()),
         ).first()
         if record is not None:
-            return self.refresh_history_run(db, record)
-        self.sync_project_history_runs(db, project_id)
-        record = db.query(HistoryRun).filter(
-            HistoryRun.project_id == project_id,
-            HistoryRun.source_type == "execution_workspace",
-            HistoryRun.run_root_path == str(candidate.resolve()),
+            return self.refresh_run_index(db, record)
+        self.sync_project_runs(db, project_id)
+        record = db.query(RunIndex).filter(
+            RunIndex.project_id == project_id,
+            RunIndex.source_type == "execution_workspace",
+            RunIndex.run_root_path == str(candidate.resolve()),
         ).first()
         if record is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
         return record
 
-    def _summary_payload(self, history_run: HistoryRun) -> dict[str, Any]:
+    def _summary_payload(self, run_index: RunIndex) -> dict[str, Any]:
         return {
-            "run_id": history_run.id,
-            "project_id": history_run.project_id,
-            "source_type": history_run.source_type,
-            "source_key": history_run.source_key,
-            "linked_task_id": history_run.linked_task_id,
-            "linked_execution_id": history_run.linked_execution_id,
-            "profile_id": history_run.profile_id,
-            "name": history_run.run_name,
-            "path": history_run.run_root_path,
-            "root_path": _parent_root(history_run.run_root_path),
-            "status": history_run.status,
-            "start_time": str((history_run.raw_summary_json or {}).get("start_time") or ""),
-            "start_epoch": int(history_run.started_at.replace(tzinfo=timezone.utc).timestamp()) if history_run.started_at else 0,
-            "duration_seconds": history_run.duration_seconds,
-            "last_activity": _iso_or_empty(history_run.last_activity_at),
-            "model": history_run.model,
-            "provider": history_run.provider,
-            "thinking": history_run.thinking,
-            "max_cycles": history_run.max_cycles,
-            "cycles_used": history_run.cycles_used,
-            "result_count": history_run.result_count,
-            "passed_count": history_run.passed_count,
-            "failed_count": history_run.failed_count,
-            "workflow_mode": history_run.workflow_mode,
-            "updated_at": _iso_or_empty(history_run.last_synced_at),
+            "run_id": run_index.id,
+            "project_id": run_index.project_id,
+            "source_type": run_index.source_type,
+            "source_key": run_index.source_key,
+            "linked_task_id": run_index.linked_task_id,
+            "linked_execution_id": run_index.linked_execution_id,
+            "profile_id": run_index.profile_id,
+            "name": run_index.run_name,
+            "path": run_index.run_root_path,
+            "root_path": _parent_root(run_index.run_root_path),
+            "status": run_index.status,
+            "start_time": str((run_index.raw_summary_json or {}).get("start_time") or ""),
+            "start_epoch": int(run_index.started_at.replace(tzinfo=timezone.utc).timestamp()) if run_index.started_at else 0,
+            "duration_seconds": run_index.duration_seconds,
+            "last_activity": _iso_or_empty(run_index.last_activity_at),
+            "model": run_index.model,
+            "provider": run_index.provider,
+            "thinking": run_index.thinking,
+            "max_cycles": run_index.max_cycles,
+            "cycles_used": run_index.cycles_used,
+            "result_count": run_index.result_count,
+            "passed_count": run_index.passed_count,
+            "failed_count": run_index.failed_count,
+            "workflow_mode": run_index.workflow_mode,
+            "updated_at": _iso_or_empty(run_index.last_synced_at),
         }
 
-    def list_history_runs(self, db: Session, project_id: str) -> list[dict[str, Any]]:
-        self.sync_project_history_runs(db, project_id)
+    def list_runs(self, db: Session, project_id: str) -> list[dict[str, Any]]:
+        self.sync_project_runs(db, project_id)
         records = [
             item
-            for item in db.query(HistoryRun).filter(
-                HistoryRun.project_id == project_id,
-                HistoryRun.source_type == "execution_workspace",
+            for item in db.query(RunIndex).filter(
+                RunIndex.project_id == project_id,
+                RunIndex.source_type == "execution_workspace",
             ).all()
             if Path(item.run_root_path).is_dir()
         ]
@@ -843,15 +896,15 @@ class HistoryRunService:
         )
         return [self._summary_payload(item) for item in records]
 
-    def get_history_run_summary(self, db: Session, history_run: HistoryRun) -> dict[str, Any]:
-        history_run = self.refresh_history_run(db, history_run)
-        return self._summary_payload(history_run)
+    def get_run_summary(self, db: Session, run_index: RunIndex) -> dict[str, Any]:
+        run_index = self.refresh_run_index(db, run_index)
+        return self._summary_payload(run_index)
 
-    def _cycle_payloads(self, db: Session, history_run_id: str) -> list[dict[str, Any]]:
+    def _cycle_payloads(self, db: Session, run_index_id: str) -> list[dict[str, Any]]:
         cycles = (
-            db.query(HistoryRunCycle)
-            .filter(HistoryRunCycle.history_run_id == history_run_id)
-            .order_by(HistoryRunCycle.cycle.asc())
+            db.query(RunIndexCycle)
+            .filter(RunIndexCycle.run_index_id == run_index_id)
+            .order_by(RunIndexCycle.cycle.asc())
             .all()
         )
         return [
@@ -882,11 +935,11 @@ class HistoryRunService:
             for item in cycles
         ]
 
-    def _result_payloads(self, db: Session, history_run_id: str) -> list[dict[str, Any]]:
+    def _result_payloads(self, db: Session, run_index_id: str) -> list[dict[str, Any]]:
         results = (
-            db.query(HistoryRunResult)
-            .filter(HistoryRunResult.history_run_id == history_run_id)
-            .order_by(HistoryRunResult.filename.asc())
+            db.query(RunIndexResult)
+            .filter(RunIndexResult.run_index_id == run_index_id)
+            .order_by(RunIndexResult.filename.asc())
             .all()
         )
         return [
@@ -916,11 +969,11 @@ class HistoryRunService:
             for item in results
         ]
 
-    def _removed_result_payloads(self, db: Session, history_run_id: str) -> list[dict[str, Any]]:
+    def _removed_result_payloads(self, db: Session, run_index_id: str) -> list[dict[str, Any]]:
         results = (
-            db.query(HistoryRunRemovedResult)
-            .filter(HistoryRunRemovedResult.history_run_id == history_run_id)
-            .order_by(HistoryRunRemovedResult.cycle.asc(), HistoryRunRemovedResult.filename.asc())
+            db.query(RunIndexRemovedResult)
+            .filter(RunIndexRemovedResult.run_index_id == run_index_id)
+            .order_by(RunIndexRemovedResult.cycle.asc(), RunIndexRemovedResult.filename.asc())
             .all()
         )
         return [
@@ -936,15 +989,15 @@ class HistoryRunService:
             for item in results
         ]
 
-    def list_history_run_sessions(self, db: Session, history_run: HistoryRun) -> list[dict[str, Any]]:
-        history_run = self.refresh_history_run(db, history_run)
-        return self._list_history_run_sessions_rows(db, history_run)
+    def list_run_sessions(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
+        run_index = self.refresh_run_index(db, run_index)
+        return self._list_run_sessions_rows(db, run_index)
 
-    def _list_history_run_sessions_rows(self, db: Session, history_run: HistoryRun) -> list[dict[str, Any]]:
+    def _list_run_sessions_rows(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
         sessions = (
-            db.query(HistoryRunSession)
-            .filter(HistoryRunSession.history_run_id == history_run.id)
-            .order_by(HistoryRunSession.session_id.asc())
+            db.query(RunIndexSession)
+            .filter(RunIndexSession.run_index_id == run_index.id)
+            .order_by(RunIndexSession.session_id.asc())
             .all()
         )
         return [
@@ -960,15 +1013,15 @@ class HistoryRunService:
             for item in sessions
         ]
 
-    def list_history_run_files(self, db: Session, history_run: HistoryRun, limit: int = 1200) -> list[dict[str, Any]]:
-        history_run = self.refresh_history_run(db, history_run)
-        return self._list_history_run_files_rows(db, history_run, limit=limit)
+    def list_run_files(self, db: Session, run_index: RunIndex, limit: int = 1200) -> list[dict[str, Any]]:
+        run_index = self.refresh_run_index(db, run_index)
+        return self._list_run_files_rows(db, run_index, limit=limit)
 
-    def _list_history_run_files_rows(self, db: Session, history_run: HistoryRun, limit: int = 1200) -> list[dict[str, Any]]:
+    def _list_run_files_rows(self, db: Session, run_index: RunIndex, limit: int = 1200) -> list[dict[str, Any]]:
         files = (
-            db.query(HistoryRunFile)
-            .filter(HistoryRunFile.history_run_id == history_run.id)
-            .order_by(HistoryRunFile.category.asc(), HistoryRunFile.path.asc())
+            db.query(RunIndexFile)
+            .filter(RunIndexFile.run_index_id == run_index.id)
+            .order_by(RunIndexFile.category.asc(), RunIndexFile.path.asc())
             .limit(limit)
             .all()
         )
@@ -984,21 +1037,21 @@ class HistoryRunService:
             for item in files
         ]
 
-    def get_history_run_detail(self, db: Session, history_run: HistoryRun) -> dict[str, Any]:
-        history_run = self.refresh_history_run(db, history_run)
-        payload = self._summary_payload(history_run)
-        raw_summary = dict(history_run.raw_summary_json or {})
+    def get_run_detail(self, db: Session, run_index: RunIndex) -> dict[str, Any]:
+        run_index = self.refresh_run_index(db, run_index)
+        payload = self._summary_payload(run_index)
+        raw_summary = dict(run_index.raw_summary_json or {})
         cli_payload = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
         command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else raw_summary.get("command")
         if not isinstance(command, list):
             command = []
         command_display = str(cli_payload.get("command_display") or raw_summary.get("command_display") or "")
         if not command and not command_display:
-            linked_execution = db.get(WorkflowExecution, history_run.linked_execution_id) if history_run.linked_execution_id else None
-            linked_task = db.get(TriggerTask, history_run.linked_task_id) if history_run.linked_task_id else None
+            linked_execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
+            linked_task = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
             cli_payload = _run_command_payload(
                 db,
-                run_root=Path(history_run.run_root_path),
+                run_root=Path(run_index.run_root_path),
                 linked_execution=linked_execution,
                 linked_task=linked_task,
             )
@@ -1006,24 +1059,24 @@ class HistoryRunService:
                 raw_summary["dataflow_cli"] = cli_payload
                 raw_summary["command"] = cli_payload.get("command") or []
                 raw_summary["command_display"] = cli_payload.get("command_display") or ""
-                history_run.raw_summary_json = raw_summary
-                db.add(history_run)
+                run_index.raw_summary_json = raw_summary
+                db.add(run_index)
                 db.commit()
                 command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else []
                 command_display = str(cli_payload.get("command_display") or "")
         payload.update(
             {
-                "config": dict(history_run.config_json or {}),
-                "error": history_run.error or None,
-                "cycles": self._cycle_payloads(db, history_run.id),
-                "results": self._result_payloads(db, history_run.id),
-                "removed_results": self._removed_result_payloads(db, history_run.id),
-                "manifests": dict(history_run.manifests_json or {}),
-                "latest_issues": list(history_run.latest_issues_json or []),
-                "atomic_work_path": history_run.atomic_work_path or "",
-                "files": self._list_history_run_files_rows(db, history_run, limit=20000),
-                "sessions": self._list_history_run_sessions_rows(db, history_run),
-                "run_log": history_run.log_tail_text or "",
+                "config": dict(run_index.config_json or {}),
+                "error": run_index.error or None,
+                "cycles": self._cycle_payloads(db, run_index.id),
+                "results": self._result_payloads(db, run_index.id),
+                "removed_results": self._removed_result_payloads(db, run_index.id),
+                "manifests": dict(run_index.manifests_json or {}),
+                "latest_issues": list(run_index.latest_issues_json or []),
+                "atomic_work_path": run_index.atomic_work_path or "",
+                "files": self._list_run_files_rows(db, run_index, limit=20000),
+                "sessions": self._list_run_sessions_rows(db, run_index),
+                "run_log": run_index.log_tail_text or "",
                 "command": [str(item) for item in command],
                 "command_display": command_display,
                 "raw": raw_summary,
@@ -1031,25 +1084,25 @@ class HistoryRunService:
         )
         return payload
 
-    def get_history_run_cycle(self, db: Session, history_run: HistoryRun, cycle: int) -> dict[str, Any]:
-        history_run = self.refresh_history_run(db, history_run)
+    def get_run_cycle(self, db: Session, run_index: RunIndex, cycle: int) -> dict[str, Any]:
+        run_index = self.refresh_run_index(db, run_index)
         cycle_row = (
-            db.query(HistoryRunCycle)
-            .filter(HistoryRunCycle.history_run_id == history_run.id, HistoryRunCycle.cycle == cycle)
+            db.query(RunIndexCycle)
+            .filter(RunIndexCycle.run_index_id == run_index.id, RunIndexCycle.cycle == cycle)
             .first()
         )
         if cycle_row is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run cycle not found")
         global_reviews = (
-            db.query(HistoryRunGlobalReview)
-            .filter(HistoryRunGlobalReview.history_run_id == history_run.id, HistoryRunGlobalReview.cycle == cycle)
-            .order_by(HistoryRunGlobalReview.advisor_id.asc())
+            db.query(RunIndexGlobalReview)
+            .filter(RunIndexGlobalReview.run_index_id == run_index.id, RunIndexGlobalReview.cycle == cycle)
+            .order_by(RunIndexGlobalReview.advisor_id.asc())
             .all()
         )
         result_reviews = (
-            db.query(HistoryRunResultReview)
-            .filter(HistoryRunResultReview.history_run_id == history_run.id, HistoryRunResultReview.cycle == cycle)
-            .order_by(HistoryRunResultReview.result_file.asc(), HistoryRunResultReview.advisor_id.asc())
+            db.query(RunIndexResultReview)
+            .filter(RunIndexResultReview.run_index_id == run_index.id, RunIndexResultReview.cycle == cycle)
+            .order_by(RunIndexResultReview.result_file.asc(), RunIndexResultReview.advisor_id.asc())
             .all()
         )
         return {
@@ -1093,35 +1146,37 @@ class HistoryRunService:
             "metrics": dict(cycle_row.metrics_json or {}),
         }
 
-    def get_history_run_file(self, db: Session, history_run: HistoryRun, path: str) -> dict[str, Any]:
-        history_run = self.refresh_history_run(db, history_run)
-        return inspect_file(history_run.run_root_path, path)
+    def get_run_file(self, db: Session, run_index: RunIndex, path: str) -> dict[str, Any]:
+        run_index = self.refresh_run_index(db, run_index)
+        return inspect_file(run_index.run_root_path, path)
 
-    def get_history_run_session_file(self, db: Session, history_run: HistoryRun, path: str) -> dict[str, Any]:
-        history_run = self.refresh_history_run(db, history_run)
-        return inspect_session_file(history_run.run_root_path, path)
+    def get_run_session_file(self, db: Session, run_index: RunIndex, path: str) -> dict[str, Any]:
+        run_index = self.refresh_run_index(db, run_index)
+        return inspect_session_file(run_index.run_root_path, path)
 
-    def get_history_run_log(self, db: Session, history_run: HistoryRun, lines: int = 300) -> dict[str, Any]:
-        history_run = self.refresh_history_run(db, history_run)
-        return inspect_log(history_run.run_root_path, lines=lines)
+    def get_run_log(self, db: Session, run_index: RunIndex, lines: int = 300) -> dict[str, Any]:
+        run_index = self.refresh_run_index(db, run_index)
+        return inspect_log(run_index.run_root_path, lines=lines)
 
-    def get_history_run_by_execution(self, db: Session, execution: WorkflowExecution) -> HistoryRun | None:
+    def get_run_index_by_execution(self, db: Session, execution: WorkflowExecution) -> RunIndex | None:
         if not execution.workspace_root:
             return None
-        record = db.query(HistoryRun).filter(
-            HistoryRun.linked_execution_id == execution.id,
-            HistoryRun.source_type == "execution_workspace",
+        record = db.query(RunIndex).filter(
+            RunIndex.linked_execution_id == execution.id,
+            RunIndex.source_type == "execution_workspace",
         ).first()
         if record is not None:
-            return self.refresh_history_run(db, record)
+            return self.refresh_run_index(db, record)
         source_key = str(Path(execution.workspace_root).resolve())
-        record = db.query(HistoryRun).filter(
-            HistoryRun.source_key == source_key,
-            HistoryRun.source_type == "execution_workspace",
-        ).first()
+        record = _find_run_by_source(
+            db,
+            source_type="execution_workspace",
+            source_key=source_key,
+            source_hash=run_source_hash("execution_workspace", source_key),
+        )
         if record is not None:
-            return self.refresh_history_run(db, record)
-        if str(execution.status or "").strip().lower() in _ACTIVE_HISTORY_RUN_STATUSES:
+            return self.refresh_run_index(db, record)
+        if str(execution.status or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES:
             return None
         record = self.sync_execution_run(db, execution)
         if record is not None:
@@ -1131,47 +1186,49 @@ class HistoryRunService:
     def bind_runtime_state(
         self,
         db: Session,
-        history_run: HistoryRun,
+        run_index: RunIndex,
         *,
         linked_execution: WorkflowExecution | None = None,
         linked_task: TriggerTask | None = None,
         profile_id: str | None = None,
         status_text: str | None = None,
-    ) -> HistoryRun:
+    ) -> RunIndex:
         self._refresh_record_bindings(
-            history_run,
-            project_id=history_run.project_id,
-            source_type=history_run.source_type,
+            run_index,
+            project_id=run_index.project_id,
+            source_type=run_index.source_type,
             linked_execution=linked_execution,
             linked_task=linked_task,
             profile_id=profile_id,
         )
         if status_text:
-            history_run.status = status_text
-        run_root = Path(history_run.run_root_path)
+            run_index.status = status_text
+        if run_index.source_key and not run_index.source_hash:
+            run_index.source_hash = run_source_hash(run_index.source_type, run_index.source_key)
+        run_root = Path(run_index.run_root_path)
         if run_root.is_dir():
-            history_run.source_mtime = max(_stored_source_mtime(history_run.source_mtime), _compute_source_mtime(run_root))
-        history_run.last_synced_at = now_local()
-        db.add(history_run)
+            run_index.source_mtime = max(_stored_source_mtime(run_index.source_mtime), _compute_source_mtime(run_root))
+        run_index.last_synced_at = now_local()
+        db.add(run_index)
         db.flush()
-        return history_run
+        return run_index
 
-    def delete_history_run(self, db: Session, history_run: HistoryRun, *, allow_active: bool = False) -> None:
-        run_root = self._managed_project_run_root(history_run.project_id, history_run.run_root_path)
-        if _history_run_is_active(history_run) and not allow_active:
+    def delete_run_index(self, db: Session, run_index: RunIndex, *, allow_active: bool = False) -> None:
+        run_root = self._managed_project_run_root(run_index.project_id, run_index.run_root_path)
+        if _run_index_is_active(run_index) and not allow_active:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run is active and cannot be deleted")
-        self._delete_children(db, history_run.id)
-        db.delete(history_run)
+        self._delete_children(db, run_index.id)
+        db.delete(run_index)
         db.flush()
         if run_root.exists():
             shutil.rmtree(run_root, ignore_errors=False)
 
 
-_history_run_service: HistoryRunService | None = None
+_run_index_service: RunIndexService | None = None
 
 
-def get_history_run_service() -> HistoryRunService:
-    global _history_run_service
-    if _history_run_service is None:
-        _history_run_service = HistoryRunService()
-    return _history_run_service
+def get_run_index_service() -> RunIndexService:
+    global _run_index_service
+    if _run_index_service is None:
+        _run_index_service = RunIndexService()
+    return _run_index_service
