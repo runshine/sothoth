@@ -250,6 +250,33 @@ class TaskManagerLeaseTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_retry_success_task_enqueues_async_workspace_reset(self):
+        self._add_task("t-success-retry", status=TaskStatus.SUCCESS.value)
+
+        ok, retried_task_id, message = task_manager_module.retry_task("t-success-retry")
+
+        self.assertTrue(ok)
+        self.assertEqual("t-success-retry", retried_task_id)
+        self.assertIn("重试", message)
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-success-retry").first()
+            self.assertEqual(TaskStatus.RETRY_PREPARING.value, task.status)
+            self.assertEqual("retry_preparing", task.current_stage)
+            self.assertIsNone(task.owner_id)
+            job = db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.task_id == "t-success-retry").first()
+            self.assertIsNotNone(job)
+            self.assertEqual("task_retry_reset", job.reason)
+            event = (
+                db.query(UnpackTaskEvent)
+                .filter(UnpackTaskEvent.task_id == "t-success-retry")
+                .order_by(UnpackTaskEvent.created_at.desc())
+                .first()
+            )
+            self.assertEqual("task_retry_requested", event.event_type)
+        finally:
+            db.close()
+
     def test_cancel_running_task_sets_deadlines_and_signals_runner(self):
         db = get_db_session()
         try:

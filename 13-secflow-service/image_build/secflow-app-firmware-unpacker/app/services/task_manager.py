@@ -1165,10 +1165,11 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
         if task is None:
             return False, None, "任务不存在"
         if task.status not in (
+            TaskStatus.SUCCESS.value,
             TaskStatus.FAILED.value,
             TaskStatus.CANCELLED.value,
         ):
-            return False, None, "仅支持重试失败或已取消的任务"
+            return False, None, "仅支持重试成功、失败或已取消的任务"
         normalized_project_id = str(task.project_id or "").strip()
         if not normalized_project_id:
             return False, None, "任务缺少 project_id，无法重试"
