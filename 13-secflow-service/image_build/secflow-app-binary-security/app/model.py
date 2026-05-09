@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect, text
@@ -53,6 +54,7 @@ class JsonMixin:
 
 class BinarySecurityTask(Base, JsonMixin):
     __tablename__ = "secflow_binary_security_task"
+    SUMMARY_FILENAME = "task-summary.json"
 
     id = Column(String(32), primary_key=True)
     project_id = Column(String(64), nullable=False, index=True)
@@ -93,11 +95,37 @@ class BinarySecurityTask(Base, JsonMixin):
 
     @property
     def summary(self) -> dict[str, Any]:
+        cached = getattr(self, "_summary_cache", None)
+        if isinstance(cached, dict):
+            return dict(cached)
+        path = self._summary_file_path()
+        if path and path.is_file():
+            try:
+                data = json.loads(path.read_text("utf-8") or "{}")
+                if isinstance(data, dict):
+                    self._summary_cache = data
+                    return dict(data)
+            except Exception:
+                pass
         return self._load_json(self.summary_json, {})
 
     @summary.setter
     def summary(self, value: dict[str, Any] | None) -> None:
-        self.summary_json = self._dump_json(value or {})
+        payload = value or {}
+        self._summary_cache = dict(payload)
+        path = self._summary_file_path()
+        if path and path.parent.exists():
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(self._dump_json(payload), encoding="utf-8")
+            tmp.replace(path)
+            self.summary_json = None
+            return
+        self.summary_json = self._dump_json(payload)
+
+    def _summary_file_path(self) -> Path | None:
+        if not self.workspace_root:
+            return None
+        return Path(self.workspace_root) / self.SUMMARY_FILENAME
 
     @property
     def metrics(self) -> dict[str, Any]:

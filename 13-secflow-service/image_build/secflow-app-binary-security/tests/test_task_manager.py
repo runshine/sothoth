@@ -103,6 +103,45 @@ class TaskManagerTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
 
+    def test_task_summary_is_written_to_task_workspace_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="n",
+                status="pending",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+
+            task.summary = {"selected_modules": [{"module_key": "m1"}]}
+
+            summary_path = Path(tmp) / BinarySecurityTask.SUMMARY_FILENAME
+            self.assertTrue(summary_path.is_file())
+            self.assertIsNone(task.summary_json)
+            self.assertEqual({"selected_modules": [{"module_key": "m1"}]}, task.summary)
+
+    def test_task_summary_falls_back_to_db_before_workspace_is_available(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="",
+        )
+
+        task.summary = {"status": "created"}
+
+        self.assertIsNotNone(task.summary_json)
+        self.assertEqual({"status": "created"}, task.summary)
+
     def test_parse_system_analysis_modules_from_modules_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -375,7 +414,9 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("e1", stored["entries"][0]["entry_key"])
         self.assertNotIn("extra_blob", stored["entries"][0])
         self.assertNotIn("downstream", stored)
-        self.assertEqual(stored, summary["items"][0])
+        self.assertEqual(1, summary["entry_count"])
+        self.assertNotIn("entries", summary["items"][0])
+        self.assertEqual("e1", summary["items"][0]["entries_preview"][0]["entry_key"])
 
     def test_dataflow_results_keep_vuln_inputs_but_drop_downstream_payload(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")

@@ -148,6 +148,7 @@ class BinarySecurityArchiveJobResponse(BaseModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    copy_stats: dict[str, Any] = Field(default_factory=dict)
 
 
 class BinarySecurityOverviewBusinessDetail(BaseModel):

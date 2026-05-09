@@ -67,6 +67,11 @@ from app.service.system_analyse import get_system_analyse_client
 from app.time_utils import now_local
 
 
+DB_SUMMARY_ITEM_LIMIT = 50
+DB_ENTRY_PREVIEW_LIMIT = 50
+DB_ARTIFACT_PREVIEW_LIMIT = 50
+
+
 def _now() -> datetime:
     return now_local()
 
@@ -85,11 +90,97 @@ def _read_text(path: Path) -> str:
 def _copytree(src: Path, dst: Path) -> None:
     if not src.exists():
         return
+    if src.is_symlink():
+        ensure_dir(dst.parent)
+        if dst.exists() or dst.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        os.symlink(os.readlink(src), dst)
+        return
     if src.is_file():
         ensure_dir(dst.parent)
-        shutil.copy2(src, dst)
+        shutil.copy2(src, dst, follow_symlinks=False)
         return
-    shutil.copytree(src, dst, dirs_exist_ok=True)
+    shutil.copytree(
+        src,
+        dst,
+        dirs_exist_ok=True,
+        symlinks=True,
+        ignore_dangling_symlinks=True,
+    )
+
+
+def _copytree_best_effort(src: Path, dst: Path, *, error_limit: int = 200) -> dict[str, Any]:
+    stats: dict[str, Any] = {
+        "copied_files": 0,
+        "copied_dirs": 0,
+        "copied_symlinks": 0,
+        "skipped_errors": 0,
+        "errors": [],
+    }
+
+    def record_error(source: Path, target: Path, exc: BaseException) -> None:
+        stats["skipped_errors"] += 1
+        if len(stats["errors"]) < error_limit:
+            stats["errors"].append(
+                {
+                    "source": str(source),
+                    "target": str(target),
+                    "error": str(exc),
+                }
+            )
+
+    def copy_one(source: Path, target: Path) -> None:
+        try:
+            if source.is_symlink():
+                ensure_dir(target.parent)
+                if target.exists() or target.is_symlink():
+                    if target.is_dir() and not target.is_symlink():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                os.symlink(os.readlink(source), target)
+                stats["copied_symlinks"] += 1
+                return
+            if source.is_file():
+                ensure_dir(target.parent)
+                shutil.copy2(source, target, follow_symlinks=False)
+                stats["copied_files"] += 1
+                return
+            if source.is_dir():
+                ensure_dir(target)
+                stats["copied_dirs"] += 1
+        except Exception as exc:
+            record_error(source, target, exc)
+
+    if not src.exists() and not src.is_symlink():
+        return stats
+    if src.is_file() or src.is_symlink():
+        copy_one(src, dst)
+        return stats
+
+    ensure_dir(dst)
+    for current_root, dirnames, filenames in os.walk(src, followlinks=False):
+        current_path = Path(current_root)
+        try:
+            relative_root = current_path.relative_to(src)
+        except ValueError:
+            relative_root = Path()
+        target_root = dst / relative_root
+        ensure_dir(target_root)
+        for dirname in list(dirnames):
+            source_dir = current_path / dirname
+            target_dir = target_root / dirname
+            copy_one(source_dir, target_dir)
+            if source_dir.is_symlink():
+                dirnames.remove(dirname)
+        for filename in filenames:
+            source_file = current_path / filename
+            target_file = target_root / filename
+            copy_one(source_file, target_file)
+    return stats
 
 
 def _path_has_content(path: Path) -> bool:
@@ -521,6 +612,7 @@ class TaskManager:
                 started_at=job.started_at,
                 completed_at=job.completed_at,
                 updated_at=job.updated_at,
+                copy_stats=dict((job.payload or {}).get("archive_copy_stats") or {}),
             )
             for job in archive_jobs
         ]
@@ -807,6 +899,12 @@ class TaskManager:
         if not supported or not stage_name:
             raise ValidationError(reason or "当前任务不支持安全重试")
         stage_sequence = self._stage_sequence_for_task(task)
+        archive_retried = False
+        for current_stage in stage_sequence:
+            archive_retried = self._retry_failed_archive_jobs_for_stage(db, task, current_stage) or archive_retried
+        if archive_retried:
+            db.commit()
+            return
         first_stage = stage_sequence[0]
         task.status = "pending"
         task.current_stage = first_stage
@@ -845,6 +943,9 @@ class TaskManager:
         stage_sequence = self._stage_sequence_for_task(task)
         if stage_name not in stage_sequence:
             raise ValidationError(f"无效阶段: {stage_name}")
+        if self._retry_failed_archive_jobs_for_stage(db, task, stage_name):
+            db.commit()
+            return
         supported, reason = self._stage_retry_support(db, task, stage_name)
         if not supported:
             raise ValidationError(reason or f"阶段 {stage_name} 不支持安全重试")
@@ -1078,6 +1179,65 @@ class TaskManager:
             .delete(synchronize_session=False)
             or 0
         )
+
+    def _retry_failed_archive_jobs_for_stage(self, db: Session, task: BinarySecurityTask, stage_name: str) -> bool:
+        if task.status in STAGE_RETRY_BLOCKED_TASK_STATUSES:
+            raise ValidationError(f"当前任务状态不允许重试: {task.status}")
+        jobs = (
+            db.query(BinarySecurityArchiveJob)
+            .filter(
+                BinarySecurityArchiveJob.task_id == task.id,
+                BinarySecurityArchiveJob.stage_name == stage_name,
+                BinarySecurityArchiveJob.archive_status == "failed",
+            )
+            .order_by(BinarySecurityArchiveJob.created_at.asc())
+            .all()
+        )
+        retryable_jobs = [
+            job
+            for job in jobs
+            if str((job.payload or {}).get("mapped_status") or "").strip() in {"success", "partial_success"}
+        ]
+        if not retryable_jobs:
+            return False
+        now = _now()
+        for job in retryable_jobs:
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
+            mapped_status = str((job.payload or {}).get("mapped_status") or "success").strip()
+            if item is not None:
+                item.status = mapped_status
+                item.error_message = None
+                item.started_at = item.started_at or now
+                item.finished_at = item.finished_at or now
+                if item.stage_name == "firmware_unpack":
+                    self._refresh_firmware_unpack_item_result(task, item, archived_dir=Path(job.archive_root) if job.archive_root else None)
+            job.archive_status = "pending"
+            job.owner_id = None
+            job.error_message = None
+            job.archive_root = None
+            job.started_at = None
+            job.completed_at = None
+            job.updated_at = now
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_retry_requested",
+                "产物归档已重新排队",
+                stage_name=stage_name,
+                item=item,
+                payload={
+                    "archive_job_id": job.id,
+                    "downstream_service": job.downstream_service,
+                    "downstream_task_id": job.downstream_task_id,
+                    "mapped_status": mapped_status,
+                },
+            )
+        if stage_name == "system_analysis":
+            self._refresh_system_analysis_stage_from_synced_items(db, task)
+        else:
+            self._refresh_stage_run_from_items(db, task, stage_name)
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+        return True
 
     def _ensure_downstream_archive_job(
         self,
@@ -1339,6 +1499,11 @@ class TaskManager:
                 job.updated_at = _now()
                 db.commit()
                 return None, job.error_message
+            copy_stats = dict((item.output_ref or {}).get("archive_copy_stats") or {})
+            job.payload = {
+                **dict(job.payload or {}),
+                "archive_copy_stats": copy_stats,
+            }
             job.archive_status = "archived"
             job.archive_root = str(archived_dir)
             job.error_message = None
@@ -1398,6 +1563,13 @@ class TaskManager:
                 **(item.output_ref or {}),
                 "archive_root": effective_archive_root,
             }
+            if item.stage_name == "firmware_unpack" and mapped_status == "success":
+                self._refresh_firmware_unpack_item_result(
+                    task,
+                    item,
+                    archived_dir=Path(effective_archive_root) if effective_archive_root else None,
+                    downstream_payload=downstream_payload,
+                )
             if mapped_status in {"success", "partial_success"}:
                 await self._refresh_terminal_item_result_from_downstream(
                     task,
@@ -2529,6 +2701,40 @@ class TaskManager:
             "archive_root": str(artifact_root),
         }
 
+    def _refresh_firmware_unpack_item_result(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        archived_dir: Path | None,
+        downstream_payload: dict[str, Any] | None = None,
+    ) -> None:
+        input_ref = dict(item.input_ref or {})
+        result = dict(item.result or {})
+        firmware_key = str(item.item_key or input_ref.get("firmware_key") or result.get("firmware_key") or "")
+        filename = str(input_ref.get("filename") or item.item_name or result.get("filename") or firmware_key)
+        runtime_output_path = str((item.output_ref or {}).get("runtime_output_path") or (item.output_ref or {}).get("output_path") or "")
+        fallback_root = runtime_output_path or str(Path(task.workspace_root) / "run" / "firmware-unpacker" / firmware_key)
+        unpacked_root = str(archived_dir) if archived_dir else str((item.output_ref or {}).get("archive_root") or result.get("archive_root") or result.get("unpacked_root") or fallback_root)
+        item.result = {
+            **result,
+            "firmware_key": firmware_key,
+            "firmware_name": str(result.get("firmware_name") or Path(filename).stem or firmware_key),
+            "filename": filename,
+            "input_path": str(input_ref.get("path") or result.get("input_path") or ""),
+            "unpacked_root": unpacked_root,
+            "source_root": str(result.get("source_root") or unpacked_root),
+            "task_type": result.get("task_type", TASK_TYPE_BINARY),
+            "downstream": self._lightweight_downstream_payload(downstream_payload or result.get("downstream") or {}),
+            "downstream_status_synced_at": _now().isoformat(),
+        }
+        item.output_ref = {
+            **(item.output_ref or {}),
+            "runtime_output_path": runtime_output_path,
+            "unpacked_root": unpacked_root,
+            **({"archive_root": str(archived_dir)} if archived_dir else {}),
+        }
+
     def _system_analysis_input_for_item(self, task: BinarySecurityTask, item: BinarySecurityStageItem) -> dict[str, Any]:
         for candidate in self._system_analysis_inputs(task):
             if str(candidate.get("firmware_key") or "") == str(item.item_key or ""):
@@ -2599,6 +2805,9 @@ class TaskManager:
         else:
             stage_run.finished_at = stage_run.finished_at or _now()
         if stage_name == "firmware_unpack":
+            success_items = [dict(item.result or {}) for item in items if item.status == "success"]
+            compact_success = self._compact_stage_success_items("firmware_unpack_results", success_items)
+            task.summary = {**(task.summary or {}), "firmware_unpack_results": compact_success}
             task.metrics = {
                 **(task.metrics or {}),
                 "unpacked_firmware_count": int(stage_run.counts.get("success_items", 0)),
@@ -2668,7 +2877,7 @@ class TaskManager:
         stage_run.counts = self._stage_counts(db, stage_run)
         stage_run.last_error = failed[0].get("error") if failed and status == "failed" else None
         stage_run.output_summary = {
-            "items": success,
+            "items": self._lightweight_system_analysis_items(success),
             "failed_items": failed,
             "success_count": len(success),
             "failed_count": len(failed),
@@ -3384,18 +3593,43 @@ class TaskManager:
             session.commit()
             archive_job = await self._wait_archive_job_completion(job.id, task.id)
             session.refresh(item)
-            if archive_job is None or archive_job.archive_status != "success":
+            archive_root = (item.output_ref or {}).get("archive_root")
+            if archive_job is not None and archive_job.archive_status == "success":
+                archive_root = archive_job.archive_root or archive_root
+            elif mapped_status == "success":
                 error = archive_job.error_message if archive_job is not None else "归档任务不存在"
-                item.status = "failed"
-                item.error_message = error or "下游产物归档失败"
-                item.finished_at = _now()
+                self._record_event(
+                    session,
+                    task,
+                    "downstream_archive_non_blocking_failed",
+                    "产物归档失败，阶段执行状态保持下游成功状态",
+                    stage_name=item.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={"archive_job_id": job.id, "error": error or "下游产物归档失败"},
+                )
+            item.status = mapped_status
+            item.error_message = None if mapped_status in {"success", "partial_success"} else (
+                payload.get("error") or payload.get("error_message") or payload.get("message")
+            )
+            item.finished_at = _now()
+            item.started_at = item.started_at or _now()
+            if mapped_status != "success":
                 session.commit()
-                return {"status": "failed", "error": item.error_message, "item": input_file}
+                return {"status": mapped_status, "error": item.error_message, "item": input_file}
+            fallback_sources = self._resolve_downstream_output_sources(
+                payload,
+                downstream_task_id=item.downstream_task_id,
+                extra_paths=[output_dir],
+                task=task,
+                downstream_service=item.downstream_service,
+            )
+            fallback_root = next((str(path) for path in fallback_sources if path.exists() and _path_has_content(path)), str(output_dir))
             result = {
                 **input_file,
                 "input_path": str(input_path),
-                "unpacked_root": str((item.output_ref or {}).get("archive_root") or output_dir),
-                "downstream": payload,
+                "unpacked_root": str(archive_root or fallback_root),
+                "downstream": self._lightweight_downstream_payload(payload),
             }
             item.result = {**(item.result or {}), **result}
             item.output_ref = {**(item.output_ref or {}), "runtime_output_path": str(output_dir), "unpacked_root": result["unpacked_root"]}
@@ -3468,7 +3702,7 @@ class TaskManager:
             }
             db.commit()
             return "failed", {
-                "items": success,
+                "items": self._lightweight_system_analysis_items(success),
                 "failed_items": failed,
                 "success_count": len(success),
                 "failed_count": len(failed),
@@ -3513,7 +3747,7 @@ class TaskManager:
             )
             db.commit()
         return status, {
-            "items": success,
+            "items": self._lightweight_system_analysis_items(success),
             "failed_items": failed,
             "success_count": len(success),
             "failed_count": len(failed),
@@ -3612,12 +3846,13 @@ class TaskManager:
                 **self._lightweight_system_analysis_input(firmware),
                 "artifact_root": str(materialized),
                 "archive_root": str(materialized),
-                "modules": self._lightweight_modules_for_storage(modules),
                 "module_count": len(modules),
+                "modules_file": str(materialized / "system_analysis_modules.json"),
+                "modules_preview": self._lightweight_modules_for_storage(modules),
                 "downstream": self._lightweight_downstream_payload(payload),
                 "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
             }
-            item.result = result
+            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized)}
             session.commit()
             return {"status": item.status, "item": {**result, "modules": modules}, "error": payload.get("error") or payload.get("error_message")}
@@ -3687,6 +3922,43 @@ class TaskManager:
                 compact[key] = nested_compact
         return compact
 
+    def _lightweight_artifacts_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        payload = payload or {}
+        files = payload.get("files") or []
+        return {
+            key: value
+            for key, value in {
+                "workspace_root": payload.get("workspace_root"),
+                "output_root": payload.get("output_root"),
+                "task_root": payload.get("task_root"),
+                "status": payload.get("status"),
+                "file_count": len(files) if isinstance(files, list) else 0,
+                "files_preview": files[:DB_ARTIFACT_PREVIEW_LIMIT] if isinstance(files, list) else [],
+            }.items()
+            if value not in (None, "")
+        }
+
+    def _compact_result_for_storage(self, stage_name: str, item: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+        result = dict(item)
+        if "downstream" in result:
+            result["downstream"] = self._lightweight_downstream_payload(result.get("downstream") or {})
+        if "artifacts" in result:
+            result["artifacts"] = self._lightweight_artifacts_payload(result.get("artifacts") or {})
+        if stage_name == "entry_analysis":
+            entries = [dict(row) for row in result.get("entries") or [] if isinstance(row, dict)]
+            result["entry_count"] = len(entries)
+            result["entries_preview"] = self._compact_entry_rows(entries[:DB_ENTRY_PREVIEW_LIMIT])
+            result.pop("entries", None)
+        elif stage_name == "vuln_scan":
+            artifact_files = result.get("artifact_files") or []
+            if isinstance(artifact_files, list):
+                result["artifact_file_count"] = len(artifact_files)
+                result["artifact_files_preview"] = artifact_files[:DB_ARTIFACT_PREVIEW_LIMIT]
+            result.pop("artifact_files", None)
+        return result
+
     def _lightweight_system_analysis_result(self, result_payload: dict[str, Any] | None) -> dict[str, Any]:
         payload = result_payload or {}
         raw_summary = dict(payload.get("summary") or {})
@@ -3729,10 +4001,6 @@ class TaskManager:
                     "risk_level": module.get("risk_level"),
                     "risk_score": module.get("risk_score"),
                     "file_count": module.get("file_count"),
-                    "source_dir": module.get("source_dir"),
-                    "module_dir": module.get("module_dir") or module.get("module_dir_path"),
-                    "module_report": module.get("module_report") or module.get("module_report_path"),
-                    "files_list": module.get("files_list") or module.get("files_list_path"),
                 }
             )
         return rows
@@ -3968,26 +4236,40 @@ class TaskManager:
                 },
             )
             return None
-        try:
-            ensure_dir(target_dir)
-            for source in existing_sources:
-                _copytree(source, target_dir)
-        except Exception as exc:
+        ensure_dir(target_dir)
+        copy_stats = {
+            "copied_files": 0,
+            "copied_dirs": 0,
+            "copied_symlinks": 0,
+            "skipped_errors": 0,
+            "errors": [],
+            "error_truncated": False,
+        }
+        for source in existing_sources:
+            current_stats = _copytree_best_effort(source, target_dir)
+            copy_stats["copied_files"] += int(current_stats.get("copied_files") or 0)
+            copy_stats["copied_dirs"] += int(current_stats.get("copied_dirs") or 0)
+            copy_stats["copied_symlinks"] += int(current_stats.get("copied_symlinks") or 0)
+            copy_stats["skipped_errors"] += int(current_stats.get("skipped_errors") or 0)
+            remaining = max(0, 200 - len(copy_stats["errors"]))
+            copy_stats["errors"].extend(list(current_stats.get("errors") or [])[:remaining])
+            if int(current_stats.get("skipped_errors") or 0) > len(current_stats.get("errors") or []):
+                copy_stats["error_truncated"] = True
+        if copy_stats["skipped_errors"]:
             self._record_event(
                 db,
                 task,
-                "downstream_output_copy_failed",
-                f"下游阶段产物归档失败: {exc}",
+                "downstream_output_copy_partial",
+                f"下游阶段产物已尽力归档，跳过 {copy_stats['skipped_errors']} 个错误文件",
                 stage_name=item.stage_name,
                 item=item,
-                level="error",
+                level="warning",
                 payload={
                     "target_dir": str(target_dir),
                     "sources": [str(path) for path in existing_sources],
-                    "error": str(exc),
+                    "copy_stats": copy_stats,
                 },
             )
-            return None
         self._record_event(
             db,
             task,
@@ -3999,8 +4281,17 @@ class TaskManager:
                 "target_dir": str(target_dir),
                 "sources": [str(path) for path in existing_sources],
                 "copied_file_count": _count_files(target_dir),
+                "copy_stats": copy_stats,
             },
         )
+        item.output_ref = {
+            **(item.output_ref or {}),
+            "archive_copy_stats": copy_stats,
+        }
+        item.result = {
+            **(item.result or {}),
+            "archive_copy_stats": copy_stats,
+        }
         return target_dir
 
     def _materialize_stage_artifact(
@@ -4147,9 +4438,7 @@ class TaskManager:
             retries=int(task.policy.get("max_retries_per_item") or 0),
             initial_retry=retry_existing,
         )
-        status, summary = self._aggregate_stage_items(db, task, results, "entry_results")
-        summary["entry_count"] = sum(len(item.get("entries") or []) for item in summary.get("items", []))
-        return status, summary
+        return self._aggregate_stage_items(db, task, results, "entry_results")
 
     def _entry_analysis_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         if self._task_type(task) == TASK_TYPE_SOURCE:
@@ -4229,9 +4518,7 @@ class TaskManager:
             retries=int(task.policy.get("max_retries_per_item") or 0),
             initial_retry=retry_existing,
         )
-        status, summary = self._aggregate_stage_items(db, task, results, "vuln_results")
-        summary["vuln_result_count"] = len(summary.get("items", []))
-        return status, summary
+        return self._aggregate_stage_items(db, task, results, "vuln_results")
 
     async def _run_stage_pool(
         self,
@@ -4333,7 +4620,7 @@ class TaskManager:
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
-            item.result = result
+            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {
                 "archive_root": str(archived_dir or artifact_root),
                 "source_dir": str(archived_dir or artifact_root),
@@ -4435,7 +4722,7 @@ class TaskManager:
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
-            item.result = result
+            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized)}
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
@@ -4573,7 +4860,7 @@ class TaskManager:
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
-            item.result = result
+            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized), "data_flow_file": result["data_flow_file"]}
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
@@ -4653,7 +4940,7 @@ class TaskManager:
             }
             item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
             item.finished_at = _now()
-            item.result = result
+            item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {
                 "workspace_root": artifacts.get("workspace_root"),
                 "archive_root": str(archived_dir) if archived_dir else None,
@@ -4682,6 +4969,7 @@ class TaskManager:
     def _aggregate_stage_items(self, db: Session, task: BinarySecurityTask, results: list[dict[str, Any]], summary_key: str) -> tuple[str, dict[str, Any]]:
         success = [result["item"] for result in results if result.get("status") == "success"]
         compact_success = self._compact_stage_success_items(summary_key, success)
+        db_success = self._compact_stage_success_items_for_db(summary_key, compact_success)
         failed = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "failed"]
         cancelled = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "cancelled"]
         if failed and success:
@@ -4693,13 +4981,14 @@ class TaskManager:
         else:
             status = "success"
         summary = {
-            "items": compact_success,
+            "items": db_success,
             "failed_items": failed,
             "cancelled_items": cancelled,
             "success_count": len(compact_success),
             "failed_count": len(failed),
-            "entry_count": 0,
-            "vuln_result_count": 0,
+            "entry_count": self._entry_count_for_summary(summary_key, compact_success),
+            "vuln_result_count": len(compact_success) if summary_key == "vuln_results" else 0,
+            "items_truncated": len(db_success) < len(compact_success),
             "error": failed[0].get("error") if failed else cancelled[0].get("error") if cancelled else None,
         }
         task.summary = {**task.summary, summary_key: compact_success}
@@ -4718,6 +5007,16 @@ class TaskManager:
         if compactor is None:
             return [dict(item) for item in items if isinstance(item, dict)]
         return [compactor(item) for item in items if isinstance(item, dict)]
+
+    def _compact_stage_success_items_for_db(self, summary_key: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if summary_key == "entry_results":
+            return [self._compact_entry_summary_item_for_db(item) for item in items[:DB_SUMMARY_ITEM_LIMIT] if isinstance(item, dict)]
+        return [dict(item) for item in items[:DB_SUMMARY_ITEM_LIMIT] if isinstance(item, dict)]
+
+    def _entry_count_for_summary(self, summary_key: str, items: list[dict[str, Any]]) -> int:
+        if summary_key != "entry_results":
+            return 0
+        return sum(len(item.get("entries") or []) for item in items if isinstance(item, dict))
 
     def _compact_firmware_unpack_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
         unpacked_root = item.get("unpacked_root")
@@ -4781,6 +5080,14 @@ class TaskManager:
                 }
             )
         return rows
+
+    def _compact_entry_summary_item_for_db(self, item: dict[str, Any]) -> dict[str, Any]:
+        row = dict(item)
+        entries = [dict(entry) for entry in row.get("entries") or [] if isinstance(entry, dict)]
+        row["entry_count"] = len(entries)
+        row["entries_preview"] = self._compact_entry_rows(entries[:DB_ENTRY_PREVIEW_LIMIT])
+        row.pop("entries", None)
+        return row
 
     def _compact_dataflow_summary_item(self, item: dict[str, Any]) -> dict[str, Any]:
         return {
