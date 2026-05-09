@@ -191,7 +191,7 @@ def _run_reviewer(
     val_sp: str,
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
-    heartbeat_callback: Optional[Callable[[], None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     stage_log_dir = _get_round_dir(log_dir, 0)
     _append_stage_log(
@@ -229,17 +229,21 @@ def _run_reviewer(
     if bind_cancel_client:
         bind_cancel_client(validator)
     try:
-        started_at = datetime.utcnow().isoformat()
-        started_monotonic = time.perf_counter()
-        verify_result = validator.prompt(
-            render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path),
-            stream_callback=lambda event: _append_stream_delta(
+        def _stream_review_event(event: dict[str, Any]) -> None:
+            _append_stream_delta(
                 stage_log_dir,
                 "stage4_llm_review.log",
                 f"reviewer:{suffix}",
                 event,
-            ),
-            heartbeat_callback=heartbeat_callback,
+            )
+            if activity_callback is not None:
+                activity_callback("review")
+
+        started_at = datetime.utcnow().isoformat()
+        started_monotonic = time.perf_counter()
+        verify_result = validator.prompt(
+            render_prompt(VAL_PROMPT_TMPL, firmware_path, output_path),
+            stream_callback=_stream_review_event,
         )
         token_stats = _save_agent_log(validator, log, round_dir, "reviewer")
         completed_at = datetime.utcnow().isoformat()
@@ -269,7 +273,7 @@ def _run_skill_unpack(
     val_sp: str,
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
-    heartbeat_callback: Optional[Callable[[], None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any]:
     global_round_dir = _get_round_dir(log_dir, 0)
     _append_stage_log(
@@ -310,9 +314,13 @@ def _run_skill_unpack(
     if bind_cancel_client:
         bind_cancel_client(executor)
     try:
+        def _stream_skill_event(_event: dict[str, Any]) -> None:
+            if activity_callback is not None:
+                activity_callback("tool_match")
+
         exec_result = executor.prompt(
             render_prompt(EXEC_FIRST_TMPL, firmware_path, output_path),
-            heartbeat_callback=heartbeat_callback,
+            stream_callback=_stream_skill_event,
         )
         _save_agent_log(executor, log, global_round_dir, "skill_executor")
         passed, review_result, _review_meta = _run_reviewer(
@@ -326,7 +334,7 @@ def _run_skill_unpack(
             val_sp,
             llm_binding_snapshot=llm_binding_snapshot,
             bind_cancel_client=bind_cancel_client,
-            heartbeat_callback=heartbeat_callback,
+            activity_callback=activity_callback,
         )
         result = {
             "success": passed,
@@ -377,8 +385,7 @@ def _run_generic_unpack(
     val_sp: str,
     llm_binding_snapshot: dict[str, Any] | None = None,
     event_callback: Optional[Callable[[str, str], None]] = None,
-    unpack_heartbeat_callback: Optional[Callable[[], None]] = None,
-    review_heartbeat_callback: Optional[Callable[[], None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
 ) -> tuple[bool, int, str]:
     stage_log_dir = _get_round_dir(log_dir, 0)
     _append_stage_log(
@@ -453,17 +460,21 @@ def _run_generic_unpack(
                 firmware_path,
                 output_path,
             )
-            executor_started_at = datetime.utcnow().isoformat()
-            executor_started_monotonic = time.perf_counter()
-            exec_result = executor.prompt(
-                exec_msg,
-                stream_callback=lambda event, round_id=attempt: _append_stream_delta(
+            def _stream_unpack_event(event: dict[str, Any], *, round_id: int = attempt) -> None:
+                _append_stream_delta(
                     stage_log_dir,
                     "stage3_llm_unpack.log",
                     f"executor:round_{round_id}",
                     event,
-                ),
-                heartbeat_callback=unpack_heartbeat_callback,
+                )
+                if activity_callback is not None:
+                    activity_callback("llm_unpack")
+
+            executor_started_at = datetime.utcnow().isoformat()
+            executor_started_monotonic = time.perf_counter()
+            exec_result = executor.prompt(
+                exec_msg,
+                stream_callback=_stream_unpack_event,
             )
             executor_token_stats = _save_agent_log(executor, log, round_dir, "executor")
             executor_completed_at = datetime.utcnow().isoformat()
@@ -507,7 +518,7 @@ def _run_generic_unpack(
                 val_sp,
                 llm_binding_snapshot=llm_binding_snapshot,
                 bind_cancel_client=cancel_check,
-                heartbeat_callback=review_heartbeat_callback,
+                activity_callback=activity_callback,
             )
             log_event(
                 log,
@@ -670,6 +681,7 @@ def _generate_candidate_skill(
     log_dir: Path | None,
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
 ) -> dict[str, Any] | None:
     _append_stage_log(
         log_dir,
@@ -721,7 +733,14 @@ def _generate_candidate_skill(
         if bind_cancel_client:
             bind_cancel_client(author)
         try:
-            raw_doc = author.prompt(prompt)
+            def _stream_skill_author_event(_event: dict[str, Any]) -> None:
+                if activity_callback is not None:
+                    activity_callback("skill_author")
+
+            raw_doc = author.prompt(
+                prompt,
+                stream_callback=_stream_skill_author_event,
+            )
             _save_agent_log(author, log, log_dir, "skill_author")
         finally:
             if bind_cancel_client:
@@ -777,7 +796,7 @@ def _run_cleaner(
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
     event_callback: Optional[Callable[[str, str], None]] = None,
-    heartbeat_callback: Optional[Callable[[], None]] = None,
+    activity_callback: Optional[Callable[[str], None]] = None,
 ) -> str:
     _append_stage_log(
         log_dir,
@@ -823,10 +842,11 @@ def _run_cleaner(
                 status="running",
                 detail={"output_path": output_path},
             )
-        result = cleaner.prompt(
-            clean_msg,
-            heartbeat_callback=heartbeat_callback,
-        )
+        def _stream_cleanup_event(_event: dict[str, Any]) -> None:
+            if activity_callback is not None:
+                activity_callback("cleanup")
+
+        result = cleaner.prompt(clean_msg, stream_callback=_stream_cleanup_event)
         _save_agent_log(cleaner, log, log_dir, "cleaner")
         log_event(
             log,
@@ -900,8 +920,16 @@ def run_unpack(
         except Exception:
             pass
 
-    def _stage_heartbeat(stage: str) -> Callable[[], None]:
-        return lambda: _report_progress(stage)
+    lease_activity_interval_seconds = 10.0
+    last_activity_reported_at: dict[str, float] = {}
+
+    def _report_activity(stage: str, *, force: bool = False) -> None:
+        now_monotonic = time.monotonic()
+        previous = last_activity_reported_at.get(stage)
+        if not force and previous is not None and (now_monotonic - previous) < lease_activity_interval_seconds:
+            return
+        last_activity_reported_at[stage] = now_monotonic
+        _report_progress(stage)
 
     os.makedirs(output_path, exist_ok=True)
     try:
@@ -911,7 +939,7 @@ def run_unpack(
     global_round_dir = _get_round_dir(log_dir, 0)
 
     _check_cancel()
-    _report_progress("preprocess")
+    _report_activity("preprocess", force=True)
 
     try:
         pre_result = run_preprocess(
@@ -939,7 +967,7 @@ def run_unpack(
         }
 
     _check_cancel()
-    _report_progress("feature_extract")
+    _report_activity("feature_extract", force=True)
 
     features: dict[str, Any] = {}
     try:
@@ -999,7 +1027,7 @@ def run_unpack(
     )
 
     _check_cancel()
-    _report_progress("skill_match")
+    _report_activity("skill_match", force=True)
 
     try:
         exec_def = load_agent_def(EXEC_AGENT_DEF)
@@ -1039,7 +1067,7 @@ def run_unpack(
                     },
                 )
             _check_cancel()
-            _report_progress("tool_match")
+            _report_activity("tool_match", force=True)
             _append_stage_log(
                 global_round_dir,
                 "skill_match.log",
@@ -1058,7 +1086,7 @@ def run_unpack(
                 val_sp,
                 llm_binding_snapshot=llm_binding_snapshot,
                 bind_cancel_client=_bind_cancel_client,
-                heartbeat_callback=_stage_heartbeat("tool_match"),
+                activity_callback=_report_activity,
             )
             if skill_result.get("success"):
                 passed = True
@@ -1097,7 +1125,7 @@ def run_unpack(
                 )
 
         if not passed:
-            _report_progress("llm_unpack")
+            _report_activity("llm_unpack", force=True)
             generic_passed, final_round, last_reason = _run_generic_unpack(
                 task_id,
                 firmware_path,
@@ -1110,12 +1138,11 @@ def run_unpack(
                 val_sp,
                 llm_binding_snapshot=llm_binding_snapshot,
                 event_callback=event_callback,
-                unpack_heartbeat_callback=_stage_heartbeat("llm_unpack"),
-                review_heartbeat_callback=_stage_heartbeat("review"),
+                activity_callback=_report_activity,
             )
             passed = generic_passed
             if passed:
-                _report_progress("review")
+                _report_activity("review", force=True)
                 generated_skill = _generate_candidate_skill(
                     task_id,
                     firmware_path,
@@ -1125,6 +1152,7 @@ def run_unpack(
                     global_round_dir,
                     llm_binding_snapshot=llm_binding_snapshot,
                     bind_cancel_client=_bind_cancel_client,
+                    activity_callback=_report_activity,
                 )
             else:
                 _append_stage_log(
@@ -1136,7 +1164,7 @@ def run_unpack(
                 )
 
         _check_cancel()
-        _report_progress("cleanup")
+        _report_activity("cleanup", force=True)
         _run_cleaner(
             task_id,
             output_path,
@@ -1144,7 +1172,7 @@ def run_unpack(
             llm_binding_snapshot=llm_binding_snapshot,
             bind_cancel_client=_bind_cancel_client,
             event_callback=event_callback,
-            heartbeat_callback=_stage_heartbeat("cleanup"),
+            activity_callback=_report_activity,
         )
         _normalize_output_reports(output_path)
         _write_token_summary(log_dir)

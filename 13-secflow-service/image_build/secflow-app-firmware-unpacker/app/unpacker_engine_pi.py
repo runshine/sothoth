@@ -8,7 +8,6 @@ import os
 import shutil
 import signal
 import subprocess
-import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -329,27 +328,7 @@ class PiRpcClient:
         self,
         message: str,
         stream_callback: Optional[Callable[[dict[str, Any]], None]] = None,
-        heartbeat_callback: Optional[Callable[[], None]] = None,
-        heartbeat_interval_seconds: float = 10.0,
     ) -> str:
-        heartbeat_stop = threading.Event()
-        heartbeat_thread: threading.Thread | None = None
-
-        if heartbeat_callback is not None and heartbeat_interval_seconds > 0:
-            def _heartbeat_loop() -> None:
-                while not heartbeat_stop.wait(timeout=heartbeat_interval_seconds):
-                    try:
-                        heartbeat_callback()
-                    except Exception:
-                        pass
-
-            heartbeat_thread = threading.Thread(
-                target=_heartbeat_loop,
-                name="pi-rpc-heartbeat",
-                daemon=True,
-            )
-            heartbeat_thread.start()
-
         self._mark_session_active()
         try:
             self.send(
@@ -402,16 +381,12 @@ class PiRpcClient:
 
             return self.extract_assistant_text(events)
         finally:
-            heartbeat_stop.set()
-            if heartbeat_thread is not None:
-                heartbeat_thread.join(timeout=1)
+            pass
 
     def prompt(
         self,
         message: str,
         stream_callback: Optional[Callable[[dict[str, Any]], None]] = None,
-        heartbeat_callback: Optional[Callable[[], None]] = None,
-        heartbeat_interval_seconds: float = 10.0,
     ) -> str:
         busy_retries = 2
         for attempt in range(1 + self.RETRIES):
@@ -421,8 +396,6 @@ class PiRpcClient:
                         return self._prompt_once(
                             message,
                             stream_callback=stream_callback,
-                            heartbeat_callback=heartbeat_callback,
-                            heartbeat_interval_seconds=heartbeat_interval_seconds,
                         )
                     except RuntimeError as exc:
                         if str(exc) != "__PI_BUSY__" or busy_attempt >= busy_retries:
