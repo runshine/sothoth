@@ -25,6 +25,7 @@ from app.model import (
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
     BinarySecurityEvent,
+    BinarySecurityArchiveJob,
     BinarySecurityProjectConfig,
     BinarySecurityServiceConfig,
     BinarySecurityStageItem,
@@ -218,6 +219,7 @@ class TaskManager:
         self.instance_id = os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or f"binary-security-{uuid.uuid4().hex[:12]}"
         self._running = False
         self._loop_task: Optional[asyncio.Task] = None
+        self._archive_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
         self._worker_lock = asyncio.Lock()
 
@@ -226,6 +228,7 @@ class TaskManager:
             return
         self._running = True
         self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
+        self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
 
     async def stop(self) -> None:
         self._running = False
@@ -233,6 +236,12 @@ class TaskManager:
             self._loop_task.cancel()
             try:
                 await self._loop_task
+            except asyncio.CancelledError:
+                pass
+        if self._archive_loop_task:
+            self._archive_loop_task.cancel()
+            try:
+                await self._archive_loop_task
             except asyncio.CancelledError:
                 pass
         active = list(self._workers.values())
@@ -881,7 +890,36 @@ class TaskManager:
                         },
                     )
                     continue
-                if force or mapped_status != before_status:
+                terminal_status = mapped_status in {"success", "partial_success", "failed", "cancelled"}
+                if terminal_status:
+                    job = self._ensure_downstream_archive_job(
+                        db,
+                        task,
+                        item,
+                        payload=payload,
+                        mapped_status=mapped_status,
+                        before_status=before_status,
+                        force=force,
+                    )
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_archive_job_queued" if job.archive_status in {"pending", "running"} else "downstream_archive_job_reused",
+                        "下游状态已获取，等待产物归档完成后更新状态",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "archive_job_id": job.id,
+                            "archive_status": job.archive_status,
+                            "downstream_service": item.downstream_service,
+                            "downstream_task_id": item.downstream_task_id,
+                            "downstream_status": downstream_status,
+                            "mapped_status": mapped_status,
+                        },
+                    )
+                    skipped_count += 1
+                    continue
+                if mapped_status != before_status:
                     item.status = mapped_status
                     item.error_message = None if mapped_status in {"queued", "running", "success"} else (
                         payload.get("error") or payload.get("error_message") or payload.get("message") or item.error_message
@@ -900,31 +938,6 @@ class TaskManager:
                     synced_count += 1
                 else:
                     skipped_count += 1
-                if force or mapped_status in {"success", "partial_success", "failed", "cancelled"}:
-                    archived_dir = self._archive_downstream_output(
-                        db,
-                        task,
-                        item,
-                        semantic_key=item.item_key,
-                        payload=payload,
-                    )
-                    if archived_dir:
-                        item.output_ref = {
-                            **(item.output_ref or {}),
-                            "archive_root": str(archived_dir),
-                        }
-                        item.result = {
-                            **(item.result or {}),
-                            "archive_root": str(archived_dir),
-                        }
-                    if mapped_status in {"success", "partial_success"}:
-                        await self._refresh_terminal_item_result_from_downstream(
-                            task,
-                            item,
-                            payload,
-                            mapped_status=mapped_status,
-                            archived_dir=archived_dir,
-                        )
                 self._record_event(
                     db,
                     task,
@@ -973,6 +986,89 @@ class TaskManager:
             failed_downstream_count=failed_count,
         )
 
+    def _ensure_downstream_archive_job(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        payload: dict[str, Any],
+        mapped_status: str,
+        before_status: str | None,
+        force: bool = False,
+        extra_paths: list[str | Path] | None = None,
+    ) -> BinarySecurityArchiveJob:
+        downstream_task_id = str(item.downstream_task_id or "").strip()
+        lock_name = f"secflow_binary_archive:{item.id}:{downstream_task_id}"
+        locked = False
+        try:
+            try:
+                locked = bool(db.execute(text("SELECT GET_LOCK(:name, :timeout)"), {"name": lock_name, "timeout": 5}).scalar())
+            except Exception:
+                locked = False
+            existing = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(
+                    BinarySecurityArchiveJob.item_id == item.id,
+                    BinarySecurityArchiveJob.downstream_task_id == downstream_task_id,
+                    BinarySecurityArchiveJob.archive_status.in_(["pending", "running", "archived", "applying", "success"]),
+                )
+                .order_by(BinarySecurityArchiveJob.created_at.desc())
+                .first()
+            )
+            if existing is not None:
+                return existing
+            failed = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(
+                    BinarySecurityArchiveJob.item_id == item.id,
+                    BinarySecurityArchiveJob.downstream_task_id == downstream_task_id,
+                    BinarySecurityArchiveJob.archive_status == "failed",
+                )
+                .order_by(BinarySecurityArchiveJob.created_at.desc())
+                .first()
+            )
+            job = failed or BinarySecurityArchiveJob(
+                id=f"aj_{uuid.uuid4().hex[:24]}",
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_name=item.stage_name,
+                item_id=item.id,
+                item_key=item.item_key,
+                downstream_service=item.downstream_service,
+                downstream_task_id=downstream_task_id,
+            )
+            job.task_id = task.id
+            job.project_id = task.project_id
+            job.stage_name = item.stage_name
+            job.item_key = item.item_key
+            job.downstream_service = item.downstream_service
+            job.downstream_task_id = downstream_task_id
+            job.archive_status = "pending"
+            job.owner_id = None
+            job.error_message = None
+            job.archive_root = None
+            job.started_at = None
+            job.completed_at = None
+            job.updated_at = _now()
+            job.payload = {
+                "mapped_status": mapped_status,
+                "before_status": before_status,
+                "force": force,
+                "downstream_payload": payload,
+                "extra_paths": [str(path) for path in (extra_paths or [])],
+            }
+            if failed is None:
+                db.add(job)
+            db.flush()
+            return job
+        finally:
+            if locked:
+                try:
+                    db.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+                except Exception:
+                    pass
+
     def get_project_config(self, db: Session, project_id: str) -> BinarySecurityProjectConfigResponse:
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
         config = BinarySecurityProjectConfigPayload(**(row.config if row else {}))
@@ -1014,6 +1110,246 @@ class TaskManager:
             finally:
                 db.close()
             await asyncio.sleep(self.cfg.scheduler.poll_interval_seconds)
+
+    async def _archive_dispatch_loop(self) -> None:
+        while self._running:
+            try:
+                archived_job_id = self._next_archived_job()
+                if archived_job_id:
+                    await self._apply_archive_job_status(archived_job_id, None)
+                    continue
+                job_id = self._claim_archive_job()
+                if job_id:
+                    await self._process_archive_job(job_id)
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(max(1, self.cfg.scheduler.poll_interval_seconds))
+
+    def _next_archived_job(self) -> str | None:
+        session_factory = get_session_factory()
+        db = session_factory()
+        try:
+            job = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(BinarySecurityArchiveJob.archive_status == "archived")
+                .order_by(BinarySecurityArchiveJob.updated_at.asc(), BinarySecurityArchiveJob.id.asc())
+                .first()
+            )
+            if job is None:
+                return None
+            updated = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(
+                    BinarySecurityArchiveJob.id == job.id,
+                    BinarySecurityArchiveJob.archive_status == "archived",
+                )
+                .update(
+                    {
+                        BinarySecurityArchiveJob.archive_status: "applying",
+                        BinarySecurityArchiveJob.owner_id: self.instance_id,
+                        BinarySecurityArchiveJob.updated_at: _now(),
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            return job.id if updated else None
+        finally:
+            db.close()
+
+    def _claim_archive_job(self) -> str | None:
+        session_factory = get_session_factory()
+        db = session_factory()
+        try:
+            job = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(BinarySecurityArchiveJob.archive_status == "pending")
+                .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+                .first()
+            )
+            if job is None:
+                return None
+            updated = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(
+                    BinarySecurityArchiveJob.id == job.id,
+                    BinarySecurityArchiveJob.archive_status == "pending",
+                )
+                .update(
+                    {
+                        BinarySecurityArchiveJob.archive_status: "running",
+                        BinarySecurityArchiveJob.owner_id: self.instance_id,
+                        BinarySecurityArchiveJob.started_at: _now(),
+                        BinarySecurityArchiveJob.updated_at: _now(),
+                        BinarySecurityArchiveJob.attempts: int(job.attempts or 0) + 1,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+            return job.id if updated else None
+        finally:
+            db.close()
+
+    async def _process_archive_job(self, job_id: str) -> None:
+        archived_root, error = await asyncio.to_thread(self._run_archive_copy_job, job_id)
+        if error:
+            return
+        await self._apply_archive_job_status(job_id, archived_root)
+
+    async def _wait_archive_job_completion(self, job_id: str, task_id: str) -> BinarySecurityArchiveJob | None:
+        session_factory = get_session_factory()
+        while True:
+            self._touch_task_heartbeat(task_id)
+            db = session_factory()
+            try:
+                job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
+                if job is None:
+                    return None
+                if job.archive_status in {"success", "failed"}:
+                    return job
+            finally:
+                db.close()
+            await asyncio.sleep(max(1, self.cfg.scheduler.stage_poll_interval_seconds))
+
+    def _run_archive_copy_job(self, job_id: str) -> tuple[str | None, str | None]:
+        session_factory = get_session_factory()
+        db = session_factory()
+        try:
+            job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
+            if job is None or job.archive_status != "running":
+                return None, "archive job is not running"
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == job.task_id).first()
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
+            if task is None or item is None:
+                job.archive_status = "failed"
+                job.error_message = "任务或阶段子任务不存在"
+                job.completed_at = _now()
+                db.commit()
+                return None, job.error_message
+            payload = dict(job.payload or {})
+            archived_dir = self._archive_downstream_output(
+                db,
+                task,
+                item,
+                semantic_key=item.item_key,
+                payload=payload.get("downstream_payload") or {},
+                extra_paths=payload.get("extra_paths") or None,
+            )
+            if not archived_dir:
+                job.archive_status = "failed"
+                job.error_message = "下游产物归档未完成"
+                job.completed_at = _now()
+                job.updated_at = _now()
+                db.commit()
+                return None, job.error_message
+            job.archive_status = "archived"
+            job.archive_root = str(archived_dir)
+            job.error_message = None
+            job.updated_at = _now()
+            db.commit()
+            return str(archived_dir), None
+        except Exception as exc:
+            db.rollback()
+            try:
+                job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
+                if job is not None:
+                    job.archive_status = "failed"
+                    job.error_message = str(exc)
+                    job.completed_at = _now()
+                    job.updated_at = _now()
+                    db.commit()
+            except Exception:
+                db.rollback()
+            return None, str(exc)
+        finally:
+            db.close()
+
+    async def _apply_archive_job_status(self, job_id: str, archived_root: str | None) -> None:
+        session_factory = get_session_factory()
+        db = session_factory()
+        try:
+            job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
+            if job is None or job.archive_status not in {"archived", "running", "applying"}:
+                return
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == job.task_id).first()
+            item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == job.item_id).first()
+            if task is None or item is None:
+                return
+            payload = dict(job.payload or {})
+            mapped_status = str(payload.get("mapped_status") or "").strip()
+            downstream_payload = dict(payload.get("downstream_payload") or {})
+            effective_archive_root = archived_root or job.archive_root
+            if not mapped_status:
+                job.archive_status = "failed"
+                job.error_message = "归档 job 缺少目标状态"
+                job.completed_at = _now()
+                db.commit()
+                return
+            item.status = mapped_status
+            item.error_message = None if mapped_status in {"queued", "running", "success"} else (
+                downstream_payload.get("error") or downstream_payload.get("error_message") or downstream_payload.get("message") or item.error_message
+            )
+            item.finished_at = None if mapped_status in {"queued", "running"} else (item.finished_at or _now())
+            item.started_at = item.started_at or _now()
+            item.result = {
+                **(item.result or {}),
+                "downstream": self._lightweight_downstream_payload(downstream_payload),
+                "downstream_status_synced_at": _now().isoformat(),
+                "archive_root": effective_archive_root,
+            }
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "archive_root": effective_archive_root,
+            }
+            if mapped_status in {"success", "partial_success"}:
+                await self._refresh_terminal_item_result_from_downstream(
+                    task,
+                    item,
+                    downstream_payload,
+                    mapped_status=mapped_status,
+                    archived_dir=Path(effective_archive_root) if effective_archive_root else None,
+                )
+            if item.stage_name == "system_analysis":
+                self._refresh_system_analysis_stage_from_synced_items(db, task)
+            else:
+                self._refresh_stage_run_from_items(db, task, item.stage_name)
+            self._refresh_task_status_after_sync(db, task)
+            job.archive_status = "success"
+            job.error_message = None
+            job.completed_at = _now()
+            job.updated_at = _now()
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_job_completed",
+                "下游产物归档完成，状态已同步",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "archive_job_id": job.id,
+                    "archive_root": effective_archive_root,
+                    "mapped_status": mapped_status,
+                    "downstream_service": item.downstream_service,
+                    "downstream_task_id": item.downstream_task_id,
+                },
+            )
+            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
+            if job is not None:
+                job.archive_status = "failed"
+                job.error_message = str(exc)
+                job.completed_at = _now()
+                job.updated_at = _now()
+                db.commit()
+        finally:
+            db.close()
 
     def _dispatch_once(self, db: Session) -> list[str]:
         lock_name = "secflow_binary_security_dispatch_lock"
@@ -2094,6 +2430,12 @@ class TaskManager:
             task.summary = summary
             self._finalize_task(db, task)
             return
+        if task_retry_mode:
+            task.execution_mode = None
+            task.target_stage_name = None
+            summary = dict(task.summary or {})
+            summary.pop("task_retry_context", None)
+            task.summary = summary
         next_stage = self._next_incomplete_stage(db, task)
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
@@ -2589,28 +2931,44 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            item.finished_at = _now()
-            item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
-            archived_dir = self._archive_downstream_output(
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            job = self._ensure_downstream_archive_job(
                 session,
                 task,
                 item,
-                semantic_key=firmware_key,
                 payload=payload,
+                mapped_status=mapped_status,
+                before_status=item.status,
+                force=False,
                 extra_paths=[output_dir],
             )
+            self._record_event(
+                session,
+                task,
+                "downstream_archive_job_queued",
+                "下游固件解包已终态，等待产物归档完成后更新阶段状态",
+                stage_name=item.stage_name,
+                item=item,
+                payload={"archive_job_id": job.id, "downstream_status": status, "mapped_status": mapped_status},
+            )
+            session.commit()
+            archive_job = await self._wait_archive_job_completion(job.id, task.id)
+            session.refresh(item)
+            if archive_job is None or archive_job.archive_status != "success":
+                error = archive_job.error_message if archive_job is not None else "归档任务不存在"
+                item.status = "failed"
+                item.error_message = error or "下游产物归档失败"
+                item.finished_at = _now()
+                session.commit()
+                return {"status": "failed", "error": item.error_message, "item": input_file}
             result = {
                 **input_file,
                 "input_path": str(input_path),
-                "unpacked_root": str(archived_dir or output_dir),
+                "unpacked_root": str((item.output_ref or {}).get("archive_root") or output_dir),
                 "downstream": payload,
             }
-            item.result = result
-            item.output_ref = {
-                "runtime_output_path": str(output_dir),
-                "archive_root": str(archived_dir) if archived_dir else None,
-                "unpacked_root": str(archived_dir or output_dir),
-            }
+            item.result = {**(item.result or {}), **result}
+            item.output_ref = {**(item.output_ref or {}), "runtime_output_path": str(output_dir), "unpacked_root": result["unpacked_root"]}
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:

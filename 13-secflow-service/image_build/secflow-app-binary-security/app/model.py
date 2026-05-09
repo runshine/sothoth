@@ -251,6 +251,37 @@ class BinarySecurityEvent(Base, JsonMixin):
         self.payload_json = self._dump_json(value or {})
 
 
+class BinarySecurityArchiveJob(Base, JsonMixin):
+    __tablename__ = "secflow_binary_security_archive_job"
+
+    id = Column(String(48), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    stage_name = Column(String(64), nullable=False, index=True)
+    item_id = Column(String(40), nullable=False, index=True)
+    item_key = Column(String(128), nullable=True, index=True)
+    downstream_service = Column(String(64), nullable=True, index=True)
+    downstream_task_id = Column(String(128), nullable=True, index=True)
+    archive_status = Column(String(32), nullable=False, default="pending", index=True)
+    owner_id = Column(String(128), nullable=True, index=True)
+    payload_json = Column(Text, nullable=True)
+    archive_root = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=now_local, nullable=False, index=True)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return self._load_json(self.payload_json, {})
+
+    @payload.setter
+    def payload(self, value: dict[str, Any] | None) -> None:
+        self.payload_json = self._dump_json(value or {})
+
+
 class BinarySecurityProjectConfig(Base, JsonMixin):
     __tablename__ = "secflow_binary_security_project_config"
 
