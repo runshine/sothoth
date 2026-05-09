@@ -2504,7 +2504,12 @@ class TaskManager:
                 item_name=firmware["filename"],
                 parent_key=firmware["firmware_key"],
                 downstream_service="system_analyse",
-                input_ref={"input_path": firmware["unpacked_root"], "firmware_key": firmware["firmware_key"]},
+                input_ref={
+                    "input_path": firmware["unpacked_root"],
+                    "firmware_key": firmware["firmware_key"],
+                    "task_type": self._task_type(task),
+                    "analysis_mode": self._task_type(task),
+                },
                 retrying=retrying,
             )
             session.commit()
@@ -2516,6 +2521,7 @@ class TaskManager:
                     f"{task.name}-{firmware['firmware_name']}-system-analysis",
                     firmware["unpacked_root"],
                     _downstream_origin_payload(task, item),
+                    analysis_mode=self._task_type(task),
                 )
             item.downstream_task_id = created.get("task_id") or item.downstream_task_id
             session.commit()
