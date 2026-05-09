@@ -123,3 +123,61 @@ def test_firmware_unpacker_agentflow_api_rejects_non_json(tmp_path, monkeypatch)
         from app.main import app
 
         app.dependency_overrides.pop(get_current_subject, None)
+
+
+def test_task_agentflow_helpers_expose_node_timing_and_files(tmp_path):
+    from app.api.firmware import (
+        _extract_failed_nodes,
+        _list_stage_files,
+        _list_trace_files,
+        _normalize_agentflow_nodes,
+    )
+
+    run_json = {
+        "nodes": {
+            "alpha": {
+                "status": "failed",
+                "started_at": "2026-05-08T00:00:00+00:00",
+                "finished_at": "2026-05-08T00:00:02+00:00",
+                "error": "boom",
+            },
+            "beta": {"status": "completed"},
+        }
+    }
+
+    nodes = _normalize_agentflow_nodes(run_json, None)
+    assert nodes["alpha"]["completed_at"] == "2026-05-08T00:00:02+00:00"
+    assert nodes["alpha"]["duration_seconds"] == 2.0
+    assert nodes["alpha"]["error"] == "boom"
+    assert _extract_failed_nodes(run_json, None, None)[0]["node_id"] == "alpha"
+
+    run_dir = tmp_path / "run"
+    (run_dir / "artifacts" / "alpha").mkdir(parents=True)
+    (run_dir / "run.json").write_text("{}", encoding="utf-8")
+    (run_dir / "events.jsonl").write_text("", encoding="utf-8")
+    (run_dir / "artifacts" / "alpha" / "trace.jsonl").write_text("", encoding="utf-8")
+    trace_paths = {item["path"] for item in _list_trace_files(run_dir)}
+    assert trace_paths == {"run.json", "events.jsonl", "artifacts/alpha/trace.jsonl"}
+
+    task_run_dir = tmp_path / "task-run"
+    task_run_dir.mkdir()
+    (task_run_dir / "final_result.json").write_text("{}", encoding="utf-8")
+    (task_run_dir / "tokens_summary.json").write_text("{}", encoding="utf-8")
+    stage_paths = {item["path"] for item in _list_stage_files(task_run_dir)}
+    assert stage_paths == {"final_result.json", "tokens_summary.json"}
+
+
+def test_metrics_endpoint_exposes_agentflow_gauges(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    try:
+        response = client.get("/metrics")
+        assert response.status_code == 200
+        body = response.text
+        assert "firmware_unpacker_tasks_total" in body
+        assert "firmware_unpacker_agentflow_active_runs" in body
+        assert "firmware_unpacker_agentflow_tokens_total" in body
+    finally:
+        from app.api.dependencies import get_current_subject
+        from app.main import app
+
+        app.dependency_overrides.pop(get_current_subject, None)

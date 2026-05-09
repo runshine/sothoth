@@ -1,0 +1,19 @@
+{
+  "skill": "tools/matched-bin.md",
+  "success": true,
+  "failure_summary": {
+    "failed_nodes": []
+  },
+  "attempts": {
+    "skill_executor": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 14.213648
+    },
+    "skill_reviewer": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 0.017186
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "features": {
+    "filename": "fw-real-skill.bin",
+    "ext": ".bin",
+    "fmt": "unknown",
+    "size": 1043,
+    "magic_hex": "52504953",
+    "family_id": "bin-52504953-boot-section-start-0x42424242-en"
+  },
+  "matched_skill": "tools/matched-bin.md",
+  "matched_skill_version": 1,
+  "matched_skill_score": 90,
+  "matched_status": "active",
+  "reasons": [
+    "magic:52504953",
+    "ext:.bin"
+  ]
+}

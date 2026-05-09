@@ -1,0 +1,37 @@
+{
+  "status": "success",
+  "message": "Unpacking verified successfully",
+  "rounds": 1,
+  "matched_skill": null,
+  "matched_skill_version": null,
+  "matched_skill_score": null,
+  "fallback_to_llm": false,
+  "generated_skill_path": "tools/bin-46575445__candidate__20260509004019.md",
+  "generated_skill_status": "candidate",
+  "promotion_success_count": 0,
+  "agentflow_run_id": "316fce4eebae487f91cbd6aba1e9648a",
+  "run_id": "316fce4eebae487f91cbd6aba1e9648a",
+  "node_attempts": {
+    "skill_executor": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 2.610102
+    },
+    "generic_executor": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 30.706892
+    },
+    "generic_reviewer": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 0.02637
+    }
+  },
+  "failure_summary": {
+    "failed_nodes": []
+  },
+  "failure_category": null,
+  "total_tokens": 50933,
+  "fixture_note": "Sanitized from a real pi AgentFlow generic smoke run on 2026-05-09; absolute temp paths removed."
+}

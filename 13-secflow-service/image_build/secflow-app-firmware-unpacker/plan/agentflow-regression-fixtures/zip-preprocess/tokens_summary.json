@@ -1,4 +1,7 @@
 {
+  "total_prompt_tokens": 0,
+  "total_completion_tokens": 0,
+  "total_tokens": 0,
   "grand_total": {
     "prompt_tokens": 0,
     "completion_tokens": 0,

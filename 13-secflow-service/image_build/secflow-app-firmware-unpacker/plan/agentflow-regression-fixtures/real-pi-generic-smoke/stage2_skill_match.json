@@ -1,0 +1,16 @@
+{
+  "features": {
+    "filename": "fw-real-generic.bin",
+    "ext": ".bin",
+    "fmt": "unknown",
+    "size": 4115,
+    "magic_hex": "46575445",
+    "binwalk_sigs": [],
+    "family_id": "bin-46575445"
+  },
+  "matched_skill": null,
+  "matched_skill_version": null,
+  "matched_skill_score": 0,
+  "matched_status": null,
+  "reasons": []
+}

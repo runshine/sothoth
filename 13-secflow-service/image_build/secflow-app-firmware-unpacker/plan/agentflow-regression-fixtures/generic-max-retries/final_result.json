@@ -1,0 +1,40 @@
+{
+  "status": "failed",
+  "message": "AgentFlow run failed: failed",
+  "rounds": 2,
+  "matched_skill": null,
+  "matched_skill_version": null,
+  "matched_skill_score": null,
+  "fallback_to_llm": false,
+  "generated_skill_path": null,
+  "generated_skill_status": null,
+  "promotion_success_count": null,
+  "agentflow_run_id": "fixture-generic-max-retries",
+  "run_id": "fixture-generic-max-retries",
+  "node_attempts": {
+    "generic_executor": {
+      "attempt_count": 2,
+      "duration_seconds": 0.7
+    },
+    "generic_reviewer": {
+      "attempt_count": 2,
+      "duration_seconds": 0.2
+    }
+  },
+  "failure_summary": {
+    "failed_nodes": [
+      {
+        "node_id": "generic_reviewer",
+        "status": "failed",
+        "attempts": 2,
+        "classification": {
+          "category": "CONTENT_MISSING",
+          "failure_category": "missing_content",
+          "reason": "empty_output"
+        }
+      }
+    ]
+  },
+  "failure_category": "missing_content",
+  "total_tokens": 840
+}

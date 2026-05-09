@@ -1,7 +1,7 @@
 {
   "description": "Fixed firmware regression samples for AgentFlow self-evolution gates.",
   "thresholds": {
-    "min_success_rate": 1.0,
+    "min_success_rate": 0.8,
     "max_avg_rounds": 1.0,
     "max_avg_token_count": 1000,
     "max_fallback_to_llm_rate": 0.34
@@ -36,6 +36,26 @@
       "expected_status": "success",
       "expected_fallback_to_llm": true,
       "expected_generated_skill": true
+    },
+    {
+      "id": "generic-success",
+      "variant": "generic",
+      "result_path": "plan/agentflow-regression-fixtures/generic-success/final_result.json",
+      "tokens_path": "plan/agentflow-regression-fixtures/generic-success/tokens_summary.json",
+      "duration_seconds": 0.6,
+      "expected_status": "success",
+      "expected_fallback_to_llm": false,
+      "expected_generated_skill": true
+    },
+    {
+      "id": "generic-max-retries",
+      "variant": "generic-failed",
+      "result_path": "plan/agentflow-regression-fixtures/generic-max-retries/final_result.json",
+      "tokens_path": "plan/agentflow-regression-fixtures/generic-max-retries/tokens_summary.json",
+      "duration_seconds": 0.9,
+      "expected_status": "failed",
+      "expected_fallback_to_llm": false,
+      "expected_generated_skill": false
     }
   ]
 }

@@ -1,0 +1,23 @@
+{
+  "id": "fixture-generic-success",
+  "status": "completed",
+  "started_at": "2026-05-08T00:00:00+00:00",
+  "finished_at": "2026-05-08T00:00:00.600000+00:00",
+  "nodes": {
+    "skill_reviewer": {
+      "status": "completed",
+      "started_at": "2026-05-08T00:00:00+00:00",
+      "finished_at": "2026-05-08T00:00:00.100000+00:00"
+    },
+    "generic_executor": {
+      "status": "completed",
+      "started_at": "2026-05-08T00:00:00.100000+00:00",
+      "finished_at": "2026-05-08T00:00:00.500000+00:00"
+    },
+    "generic_reviewer": {
+      "status": "completed",
+      "started_at": "2026-05-08T00:00:00.500000+00:00",
+      "finished_at": "2026-05-08T00:00:00.600000+00:00"
+    }
+  }
+}

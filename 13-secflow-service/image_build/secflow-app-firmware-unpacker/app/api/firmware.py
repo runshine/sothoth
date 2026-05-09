@@ -6,6 +6,7 @@ import os
 import json
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import or_
@@ -140,6 +141,7 @@ def _get_task_agentflow_status(task_id: str) -> dict:
     run_path = str(task.get("run_path") or "").strip()
     run_json = None
     agentflow_run_dir = None
+    run_json_error = None
     if run_id:
         candidate_dirs = [Path(get_config().agentflow.runs_dir) / run_id]
         if run_path:
@@ -151,22 +153,34 @@ def _get_task_agentflow_status(task_id: str) -> dict:
                     run_json = json.loads(candidate.read_text(encoding="utf-8"))
                     agentflow_run_dir = str(candidate_dir)
                     break
-                except Exception:
+                except Exception as exc:
                     run_json = None
+                    run_json_error = str(exc)
     run_dir = Path(run_path) if run_path else None
     final_result = _read_json_file(run_dir / "final_result.json") if run_dir else None
     tokens_summary = _read_json_file(run_dir / "tokens_summary.json") if run_dir else None
+    failure_summary = task.get("failure_summary")
+    failed_nodes = _extract_failed_nodes(run_json, final_result, failure_summary)
+    node_attempts = task.get("node_attempts")
+    nodes = _normalize_agentflow_nodes(run_json, node_attempts)
+    trace_files = _list_trace_files(Path(agentflow_run_dir)) if agentflow_run_dir else []
+    stage_files = _list_stage_files(run_dir) if run_dir else []
     return {
         "task_id": task_id,
         "agentflow_run_id": run_id,
         "agentflow_run_dir": agentflow_run_dir,
         "run_path": run_path or None,
         "status": run_json.get("status") if isinstance(run_json, dict) else None,
-        "nodes": run_json.get("nodes") if isinstance(run_json, dict) else None,
+        "nodes": nodes,
+        "failed_nodes": failed_nodes,
         "final_result": final_result,
         "tokens_summary": tokens_summary,
+        "token_summary": tokens_summary,
         "node_attempts": task.get("node_attempts"),
-        "failure_summary": task.get("failure_summary"),
+        "failure_summary": failure_summary,
+        "trace_files": trace_files,
+        "stage_files": stage_files,
+        "run_json_error": run_json_error,
         "run": run_json,
     }
 
@@ -184,6 +198,121 @@ def _phase_payload(key: str, label: str, status: str, detail: Optional[str] = No
 def _read_json_file(path: Path) -> dict | list | None:
     if not path.exists():
         return None
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _duration_seconds(started_at: str | None, completed_at: str | None) -> float | None:
+    started = _parse_iso(started_at)
+    completed = _parse_iso(completed_at)
+    if started is None or completed is None:
+        return None
+    return max(0.0, (completed - started).total_seconds())
+
+
+def _node_error(node: dict) -> str | None:
+    for key in ("error", "error_message", "message"):
+        value = node.get(key)
+        if isinstance(value, str) and value:
+            return value
+    attempts = node.get("attempts")
+    if isinstance(attempts, list):
+        for attempt in reversed(attempts):
+            if not isinstance(attempt, dict):
+                continue
+            value = attempt.get("error") or attempt.get("stderr")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _normalize_agentflow_nodes(run_json: dict | None, node_attempts: dict | None) -> dict[str, dict] | None:
+    source = run_json.get("nodes") if isinstance(run_json, dict) else None
+    if not isinstance(source, dict):
+        return node_attempts if isinstance(node_attempts, dict) else None
+    normalized: dict[str, dict] = {}
+    for node_id, raw_node in source.items():
+        node = raw_node if isinstance(raw_node, dict) else {}
+        started_at = node.get("started_at")
+        completed_at = node.get("finished_at") or node.get("completed_at")
+        normalized[str(node_id)] = {
+            **node,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_seconds": node.get("duration_seconds") if node.get("duration_seconds") is not None else _duration_seconds(started_at, completed_at),
+            "status": node.get("status"),
+            "error": _node_error(node),
+        }
+    return normalized
+
+
+def _extract_failed_nodes(run_json: dict | None, final_result: dict | list | None, failure_summary: dict | None) -> list[dict]:
+    if isinstance(failure_summary, dict) and isinstance(failure_summary.get("failed_nodes"), list):
+        return failure_summary["failed_nodes"]
+    if isinstance(final_result, dict):
+        result_summary = final_result.get("failure_summary")
+        if isinstance(result_summary, dict) and isinstance(result_summary.get("failed_nodes"), list):
+            return result_summary["failed_nodes"]
+    failed = []
+    nodes = run_json.get("nodes") if isinstance(run_json, dict) else None
+    if not isinstance(nodes, dict):
+        return failed
+    for node_id, raw_node in nodes.items():
+        if not isinstance(raw_node, dict):
+            continue
+        if raw_node.get("status") == "failed":
+            failed.append(
+                {
+                    "node_id": node_id,
+                    "status": raw_node.get("status"),
+                    "error": _node_error(raw_node),
+                    "duration_seconds": _duration_seconds(raw_node.get("started_at"), raw_node.get("finished_at") or raw_node.get("completed_at")),
+                }
+            )
+    return failed
+
+
+def _relative_file_entry(root: Path, path: Path) -> dict:
+    return {
+        "path": str(path.relative_to(root)),
+        "size_bytes": path.stat().st_size if path.exists() else None,
+        "updated_at": _mtime_iso_text(path),
+    }
+
+
+def _list_trace_files(run_dir: Path) -> list[dict]:
+    if not run_dir.exists():
+        return []
+    files = []
+    for path in sorted([run_dir / "run.json", run_dir / "events.jsonl"] + list((run_dir / "artifacts").glob("*/trace.jsonl"))):
+        if path.is_file():
+            files.append(_relative_file_entry(run_dir, path))
+    return files
+
+
+def _list_stage_files(run_dir: Path | None) -> list[dict]:
+    if run_dir is None or not run_dir.exists():
+        return []
+    names = {
+        "final_result.json",
+        "tokens_summary.json",
+        "stage1_preprocess.json",
+        "stage2_skill_match.json",
+        "stage3_skill_exec.json",
+        "stage4_llm_fallback.json",
+        "stage5_skill_generate.json",
+        "preprocess.json",
+        "feature-match.json",
+        "generated_skill.md",
+    }
+    return [_relative_file_entry(run_dir, path) for path in sorted(run_dir.iterdir()) if path.is_file() and path.name in names]
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:

@@ -1,0 +1,36 @@
+{
+  "status": "success",
+  "message": "Unpacking verified successfully",
+  "rounds": 0,
+  "matched_skill": "tools/matched-bin.md",
+  "matched_skill_version": 1,
+  "matched_skill_score": 90,
+  "fallback_to_llm": false,
+  "generated_skill_path": null,
+  "generated_skill_status": null,
+  "promotion_success_count": 1,
+  "agentflow_run_id": "e35aac7721bb4220a4b7625da30869be",
+  "run_id": "e35aac7721bb4220a4b7625da30869be",
+  "node_attempts": {
+    "skill_executor": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 14.213648
+    },
+    "skill_reviewer": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 0.017186
+    },
+    "generic_executor": {
+      "status": "skipped",
+      "attempt_count": 0
+    }
+  },
+  "failure_summary": {
+    "failed_nodes": []
+  },
+  "failure_category": null,
+  "total_tokens": 17870,
+  "fixture_note": "Sanitized from a real pi AgentFlow skill-hit smoke run on 2026-05-09; absolute temp paths removed."
+}

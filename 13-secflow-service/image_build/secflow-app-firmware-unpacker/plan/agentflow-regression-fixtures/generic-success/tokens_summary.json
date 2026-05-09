@@ -1,0 +1,27 @@
+{
+  "total_prompt_tokens": 510,
+  "total_completion_tokens": 100,
+  "total_tokens": 610,
+  "grand_total": {
+    "prompt_tokens": 510,
+    "completion_tokens": 100,
+    "total_tokens": 610
+  },
+  "nodes": {
+    "generic_executor": {
+      "prompt_tokens": 410,
+      "completion_tokens": 70,
+      "total_tokens": 480
+    },
+    "generic_reviewer": {
+      "prompt_tokens": 70,
+      "completion_tokens": 20,
+      "total_tokens": 90
+    },
+    "skill_author": {
+      "prompt_tokens": 30,
+      "completion_tokens": 10,
+      "total_tokens": 40
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "id": "316fce4eebae487f91cbd6aba1e9648a",
+  "status": "completed",
+  "started_at": "2026-05-09T00:39:45.225657+00:00",
+  "finished_at": "2026-05-09T00:40:19.030113+00:00",
+  "nodes": {
+    "skill_executor": {
+      "status": "completed",
+      "started_at": "2026-05-09T00:39:45.536010+00:00",
+      "finished_at": "2026-05-09T00:39:48.146112+00:00"
+    },
+    "generic_executor": {
+      "status": "completed",
+      "started_at": "2026-05-09T00:39:48.165393+00:00",
+      "finished_at": "2026-05-09T00:40:18.872285+00:00"
+    },
+    "generic_reviewer": {
+      "status": "completed",
+      "started_at": "2026-05-09T00:40:18.913365+00:00",
+      "finished_at": "2026-05-09T00:40:18.939735+00:00"
+    }
+  }
+}

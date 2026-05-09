@@ -417,6 +417,9 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
             {"prompt_tokens": 4432, "completion_tokens": 382, "total_tokens": 4814},
             summary["nodes"]["skill_executor"],
         )
+        self.assertEqual(4432, summary["total_prompt_tokens"])
+        self.assertEqual(382, summary["total_completion_tokens"])
+        self.assertEqual(4814, summary["total_tokens"])
         self.assertEqual(4814, summary["grand_total"]["total_tokens"])
 
     def test_token_summary_deduplicates_streaming_usage_by_response_id(self):
@@ -551,6 +554,9 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
 
             self.assertEqual("cancelled", result["status"])
             self.assertEqual(1, result["rounds"])
+            self.assertEqual("run-1", result["agentflow_run_id"])
+            self.assertIn("cancellation_summary", result)
+            self.assertIn("generic_executor", result["node_attempts"])
             self.assertEqual(["run-1"], FakeOrchestrator.last.cancelled)
 
 
@@ -686,6 +692,52 @@ class AgentFlowRunnerSmokeTests(unittest.TestCase):
             self.assertEqual("candidate", result["generated_skill_status"])
             self.assertTrue(result["generated_skill_path"])
             self.assertTrue(Path(result["generated_skill_path"]).is_file())
+
+
+class AgentFlowWorkerObservabilityTests(unittest.TestCase):
+    def test_cleanup_agentflow_runs_removes_only_expired_terminal_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runs_dir = root / "runs"
+            expired = runs_dir / "expired"
+            active = runs_dir / "active"
+            malformed = runs_dir / "malformed"
+            for path in (expired, active, malformed):
+                path.mkdir(parents=True)
+            expired.joinpath("run.json").write_text(
+                '{"status": "completed", "finished_at": "2026-01-01T00:00:00+00:00"}',
+                encoding="utf-8",
+            )
+            active.joinpath("run.json").write_text(
+                '{"status": "running", "started_at": "2026-01-01T00:00:00+00:00"}',
+                encoding="utf-8",
+            )
+            malformed.joinpath("note.txt").write_text("not a run", encoding="utf-8")
+
+            from app.services import worker
+
+            config = SimpleNamespace(
+                agentflow=SimpleNamespace(
+                    runs_dir=str(runs_dir),
+                    cleanup_runs_retention_days=7,
+                )
+            )
+            with patch("app.services.worker.get_config", return_value=config):
+                worker.cleanup_agentflow_runs()
+
+            self.assertFalse(expired.exists())
+            self.assertTrue(active.exists())
+            self.assertTrue(malformed.exists())
+
+    def test_agentflow_runs_dir_usage_counts_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "run").mkdir()
+            (root / "run" / "artifact.bin").write_bytes(b"a" * 1024)
+
+            from app.services.worker import _agentflow_runs_dir_usage_mb
+
+            self.assertGreater(_agentflow_runs_dir_usage_mb(root), 0)
 
 
 class AgentFlowApiSmokeTests(unittest.TestCase):

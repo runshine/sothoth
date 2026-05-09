@@ -1,0 +1,17 @@
+{
+  "total_prompt_tokens": 17059,
+  "total_completion_tokens": 811,
+  "total_tokens": 17870,
+  "grand_total": {
+    "prompt_tokens": 17059,
+    "completion_tokens": 811,
+    "total_tokens": 17870
+  },
+  "nodes": {
+    "skill_executor": {
+      "prompt_tokens": 17059,
+      "completion_tokens": 811,
+      "total_tokens": 17870
+    }
+  }
+}

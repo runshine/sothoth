@@ -28,6 +28,7 @@ from app.skill_store import (
     register_skill_success,
     save_candidate_skill,
 )
+from app.logging_utils import log_event
 
 log = logging.getLogger("unpacker.agentflow")
 
@@ -108,6 +109,30 @@ def _duration_seconds(started_at: str | None, finished_at: str | None) -> float 
     return max(0.0, (finished - started).total_seconds())
 
 
+def _current_node_summary(record: Any) -> dict[str, Any] | None:
+    active = []
+    fallback = []
+    for node_id, node in getattr(record, "nodes", {}).items():
+        status = getattr(getattr(node, "status", None), "value", getattr(node, "status", None))
+        summary = {
+            "node_id": node_id,
+            "status": str(status) if status else None,
+            "started_at": getattr(node, "started_at", None),
+            "completed_at": getattr(node, "finished_at", None),
+            "duration_seconds": _duration_seconds(getattr(node, "started_at", None), getattr(node, "finished_at", None)),
+            "attempt_count": _node_attempts(record, node_id),
+        }
+        if status == "running":
+            active.append(summary)
+        elif status in {"pending", "queued"}:
+            fallback.append(summary)
+    if active:
+        return active[-1]
+    if fallback:
+        return fallback[0]
+    return None
+
+
 def _node_attempt_map(record: Any) -> dict[str, Any]:
     attempts: dict[str, Any] = {}
     for node_id, node in getattr(record, "nodes", {}).items():
@@ -134,8 +159,10 @@ def _node_attempt_map(record: Any) -> dict[str, Any]:
             "current_attempt": int(getattr(node, "current_attempt", 0) or 0),
             "started_at": getattr(node, "started_at", None),
             "finished_at": getattr(node, "finished_at", None),
+            "completed_at": getattr(node, "finished_at", None),
             "duration_seconds": _duration_seconds(getattr(node, "started_at", None), getattr(node, "finished_at", None)),
             "exit_code": getattr(node, "exit_code", None),
+            "error": getattr(node, "error", None),
             "success": getattr(node, "success", None),
             "success_details": list(getattr(node, "success_details", []) or []),
             "attempts": node_attempts,
@@ -164,7 +191,17 @@ def _classify_review_failure(text: str) -> dict[str, str | None]:
     reason = None
     if "reason=" in raw:
         reason = raw.split("reason=", 1)[1].splitlines()[0].strip()
-    return {"category": category, "reason": reason or _preview_text(raw, 180) or None}
+    normalized = {
+        "STRUCTURAL_FAILURE": "structure_error",
+        "CONTENT_MISSING": "missing_content",
+        "PROTOCOL_VIOLATION": "protocol_error",
+        "RETRYABLE_ERROR": "retryable_unknown",
+    }.get(str(category or ""), "non_retryable" if raw else None)
+    return {
+        "category": category,
+        "failure_category": normalized,
+        "reason": reason or _preview_text(raw, 180) or None,
+    }
 
 
 def _failure_summary(record: Any) -> dict[str, Any]:
@@ -284,7 +321,71 @@ def _token_summary(record: Any) -> dict[str, Any]:
         nodes[node_id] = totals
         for key, value in totals.items():
             grand_total[key] = grand_total.get(key, 0) + int(value or 0)
-    return {"grand_total": grand_total, "nodes": nodes}
+    return {
+        "total_prompt_tokens": grand_total["prompt_tokens"],
+        "total_completion_tokens": grand_total["completion_tokens"],
+        "total_tokens": grand_total["total_tokens"],
+        "grand_total": grand_total,
+        "nodes": nodes,
+    }
+
+
+_LOGGED_AGENTFLOW_EVENT_TYPES = {
+    "run_started",
+    "node_started",
+    "node_completed",
+    "node_failed",
+    "run_completed",
+    "run_cancelled",
+}
+
+
+def _event_duration_seconds(event: dict[str, Any]) -> float | None:
+    data = event.get("data")
+    if isinstance(data, dict):
+        value = data.get("duration_seconds")
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def _bridge_agentflow_events(
+    events_path: Path,
+    *,
+    offset: int,
+    task_id: str | None,
+    project_id: str | None,
+    agentflow_run_id: str,
+) -> int:
+    if not events_path.is_file():
+        return offset
+    with events_path.open("r", encoding="utf-8") as handle:
+        handle.seek(offset)
+        for line in handle:
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event_type = str(event.get("type") or "")
+            if event_type not in _LOGGED_AGENTFLOW_EVENT_TYPES:
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            log_event(
+                log,
+                logging.INFO,
+                "agentflow event",
+                event_type=event_type,
+                task_id=task_id,
+                project_id=project_id,
+                agentflow_run_id=agentflow_run_id,
+                node_id=event.get("node_id"),
+                status=data.get("status"),
+                duration_seconds=_event_duration_seconds(event),
+                error=data.get("error") or data.get("message"),
+            )
+        return handle.tell()
 
 
 def _archive_success_sample(log_dir: Path | None, record: Any, result: dict[str, Any], tokens: dict[str, Any]) -> str | None:
@@ -323,11 +424,19 @@ def _review_skipped(review_text: str) -> bool:
     return "AGENTFLOW_REVIEW_SKIPPED" in str(review_text or "")
 
 
-def _cancelled_result(rounds: int) -> dict[str, Any]:
+def _cancelled_result(rounds: int, record: Any | None = None) -> dict[str, Any]:
+    cancellation_summary = {
+        "current_node": _current_node_summary(record) if record is not None else None,
+        "cancelled_at": datetime.utcnow().isoformat(),
+    }
     return {
         "status": "cancelled",
         "message": "Task was cancelled",
         "rounds": rounds,
+        "agentflow_run_id": getattr(record, "id", None) if record is not None else None,
+        "node_attempts": _node_attempt_map(record) if record is not None else {},
+        "failure_summary": {"failed_nodes": []},
+        "cancellation_summary": cancellation_summary,
     }
 
 
@@ -445,21 +554,50 @@ def run_unpack_agentflow(
 
         async def _execute() -> dict[str, Any]:
             record = await orchestrator.submit(pipeline)
+            event_offset = 0
             if log_dir is not None:
                 _write_text(log_dir / "agentflow_run_id.txt", record.id)
                 _write_text(log_dir / "agentflow_run_dir.txt", str(run_store_dir / record.id))
             while True:
+                event_offset = _bridge_agentflow_events(
+                    run_store_dir / record.id / "events.jsonl",
+                    offset=event_offset,
+                    task_id=task_id,
+                    project_id=project_id,
+                    agentflow_run_id=record.id,
+                )
                 if cancel_check and cancel_check():
                     await orchestrator.cancel(record.id)
-                    await orchestrator.wait(record.id, timeout=5)
-                    return _cancelled_result(_node_attempts(_cached_run(store, record.id), "generic_executor"))
+                    cancelled = await orchestrator.wait(record.id, timeout=5)
+                    current = cancelled or _cached_run(store, record.id)
+                    _bridge_agentflow_events(
+                        run_store_dir / record.id / "events.jsonl",
+                        offset=event_offset,
+                        task_id=task_id,
+                        project_id=project_id,
+                        agentflow_run_id=record.id,
+                    )
+                    result = _cancelled_result(_node_attempts(current, "generic_executor"), current)
+                    if log_dir is not None:
+                        _write_json(log_dir / "final_result.json", result)
+                    return result
                 current = _cached_run(store, record.id)
                 if current.status.value in {"completed", "failed", "cancelled"}:
                     break
                 await asyncio.sleep(0.5)
             current = store.get_run(record.id)
+            _bridge_agentflow_events(
+                run_store_dir / record.id / "events.jsonl",
+                offset=event_offset,
+                task_id=task_id,
+                project_id=project_id,
+                agentflow_run_id=record.id,
+            )
             if current.status.value == "cancelled":
-                return _cancelled_result(_node_attempts(current, "generic_executor"))
+                result = _cancelled_result(_node_attempts(current, "generic_executor"), current)
+                if log_dir is not None:
+                    _write_json(log_dir / "final_result.json", result)
+                return result
 
             preprocess_output = _node_output(current, "preprocess")
             feature_output = _node_output(current, "feature_match")
@@ -533,7 +671,15 @@ def run_unpack_agentflow(
                 "run_path": str(log_dir) if log_dir else None,
                 "node_attempts": node_attempts,
                 "failure_summary": failure_summary,
+                "failure_category": (
+                    failure_summary.get("failed_nodes", [{}])[0]
+                    .get("classification", {})
+                    .get("failure_category")
+                    if failure_summary.get("failed_nodes")
+                    else None
+                ),
                 "total_tokens": tokens.get("grand_total", {}).get("total_tokens", 0),
+                "run_id": current.id,
             }
             if log_dir is not None:
                 _write_json(log_dir / "final_result.json", result)

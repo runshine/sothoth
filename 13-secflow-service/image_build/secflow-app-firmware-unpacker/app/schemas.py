@@ -160,6 +160,9 @@ class ClusterInfoResponse(BaseModel):
     task_counts: dict[str, int]
     total_tasks: int
     concurrency: ConcurrencyInfoResponse
+    agentflow_active_runs: int = 0
+    agentflow_max_concurrent: int = 0
+    agentflow_runs_dir_usage_mb: float = 0.0
 
 
 class ConfigEntryResponse(BaseModel):

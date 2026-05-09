@@ -240,6 +240,10 @@ def _apply_env_overrides(cfg: Config) -> Config:
         "AGENTFLOW_EVOLUTION_ARCHIVE_DIR",
         cfg.agentflow.evolution_archive_dir,
     )
+    cfg.agentflow.cleanup_runs_retention_days = _env_int(
+        "AGENTFLOW_CLEANUP_RUNS_RETENTION_DAYS",
+        cfg.agentflow.cleanup_runs_retention_days,
+    )
     return cfg
 
 

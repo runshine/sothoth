@@ -28,9 +28,16 @@ def _result_for_sample(sample: dict[str, Any]) -> dict[str, Any]:
         "status": result.get("status"),
         "rounds": int(result.get("rounds") or 0),
         "duration_seconds": sample.get("duration_seconds"),
-        "total_tokens": int(result.get("total_tokens") or grand_total.get("total_tokens") or 0),
+        "total_tokens": int(result.get("total_tokens") or tokens.get("total_tokens") or grand_total.get("total_tokens") or 0) if isinstance(tokens, dict) else int(result.get("total_tokens") or 0),
         "generated_skill": bool(result.get("generated_skill_path")),
+        "generated_skill_path": result.get("generated_skill_path"),
+        "matched_skill": result.get("matched_skill"),
         "fallback_to_llm": bool(result.get("fallback_to_llm")),
+        "token_summary": {
+            "total_prompt_tokens": int(tokens.get("total_prompt_tokens") or grand_total.get("prompt_tokens") or 0) if isinstance(tokens, dict) else 0,
+            "total_completion_tokens": int(tokens.get("total_completion_tokens") or grand_total.get("completion_tokens") or 0) if isinstance(tokens, dict) else 0,
+            "total_tokens": int(tokens.get("total_tokens") or grand_total.get("total_tokens") or result.get("total_tokens") or 0) if isinstance(tokens, dict) else 0,
+        },
     }
     if "expected_status" in sample:
         row["expected_status"] = sample["expected_status"]

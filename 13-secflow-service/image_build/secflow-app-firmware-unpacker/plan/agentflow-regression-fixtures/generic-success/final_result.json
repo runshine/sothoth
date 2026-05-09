@@ -1,0 +1,33 @@
+{
+  "status": "success",
+  "message": "Unpacking verified successfully",
+  "rounds": 1,
+  "matched_skill": null,
+  "matched_skill_version": null,
+  "matched_skill_score": null,
+  "fallback_to_llm": false,
+  "generated_skill_path": "tools/generic-bin__candidate__fixture.md",
+  "generated_skill_status": "candidate",
+  "promotion_success_count": 0,
+  "agentflow_run_id": "fixture-generic-success",
+  "run_id": "fixture-generic-success",
+  "node_attempts": {
+    "generic_executor": {
+      "attempt_count": 1,
+      "duration_seconds": 0.4
+    },
+    "generic_reviewer": {
+      "attempt_count": 1,
+      "duration_seconds": 0.1
+    },
+    "skill_author": {
+      "attempt_count": 1,
+      "duration_seconds": 0.1
+    }
+  },
+  "failure_summary": {
+    "failed_nodes": []
+  },
+  "failure_category": null,
+  "total_tokens": 610
+}

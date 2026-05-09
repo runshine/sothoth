@@ -24,6 +24,7 @@ from app.api.firmware import router as firmware_router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.logging_utils import configure_container_logging
+from app.metrics import router as metrics_router
 from app.model import init_database
 from app.services.registry import get_registry_service
 from app.services.task_manager import start as start_task_dispatcher
@@ -136,6 +137,7 @@ app.add_middleware(
 setup_exception_handlers(app)
 app.include_router(agentflow_runs_router)
 app.include_router(firmware_router)
+app.include_router(metrics_router)
 
 
 if __name__ == "__main__":

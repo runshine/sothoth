@@ -1,4 +1,7 @@
 {
+  "total_prompt_tokens": 260,
+  "total_completion_tokens": 60,
+  "total_tokens": 320,
   "grand_total": {
     "prompt_tokens": 260,
     "completion_tokens": 60,

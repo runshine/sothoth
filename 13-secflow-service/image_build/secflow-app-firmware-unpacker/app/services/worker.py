@@ -6,7 +6,10 @@ import logging
 import os
 import socket
 import threading
+import json
+import shutil
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 from app.config import get_config
@@ -47,6 +50,75 @@ def _runtime_cleanup_days() -> int:
         return max(0, int(value))
     finally:
         db.close()
+
+
+def _agentflow_runs_dir_usage_mb(runs_dir: Path) -> float:
+    if not runs_dir.exists():
+        return 0.0
+    total = 0
+    for path in runs_dir.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return round(total / (1024 * 1024), 3)
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    except Exception:
+        return None
+
+
+def cleanup_agentflow_runs() -> None:
+    config = get_config()
+    retention_days = int(getattr(config.agentflow, "cleanup_runs_retention_days", 0) or 0)
+    if retention_days <= 0:
+        return
+    runs_dir = Path(config.agentflow.runs_dir)
+    if not runs_dir.exists():
+        return
+
+    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        run_json = run_dir / "run.json"
+        if not run_json.is_file():
+            logger.warning("agentflow run cleanup skipped malformed directory: %s", run_dir)
+            continue
+        try:
+            payload = json.loads(run_json.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("agentflow run cleanup skipped unreadable run: %s: %s", run_dir, exc)
+            continue
+        status = str(payload.get("status") or "")
+        if status not in {"completed", "failed", "cancelled"}:
+            continue
+        finished_at = _parse_iso(payload.get("finished_at") or payload.get("completed_at"))
+        if finished_at is None:
+            logger.warning("agentflow run cleanup skipped run without finish time: %s", run_dir)
+            continue
+        if finished_at >= cutoff:
+            continue
+        try:
+            shutil.rmtree(run_dir)
+            logger.info(
+                "agentflow run cleaned",
+                extra={
+                    "agentflow_run_id": run_dir.name,
+                    "agentflow_run_dir": str(run_dir),
+                    "finished_at": finished_at.isoformat(),
+                    "retention_days": retention_days,
+                },
+            )
+        except Exception as exc:
+            logger.warning("agentflow run cleanup failed for %s: %s", run_dir, exc)
 
 
 def register_worker() -> None:
@@ -238,6 +310,14 @@ def get_cluster_snapshot() -> dict:
         for task in all_tasks:
             task_counts[task.status] = int(task_counts.get(task.status, 0)) + 1
 
+        config = get_config()
+        runs_dir = Path(config.agentflow.runs_dir)
+        active_agentflow_runs = sum(
+            1
+            for task in all_tasks
+            if task.status in {TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value}
+            and bool(task.agentflow_run_id)
+        )
         return {
             "this_worker": get_worker_id(),
             "total_workers": len(workers),
@@ -246,6 +326,9 @@ def get_cluster_snapshot() -> dict:
             "task_counts": task_counts,
             "total_tasks": len(all_tasks),
             "concurrency": get_concurrency_snapshot(),
+            "agentflow_active_runs": active_agentflow_runs,
+            "agentflow_max_concurrent": int(config.agentflow.max_concurrent_runs),
+            "agentflow_runs_dir_usage_mb": _agentflow_runs_dir_usage_mb(runs_dir),
         }
     finally:
         db.close()
@@ -257,6 +340,7 @@ def _heartbeat_loop(interval: int) -> None:
             heartbeat()
             reclaim_orphaned_tasks()
             cleanup_finished_tasks()
+            cleanup_agentflow_runs()
         except Exception as exc:
             logger.warning("worker heartbeat loop warning: %s", exc)
 

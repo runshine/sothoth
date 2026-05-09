@@ -1,0 +1,18 @@
+{
+  "id": "fixture-skill-hit",
+  "status": "completed",
+  "started_at": "2026-05-08T00:00:00+00:00",
+  "finished_at": "2026-05-08T00:00:00.300000+00:00",
+  "nodes": {
+    "skill_executor": {
+      "status": "completed",
+      "started_at": "2026-05-08T00:00:00+00:00",
+      "finished_at": "2026-05-08T00:00:00.200000+00:00"
+    },
+    "skill_reviewer": {
+      "status": "completed",
+      "started_at": "2026-05-08T00:00:00.200000+00:00",
+      "finished_at": "2026-05-08T00:00:00.300000+00:00"
+    }
+  }
+}

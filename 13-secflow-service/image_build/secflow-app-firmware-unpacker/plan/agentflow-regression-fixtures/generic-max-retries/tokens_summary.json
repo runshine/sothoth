@@ -1,0 +1,22 @@
+{
+  "total_prompt_tokens": 700,
+  "total_completion_tokens": 140,
+  "total_tokens": 840,
+  "grand_total": {
+    "prompt_tokens": 700,
+    "completion_tokens": 140,
+    "total_tokens": 840
+  },
+  "nodes": {
+    "generic_executor": {
+      "prompt_tokens": 560,
+      "completion_tokens": 100,
+      "total_tokens": 660
+    },
+    "generic_reviewer": {
+      "prompt_tokens": 140,
+      "completion_tokens": 40,
+      "total_tokens": 180
+    }
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "matched_skill": null,
+  "fallback_to_llm": false,
+  "failure_classification": {
+    "category": null,
+    "failure_category": "non_retryable",
+    "reason": "SKIPPED_NO_SKILL"
+  },
+  "reason": "AGENTFLOW_REVIEW_SUCCESS",
+  "attempts": {
+    "generic_executor": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 30.706892
+    },
+    "generic_reviewer": {
+      "status": "completed",
+      "attempt_count": 1,
+      "duration_seconds": 0.02637
+    }
+  }
+}
