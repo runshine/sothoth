@@ -850,6 +850,9 @@ class TaskManager:
         touched_stages: set[str] = set()
         auth_token = token or self._service_token()
         for item in items:
+            item_stage_name = item.stage_name
+            item_downstream_service = item.downstream_service
+            item_downstream_task_id = item.downstream_task_id
             if not item.downstream_service or not item.downstream_task_id:
                 skipped_count += 1
                 self._record_event(
@@ -948,6 +951,7 @@ class TaskManager:
                     },
                 )
             except Exception as exc:
+                db.rollback()
                 failed_count += 1
                 self._record_event(
                     db,
@@ -955,11 +959,11 @@ class TaskManager:
                     "downstream_status_sync_failed",
                     f"同步下游子任务状态失败: {exc}",
                     level="warning",
-                    stage_name=item.stage_name,
+                    stage_name=item_stage_name,
                     item=item,
                     payload={
-                        "downstream_service": item.downstream_service,
-                        "downstream_task_id": item.downstream_task_id,
+                        "downstream_service": item_downstream_service,
+                        "downstream_task_id": item_downstream_task_id,
                         "error": str(exc),
                     },
                 )
@@ -1049,7 +1053,7 @@ class TaskManager:
                 "mapped_status": mapped_status,
                 "before_status": before_status,
                 "force": force,
-                "downstream_payload": payload,
+                "downstream_payload": self._archive_job_downstream_payload(payload),
                 "extra_paths": [str(path) for path in (extra_paths or [])],
             }
             if failed is None:
@@ -3313,6 +3317,26 @@ class TaskManager:
         ]
         return {key: payload.get(key) for key in keys if payload.get(key) is not None}
 
+    def _archive_job_downstream_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        compact = self._lightweight_downstream_payload(payload)
+        payload = payload or {}
+        for key in ("output_root", "work_dir", "task_root"):
+            value = payload.get(key)
+            if value is not None:
+                compact[key] = value
+        for key in ("result", "artifacts", "artifact", "data"):
+            nested = payload.get(key)
+            if not isinstance(nested, dict):
+                continue
+            nested_compact = self._lightweight_downstream_payload(nested)
+            for nested_key in ("output_root", "work_dir", "task_root"):
+                value = nested.get(nested_key)
+                if value is not None:
+                    nested_compact[nested_key] = value
+            if nested_compact:
+                compact[key] = nested_compact
+        return compact
+
     def _lightweight_system_analysis_result(self, result_payload: dict[str, Any] | None) -> dict[str, Any]:
         payload = result_payload or {}
         raw_summary = dict(payload.get("summary") or {})
@@ -3868,7 +3892,8 @@ class TaskManager:
         retries: int = 0,
         initial_retry: bool = False,
     ):
-        semaphore = asyncio.Semaphore(max(1, concurrency))
+        effective_concurrency = len(items) if initial_retry else concurrency
+        semaphore = asyncio.Semaphore(max(1, effective_concurrency))
 
         async def wrapped(item: dict[str, Any]):
             async with semaphore:

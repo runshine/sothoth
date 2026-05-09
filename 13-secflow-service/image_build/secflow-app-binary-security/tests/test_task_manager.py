@@ -852,6 +852,54 @@ class TaskManagerTests(unittest.TestCase):
             self.assertIsNone(target)
             self.assertFalse((root / "task-output" / "system-analyse" / "fw1__down1").exists())
 
+    def test_archive_job_payload_uses_compact_downstream_payload(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = type("Item", (), {
+            "id": "si1",
+            "stage_name": "system_analysis",
+            "item_key": "source_project",
+            "downstream_service": "system_analyse",
+            "downstream_task_id": "sat1",
+        })()
+        db = _ModelAwareDb()
+
+        job = self.manager._ensure_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload={
+                "task_id": "sat1",
+                "status": "success",
+                "workspace_root": "/tmp/system-analysis/sat1",
+                "modules": [{"name": f"module-{idx}", "blob": "x" * 1000} for idx in range(100)],
+                "result": {
+                    "output_root": "/tmp/system-analysis/sat1/output",
+                    "modules": [{"name": f"nested-{idx}", "blob": "y" * 1000} for idx in range(100)],
+                },
+            },
+            mapped_status="success",
+            before_status="running",
+        )
+
+        payload = job.payload
+        downstream_payload = payload["downstream_payload"]
+        self.assertEqual("sat1", downstream_payload["task_id"])
+        self.assertEqual("/tmp/system-analysis/sat1", downstream_payload["workspace_root"])
+        self.assertEqual("/tmp/system-analysis/sat1/output", downstream_payload["result"]["output_root"])
+        self.assertNotIn("modules", downstream_payload)
+        self.assertNotIn("modules", downstream_payload["result"])
+        self.assertLess(len(job.payload_json or ""), 2048)
+
     def test_collect_downstream_refs_dedupes_same_service_and_task_id(self):
         task = BinarySecurityTask(
             id="task1",
@@ -1085,6 +1133,49 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("success", results[0]["status"])
         self.assertEqual([False, True, True], calls)
+
+    def test_run_stage_pool_ignores_concurrency_limit_for_retry_mode(self):
+        active = 0
+        max_active = 0
+
+        async def runner(item, retrying=False):
+            nonlocal active, max_active
+            self.assertTrue(retrying)
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return {"status": "success", "item": item}
+
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+
+        original_is_cancelled = self.manager._is_task_cancelled
+        self.manager._is_task_cancelled = lambda task_id: False
+        try:
+            results = asyncio.run(
+                self.manager._run_stage_pool(
+                    task,
+                    [{"id": idx} for idx in range(6)],
+                    2,
+                    runner,
+                    initial_retry=True,
+                )
+            )
+        finally:
+            self.manager._is_task_cancelled = original_is_cancelled
+
+        self.assertEqual(6, len(results))
+        self.assertEqual(6, max_active)
 
 
 if __name__ == "__main__":
