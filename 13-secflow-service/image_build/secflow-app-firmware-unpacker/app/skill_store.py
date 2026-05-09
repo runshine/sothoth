@@ -21,7 +21,12 @@ def _parse_list(value: str) -> list[str]:
         return []
     if cleaned.startswith("[") and cleaned.endswith("]"):
         cleaned = cleaned[1:-1]
-    return [item.strip().lower() for item in cleaned.split(",") if item.strip()]
+    items: list[str] = []
+    for item in cleaned.split(","):
+        token = item.strip().strip("\"'").lower()
+        if token:
+            items.append(token)
+    return items
 
 
 def _parse_int(value: str | None, default: int) -> int:
@@ -61,25 +66,39 @@ def parse_skill_metadata(skill_path: Path, include_prompt: bool = False) -> dict
         "promotion_threshold": DEFAULT_PROMOTION_THRESHOLD,
         "tools": [],
     }
+    current_list_key: str | None = None
     for line in header.splitlines():
         stripped = line.strip()
-        if not stripped or ":" not in stripped:
+        if not stripped:
+            current_list_key = None
+            continue
+        if current_list_key and stripped.startswith("- "):
+            meta[current_list_key].append(stripped[2:].strip().strip("\"'").lower())
+            continue
+        if ":" not in stripped:
+            current_list_key = None
             continue
         key, _, value = stripped.partition(":")
         key = key.strip()
         value = value.strip()
         if key in {"extensions", "keywords", "binwalk_sigs", "tools"}:
             meta[key] = _parse_list(value)
+            current_list_key = key if not value else None
         elif key == "magic_hex":
             meta[key] = value.lower().replace(" ", "")
+            current_list_key = None
         elif key == "skill_version":
             meta[key] = _parse_int(value, 1)
+            current_list_key = None
         elif key == "promotion_success_count":
             meta[key] = _parse_int(value, 0)
+            current_list_key = None
         elif key == "promotion_threshold":
             meta[key] = _parse_int(value, DEFAULT_PROMOTION_THRESHOLD)
+            current_list_key = None
         else:
             meta[key] = value
+            current_list_key = None
     if include_prompt:
         meta["system_prompt"] = body
     return meta

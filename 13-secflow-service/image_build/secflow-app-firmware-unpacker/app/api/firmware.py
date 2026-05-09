@@ -722,6 +722,10 @@ def _get_cached_result_metrics(run_root: Path) -> dict:
             "executor_rounds": 0,
             "fallback_to_llm": False,
             "matched_skill": None,
+            "generated_skill_path": None,
+            "generated_skill_status": None,
+            "promotion_success_count": 0,
+            "skill_generation_status": None,
         }
     return {
         "cache_available": True,
@@ -737,6 +741,10 @@ def _get_cached_result_metrics(run_root: Path) -> dict:
         "executor_rounds": int(summary.get("executor_rounds") or 0),
         "fallback_to_llm": bool(summary.get("fallback_to_llm")),
         "matched_skill": str(summary.get("matched_skill") or "").strip() or None,
+        "generated_skill_path": str(summary.get("generated_skill_path") or "").strip() or None,
+        "generated_skill_status": str(summary.get("generated_skill_status") or "").strip() or None,
+        "promotion_success_count": int(summary.get("promotion_success_count") or 0),
+        "skill_generation_status": str(summary.get("skill_generation_status") or "").strip() or None,
     }
 
 
@@ -1402,7 +1410,13 @@ def _get_task_result(task_id: str) -> dict:
             "matched_skill": str(task.get("matched_skill") or "").strip() or None,
             "fallback_to_llm": bool(task.get("fallback_to_llm")),
             "generated_skill_path": str(task.get("generated_skill_path") or "").strip() or None,
+            "generated_skill_status": str(task.get("generated_skill_status") or "").strip() or None,
             "promotion_success_count": int(task.get("promotion_success_count") or 0),
+            "skill_generation_status": str(task.get("skill_generation_status") or "").strip() or None,
+            "skill_generation_error": str(task.get("skill_generation_error") or "").strip() or None,
+            "skill_generation_job_id": str(task.get("skill_generation_job_id") or "").strip() or None,
+            "skill_generation_started_at": str(task.get("skill_generation_started_at") or "").strip() or None,
+            "skill_generation_completed_at": str(task.get("skill_generation_completed_at") or "").strip() or None,
             "executor_rounds": int(task.get("rounds") or 0),
             "session_count": session_count,
             "event_count": event_count,

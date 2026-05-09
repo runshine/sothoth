@@ -67,6 +67,7 @@ from app.unpacker_engine_session import build_session_artifacts, update_session_
 
 
 log = logging.getLogger("unpacker.engine")
+SKILL_GENERATION_CONTEXT_FILENAME = "stage5_skill_generation_context.json"
 
 
 def _reviewer_session_name(suffix: str) -> tuple[str, int | None]:
@@ -671,6 +672,28 @@ def _extract_markdown_document(text: str) -> str:
     return raw.strip()
 
 
+def _extract_generated_skill_path(text: str) -> Path | None:
+    import re
+
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if candidate.is_absolute() and candidate.suffix.lower() == ".md":
+        return candidate
+    match = re.search(r"(/[^\s`\"']+\.md)\b", raw)
+    if not match:
+        return None
+    return Path(match.group(1))
+
+
+def _resolve_skill_document(raw_output: str) -> tuple[str, Path | None]:
+    skill_path = _extract_generated_skill_path(raw_output)
+    if skill_path and skill_path.exists():
+        return skill_path.read_text(encoding="utf-8"), skill_path
+    return _extract_markdown_document(raw_output), None
+
+
 def _generate_candidate_skill(
     task_id: str,
     firmware_path: str,
@@ -699,6 +722,7 @@ def _generate_candidate_skill(
             {
                 "$input": firmware_path,
                 "$output": output_path,
+                "$tools": str(TOOLS_DIR),
                 "$summary": summary_text,
                 "$features": json.dumps(features, ensure_ascii=False, indent=2),
                 "$review_result": review_result,
@@ -749,15 +773,23 @@ def _generate_candidate_skill(
                 Path(author_sp).unlink()
             except FileNotFoundError:
                 pass
+        skill_document, authored_skill_path = _resolve_skill_document(raw_doc)
         saved = save_candidate_skill(
             TOOLS_DIR,
-            _extract_markdown_document(raw_doc),
+            skill_document,
             {"family_id": compute_family_id(features)},
         )
+        if authored_skill_path:
+            try:
+                if authored_skill_path.resolve() != Path(str(saved.get("path") or "")).resolve():
+                    authored_skill_path.unlink(missing_ok=True)
+            except Exception:
+                pass
         _write_json_log(
             log_dir,
             "stage5_skill_generate.json",
             {
+                "authored_skill_path": str(authored_skill_path) if authored_skill_path else None,
                 "generated_skill_path": saved.get("path"),
                 "family_id": saved.get("family_id"),
                 "skill_version": saved.get("skill_version"),
@@ -768,6 +800,7 @@ def _generate_candidate_skill(
             log_dir,
             "stage5_skill_generate.log",
             "candidate skill generated",
+            authored_skill_path=str(authored_skill_path) if authored_skill_path else None,
             generated_skill_path=saved.get("path"),
             skill_status=saved.get("skill_status"),
             promotion_success_count=saved.get("promotion_success_count"),
@@ -785,7 +818,7 @@ def _generate_candidate_skill(
             "candidate skill generation failed",
             error=str(exc),
         )
-        return None
+        raise
 
 
 def _run_cleaner(
@@ -1047,9 +1080,9 @@ def run_unpack(
     final_round = 0
     last_reason = ""
     fallback_to_llm = False
-    generated_skill = None
     matched_skill = skill_meta
     promotion_success_count = None
+    skill_generation_requested = False
 
     try:
         if skill_meta:
@@ -1141,17 +1174,27 @@ def run_unpack(
             )
             passed = generic_passed
             if passed:
-                _report_activity("review", force=True)
-                generated_skill = _generate_candidate_skill(
-                    task_id,
-                    firmware_path,
-                    output_path,
-                    features,
-                    last_reason or '{"result":"success"}',
+                skill_generation_requested = True
+                _write_json_log(
                     global_round_dir,
-                    llm_binding_snapshot=llm_binding_snapshot,
-                    bind_cancel_client=_bind_cancel_client,
-                    activity_callback=_report_activity,
+                    SKILL_GENERATION_CONTEXT_FILENAME,
+                    {
+                        "task_id": task_id,
+                        "firmware_path": firmware_path,
+                        "output_path": output_path,
+                        "features": features,
+                        "review_result": last_reason or '{"result":"success"}',
+                        "family_id": compute_family_id(features),
+                        "llm_binding_snapshot": llm_binding_snapshot,
+                        "created_at": datetime.now().isoformat(),
+                    },
+                )
+                _append_stage_log(
+                    global_round_dir,
+                    "stage5_skill_generate.log",
+                    "skill generation context prepared for async job",
+                    family_id=compute_family_id(features),
+                    context_file=SKILL_GENERATION_CONTEXT_FILENAME,
                 )
             else:
                 _append_stage_log(
@@ -1199,13 +1242,10 @@ def run_unpack(
         "matched_skill_version": matched_skill.get("skill_version") if matched_skill else None,
         "matched_skill_score": skill_score if matched_skill else None,
         "fallback_to_llm": fallback_to_llm,
-        "generated_skill_path": generated_skill.get("path") if generated_skill else None,
-        "generated_skill_status": generated_skill.get("skill_status") if generated_skill else None,
-        "promotion_success_count": (
-            promotion_success_count
-            if promotion_success_count is not None
-            else generated_skill.get("promotion_success_count") if generated_skill else None
-        ),
+        "generated_skill_path": None,
+        "generated_skill_status": None,
+        "promotion_success_count": promotion_success_count,
+        "skill_generation_requested": skill_generation_requested,
     }
 
 
@@ -1231,4 +1271,6 @@ __all__ = [
     "render_prompt",
     "render_template",
     "run_unpack",
+    "SKILL_GENERATION_CONTEXT_FILENAME",
+    "_generate_candidate_skill",
 ]

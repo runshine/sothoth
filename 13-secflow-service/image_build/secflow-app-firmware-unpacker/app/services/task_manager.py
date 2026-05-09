@@ -14,7 +14,7 @@ from math import floor
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from app.config import get_config
 from app.time_utils import isoformat_local, now_local
@@ -48,6 +48,11 @@ STAGE_LABELS = {
     "review": "LLM 评审",
     "cleanup": "清理收尾",
 }
+SKILL_GENERATION_PENDING = "pending"
+SKILL_GENERATION_RUNNING = "running"
+SKILL_GENERATION_SUCCESS = "success"
+SKILL_GENERATION_FAILED = "failed"
+SKILL_GENERATION_NOT_APPLICABLE = "not_applicable"
 
 
 def _executor_capacity() -> int:
@@ -228,6 +233,10 @@ def _cleanup_job_lease_seconds() -> int:
 
 
 def _cleanup_job_lease_deadline(now: Optional[datetime] = None) -> datetime:
+    return (now or now_local()) + timedelta(seconds=_cleanup_job_lease_seconds())
+
+
+def _skill_generation_job_lease_deadline(now: Optional[datetime] = None) -> datetime:
     return (now or now_local()) + timedelta(seconds=_cleanup_job_lease_seconds())
 
 
@@ -830,7 +839,7 @@ def enqueue_workspace_cleanup(
 
 
 def process_workspace_cleanup_jobs(limit: int = 2) -> int:
-    from app.model import TaskStatus, UnpackTask, WorkspaceCleanupJob, get_db_session, get_worker_id
+    from app.model import SkillGenerationJob, TaskStatus, UnpackTask, WorkspaceCleanupJob, get_db_session, get_worker_id
 
     owner_id = get_worker_id()
     processed = 0
@@ -913,8 +922,14 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
                     task.generated_skill_path = None
                     task.generated_skill_status = None
                     task.promotion_success_count = None
+                    task.skill_generation_status = None
+                    task.skill_generation_error = None
+                    task.skill_generation_job_id = None
+                    task.skill_generation_started_at = None
+                    task.skill_generation_completed_at = None
                     task.started_at = None
                     task.completed_at = None
+                    db.query(SkillGenerationJob).filter(SkillGenerationJob.task_id == task.id).delete()
                     if not task.llm_binding_snapshot:
                         snapshot = _build_llm_binding_snapshot(db)
                         task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
@@ -966,6 +981,150 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
                     created_by="task_manager",
                 )
                 _schedule_pending_tasks()
+        processed += 1
+    return processed
+
+
+def process_skill_generation_jobs(limit: int = 1) -> int:
+    from app.model import SkillGenerationJob, UnpackTask, get_db_session, get_worker_id
+    from app.unpacker_engine import _generate_candidate_skill
+
+    owner_id = get_worker_id()
+    processed = 0
+    while processed < max(1, limit):
+        db = get_db_session()
+        job = None
+        now = now_local()
+        try:
+            job = (
+                db.query(SkillGenerationJob)
+                .filter(
+                    (SkillGenerationJob.status == SKILL_GENERATION_PENDING)
+                    | (
+                        (SkillGenerationJob.status == SKILL_GENERATION_RUNNING)
+                        & (
+                            (SkillGenerationJob.lease_expires_at.is_(None))
+                            | (SkillGenerationJob.lease_expires_at < now)
+                        )
+                    )
+                )
+                .order_by(SkillGenerationJob.created_at.asc())
+                .first()
+            )
+            if job is None:
+                db.close()
+                break
+            job.status = SKILL_GENERATION_RUNNING
+            job.owner_id = owner_id
+            job.started_at = job.started_at or now
+            job.completed_at = None
+            job.error_message = None
+            job.attempts = int(job.attempts or 0) + 1
+            job.lease_expires_at = _skill_generation_job_lease_deadline(now)
+            task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+            if task is not None:
+                task.skill_generation_status = SKILL_GENERATION_RUNNING
+                task.skill_generation_error = None
+                task.skill_generation_job_id = job.id
+                task.skill_generation_started_at = job.started_at
+                task.skill_generation_completed_at = None
+            db.commit()
+            if task is not None:
+                _record_task_event_from_row(
+                    task,
+                    event_type="skill_generation_started",
+                    summary="候选 SKILL 开始异步生成",
+                    stage_key="skill_generation",
+                    status=task.status,
+                    detail={"job_id": job.id},
+                    owner_id=owner_id,
+                    created_by="task_manager",
+                )
+                _write_task_result_cache(task.id)
+            task_id = job.task_id
+            project_id = job.project_id
+            job_id = job.id
+        finally:
+            db.close()
+
+        error_message: Optional[str] = None
+        saved_skill: Optional[dict[str, Any]] = None
+        try:
+            db = get_db_session()
+            try:
+                task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+                if task is None:
+                    raise RuntimeError("任务不存在，无法执行异步 SKILL 沉淀")
+                context_path = _skill_generation_context_path(task.output_path)
+                if not context_path.exists():
+                    raise RuntimeError(f"缺少 SKILL 沉淀上下文文件: {context_path}")
+                context = json.loads(context_path.read_text(encoding="utf-8"))
+                features = context.get("features") or {}
+                if not isinstance(features, dict) or not features:
+                    raise RuntimeError("SKILL 沉淀上下文缺少 features")
+                review_result = str(context.get("review_result") or "").strip()
+                if not review_result:
+                    raise RuntimeError("SKILL 沉淀上下文缺少 review_result")
+                llm_binding_snapshot = None
+                if task.llm_binding_snapshot:
+                    try:
+                        llm_binding_snapshot = json.loads(task.llm_binding_snapshot)
+                    except Exception:
+                        llm_binding_snapshot = None
+                saved_skill = _generate_candidate_skill(
+                    task_id=task.id,
+                    firmware_path=str(context.get("firmware_path") or task.firmware_path),
+                    output_path=task.output_path,
+                    features=features,
+                    review_result=review_result,
+                    log_dir=context_path.parent,
+                    llm_binding_snapshot=llm_binding_snapshot,
+                )
+            finally:
+                db.close()
+        except Exception as exc:
+            error_message = str(exc)
+            logger.warning("failed to process skill generation job %s task %s: %s", job_id, task_id, exc)
+
+        db = get_db_session()
+        try:
+            current = db.query(SkillGenerationJob).filter(SkillGenerationJob.id == job_id).first()
+            task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+            completed_at = now_local()
+            if current is not None:
+                current.owner_id = owner_id
+                current.lease_expires_at = None
+                current.completed_at = completed_at
+                current.status = SKILL_GENERATION_FAILED if error_message else SKILL_GENERATION_SUCCESS
+                current.error_message = error_message
+            if task is not None:
+                task.skill_generation_status = SKILL_GENERATION_FAILED if error_message else SKILL_GENERATION_SUCCESS
+                task.skill_generation_error = error_message
+                task.skill_generation_job_id = job_id
+                task.skill_generation_completed_at = completed_at
+                if saved_skill:
+                    task.generated_skill_path = saved_skill.get("path")
+                    task.generated_skill_status = saved_skill.get("skill_status")
+                    task.promotion_success_count = saved_skill.get("promotion_success_count")
+            db.commit()
+            if task is not None:
+                _record_task_event_from_row(
+                    task,
+                    event_type="skill_generation_failed" if error_message else "skill_generation_completed",
+                    summary="候选 SKILL 生成失败" if error_message else "候选 SKILL 已异步生成",
+                    stage_key="skill_generation",
+                    status=task.status,
+                    detail={
+                        "skill_generation_status": task.skill_generation_status,
+                        "generated_skill_path": task.generated_skill_path,
+                        "error": error_message,
+                    },
+                    owner_id=owner_id,
+                    created_by="task_manager",
+                )
+                _write_task_result_cache(task_id)
+        finally:
+            db.close()
         processed += 1
     return processed
 
@@ -1777,7 +1936,13 @@ def _write_task_result_cache(task_id: str) -> None:
                 "matched_skill": str(task.matched_skill or "").strip() or None,
                 "fallback_to_llm": bool(task.fallback_to_llm),
                 "generated_skill_path": str(task.generated_skill_path or "").strip() or None,
+                "generated_skill_status": str(task.generated_skill_status or "").strip() or None,
                 "promotion_success_count": int(task.promotion_success_count or 0),
+                "skill_generation_status": str(task.skill_generation_status or "").strip() or None,
+                "skill_generation_error": str(task.skill_generation_error or "").strip() or None,
+                "skill_generation_job_id": str(task.skill_generation_job_id or "").strip() or None,
+                "skill_generation_started_at": isoformat_local(task.skill_generation_started_at),
+                "skill_generation_completed_at": isoformat_local(task.skill_generation_completed_at),
                 "executor_rounds": int(task.rounds or 0),
                 "session_count": session_count,
                 "event_count": 0,
@@ -1789,6 +1954,51 @@ def _write_task_result_cache(task_id: str) -> None:
         atomic_write_json(run_root / TASK_RESULT_CACHE_FILENAME, payload)
     finally:
         db.close()
+
+
+def _skill_generation_context_path(output_path: str) -> Path:
+    from app.unpacker_engine import SKILL_GENERATION_CONTEXT_FILENAME
+
+    return _derive_run_root_from_output_path(output_path) / "round_000" / SKILL_GENERATION_CONTEXT_FILENAME
+
+
+def _enqueue_skill_generation_job(db: Any, task: Any, *, created_by: str = "task_manager") -> Optional[str]:
+    from app.model import SkillGenerationJob, generate_id
+
+    if task is None:
+        return None
+    existing = (
+        db.query(SkillGenerationJob)
+        .filter(
+            SkillGenerationJob.task_id == task.id,
+            SkillGenerationJob.status.in_([SKILL_GENERATION_PENDING, SKILL_GENERATION_RUNNING]),
+        )
+        .first()
+    )
+    if existing is not None:
+        task.skill_generation_status = existing.status
+        task.skill_generation_job_id = existing.id
+        task.skill_generation_error = None
+        task.skill_generation_started_at = existing.started_at
+        task.skill_generation_completed_at = existing.completed_at
+        return existing.id
+
+    job_id = generate_id()
+    db.add(
+        SkillGenerationJob(
+            id=job_id,
+            task_id=task.id,
+            project_id=task.project_id,
+            status=SKILL_GENERATION_PENDING,
+            created_by=created_by,
+        )
+    )
+    task.skill_generation_status = SKILL_GENERATION_PENDING
+    task.skill_generation_error = None
+    task.skill_generation_job_id = job_id
+    task.skill_generation_started_at = None
+    task.skill_generation_completed_at = None
+    return job_id
 
 
 def _run_task_result_cache_refresh(task_id: str) -> None:
@@ -2004,6 +2214,7 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
+    queued_skill_generation_job_id: Optional[str] = None
     try:
         query = db.query(UnpackTask).filter(UnpackTask.id == task_id)
         if run_token:
@@ -2051,6 +2262,16 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
         task.generated_skill_path = result.get("generated_skill_path")
         task.generated_skill_status = result.get("generated_skill_status")
         task.promotion_success_count = result.get("promotion_success_count")
+        task.skill_generation_error = None
+        skill_generation_requested = bool(result.get("skill_generation_requested"))
+        if task.status == TaskStatus.SUCCESS.value and skill_generation_requested:
+            queued_skill_generation_job_id = _enqueue_skill_generation_job(db, task)
+        else:
+            task.skill_generation_status = SKILL_GENERATION_NOT_APPLICABLE
+            task.skill_generation_error = None
+            task.skill_generation_job_id = None
+            task.skill_generation_started_at = None
+            task.skill_generation_completed_at = None
         task.completed_at = now_local()
         task.last_progress_at = now_local()
         db.commit()
@@ -2069,6 +2290,16 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
+        if queued_skill_generation_job_id:
+            _record_task_event_from_row(
+                task,
+                event_type="skill_generation_queued",
+                summary="候选 SKILL 已入队，等待后台异步沉淀",
+                stage_key="skill_generation",
+                status=task.status,
+                detail={"job_id": queued_skill_generation_job_id},
+                created_by="task_manager",
+            )
         _write_task_result_cache(task_id)
     finally:
         db.close()

@@ -88,6 +88,11 @@ class TaskResponse(BaseModel):
     generated_skill_path: Optional[str] = None
     generated_skill_status: Optional[str] = None
     promotion_success_count: Optional[int] = None
+    skill_generation_status: Optional[str] = None
+    skill_generation_error: Optional[str] = None
+    skill_generation_job_id: Optional[str] = None
+    skill_generation_started_at: Optional[str] = None
+    skill_generation_completed_at: Optional[str] = None
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -166,7 +171,13 @@ class TaskResultSummaryResponse(BaseModel):
     matched_skill: Optional[str] = None
     fallback_to_llm: bool = False
     generated_skill_path: Optional[str] = None
+    generated_skill_status: Optional[str] = None
     promotion_success_count: int = 0
+    skill_generation_status: Optional[str] = None
+    skill_generation_error: Optional[str] = None
+    skill_generation_job_id: Optional[str] = None
+    skill_generation_started_at: Optional[str] = None
+    skill_generation_completed_at: Optional[str] = None
     executor_rounds: int = 0
     session_count: int = 0
     event_count: int = 0

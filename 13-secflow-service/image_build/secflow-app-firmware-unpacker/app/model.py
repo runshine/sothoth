@@ -82,6 +82,11 @@ class UnpackTask(Base):
     generated_skill_path = Column(String(512), nullable=True)
     generated_skill_status = Column(String(32), nullable=True)
     promotion_success_count = Column(Integer, nullable=True)
+    skill_generation_status = Column(String(32), nullable=True)
+    skill_generation_error = Column(Text, nullable=True)
+    skill_generation_job_id = Column(String(32), nullable=True, index=True)
+    skill_generation_started_at = Column(DateTime, nullable=True)
+    skill_generation_completed_at = Column(DateTime, nullable=True)
     llm_binding_snapshot = Column(Text, nullable=True)
     created_at = Column(DateTime, default=now_local)
     started_at = Column(DateTime, nullable=True)
@@ -130,6 +135,11 @@ class UnpackTask(Base):
             "generated_skill_path": self.generated_skill_path,
             "generated_skill_status": self.generated_skill_status,
             "promotion_success_count": self.promotion_success_count,
+            "skill_generation_status": self.skill_generation_status,
+            "skill_generation_error": self.skill_generation_error,
+            "skill_generation_job_id": self.skill_generation_job_id,
+            "skill_generation_started_at": isoformat_local(self.skill_generation_started_at),
+            "skill_generation_completed_at": isoformat_local(self.skill_generation_completed_at),
             "created_at": isoformat_local(self.created_at),
             "started_at": isoformat_local(self.started_at),
             "completed_at": isoformat_local(self.completed_at),
@@ -252,6 +262,39 @@ class WorkspaceCleanupJob(Base):
         }
 
 
+class SkillGenerationJob(Base):
+    __tablename__ = "secflow_app_firmware_unpacker_skill_generation_jobs"
+
+    id = Column(String(32), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=True, index=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    owner_id = Column(String(96), nullable=True, index=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text, nullable=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "project_id": self.project_id,
+            "status": self.status,
+            "owner_id": self.owner_id,
+            "lease_expires_at": isoformat_local(self.lease_expires_at),
+            "attempts": self.attempts,
+            "error_message": self.error_message,
+            "created_by": self.created_by,
+            "created_at": isoformat_local(self.created_at),
+            "started_at": isoformat_local(self.started_at),
+            "completed_at": isoformat_local(self.completed_at),
+        }
+
+
 DEFAULT_CONFIGS = [
     ("concurrency_mode", "auto", "string", "并发控制模式：auto=按 Pod CPU/内存自动计算，manual=手动指定"),
     ("manual_max_concurrent", "3", "int", "手动模式下单个 Pod 最大并发解包任务数"),
@@ -336,6 +379,7 @@ def apply_table_prefix_if_needed() -> None:
     ServiceConfig.__table__.name = f"{prefix}service_configs"
     UnpackTaskEvent.__table__.name = f"{prefix}task_events"
     WorkspaceCleanupJob.__table__.name = f"{prefix}workspace_cleanup_jobs"
+    SkillGenerationJob.__table__.name = f"{prefix}skill_generation_jobs"
 
 
 def init_database() -> None:
@@ -379,6 +423,11 @@ def _ensure_unpack_task_columns() -> None:
         "generated_skill_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_path VARCHAR(512)",
         "generated_skill_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_status VARCHAR(32)",
         "promotion_success_count": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN promotion_success_count INTEGER",
+        "skill_generation_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_status VARCHAR(32)",
+        "skill_generation_error": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_error TEXT",
+        "skill_generation_job_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_job_id VARCHAR(32)",
+        "skill_generation_started_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_started_at DATETIME",
+        "skill_generation_completed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_completed_at DATETIME",
         "llm_binding_snapshot": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN llm_binding_snapshot TEXT",
     }
 
