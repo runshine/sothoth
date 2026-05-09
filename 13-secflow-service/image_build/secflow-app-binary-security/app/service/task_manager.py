@@ -4285,11 +4285,11 @@ class TaskManager:
             },
         )
         item.output_ref = {
-            **(item.output_ref or {}),
+            **(getattr(item, "output_ref", None) or {}),
             "archive_copy_stats": copy_stats,
         }
         item.result = {
-            **(item.result or {}),
+            **(getattr(item, "result", None) or {}),
             "archive_copy_stats": copy_stats,
         }
         return target_dir
