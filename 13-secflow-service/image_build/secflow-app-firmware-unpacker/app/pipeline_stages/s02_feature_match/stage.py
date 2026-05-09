@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.skill_store import compute_family_id, match_skill
-from app.unpacker_engine import extract_firmware_features
+from .features import extract_firmware_features
+from .skill_store import compute_family_id, match_skill
 
 
 def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
@@ -56,4 +56,3 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
         flush=True,
     )
     print(json.dumps(summary, ensure_ascii=False))
-

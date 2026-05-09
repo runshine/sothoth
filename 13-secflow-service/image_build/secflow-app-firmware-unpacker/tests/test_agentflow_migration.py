@@ -7,10 +7,9 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
-from app.agentflow_runner import _token_summary, run_unpack_agentflow
-from app.agentflow_pipeline import _skill_author_code, build_firmware_unpack_pipeline
-from app.config import reload_config
-from app.unpacker_engine import run_unpack
+from app.cli import _token_summary, run_unpack_agentflow
+from app.cli import _skill_author_code, build_firmware_unpack_pipeline
+from app.cli import reload_config
 
 
 def _status(value):
@@ -76,13 +75,13 @@ def _run_agentflow_with_record(record, output_path, **kwargs):
         )
     )
     patches = [
-        patch("app.agentflow_runner.get_config", return_value=config),
-        patch("app.agentflow_runner.RunStore", FakeRunStore),
-        patch("app.agentflow_runner.Orchestrator", FakeOrchestrator),
-        patch("app.agentflow_runner.build_firmware_unpack_pipeline", return_value=object()),
-        patch("app.unpacker_engine.extract_firmware_features", return_value={"filename": "fw.bin"}),
-        patch("app.unpacker_engine._get_max_retries", return_value=2),
-        patch("app.agentflow_runner.compute_family_id", return_value="family-1"),
+        patch("app.cli.get_config", return_value=config),
+        patch("app.cli.RunStore", FakeRunStore),
+        patch("app.cli.Orchestrator", FakeOrchestrator),
+        patch("app.cli.build_firmware_unpack_pipeline", return_value=object()),
+        patch("app.cli.extract_firmware_features", return_value={"filename": "fw.bin"}),
+        patch("app.cli.get_max_retries", return_value=2),
+        patch("app.cli.compute_family_id", return_value="family-1"),
     ]
     with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
         return run_unpack_agentflow("/tmp/fw.bin", output_path, **kwargs)
@@ -389,24 +388,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
             self.assertIn("[summary truncated for reusable skill size]", generated)
 
 
-class EngineDispatchTests(unittest.TestCase):
-    def test_run_unpack_dispatches_to_agentflow(self):
-        with patch("app.agentflow_runner.run_unpack_agentflow", return_value={"status": "success"}) as agentflow:
-            self.assertEqual({"status": "success"}, run_unpack("/tmp/fw.bin", "/tmp/out", task_id="t1", project_id="p1"))
-            agentflow.assert_called_once_with(
-                "/tmp/fw.bin",
-                "/tmp/out",
-                cancel_check=None,
-                task_id="t1",
-                project_id="p1",
-            )
-
-    def test_agentflow_failure_is_not_fallbacked(self):
-        with patch("app.agentflow_runner.run_unpack_agentflow", side_effect=RuntimeError("boom")):
-            with self.assertRaisesRegex(RuntimeError, "boom"):
-                run_unpack("/tmp/fw.bin", "/tmp/out")
-
-
 class AgentFlowRunnerAdapterTests(unittest.TestCase):
     def test_token_summary_supports_gaiasec_usage_fields(self):
         events = [
@@ -487,7 +468,7 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
                     "generic_reviewer": _node("AGENTFLOW_REVIEW_SKIPPED"),
                 }
             )
-            with patch("app.agentflow_runner.match_skill", return_value=(None, 0, {"matched_status": "miss"})):
+            with patch("app.cli.match_skill", return_value=(None, 0, {"matched_status": "miss"})):
                 result = _run_agentflow_with_record(record, output)
 
             self.assertEqual("success", result["status"])
@@ -514,8 +495,8 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
                     "generic_reviewer": _node("AGENTFLOW_REVIEW_SKIPPED"),
                 }
             )
-            with patch("app.agentflow_runner.match_skill", return_value=(skill, 95, {"matched_status": "hit"})):
-                with patch("app.agentflow_runner.register_skill_success", return_value=promoted) as register:
+            with patch("app.cli.match_skill", return_value=(skill, 95, {"matched_status": "hit"})):
+                with patch("app.cli.register_skill_success", return_value=promoted) as register:
                     result = _run_agentflow_with_record(record, output)
 
             self.assertEqual("success", result["status"])
@@ -545,8 +526,8 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
                 },
                 status="completed",
             )
-            with patch("app.agentflow_runner.match_skill", return_value=(skill, 80, {"matched_status": "hit"})):
-                with patch("app.agentflow_runner.save_candidate_skill", return_value=generated) as save_skill:
+            with patch("app.cli.match_skill", return_value=(skill, 80, {"matched_status": "hit"})):
+                with patch("app.cli.save_candidate_skill", return_value=generated) as save_skill:
                     result = _run_agentflow_with_record(record, output)
 
             self.assertEqual("success", result["status"])
@@ -569,7 +550,7 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
                 },
                 status="failed",
             )
-            with patch("app.agentflow_runner.match_skill", return_value=(None, 0, {"matched_status": "miss"})):
+            with patch("app.cli.match_skill", return_value=(None, 0, {"matched_status": "miss"})):
                 result = _run_agentflow_with_record(record, output)
 
             self.assertEqual("failed", result["status"])
@@ -590,8 +571,8 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
                 },
                 status="failed",
             )
-            with patch("app.agentflow_runner.match_skill", return_value=(skill, 80, {"matched_status": "hit"})):
-                with patch("app.agentflow_runner.register_skill_success") as register_success:
+            with patch("app.cli.match_skill", return_value=(skill, 80, {"matched_status": "hit"})):
+                with patch("app.cli.register_skill_success") as register_success:
                     result = _run_agentflow_with_record(record, output)
 
             self.assertEqual("failed", result["status"])
@@ -606,7 +587,7 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
                 nodes={"generic_executor": _node("partial", attempts=1)},
                 status="running",
             )
-            with patch("app.agentflow_runner.match_skill", return_value=(None, 0, {"matched_status": "miss"})):
+            with patch("app.cli.match_skill", return_value=(None, 0, {"matched_status": "miss"})):
                 result = _run_agentflow_with_record(record, output, cancel_check=unittest.mock.Mock(side_effect=[False, True]))
 
             self.assertEqual("cancelled", result["status"])
@@ -649,8 +630,8 @@ class AgentFlowRunnerSmokeTests(unittest.TestCase):
             }
 
             with patch.dict(os.environ, env, clear=False):
-                with patch("app.agentflow_runner.get_config", return_value=config):
-                    with patch("app.unpacker_engine.TOOLS_DIR", tools_dir):
+                with patch("app.cli.get_config", return_value=config):
+                    with patch("app.cli.TOOLS_DIR", tools_dir):
                         result = run_unpack_agentflow(str(firmware), str(output))
 
             self.assertEqual("success", result["status"])
@@ -691,8 +672,8 @@ class AgentFlowRunnerSmokeTests(unittest.TestCase):
             }
 
             with patch.dict(os.environ, env, clear=False):
-                with patch("app.agentflow_runner.get_config", return_value=config):
-                    with patch("app.unpacker_engine.TOOLS_DIR", tools_dir):
+                with patch("app.cli.get_config", return_value=config):
+                    with patch("app.cli.TOOLS_DIR", tools_dir):
                         result = run_unpack_agentflow(str(firmware), str(output))
 
             self.assertEqual("success", result["status"])
@@ -740,8 +721,8 @@ class AgentFlowRunnerSmokeTests(unittest.TestCase):
             }
 
             with patch.dict(os.environ, env, clear=False):
-                with patch("app.agentflow_runner.get_config", return_value=config):
-                    with patch("app.unpacker_engine.TOOLS_DIR", tools_dir):
+                with patch("app.cli.get_config", return_value=config):
+                    with patch("app.cli.TOOLS_DIR", tools_dir):
                         result = run_unpack_agentflow(str(firmware), str(output))
 
             self.assertEqual("success", result["status"])

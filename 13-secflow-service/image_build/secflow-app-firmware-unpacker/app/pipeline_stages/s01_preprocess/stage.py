@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from app.preprocess import run_preprocess
+from .engine import run_preprocess
 
 
 def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
@@ -34,4 +34,3 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
         flush=True,
     )
     print(json.dumps(result, ensure_ascii=False))
-

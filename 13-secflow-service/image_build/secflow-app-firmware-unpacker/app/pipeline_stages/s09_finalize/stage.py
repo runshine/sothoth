@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from app.skill_store import register_skill_success, save_candidate_skill
+from .skill_store import register_skill_success, save_candidate_skill
 
 
 def _write_json(path: str, data: Any) -> None:
@@ -194,4 +194,3 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
         flush=True,
     )
     print(json.dumps(result, ensure_ascii=False))
-

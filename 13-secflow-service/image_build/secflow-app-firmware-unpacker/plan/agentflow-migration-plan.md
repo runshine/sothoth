@@ -54,8 +54,8 @@ AgentFlow 迁移主干已完成：服务入口、pipeline builder、runner、ski
 涉及文件：
 
 - `plan/agentflow-regression-fixtures/`
-- `app/agentflow_runner.py`
-- `app/agentflow_pipeline.py`
+- `app/cli.py`
+- `app/cli.py`
 
 验收标准：
 
@@ -69,13 +69,13 @@ AgentFlow 迁移主干已完成：服务入口、pipeline builder、runner、ski
 
 任务：
 
-- 核对 `app/agentflow_pipeline.py` 中各节点 prompt 与 `app/agent/prompt/*.md` 的差异。
+- 核对 `app/cli.py` 中各节点 prompt 与 `app/agent/prompt/*.md` 的差异。
 - 将仍依赖临时 marker 协议的 prompt 逐步收敛到现有模板。
 - 保留 AgentFlow 必需的 success marker，但避免重复维护两套业务语义。
 
 涉及文件：
 
-- `app/agentflow_pipeline.py`
+- `app/cli.py`
 - `app/agent/prompt/unpack-firmware.md`
 - `app/agent/prompt/retry-firmware-unpack.md`
 - `app/agent/prompt/review-firmware-unpack.md`

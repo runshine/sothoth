@@ -44,12 +44,13 @@ docker run --rm \
 
 ## 代码结构
 
-- `app/cli.py`: AgentFlow-only 命令行入口
-- `app/agentflow_runner.py`: 提交 pipeline、等待结果、汇总 token 和 run artifact
-- `app/agentflow_pipeline.py`: AgentFlow 图装配
-- `app/pipeline_stages/*.py`: 各 Python 阶段实现
-- `app/preprocess.py`: 确定性预处理
-- `app/skill_store.py`: skill 匹配、生成和晋级
+- `app/cli.py`: AgentFlow-only 命令行入口，负责配置读取、图装配、pipeline 提交、结果汇总和 token/run artifact 处理
+- `app/pipeline_stages/*/`: 各 Python 阶段包，每个阶段的实现和私有依赖就近放置
+- `app/pipeline_stages/s01_preprocess/engine.py`: 确定性预处理实现
+- `app/pipeline_stages/s02_feature_match/features.py`: 固件特征提取
+- `app/pipeline_stages/s02_feature_match/skill_store.py`: skill 匹配逻辑
+- `app/pipeline_stages/s09_finalize/skill_store.py`: skill 生成和晋级逻辑
+- `app/agent/defs.py`: pi agent 定义路径和 frontmatter 解析
 - `app/agent/**`: pi agent system prompts 和 prompt 模板
 
 离线回归评测：

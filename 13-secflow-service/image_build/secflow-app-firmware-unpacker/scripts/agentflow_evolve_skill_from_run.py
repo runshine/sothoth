@@ -14,7 +14,7 @@ if str(ROOT) not in sys.path:
 if str(ROOT / "app") not in sys.path:
     sys.path.insert(0, str(ROOT / "app"))
 
-from app.skill_store import save_candidate_skill
+from app.pipeline_stages.s09_finalize.skill_store import save_candidate_skill
 
 
 def _infer_run_id(run_dir: Path) -> str:

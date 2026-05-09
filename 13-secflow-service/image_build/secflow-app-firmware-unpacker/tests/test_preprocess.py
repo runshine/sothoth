@@ -1,7 +1,7 @@
 import tempfile
 from pathlib import Path
 
-from app.preprocess import run_preprocess
+from app.pipeline_stages.s01_preprocess.engine import run_preprocess
 
 
 def test_preprocess_extracts_embedded_elf_with_prefix():

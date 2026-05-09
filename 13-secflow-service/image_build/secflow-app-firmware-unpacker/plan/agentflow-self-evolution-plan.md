@@ -34,7 +34,7 @@
 
 涉及文件：
 
-- `app/agentflow_runner.py`
+- `app/cli.py`
 - `app/api/firmware.py`
 - `app/model.py`
 - `app/schemas.py`
@@ -67,9 +67,10 @@
 
 涉及文件：
 
-- `app/agentflow_pipeline.py`
-- `app/agentflow_runner.py`
-- `app/skill_store.py`
+- `app/cli.py`
+- `app/cli.py`
+- `app/pipeline_stages/s02_feature_match/skill_store.py`
+- `app/pipeline_stages/s09_finalize/skill_store.py`
 - `app/agent/prompt/review-firmware-unpack.md`
 
 验收标准：
@@ -92,8 +93,9 @@
 
 涉及文件：
 
-- `app/skill_store.py`
-- `app/agentflow_runner.py`
+- `app/pipeline_stages/s02_feature_match/skill_store.py`
+- `app/pipeline_stages/s09_finalize/skill_store.py`
+- `app/cli.py`
 - `app/api/firmware.py`
 - `scripts/`
 - `tests/`
@@ -129,8 +131,8 @@
 
 涉及文件：
 
-- `app/agentflow_pipeline.py`
-- `app/config.py`
+- `app/cli.py`
+- `app/cli.py`
 - `config.yaml`
 - `tests/`
 

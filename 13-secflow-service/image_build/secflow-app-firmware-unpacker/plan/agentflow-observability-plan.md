@@ -16,13 +16,13 @@
 
 任务：
 
-- 在 `app/agentflow_runner.py` 中从 AgentFlow trace / events / node outputs 聚合 token 使用量。
+- 在 `app/cli.py` 中从 AgentFlow trace / events / node outputs 聚合 token 使用量。
 - 写入 `tokens_summary.json`，包含总量和节点级明细。
 - 在结果或 DB 可见字段中暴露总 token 数，便于任务列表和回归评测使用。
 
 涉及文件：
 
-- `app/agentflow_runner.py`
+- `app/cli.py`
 - `app/model.py`
 - `app/schemas.py`
 - `tests/`
@@ -61,8 +61,7 @@
 
 涉及文件：
 
-- `app/agentflow_runner.py`
-- `app/logging_utils.py`
+- `app/cli.py`
 - `tests/`
 
 验收标准：
@@ -81,7 +80,7 @@
 
 - `plan/`
 - `app/services/worker.py`
-- `app/agentflow_runner.py`
+- `app/cli.py`
 
 验收标准：
 
@@ -135,7 +134,7 @@
 涉及文件：
 
 - `app/services/worker.py`
-- `app/agentflow_runner.py`
+- `app/cli.py`
 - `tests/`
 
 验收标准：
@@ -153,7 +152,7 @@
 
 涉及文件：
 
-- `app/agentflow_runner.py`
+- `app/cli.py`
 - `app/services/task_manager.py`
 - `tests/test_agentflow_migration.py`
 
@@ -174,7 +173,7 @@
 
 - `app/metrics.py`
 - `app/main.py`
-- `app/agentflow_runner.py`
+- `app/cli.py`
 - `requirements.txt`
 
 验收标准：

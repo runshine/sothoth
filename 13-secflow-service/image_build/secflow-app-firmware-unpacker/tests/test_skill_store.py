@@ -2,13 +2,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.skill_store import (
+from app.pipeline_stages.s02_feature_match.skill_store import (
     SKILL_STATUS_ACTIVE,
     SKILL_STATUS_ARCHIVED,
     SKILL_STATUS_CANDIDATE,
     compute_family_id,
     match_skill,
     parse_skill_metadata,
+)
+from app.pipeline_stages.s09_finalize.skill_store import (
     register_skill_success,
     save_candidate_skill,
 )

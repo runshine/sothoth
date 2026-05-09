@@ -11,13 +11,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from logging_utils import log_event
-
 log = logging.getLogger("unpacker.service")
 
 MAX_RECURSIVE_ITEMS = int(os.environ.get("UNPACKER_PREPROCESS_MAX_RECURSIVE_ITEMS", "80"))
 MAX_RECURSIVE_DEPTH = int(os.environ.get("UNPACKER_PREPROCESS_MAX_RECURSIVE_DEPTH", "4"))
 MAX_RECURSIVE_FILE_BYTES = int(os.environ.get("UNPACKER_PREPROCESS_MAX_RECURSIVE_FILE_BYTES", str(256 * 1024 * 1024)))
+
+
+def log_event(logger: logging.Logger, level: int, message: str, **fields: object) -> None:
+    logger.log(level, message, extra=fields)
 
 
 def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
