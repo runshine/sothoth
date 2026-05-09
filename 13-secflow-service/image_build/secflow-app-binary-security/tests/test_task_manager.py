@@ -84,6 +84,9 @@ class _ModelAwareDb:
     def commit(self):
         pass
 
+    def flush(self):
+        pass
+
 
 class _StageRun:
     def __init__(self, stage_name, status):
@@ -448,6 +451,86 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertFalse(supported)
         self.assertIn("下游服务不匹配", reason or "")
+
+    def test_stage_retry_clears_only_target_stage_outputs(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="partial_success",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "selected_modules": [{"module_key": "m1"}],
+            "entry_results": [{"entry_key": "e1"}],
+            "dataflow_results": [{"entry_key": "e1"}],
+            "vuln_results": [{"entry_key": "e1"}],
+            "stale_stages": ["dataflow_analysis"],
+            "stale_from_stage": "entry_analysis",
+        }
+        task.metrics = {"entry_count": 1, "vuln_result_count": 1}
+        task.stage_summary = {
+            "system_analysis": {"status": "success"},
+            "entry_analysis": {"status": "failed"},
+            "dataflow_analysis": {"status": "success"},
+        }
+
+        self.manager._clear_single_stage_outputs(task, "entry_analysis")
+
+        self.assertNotIn("entry_results", task.summary)
+        self.assertIn("dataflow_results", task.summary)
+        self.assertIn("vuln_results", task.summary)
+        self.assertIn("stale_stages", task.summary)
+        self.assertEqual(0, task.metrics["entry_count"])
+        self.assertEqual(1, task.metrics["vuln_result_count"])
+        self.assertNotIn("entry_analysis", task.stage_summary)
+        self.assertIn("dataflow_analysis", task.stage_summary)
+
+    def test_upsert_stage_item_creates_missing_item_during_retry(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        db = _ModelAwareDb(stage_runs=[run], stage_items=[])
+
+        item = self.manager._upsert_stage_item(
+            db,
+            task=task,
+            stage_run=run,
+            stage_name="entry_analysis",
+            item_key="m1",
+            item_name="module1",
+            parent_key="source_project",
+            downstream_service="entry_analyse",
+            input_ref={"module_key": "m1"},
+            retrying=True,
+        )
+
+        self.assertEqual("m1", item.item_key)
+        self.assertEqual(1, item.retry_count)
+        self.assertEqual("running", item.status)
+        self.assertEqual(1, len(db.added))
 
     def test_stage_enabled_uses_policy_override(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
@@ -875,7 +958,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertFalse(supported)
         self.assertIn("重复历史 item", reason or "")
 
-    def test_task_retry_support_targets_first_failed_stage(self):
+    def test_task_retry_support_targets_first_stage_for_full_restart(self):
         task = BinarySecurityTask(
             id="task1",
             project_id="p1",
@@ -910,7 +993,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertTrue(supported)
         self.assertIsNone(reason)
-        self.assertEqual("system_analysis", stage_name)
+        self.assertEqual("firmware_unpack", stage_name)
 
     def test_reclaim_stale_running_task_marks_stage_and_items_failed(self):
         task = BinarySecurityTask(

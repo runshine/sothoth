@@ -743,30 +743,35 @@ class TaskManager:
         if not supported or not stage_name:
             raise ValidationError(reason or "当前任务不支持安全重试")
         stage_sequence = self._stage_sequence_for_task(task)
+        first_stage = stage_sequence[0]
         task.status = "pending"
-        task.current_stage = stage_name
-        task.execution_mode = "task_retry"
-        task.target_stage_name = stage_name
+        task.current_stage = first_stage
+        task.execution_mode = None
+        task.target_stage_name = None
         task.last_error = None
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.finished_at = None
-        self._clear_stage_outputs_from(task, stage_name)
-        for current_stage in stage_sequence[stage_sequence.index(stage_name):]:
+        self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
+        db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.stage_name.in_(stage_sequence),
+        ).delete(synchronize_session=False)
+        for current_stage in stage_sequence:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
                 BinarySecurityStageRun.stage_name == current_stage,
             ).first()
             if stage_run:
-                self._reset_stage_run_for_retry(stage_run, increment_retry=current_stage == stage_name)
+                self._reset_stage_run_for_retry(stage_run, increment_retry=True)
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(
             db,
             task,
             "task_retried",
-            f"任务将从阶段 {stage_name} 继续安全重试",
-            stage_name=stage_name,
-            payload={"target_stage": stage_name, "stale_stages": stage_sequence[stage_sequence.index(stage_name) + 1:]},
+            f"任务已重置，将从第一阶段 {first_stage} 重新开始",
+            stage_name=first_stage,
+            payload={"target_stage": first_stage, "cleared_stages": stage_sequence, "retry_semantics": "full_restart"},
         )
         db.commit()
 
@@ -784,8 +789,7 @@ class TaskManager:
         ).first()
         if not stage_run:
             raise ValidationError("目标阶段尚未执行，不能重试")
-        downstream_stale = stage_sequence[stage_sequence.index(stage_name) + 1 :]
-        self._clear_stage_outputs_from(task, stage_name)
+        self._clear_single_stage_outputs(task, stage_name)
         self._reset_stage_run_for_retry(stage_run, increment_retry=True)
 
         task.execution_mode = "stage_retry"
@@ -803,18 +807,8 @@ class TaskManager:
             "stage_retry_requested",
             f"请求重试阶段: {stage_name}",
             stage_name=stage_name,
-            payload={"downstream_stale": downstream_stale},
+            payload={"retry_semantics": "stage_only_all_items"},
         )
-        if downstream_stale:
-            self._record_event(
-                db,
-                task,
-                "downstream_marked_stale",
-                f"阶段 {stage_name} 之后的结果已标记过期",
-                stage_name=stage_name,
-                level="warning",
-                payload={"stale_stages": downstream_stale},
-            )
         db.commit()
 
     async def sync_downstream_status(
@@ -1359,7 +1353,6 @@ class TaskManager:
             return []
         try:
             stale_reclaimed = self._reclaim_stale_dispatching_locked(db)
-            stale_reclaimed = self._reclaim_stale_running_locked(db) or stale_reclaimed
             service_config = self._load_service_config(db)
             active_count = self._active_dispatch_count(db)
             slots = max(0, service_config.max_concurrent_tasks - active_count)
@@ -2514,8 +2507,6 @@ class TaskManager:
             parent_key=parent_key,
         )
         if item is None:
-            if retrying:
-                raise ValidationError(f"缺少历史阶段项，无法安全重试: {stage_name}:{item_key}")
             item = BinarySecurityStageItem(
                 id=f"si_{uuid.uuid4().hex[:20]}",
                 task_id=task.id,
@@ -2529,6 +2520,8 @@ class TaskManager:
                 downstream_service=downstream_service,
                 started_at=_now(),
             )
+            if retrying:
+                item.retry_count = 1
             db.add(item)
         else:
             item.stage_run_id = stage_run.id
@@ -2548,6 +2541,61 @@ class TaskManager:
             item.output_ref = output_ref
         db.flush()
         return item
+
+    def _prepare_stage_items_for_retry(
+        self,
+        db: Session,
+        *,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        inputs: list[dict[str, Any]],
+        downstream_service: str,
+        identity,
+        output_ref,
+    ) -> None:
+        """Mark every intended stage item as queued before a stage-only retry starts.
+
+        The actual worker still decides whether to call a native downstream retry or
+        create a new downstream task. This pre-step makes the DB reflect that all
+        current-stage inputs are part of the retry, not only the first concurrency batch.
+        """
+        for input_item in inputs:
+            item_key, item_name, parent_key, input_ref = identity(input_item)
+            item = self._find_stage_item(
+                db,
+                task_id=task.id,
+                stage_name=stage_run.stage_name,
+                item_key=item_key,
+                parent_key=parent_key,
+            )
+            if item is None:
+                item = BinarySecurityStageItem(
+                    id=f"si_{uuid.uuid4().hex[:20]}",
+                    task_id=task.id,
+                    project_id=task.project_id,
+                    stage_run_id=stage_run.id,
+                    stage_name=stage_run.stage_name,
+                    item_key=item_key,
+                    item_name=item_name,
+                    parent_key=parent_key,
+                    status="queued",
+                    downstream_service=downstream_service,
+                )
+                db.add(item)
+            else:
+                item.stage_run_id = stage_run.id
+                item.item_name = item_name
+                item.parent_key = parent_key
+                item.status = "queued"
+                item.downstream_service = downstream_service
+                item.error_message = None
+                item.started_at = None
+                item.finished_at = None
+                item.payload = {}
+                item.result = {}
+            item.input_ref = input_ref
+            item.output_ref = output_ref(input_item)
+        db.commit()
 
     def _invoke_existing_downstream_retry(
         self,
@@ -2637,15 +2685,14 @@ class TaskManager:
         return None
 
     def _task_retry_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
-        if task.status in {"pending_upload", "uploading"}:
-            return False, "当前任务仍在上传输入，不能重试", None
-        stage_name = self._first_retry_stage_name(db, task)
-        if not stage_name:
-            return False, "当前任务没有可安全重试的失败阶段", None
-        supported, reason = self._stage_retry_support(db, task, stage_name)
-        if not supported:
-            return False, f"阶段 {stage_name} 不支持安全重试: {reason}", stage_name
-        return True, None, stage_name
+        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+            return False, "当前任务尚未完成输入准备，不能重试", None
+        if task.status in {"pending", "dispatching", "running"}:
+            return False, f"当前任务正在执行或排队中，不能重试: {task.status}", None
+        stage_sequence = self._stage_sequence_for_task(task)
+        if not stage_sequence:
+            return False, "当前任务没有可执行阶段", None
+        return True, None, stage_sequence[0]
 
     def _clear_stage_outputs_from(self, task: BinarySecurityTask, stage_name: str, *, mark_stale: bool = True) -> None:
         summary = dict(task.summary or {})
@@ -2668,6 +2715,18 @@ class TaskManager:
             summary.pop("stale_reason", None)
             summary.pop("stale_from_stage", None)
             summary.pop("stale_stages", None)
+        task.summary = summary
+        task.metrics = metrics
+        task.stage_summary = stage_summary
+
+    def _clear_single_stage_outputs(self, task: BinarySecurityTask, stage_name: str) -> None:
+        summary = dict(task.summary or {})
+        metrics = dict(task.metrics or {})
+        stage_summary = dict(task.stage_summary or {})
+        for summary_key in self._stage_result_keys(stage_name):
+            summary.pop(summary_key, None)
+        stage_summary.pop(stage_name, None)
+        metrics.update(STAGE_METRIC_RESETTERS.get(stage_name, {}))
         task.summary = summary
         task.metrics = metrics
         task.stage_summary = stage_summary
@@ -2870,6 +2929,23 @@ class TaskManager:
         input_files = list(task.summary.get("input_files") or [])
         if not input_files:
             return "failed", {"error": "缺少输入文件"}
+        if retry_existing:
+            self._prepare_stage_items_for_retry(
+                db,
+                task=task,
+                stage_run=stage_run,
+                inputs=input_files,
+                downstream_service="firmware_unpacker",
+                identity=lambda input_file: (
+                    input_file["firmware_key"],
+                    input_file["filename"],
+                    input_file["firmware_key"],
+                    {"filename": input_file["filename"], "path": str(Path(task.workspace_root) / "input" / input_file["filename"])},
+                ),
+                output_ref=lambda input_file: {
+                    "output_path": str(Path(task.workspace_root) / "run" / "firmware-unpacker" / input_file["firmware_key"]),
+                },
+            )
         results = await self._run_stage_pool(
             task,
             input_files,
@@ -2993,6 +3069,21 @@ class TaskManager:
         system_inputs = self._system_analysis_inputs(task)
         if not system_inputs:
             return "failed", {"error": "缺少可用于系统分析的输入"}
+        if retry_existing:
+            self._prepare_stage_items_for_retry(
+                db,
+                task=task,
+                stage_run=stage_run,
+                inputs=system_inputs,
+                downstream_service="system_analyse",
+                identity=lambda analysis_input: (
+                    analysis_input["firmware_key"],
+                    analysis_input.get("firmware_name") or analysis_input["firmware_key"],
+                    analysis_input["firmware_key"],
+                    analysis_input,
+                ),
+                output_ref=lambda _analysis_input: {},
+            )
         results = await self._run_stage_pool(
             task,
             system_inputs,
@@ -3623,6 +3714,21 @@ class TaskManager:
         modules = list(task.summary.get("selected_modules") or [])
         if not modules:
             return "failed", {"error": "缺少已选模块列表"}
+        if retry_existing:
+            self._prepare_stage_items_for_retry(
+                db,
+                task=task,
+                stage_run=stage_run,
+                inputs=modules,
+                downstream_service="binary_to_source",
+                identity=lambda module: (
+                    module["module_key"],
+                    module["module_name"],
+                    module.get("firmware_key"),
+                    module,
+                ),
+                output_ref=lambda _module: {},
+            )
         results = await self._run_stage_pool(
             task,
             modules,
@@ -3644,6 +3750,21 @@ class TaskManager:
         b2s_success = self._entry_analysis_inputs(task)
         if not b2s_success:
             return "failed", {"error": "没有可用于入口分析的源码模块"}
+        if retry_existing:
+            self._prepare_stage_items_for_retry(
+                db,
+                task=task,
+                stage_run=stage_run,
+                inputs=b2s_success,
+                downstream_service="entry_analyse",
+                identity=lambda module: (
+                    module["module_key"],
+                    module["module_name"],
+                    module.get("firmware_key"),
+                    module,
+                ),
+                output_ref=lambda _module: {},
+            )
         results = await self._run_stage_pool(
             task,
             b2s_success,
@@ -3675,6 +3796,21 @@ class TaskManager:
             entries.extend(result.get("entries", []))
         if not entries:
             return "failed", {"error": "没有可用于数据流分析的入口"}
+        if retry_existing:
+            self._prepare_stage_items_for_retry(
+                db,
+                task=task,
+                stage_run=stage_run,
+                inputs=entries,
+                downstream_service="dataflow_analyse",
+                identity=lambda entry: (
+                    entry["entry_key"],
+                    entry["function_name"],
+                    entry.get("module_key"),
+                    entry,
+                ),
+                output_ref=lambda _entry: {},
+            )
         results = await self._run_stage_pool(
             task,
             entries,
@@ -3696,6 +3832,21 @@ class TaskManager:
         dataflow_results = list(task.summary.get("dataflow_results") or [])
         if not dataflow_results:
             return "failed", {"error": "没有可用于漏洞扫描的数据流结果"}
+        if retry_existing:
+            self._prepare_stage_items_for_retry(
+                db,
+                task=task,
+                stage_run=stage_run,
+                inputs=dataflow_results,
+                downstream_service="dataflow_vuln_scanner",
+                identity=lambda result: (
+                    result["entry_key"],
+                    result["function_name"],
+                    result.get("module_key"),
+                    result,
+                ),
+                output_ref=lambda _result: {},
+            )
         results = await self._run_stage_pool(
             task,
             dataflow_results,

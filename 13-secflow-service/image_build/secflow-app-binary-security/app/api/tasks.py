@@ -198,7 +198,7 @@ async def retry_task(
     db: Session = Depends(get_db),
 ):
     get_task_manager().retry_task(db, project_id=project_id, task_id=task_id)
-    return BinarySecurityActionResponse(task_id=task_id, message="任务已重新排队")
+    return BinarySecurityActionResponse(task_id=task_id, message="任务已从第一阶段重新排队")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/continue", response_model=BinarySecurityActionResponse)
@@ -221,7 +221,7 @@ async def retry_stage(
     db: Session = Depends(get_db),
 ):
     get_task_manager().retry_stage(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
-    return BinarySecurityActionResponse(task_id=task_id, message=f"阶段 {stage_name} 已重新排队")
+    return BinarySecurityActionResponse(task_id=task_id, message=f"阶段 {stage_name} 的全部子任务已重新排队")
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/sync-downstream-status", response_model=BinarySecurityActionResponse)
