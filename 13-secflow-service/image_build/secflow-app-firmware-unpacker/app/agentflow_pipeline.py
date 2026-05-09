@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 _repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 _local_agentflow = _repo_root / "agentflow"
 if _local_agentflow.exists() and str(_local_agentflow) not in sys.path:
     sys.path.insert(0, str(_local_agentflow))
@@ -201,6 +203,161 @@ def _cleanup_output_code(ctx: dict[str, Any]) -> str:
     )
 
 
+def _finalize_result_code(ctx: dict[str, Any]) -> str:
+    payload = {
+        "firmware_path": ctx["firmware_path"],
+        "output_path": ctx["output_path"],
+        "tools_dir": ctx["tools_dir"],
+        "feature_match_output_file": ctx["feature_match_output_file"],
+        "skill_author_output_file": ctx["skill_author_output_file"],
+        "final_result_file": ctx["final_result_file"],
+        "stage2_file": str(Path(ctx["final_result_file"]).parent / "stage2_skill_match.json"),
+        "stage3_file": str(Path(ctx["final_result_file"]).parent / "stage3_skill_exec.json"),
+        "stage4_file": str(Path(ctx["final_result_file"]).parent / "stage4_llm_fallback.json"),
+        "stage5_file": str(Path(ctx["final_result_file"]).parent / "stage5_skill_generate.json"),
+    }
+    return (
+        "import json\n"
+        "import re\n"
+        "from pathlib import Path\n\n"
+        "from app.skill_store import register_skill_success, save_candidate_skill\n\n"
+        f"payload = json.loads(r'''{json.dumps(payload, ensure_ascii=False)}''')\n"
+        "preprocess_output = r'''{{ nodes.preprocess.output }}'''\n"
+        "feature_output = r'''{{ nodes.feature_match.output }}'''\n"
+        "skill_output = r'''{{ nodes.skill_executor.output }}'''\n"
+        "skill_review = r'''{{ nodes.skill_reviewer.output }}'''\n"
+        "generic_output = r'''{{ nodes.generic_executor.output }}'''\n"
+        "generic_review = r'''{{ nodes.generic_reviewer.output }}'''\n"
+        "author_output = r'''{{ nodes.skill_author.output }}'''\n"
+        "cleanup_output = r'''{{ nodes.cleanup.output }}'''\n"
+        "skill_status = r'''{{ nodes.skill_executor.status }}'''.strip()\n"
+        "generic_status = r'''{{ nodes.generic_executor.status }}'''.strip()\n\n"
+        "def write_json(path, data):\n"
+        "    target = Path(path)\n"
+        "    target.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    target.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')\n\n"
+        "def parse_json_text(text):\n"
+        "    try:\n"
+        "        return json.loads(str(text or '').strip())\n"
+        "    except Exception:\n"
+        "        return {}\n\n"
+        "def preview(text, limit=320):\n"
+        "    compact = ' '.join(str(text or '').split())\n"
+        "    return compact if len(compact) <= limit else compact[:limit] + '...'\n\n"
+        "def review_success(text):\n"
+        "    raw = str(text or '')\n"
+        "    if 'AGENTFLOW_REVIEW_SUCCESS' in raw:\n"
+        "        return True\n"
+        "    lowered = raw.lower()\n"
+        "    return '\"result\"' in lowered and '\"success\"' in lowered\n\n"
+        "def review_skipped(text):\n"
+        "    return 'AGENTFLOW_REVIEW_SKIPPED' in str(text or '')\n\n"
+        "def extract_markdown_document(text):\n"
+        "    raw = str(text or '').strip()\n"
+        "    if raw.startswith('```'):\n"
+        "        raw = re.sub(r'^```[a-zA-Z0-9_-]*\\n', '', raw)\n"
+        "        raw = re.sub(r'\\n```$', '', raw)\n"
+        "    return raw.strip()\n\n"
+        "preprocess_data = parse_json_text(preprocess_output)\n"
+        "try:\n"
+        "    feature_payload = json.loads(Path(payload['feature_match_output_file']).read_text(encoding='utf-8'))\n"
+        "except Exception:\n"
+        "    feature_payload = parse_json_text(feature_output)\n"
+        "features = feature_payload.get('features') or {}\n"
+        "matched_skill_path = feature_payload.get('matched_skill')\n"
+        "matched_skill_version = feature_payload.get('matched_skill_version')\n"
+        "matched_skill_score = feature_payload.get('matched_skill_score')\n"
+        "preprocess_passed = bool(preprocess_data.get('success'))\n"
+        "skill_passed = skill_status not in {'failed', 'cancelled'} and review_success(skill_review)\n"
+        "generic_passed = generic_status not in {'failed', 'cancelled'} and review_success(generic_review)\n"
+        "passed = preprocess_passed or skill_passed or generic_passed\n"
+        "fallback_to_llm = bool(matched_skill_path and not skill_passed)\n"
+        "generated_skill = None\n"
+        "skill_update_error = None\n"
+        "generated_skill_error = None\n"
+        "matched_skill_after_update = matched_skill_path\n"
+        "promotion_success_count = None\n\n"
+        "if passed and skill_passed and matched_skill_path:\n"
+        "    try:\n"
+        "        updated_skill = register_skill_success(Path(payload['tools_dir']), matched_skill_path)\n"
+        "        matched_skill_after_update = updated_skill.get('path')\n"
+        "        matched_skill_version = updated_skill.get('skill_version')\n"
+        "        promotion_success_count = updated_skill.get('promotion_success_count')\n"
+        "    except Exception as exc:\n"
+        "        skill_update_error = str(exc)\n\n"
+        "author_file = Path(payload['skill_author_output_file'])\n"
+        "if author_file.is_file():\n"
+        "    author_output = author_file.read_text(encoding='utf-8', errors='replace')\n"
+        "if passed and generic_passed and author_output.strip() and 'SKIPPED' not in author_output:\n"
+        "    try:\n"
+        "        generated_skill = save_candidate_skill(\n"
+        "            Path(payload['tools_dir']),\n"
+        "            extract_markdown_document(author_output),\n"
+        "            {\n"
+        "                'family_id': features.get('family_id') or 'generic-firmware',\n"
+        "                'source_run_id': '',\n"
+        "                'source_node_id': 'generic_executor',\n"
+        "            },\n"
+        "        )\n"
+        "    except Exception as exc:\n"
+        "        generated_skill_error = str(exc)\n\n"
+        "failure_summary = {'failed_nodes': []}\n"
+        "if not passed:\n"
+        "    reason = generic_review or skill_review or generic_output or skill_output\n"
+        "    failure_summary['failed_nodes'].append({\n"
+        "        'node_id': 'generic_reviewer' if generic_output else 'skill_reviewer',\n"
+        "        'classification': {'failure_category': 'non_retryable', 'reason': preview(reason, 180)},\n"
+        "        'output_preview': preview(reason),\n"
+        "    })\n\n"
+        "result = {\n"
+        "    'status': 'success' if passed else 'failed',\n"
+        "    'message': 'Unpacking verified successfully' if passed else 'AgentFlow run failed',\n"
+        "    'rounds': 0 if preprocess_passed or skill_passed else (1 if generic_output.strip() else 0),\n"
+        "    'matched_skill': matched_skill_after_update,\n"
+        "    'matched_skill_version': matched_skill_version,\n"
+        "    'matched_skill_score': matched_skill_score if matched_skill_after_update else None,\n"
+        "    'fallback_to_llm': fallback_to_llm,\n"
+        "    'generated_skill_path': generated_skill.get('path') if generated_skill else None,\n"
+        "    'generated_skill_status': generated_skill.get('skill_status') if generated_skill else None,\n"
+        "    'promotion_success_count': promotion_success_count if promotion_success_count is not None else (generated_skill.get('promotion_success_count') if generated_skill else None),\n"
+        "    'firmware_path': payload['firmware_path'],\n"
+        "    'output_path': payload['output_path'],\n"
+        "    'run_path': str(Path(payload['final_result_file']).parent),\n"
+        "    'node_attempts': {\n"
+        "        'skill_executor': {'status': skill_status},\n"
+        "        'generic_executor': {'status': generic_status},\n"
+        "    },\n"
+        "    'failure_summary': failure_summary,\n"
+        "    'failure_category': failure_summary['failed_nodes'][0]['classification']['failure_category'] if failure_summary['failed_nodes'] else None,\n"
+        "    'total_tokens': 0,\n"
+        "    'skill_update_error': skill_update_error,\n"
+        "    'generated_skill_error': generated_skill_error,\n"
+        "}\n"
+        "write_json(payload['stage2_file'], feature_payload)\n"
+        "write_json(payload['stage3_file'], {\n"
+        "    'skill': matched_skill_path,\n"
+        "    'success': passed,\n"
+        "    'skill_status': skill_status,\n"
+        "    'response_preview': preview(skill_output or generic_output),\n"
+        "    'review_preview': preview(skill_review or generic_review),\n"
+        "})\n"
+        "write_json(payload['stage4_file'], {\n"
+        "    'matched_skill': matched_skill_path,\n"
+        "    'fallback_to_llm': fallback_to_llm,\n"
+        "    'reason': preview(generic_review or skill_review, 400),\n"
+        "})\n"
+        "write_json(payload['stage5_file'], {\n"
+        "    'generated_skill_path': generated_skill.get('path') if generated_skill else None,\n"
+        "    'generated_skill_status': generated_skill.get('skill_status') if generated_skill else None,\n"
+        "    'promotion_success_count': promotion_success_count,\n"
+        "    'source_node_id': 'generic_executor' if generated_skill else None,\n"
+        "    'error': generated_skill_error,\n"
+        "})\n"
+        "write_json(payload['final_result_file'], result)\n"
+        "print(json.dumps(result, ensure_ascii=False))\n"
+    )
+
+
 def _skill_review_code() -> str:
     return (
         "executor_status = r'''{{ nodes.skill_executor.status }}'''.strip()\n"
@@ -274,11 +431,30 @@ def _skill_author_code(ctx: dict[str, Any]) -> str:
         "    if not ext:\n"
         "        ext = '.bin'\n"
         "    magic_hex = str(features.get('magic_hex') or '').strip()\n"
-        "    sigs = ', '.join(str(item) for item in features.get('binwalk_sigs') or [])\n"
+        "    raw_sigs = []\n"
+        "    seen_sigs = set()\n"
+        "    for item in features.get('binwalk_sigs') or []:\n"
+        "        sig = ' '.join(str(item).split())[:60]\n"
+        "        if sig and sig not in seen_sigs:\n"
+            "            raw_sigs.append(sig)\n"
+            "            seen_sigs.add(sig)\n"
+        "        if len(raw_sigs) >= 8:\n"
+            "            break\n"
+        "    sigs = ', '.join(raw_sigs)\n"
         "    if not sigs:\n"
         "        sigs = 'firmware'\n"
         "    summary = Path(payload['output_path']) / 'summary.txt'\n"
-        "    summary_text = summary.read_text(encoding='utf-8', errors='replace') if summary.is_file() else ''\n"
+        "    raw_summary = summary.read_text(encoding='utf-8', errors='replace') if summary.is_file() else ''\n"
+        "    summary_lines = []\n"
+        "    for line in raw_summary.splitlines():\n"
+        "        compact = ' '.join(line.split())\n"
+        "        if compact:\n"
+        "            summary_lines.append(compact[:500])\n"
+        "        if len(summary_lines) >= 80:\n"
+        "            break\n"
+        "    summary_text = '\\n'.join(summary_lines)\n"
+        "    if len(raw_summary.splitlines()) > len(summary_lines) or len(raw_summary) > len(summary_text):\n"
+        "        summary_text += '\\n[summary truncated for reusable skill size]'\n"
         "    doc = f'''---\n"
         "name: {slug} unpack\n"
         "description: Candidate firmware unpacking guidance generated from a successful AgentFlow run\n"
@@ -306,6 +482,21 @@ def _skill_author_code(ctx: dict[str, Any]) -> str:
 
 def _input_path(ctx: dict[str, Any]) -> str:
     return str(ctx.get("input_path") or Path(ctx["firmware_path"]).parent)
+
+
+def _executor_env(ctx: dict[str, Any]) -> dict[str, str]:
+    """Expose task paths to Pi and its bash tool exactly as the prompts name them."""
+    input_path = _input_path(ctx)
+    firmware_path = str(ctx["firmware_path"])
+    output_path = str(ctx["output_path"])
+    return {
+        "input": input_path,
+        "firmware": firmware_path,
+        "output": output_path,
+        "FIRMWARE_INPUT": input_path,
+        "FIRMWARE_PATH": firmware_path,
+        "FIRMWARE_OUTPUT": output_path,
+    }
 
 
 def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
@@ -362,12 +553,14 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
                 f"$input = {_input_path(ctx)}\n"
                 f"$firmware = {ctx['firmware_path']}\n"
                 f"$output = {ctx['output_path']}\n"
+                "These variables are exported in the bash tool environment; use them quoted exactly as shown.\n"
                 "Use $output exactly as the output directory. Do not write results to its parent directory.\n"
                 "Skill gate: {{ nodes.skill_gate.output }}\n"
                 "Preprocess: {{ nodes.preprocess.output }}\n"
             ),
             tools="read_write",
             model=ctx.get("executor_model"),
+            env=_executor_env(ctx),
             extra_args=ctx.get("executor_extra_args", []),
             timeout_seconds=None,
         )
@@ -400,6 +593,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
                 f"$input = {_input_path(ctx)}\n"
                 f"$firmware = {ctx['firmware_path']}\n"
                 f"$output = {ctx['output_path']}\n"
+                "These variables are exported in the bash tool environment; use them quoted exactly as shown.\n"
                 "Analyze the current firmware file at $firmware first. Use $input only as supporting context.\n"
                 "Write every extraction artifact and $output/summary.txt under $output exactly; do not write to the parent directory.\n"
                 "Always create $output/summary.txt before finishing, even if no extractable components are found. If nothing can be extracted, record that clearly and stop.\n"
@@ -414,20 +608,9 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             ),
             tools="read_write",
             model=ctx.get("executor_model"),
+            env=_executor_env(ctx),
             extra_args=ctx.get("executor_extra_args", []),
             timeout_seconds=None,
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "skill_reviewer",
-                    "value": "AGENTFLOW_REVIEW_SUCCESS",
-                },
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "skill_reviewer",
-                    "value": "SKIPPED_BY_PREPROCESS",
-                },
-            ],
         )
         output_summary = python_node(
             task_id="output_summary",
@@ -457,15 +640,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
         )
         finalize = python_node(
             task_id="finalize",
-            code=_write_json_code(
-                {
-                    "output_file": ctx["final_result_file"],
-                    "data": {
-                        "firmware_path": ctx["firmware_path"],
-                        "output_path": ctx["output_path"],
-                    },
-                }
-            ),
+            code=_finalize_result_code(ctx),
             tools="read_only",
             env=_python_node_env(),
         )
@@ -478,3 +653,128 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
         generic_reviewer >> skill_author >> cleanup >> finalize
 
     return g.to_spec()
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _first_env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def _load_agent_defs_for_pipeline() -> dict[str, dict[str, Any]]:
+    from app.unpacker_engine import (
+        AUTHOR_AGENT_DEF,
+        CLEAN_AGENT_DEF,
+        EXEC_AGENT_DEF,
+        VAL_AGENT_DEF,
+        load_agent_def,
+    )
+
+    return {
+        "exec": load_agent_def(EXEC_AGENT_DEF),
+        "review": load_agent_def(VAL_AGENT_DEF),
+        "author": load_agent_def(AUTHOR_AGENT_DEF),
+        "cleanup": load_agent_def(CLEAN_AGENT_DEF),
+    }
+
+
+def _materialize_system_prompts(run_dir: Path, agent_defs: dict[str, dict[str, Any]]) -> dict[str, Path]:
+    prompt_dir = run_dir / "system-prompts"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, Path] = {}
+    for key, agent_def in agent_defs.items():
+        path = prompt_dir / f"{key}.md"
+        path.write_text(str(agent_def.get("system_prompt") or ""), encoding="utf-8")
+        paths[key] = path
+    return paths
+
+
+def build_firmware_unpack_context_from_env() -> dict[str, Any]:
+    firmware = _first_env("FIRMWARE_PATH", "firmware")
+    output = _first_env("OUTPUT_PATH", "FIRMWARE_OUTPUT", "output")
+    if not firmware or not output:
+        raise ValueError(
+            "FIRMWARE_PATH and OUTPUT_PATH are required when running app/agentflow_pipeline.py directly"
+        )
+
+    firmware_path = Path(firmware).expanduser().resolve()
+    output_path = Path(output).expanduser().resolve()
+    task_dir = Path(_first_env("TASK_DIR", "BASE_DIR") or output_path.parent).expanduser().resolve()
+    run_dir = Path(_first_env("RUN_PATH", "LOG_PATH", "FIRMWARE_RUN_PATH") or task_dir / "run").expanduser().resolve()
+    tools_dir = Path(
+        _first_env("TOOLS_DIR", "UNPACKER_TOOLS_DIR") or _repo_root / "tools"
+    ).expanduser().resolve()
+    input_path = Path(_first_env("INPUT_PATH", "FIRMWARE_INPUT") or firmware_path.parent).expanduser().resolve()
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tools_dir.mkdir(parents=True, exist_ok=True)
+
+    agent_defs = _load_agent_defs_for_pipeline()
+    prompt_paths = _materialize_system_prompts(run_dir, agent_defs)
+
+    graph_optimization_enabled = _env_bool("AGENTFLOW_GRAPH_OPTIMIZATION_ENABLED", False)
+    graph_optimization_rounds = _env_int("AGENTFLOW_GRAPH_OPTIMIZATION_ROUNDS", 1)
+
+    return {
+        "base_dir": str(task_dir),
+        "task_dir": str(task_dir),
+        "input_path": str(input_path),
+        "firmware_path": str(firmware_path),
+        "firmware_name": firmware_path.name,
+        "output_path": str(output_path),
+        "log_dir": str(run_dir),
+        "tools_dir": str(tools_dir),
+        "max_retries": _env_int("MAX_RETRIES", _env_int("AGENTFLOW_MAX_ITERATIONS", 5)),
+        "node_timeout_seconds": _env_int("AGENTFLOW_NODE_TIMEOUT_SECONDS", 1800),
+        "agentflow_concurrency": _env_int("AGENTFLOW_MAX_CONCURRENT_RUNS", 2),
+        "use_worktree": _env_bool("AGENTFLOW_USE_WORKTREE", False),
+        "graph_optimization_enabled": graph_optimization_enabled and graph_optimization_rounds > 1,
+        "graph_optimizer": os.environ.get("AGENTFLOW_GRAPH_OPTIMIZER", "codex"),
+        "graph_optimization_rounds": graph_optimization_rounds,
+        "preprocess_output_file": str(run_dir / "preprocess.json"),
+        "feature_match_output_file": str(run_dir / "feature-match.json"),
+        "skill_author_output_file": str(run_dir / "generated_skill.md"),
+        "final_result_file": str(run_dir / "final_result.json"),
+        "executor_model": agent_defs["exec"].get("model"),
+        "review_model": agent_defs["review"].get("model"),
+        "author_model": agent_defs["author"].get("model"),
+        "cleanup_model": agent_defs["cleanup"].get("model"),
+        "executor_extra_args": ["--append-system-prompt", str(prompt_paths["exec"])],
+        "review_extra_args": ["--append-system-prompt", str(prompt_paths["review"])],
+        "author_extra_args": ["--append-system-prompt", str(prompt_paths["author"])],
+        "cleanup_extra_args": ["--append-system-prompt", str(prompt_paths["cleanup"])],
+    }
+
+
+def main() -> None:
+    try:
+        ctx = build_firmware_unpack_context_from_env()
+        spec = build_firmware_unpack_pipeline(ctx)
+    except Exception as exc:
+        print(f"failed to build firmware unpack pipeline: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    print(json.dumps(spec.model_dump(mode="json"), ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

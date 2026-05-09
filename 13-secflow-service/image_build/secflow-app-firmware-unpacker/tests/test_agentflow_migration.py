@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -7,7 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from app.agentflow_runner import _token_summary, run_unpack_agentflow
-from app.agentflow_pipeline import build_firmware_unpack_pipeline
+from app.agentflow_pipeline import _skill_author_code, build_firmware_unpack_pipeline
 from app.config import reload_config
 from app.unpacker_engine import run_unpack
 
@@ -266,16 +267,9 @@ class AgentFlowPipelineTests(unittest.TestCase):
             self.assertIn("generic_executor", node_map["output_summary"].depends_on)
             self.assertIn("output_summary", node_map["generic_reviewer"].depends_on)
             self.assertIn("generic_executor", node_map["generic_reviewer"].on_failure_restart)
-            self.assertEqual(
-                [
-                    ("node_output_contains", "skill_reviewer", "AGENTFLOW_REVIEW_SUCCESS"),
-                    ("node_output_contains", "skill_reviewer", "SKIPPED_BY_PREPROCESS"),
-                ],
-                [
-                    (criterion.kind, criterion.node_id, criterion.value)
-                    for criterion in node_map["generic_executor"].skip_if
-                ],
-            )
+            self.assertEqual([], node_map["generic_executor"].skip_if)
+            self.assertIn("SKIPPED_BY_SKILL_SUCCESS", node_map["generic_executor"].prompt)
+            self.assertIn("SKIPPED_BY_PREPROCESS", node_map["generic_executor"].prompt)
             for node_id in ("skill_reviewer", "generic_reviewer"):
                 criteria = node_map[node_id].success_criteria
                 self.assertEqual(1, len(criteria))
@@ -286,6 +280,13 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 self.assertIn("/app", node_map[node_id].env["PYTHONPATH"])
             self.assertIsNone(node_map["skill_executor"].timeout_seconds)
             self.assertIsNone(node_map["generic_executor"].timeout_seconds)
+            for node_id in ("skill_executor", "generic_executor"):
+                self.assertEqual(str(root / "input" / "fw.bin"), node_map[node_id].env["firmware"])
+                self.assertEqual(str(root / "output"), node_map[node_id].env["output"])
+                self.assertEqual(str(root / "input"), node_map[node_id].env["input"])
+                self.assertEqual(str(root / "input" / "fw.bin"), node_map[node_id].env["FIRMWARE_PATH"])
+                self.assertEqual(str(root / "output"), node_map[node_id].env["FIRMWARE_OUTPUT"])
+                self.assertIn("exported in the bash tool environment", node_map[node_id].prompt)
             self.assertEqual(450, node_map["skill_reviewer"].timeout_seconds)
             self.assertEqual("python", node_map["output_summary"].agent)
             self.assertEqual("python", node_map["cleanup"].agent)
@@ -353,6 +354,39 @@ class AgentFlowPipelineTests(unittest.TestCase):
             self.assertIsNone(node_map["generic_executor"].timeout_seconds)
             self.assertEqual(15, node_map["generic_reviewer"].timeout_seconds)
             self.assertEqual("python", node_map["cleanup"].agent)
+
+    def test_skill_author_caps_generated_skill_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "output"
+            run = root / "run"
+            output.mkdir()
+            run.mkdir()
+            (output / "summary.txt").write_text(("very long summary line " * 200) + "\n" * 2 + "keep this\n", encoding="utf-8")
+            feature_payload = {
+                "features": {
+                    "family_id": "cc-00000000-lzma-compressed-data-properties",
+                    "ext": ".cc",
+                    "magic_hex": "00000000",
+                    "binwalk_sigs": [f"signature {index} " + ("x" * 300) for index in range(100)],
+                }
+            }
+            feature_file = run / "feature-match.json"
+            feature_file.write_text(json.dumps(feature_payload), encoding="utf-8")
+            skill_file = run / "generated_skill.md"
+            ctx = {
+                "feature_match_output_file": str(feature_file),
+                "output_path": str(output),
+                "skill_author_output_file": str(skill_file),
+            }
+
+            code = _skill_author_code(ctx).replace("{{ nodes.generic_reviewer.output }}", "AGENTFLOW_REVIEW_SUCCESS")
+            exec(code, {})
+            generated = skill_file.read_text(encoding="utf-8")
+
+            self.assertLess(skill_file.stat().st_size, 20_000)
+            self.assertLess(max(len(line) for line in generated.splitlines()), 1_000)
+            self.assertIn("[summary truncated for reusable skill size]", generated)
 
 
 class EngineDispatchTests(unittest.TestCase):
@@ -542,6 +576,29 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
             self.assertEqual(2, result["rounds"])
             self.assertIn("AgentFlow run failed: failed", result["message"])
 
+    def test_failed_run_status_overrides_successful_node_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(Path(tmp) / "task" / "output")
+            skill = {"path": "/data/tools/skills/router.md", "skill_version": "1.0"}
+            record = _record(
+                nodes={
+                    "preprocess": _node('{"success": false}'),
+                    "skill_executor": _node("skill executor completed"),
+                    "skill_reviewer": _node("AGENTFLOW_REVIEW_SUCCESS"),
+                    "generic_executor": _node("AGENTFLOW_EXECUTOR_SKIPPED"),
+                    "generic_reviewer": _node("AGENTFLOW_REVIEW_SKIPPED"),
+                },
+                status="failed",
+            )
+            with patch("app.agentflow_runner.match_skill", return_value=(skill, 80, {"matched_status": "hit"})):
+                with patch("app.agentflow_runner.register_skill_success") as register_success:
+                    result = _run_agentflow_with_record(record, output)
+
+            self.assertEqual("failed", result["status"])
+            self.assertEqual(0, result["rounds"])
+            self.assertIn("AgentFlow run failed: failed", result["message"])
+            register_success.assert_not_called()
+
     def test_cancelled_run_cancels_orchestrator_and_returns_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = str(Path(tmp) / "task" / "output")
@@ -650,7 +707,8 @@ class AgentFlowRunnerSmokeTests(unittest.TestCase):
             )
             run_payload = run_json.read_text(encoding="utf-8")
             self.assertIn('"generic_executor"', run_payload)
-            self.assertIn('"status": "skipped"', run_payload)
+            self.assertIn('"status": "completed"', run_payload)
+            self.assertIn('AGENTFLOW_EXECUTOR_SKIPPED reason=SKIPPED_BY_SKILL_SUCCESS', run_payload)
 
     def test_real_agentflow_smoke_with_fake_pi_and_skill_fallback_author(self):
         with tempfile.TemporaryDirectory() as tmp:

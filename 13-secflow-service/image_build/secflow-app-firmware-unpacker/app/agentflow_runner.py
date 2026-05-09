@@ -448,6 +448,8 @@ def run_unpack_agentflow(
     project_id: str | None = None,
 ) -> dict[str, Any]:
     config = get_config()
+    firmware_path = str(Path(firmware_path).expanduser().resolve())
+    output_path = str(Path(output_path).expanduser().resolve())
 
     from app.unpacker_engine import (
         AUTHOR_AGENT_DEF,
@@ -621,22 +623,53 @@ def run_unpack_agentflow(
                 and bool(generic_output.strip())
                 and _review_success(generic_review, _is_review_success)
             )
-            passed = preprocess_passed or skill_passed or generic_passed
             rounds = 0 if preprocess_passed or skill_passed else _node_attempts(current, "generic_executor")
             node_attempts = _node_attempt_map(current)
             failure_summary = _failure_summary(current)
+            failed_node_ids = {
+                str(item.get("node_id"))
+                for item in failure_summary.get("failed_nodes", [])
+                if item.get("node_id")
+            }
+            extraction_passed = preprocess_passed or skill_passed or generic_passed
+            recovered_by_generic = (
+                current.status.value == "failed"
+                and generic_passed
+                and failed_node_ids
+                and failed_node_ids <= {"skill_reviewer"}
+            )
+            passed = (
+                (current.status.value == "completed" and extraction_passed)
+                or recovered_by_generic
+            )
             tokens = _token_summary(current)
             matched_skill = skill_meta
             fallback_to_llm = bool(skill_meta and not skill_passed)
             promotion_success_count = None
             generated_skill = None
+            pipeline_result = {}
+            pipeline_final_result = Path(ctx.get("final_result_file") or "")
+            if pipeline_final_result.is_file():
+                try:
+                    pipeline_result = json.loads(pipeline_final_result.read_text(encoding="utf-8"))
+                except Exception:
+                    pipeline_result = {}
 
-            if skill_meta and skill_passed:
-                updated_skill = register_skill_success(TOOLS_DIR, str(skill_meta.get("path")))
-                matched_skill = updated_skill
-                promotion_success_count = updated_skill.get("promotion_success_count")
+            if passed and skill_meta and skill_passed:
+                if pipeline_result.get("promotion_success_count") is not None:
+                    matched_skill = {
+                        **skill_meta,
+                        "path": pipeline_result.get("matched_skill") or skill_meta.get("path"),
+                        "skill_version": pipeline_result.get("matched_skill_version") or skill_meta.get("skill_version"),
+                        "promotion_success_count": pipeline_result.get("promotion_success_count"),
+                    }
+                    promotion_success_count = pipeline_result.get("promotion_success_count")
+                else:
+                    updated_skill = register_skill_success(TOOLS_DIR, str(skill_meta.get("path")))
+                    matched_skill = updated_skill
+                    promotion_success_count = updated_skill.get("promotion_success_count")
 
-            if generic_passed and author_output.strip() and "SKIPPED" not in author_output:
+            if passed and generic_passed and author_output.strip() and "SKIPPED" not in author_output:
                 generated_skill = save_candidate_skill(
                     TOOLS_DIR,
                     _extract_markdown_document(author_output),

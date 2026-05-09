@@ -70,6 +70,25 @@ class SkillStoreTests(unittest.TestCase):
             self.assertEqual("run-1", saved["source_run_id"])
             self.assertEqual("generic_executor", saved["source_node_id"])
 
+    def test_save_candidate_skill_caps_body_for_safe_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            long_body = ("x" * 5_000 + "\n") * 20
+            saved = save_candidate_skill(
+                root,
+                _skill_doc(name="candidate-skill", family_id="family-a", status=SKILL_STATUS_CANDIDATE, version=1).replace(
+                    "You are a reusable skill.",
+                    long_body,
+                ).replace("binwalk_sigs: squashfs filesystem", "binwalk_sigs: " + ("squashfs " * 2_000)),
+                {"family_id": "family-a"},
+            )
+
+            skill_path = Path(saved["path"])
+            self.assertLess(skill_path.stat().st_size, 25_000)
+            self.assertLess(max(len(line) for line in skill_path.read_text(encoding="utf-8").splitlines()), 1_000)
+            self.assertLess(max(len(item) for item in saved["binwalk_sigs"]), 100)
+            self.assertIn("[skill body truncated for safe reuse]", saved["system_prompt"])
+
     def test_register_skill_success_promotes_candidate_and_archives_old_active(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
