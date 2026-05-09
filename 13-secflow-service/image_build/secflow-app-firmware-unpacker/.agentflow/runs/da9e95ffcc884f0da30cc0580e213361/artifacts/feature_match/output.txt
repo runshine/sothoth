@@ -1,1 +1,0 @@
-{"matched_skill": null, "matched_skill_version": null, "matched_skill_score": 0, "matched_status": null, "reasons": [], "feature_family_id": "cc-00000000-lzma-compressed-data-properties", "feature_count_binwalk_sigs": 3065}

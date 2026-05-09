@@ -1,1 +1,0 @@
-AGENTFLOW_SKILL_GATE matched=true skill=/home/icsl/sothoth/13-secflow-service/image_build/secflow-app-firmware-unpacker/tools/cc-00000000-lzma-compressed-data-properties__active__v1.md

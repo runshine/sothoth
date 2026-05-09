@@ -9,7 +9,7 @@ binwalk_sigs: lzma compressed data, squashfs filesystem, uimage header, 7-zip ar
 skill_status: active
 skill_version: 1
 family_id: cc-00000000-lzma-compressed-data-properties
-promotion_success_count: 9
+promotion_success_count: 11
 promotion_threshold: 5
 source_run_id: fd27a3794e5c40619b020bc14808c17c
 source_node_id: generic_executor

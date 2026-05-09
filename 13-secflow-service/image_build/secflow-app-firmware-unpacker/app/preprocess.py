@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -22,6 +23,72 @@ def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
     )
 
 
+def _normalize_file_format(file_desc: str) -> str | None:
+    desc = str(file_desc or "").strip().lower()
+    if not desc:
+        return None
+
+    if "glf_binary_msb_first" in desc:
+        return "glf"
+    if "tar archive" in desc:
+        return "tar"
+    if "zip archive data" in desc:
+        return "zip"
+    if "gzip compressed data" in desc:
+        return "gzip"
+    if "bzip2 compressed data" in desc:
+        return "bzip2"
+    if "xz compressed data" in desc:
+        return "xz"
+    if "lzma compressed data" in desc:
+        return "lzma"
+    if "zstandard compressed data" in desc:
+        return "zstd"
+    if "lzop compressed data" in desc:
+        return "lzop"
+    if "squashfs filesystem" in desc:
+        return "squashfs"
+    if "cpio archive" in desc:
+        return "cpio"
+    if "7-zip archive data" in desc:
+        return "7zip"
+    if "cabinet archive data" in desc or "microsoft cabinet archive" in desc:
+        return "cab"
+    if "romfs filesystem" in desc:
+        return "romfs"
+    if "cramfs filesystem" in desc:
+        return "cramfs"
+    if "jffs2 filesystem" in desc:
+        return "jffs2"
+    if "ubifs" in desc:
+        return "ubifs"
+    if "ubi image" in desc:
+        return "ubi"
+    if "elf " in desc:
+        return "elf"
+    if "pe32 executable" in desc or "dos executable" in desc:
+        return "exe"
+    return None
+
+
+def _file_format_hint(firmware_path: str) -> tuple[str | None, str]:
+    try:
+        proc = subprocess.run(
+            ["file", "-b", firmware_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except Exception:
+        return None, ""
+
+    file_desc = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        return None, file_desc
+    return _normalize_file_format(file_desc), file_desc
+
+
 def detect_format(firmware_path: str) -> dict:
     """Detect firmware format via magic bytes and file extension."""
     path = Path(firmware_path)
@@ -30,6 +97,7 @@ def detect_format(firmware_path: str) -> dict:
     ext2 = "".join(suffixes[-2:]).lower() if len(suffixes) >= 2 else ext
     fmt = None
     magic = b""
+    file_desc = ""
     try:
         with open(firmware_path, "rb") as fh:
             header = fh.read(512)
@@ -115,6 +183,8 @@ def detect_format(firmware_path: str) -> dict:
         fmt = "tar"
     if fmt == "gzip" and ext == ".tgz":
         fmt = "tar"
+    if fmt is None:
+        fmt, file_desc = _file_format_hint(firmware_path)
 
     log_event(
         log,
@@ -126,8 +196,9 @@ def detect_format(firmware_path: str) -> dict:
         ext=ext,
         ext2=ext2,
         magic_hex=magic.hex()[:8] if magic else "",
+        file_desc=file_desc[:120] if file_desc else "",
     )
-    return {"fmt": fmt, "ext": ext, "ext2": ext2, "magic": magic}
+    return {"fmt": fmt, "ext": ext, "ext2": ext2, "magic": magic, "file_desc": file_desc}
 
 
 def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
@@ -144,6 +215,7 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
             "firmware": firmware_name,
             "fmt": fmt,
             "magic_hex": info["magic"].hex()[:8] if info["magic"] else "",
+            "file_desc": info.get("file_desc", ""),
         }
     )
     log_event(
@@ -154,6 +226,7 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
         firmware=firmware_name,
         fmt=fmt,
         magic_hex=info["magic"].hex()[:8] if info["magic"] else "",
+        file_desc=(info.get("file_desc", "")[:120] if info.get("file_desc") else ""),
     )
 
     def _run(cmd, **kw):
@@ -205,6 +278,21 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
                     break
                 out.write(chunk)
                 total += len(chunk)
+        return total
+
+    def _copy_range(offset: int, size: int, dest: Path) -> int:
+        total = 0
+        remaining = max(0, int(size))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(firmware_path, "rb") as src, open(dest, "wb") as out:
+            src.seek(offset)
+            while remaining > 0:
+                chunk = src.read(min(4 * 1024 * 1024, remaining))
+                if not chunk:
+                    break
+                out.write(chunk)
+                total += len(chunk)
+                remaining -= len(chunk)
         return total
 
     def _extract_elf_at_offset(offset: int) -> dict | None:
@@ -298,6 +386,110 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
         )
         return None
 
+    def _extract_glf_payloads() -> dict | None:
+        log_event(
+            log,
+            logging.DEBUG,
+            "[Stage1] trying: glf binwalk slice extraction",
+            event="preprocess_try_tool",
+            tool="glf binwalk slice extraction",
+            firmware=firmware_name,
+        )
+        proc = _run(["binwalk", "-B", firmware_path], timeout=60)
+        if proc.returncode != 0:
+            _record("glf binwalk slice extraction", proc)
+            return None
+
+        artifacts_dir = Path(output_path) / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        extracted: list[dict] = []
+        squashfs_index = 0
+        uimage_index = 0
+        line_re = re.compile(r"^\s*(\d+)\s+0x[0-9A-Fa-f]+\s+(.+)$")
+        size_re = re.compile(r"size:\s*(\d+)\s+bytes", re.IGNORECASE)
+        image_size_re = re.compile(r"image size:\s*(\d+)\s+bytes", re.IGNORECASE)
+
+        for raw_line in proc.stdout.splitlines():
+            match = line_re.match(raw_line.strip())
+            if not match:
+                continue
+            offset = int(match.group(1))
+            desc = match.group(2).strip()
+            desc_lower = desc.lower()
+            if "squashfs filesystem" in desc_lower:
+                size_match = size_re.search(desc)
+                if not size_match:
+                    continue
+                squashfs_index += 1
+                size = int(size_match.group(1))
+                compression = "unknown"
+                compression_match = re.search(r"compression:([a-z0-9_-]+)", desc, re.IGNORECASE)
+                if compression_match:
+                    compression = compression_match.group(1).lower()
+                dest = artifacts_dir / f"rootfs_{squashfs_index}_{compression}.squashfs"
+                output_size = _copy_range(offset, size, dest)
+                if output_size > 0:
+                    extracted.append(
+                        {
+                            "kind": "squashfs",
+                            "offset": offset,
+                            "size": output_size,
+                            "path": str(dest),
+                            "description": desc,
+                        }
+                    )
+            elif "uimage header" in desc_lower:
+                size_match = image_size_re.search(desc)
+                if not size_match:
+                    continue
+                uimage_index += 1
+                size = int(size_match.group(1)) + 64
+                dest = artifacts_dir / f"uimage_{uimage_index}.bin"
+                output_size = _copy_range(offset, size, dest)
+                if output_size > 0:
+                    extracted.append(
+                        {
+                            "kind": "uimage",
+                            "offset": offset,
+                            "size": output_size,
+                            "path": str(dest),
+                            "description": desc,
+                        }
+                    )
+
+        if not extracted:
+            _record("glf binwalk slice extraction", proc)
+            return None
+
+        summary_lines = [
+            f"Firmware: {firmware_path}",
+            "Method: GLF wrapper extraction via file+binwalk",
+            f"file(1): {info.get('file_desc', '') or 'n/a'}",
+            "",
+            "Extracted artifacts:",
+        ]
+        for item in extracted:
+            rel = Path(item["path"]).relative_to(output_path)
+            summary_lines.append(
+                f"- {rel} ({item['size']} bytes) from offset {item['offset']} - {item['description']}"
+            )
+        summary_lines.extend(
+            [
+                "",
+                "Skill Reuse Notes:",
+                "- When the top-level header is vendor-specific GLF data, fall back to file(1) plus bounded binwalk scanning.",
+                "- Extract only top-level SquashFS and uImage payloads with fixed offsets and recorded sizes.",
+            ]
+        )
+        Path(output_path, "summary.txt").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+        _record(
+            "glf binwalk slice extraction",
+            proc,
+            success=True,
+            extra={"artifact_count": len(extracted), "artifacts": extracted},
+        )
+        return _success("glf binwalk slice extraction")
+
     if fmt in (None, "elf"):
         elf_offset = _find_magic_offset(b"\x7fELF")
         if elf_offset >= 0:
@@ -380,6 +572,11 @@ def run_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
             returncode=proc.returncode,
             stderr=proc.stderr[:200],
         )
+
+    if fmt == "glf":
+        result = _extract_glf_payloads()
+        if result:
+            return result
 
     if fmt == "gzip":
         result = _stream_decompress("gzip -dc", "gzip -dc '{src}' > '{out}'")

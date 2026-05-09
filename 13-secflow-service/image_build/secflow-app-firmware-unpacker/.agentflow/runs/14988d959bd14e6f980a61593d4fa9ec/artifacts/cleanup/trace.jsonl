@@ -1,1 +1,0 @@
-{"timestamp":"2026-05-08T14:39:03.687962+00:00","node_id":"cleanup","agent":"python","attempt":1,"source":"stdout","kind":"stdout","title":"stdout","content":"{\"removed_files\": [], \"removed_dirs\": [\"binwalk_extract\"]}","raw":"{\"removed_files\": [], \"removed_dirs\": [\"binwalk_extract\"]}"}
