@@ -133,6 +133,23 @@ class BinarySecurityStageItemResponse(BaseModel):
     finished_at: Optional[datetime] = None
 
 
+class BinarySecurityArchiveJobResponse(BaseModel):
+    id: str
+    stage_name: str
+    item_id: str
+    item_key: Optional[str] = None
+    downstream_service: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    archive_status: str
+    archive_root: Optional[str] = None
+    error_message: Optional[str] = None
+    attempts: int = 0
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
 class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     description: Optional[str] = None
     output_root: str
@@ -143,6 +160,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     metrics: dict[str, Any] = Field(default_factory=dict)
     item_stats: dict[str, dict[str, int]] = Field(default_factory=dict)
     stage_items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
+    archive_jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
 
 
 class BinarySecurityTaskEventResponse(BaseModel):
@@ -185,6 +203,7 @@ class BinarySecurityActionResponse(BaseModel):
     synced_downstream_count: int = 0
     skipped_downstream_count: int = 0
     failed_downstream_count: int = 0
+    deleted_event_count: int = 0
 
 
 class BinarySecurityDownstreamStatusSyncPayload(BaseModel):

@@ -160,6 +160,16 @@ async def get_timeline(
     return get_task_manager().get_timeline(db, project_id=project_id, task_id=task_id)
 
 
+@router.delete("/projects/{project_id}/tasks/{task_id}/timeline", response_model=BinarySecurityActionResponse)
+async def clear_timeline(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().clear_timeline(db, project_id=project_id, task_id=task_id)
+
+
 @router.get("/projects/{project_id}/tasks/{task_id}/artifacts", response_model=BinarySecurityArtifactsResponse)
 async def get_artifacts(
     project_id: str,

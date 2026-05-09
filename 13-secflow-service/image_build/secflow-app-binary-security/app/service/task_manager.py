@@ -35,6 +35,7 @@ from app.model import (
 )
 from app.schemas import (
     BinarySecurityActionResponse,
+    BinarySecurityArchiveJobResponse,
     BinarySecurityArtifactsResponse,
     BinarySecurityInputFile,
     BinarySecurityModuleSelectionResponse,
@@ -488,6 +489,9 @@ class TaskManager:
         items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).order_by(
             BinarySecurityStageItem.created_at.asc()
         ).all()
+        archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id).order_by(
+            BinarySecurityArchiveJob.created_at.asc()
+        ).all()
         queue_info = self._build_queue_info(db, project_id=project_id)
         base = self._task_response(db, task, queue_info=queue_info).model_dump()
         return BinarySecurityTaskDetailResponse(
@@ -501,6 +505,25 @@ class TaskManager:
             metrics=task.metrics,
             item_stats=self._item_stats(items),
             stage_items=[self._stage_item_response(item) for item in items],
+            archive_jobs=[
+                BinarySecurityArchiveJobResponse(
+                    id=job.id,
+                    stage_name=job.stage_name,
+                    item_id=job.item_id,
+                    item_key=job.item_key,
+                    downstream_service=job.downstream_service,
+                    downstream_task_id=job.downstream_task_id,
+                    archive_status=job.archive_status,
+                    archive_root=job.archive_root,
+                    error_message=job.error_message,
+                    attempts=job.attempts or 0,
+                    created_at=job.created_at,
+                    started_at=job.started_at,
+                    completed_at=job.completed_at,
+                    updated_at=job.updated_at,
+                )
+                for job in archive_jobs
+            ],
         )
 
     def get_module_selection(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityModuleSelectionResponse:
@@ -591,6 +614,20 @@ class TaskManager:
                 )
                 for event in events
             ],
+        )
+
+    def clear_timeline(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        deleted_count = (
+            db.query(BinarySecurityEvent)
+            .filter(BinarySecurityEvent.task_id == task.id)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return BinarySecurityActionResponse(
+            task_id=task.id,
+            message=f"事件时间线已清空，共删除 {deleted_count} 条事件",
+            deleted_event_count=int(deleted_count or 0),
         )
 
     def get_artifacts(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityArtifactsResponse:
