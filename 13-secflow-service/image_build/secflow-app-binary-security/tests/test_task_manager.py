@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.model import (
+    BinarySecurityArchiveJob,
     BinarySecurityEvent,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
@@ -14,6 +15,7 @@ from app.model import (
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
 )
+from app.schemas import BinarySecurityArchiveJobResponse
 from app.service.task_manager import TaskManager, _now
 
 
@@ -62,10 +64,11 @@ class _FakeDb:
 
 
 class _ModelAwareDb:
-    def __init__(self, *, tasks=None, stage_runs=None, stage_items=None):
+    def __init__(self, *, tasks=None, stage_runs=None, stage_items=None, archive_jobs=None):
         self.tasks = list(tasks or [])
         self.stage_runs = list(stage_runs or [])
         self.stage_items = list(stage_items or [])
+        self.archive_jobs = list(archive_jobs or [])
         self.added = []
 
     def query(self, model, *args, **kwargs):
@@ -76,6 +79,8 @@ class _ModelAwareDb:
             return _FakeQuery(self.stage_runs)
         if model_name == "BinarySecurityStageItem":
             return _FakeQuery(self.stage_items)
+        if model_name == "BinarySecurityArchiveJob":
+            return _FakeQuery(self.archive_jobs)
         return _FakeQuery([])
 
     def add(self, obj):
@@ -145,6 +150,79 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertEqual(1, len(rows))
             self.assertEqual("parse_input", rows[0]["function_name"])
+
+    def test_build_stage_summaries_aggregates_downstream_statuses(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="task", firmware_path="/tmp/in", output_root="/tmp/out", workspace_root="/tmp/ws", status="running", current_stage="firmware_unpack")
+        stage_run = BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="pending")
+        items = [
+            BinarySecurityStageItem(id="i1", task_id="t1", project_id="p1", stage_run_id="sr1", stage_name="firmware_unpack", item_key="fw1", status="success"),
+            BinarySecurityStageItem(id="i2", task_id="t1", project_id="p1", stage_run_id="sr1", stage_name="firmware_unpack", item_key="fw2", status="failed"),
+        ]
+
+        summaries = self.manager._build_stage_summaries(
+            _ModelAwareDb(stage_runs=[stage_run], stage_items=items),
+            task,
+            ["firmware_unpack"],
+            [stage_run],
+            items,
+        )
+
+        self.assertEqual(1, len(summaries))
+        self.assertEqual("partial_success", summaries[0].status)
+        self.assertEqual(2, summaries[0].total_items)
+        self.assertEqual(1, summaries[0].success_items)
+        self.assertEqual(1, summaries[0].failed_items)
+
+    def test_aggregate_archive_stage_status_supports_applying(self):
+        self.assertEqual("pending", self.manager._aggregate_archive_stage_status([]))
+        self.assertEqual("running", self.manager._aggregate_archive_stage_status(["pending", "running"]))
+        self.assertEqual("applying", self.manager._aggregate_archive_stage_status(["archived"]))
+        self.assertEqual("failed", self.manager._aggregate_archive_stage_status(["failed"]))
+        self.assertEqual("success", self.manager._aggregate_archive_stage_status(["success", "success"]))
+
+    def test_build_stage_overview_nodes_returns_business_then_archive(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="task", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/tmp/in", output_root="/tmp/out", workspace_root="/tmp/ws", status="running")
+        summaries = [
+            self.manager._build_stage_summaries(
+                _ModelAwareDb(),
+                task,
+                ["firmware_unpack"],
+                [BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="firmware_unpack", sequence_no=1, status="success")],
+                [BinarySecurityStageItem(id="i1", task_id="t1", project_id="p1", stage_run_id="sr1", stage_name="firmware_unpack", item_key="fw1", status="success")],
+            )[0]
+        ]
+        archive_jobs = [
+            BinarySecurityArchiveJobResponse(
+                id="aj1",
+                stage_name="firmware_unpack",
+                item_id="i1",
+                item_key="fw1",
+                archive_status="running",
+            )
+        ]
+
+        stage_items = [
+            BinarySecurityStageItem(
+                id="i1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="firmware_unpack",
+                item_key="fw1",
+                status="success",
+                downstream_service="firmware_unpacker",
+                downstream_task_id="d1",
+            )
+        ]
+        nodes = self.manager._build_stage_overview_nodes(task, summaries, archive_jobs, stage_items)
+
+        self.assertEqual("business:firmware_unpack", nodes[0].node_id)
+        self.assertEqual("archive:firmware_unpack", nodes[1].node_id)
+        self.assertEqual("success", nodes[0].status)
+        self.assertEqual("running", nodes[1].status)
+        self.assertEqual("fw1", nodes[0].detail.representative_item_key)
+        self.assertEqual("d1", nodes[0].detail.representative_downstream_task_id)
+        self.assertEqual(["firmware_unpacker"], nodes[0].detail.downstream_services)
 
     def test_choose_module_binary_handles_relative_path(self):
         with tempfile.TemporaryDirectory() as tmp:

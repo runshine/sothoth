@@ -150,6 +150,50 @@ class BinarySecurityArchiveJobResponse(BaseModel):
     updated_at: Optional[datetime] = None
 
 
+class BinarySecurityOverviewBusinessDetail(BaseModel):
+    total_items: int = 0
+    success_items: int = 0
+    failed_items: int = 0
+    skipped_items: int = 0
+    running_items: int = 0
+    cancelled_items: int = 0
+    downstream_status_counts: dict[str, int] = Field(default_factory=dict)
+    downstream_services: list[str] = Field(default_factory=list)
+    representative_item_key: Optional[str] = None
+    representative_downstream_task_id: Optional[str] = None
+
+
+class BinarySecurityOverviewArchiveDetail(BaseModel):
+    job_count: int = 0
+    success_count: int = 0
+    failed_count: int = 0
+    running_count: int = 0
+    applying_count: int = 0
+    pending_count: int = 0
+    first_created_at: Optional[datetime] = None
+    last_updated_at: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    latest_error: Optional[str] = None
+    jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
+
+
+class BinarySecurityOverviewNode(BaseModel):
+    node_id: str
+    node_type: str
+    stage_name: str
+    sequence_no: int
+    title: str
+    status: str
+    status_label: str
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    retry_supported: bool = False
+    retry_reason: Optional[str] = None
+    detail: BinarySecurityOverviewBusinessDetail | BinarySecurityOverviewArchiveDetail
+
+
 class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     description: Optional[str] = None
     output_root: str
@@ -161,6 +205,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     item_stats: dict[str, dict[str, int]] = Field(default_factory=dict)
     stage_items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
     archive_jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
+    overview_nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
 
 
 class BinarySecurityTaskEventResponse(BaseModel):

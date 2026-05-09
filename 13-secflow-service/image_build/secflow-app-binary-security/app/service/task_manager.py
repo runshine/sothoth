@@ -39,6 +39,9 @@ from app.schemas import (
     BinarySecurityArtifactsResponse,
     BinarySecurityInputFile,
     BinarySecurityModuleSelectionResponse,
+    BinarySecurityOverviewArchiveDetail,
+    BinarySecurityOverviewBusinessDetail,
+    BinarySecurityOverviewNode,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
@@ -176,6 +179,14 @@ STAGE_METRIC_RESETTERS = {
     },
     "entry_analysis": {"entry_count": 0},
     "vuln_scan": {"vuln_result_count": 0},
+}
+STAGE_TITLES = {
+    "firmware_unpack": "固件解包",
+    "system_analysis": "系统分析",
+    "binary_to_source": "二进制逆向",
+    "entry_analysis": "入口分析",
+    "dataflow_analysis": "数据流分析",
+    "vuln_scan": "漏洞扫描",
 }
 STAGE_RETRY_ENDPOINTS = {
     "firmware_unpack": ("firmware_unpacker", "retry"),
@@ -494,6 +505,25 @@ class TaskManager:
         ).all()
         queue_info = self._build_queue_info(db, project_id=project_id)
         base = self._task_response(db, task, queue_info=queue_info).model_dump()
+        archive_job_responses = [
+            BinarySecurityArchiveJobResponse(
+                id=job.id,
+                stage_name=job.stage_name,
+                item_id=job.item_id,
+                item_key=job.item_key,
+                downstream_service=job.downstream_service,
+                downstream_task_id=job.downstream_task_id,
+                archive_status=job.archive_status,
+                archive_root=job.archive_root,
+                error_message=job.error_message,
+                attempts=job.attempts or 0,
+                created_at=job.created_at,
+                started_at=job.started_at,
+                completed_at=job.completed_at,
+                updated_at=job.updated_at,
+            )
+            for job in archive_jobs
+        ]
         return BinarySecurityTaskDetailResponse(
             **base,
             description=task.description,
@@ -505,25 +535,13 @@ class TaskManager:
             metrics=task.metrics,
             item_stats=self._item_stats(items),
             stage_items=[self._stage_item_response(item) for item in items],
-            archive_jobs=[
-                BinarySecurityArchiveJobResponse(
-                    id=job.id,
-                    stage_name=job.stage_name,
-                    item_id=job.item_id,
-                    item_key=job.item_key,
-                    downstream_service=job.downstream_service,
-                    downstream_task_id=job.downstream_task_id,
-                    archive_status=job.archive_status,
-                    archive_root=job.archive_root,
-                    error_message=job.error_message,
-                    attempts=job.attempts or 0,
-                    created_at=job.created_at,
-                    started_at=job.started_at,
-                    completed_at=job.completed_at,
-                    updated_at=job.updated_at,
-                )
-                for job in archive_jobs
-            ],
+            archive_jobs=archive_job_responses,
+            overview_nodes=self._build_stage_overview_nodes(
+                task,
+                [BinarySecurityStageSummary(**summary) if isinstance(summary, dict) else summary for summary in base.get("stage_summaries", [])],
+                archive_job_responses,
+                items,
+            ),
         )
 
     def get_module_selection(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityModuleSelectionResponse:
@@ -2111,18 +2129,216 @@ class TaskManager:
                 counts["running_items"] += 1
         return counts
 
+    def _normalize_downstream_status(self, status: str | None) -> str | None:
+        return self._map_downstream_status(status or "")
+
+    def _business_stage_status(
+        self,
+        task: BinarySecurityTask,
+        stage_name: str,
+        stage_run: BinarySecurityStageRun | None,
+        items: list[BinarySecurityStageItem],
+    ) -> str:
+        if stage_name == "system_analysis":
+            if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+                return "waiting_confirmation"
+            if stage_run and stage_run.status == "waiting_confirmation":
+                return "waiting_confirmation"
+        statuses = [self._normalize_downstream_status(item.status) or item.status for item in items]
+        if statuses:
+            return self._aggregate_item_statuses(statuses)
+        if task.current_stage == stage_name and task.status in {"running", "dispatching", TASK_STATUS_PENDING_MODULE_CONFIRMATION}:
+            return "queued"
+        if stage_run and stage_run.status in {"success", "partial_success", "failed", "cancelled", "waiting_confirmation"}:
+            return stage_run.status
+        return "pending"
+
+    def _status_label(self, status: str) -> str:
+        return {
+            "pending": "pending",
+            "queued": "queued",
+            "running": "running",
+            "applying": "applying",
+            "success": "success",
+            "partial_success": "partial_success",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "waiting_confirmation": "waiting_confirmation",
+        }.get(status, status)
+
+    def _build_stage_summaries(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_sequence: list[str],
+        stage_runs: list[BinarySecurityStageRun],
+        items: list[BinarySecurityStageItem],
+    ) -> list[BinarySecurityStageSummary]:
+        runs_by_stage = {run.stage_name: run for run in stage_runs if run.stage_name in stage_sequence}
+        items_by_stage: dict[str, list[BinarySecurityStageItem]] = {stage_name: [] for stage_name in stage_sequence}
+        for item in items:
+            if item.stage_name in items_by_stage:
+                items_by_stage[item.stage_name].append(item)
+        stage_retry_support = {
+            stage_name: self._stage_retry_support(db, task, stage_name)
+            for stage_name in stage_sequence
+            if stage_name in runs_by_stage
+        }
+        summaries: list[BinarySecurityStageSummary] = []
+        for index, stage_name in enumerate(stage_sequence, start=1):
+            run = runs_by_stage.get(stage_name)
+            stage_items = items_by_stage.get(stage_name, [])
+            counts = {
+                "total_items": len(stage_items),
+                "success_items": len([item for item in stage_items if item.status == "success"]),
+                "failed_items": len([item for item in stage_items if item.status == "failed"]),
+                "skipped_items": len([item for item in stage_items if item.status == "skipped"]),
+                "running_items": len(
+                    [
+                        item for item in stage_items
+                        if (self._normalize_downstream_status(item.status) or item.status) in {"pending", "queued", "running", "dispatching"}
+                    ]
+                ),
+            }
+            summaries.append(
+                BinarySecurityStageSummary(
+                    stage_name=stage_name,
+                    sequence_no=run.sequence_no if run else index,
+                    status=self._business_stage_status(task, stage_name, run, stage_items),
+                    retry_count=int(run.retry_count or 0) if run else 0,
+                    retry_supported=stage_retry_support.get(stage_name, (False, None))[0],
+                    retry_reason=stage_retry_support.get(stage_name, (False, None))[1],
+                    total_items=counts["total_items"],
+                    success_items=counts["success_items"],
+                    failed_items=counts["failed_items"],
+                    skipped_items=counts["skipped_items"],
+                    running_items=counts["running_items"],
+                    started_at=run.started_at if run else None,
+                    finished_at=run.finished_at if run else None,
+                    last_error=(run.last_error if run and run.last_error else next((item.error_message for item in stage_items if item.error_message), None)),
+                )
+            )
+        return summaries
+
+    def _aggregate_archive_stage_status(self, statuses: list[str]) -> str:
+        if not statuses:
+            return "pending"
+        normalized = [str(status or "").strip().lower() for status in statuses]
+        if any(status == "running" for status in normalized):
+            return "running"
+        if any(status in {"archived", "applying"} for status in normalized):
+            return "applying"
+        if any(status == "failed" for status in normalized):
+            return "failed"
+        if all(status == "success" for status in normalized):
+            return "success"
+        return "pending"
+
+    def _build_stage_overview_nodes(
+        self,
+        task: BinarySecurityTask,
+        stage_summaries: list[BinarySecurityStageSummary],
+        archive_jobs: list[BinarySecurityArchiveJobResponse],
+        stage_items: list[BinarySecurityStageItem],
+    ) -> list[BinarySecurityOverviewNode]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        summaries_by_stage = {summary.stage_name: summary for summary in stage_summaries}
+        jobs_by_stage: dict[str, list[BinarySecurityArchiveJobResponse]] = {}
+        items_by_stage: dict[str, list[BinarySecurityStageItem]] = {}
+        for job in archive_jobs:
+            jobs_by_stage.setdefault(job.stage_name, []).append(job)
+        for item in stage_items:
+            items_by_stage.setdefault(item.stage_name, []).append(item)
+        nodes: list[BinarySecurityOverviewNode] = []
+        for index, stage_name in enumerate(stage_sequence, start=1):
+            summary = summaries_by_stage.get(stage_name) or BinarySecurityStageSummary(stage_name=stage_name, sequence_no=index, status="pending")
+            stage_jobs = jobs_by_stage.get(stage_name, [])
+            current_stage_items = items_by_stage.get(stage_name, [])
+            downstream_status_counts: dict[str, int] = {}
+            for item in current_stage_items:
+                normalized_status = self._normalize_downstream_status(item.status) or item.status or "pending"
+                downstream_status_counts[normalized_status] = downstream_status_counts.get(normalized_status, 0) + 1
+            business_detail = BinarySecurityOverviewBusinessDetail(
+                total_items=summary.total_items,
+                success_items=summary.success_items,
+                failed_items=summary.failed_items,
+                skipped_items=summary.skipped_items,
+                running_items=summary.running_items,
+                cancelled_items=downstream_status_counts.get("cancelled", 0),
+                downstream_status_counts=downstream_status_counts,
+                downstream_services=sorted({str(item.downstream_service) for item in current_stage_items if item.downstream_service}),
+                representative_item_key=next((item.item_key for item in current_stage_items if item.item_key), None),
+                representative_downstream_task_id=next((item.downstream_task_id for item in current_stage_items if item.downstream_task_id), None),
+            )
+            nodes.append(
+                BinarySecurityOverviewNode(
+                    node_id=f"business:{stage_name}",
+                    node_type="business",
+                    stage_name=stage_name,
+                    sequence_no=summary.sequence_no or index,
+                    title=STAGE_TITLES.get(stage_name, stage_name),
+                    status=summary.status,
+                    status_label=self._status_label(summary.status),
+                    started_at=summary.started_at,
+                    finished_at=summary.finished_at,
+                    updated_at=summary.finished_at or summary.started_at,
+                    last_error=summary.last_error,
+                    retry_supported=summary.retry_supported,
+                    retry_reason=summary.retry_reason,
+                    detail=business_detail,
+                )
+            )
+            first_created_at = min((job.created_at for job in stage_jobs if job.created_at), default=None)
+            last_updated_at = max(
+                (job.completed_at or job.updated_at or job.started_at or job.created_at for job in stage_jobs if (job.completed_at or job.updated_at or job.started_at or job.created_at)),
+                default=None,
+            )
+            duration_seconds = None
+            if first_created_at and last_updated_at:
+                duration_seconds = max(0.0, (last_updated_at - first_created_at).total_seconds())
+            archive_detail = BinarySecurityOverviewArchiveDetail(
+                job_count=len(stage_jobs),
+                success_count=len([job for job in stage_jobs if job.archive_status == "success"]),
+                failed_count=len([job for job in stage_jobs if job.archive_status == "failed"]),
+                running_count=len([job for job in stage_jobs if job.archive_status == "running"]),
+                applying_count=len([job for job in stage_jobs if job.archive_status in {"archived", "applying"}]),
+                pending_count=len([job for job in stage_jobs if job.archive_status == "pending"]),
+                first_created_at=first_created_at,
+                last_updated_at=last_updated_at,
+                duration_seconds=duration_seconds,
+                latest_error=next((job.error_message for job in reversed(stage_jobs) if job.error_message), None),
+                jobs=stage_jobs,
+            )
+            archive_status = self._aggregate_archive_stage_status([job.archive_status for job in stage_jobs])
+            nodes.append(
+                BinarySecurityOverviewNode(
+                    node_id=f"archive:{stage_name}",
+                    node_type="archive",
+                    stage_name=stage_name,
+                    sequence_no=summary.sequence_no or index,
+                    title="产物归档",
+                    status=archive_status,
+                    status_label=self._status_label(archive_status),
+                    started_at=first_created_at,
+                    finished_at=last_updated_at if archive_status == "success" else None,
+                    updated_at=last_updated_at,
+                    last_error=archive_detail.latest_error,
+                    retry_supported=False,
+                    retry_reason=None,
+                    detail=archive_detail,
+                )
+            )
+        return nodes
+
     def _task_response(self, db: Session, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> BinarySecurityTaskResponse:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).order_by(BinarySecurityStageRun.sequence_no.asc()).all()
+        items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
         metrics = task.metrics or {}
         queue_info = queue_info or {"pending_positions": {}}
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
         stage_sequence = self._stage_sequence_for_task(task)
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
-        stage_retry_support = {
-            run.stage_name: self._stage_retry_support(db, task, run.stage_name)
-            for run in stage_runs
-            if run.stage_name in stage_sequence
-        }
+        stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -2154,26 +2370,7 @@ class TaskManager:
             failed_firmware_count=int(metrics.get("failed_firmware_count", 0)),
             task_retry_supported=task_retry_supported,
             task_retry_reason=task_retry_reason,
-            stage_summaries=[
-                BinarySecurityStageSummary(
-                    stage_name=run.stage_name,
-                    sequence_no=run.sequence_no,
-                    status=run.status,
-                    retry_count=run.retry_count,
-                    retry_supported=stage_retry_support.get(run.stage_name, (False, None))[0],
-                    retry_reason=stage_retry_support.get(run.stage_name, (False, None))[1],
-                    total_items=int(run.counts.get("total_items", 0)),
-                    success_items=int(run.counts.get("success_items", 0)),
-                    failed_items=int(run.counts.get("failed_items", 0)),
-                    skipped_items=int(run.counts.get("skipped_items", 0)),
-                    running_items=int(run.counts.get("running_items", 0)),
-                    started_at=run.started_at,
-                    finished_at=run.finished_at,
-                    last_error=run.last_error,
-                )
-                for run in stage_runs
-                if run.stage_name in stage_sequence
-            ],
+            stage_summaries=stage_summaries,
         )
 
     def _stage_item_response(self, item: BinarySecurityStageItem) -> BinarySecurityStageItemResponse:
