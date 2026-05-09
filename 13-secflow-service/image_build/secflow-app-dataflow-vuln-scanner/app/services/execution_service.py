@@ -179,22 +179,54 @@ class ExecutionService:
             or isinstance(metadata.get("run_retry"), dict)
         )
 
+    def _planned_run_root_for_trigger(self, trigger: TriggerTask | None) -> Path | None:
+        metadata = self._trigger_task_metadata(trigger)
+        plan = metadata.get("dataflow_cli") if isinstance(metadata.get("dataflow_cli"), dict) else {}
+        raw_run_dir = str(plan.get("run_dir") or "").strip()
+        if not raw_run_dir:
+            request = metadata.get("dataflow_scan_request") if isinstance(metadata.get("dataflow_scan_request"), dict) else {}
+            raw_run_dir = str(request.get("resume_run_dir") or "").strip()
+        if not raw_run_dir:
+            return None
+        candidate = Path(raw_run_dir)
+        if not candidate.is_absolute():
+            return None
+        try:
+            project_id = trigger.project_id if trigger is not None else ""
+            return self._ensure_path_within(path=candidate, root=self._project_files_root(project_id), label="run_dir")
+        except Exception:
+            return None
+
+    def _run_root_for_execution_or_trigger(
+        self,
+        execution: WorkflowExecution | None,
+        trigger: TriggerTask | None = None,
+    ) -> Path | None:
+        if execution is not None and execution.workspace_root:
+            return Path(execution.workspace_root).resolve()
+        return self._planned_run_root_for_trigger(trigger)
+
     def _run_locator_for_execution(self, execution: WorkflowExecution | None, trigger: TriggerTask | None = None) -> dict[str, str | None]:
-        if execution is None or not execution.workspace_root:
-            return {"run_name": None, "runs_root": None, "run_path": None}
         if not self._trigger_uses_run_directory(trigger):
             return {"run_name": None, "runs_root": None, "run_path": None}
-        run_root = Path(execution.workspace_root).resolve()
+        run_root = self._run_root_for_execution_or_trigger(execution, trigger)
+        if run_root is None:
+            return {"run_name": None, "runs_root": None, "run_path": None}
         return {
             "run_name": run_root.name,
             "runs_root": str(run_root.parent),
             "run_path": str(run_root),
         }
 
-    def _latest_run_summary_for_execution(self, db: Session, execution: WorkflowExecution | None) -> dict[str, Any]:
-        if execution is None or not execution.workspace_root:
+    def _latest_run_summary_for_execution(self, db: Session, execution: WorkflowExecution | None, trigger: TriggerTask | None = None) -> dict[str, Any]:
+        if execution is None:
             return {}
-        history_run = get_history_run_service().get_history_run_by_execution(db, execution)
+        history_run = get_history_run_service().get_history_run_by_execution(db, execution) if execution.workspace_root else None
+        if history_run is None:
+            try:
+                history_run = self._ensure_history_run_for_execution(db, execution, trigger)
+            except Exception:
+                history_run = None
         if history_run is None:
             return {}
         return get_history_run_service().get_history_run_summary(db, history_run)
@@ -205,9 +237,15 @@ class ExecutionService:
         execution: WorkflowExecution | None,
         trigger: TriggerTask | None = None,
     ) -> HistoryRun | None:
-        if execution is None or not execution.workspace_root:
+        if execution is None:
             return None
-        run_root = Path(execution.workspace_root)
+        run_root = self._run_root_for_execution_or_trigger(execution, trigger)
+        if run_root is None:
+            return None
+        if not execution.workspace_root:
+            execution.workspace_root = abs_path(run_root)
+            db.add(execution)
+            db.flush()
         if not run_root.is_dir() and trigger is not None and self._trigger_uses_run_directory(trigger):
             metadata = self._trigger_task_metadata(trigger)
             plan = metadata.get("dataflow_cli") if isinstance(metadata.get("dataflow_cli"), dict) else {}
@@ -248,7 +286,7 @@ class ExecutionService:
             else "手动任务"
         )
         run_locator = self._run_locator_for_execution(latest_execution, trigger)
-        run_summary = self._latest_run_summary_for_execution(db, latest_execution)
+        run_summary = self._latest_run_summary_for_execution(db, latest_execution, trigger)
         if run_locator["run_name"] and run_locator["runs_root"]:
             run_summary = {
                 "name": run_locator["run_name"],

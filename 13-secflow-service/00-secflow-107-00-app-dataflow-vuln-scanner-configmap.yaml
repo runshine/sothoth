@@ -45,7 +45,7 @@ data:
       project_files_dirname: "files"
       dataflow_subproject_name: "DATAFLOW_VULN_SCANNER"
 
-    history_runs:
+    runs:
       enabled: true
 
     registry:
