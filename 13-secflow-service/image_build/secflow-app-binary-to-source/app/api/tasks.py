@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import B2STask, get_db
-from app.schemas import ActionResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
+from app.schemas import ActionResponse, LlmProviderListResponse, LlmProviderSummary, RerunRequest, RetryRequest, ReviewAnalyticsResponse, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskListResponse, TaskPrepareResponse, TaskResponse, TokenUser
 from app.service.auth import get_auth_service
 from app.service.configcenter import get_configcenter_client
 from app.service.project import get_project_service
@@ -17,6 +17,7 @@ from app.service.security import validate_project_id
 from app.service.task_service import (
     build_task_detail,
     build_task_item_advanced,
+    build_task_item_review_analytics,
     build_task_response,
     create_task,
     delete_task,
@@ -132,6 +133,21 @@ async def get_b2s_task_item_advanced(
     await sync_task(db, task)
     item = get_task_item_or_404(db, task, item_id)
     return build_task_item_advanced(item, include_content=include_content)
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/items/{item_id}/review-analytics", response_model=ReviewAnalyticsResponse)
+async def get_b2s_task_item_review_analytics(
+    project_id: str,
+    task_id: str,
+    item_id: str,
+    mock: bool = Query(False),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    task = get_task_or_404(db, project_id, task_id)
+    await sync_task(db, task)
+    item = get_task_item_or_404(db, task, item_id)
+    return build_task_item_review_analytics(item, mock=mock)
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/terminate", response_model=ActionResponse)

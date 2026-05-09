@@ -185,6 +185,68 @@ class TaskListResponse(BaseModel):
     items: list[TaskResponse]
 
 
+class ReviewAnalyticsAttempt(BaseModel):
+    attempt_no: int
+    verdict: str = "UNKNOWN"
+    total_functions: int = 0
+    verified_functions: int = 0
+    blocking_issues: int = 0
+    warnings: int = 0
+    semantic_score: int = 0
+    confidence: int = 0
+
+
+class ReviewAnalyticsIssue(BaseModel):
+    id: str
+    label: str
+    function: str = "global"
+    category: str = "Semantic"
+    severity: str = "blocking"
+    introduced_attempt: int
+    resolved_attempt: Optional[int] = None
+    status: str = "remaining"
+
+
+class ReviewAnalyticsFunctionAttempt(BaseModel):
+    attempt_no: int
+    risk: str = "unknown"
+    score: int = 0
+
+
+class ReviewAnalyticsFunction(BaseModel):
+    function: str
+    attempts: list[ReviewAnalyticsFunctionAttempt] = Field(default_factory=list)
+
+
+class ReviewAnalyticsRadar(BaseModel):
+    attempt_no: int
+    completeness: int = 0
+    control_flow: int = 0
+    return_semantics: int = 0
+    input_validation: int = 0
+    call_fidelity: int = 0
+    type_struct_fidelity: int = 0
+
+
+class ReviewAnalyticsSummary(BaseModel):
+    attempts: int = 0
+    final_verdict: str = "UNKNOWN"
+    final_confidence: int = 0
+    issue_closure_rate: float = 0
+    residual_risk: str = "unknown"
+    mock: bool = False
+
+
+class ReviewAnalyticsResponse(BaseModel):
+    task_id: str
+    item_id: str
+    summary: ReviewAnalyticsSummary
+    attempts: list[ReviewAnalyticsAttempt] = Field(default_factory=list)
+    issues: list[ReviewAnalyticsIssue] = Field(default_factory=list)
+    function_matrix: list[ReviewAnalyticsFunction] = Field(default_factory=list)
+    radar: list[ReviewAnalyticsRadar] = Field(default_factory=list)
+
+
 class LlmProviderSummary(BaseModel):
     provider_key: str
     display_name: Optional[str] = None

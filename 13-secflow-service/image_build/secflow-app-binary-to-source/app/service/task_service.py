@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
-from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SOverallProgress, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemResponse, TaskResponse
+from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
@@ -863,6 +863,106 @@ def _collect_advanced_files(paths: list[Path], base: Path, include_content: bool
         if file:
             files.append(file)
     return files
+
+
+def _mock_review_analytics(task_id: str, item_id: str) -> ReviewAnalyticsResponse:
+    attempts = [
+        ReviewAnalyticsAttempt(attempt_no=1, verdict="FAIL", total_functions=10, verified_functions=8, blocking_issues=3, semantic_score=68, confidence=64),
+        ReviewAnalyticsAttempt(attempt_no=2, verdict="PASS", total_functions=10, verified_functions=10, blocking_issues=0, semantic_score=94, confidence=89),
+    ]
+    issues = [
+        ReviewAnalyticsIssue(id="I1", label="Length Logic", function="sub_880", category="Validation", severity="blocking", introduced_attempt=1, resolved_attempt=2, status="resolved"),
+        ReviewAnalyticsIssue(id="I2", label="Return Code", function="sub_880", category="Return", severity="blocking", introduced_attempt=1, resolved_attempt=2, status="resolved"),
+        ReviewAnalyticsIssue(id="I3", label="Extra Check", function="sub_880", category="Validation", severity="major", introduced_attempt=1, resolved_attempt=2, status="resolved"),
+    ]
+    names = [".init_proc", "sub_880", "start", "sub_E74", "sub_E90", "sub_EC0", "sub_F00", "sub_F50", "sub_F60", ".term_proc"]
+    matrix = [ReviewAnalyticsFunction(function=name, attempts=[ReviewAnalyticsFunctionAttempt(attempt_no=1, risk="critical" if name == "sub_880" else "passed", score=45 if name == "sub_880" else 86), ReviewAnalyticsFunctionAttempt(attempt_no=2, risk="warning" if name == "sub_E74" else "passed", score=80 if name == "sub_E74" else 95)]) for name in names]
+    radar = [
+        ReviewAnalyticsRadar(attempt_no=1, completeness=100, control_flow=70, return_semantics=55, input_validation=45, call_fidelity=94, type_struct_fidelity=88),
+        ReviewAnalyticsRadar(attempt_no=2, completeness=100, control_flow=95, return_semantics=96, input_validation=96, call_fidelity=95, type_struct_fidelity=95),
+    ]
+    return ReviewAnalyticsResponse(task_id=task_id, item_id=item_id, summary=ReviewAnalyticsSummary(attempts=2, final_verdict="PASS", final_confidence=89, issue_closure_rate=1.0, residual_risk="low-medium", mock=True), attempts=attempts, issues=issues, function_matrix=matrix, radar=radar)
+
+
+def _parse_review_file(file: AdvancedFile) -> dict:
+    try:
+        data = json.loads(file.content or "{}")
+    except Exception:
+        data = {}
+    verdict = str(data.get("verdict") or "UNKNOWN").upper()
+    issues = [str(issue) for issue in data.get("issues") or [] if str(issue).strip()]
+    total = int(data.get("total_functions") or 0)
+    verified = int(data.get("verified_functions") or 0)
+    attempt_no = file.attempt_no or _attempt_no(file.name) or 0
+    ratio = verified / total if total else (1 if verdict == "PASS" else 0)
+    score = max(0, min(100, round(ratio * 100) - len(issues) * 8 + (0 if verdict == "PASS" else -8)))
+    return {"attempt_no": attempt_no, "verdict": verdict, "issues": issues, "total": total, "verified": verified, "score": score}
+
+
+def _review_issue_key(issue: str) -> tuple[str, str, str]:
+    function_match = re.search(r"\b([A-Za-z_.][\w.]*)\s*:", issue)
+    function_name = function_match.group(1) if function_match else "global"
+    lower = issue.lower()
+    if "return" in lower:
+        category, label = "Return", "Return Code"
+    elif "length" in lower:
+        category, label = "Validation", "Length Logic"
+    elif "hex_len" in lower or "validation" in lower:
+        category, label = "Validation", "Extra Check"
+    elif "call" in lower:
+        category, label = "Call", "Call"
+    elif "struct" in lower or "type" in lower:
+        category, label = "Type", "Type"
+    else:
+        category, label = "Semantic", "Semantic"
+    return function_name, category, label
+
+
+def build_task_item_review_analytics(item: B2STaskItem, mock: bool = False) -> ReviewAnalyticsResponse:
+    if mock:
+        return _mock_review_analytics(item.task_id, item.id)
+    advanced = build_task_item_advanced(item, include_content=True)
+    review_files = [review for run in advanced.runs for batch in run.batches for review in batch.reviews]
+    parsed = [_parse_review_file(file) for file in review_files]
+    parsed = [entry for entry in parsed if entry["attempt_no"]]
+    parsed.sort(key=lambda entry: entry["attempt_no"])
+    if not parsed:
+        return _mock_review_analytics(item.task_id, item.id)
+    attempts = [ReviewAnalyticsAttempt(attempt_no=entry["attempt_no"], verdict=entry["verdict"], total_functions=entry["total"], verified_functions=entry["verified"], blocking_issues=len(entry["issues"]), semantic_score=entry["score"], confidence=max(0, min(100, entry["score"] + (10 if entry["verdict"] == "PASS" else -4)))) for entry in parsed]
+    final = parsed[-1]
+    final_keys = {_review_issue_key(issue) for issue in final["issues"]}
+    first_seen: dict[tuple[str, str, str], tuple[str, int]] = {}
+    for entry in parsed:
+        for issue in entry["issues"]:
+            first_seen.setdefault(_review_issue_key(issue), (issue, entry["attempt_no"]))
+    issues: list[ReviewAnalyticsIssue] = []
+    for idx, (key, (_, first_attempt)) in enumerate(first_seen.items(), start=1):
+        function_name, category, label = key
+        remaining = key in final_keys
+        resolved_attempt = None if remaining else next((entry["attempt_no"] for entry in parsed if entry["attempt_no"] > first_attempt and key not in {_review_issue_key(candidate) for candidate in entry["issues"]}), None)
+        issues.append(ReviewAnalyticsIssue(id=f"I{idx}", label=label, function=function_name, category=category, severity="blocking", introduced_attempt=first_attempt, resolved_attempt=resolved_attempt, status="remaining" if remaining else "resolved"))
+    function_names = {issue.function for issue in issues}
+    for run in advanced.runs:
+        for batch in run.batches:
+            source = (batch.source.content if batch.source else None) or (batch.review_snapshots[-1].content if batch.review_snapshots else "") or ""
+            for match in re.finditer(r"(?:^|\n)(?:[\w\s_*]+\s+)?([A-Za-z_.][\w.]*)\s*\([^;{}]*\)\s*\{", source):
+                function_names.add(match.group(1))
+    matrix = []
+    for name in list(function_names)[:24]:
+        cells = []
+        for entry in parsed:
+            hits = sum(1 for issue in entry["issues"] if _review_issue_key(issue)[0] == name)
+            cells.append(ReviewAnalyticsFunctionAttempt(attempt_no=entry["attempt_no"], risk="critical" if hits else ("passed" if entry["verdict"] == "PASS" else "unknown"), score=max(0, 42 - hits * 8) if hits else (95 if entry["verdict"] == "PASS" else 82)))
+        matrix.append(ReviewAnalyticsFunction(function=name, attempts=cells))
+    radar = []
+    for entry in parsed:
+        categories = {_review_issue_key(issue)[1] for issue in entry["issues"]}
+        radar.append(ReviewAnalyticsRadar(attempt_no=entry["attempt_no"], completeness=round((entry["verified"] / entry["total"] * 100) if entry["total"] else (100 if entry["verdict"] == "PASS" else 0)), control_flow=94 if entry["verdict"] == "PASS" else 72, return_semantics=45 if "Return" in categories else 94, input_validation=42 if "Validation" in categories else 94, call_fidelity=92, type_struct_fidelity=88))
+    resolved = sum(1 for issue in issues if issue.status == "resolved")
+    closure = resolved / len(issues) if issues else (1.0 if final["verdict"] == "PASS" else 0.0)
+    confidence = max(0, min(100, round(final["score"] * 0.42 + closure * 38 + (14 if final["verdict"] == "PASS" else 0) + min(len(parsed), 3) * 2)))
+    residual = "high" if final["verdict"] != "PASS" or final["issues"] else ("low" if confidence >= 92 else "low-medium" if confidence >= 82 else "medium")
+    return ReviewAnalyticsResponse(task_id=item.task_id, item_id=item.id, summary=ReviewAnalyticsSummary(attempts=len(parsed), final_verdict=final["verdict"], final_confidence=confidence, issue_closure_rate=closure, residual_risk=residual, mock=False), attempts=attempts, issues=issues, function_matrix=matrix, radar=radar)
 
 
 def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) -> TaskItemAdvancedResponse:
