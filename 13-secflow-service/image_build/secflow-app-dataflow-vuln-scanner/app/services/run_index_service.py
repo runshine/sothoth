@@ -867,6 +867,7 @@ class RunIndexService:
             "model": run_index.model,
             "provider": run_index.provider,
             "thinking": run_index.thinking,
+            "review_profile": str((run_index.config_json or {}).get("review_profile") or ""),
             "max_cycles": run_index.max_cycles,
             "cycles_used": run_index.cycles_used,
             "result_count": run_index.result_count,

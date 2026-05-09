@@ -1,18 +1,16 @@
 对目标函数进行全面、深入的 **data-flow driven vulnerability hunting**。
 
-## 当前执行上下文
 {worker_runtime_context}
 
 ## 你的执行要求
 1. 先 `read` 上下文中列出的必读文件；不要要求框架重复粘贴大文件全文。
 2. 本任务不是无边界全源码审计；所有正式结果必须能回链到数据流文件中的 INPUT / EXPORT / USED / CLEANED / ★，或其直接上下游源码证据。
 3. 以攻击者视角完成本轮漏洞挖掘：梳理 INPUT / EXPORT / USED / CLEANED / ★ 关键发现，并做源码级验证。
-4. 对当前 review_profile 要求范围内的 EXPORT 终点继续跟入；对 USED 终点逐项扫描漏洞模式。
+4. 对本轮范围要求内的 EXPORT 终点继续跟入；对 USED 终点逐项扫描漏洞模式。
 5. **本阶段只负责沉淀漏洞发现与证据**，正式产物只写到下列位置：
 {output_contract_text}
-6. `summary.md` 和 `previous_limitations.md` 由后续显式 summary 阶段统一整理/同步；除非后续 prompt 明确要求进入 summary 阶段，否则当前不要把预算花在反复整理总结上。
-7. 如果当前是返工轮，优先处理失败结果、评审反馈和局限性连续性要求。
-8. 不要把 `result_*.md`、辅助文档或其他正式产物写到 `sessions/`、`calls/` 或 prompt 文件目录。
+6. `summary.md` 和 `previous_limitations.md` 由后续显式 summary 阶段统一整理/同步；除非后续 prompt 明确要求进入 summary 阶段，否则当前不要反复整理总结。
+7. 不要把 `result_*.md`、辅助文档或其他正式产物写到 `sessions/`、`calls/` 或 prompt 文件目录。
 
 ## result_NNN.md 强制模板
 

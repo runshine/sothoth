@@ -64,7 +64,7 @@ _MODEL_PREFIX_THINKING_LEVELS: tuple[tuple[str, tuple[ThinkingLevel, ...]], ...]
 _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
     "fast": ReviewProfilePolicy(
         name="fast",
-        description="快速筛选：单轮 Worker 分析与 summary 输出，不启动评审闭环。",
+        description="初步筛选：聚焦显性数据流漏洞与关键证据整理。",
         review_enabled=False,
         enforce_coverage_gate=False,
         require_dataflow_extraction=False,
@@ -90,8 +90,8 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         advisor_max_internal_turns=0,
         advisor_rpc_stdout_trace_bytes=1 * 1024 * 1024,
         advisor_rpc_stdout_abort_bytes=0,
-        execution_goal="快速确认显性漏洞并生成 summary.md；不做评审返工或低风险穷尽。",
-        closure_policy="fast 不进入评审 closure；summary.md 必须由 Worker 真实生成。",
+        execution_goal="确认显性漏洞并整理 summary.md；不做低风险穷尽。",
+        closure_policy="当前范围以显性漏洞确认和真实 summary 产出为主。",
         depth_lanes=(
             "沿数据流主路径核对显性内存安全/整数安全问题",
             "优先验证 STAR 与最直接 USED 终点",
@@ -99,7 +99,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
     ),
     "balanced": ReviewProfilePolicy(
         name="balanced",
-        description="平衡档：面向中高危与关键路径，目标是挖到大部分主要漏洞。",
+        description="标准深度：面向中高危与关键路径，目标是挖到大部分主要漏洞。",
         review_enabled=True,
         enforce_coverage_gate=True,
         require_dataflow_extraction=True,
@@ -140,7 +140,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
     ),
     "audit": ReviewProfilePolicy(
         name="audit",
-        description="审计档：深度漏洞挖掘，追求最多、最深且可复核的漏洞证据。",
+        description="深度审计：追求更多、更深且可复核的漏洞证据。",
         review_enabled=True,
         enforce_coverage_gate=True,
         require_dataflow_extraction=True,
@@ -176,7 +176,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         execution_goal="深度审计关键数据流、变体和跨路径副作用；尽量挖出最多且最深的漏洞。",
         closure_policy="closure 优先验证 active backlog 与关键 obligations；无有效进展时收敛，external_blocked 必须显式保留。",
         depth_lanes=(
-            "balanced 全部路线",
+            "标准关键路径、主入口、高风险端点和关键 EXPORT/USED 路线",
             "STAR/EXPORT/USED obligation 深度闭环，并对 INPUT/CLEANED 保留可复核边界",
             "跨函数、跨协议族、跨方向的漏洞变体搜索",
             "未立项端点的可复核负证据矩阵",
@@ -544,70 +544,66 @@ def _format_pattern_families(families: tuple[str, ...]) -> str:
     return ", ".join(labels.get(item, item) for item in families)
 
 
-def _format_abort_limit(limit_bytes: int) -> str:
-    if int(limit_bytes) <= 0:
-        return "不限制"
-    return f"{int(limit_bytes) // (1024 * 1024)}MB"
-
-
 def format_review_profile_policy(value: str | None, *, compact: bool = False) -> str:
     policy = get_review_profile_policy(value)
-    completeness_thresholds = get_review_score_threshold_policy(policy.name, "global_completeness")
-    depth_thresholds = get_review_score_threshold_policy(policy.name, "global_depth")
-    required = ", ".join(policy.required_risks) if policy.required_risks else "(none)"
-    kinds = ", ".join(policy.required_kinds) if policy.required_kinds else "(none)"
+    required = ", ".join(policy.required_risks) if policy.required_risks else "不强制固定 risk 清单"
+    kinds = ", ".join(policy.required_kinds) if policy.required_kinds else "不强制固定 kind 清单"
+    pattern_focus = (
+        _format_pattern_families(policy.required_pattern_families)
+        if policy.required_pattern_families else
+        "不强制固定模式族；按数据流证据和本轮目标裁剪。"
+    )
+    coverage_focus = (
+        "需要按本轮范围闭环关键 coverage obligations。"
+        if policy.enforce_coverage_gate else
+        "初步筛选优先，不因覆盖率做无边界扩张。"
+    )
+    dataflow_focus = (
+        f"目标抽取比例约 {policy.min_declared_extraction_ratio:.0%}"
+        if policy.min_declared_extraction_ratio > 0 else
+        "不设置硬性抽取比例，优先验证显性主路径。"
+    )
+    summary_only = (
+        "可作为辅助证据，但高风险结论仍应优先落到 result/supporting_docs"
+        if policy.allow_summary_only_evidence else
+        "不足以单独支撑高/中风险 obligation，需补充 result 或 supporting_docs 证据"
+    )
+    depth_lanes = _prompt_facing_depth_lanes(policy)
     if compact:
-        gate = "on" if policy.enforce_coverage_gate else "off"
-        summary_only = "allowed" if policy.allow_summary_only_evidence else "not sufficient"
         return "\n".join([
-            "## Review Profile",
+            "## 本轮审查范围与验收要求",
+            f"- 定位: {policy.description}",
             (
-                f"- `{policy.name}`: review={'on' if policy.review_enabled else 'off'}; "
-                f"gate={gate}; required_risks={required}; "
-                f"required_kinds={kinds}; dataflow>={policy.min_declared_extraction_ratio:.0%}; "
-                f"summary_only={summary_only}; cycles={policy.default_max_review_cycles}; "
-                "worker_internal_turns=unlimited; "
-                "reflection_turns=unlimited; "
-                "advisor_turns=unlimited; "
-                f"min_discovery={policy.min_discovery_cycles_before_pass}; "
-                f"progress_after={policy.progress_required_after_cycle}; "
-                f"min_evidence_artifacts={policy.min_evidence_artifacts}; "
-                f"required_patterns={len(policy.required_pattern_families)}; "
-                f"pi_timeout=native; "
-                f"depth_threshold={min(depth_thresholds.score_thresholds.values()):.2f}"
+                f"- 关注点: risks={required}; kinds={kinds}; dataflow={dataflow_focus}; "
+                f"summary_only={summary_only}; patterns={pattern_focus}"
             ),
+            f"- coverage: {coverage_focus}",
+            f"- 目标: {policy.execution_goal}",
         ])
     return "\n".join([
-        "## Review Profile",
-        f"- profile: `{policy.name}`",
+        "## 本轮审查范围与验收要求",
         f"- 定位: {policy.description}",
-        f"- review loop: {'enabled' if policy.review_enabled else 'disabled'}",
-        f"- coverage gate: {'enabled' if policy.enforce_coverage_gate else 'disabled'}",
-        f"- 必须闭环 risk: {required}",
-        f"- 必须闭环 kind: {kinds}",
-        f"- data-flow 抽取下限: {policy.min_declared_extraction_ratio:.0%}",
-        f"- summary-only evidence: {'allowed' if policy.allow_summary_only_evidence else 'not sufficient'}",
-        f"- 默认最大评审轮次: {policy.default_max_review_cycles}",
-        "- 单轮 Worker 内部 turn 硬上限: 不限制",
-        f"- 单轮 Worker stdout 软上限: {_format_abort_limit(policy.worker_rpc_stdout_abort_bytes)}",
-        "- 单次 Advisor 内部 turn 硬上限: 不限制",
-        f"- 单次 Advisor stdout 软上限: {_format_abort_limit(policy.advisor_rpc_stdout_abort_bytes)}",
-        f"- 全面性最终分数线: {_format_threshold_brief(completeness_thresholds)}",
-        f"- 深入性最终分数线: {_format_threshold_brief(depth_thresholds)}",
-        f"- 每轮反思 pass: {policy.reflection_passes_per_cycle}",
-        "- 单次反思内部 turn 硬上限: 不限制",
-        "- Pi/provider timeout: 仅依赖 Pi 原生 timeout；重发次数/间隔由 runtime_config.timeout_max_retries 与 timeout_retry_interval_seconds 控制",
-        f"- 最少探索轮次: {policy.min_discovery_cycles_before_pass}",
-        f"- 有效进展检测起始轮: {policy.progress_required_after_cycle or 'disabled'}",
-        (
-            f"- 无有效进展收敛/终止阈值: "
-            f"{policy.progress_no_signal_closure_streak}/"
-            f"{policy.progress_no_signal_abort_streak}"
-        ),
-        f"- 最少证据产物数: {policy.min_evidence_artifacts}",
-        f"- 必须覆盖漏洞模式族: {_format_pattern_families(policy.required_pattern_families)}",
+        f"- 覆盖闭环取向: {coverage_focus}",
+        f"- 重点 risk: {required}",
+        f"- 重点 kind: {kinds}",
+        f"- data-flow 抽取取向: {dataflow_focus}",
+        f"- summary-only evidence: {summary_only}",
+        f"- 漏洞模式重点: {pattern_focus}",
         f"- 挖掘目标: {policy.execution_goal}",
         f"- closure 策略: {policy.closure_policy}",
         "- 深挖路线:",
-        *[f"  - {lane}" for lane in policy.depth_lanes],
+        *[f"  - {lane}" for lane in depth_lanes],
     ])
+
+
+def _prompt_facing_depth_lanes(policy: ReviewProfilePolicy) -> tuple[str, ...]:
+    if policy.name != "audit":
+        return tuple(policy.depth_lanes)
+    return (
+        "沿主路径、高风险端点和关键 EXPORT/USED 路线继续深挖。",
+        "STAR/EXPORT/USED obligation 深度闭环，并对 INPUT/CLEANED 保留可复核边界。",
+        "跨函数、跨协议族、跨方向的漏洞变体搜索。",
+        "未立项端点的可复核负证据矩阵。",
+        "可利用性前提、攻击者能力、配置依赖和 residual 边界审计。",
+        "对候选漏洞做反例/误报证伪后再保留最终报告。",
+    )

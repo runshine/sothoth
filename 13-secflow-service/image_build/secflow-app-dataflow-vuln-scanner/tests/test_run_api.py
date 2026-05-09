@@ -80,6 +80,12 @@ def _create_run_workspace(run_root: Path) -> None:
             },
         }],
         "execution": {"execution_id": run_root.name, "input_task": {"task_file": "input/task.md"}},
+        "workflows": {
+            "atomic": [{
+                "id": "vuln_scan",
+                "engine": {"review_profile": "audit"},
+            }],
+        },
     })
     _write(run_root / "input" / "task.md", "# Task\n")
     _write(run_root / "run.log", "line1\nline2\n")
@@ -313,13 +319,21 @@ def test_runs_list_uses_execution_bound_runs_and_ignores_unbound_directories(ser
     assert summary["source_type"] == "execution_workspace"
     assert summary["linked_task_id"] == bound["task_id"]
     assert summary["linked_execution_id"] == bound["execution_id"]
+    assert summary["review_profile"] == "audit"
 
     tasks = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert tasks.status_code == 200
     task_summary = next(item for item in tasks.json() if item["task_id"] == bound["task_id"])
     assert task_summary["title"] == "DB bound scan"
     assert task_summary["run"]["run_id"] == run_summary["run_id"]
+    assert task_summary["run"]["review_profile"] == "audit"
     assert task_summary["latest_run"]["run_id"] == summary["run_id"]
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert detail.status_code == 200
+    detail_payload = detail.json()
+    assert detail_payload["review_profile"] == "audit"
+    assert detail_payload["config"]["review_profile"] == "audit"
 
 
 def test_run_resolve_only_returns_execution_bound_records(service_config_path):

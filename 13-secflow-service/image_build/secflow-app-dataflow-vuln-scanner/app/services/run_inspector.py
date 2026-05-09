@@ -256,10 +256,19 @@ def _extract_config_summary(config: dict[str, Any]) -> dict[str, Any]:
     sdk = runtime.get("sdk_specific", {})
     global_cfg = config.get("global", {})
     execution_cfg = config.get("execution", {})
+    review_profile = "balanced"
+    for workflow in ((config.get("workflows") or {}).get("atomic") or []):
+        if not isinstance(workflow, dict):
+            continue
+        engine = workflow.get("engine") or {}
+        if isinstance(engine, dict) and (engine.get("review_profile") or workflow.get("id") == "vuln_scan"):
+            review_profile = str(engine.get("review_profile") or "balanced")
+            break
     return {
         "model": runtime.get("model", ""),
         "provider": sdk.get("provider", ""),
         "thinking": sdk.get("thinking", ""),
+        "review_profile": review_profile,
         "timeout_seconds": runtime.get("timeout_seconds", 0),
         "max_review_cycles": global_cfg.get("max_review_cycles", 0),
         "parallel_result_review": global_cfg.get("parallel_result_review", False),
@@ -535,6 +544,7 @@ def inspect_run_summary(workspace_root: str | Path) -> dict[str, Any]:
         "model": cfg_summary["model"],
         "provider": cfg_summary["provider"],
         "thinking": cfg_summary["thinking"],
+        "review_profile": cfg_summary["review_profile"],
         "max_cycles": cfg_summary["max_review_cycles"],
         "cycles_used": cycles_used,
         "result_count": result_count,

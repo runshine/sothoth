@@ -814,7 +814,7 @@ class GlobalReviewExecutor:
                 lines.append(f"  - resolved_issues: {', '.join(resolved)}")
             if issues:
                 issue_ids = [
-                    str(issue.get('id') or '').strip()
+                    ReviewState.prompt_safe_issue_id(issue.get('id') or '')
                     for issue in issues
                     if str(issue.get('id') or '').strip()
                 ]
@@ -858,7 +858,6 @@ class GlobalReviewExecutor:
             "## 当前评审对象",
             f"- 当前轮次：{cycle}",
             f"- 当前工作模式：{review_state.workflow_mode}",
-            f"- Review profile：{review_profile}",
             f"- 任务文件: `{task_file}`",
             f"- 总结报告: `{summary_file}`",
             f"- 结果目录: `{results_dir}`",
@@ -912,7 +911,7 @@ class GlobalReviewExecutor:
             lines.extend([
                 "",
                 "## Closure 评审模式",
-                "- 当前已进入 closure：优先验证 active issue backlog 和 coverage ledger 的 open obligations 是否按当前 review profile 被关闭、接受 residual、标记 unused/not_applicable 或 external_blocked。",
+                "- 当前已进入 closure：优先验证 active issue backlog 和 coverage ledger 的 open obligations 是否按本轮验收要求被关闭、接受 residual、标记 unused/not_applicable 或 external_blocked。",
                 "- 不要把本轮评审重新展开成无限全量重扫；新 blocker 只允许针对 coverage ledger 中具体 obligation，或明确高严重度且可验证的新增遗漏。",
                 "- 若 Worker 已给出 source_closed/accepted_residual/unused/not_applicable/external_blocked 且证据自洽，应接受 closure，不要反复要求无新增信息的继续分析。",
             ])
@@ -1214,8 +1213,8 @@ class GlobalReviewExecutor:
                 "category": "coverage_gate",
                 "target": str(ledger_file),
                 "severity": "high",
-                "required_action": "重新同步 coverage ledger；summary 阶段必须生成 `_meta/coverage_ledger.json` 后才能通过该 review profile。",
-                "detail": f"review_profile={policy.name} 要求 coverage gate，但 coverage ledger 不存在。",
+                "required_action": "重新同步 coverage ledger；summary 阶段必须生成 `_meta/coverage_ledger.json` 后才能通过本轮验收。",
+                "detail": "本轮验收要求 coverage gate，但 coverage ledger 不存在。",
                 "owner": "framework",
                 "actionable_by": "framework",
                 "blocking_type": "metadata_sync",
@@ -1274,13 +1273,13 @@ class GlobalReviewExecutor:
                 "severity": "high",
                 "required_action": "从原始 data-flow 文件抽取端点级 INPUT/EXPORT/USED/CLEANED/STAR obligations，而不是只抽 task.md 摘要。",
                 "detail": (
-                    f"review_profile={policy.name} 要求端点级账本；task 声明约 {declared_total} 个义务，"
+                    f"本轮验收要求端点级账本；task 声明约 {declared_total} 个义务，"
                     f"当前 ledger 仅 {total} 个，低于 {policy.min_declared_extraction_ratio:.0%} 抽取下限。"
                 ),
                 "owner": "framework",
                 "actionable_by": "framework",
                 "blocking_type": "coverage_ledger_under_extracted",
-                "acceptance_criteria": "coverage_ledger.coverage_obligations.entries 覆盖原始 data-flow 的主要端点，至少达到当前 profile 的抽取比例。",
+                "acceptance_criteria": "coverage_ledger.coverage_obligations.entries 覆盖原始 data-flow 的主要端点，至少达到本轮验收要求的抽取比例。",
             })
 
         required_risks = set(policy.required_risks)
@@ -1301,10 +1300,10 @@ class GlobalReviewExecutor:
                 "target": str(ledger_file),
                 "severity": "high",
                 "required_action": (
-                    f"关闭当前 profile 必须闭环的 open obligations：{preview}"
+                    f"关闭本轮必须闭环的 open obligations：{preview}"
                 ),
                 "detail": (
-                    f"review_profile={policy.name} 不允许 {len(blocking_open)} 个 "
+                    f"本轮验收不允许 {len(blocking_open)} 个 "
                     "STAR/高风险/指定风险等级 coverage obligations 仍为 open。"
                 ),
                 "owner": "worker",
@@ -1327,7 +1326,7 @@ class GlobalReviewExecutor:
                     "category": "coverage_gate",
                     "target": str(ledger_file),
                     "severity": "high",
-                    "required_action": "为高/中风险 obligations 补充 result 或 supporting_docs 源码证据；summary-only 不能作为该 profile 的充分证据。",
+                    "required_action": "为高/中风险 obligations 补充 result 或 supporting_docs 源码证据；summary-only 不能作为本轮验收的充分证据。",
                     "detail": f"以下 obligations 只有 summary.md 证据：{preview}",
                     "owner": "worker",
                     "actionable_by": "worker",
@@ -1384,11 +1383,11 @@ class GlobalReviewExecutor:
             "target": str(work_path),
             "severity": "medium" if policy.name in {"fast", "balanced"} else "high",
             "required_action": (
-                f"当前 profile 至少需要 {required_count} 个证据产物；"
+                f"本轮范围至少需要 {required_count} 个证据产物；"
                 "若无新增漏洞，用 supporting_docs 记录源码级负面证据、模式覆盖和 residual 边界。"
             ),
             "detail": (
-                f"review_profile={policy.name} 要求 evidence artifacts >= {required_count}，"
+                f"本轮验收要求 evidence artifacts >= {required_count}，"
                 f"当前 taskable results={result_count}, supporting_docs={supporting_count}, "
                 f"total={artifact_count}。"
             ),
@@ -1397,7 +1396,7 @@ class GlobalReviewExecutor:
             "blocking_type": "profile_evidence_floor",
             "acceptance_criteria": (
                 "results/*.md 或 supporting_docs/*.md 中留下足够的源码级正/负证据；"
-                "高档位不能只复用低档 summary 结论。"
+                "深度验收不能只复用初步 summary 结论。"
             ),
         }]
 
@@ -1438,11 +1437,11 @@ class GlobalReviewExecutor:
             "target": str(Path(work_dir)),
             "severity": "medium" if policy.name == "balanced" else "high",
             "required_action": (
-                "补齐当前 profile 要求的漏洞模式族扫描记录；缺失模式族："
+                "补齐本轮要求的漏洞模式族扫描记录；缺失模式族："
                 f"{missing_labels}。"
             ),
             "detail": (
-                f"review_profile={policy.name} 要求在 summary/results/supporting_docs 中"
+                "本轮验收要求在 summary/results/supporting_docs 中"
                 f"留下模式族覆盖或不适用证据；当前缺失：{missing_labels}。"
             ),
             "owner": "worker",
@@ -1505,9 +1504,9 @@ class GlobalReviewExecutor:
     def _format_profile_gate_feedback(issues: list[dict[str, str]]) -> str:
         if not issues:
             return ""
-        lines = ["[框架 Review Profile 硬门槛未通过]"]
+        lines = ["[框架范围验收硬门槛未通过]"]
         for item in issues:
-            lines.append(f"- {item.get('id')}: {item.get('detail')}")
+            lines.append(f"- {ReviewState.prompt_safe_issue_id(item.get('id'))}: {item.get('detail')}")
         return "\n".join(lines)
 
     @staticmethod

@@ -322,6 +322,7 @@ class RunSummaryResponse(BaseModel):
     model: str = ""
     provider: str = ""
     thinking: str = ""
+    review_profile: str = ""
     max_cycles: int = 0
     cycles_used: int = 0
     result_count: int = 0

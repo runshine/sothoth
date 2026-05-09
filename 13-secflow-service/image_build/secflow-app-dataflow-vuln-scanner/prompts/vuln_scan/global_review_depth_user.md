@@ -12,7 +12,7 @@
 
 ## Worker 漏洞挖掘清单基线
 若需核对 Worker 的稳定角色/输出契约，请 `read` 此文件：`{worker_system_prompt_file}`。
-实际漏洞模式广度由当前 `review_profile` 动态裁剪，已在下方评审上下文的 Review Profile / Coverage Obligation Ledger 中体现；不要机械要求低档位执行 audit 全量清单。
+实际漏洞模式广度由本轮范围动态裁剪，已在下方评审上下文的范围要求 / Coverage Obligation Ledger 中体现；不要机械要求超出本轮范围的全量清单。
 
 ## 当前评审上下文
 {review_context}
@@ -33,7 +33,7 @@
 5. 判断代码证据是否充分（源码片段、完整路径、字段级触发条件）。
 6. 若不通过，返回**结构化问题列表**；最多 8 个 issue。
 
-## 本角色专属分数阈值（由框架注入，单一事实源）
+## 本角色专属评分参考
 {score_thresholds}
 
 ## 输出要求（严格遵守，否则框架会拒绝并要求重新输出）

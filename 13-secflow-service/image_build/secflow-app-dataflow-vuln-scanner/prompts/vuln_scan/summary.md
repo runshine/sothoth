@@ -70,7 +70,7 @@ Cycle {cycle}
 ```
 
 ## Coverage Closure Matrix 硬性要求
-- 必须覆盖 `_meta/coverage_ledger.json` 中的 INPUT / EXPORT / USED / CLEANED / ★ obligations，至少覆盖所有 open/high/STAR 项；audit 档必须尽量逐项覆盖全部 obligations。
+- 必须覆盖 `_meta/coverage_ledger.json` 中的 INPUT / EXPORT / USED / CLEANED / ★ obligations，至少覆盖所有 open/high/STAR 项；若本轮范围要求完整闭环，则尽量逐项覆盖全部 obligations。
 - `status` 只能使用：`source_closed`、`promoted_to_result`、`accepted_residual`、`unused`、`not_applicable`、`external_blocked`。
 - `evidence` 必须指向 `results/*.md` 或 `supporting_docs/*.md` 或 summary 中的具体章节；不要只写“已分析”。
 - 对 active issue backlog 中的每个 issue，summary.md 或 supporting_docs 必须明确写出关闭状态和证据；不能只泛化描述。
@@ -85,7 +85,7 @@ Cycle {cycle}
 - 生成完整、准确、结构化的总结文档。
 - 确保 summary.md 与 results/、supporting_docs/、previous_limitations.md 内容一致。
 - 确保所有 coverage obligations 和 active issues 都有明确状态。
-- 不用 summary 阶段替代漏洞真实性评审；真实性由 result review 负责。
+- 不用 summary 阶段替代源码验证；summary 只整理已有 evidence 与结果关系，不凭空确认漏洞真实性。
 
 ## 输出前自检
 - [ ] `summary.md` 严格包含 7 个固定章节标题

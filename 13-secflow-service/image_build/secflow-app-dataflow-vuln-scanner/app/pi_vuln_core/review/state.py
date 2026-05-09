@@ -128,6 +128,21 @@ class ReviewState:
 
     FEEDBACK_WINDOW = 2  # Worker 收到最近 N 轮反馈
 
+    @staticmethod
+    def prompt_safe_issue_id(value: object) -> str:
+        """Return a model-facing issue id without leaking run-scope labels."""
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return re.sub(r"PROFILE-(?:fast|balanced|strict|audit)-", "SCOPE-", text, flags=re.IGNORECASE)
+
+    @staticmethod
+    def prompt_safe_blocking_type(value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return text.replace("profile_", "scope_")
+
     def __init__(self):
         self.global_review_history: list[GlobalReviewRecord] = []
         self.result_states: dict[str, ResultItemState] = {}
@@ -594,9 +609,11 @@ class ReviewState:
                 or entry.semantic_key
             )
             target = entry.issue.get("target") or "(未指定 target)"
+            safe_signature = self.prompt_safe_issue_id(entry.signature)
+            safe_blocking_type = self.prompt_safe_blocking_type(entry.blocking_type)
             lines.append(
-                f"- {entry.signature}: 连续 {entry.consecutive_count} 轮，target={target}，"
-                f"actionable_by={entry.actionable_by or 'worker'}，blocking_type={entry.blocking_type or 'unspecified'}，"
+                f"- {safe_signature}: 连续 {entry.consecutive_count} 轮，target={target}，"
+                f"actionable_by={entry.actionable_by or 'worker'}，blocking_type={safe_blocking_type or 'unspecified'}，"
                 f"要求={str(detail)[:220]}"
             )
             if entry.acceptance_criteria:
@@ -637,10 +654,11 @@ class ReviewState:
                 or ""
             )
             target = issue.get("target") or "(未指定 target)"
-            issue_id = issue.get("id") or item.get("signature")
+            issue_id = self.prompt_safe_issue_id(issue.get("id") or item.get("signature"))
+            blocking_type = self.prompt_safe_blocking_type(item.get("blocking_type"))
             lines.append(
                 f"- {issue_id}: target={target}; actionable_by={item.get('actionable_by') or 'worker'}; "
-                f"blocking_type={item.get('blocking_type') or 'unspecified'}; "
+                f"blocking_type={blocking_type or 'unspecified'}; "
                 f"last_seen=Cycle {item.get('last_seen_cycle')}; seen={item.get('seen_count')}"
             )
             if detail:

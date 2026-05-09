@@ -360,7 +360,7 @@ class WorkerExecutor:
     def _sync_worker_scaffolds(self, ctx: WorkflowContext) -> None:
         """Generate stable result/coverage ledgers before the Worker prompt.
 
-        This makes profile gates visible from cycle 1 instead of only after the
+        This makes scope gates visible from cycle 1 instead of only after the
         summary/review phases have already discovered missing obligations.
         """
         results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
@@ -435,11 +435,11 @@ class WorkerExecutor:
         system_prompt_file: str,
         ctx: WorkflowContext,
     ) -> str:
-        """Build the effective Worker system prompt with profile-owned scope.
+        """Build the effective Worker system prompt with run-scope guidance.
 
         The prompt file intentionally contains only the stable role/contract.
-        The breadth/depth checklist is injected here so fast/balanced/audit do
-        not all receive the same unbounded audit instructions.
+        The breadth/depth checklist is injected here so each run receives the
+        right bounded hunting instructions without exposing profile labels.
         """
         base = read_file(system_prompt_file).rstrip()
         dynamic_sections = [
@@ -518,7 +518,6 @@ class WorkerExecutor:
             "",
             "## 10. artifacts / metadata",
             "- **artifacts**: <相关 supporting_docs、代码片段、日志或 PoC 文件路径；没有写 none>",
-            "- **metadata.review_profile**: <fast/balanced/audit>",
             "- **metadata.related_issue_ids**: <全局评审 issue id；没有写 []>",
             "- **metadata.related_results**: <补充/修正关系；没有写 []>",
             "```",
@@ -528,8 +527,7 @@ class WorkerExecutor:
     def _format_profile_worker_scope(ctx: WorkflowContext) -> str:
         policy = get_review_profile_policy(ctx.review_profile)
         common = [
-            "## 当前 review_profile 下的 Worker 初始挖掘范围（框架动态裁剪）",
-            f"- profile: `{policy.name}`",
+            "## 本轮 Worker 初始挖掘范围",
             "- 本任务是 data-flow driven vulnerability hunting，不是无边界全源码审计。",
             "- 所有正式漏洞报告、补扫记录和返工动作都必须能回链到数据流文件中的 INPUT / EXPORT / USED / CLEANED / ★，或其直接上下游源码证据。",
         ]
@@ -549,7 +547,7 @@ class WorkerExecutor:
             ]
         else:
             lanes = [
-                "审计档需要尽量闭环全部 INPUT/EXPORT/USED/CLEANED/★ obligations。",
+                "需要尽量闭环全部 INPUT/EXPORT/USED/CLEANED/★ obligations。",
                 "漏洞模式完整覆盖 memory_safety、integer_safety、input_validation、logic_state、resource_lifetime、concurrency_timing、resource_exhaustion、information_disclosure。",
                 "对关键校验做边界值、符号混用、整数截断/溢出、TOCTOU、错误处理分支和对称路径分析。",
                 "无法闭环的外部源码/上下文必须写 accepted_residual/external_blocked，并给出人工验收条件。",
@@ -734,7 +732,6 @@ class WorkerExecutor:
             "",
             f"- 当前轮次：{ctx.cycle}",
             f"- 工作模式：{ctx.review_mode or review_state.workflow_mode}",
-            f"- Review profile：{ctx.review_profile}",
             f"- 当前结果文件数：{len(current_result_files)}",
             f"- 已通过评审：{len(passed_results)}",
             f"- 未通过评审：{len(failed_results)}",
@@ -779,7 +776,6 @@ class WorkerExecutor:
             "## 当前执行上下文",
             f"- 当前轮次：{ctx.cycle}",
             f"- 工作模式：{ctx.review_mode or review_state.workflow_mode}",
-            f"- Review profile：{ctx.review_profile}",
             f"- 任务文件: `{ctx.task_file}`",
             f"- 工作目录: `{ctx.working_dir}`",
             f"- 本阶段正式结果目录: `{ctx.results_dir or os.path.join(ctx.working_dir, 'results')}`",
@@ -788,8 +784,6 @@ class WorkerExecutor:
             f"- 后续 summary 阶段同步的局限性记录: `{previous_limitations_file}`",
             "",
             self._format_profile_execution_context(ctx),
-            "",
-            self._format_profile_worker_scope(ctx),
         ]
         coverage_context = self._format_coverage_obligation_context(ctx)
         if coverage_context:
@@ -1037,7 +1031,8 @@ class WorkerExecutor:
                 issue_id = issue_id or str(issue.get("id") or "").strip()
                 target = str(issue.get("target") or "").strip()
             if issue_id:
-                issue_lines.append(f"| {issue_id} | {target} |  |  |  |  |")
+                safe_issue_id = ReviewState.prompt_safe_issue_id(issue_id)
+                issue_lines.append(f"| {safe_issue_id} | {target} |  |  |  |  |")
         if not issue_lines:
             issue_lines.append("| <issue_id 或 obligation_id> | <目标> | <source_closed/promoted_to_result/accepted_residual/unused/not_applicable/external_blocked> | <本轮动作> | <results/... 或 supporting_docs/...> | <剩余限制> |")
         return "\n".join([
@@ -1145,7 +1140,6 @@ class WorkerExecutor:
             "## 返工上下文恢复包",
             f"- 当前轮次：{ctx.cycle}",
             f"- 工作模式：{ctx.review_mode or review_state.workflow_mode}",
-            f"- Review profile：{ctx.review_profile}",
             f"- 任务文件: `{ctx.task_file}`",
             f"- 工作目录: `{ctx.working_dir}`",
             f"- summary: `{summary_path}`",
@@ -1181,35 +1175,46 @@ class WorkerExecutor:
     @staticmethod
     def _format_profile_execution_context(ctx: WorkflowContext) -> str:
         policy = get_review_profile_policy(ctx.review_profile)
+        if policy.required_pattern_families:
+            pattern_focus = ", ".join(policy.required_pattern_families)
+        else:
+            pattern_focus = "优先沿数据流主轴验证显性、高置信漏洞。"
+        coverage_focus = (
+            "需要主动闭环本轮范围内的关键 INPUT/EXPORT/USED/CLEANED/STAR obligations。"
+            if policy.enforce_coverage_gate else
+            "快速筛选优先；不要求为了覆盖率做低风险、低置信的无边界扩张。"
+        )
+        depth_lanes = WorkerExecutor._prompt_facing_depth_lanes(policy)
         lines = [
-            "## Profile 执行预算与深度目标",
-            "- 单轮 Worker 内部 turn 硬上限: 不限制",
-            f"- 每轮反思 pass: {policy.reflection_passes_per_cycle}",
-            "- 单次反思内部 turn 硬上限: 不限制",
-            "- Pi/provider timeout: 仅依赖 Pi 原生 timeout；不再使用档位级 no-progress / wall-clock watchdog",
-            f"- 最少探索轮次: {policy.min_discovery_cycles_before_pass}",
-            f"- 最少证据产物数: {policy.min_evidence_artifacts}",
-            (
-                "- 必须覆盖漏洞模式族: "
-                + (
-                    ", ".join(policy.required_pattern_families)
-                    if policy.required_pattern_families else
-                    "(none)"
-                )
-            ),
-            f"- 本档挖掘目标: {policy.execution_goal}",
-            "- 本档深挖路线:",
+            "## 本轮挖掘目标与深度提示",
+            f"- 本轮目标: {policy.execution_goal}",
+            f"- 覆盖取向: {coverage_focus}",
+            f"- 漏洞模式重点: {pattern_focus}",
+            "- 深挖路线:",
         ]
-        lines.extend(f"  - {lane}" for lane in policy.depth_lanes)
+        lines.extend(f"  - {lane}" for lane in depth_lanes)
         lines.extend([
             (
-                "- 如果本轮没有新增高置信漏洞，必须在 `supporting_docs/` 中留下 "
-                "`source_closed` / `accepted_residual` / `not_applicable` 等可评审证据，"
+                "- 如果本轮没有新增高置信漏洞，也要在 `supporting_docs/` 中留下 "
+                "`source_closed` / `accepted_residual` / `not_applicable` 等可复核证据，"
                 "不要只写“继续分析”。"
             ),
             "- 使用 `rg` 先定位，再用小窗口 `read` 跟入；避免无边界读取整文件造成单轮膨胀。",
         ])
         return "\n".join(lines)
+
+    @staticmethod
+    def _prompt_facing_depth_lanes(policy) -> tuple[str, ...]:
+        if policy.name == "audit":
+            return (
+                "沿主路径、高风险端点和关键 EXPORT/USED 路线继续深挖。",
+                "STAR/EXPORT/USED obligation 深度闭环，并对 INPUT/CLEANED 保留可复核边界。",
+                "跨函数、跨协议族、跨方向的漏洞变体搜索。",
+                "未立项端点的可复核负证据矩阵。",
+                "可利用性前提、攻击者能力、配置依赖和 residual 边界审计。",
+                "对候选漏洞做反例/误报证伪后再保留最终报告。",
+            )
+        return tuple(policy.depth_lanes)
 
     @staticmethod
     def _clip_prompt_section(text: str, *, max_chars: int) -> str:
@@ -1962,12 +1967,11 @@ class WorkerExecutor:
         reflection_state = review_state or ReviewState()
         reflection_state.workflow_mode = ctx.review_mode
         # 单 session 模式下，Worker 已拥有完整对话历史，无需重复注入上下文
-        reflection_runtime_context = (
-            f"当前轮次：第 {ctx.cycle} 轮，"
-            f"工作模式：{ctx.review_mode or reflection_state.workflow_mode}，"
-            f"review_profile：{ctx.review_profile}，"
-            f"profile_goal：{policy.execution_goal}"
-        )
+        reflection_runtime_context = "\n".join([
+            f"- 当前轮次：第 {ctx.cycle} 轮",
+            f"- 工作模式：{ctx.review_mode or reflection_state.workflow_mode}",
+            f"- 本轮自审目标：{policy.execution_goal}",
+        ])
         reflection_runtime_limits = self._effective_reflection_runtime_limits(wf_def, ctx)
         reflection_scope = self._build_reflection_scope(ctx, review_state)
         reflection_checklist = self._build_reflection_checklist(ctx, review_state, prompts_dir=prompts_dir)
@@ -1992,10 +1996,7 @@ class WorkerExecutor:
                     results_dir=ctx.results_dir or os.path.join(ctx.working_dir, "results"),
                     supporting_docs_dir=self._supporting_docs_dir(ctx.working_dir),
                     previous_limitations_file=os.path.join(ctx.working_dir, "previous_limitations.md"),
-                    reflection_runtime_context=(
-                        f"{reflection_runtime_context}，"
-                        f"reflection_pass={pass_index}/{reflection_passes}"
-                    ),
+                    reflection_runtime_context=reflection_runtime_context,
                     reflection_scope=reflection_scope,
                     reflection_checklist=reflection_checklist,
                 )
@@ -2140,7 +2141,6 @@ class WorkerExecutor:
         summary_runtime_context = "\n".join([
             f"- 当前轮次：第 {ctx.cycle} 轮",
             f"- 工作模式：{ctx.review_mode or summary_state.workflow_mode}",
-            f"- Review profile：{ctx.review_profile}",
             f"- 任务文件: `{ctx.task_file}`",
             f"- 工作目录: `{ctx.working_dir}`",
             f"- coverage ledger: `{coverage_ledger_path(ctx.working_dir)}`",
@@ -2248,7 +2248,6 @@ class WorkerExecutor:
         lines = [
             f"- 当前轮次：{ctx.cycle}",
             f"- 当前工作模式：{ctx.review_mode or review_state.workflow_mode}",
-            f"- Review profile：{ctx.review_profile}",
         ]
         lines.extend(["", format_review_profile_policy(ctx.review_profile)])
         if ctx.plateau_reason:
