@@ -8,16 +8,6 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import ensure_project_access, get_current_subject, get_db
 from app.config import get_config
 from app.schemas import (
-    HistoryRunCycleResponse,
-    HistoryRunDetailResponse,
-    HistoryRunFileContentResponse,
-    HistoryRunFileResponse,
-    HistoryRunLogResponse,
-    HistoryRunMutationResponse,
-    HistoryRunResolveResponse,
-    HistoryRunRetryRequest,
-    HistoryRunSessionResponse,
-    HistoryRunSummaryResponse,
     ProjectFilesystemChildrenResponse,
     ProjectFilesystemRootResponse,
     RunCycleResponse,
@@ -139,7 +129,7 @@ async def list_runs(
 ):
     principal, token = subject
     await ensure_project_access(project_id, token)
-    return get_execution_service().list_history_runs(db, principal, project_id=project_id)
+    return get_execution_service().list_runs(db, principal, project_id=project_id)
 
 
 @router.get("/runs/resolve", response_model=RunResolveResponse)
@@ -152,7 +142,7 @@ async def resolve_run(
 ):
     principal, token = subject
     await ensure_project_access(project_id, token)
-    return get_execution_service().resolve_history_run(db, principal, project_id=project_id, run_name=run_name, root_path=root_path)
+    return get_execution_service().resolve_run(db, principal, project_id=project_id, run_name=run_name, root_path=root_path)
 
 
 @router.get("/runs/by-task", response_model=RunResolveResponse)
@@ -165,7 +155,7 @@ async def resolve_run_by_task(
 ):
     principal, token = subject
     await ensure_project_access(project_id, token)
-    return get_execution_service().resolve_history_run_by_task(
+    return get_execution_service().resolve_run_by_task(
         db,
         principal,
         project_id=project_id,
@@ -177,7 +167,7 @@ async def resolve_run_by_task(
 @router.get("/runs/{run_id}", response_model=RunDetailResponse)
 async def get_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
-    return get_execution_service().get_history_run(db, run_id, principal)
+    return get_execution_service().get_run(db, run_id, principal)
 
 
 @router.get("/runs/{run_id}/cycles/{cycle}", response_model=RunCycleResponse)
@@ -188,13 +178,13 @@ async def get_run_cycle(
     db: Session = Depends(get_db),
 ):
     principal, _ = subject
-    return get_execution_service().get_history_run_cycle(db, run_id, cycle, principal)
+    return get_execution_service().get_run_cycle(db, run_id, cycle, principal)
 
 
 @router.get("/runs/{run_id}/sessions", response_model=List[RunSessionResponse])
 async def list_run_sessions(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
-    return get_execution_service().list_history_run_sessions(db, run_id, principal)
+    return get_execution_service().list_run_sessions(db, run_id, principal)
 
 
 @router.get("/runs/{run_id}/files", response_model=List[RunFileResponse])
@@ -205,7 +195,7 @@ async def list_run_files(
     db: Session = Depends(get_db),
 ):
     principal, _ = subject
-    return get_execution_service().list_history_run_files(db, run_id, principal, limit=limit)
+    return get_execution_service().list_run_files(db, run_id, principal, limit=limit)
 
 
 @router.get("/runs/{run_id}/file", response_model=RunFileContentResponse)
@@ -216,7 +206,7 @@ async def get_run_file(
     db: Session = Depends(get_db),
 ):
     principal, _ = subject
-    return get_execution_service().get_history_run_file(db, run_id, principal, path)
+    return get_execution_service().get_run_file(db, run_id, principal, path)
 
 
 @router.get("/runs/{run_id}/session-file", response_model=Dict[str, Any])
@@ -227,7 +217,7 @@ async def get_run_session_file(
     db: Session = Depends(get_db),
 ):
     principal, _ = subject
-    return get_execution_service().get_history_run_session_file(db, run_id, principal, path)
+    return get_execution_service().get_run_session_file(db, run_id, principal, path)
 
 
 @router.get("/runs/{run_id}/log", response_model=RunLogResponse)
@@ -238,25 +228,25 @@ async def get_run_log(
     db: Session = Depends(get_db),
 ):
     principal, _ = subject
-    return get_execution_service().get_history_run_log(db, run_id, principal, lines=lines)
+    return get_execution_service().get_run_log(db, run_id, principal, lines=lines)
 
 
 @router.delete("/runs/{run_id}", response_model=RunMutationResponse)
 async def delete_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
-    return get_execution_service().delete_history_run(db, run_id, principal)
+    return get_execution_service().delete_run(db, run_id, principal)
 
 
 @router.post("/runs/{run_id}/cancel", response_model=RunMutationResponse)
 async def cancel_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
-    return get_execution_service().cancel_history_run(db, run_id, principal)
+    return get_execution_service().cancel_run(db, run_id, principal)
 
 
 @router.post("/runs/{run_id}/adopt", response_model=RunMutationResponse)
 async def adopt_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
-    return get_execution_service().adopt_history_run(db, run_id, principal)
+    return get_execution_service().adopt_run(db, run_id, principal)
 
 
 @router.post(
@@ -271,157 +261,10 @@ async def retry_run(
     db: Session = Depends(get_db),
 ):
     principal, _ = subject
-    result = get_execution_service().retry_history_run(db, run_id, principal, payload)
+    result = get_execution_service().retry_run(db, run_id, principal, payload)
     if get_scheduler_service().start_execution_now(result.get("linked_execution_id")):
         result["status"] = "running"
         result["message"] = "Run resume started"
-    return result
-
-
-@router.get("/history-runs", response_model=List[HistoryRunSummaryResponse])
-async def list_history_runs(
-    project_id: str = Query(...),
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, token = subject
-    await ensure_project_access(project_id, token)
-    return get_execution_service().list_history_runs(db, principal, project_id=project_id)
-
-
-@router.get("/history-runs/resolve", response_model=HistoryRunResolveResponse)
-async def resolve_history_run(
-    project_id: str = Query(...),
-    run_name: str = Query(...),
-    root_path: str = Query(...),
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, token = subject
-    await ensure_project_access(project_id, token)
-    return get_execution_service().resolve_history_run(db, principal, project_id=project_id, run_name=run_name, root_path=root_path)
-
-
-@router.get("/history-runs/by-task", response_model=HistoryRunResolveResponse)
-async def resolve_history_run_by_task(
-    project_id: str = Query(...),
-    task_id: str = Query(...),
-    execution_id: Optional[str] = Query(None),
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, token = subject
-    await ensure_project_access(project_id, token)
-    return get_execution_service().resolve_history_run_by_task(
-        db,
-        principal,
-        project_id=project_id,
-        task_id=task_id,
-        execution_id=execution_id,
-    )
-
-
-@router.get("/history-runs/{history_run_id}", response_model=HistoryRunDetailResponse)
-async def get_history_run(history_run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
-    principal, _ = subject
-    return get_execution_service().get_history_run(db, history_run_id, principal)
-
-
-@router.get("/history-runs/{history_run_id}/cycles/{cycle}", response_model=HistoryRunCycleResponse)
-async def get_history_run_cycle(
-    history_run_id: str,
-    cycle: int,
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, _ = subject
-    return get_execution_service().get_history_run_cycle(db, history_run_id, cycle, principal)
-
-
-@router.get("/history-runs/{history_run_id}/sessions", response_model=List[HistoryRunSessionResponse])
-async def list_history_run_sessions(history_run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
-    principal, _ = subject
-    return get_execution_service().list_history_run_sessions(db, history_run_id, principal)
-
-
-@router.get("/history-runs/{history_run_id}/files", response_model=List[HistoryRunFileResponse])
-async def list_history_run_files(
-    history_run_id: str,
-    limit: int = Query(default=1200, ge=1, le=5000),
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, _ = subject
-    return get_execution_service().list_history_run_files(db, history_run_id, principal, limit=limit)
-
-
-@router.get("/history-runs/{history_run_id}/file", response_model=HistoryRunFileContentResponse)
-async def get_history_run_file(
-    history_run_id: str,
-    path: str = Query(...),
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, _ = subject
-    return get_execution_service().get_history_run_file(db, history_run_id, principal, path)
-
-
-@router.get("/history-runs/{history_run_id}/session-file", response_model=Dict[str, Any])
-async def get_history_run_session_file(
-    history_run_id: str,
-    path: str = Query(...),
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, _ = subject
-    return get_execution_service().get_history_run_session_file(db, history_run_id, principal, path)
-
-
-@router.get("/history-runs/{history_run_id}/log", response_model=HistoryRunLogResponse)
-async def get_history_run_log(
-    history_run_id: str,
-    lines: int = Query(default=300, ge=1, le=2000),
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, _ = subject
-    return get_execution_service().get_history_run_log(db, history_run_id, principal, lines=lines)
-
-
-@router.delete("/history-runs/{history_run_id}", response_model=HistoryRunMutationResponse)
-async def delete_history_run(history_run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
-    principal, _ = subject
-    return get_execution_service().delete_history_run(db, history_run_id, principal)
-
-
-@router.post("/history-runs/{history_run_id}/cancel", response_model=HistoryRunMutationResponse)
-async def cancel_history_run(history_run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
-    principal, _ = subject
-    return get_execution_service().cancel_history_run(db, history_run_id, principal)
-
-
-@router.post("/history-runs/{history_run_id}/adopt", response_model=HistoryRunMutationResponse)
-async def adopt_history_run(history_run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
-    principal, _ = subject
-    return get_execution_service().adopt_history_run(db, history_run_id, principal)
-
-
-@router.post(
-    "/history-runs/{history_run_id}/retry",
-    response_model=HistoryRunMutationResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def retry_history_run(
-    history_run_id: str,
-    payload: HistoryRunRetryRequest,
-    subject=Depends(get_current_subject),
-    db: Session = Depends(get_db),
-):
-    principal, _ = subject
-    result = get_execution_service().retry_history_run(db, history_run_id, principal, payload)
-    if get_scheduler_service().start_execution_now(result.get("linked_execution_id")):
-        result["status"] = "running"
-        result["message"] = "history run resume started"
     return result
 
 

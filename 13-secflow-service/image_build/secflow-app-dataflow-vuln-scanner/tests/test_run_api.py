@@ -238,7 +238,7 @@ def _create_execution_bound_run(client: TestClient, run_root: Path, *, title: st
             "profile_id": profile["profile_id"],
             "task_id": trigger.id,
             "execution_id": execution.id,
-            "history_run_id": history_run.id,
+            "run_id": history_run.id,
             "run_root": str(run_root.resolve()),
             "run_name": run_root.name,
         }
@@ -282,7 +282,7 @@ class _FakeCliProcess:
         self.returncode = self.returncode if self.returncode is not None else 137
 
 
-def test_history_runs_list_uses_execution_bound_runs_and_ignores_unbound_directories(service_config_path):
+def test_runs_list_uses_execution_bound_runs_and_ignores_unbound_directories(service_config_path):
     runs_root = _project_runs_root()
     unbound_run = runs_root / "unbound_run_20260508_010203"
     _create_run_workspace(unbound_run)
@@ -292,12 +292,10 @@ def test_history_runs_list_uses_execution_bound_runs_and_ignores_unbound_directo
     bound_run = runs_root / "bound_run_20260508_010204"
     bound = _create_execution_bound_run(client, bound_run, title="DB bound scan")
 
-    history_runs = client.get("/api/dataflow-vuln-scanner/history-runs", params={"project_id": "default"})
-    assert history_runs.status_code == 200
-    runs = client.get("/api/dataflow-vuln-scanner/runs", params={"project_id": "default"})
-    assert runs.status_code == 200
-    items = history_runs.json()
-    run_items = runs.json()
+    response = client.get("/api/dataflow-vuln-scanner/runs", params={"project_id": "default"})
+    assert response.status_code == 200
+    items = response.json()
+    run_items = items
     names = {item["name"] for item in items}
     run_names = {item["name"] for item in run_items}
     assert bound_run.name in names
@@ -307,7 +305,7 @@ def test_history_runs_list_uses_execution_bound_runs_and_ignores_unbound_directo
 
     summary = next(item for item in items if item["name"] == bound_run.name)
     run_summary = next(item for item in run_items if item["name"] == bound_run.name)
-    assert run_summary["run_id"] == summary["history_run_id"]
+    assert run_summary["run_id"] == summary["run_id"]
     assert summary["source_type"] == "execution_workspace"
     assert summary["linked_task_id"] == bound["task_id"]
     assert summary["linked_execution_id"] == bound["execution_id"]
@@ -317,10 +315,10 @@ def test_history_runs_list_uses_execution_bound_runs_and_ignores_unbound_directo
     task_summary = next(item for item in tasks.json() if item["task_id"] == bound["task_id"])
     assert task_summary["title"] == "DB bound scan"
     assert task_summary["run"]["run_id"] == run_summary["run_id"]
-    assert task_summary["latest_run"]["history_run_id"] == summary["history_run_id"]
+    assert task_summary["latest_run"]["run_id"] == summary["run_id"]
 
 
-def test_history_run_resolve_only_returns_execution_bound_records(service_config_path):
+def test_run_resolve_only_returns_execution_bound_records(service_config_path):
     runs_root = _project_runs_root()
     unbound_run = runs_root / "unbound_resolve_20260508_010203"
     _create_run_workspace(unbound_run)
@@ -331,26 +329,26 @@ def test_history_run_resolve_only_returns_execution_bound_records(service_config
     bound = _create_execution_bound_run(client, bound_run)
 
     resolve_bound = client.get(
-        "/api/dataflow-vuln-scanner/history-runs/resolve",
+        "/api/dataflow-vuln-scanner/runs/resolve",
         params={"project_id": "default", "run_name": bound_run.name, "root_path": str(bound_run.parent)},
     )
     assert resolve_bound.status_code == 200
-    assert resolve_bound.json()["history_run_id"] == bound["history_run_id"]
+    assert resolve_bound.json()["run_id"] == bound["run_id"]
 
     resolve_unbound = client.get(
-        "/api/dataflow-vuln-scanner/history-runs/resolve",
+        "/api/dataflow-vuln-scanner/runs/resolve",
         params={"project_id": "default", "run_name": unbound_run.name, "root_path": str(unbound_run.parent)},
     )
     assert resolve_unbound.status_code == 404
 
 
-def test_history_run_refreshes_after_execution_directory_changes(service_config_path):
+def test_run_refreshes_after_execution_directory_changes(service_config_path):
     app = create_app()
     client = TestClient(app)
     bound_run = _project_runs_root() / "bound_refresh_20260508_010203"
     bound = _create_execution_bound_run(client, bound_run)
 
-    detail_before = client.get(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    detail_before = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail_before.status_code == 200
     assert not any(item["path"] == "supporting_docs/new_note.md" for item in detail_before.json()["files"])
 
@@ -358,18 +356,18 @@ def test_history_run_refreshes_after_execution_directory_changes(service_config_
     atomic = bound_run / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
     _write(atomic / "supporting_docs" / "new_note.md", "# New note\n")
 
-    detail_after = client.get(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    detail_after = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail_after.status_code == 200
     assert any(item["path"] == "supporting_docs/new_note.md" for item in detail_after.json()["files"])
 
 
-def test_history_run_reparses_when_atomic_work_path_was_stale(service_config_path):
+def test_run_reparses_when_atomic_work_path_was_stale(service_config_path):
     app = create_app()
     client = TestClient(app)
     bound = _create_execution_bound_run(client, _project_runs_root() / "bound_atomic_refresh_20260508_010203")
 
     with get_db_session() as db:
-        row = db.get(HistoryRun, bound["history_run_id"])
+        row = db.get(HistoryRun, bound["run_id"])
         assert row is not None
         row.atomic_work_path = ""
         row.cycles_used = 0
@@ -378,7 +376,7 @@ def test_history_run_reparses_when_atomic_work_path_was_stale(service_config_pat
         db.add(row)
         db.commit()
 
-    detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail.status_code == 200
     payload = detail.json()
     assert payload["atomic_work_path"].endswith("vuln_scan_initial_001")
@@ -386,7 +384,7 @@ def test_history_run_reparses_when_atomic_work_path_was_stale(service_config_pat
     assert payload["results"]
 
 
-def test_history_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
+def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)
     monkeypatch.setattr(get_scheduler_service(), "start_execution_now", lambda execution_id: False)
@@ -394,21 +392,21 @@ def test_history_run_retry_queue_cancel_and_delete(service_config_path, monkeypa
     bound = _create_execution_bound_run(client, run_root)
 
     completed_retry_response = client.post(
-        f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}/retry",
+        f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
         json={"extra_cycles": 2},
     )
     assert completed_retry_response.status_code == 409
     assert "not retryable" in completed_retry_response.json()["detail"]
 
     with get_db_session() as db:
-        history_run = db.get(HistoryRun, bound["history_run_id"])
+        history_run = db.get(HistoryRun, bound["run_id"])
         assert history_run is not None
         history_run.status = "failed"
         db.add(history_run)
         db.commit()
 
     retry_response = client.post(
-        f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}/retry",
+        f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
         json={"extra_cycles": 2},
     )
     assert retry_response.status_code == 202
@@ -417,30 +415,30 @@ def test_history_run_retry_queue_cancel_and_delete(service_config_path, monkeypa
     assert retry_payload["linked_task_id"]
     assert retry_payload["linked_execution_id"]
 
-    detail_queued = client.get(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    detail_queued = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail_queued.status_code == 200
     assert detail_queued.json()["status"] == "queued"
 
-    cancel_response = client.post(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}/cancel")
+    cancel_response = client.post(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/cancel")
     assert cancel_response.status_code == 200
     assert cancel_response.json()["status"] == "cancelled"
 
-    delete_response = client.delete(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    delete_response = client.delete(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert delete_response.status_code == 200
     assert delete_response.json()["status"] == "deleted"
     assert not run_root.exists()
 
-    missing_detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    missing_detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert missing_detail.status_code == 404
 
 
-def test_history_run_cancel_active_run_signals_bound_process(service_config_path):
+def test_run_cancel_active_run_signals_bound_process(service_config_path):
     app = create_app()
     client = TestClient(app)
     bound = _create_execution_bound_run(client, _project_runs_root() / "bound_cancel_active_20260508_010203")
 
     with get_db_session() as db:
-        history_run = db.get(HistoryRun, bound["history_run_id"])
+        history_run = db.get(HistoryRun, bound["run_id"])
         execution = db.get(WorkflowExecution, bound["execution_id"])
         trigger = db.get(TriggerTask, bound["task_id"])
         assert history_run is not None and execution is not None and trigger is not None
@@ -455,7 +453,7 @@ def test_history_run_cancel_active_run_signals_bound_process(service_config_path
     fake_process = _FakeCliProcess()
     get_execution_service()._register_cli_process(bound["execution_id"], fake_process)
 
-    cancel_response = client.post(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}/cancel")
+    cancel_response = client.post(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/cancel")
     assert cancel_response.status_code == 200
     cancel_payload = cancel_response.json()
     assert cancel_payload["status"] == "cancel_requested"
@@ -466,19 +464,19 @@ def test_history_run_cancel_active_run_signals_bound_process(service_config_path
 
     with get_db_session() as db:
         execution = db.get(WorkflowExecution, bound["execution_id"])
-        history_run = db.get(HistoryRun, bound["history_run_id"])
+        history_run = db.get(HistoryRun, bound["run_id"])
         assert execution is not None and execution.status == "cancel_requested"
         assert history_run is not None and history_run.status == "cancel_requested"
 
 
-def test_history_run_delete_active_run_stops_process_and_removes_records(service_config_path, monkeypatch):
+def test_run_delete_active_run_stops_process_and_removes_records(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)
     run_root = _project_runs_root() / "bound_delete_active_20260508_010203"
     bound = _create_execution_bound_run(client, run_root)
 
     with get_db_session() as db:
-        history_run = db.get(HistoryRun, bound["history_run_id"])
+        history_run = db.get(HistoryRun, bound["run_id"])
         execution = db.get(WorkflowExecution, bound["execution_id"])
         trigger = db.get(TriggerTask, bound["task_id"])
         assert history_run is not None and execution is not None and trigger is not None
@@ -502,7 +500,7 @@ def test_history_run_delete_active_run_stops_process_and_removes_records(service
     service._register_cli_process(bound["execution_id"], fake_process)
     monkeypatch.setattr(type(service), "_wait_until_execution_inactive", lambda self, db, execution_id, timeout_seconds: True)
 
-    delete_response = client.delete(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    delete_response = client.delete(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert delete_response.status_code == 200
     delete_payload = delete_response.json()
     assert delete_payload["status"] == "deleted"
@@ -513,20 +511,20 @@ def test_history_run_delete_active_run_stops_process_and_removes_records(service
     assert not run_root.exists()
 
     with get_db_session() as db:
-        assert db.get(HistoryRun, bound["history_run_id"]) is None
+        assert db.get(HistoryRun, bound["run_id"]) is None
         assert db.get(TriggerTask, bound["task_id"]) is None
         assert db.get(WorkflowExecution, bound["execution_id"]) is None
         assert db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id == bound["execution_id"]).count() == 0
 
 
-def test_history_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypatch):
+def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)
     run_root = _project_runs_root() / "bound_resume_cli_20260508_010203"
     bound = _create_execution_bound_run(client, run_root)
 
     with get_db_session() as db:
-        history_run = db.get(HistoryRun, bound["history_run_id"])
+        history_run = db.get(HistoryRun, bound["run_id"])
         assert history_run is not None
         history_run.status = "cancelled"
         db.add(history_run)
@@ -541,7 +539,7 @@ def test_history_run_retry_execution_uses_resume_cli_argv(service_config_path, m
     monkeypatch.setattr(type(get_execution_service()), "_invoke_run_vuln_scan_cli", fake_invoke)
 
     retry_response = client.post(
-        f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}/retry",
+        f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/retry",
         json={"extra_cycles": 2, "model": "mock/override", "thinking": "low"},
     )
     assert retry_response.status_code == 202
@@ -557,7 +555,7 @@ def test_history_run_retry_execution_uses_resume_cli_argv(service_config_path, m
     assert "--thinking" not in captured["argv"]
 
 
-def test_history_run_status_prefers_active_run_meta_over_stale_terminal_state(service_config_path):
+def test_run_status_prefers_active_run_meta_over_stale_terminal_state(service_config_path):
     app = create_app()
     client = TestClient(app)
     run_root = _project_runs_root() / "bound_running_meta_20260508_010203"
@@ -568,12 +566,12 @@ def test_history_run_status_prefers_active_run_meta_over_stale_terminal_state(se
         "status": "running",
     })
 
-    detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail.status_code == 200
     assert detail.json()["status"] == "running"
 
 
-def test_history_run_status_preserves_specific_terminal_workflow_result(service_config_path):
+def test_run_status_preserves_specific_terminal_workflow_result(service_config_path):
     app = create_app()
     client = TestClient(app)
     run_root = _project_runs_root() / "bound_specific_failed_20260508_010203"
@@ -591,12 +589,12 @@ def test_history_run_status_preserves_specific_terminal_workflow_result(service_
         "detail": {"cycles_used": 2, "error": "summary/ledger sync incomplete"},
     })
 
-    detail = client.get(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}")
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
     assert detail.status_code == 200
     assert detail.json()["status"] == "summary_incomplete"
 
 
-def test_history_run_sessions_expose_stdout_soft_limit_metadata(service_config_path):
+def test_run_sessions_expose_stdout_soft_limit_metadata(service_config_path):
     app = create_app()
     client = TestClient(app)
     run_root = _project_runs_root() / "bound_session_limit_20260508_010203"
@@ -614,7 +612,7 @@ def test_history_run_sessions_expose_stdout_soft_limit_metadata(service_config_p
         "events_truncated_count": 3,
     })
 
-    sessions_response = client.get(f"/api/dataflow-vuln-scanner/history-runs/{bound['history_run_id']}/sessions")
+    sessions_response = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/sessions")
     assert sessions_response.status_code == 200
     call_session = next(item for item in sessions_response.json() if item["format"] == "calls")
     call = call_session["calls"][0]
