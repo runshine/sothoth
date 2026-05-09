@@ -2237,6 +2237,9 @@ class TaskManager:
             return get_dataflow_vuln_scanner_client().retry_task(downstream_task_id, token or "")
         raise ValidationError(f"阶段 {stage_name} 未配置安全重试接口")
 
+    def _has_retryable_downstream_task(self, item: BinarySecurityStageItem) -> bool:
+        return bool(str(item.downstream_task_id or "").strip())
+
     def _stage_retry_support(
         self,
         db: Session,
@@ -2270,9 +2273,7 @@ class TaskManager:
             if logical_key in seen:
                 return False, f"阶段 {stage_name} 存在重复历史 item，无法安全重试: {item.item_key}"
             seen.add(logical_key)
-            if not str(item.downstream_task_id or "").strip():
-                return False, f"阶段 {stage_name} 存在缺少下游任务ID的子任务，无法安全重试"
-            if item.downstream_service != expected_service:
+            if item.downstream_service and item.downstream_service != expected_service:
                 return False, (
                     f"阶段 {stage_name} 下游服务不匹配，期望 {expected_service}，实际 {item.downstream_service or '-'}"
                 )
@@ -2566,7 +2567,7 @@ class TaskManager:
                 running_status="queued",
             )
             session.commit()
-            if retrying:
+            if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
             else:
                 created = await get_firmware_unpacker_client().create_task(
@@ -2767,7 +2768,7 @@ class TaskManager:
                 retrying=retrying,
             )
             session.commit()
-            if retrying:
+            if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
             else:
                 created = await get_system_analyse_client().create_task(
@@ -3398,7 +3399,7 @@ class TaskManager:
             )
             session.commit()
             elf_path = self._choose_module_binary(module)
-            if retrying:
+            if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
             else:
                 created = await get_binary_to_source_client().create_task(
@@ -3511,7 +3512,7 @@ class TaskManager:
                 retrying=retrying,
             )
             session.commit()
-            if retrying:
+            if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
             else:
                 created = await get_entry_analyse_client().create_task(
@@ -3651,7 +3652,7 @@ class TaskManager:
             )
             session.commit()
             prompt = f"分析文件 {entry['file_name']} 中函数 {entry['function_name']} 的外部输入数据流"
-            if retrying:
+            if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
             else:
                 created = await get_dataflow_analyse_client().create_task(
@@ -3728,7 +3729,7 @@ class TaskManager:
             vuln_workspace = ensure_dir(Path(task.workspace_root) / "run" / "dataflow-vuln-scanner" / dataflow_result["entry_key"] / "workspace")
             vuln_output = vuln_workspace / "output"
             ensure_dir(vuln_output)
-            if retrying:
+            if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=token)
             else:
                 created = await get_dataflow_vuln_scanner_client().create_task(
@@ -3796,8 +3797,8 @@ class TaskManager:
 
     def _aggregate_stage_items(self, db: Session, task: BinarySecurityTask, results: list[dict[str, Any]], summary_key: str) -> tuple[str, dict[str, Any]]:
         success = [result["item"] for result in results if result.get("status") == "success"]
-        failed = [result for result in results if result.get("status") == "failed"]
-        cancelled = [result for result in results if result.get("status") == "cancelled"]
+        failed = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "failed"]
+        cancelled = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "cancelled"]
         if failed and success:
             status = "partial_success"
         elif failed:
@@ -3819,6 +3820,27 @@ class TaskManager:
         task.summary = {**task.summary, summary_key: success}
         db.commit()
         return status, summary
+
+    def _lightweight_stage_failure(self, result: dict[str, Any]) -> dict[str, Any]:
+        item = result.get("item") or {}
+        if not isinstance(item, dict):
+            item = {}
+        error = str(result.get("error") or "")[:1000]
+        return {
+            "status": result.get("status"),
+            "error": error,
+            "item": {
+                "firmware_key": item.get("firmware_key"),
+                "firmware_name": item.get("firmware_name"),
+                "module_key": item.get("module_key"),
+                "module_name": item.get("module_name"),
+                "entry_key": item.get("entry_key"),
+                "function_name": item.get("function_name"),
+                "file_name": item.get("file_name"),
+                "line_no": item.get("line_no"),
+                "source_dir": item.get("source_dir"),
+            },
+        }
 
     def _fileserver_task_path(self, task_id: str, suffix: str | None = None) -> str:
         base = f"/app/secflow-app-binary-security/{task_id}"

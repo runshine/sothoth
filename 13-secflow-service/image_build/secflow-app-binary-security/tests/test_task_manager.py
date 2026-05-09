@@ -372,6 +372,83 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.target_stage_name)
         self.assertNotIn("stage_retry_context", task.summary)
 
+    def test_stage_retry_support_allows_missing_downstream_task_id(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="partial_success",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+        )
+        db = _ModelAwareDb(stage_runs=[run], stage_items=[item])
+
+        supported, reason = self.manager._stage_retry_support(db, task, "entry_analysis")
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+        self.assertFalse(self.manager._has_retryable_downstream_task(item))
+
+    def test_stage_retry_support_still_rejects_downstream_service_mismatch(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="partial_success",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            downstream_service="system_analyse",
+            downstream_task_id=None,
+        )
+        db = _ModelAwareDb(stage_runs=[run], stage_items=[item])
+
+        supported, reason = self.manager._stage_retry_support(db, task, "entry_analysis")
+
+        self.assertFalse(supported)
+        self.assertIn("下游服务不匹配", reason or "")
+
     def test_stage_enabled_uses_policy_override(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         task.policy = {"stage_options": {"vuln_scan": {"enabled": False}}}
@@ -725,7 +802,7 @@ class TaskManagerTests(unittest.TestCase):
             refs,
         )
 
-    def test_stage_retry_support_requires_downstream_task_id(self):
+    def test_stage_retry_support_allows_missing_downstream_task_id_for_recreate(self):
         task = BinarySecurityTask(
             id="task1",
             project_id="p1",
@@ -754,8 +831,8 @@ class TaskManagerTests(unittest.TestCase):
             "firmware_unpack",
         )
 
-        self.assertFalse(supported)
-        self.assertIn("缺少下游任务ID", reason or "")
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
 
     def test_stage_retry_support_rejects_duplicate_history_items(self):
         task = BinarySecurityTask(
