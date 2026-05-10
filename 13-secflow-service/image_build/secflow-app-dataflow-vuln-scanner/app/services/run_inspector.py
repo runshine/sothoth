@@ -149,15 +149,29 @@ def _sorted_json_files(directory: Path, pattern: str = "cycle_*.json") -> list[P
     return sorted(directory.glob(pattern))
 
 
+def _runtime_dir(run_dir: Path) -> Path:
+    runtime = run_dir / "run"
+    if runtime.is_dir() and (
+        (runtime / "config.json").exists()
+        or (runtime / "_meta").exists()
+        or (runtime / "workspace").exists()
+        or (runtime / "ws").exists()
+    ):
+        return runtime
+    return run_dir
+
+
 def _atomic_candidate_search_roots(run_dir: Path, config: dict[str, Any]) -> list[Path]:
+    runtime = _runtime_dir(run_dir)
     workspace_candidates: list[Path] = []
     workspace_root = str((config.get("global") or {}).get("workspace_root") or "").strip()
     if workspace_root:
         workspace_candidates.append(Path(from_msys_path(workspace_root) or workspace_root))
         workspace_name = Path(workspace_root).name
         if workspace_name:
+            workspace_candidates.append(runtime / workspace_name)
             workspace_candidates.append(run_dir / workspace_name)
-    workspace_candidates.extend([run_dir / "workspace", run_dir / "ws", run_dir])
+    workspace_candidates.extend([runtime / "workspace", runtime / "ws", runtime, run_dir / "workspace", run_dir / "ws", run_dir])
 
     unique: list[Path] = []
     seen: set[str] = set()
@@ -198,7 +212,8 @@ def _atomic_candidate_score(candidate: Path) -> tuple[int, int]:
 
 
 def _find_atomic_work_dir(run_dir: Path) -> Path | None:
-    config = _read_json(run_dir / "config.json")
+    runtime = _runtime_dir(run_dir)
+    config = _read_json(runtime / "config.json") or _read_json(run_dir / "config.json")
     candidates: list[tuple[int, int, int, Path]] = []
     fallback_candidates: list[tuple[int, Path]] = []
     seen: set[str] = set()
@@ -581,7 +596,8 @@ def _extract_config_summary(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _read_run_timestamps(run_dir: Path) -> dict[str, Any]:
-    return _read_json(run_dir / "_meta" / "run_timestamps.json")
+    runtime = _runtime_dir(run_dir)
+    return _read_json(runtime / "_meta" / "run_timestamps.json") or _read_json(run_dir / "_meta" / "run_timestamps.json")
 
 
 def _normalize_run_status(raw_status: str, run_meta: dict[str, Any] | None = None) -> str:
@@ -630,7 +646,10 @@ def _find_last_activity(atomic: Path | None, run_dir: Path) -> str:
                         break
             except Exception:
                 continue
-    log_path = run_dir / "run.log"
+    runtime = _runtime_dir(run_dir)
+    log_path = runtime / "run.log"
+    if not log_path.is_file():
+        log_path = run_dir / "run.log"
     if log_path.is_file():
         try:
             candidates.append(datetime.fromtimestamp(log_path.stat().st_mtime, tz=timezone.utc).isoformat())
@@ -804,7 +823,8 @@ def inspect_run_summary(workspace_root: str | Path) -> dict[str, Any]:
     run_dir = Path(workspace_root)
     if not run_dir.is_dir():
         return {"status": "pending", "cycles_used": 0, "result_count": 0}
-    config = _read_json(run_dir / "config.json")
+    runtime = _runtime_dir(run_dir)
+    config = _read_json(runtime / "config.json") or _read_json(run_dir / "config.json")
     cfg_summary = _extract_config_summary(config)
     atomic = _find_atomic_work_dir(run_dir)
     run_meta = _read_run_timestamps(run_dir)
@@ -859,7 +879,8 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
     run_dir = Path(workspace_root)
     if not run_dir.is_dir():
         raise HTTPException(404, "run workspace not found")
-    config = _read_json(run_dir / "config.json")
+    runtime = _runtime_dir(run_dir)
+    config = _read_json(runtime / "config.json") or _read_json(run_dir / "config.json")
     cfg_summary = _extract_config_summary(config)
     atomic = _find_atomic_work_dir(run_dir)
     run_meta = _read_run_timestamps(run_dir)
@@ -1144,10 +1165,15 @@ def inspect_files(workspace_root: str | Path, limit: int = 1200) -> list[dict[st
             if len(entries) >= limit:
                 return
 
+    runtime = _runtime_dir(run_dir)
+    add(runtime / "config.json", run_dir, "Run")
+    add(runtime / "run.log", run_dir, "Run")
     add(run_dir / "config.json", run_dir, "Run Root")
     add(run_dir / "run.log", run_dir, "Run Root")
+    add(runtime / "execution_meta.json", run_dir, "Run")
     add(run_dir / "execution_meta.json", run_dir, "Run Root")
     add_glob(run_dir / "input", "**/*.md", run_dir, "Input")
+    add_glob(runtime / "input", "**/*.md", run_dir, "Run / Input")
     add_glob(run_dir / "trigger_inputs", "**/*.md", run_dir, "Input")
     if atomic:
         add(atomic / "summary.md", atomic, "Outputs")
@@ -1221,7 +1247,11 @@ def inspect_session_file(workspace_root: str | Path, path: str) -> dict[str, Any
 
 
 def inspect_log(workspace_root: str | Path, lines: int = 300) -> dict[str, str]:
-    log_path = Path(workspace_root) / "run.log"
+    run_dir = Path(workspace_root)
+    runtime = _runtime_dir(run_dir)
+    log_path = runtime / "run.log"
+    if not log_path.is_file():
+        log_path = run_dir / "run.log"
     if not log_path.is_file():
         return {"content": "(no log file)"}
     return {"content": _tail_lines(log_path, lines)}

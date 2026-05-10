@@ -368,7 +368,10 @@ class ExecutionService:
                 run_index = None
             if not task_markdown and run_index is not None:
                 try:
-                    task_markdown = (Path(run_index.run_root_path) / "input" / "task.md").read_text(encoding="utf-8")
+                    task_path = Path(run_index.run_root_path) / "run" / "input" / "task.md"
+                    if not task_path.exists():
+                        task_path = Path(run_index.run_root_path) / "input" / "task.md"
+                    task_markdown = task_path.read_text(encoding="utf-8")
                 except (FileNotFoundError, TypeError):
                     task_markdown = ""
             attempts.append(self._attempt_response(item, run_id=run_index.id if run_index else None))
@@ -1002,6 +1005,8 @@ class ExecutionService:
         if not run_dir.is_dir():
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"resume_run_dir not found: {run_dir}")
         task_md_path = run_dir / "run" / "input" / "task.md"
+        if not task_md_path.exists():
+            task_md_path = run_dir / "input" / "task.md"
         return {
             "launcher": "run_vuln_scan.py",
             "mode": "resume",
@@ -1204,7 +1209,7 @@ class ExecutionService:
         task.task_md_path = task_md_path
         trigger.input_tasks_json = TaskManifest(tasks=[task, *manifest.tasks[1:]]).model_dump(mode="json")
 
-    def _materialize_dataflow_scan_inputs(self, *, task_input_dir: Path, metadata: Dict[str, Any]) -> tuple[str | None, Dict[str, Any]]:
+    def _materialize_dataflow_scan_inputs(self, *, materialized_input_dir: Path, metadata: Dict[str, Any]) -> tuple[str | None, Dict[str, Any]]:
         request = metadata.get("dataflow_scan_request")
         if not isinstance(request, dict):
             return None, {}
@@ -1237,7 +1242,7 @@ class ExecutionService:
         effective_output_base = output_base
         if workspace_base is not None and effective_output_base is None:
             effective_output_base = workspace_base / "output"
-        scan_input_dir = ensure_dir(task_input_dir / "dataflow_scan")
+        scan_input_dir = ensure_dir(materialized_input_dir / "dataflow_scan")
         data_flow_name = sanitize_name(str(data_flow_ref.get("filename") or source_data_flow.name or "data_flow.md"))
         data_flow_target = scan_input_dir / "data_flow" / data_flow_name
         source_target = scan_input_dir / "source"
@@ -1274,7 +1279,9 @@ class ExecutionService:
         workspace_root: Path,
         entry_input_task_type: str,
     ) -> List[TaskItem]:
-        task_inputs_root = ensure_dir(workspace_root / "trigger_inputs")
+        metadata_tasks_root = ensure_dir(workspace_root / "input" / "tasks")
+        runtime_tasks_root = ensure_dir(workspace_root / "run" / "input" / "tasks")
+        materialized_tasks_root = ensure_dir(workspace_root / "run" / "materialized_inputs" / "tasks")
         normalized: List[TaskItem] = []
         if not input_tasks:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="input_tasks must not be empty")
@@ -1290,14 +1297,15 @@ class ExecutionService:
                 )
             task_id = raw_task.task_id or _new_id(f"task{index}")
             task_slug = sanitize_name(task_id)
-            task_dir = ensure_dir(task_inputs_root / task_slug)
-            input_dir = ensure_dir(task_dir / "input")
+            metadata_dir = ensure_dir(metadata_tasks_root / task_slug)
+            runtime_input_dir = ensure_dir(runtime_tasks_root / task_slug)
+            materialized_input_dir = ensure_dir(materialized_tasks_root / task_slug)
             metadata = dict(raw_task.metadata or {})
             markdown = raw_task.task_markdown
             if markdown is None and raw_task.task_md_path:
                 markdown = Path(raw_task.task_md_path).read_text(encoding="utf-8")
             generated_markdown, materialized_inputs = self._materialize_dataflow_scan_inputs(
-                task_input_dir=input_dir,
+                materialized_input_dir=materialized_input_dir,
                 metadata=metadata,
             )
             if generated_markdown:
@@ -1308,16 +1316,27 @@ class ExecutionService:
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"task {task_id} missing task_markdown",
                 )
-            task_md_path = write_text(input_dir / "task.md", markdown.strip() + "\n")
-            copied_inputs = self._copy_uploaded_inputs_to_task_dir(project_id=project_id, task_input_dir=input_dir, metadata=metadata)
+            task_content = markdown.strip() + "\n"
+            task_md_path = write_text(runtime_input_dir / "task.md", task_content)
+            copied_inputs = self._copy_uploaded_inputs_to_task_dir(
+                project_id=project_id,
+                task_input_dir=materialized_input_dir,
+                metadata=metadata,
+            )
+            import hashlib
+
             write_json(
-                input_dir / "task.json",
+                metadata_dir / "task.json",
                 {
+                    "schema_version": 1,
                     "task_id": task_id,
                     "task_type": entry_input_task_type,
                     "title": raw_task.title,
                     "metadata": metadata,
                     "upstream_refs": raw_task.upstream_refs,
+                    "task_md_path": abs_path(task_md_path),
+                    "task_md_content_length": len(task_content),
+                    "task_md_sha256": hashlib.sha256(task_content.encode("utf-8")).hexdigest(),
                     "copied_input_files": copied_inputs,
                 },
             )
@@ -1346,7 +1365,7 @@ class ExecutionService:
             return None
         if not markdown.strip():
             return None
-        task_file = write_text(workspace_root / "input" / "task.md", markdown.strip() + "\n")
+        task_file = write_text(workspace_root / "run" / "input" / "task.md", markdown.strip() + "\n")
         return abs_path(task_file)
 
     def _build_project_workspace_root(
@@ -1366,10 +1385,10 @@ class ExecutionService:
         base_root = Path(subproject["root_dir"])
         return ensure_dir(
             base_root
-            / "scan-profiles"
-            / sanitize_name(definition.id)
-            / "tasks"
+            / "app"
+            / "secflow-app-dataflow-vuln-scanner"
             / sanitize_name(trigger_id)
+            / "run"
             / "executions"
             / sanitize_name(execution_id)
         )
@@ -1595,6 +1614,7 @@ class ExecutionService:
             .filter(WorkflowExecution.trigger_task_id == trigger.id)
             .count()
         ) + 1
+        request = {**request, "task_id": trigger.id}
         plan = self._build_dataflow_cli_plan(
             project_id=definition.project_id,
             request=request,
@@ -1752,6 +1772,12 @@ class ExecutionService:
         candidate = Path(atomic_work_path) / "_meta" / "results_manifest.json"
         return abs_path(candidate) if candidate.exists() else None
 
+    def _run_index_task_md_path(self, run_index) -> str:
+        candidate = Path(run_index.run_root_path) / "run" / "input" / "task.md"
+        if not candidate.exists():
+            candidate = Path(run_index.run_root_path) / "input" / "task.md"
+        return abs_path(candidate)
+
     def _run_index_adoption_manifest(self, run_index) -> dict[str, Any]:
         return TaskManifest(
             tasks=[
@@ -1759,7 +1785,7 @@ class ExecutionService:
                     task_id=_new_id("task"),
                     task_type="dataflow_vuln_scan_cli",
                     title=f"Run {run_index.run_name}",
-                    task_md_path=abs_path(Path(run_index.run_root_path) / "input" / "task.md"),
+                    task_md_path=self._run_index_task_md_path(run_index),
                     metadata={
                         "run_adoption": {
                             "run_id": run_index.id,
@@ -1882,7 +1908,7 @@ class ExecutionService:
                     task_id=_new_id("task"),
                     task_type="dataflow_vuln_scan_cli",
                     title=f"Resume {run_index.run_name}",
-                    task_md_path=abs_path(Path(run_index.run_root_path) / "input" / "task.md"),
+                    task_md_path=self._run_index_task_md_path(run_index),
                     metadata={
                         "dataflow_scan_request": request,
                         "run_retry": {
@@ -3268,9 +3294,11 @@ class ExecutionService:
             )
             entry_task_file = single_task_entry_file or service_manifest.tasks[0].task_md_path
             launcher_mode = "rest_service_cli" if single_task_entry_file else "rest_service"
+            runtime_root = ensure_dir(workspace_root / "run")
+            runtime_workspace_root = ensure_dir(runtime_root / "workspace")
             runtime_config = build_runtime_framework_config(
                 compiled_config,
-                workspace_root=abs_path(workspace_root),
+                workspace_root=abs_path(runtime_workspace_root),
                 execution_id=execution.id,
                 input_task_file=entry_task_file,
                 input_task_id=service_manifest.tasks[0].task_id,
@@ -3278,9 +3306,9 @@ class ExecutionService:
                 summary_file=abs_path((custom_output_dir or (workspace_root / "output")) / "execution_summary.json"),
                 runtime_mode=launcher_mode,
             )
-            write_json(workspace_root / "config.json", runtime_config.model_dump(mode="json"))
+            write_json(runtime_root / "config.json", runtime_config.model_dump(mode="json"))
             write_json(
-                workspace_root / "_meta" / "run_timestamps.json",
+                runtime_root / "_meta" / "run_timestamps.json",
                 {
                     "started_at": isoformat_local(now_local()),
                     "status": "running",
@@ -3290,7 +3318,7 @@ class ExecutionService:
             )
             get_run_index_service().sync_execution_run(db, execution)
             db.commit()
-            log_path = attach_log_file(abs_path(workspace_root / "run.log"))
+            log_path = attach_log_file(abs_path(runtime_root / "run.log"))
             self.record_event(
                 db,
                 execution_id=execution.id,
@@ -3305,7 +3333,7 @@ class ExecutionService:
                 },
             )
             observer = DbExecutionObserver(execution.id)
-            recorder = DbExecutionRecorder(abs_path(workspace_root), execution.id)
+            recorder = DbExecutionRecorder(abs_path(runtime_workspace_root), execution.id)
             ensure_event_loop_policy()
             try:
                 artifacts = asyncio.run(
@@ -3337,7 +3365,7 @@ class ExecutionService:
             )
             db.commit()
             write_json(
-                workspace_root / "_meta" / "run_timestamps.json",
+                workspace_root / "run" / "_meta" / "run_timestamps.json",
                 {
                     "started_at": isoformat_local(execution.started_at or trigger.started_at or now_local()),
                     "finished_at": isoformat_local(now_local()),
@@ -3374,7 +3402,7 @@ class ExecutionService:
                 workspace_root = Path(execution.workspace_root) if execution.workspace_root else None
                 if workspace_root:
                     write_json(
-                        workspace_root / "_meta" / "run_timestamps.json",
+                        workspace_root / "run" / "_meta" / "run_timestamps.json",
                         {
                             "started_at": isoformat_local(execution.started_at or trigger.started_at or now_local()),
                             "finished_at": isoformat_local(now_local()),
@@ -3403,7 +3431,7 @@ class ExecutionService:
             workspace_root = Path(execution.workspace_root) if execution.workspace_root else None
             if workspace_root:
                 write_json(
-                    workspace_root / "_meta" / "run_timestamps.json",
+                    workspace_root / "run" / "_meta" / "run_timestamps.json",
                     {
                         "started_at": isoformat_local(execution.started_at or trigger.started_at or now_local()),
                         "finished_at": isoformat_local(now_local()),

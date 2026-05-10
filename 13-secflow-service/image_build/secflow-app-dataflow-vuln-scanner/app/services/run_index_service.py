@@ -111,8 +111,18 @@ def _compute_source_mtime(path: Path) -> float:
 
 
 def _compute_source_mtime_hint(run_root: Path, atomic_work_path: str | None = None) -> float:
+    runtime_root = run_root / "run"
     candidates: list[Path] = [
         run_root,
+        runtime_root,
+        runtime_root / "_meta",
+        runtime_root / "_meta" / "run_timestamps.json",
+        runtime_root / "_meta" / "process.json",
+        runtime_root / "input",
+        runtime_root / "workspace",
+        runtime_root / "ws",
+        runtime_root / "config.json",
+        runtime_root / "run.log",
         run_root / "_meta",
         run_root / "_meta" / "run_timestamps.json",
         run_root / "_meta" / "process.json",
@@ -233,6 +243,9 @@ def _task_markdown_for_run(run_root: Path) -> str:
         content = _read_text_file(candidate)
         if content:
             return content
+    content = _read_text_file(run_root / "run" / "input" / "task.md")
+    if content:
+        return content
     content = _read_text_file(run_root / "input" / "task.md")
     if content:
         return content
@@ -314,7 +327,7 @@ def _execution_started_command_payload(db: Session, linked_execution: WorkflowEx
 
 
 def _process_file_command_payload(run_root: Path) -> dict[str, Any]:
-    payload = _read_json_file(run_root / "_meta" / "process.json")
+    payload = _read_json_file(run_root / "run" / "_meta" / "process.json") or _read_json_file(run_root / "_meta" / "process.json")
     return _normalize_command_payload(payload)
 
 
@@ -664,7 +677,7 @@ class RunIndexService:
         sessions = inspect_sessions(run_root)
         files = inspect_files(run_root, limit=20000)
         run_log = inspect_log(run_root, lines=2000).get("content", "")
-        run_timestamps = _read_json_file(run_root / "_meta" / "run_timestamps.json")
+        run_timestamps = _read_json_file(run_root / "run" / "_meta" / "run_timestamps.json") or _read_json_file(run_root / "_meta" / "run_timestamps.json")
         started_at = _parse_datetime(str(run_timestamps.get("started_at") or "")) or _datetime_from_epoch(summary.get("start_epoch"))
         finished_at = _parse_datetime(str(run_timestamps.get("finished_at") or ""))
         last_activity_at = _parse_datetime(str(detail.get("last_activity") or "")) or finished_at
@@ -672,7 +685,9 @@ class RunIndexService:
             duration = int(summary.get("duration_seconds") or 0)
             if started_at and duration > 0:
                 finished_at = started_at + timedelta(seconds=duration)
-        log_path = run_root / "run.log"
+        log_path = run_root / "run" / "run.log"
+        if not log_path.is_file():
+            log_path = run_root / "run.log"
         atomic_work_path = _detail_atomic_work_path(detail)
         raw_summary = {
             "start_time": str(summary.get("start_time") or ""),

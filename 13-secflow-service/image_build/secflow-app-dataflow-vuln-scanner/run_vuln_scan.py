@@ -50,7 +50,11 @@ def _now_iso() -> str:
 
 
 def _runtime_dir_for_run(run_dir: str | Path) -> Path:
-    return Path(run_dir) / "run"
+    root = Path(run_dir)
+    runtime = root / "run"
+    if (root / "config.json").exists() and not (runtime / "config.json").exists():
+        return root
+    return runtime
 
 
 def _run_timestamps_path(run_dir: str | Path) -> Path:
