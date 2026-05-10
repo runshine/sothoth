@@ -11,6 +11,141 @@ import httpx
 from app.config import get_config
 from app.exception import InternalError, NotFoundError, ValidationError
 
+_DEFAULT_CONTEXT_WINDOW = 128000
+_DEFAULT_MAX_TOKENS = 8192
+
+
+def _provider_api(provider_type: str) -> str:
+    normalized = str(provider_type or "").strip().lower()
+    if normalized == "anthropic":
+        return "anthropic-messages"
+    return "openai-completions"
+
+
+def _as_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _provider_context_window(provider: dict[str, Any]) -> int:
+    extra = provider.get("extra_config") if isinstance(provider.get("extra_config"), dict) else {}
+    return _as_positive_int(
+        provider.get("model_context_window")
+        or provider.get("context_window")
+        or provider.get("contextWindow")
+        or provider.get("context_length")
+        or provider.get("contextLength")
+        or extra.get("model_context_window")
+        or extra.get("contextWindow")
+        or extra.get("context_length")
+        or extra.get("contextLength"),
+        _DEFAULT_CONTEXT_WINDOW,
+    )
+
+
+def _provider_max_tokens(provider: dict[str, Any]) -> int:
+    extra = provider.get("extra_config") if isinstance(provider.get("extra_config"), dict) else {}
+    return _as_positive_int(
+        provider.get("max_tokens")
+        or provider.get("maxTokens")
+        or extra.get("max_tokens")
+        or extra.get("maxTokens"),
+        _DEFAULT_MAX_TOKENS,
+    )
+
+
+def _provider_model_entries(provider: dict[str, Any]) -> list[dict[str, Any]]:
+    model = str(provider.get("model") or "").strip()
+    extra = provider.get("extra_config") if isinstance(provider.get("extra_config"), dict) else {}
+    context_window = _provider_context_window(provider)
+    max_tokens = _provider_max_tokens(provider)
+    pi_models = extra.get("pi_models")
+    raw_models = pi_models if isinstance(pi_models, list) else ([{"id": model}] if model else [])
+    entries: list[dict[str, Any]] = []
+    for raw in raw_models:
+        if isinstance(raw, str):
+            item: dict[str, Any] = {"id": raw}
+        elif isinstance(raw, dict):
+            item = dict(raw)
+        else:
+            continue
+        item.setdefault("id", model)
+        item.setdefault("name", item.get("id") or model)
+        item.setdefault("reasoning", False)
+        item.setdefault("input", ["text"])
+        item.setdefault("contextWindow", context_window)
+        item.setdefault("maxTokens", max_tokens)
+        item.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
+        if str(item.get("id") or "").strip():
+            entries.append(item)
+    return entries
+
+
+def build_models_json_from_provider(provider: dict[str, Any]) -> dict[str, Any]:
+    provider_key = str(provider.get("provider_key") or "").strip()
+    model = str(provider.get("model") or "").strip()
+    api_base = str(provider.get("api_base") or "").strip()
+    api_key = str(provider.get("api_key") or "").strip()
+    if not provider_key or not model or not api_base or not api_key:
+        raise ValidationError("LLM Provider缺少provider_key/model/api_base/api_key，无法生成models.json")
+    return {
+        "providers": {
+            provider_key: {
+                "baseUrl": api_base.rstrip("/"),
+                "api": _provider_api(str(provider.get("provider_type") or "")),
+                "apiKey": api_key,
+                "models": _provider_model_entries(provider),
+            }
+        }
+    }
+
+
+def _complete_models_json(models_json: dict[str, Any], provider: dict[str, Any]) -> dict[str, Any]:
+    completed = json.loads(json.dumps(models_json, ensure_ascii=False))
+    context_window = _provider_context_window(provider)
+    max_tokens = _provider_max_tokens(provider)
+    provider_key = str(provider.get("provider_key") or "").strip()
+    if "providers" not in completed and isinstance(completed.get("models"), list) and provider_key:
+        completed = {
+            "providers": {
+                provider_key: {
+                    "baseUrl": str(provider.get("api_base") or "").strip().rstrip("/"),
+                    "api": _provider_api(str(provider.get("provider_type") or "")),
+                    "apiKey": str(provider.get("api_key") or "").strip(),
+                    "models": completed["models"],
+                }
+            }
+        }
+    providers = completed.get("providers") if isinstance(completed.get("providers"), dict) else {}
+    for provider_block in providers.values():
+        if not isinstance(provider_block, dict):
+            continue
+        models = provider_block.get("models") if isinstance(provider_block.get("models"), list) else []
+        for index, item in enumerate(models):
+            if isinstance(item, str):
+                models[index] = {
+                    "id": item,
+                    "name": item,
+                    "reasoning": False,
+                    "input": ["text"],
+                    "contextWindow": context_window,
+                    "maxTokens": max_tokens,
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                }
+                continue
+            if not isinstance(item, dict):
+                continue
+            item.setdefault("name", item.get("id"))
+            item.setdefault("reasoning", False)
+            item.setdefault("input", ["text"])
+            item.setdefault("contextWindow", context_window)
+            item.setdefault("maxTokens", max_tokens)
+            item.setdefault("cost", {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0})
+    return completed
+
 
 class ConfigCenterClient:
     def __init__(self) -> None:
@@ -154,6 +289,7 @@ def extract_models_json_config(provider: dict[str, Any]) -> dict[str, Any] | Non
             raise ValidationError(f"配置文件 {provider_key} 的 models.json 不是合法 JSON: {exc}") from exc
         if not isinstance(models_json, dict):
             raise ValidationError(f"配置文件 {provider_key} 的 models.json 顶层必须是对象")
+        models_json = _complete_models_json(models_json, provider)
         model_options = _extract_provider_models(models_json, provider_key)
         default_model = str(provider.get("model") or "").strip() or None
         if default_model and "/" not in default_model:
@@ -165,7 +301,19 @@ def extract_models_json_config(provider: dict[str, Any]) -> dict[str, Any] | Non
             "model_options": model_options,
             "default_model": default_model,
         }
-    return None
+
+    models_json = build_models_json_from_provider(provider)
+    model_options = _extract_provider_models(models_json, provider_key)
+    default_model = str(provider.get("model") or "").strip() or None
+    if default_model and "/" not in default_model:
+        default_model = f"{provider_key}/{default_model}"
+    if not default_model and model_options:
+        default_model = model_options[0]["value"]
+    return {
+        "models_json": models_json,
+        "model_options": model_options,
+        "default_model": default_model,
+    }
 
 
 def _handle(response: httpx.Response) -> dict[str, Any]:

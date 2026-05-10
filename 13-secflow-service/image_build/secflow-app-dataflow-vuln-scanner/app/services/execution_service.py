@@ -54,6 +54,7 @@ from app.schemas import (
     TriggerTaskInputTask,
 )
 from app.services.fileserver_client import get_fileserver_client
+from app.services.llm_provider_sync import sync_providers_to_pi
 from app.services.run_index_service import get_run_index_service
 from app.services.pi_vuln_adapter import (
     DbExecutionObserver,
@@ -3296,6 +3297,7 @@ class ExecutionService:
             recorder = DbExecutionRecorder(abs_path(runtime_workspace_root), execution.id)
             ensure_event_loop_policy()
             try:
+                sync_providers_to_pi()
                 artifacts = asyncio.run(
                     run_framework_config(
                         runtime_config,

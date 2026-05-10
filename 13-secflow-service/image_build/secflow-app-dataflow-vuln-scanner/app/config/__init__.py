@@ -76,6 +76,12 @@ class FileserverServiceConfig(BaseModel):
     dataflow_subproject_name: str = "DATAFLOW_VULN_SCANNER"
 
 
+class ConfigCenterServiceConfig(BaseModel):
+    enabled: bool = True
+    base_url: str = "http://secflow-platform-configcenter/api/configcenter"
+    timeout: int = 30
+
+
 class RunsConfig(BaseModel):
     enabled: bool = True
 
@@ -141,6 +147,7 @@ class Config(BaseModel):
     auth_service: AuthServiceConfig = Field(default_factory=AuthServiceConfig)
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     fileserver_service: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
+    configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)

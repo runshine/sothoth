@@ -16,6 +16,7 @@ from app.pi_vuln_core.config.loader import ConfigValidationError
 from app.pi_vuln_core.runner import load_framework_config_from_path, run_framework_config
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
 from app.services.auth import get_auth_service
+from app.services.llm_provider_sync import sync_providers_to_pi
 from app.services.project import get_project_service
 from app.services.registry import get_registry_service
 from app.services.scheduler import get_scheduler_service
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("starting secflow dataflow vuln scanner service...")
     load_config()
+    sync_providers_to_pi()
     init_database()
     with get_engine().connect() as conn:
         conn.exec_driver_sql("SELECT 1")
@@ -67,6 +69,8 @@ app = create_app()
 
 async def _run_cli(config_path: str, clean_workspace: bool) -> int:
     try:
+        load_config()
+        sync_providers_to_pi()
         framework_config = load_framework_config_from_path(config_path)
         artifacts = await run_framework_config(
             framework_config,

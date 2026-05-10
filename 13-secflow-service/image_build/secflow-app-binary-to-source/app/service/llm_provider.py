@@ -15,6 +15,8 @@ from app.service.configcenter import get_configcenter_client
 logger = logging.getLogger(__name__)
 _cached_provider: Optional[dict[str, Any]] = None
 _cached_providers: dict[str, dict[str, Any]] = {}
+_DEFAULT_CONTEXT_WINDOW = 128000
+_DEFAULT_MAX_TOKENS = 8192
 
 
 def _provider_api(provider_type: str) -> str:
@@ -32,6 +34,14 @@ def _provider_model_name(provider: dict[str, Any]) -> str:
     return f"{provider_key}/{model}"
 
 
+def _as_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_models_json(provider: dict[str, Any]) -> dict[str, Any]:
     provider_key = str(provider.get("provider_key") or "").strip()
     model = str(provider.get("model") or "").strip()
@@ -39,6 +49,23 @@ def _build_models_json(provider: dict[str, Any]) -> dict[str, Any]:
     api_key = str(provider.get("api_key") or "").strip()
     if not provider_key or not model or not api_base or not api_key:
         raise ValueError("LLM Provider缺少provider_key/model/api_base/api_key")
+    extra_config = provider.get("extra_config") if isinstance(provider.get("extra_config"), dict) else {}
+    context_window = _as_positive_int(
+        provider.get("model_context_window")
+        or provider.get("context_window")
+        or provider.get("contextWindow")
+        or provider.get("context_length")
+        or provider.get("contextLength")
+        or extra_config.get("model_context_window")
+        or extra_config.get("contextWindow")
+        or extra_config.get("context_length")
+        or extra_config.get("contextLength"),
+        _DEFAULT_CONTEXT_WINDOW,
+    )
+    max_tokens = _as_positive_int(
+        provider.get("max_tokens") or provider.get("maxTokens") or extra_config.get("max_tokens") or extra_config.get("maxTokens"),
+        _DEFAULT_MAX_TOKENS,
+    )
     return {
         "providers": {
             provider_key: {
@@ -51,8 +78,8 @@ def _build_models_json(provider: dict[str, Any]) -> dict[str, Any]:
                         "name": model,
                         "reasoning": False,
                         "input": ["text"],
-                        "contextWindow": 128000,
-                        "maxTokens": provider.get("max_tokens") or 16384,
+                        "contextWindow": context_window,
+                        "maxTokens": max_tokens,
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                     }
                 ],
