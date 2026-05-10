@@ -20,3 +20,6 @@
 [submodule "13-secflow-service/image_build/secflow-app-dataflow-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-dataflow-analyse
 	url = https://github.com/ict-bin/data_flow_analyse
+[submodule "15-ai-infra/image_build/claude-web-platform"]
+	path = 15-ai-infra/image_build/claude-web-platform
+	url = https://gitea.ai.icsl.huawei.com/ai-infra/claude-web-platform.git
