@@ -900,9 +900,14 @@ class TaskManager:
             raise ValidationError(reason or "当前任务不支持安全重试")
         stage_sequence = self._stage_sequence_for_task(task)
         archive_retried = False
+        archive_retry_stage: str | None = None
         for current_stage in stage_sequence:
-            archive_retried = self._retry_failed_archive_jobs_for_stage(db, task, current_stage) or archive_retried
+            stage_archive_retried = self._retry_failed_archive_jobs_for_stage(db, task, current_stage)
+            if stage_archive_retried and archive_retry_stage is None:
+                archive_retry_stage = current_stage
+            archive_retried = stage_archive_retried or archive_retried
         if archive_retried:
+            self._mark_task_waiting_for_archive_retry(db, task, archive_retry_stage or stage_name)
             db.commit()
             return
         first_stage = stage_sequence[0]
@@ -944,6 +949,7 @@ class TaskManager:
         if stage_name not in stage_sequence:
             raise ValidationError(f"无效阶段: {stage_name}")
         if self._retry_failed_archive_jobs_for_stage(db, task, stage_name):
+            self._mark_task_waiting_for_archive_retry(db, task, stage_name)
             db.commit()
             return
         supported, reason = self._stage_retry_support(db, task, stage_name)
@@ -1239,6 +1245,25 @@ class TaskManager:
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
         return True
 
+    def _mark_task_waiting_for_archive_retry(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
+        task.status = "running"
+        task.current_stage = stage_name
+        task.execution_mode = None
+        task.target_stage_name = None
+        task.last_error = None
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.finished_at = None
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="running")
+        self._record_event(
+            db,
+            task,
+            "task_archive_retry_requeued",
+            "失败任务的产物归档已重新排队，等待归档 worker 完成后继续推进",
+            stage_name=stage_name,
+            payload={"stage_name": stage_name, "retry_semantics": "archive_retry"},
+        )
+
     def _ensure_downstream_archive_job(
         self,
         db: Session,
@@ -1321,6 +1346,86 @@ class TaskManager:
                     db.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
                 except Exception:
                     pass
+
+    def _queue_downstream_archive_job(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        payload: dict[str, Any],
+        mapped_status: str,
+        before_status: str | None,
+        extra_paths: list[str | Path] | None = None,
+    ) -> BinarySecurityArchiveJob:
+        job = self._ensure_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload=payload,
+            mapped_status=mapped_status,
+            before_status=before_status,
+            force=False,
+            extra_paths=extra_paths,
+        )
+        self._record_event(
+            db,
+            task,
+            "downstream_archive_job_queued" if job.archive_status in {"pending", "running"} else "downstream_archive_job_reused",
+            "下游子任务已终态，产物归档已入队",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "archive_job_id": job.id,
+                "archive_status": job.archive_status,
+                "downstream_service": item.downstream_service,
+                "downstream_task_id": item.downstream_task_id,
+                "mapped_status": mapped_status,
+            },
+        )
+        return job
+
+    async def _queue_archive_and_wait(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        payload: dict[str, Any],
+        mapped_status: str,
+        before_status: str | None,
+        extra_paths: list[str | Path] | None = None,
+    ) -> tuple[Path | None, BinarySecurityArchiveJob | None]:
+        job = self._queue_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload=payload,
+            mapped_status=mapped_status,
+            before_status=before_status,
+            extra_paths=extra_paths,
+        )
+        db.commit()
+        completed = await self._wait_archive_job_completion(job.id, task.id)
+        try:
+            db.refresh(item)
+        except Exception:
+            db.rollback()
+        if completed is None or completed.archive_status != "success":
+            error = completed.error_message if completed is not None else "归档任务不存在"
+            self._record_event(
+                db,
+                task,
+                "downstream_archive_blocking_failed",
+                "总任务产物归档未完成，阶段结果不能用于后续推进",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={"archive_job_id": job.id, "error": error or "下游产物归档失败"},
+            )
+            db.commit()
+            return None, completed
+        return Path(completed.archive_root) if completed.archive_root else None, completed
 
     def get_project_config(self, db: Session, project_id: str) -> BinarySecurityProjectConfigResponse:
         row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
@@ -1687,6 +1792,7 @@ class TaskManager:
             stage_retry_mode = task.execution_mode == "stage_retry" and bool(task.target_stage_name)
             task_retry_mode = task.execution_mode == "task_retry" and bool(task.target_stage_name)
             target_stage_name = task.target_stage_name if (stage_retry_mode or task_retry_mode) else None
+            archive_blocked = False
             for stage_name in stage_sequence[start_index:]:
                 if stage_retry_mode and stage_name != target_stage_name:
                     continue
@@ -1770,6 +1876,24 @@ class TaskManager:
                     self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
                     db.commit()
                     return
+                if summary.get("archive_blocked"):
+                    archive_blocked = True
+                    task.status = "failed"
+                    task.last_error = summary.get("error") or "总任务产物归档失败"
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.finished_at = _now()
+                    self._record_event(
+                        db,
+                        task,
+                        "stage_archive_blocked",
+                        f"阶段业务执行已完成，但总任务产物归档失败，停止后续推进: {stage_name}",
+                        level="error",
+                        stage_name=stage_name,
+                        payload={"stage_status": status, "error": task.last_error},
+                    )
+                    db.commit()
+                    break
                 if stage_retry_mode:
                     self._record_event(
                         db,
@@ -1785,6 +1909,10 @@ class TaskManager:
                     self._record_event(db, task, "stage_failed", f"阶段失败，停止后续推进: {stage_name}", level="error", stage_name=stage_name)
                     db.commit()
                     break
+            if archive_blocked:
+                self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+                db.commit()
+                return
             if stage_retry_mode or task_retry_mode:
                 task.execution_mode = None
                 task.target_stage_name = None
@@ -3571,68 +3699,42 @@ class TaskManager:
                 item=item,
             )
             mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
-            job = self._ensure_downstream_archive_job(
-                session,
-                task,
-                item,
-                payload=payload,
-                mapped_status=mapped_status,
-                before_status=item.status,
-                force=False,
-                extra_paths=[output_dir],
-            )
-            self._record_event(
-                session,
-                task,
-                "downstream_archive_job_queued",
-                "下游固件解包已终态，等待产物归档完成后更新阶段状态",
-                stage_name=item.stage_name,
-                item=item,
-                payload={"archive_job_id": job.id, "downstream_status": status, "mapped_status": mapped_status},
-            )
-            session.commit()
-            archive_job = await self._wait_archive_job_completion(job.id, task.id)
-            session.refresh(item)
-            archive_root = (item.output_ref or {}).get("archive_root")
-            if archive_job is not None and archive_job.archive_status == "success":
-                archive_root = archive_job.archive_root or archive_root
-            elif mapped_status == "success":
-                error = archive_job.error_message if archive_job is not None else "归档任务不存在"
-                self._record_event(
-                    session,
-                    task,
-                    "downstream_archive_non_blocking_failed",
-                    "产物归档失败，阶段执行状态保持下游成功状态",
-                    stage_name=item.stage_name,
-                    item=item,
-                    level="warning",
-                    payload={"archive_job_id": job.id, "error": error or "下游产物归档失败"},
-                )
             item.status = mapped_status
             item.error_message = None if mapped_status in {"success", "partial_success"} else (
                 payload.get("error") or payload.get("error_message") or payload.get("message")
             )
             item.finished_at = _now()
             item.started_at = item.started_at or _now()
+            archive_root, archive_job = await self._queue_archive_and_wait(
+                session,
+                task,
+                item,
+                payload=payload,
+                mapped_status=mapped_status,
+                before_status="running",
+                extra_paths=[output_dir],
+            )
             if mapped_status != "success":
                 session.commit()
                 return {"status": mapped_status, "error": item.error_message, "item": input_file}
-            fallback_sources = self._resolve_downstream_output_sources(
-                payload,
-                downstream_task_id=item.downstream_task_id,
-                extra_paths=[output_dir],
-                task=task,
-                downstream_service=item.downstream_service,
-            )
-            fallback_root = next((str(path) for path in fallback_sources if path.exists() and _path_has_content(path)), str(output_dir))
+            if archive_root is None:
+                error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
+                item.error_message = error
+                session.commit()
+                return {"status": "archive_blocked", "error": error, "item": input_file, "archive_blocked": True}
             result = {
                 **input_file,
                 "input_path": str(input_path),
-                "unpacked_root": str(archive_root or fallback_root),
+                "unpacked_root": str(archive_root),
                 "downstream": self._lightweight_downstream_payload(payload),
             }
             item.result = {**(item.result or {}), **result}
-            item.output_ref = {**(item.output_ref or {}), "runtime_output_path": str(output_dir), "unpacked_root": result["unpacked_root"]}
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "runtime_output_path": str(output_dir),
+                "archive_root": str(archive_root),
+                "unpacked_root": result["unpacked_root"],
+            }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -3681,6 +3783,14 @@ class TaskManager:
             initial_retry=retry_existing,
         )
         success = [result["item"] for result in results if result.get("status") == "success"]
+        archive_blocked = [result for result in results if result.get("status") == "archive_blocked" or result.get("archive_blocked")]
+        if archive_blocked:
+            return "success", {
+                "archive_blocked": True,
+                "success_count": len(success),
+                "failed_count": 0,
+                "error": archive_blocked[0].get("error") or "总任务产物归档失败",
+            }
         failed = [result for result in results if result.get("status") == "failed"]
         all_modules: list[dict[str, Any]] = []
         for result in success:
@@ -3830,30 +3940,45 @@ class TaskManager:
                     result_payload = await get_system_analyse_client().get_task_result(item.downstream_task_id)
                 except Exception:
                     result_payload = {}
-            artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, firmware["firmware_key"], item.downstream_task_id)
-            materialized = self._materialize_stage_artifact(
-                artifact_root,
-                item.downstream_task_id,
-                {**payload, **({"result": result_payload} if result_payload else {})},
-                db=session,
-                task=task,
-                item=item,
-            )
-            modules = self._parse_system_analysis_modules(materialized, firmware, result_payload)
+            archive_payload = {**payload, **({"result": result_payload} if result_payload else {})}
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            item.status = mapped_status
             item.finished_at = _now()
-            item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            archive_root, archive_job = await self._queue_archive_and_wait(
+                session,
+                task,
+                item,
+                payload=archive_payload,
+                mapped_status=mapped_status,
+                before_status="running",
+            )
+            if mapped_status != "success":
+                item.error_message = payload.get("error") or payload.get("error_message")
+                session.commit()
+                return {"status": mapped_status, "item": self._lightweight_system_analysis_input(firmware), "error": item.error_message}
+            if archive_root is None:
+                error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
+                item.error_message = error
+                session.commit()
+                return {
+                    "status": "archive_blocked",
+                    "error": error,
+                    "item": self._lightweight_system_analysis_input(firmware),
+                    "archive_blocked": True,
+                }
+            modules = self._parse_system_analysis_modules(archive_root, firmware, result_payload)
             result = {
                 **self._lightweight_system_analysis_input(firmware),
-                "artifact_root": str(materialized),
-                "archive_root": str(materialized),
+                "artifact_root": str(archive_root),
+                "archive_root": str(archive_root),
                 "module_count": len(modules),
-                "modules_file": str(materialized / "system_analysis_modules.json"),
+                "modules_file": str(archive_root / "system_analysis_modules.json"),
                 "modules_preview": self._lightweight_modules_for_storage(modules),
                 "downstream": self._lightweight_downstream_payload(payload),
                 "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
             }
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
-            item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized)}
+            item.output_ref = {**(item.output_ref or {}), "artifact_root": str(archive_root), "archive_root": str(archive_root)}
             session.commit()
             return {"status": item.status, "item": {**result, "modules": modules}, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -4031,8 +4156,15 @@ class TaskManager:
                 name = str(module.get("module_name") or "").strip()
                 if not name:
                     continue
-                module_dir = Path(str(module.get("module_dir_path") or (modules_dir / name)))
-                files_list = Path(str(module.get("files_list_path") or (module_dir / "files.list")))
+                archived_module_dir = modules_dir / name
+                reported_module_dir = Path(str(module.get("module_dir_path") or archived_module_dir))
+                module_dir = archived_module_dir if archived_module_dir.is_dir() else reported_module_dir
+                archived_files_list = module_dir / "files.list"
+                reported_files_list = Path(str(module.get("files_list_path") or archived_files_list))
+                files_list = archived_files_list if archived_files_list.is_file() else reported_files_list
+                archived_module_report = module_dir / "module_report.md"
+                reported_module_report = Path(str(module.get("module_report_path") or archived_module_report))
+                module_report = archived_module_report if archived_module_report.is_file() else reported_module_report
                 source_dir = module_dir if module_dir.is_dir() else Path(str(firmware.get("source_root") or firmware.get("unpacked_root") or root))
                 module_key = _slug(f"{firmware['firmware_key']}-{name}")
                 items.append(
@@ -4047,7 +4179,7 @@ class TaskManager:
                         "module_name": name,
                         "module_dir": str(module_dir),
                         "source_dir": str(source_dir),
-                        "module_report": str(module.get("module_report_path") or (module_dir / "module_report.md")),
+                        "module_report": str(module_report),
                         "files_list": str(files_list),
                         "risk_level": str(module.get("risk_level") or "").strip(),
                         "risk_score": int(module.get("risk_score") or 0),
@@ -4304,7 +4436,8 @@ class TaskManager:
         task: BinarySecurityTask | None = None,
         item: BinarySecurityStageItem | None = None,
     ) -> Path:
-        existing_candidates = [
+        del db
+        candidates = [
             candidate
             for candidate in self._resolve_downstream_output_sources(
                 payload,
@@ -4317,56 +4450,7 @@ class TaskManager:
             and candidate.resolve() != artifact_root.resolve()
             and not _is_within_path(artifact_root, candidate)
         ]
-        if not existing_candidates:
-            if db and task and item:
-                self._record_event(
-                    db,
-                    task,
-                    "downstream_output_copy_skipped",
-                    f"下游阶段产物不存在，跳过归档: {item.downstream_service or item.stage_name}",
-                    stage_name=item.stage_name,
-                    item=item,
-                    level="warning",
-                    payload={"target_dir": str(artifact_root)},
-                )
-            ensure_dir(artifact_root)
-            return artifact_root
-        try:
-            ensure_dir(artifact_root)
-            for candidate in existing_candidates:
-                _copytree(candidate, artifact_root)
-        except Exception as exc:
-            if db and task and item:
-                self._record_event(
-                    db,
-                    task,
-                    "downstream_output_copy_failed",
-                    f"下游阶段产物归档失败: {exc}",
-                    stage_name=item.stage_name,
-                    item=item,
-                    level="error",
-                    payload={
-                        "target_dir": str(artifact_root),
-                        "sources": [str(path) for path in existing_candidates],
-                        "error": str(exc),
-                    },
-                )
-            return artifact_root
-        if db and task and item:
-            self._record_event(
-                db,
-                task,
-                "downstream_output_copied",
-                f"下游阶段产物已归档: {item.downstream_service or item.stage_name}",
-                stage_name=item.stage_name,
-                item=item,
-                payload={
-                    "target_dir": str(artifact_root),
-                    "sources": [str(path) for path in existing_candidates],
-                    "copied_file_count": _count_files(artifact_root),
-                },
-            )
-        return artifact_root
+        return candidates[0] if candidates else artifact_root
 
     async def _stage_binary_to_source(
         self,
@@ -4591,8 +4675,6 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, module["module_key"], item.downstream_task_id)
-            generated_files = []
             extra_paths: list[str] = []
             for child in payload.get("items", []):
                 if child.get("output_dir"):
@@ -4600,30 +4682,39 @@ class TaskManager:
                 for file_path in child.get("generated_files") or []:
                     src = Path(file_path)
                     if src.exists():
-                        target = artifact_root / src.name
-                        _copytree(src, target)
-                        generated_files.append(str(target))
                         extra_paths.append(str(src.parent))
-            archived_dir = self._archive_downstream_output(
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            item.status = mapped_status
+            item.finished_at = _now()
+            archived_dir, archive_job = await self._queue_archive_and_wait(
                 session,
                 task,
                 item,
-                semantic_key=module["module_key"],
                 payload=payload,
+                mapped_status=mapped_status,
+                before_status="running",
                 extra_paths=extra_paths,
             )
+            if mapped_status != "success":
+                item.error_message = payload.get("error") or payload.get("error_message")
+                session.commit()
+                return {"status": mapped_status, "error": item.error_message, "item": module}
+            if archived_dir is None:
+                error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
+                item.error_message = error
+                session.commit()
+                return {"status": "archive_blocked", "error": error, "item": module, "archive_blocked": True}
             result = {
                 **module,
-                "source_dir": str(archived_dir or artifact_root),
-                "generated_files": generated_files,
-                "downstream": payload,
+                "source_dir": str(archived_dir),
+                "generated_files": [],
+                "downstream": self._lightweight_downstream_payload(payload),
             }
-            item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
-            item.finished_at = _now()
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {
-                "archive_root": str(archived_dir or artifact_root),
-                "source_dir": str(archived_dir or artifact_root),
+                **(item.output_ref or {}),
+                "archive_root": str(archived_dir),
+                "source_dir": str(archived_dir),
             }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
@@ -4703,27 +4794,47 @@ class TaskManager:
                 task=task,
                 item=item,
             )
-            artifact_root = self._service_output_dir(task, item.downstream_service or stage_run.stage_name, module["module_key"], item.downstream_task_id)
-            materialized = self._materialize_stage_artifact(
-                artifact_root,
+            service_output = self._materialize_stage_artifact(
+                self._service_output_path(task, item.downstream_service or stage_run.stage_name, module["module_key"], item.downstream_task_id),
                 item.downstream_task_id,
                 payload,
                 db=session,
                 task=task,
                 item=item,
             )
-            entries = self._parse_entries(materialized, module)
+            entries = self._parse_entries(service_output, module)
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            item.status = mapped_status
+            item.finished_at = _now()
+            archived_dir, archive_job = await self._queue_archive_and_wait(
+                session,
+                task,
+                item,
+                payload=payload,
+                mapped_status=mapped_status,
+                before_status="running",
+            )
+            if mapped_status != "success":
+                item.error_message = payload.get("error") or payload.get("error_message")
+                session.commit()
+                return {"status": mapped_status, "error": item.error_message, "item": module}
+            if archived_dir is None:
+                error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
+                item.error_message = error
+                session.commit()
+                return {"status": "archive_blocked", "error": error, "item": module, "archive_blocked": True}
+            archived_entries = self._parse_entries(archived_dir, module)
+            if archived_entries:
+                entries = archived_entries
             result = {
                 **module,
-                "artifact_root": str(materialized),
+                "artifact_root": str(archived_dir),
                 "entries": entries,
                 "source_dir": module["source_dir"],
                 "downstream": payload,
             }
-            item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
-            item.finished_at = _now()
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
-            item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized)}
+            item.output_ref = {**(item.output_ref or {}), "artifact_root": str(archived_dir), "archive_root": str(archived_dir)}
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -4852,16 +4963,40 @@ class TaskManager:
                 item=item,
             )
             data_flow_file = self._find_first(materialized, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            item.status = mapped_status
+            item.finished_at = _now()
+            archived_dir, archive_job = await self._queue_archive_and_wait(
+                session,
+                task,
+                item,
+                payload=payload,
+                mapped_status=mapped_status,
+                before_status="running",
+            )
+            if mapped_status != "success":
+                item.error_message = payload.get("error") or payload.get("error_message")
+                session.commit()
+                return {"status": mapped_status, "error": item.error_message, "item": entry}
+            if archived_dir is None:
+                error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
+                item.error_message = error
+                session.commit()
+                return {"status": "archive_blocked", "error": error, "item": entry, "archive_blocked": True}
+            archived_data_flow_file = self._find_first(archived_dir, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
             result = {
                 **entry,
-                "artifact_root": str(materialized),
-                "data_flow_file": str(data_flow_file) if data_flow_file else "",
-                "downstream": payload,
+                "artifact_root": str(archived_dir),
+                "data_flow_file": str(archived_data_flow_file or data_flow_file) if (archived_data_flow_file or data_flow_file) else "",
+                "downstream": self._lightweight_downstream_payload(payload),
             }
-            item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
-            item.finished_at = _now()
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
-            item.output_ref = {"artifact_root": str(materialized), "archive_root": str(materialized), "data_flow_file": result["data_flow_file"]}
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "artifact_root": str(archived_dir),
+                "archive_root": str(archived_dir),
+                "data_flow_file": result["data_flow_file"],
+            }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
         except Exception as exc:
@@ -4923,27 +5058,44 @@ class TaskManager:
                 item=item,
             )
             artifacts = await get_dataflow_vuln_scanner_client().get_artifacts(item.downstream_task_id, token or "")
-            archived_dir = self._archive_downstream_output(
+            archive_payload = {
+                **payload,
+                "artifacts": artifacts,
+                "workspace_root": artifacts.get("workspace_root"),
+            }
+            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            item.status = mapped_status
+            item.finished_at = _now()
+            archived_dir, archive_job = await self._queue_archive_and_wait(
                 session,
                 task,
                 item,
-                semantic_key=dataflow_result["entry_key"],
-                payload={"workspace_root": artifacts.get("workspace_root")},
+                payload=archive_payload,
+                mapped_status=mapped_status,
+                before_status="running",
             )
+            if mapped_status != "success":
+                item.error_message = payload.get("error") or payload.get("error_message")
+                session.commit()
+                return {"status": mapped_status, "error": item.error_message, "item": dataflow_result}
+            if archived_dir is None:
+                error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
+                item.error_message = error
+                session.commit()
+                return {"status": "archive_blocked", "error": error, "item": dataflow_result, "archive_blocked": True}
             result = {
                 **dataflow_result,
                 "workspace_root": artifacts.get("workspace_root"),
                 "artifact_files": artifacts.get("files", []),
-                "archive_root": str(archived_dir) if archived_dir else None,
-                "downstream": payload,
+                "archive_root": str(archived_dir),
+                "downstream": self._lightweight_downstream_payload(payload),
                 "artifacts": artifacts,
             }
-            item.status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
-            item.finished_at = _now()
             item.result = self._compact_result_for_storage(stage_run.stage_name, result)
             item.output_ref = {
+                **(item.output_ref or {}),
                 "workspace_root": artifacts.get("workspace_root"),
-                "archive_root": str(archived_dir) if archived_dir else None,
+                "archive_root": str(archived_dir),
             }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
@@ -4970,6 +5122,23 @@ class TaskManager:
         success = [result["item"] for result in results if result.get("status") == "success"]
         compact_success = self._compact_stage_success_items(summary_key, success)
         db_success = self._compact_stage_success_items_for_db(summary_key, compact_success)
+        archive_blocked = [result for result in results if result.get("status") == "archive_blocked" or result.get("archive_blocked")]
+        if archive_blocked:
+            summary = {
+                "items": db_success,
+                "failed_items": [],
+                "cancelled_items": [],
+                "success_count": len(compact_success),
+                "failed_count": 0,
+                "entry_count": self._entry_count_for_summary(summary_key, compact_success),
+                "vuln_result_count": len(compact_success) if summary_key == "vuln_results" else 0,
+                "items_truncated": len(db_success) < len(compact_success),
+                "archive_blocked": True,
+                "error": archive_blocked[0].get("error") or "总任务产物归档失败",
+            }
+            task.summary = {**task.summary, summary_key: compact_success}
+            db.commit()
+            return "success", summary
         failed = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "failed"]
         cancelled = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "cancelled"]
         if failed and success:

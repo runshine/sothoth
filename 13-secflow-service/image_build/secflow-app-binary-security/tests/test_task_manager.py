@@ -706,6 +706,76 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("pending", task.status)
             self.assertEqual([], db.archive_jobs)
 
+    def test_retry_stage_requeues_failed_archive_job_and_marks_task_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="firmware_unpack",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                last_error="归档失败",
+                finished_at=_now(),
+            )
+            run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="firmware_unpack",
+                sequence_no=1,
+                status="failed",
+                last_error="归档失败",
+            )
+            item = BinarySecurityStageItem(
+                id="i1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="firmware_unpack",
+                item_key="fw1",
+                item_name="fw.bin",
+                status="failed",
+                downstream_service="firmware_unpacker",
+                downstream_task_id="ut1",
+                error_message="归档失败",
+            )
+            item.input_ref = {"filename": "fw.bin", "path": "/input/fw.bin"}
+            job = BinarySecurityArchiveJob(
+                id="aj1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="firmware_unpack",
+                item_id="i1",
+                item_key="fw1",
+                downstream_service="firmware_unpacker",
+                downstream_task_id="ut1",
+                archive_status="failed",
+                owner_id="old-worker",
+                archive_root=str(workspace / "old-archive"),
+                error_message="copy failed",
+            )
+            job.payload = {"mapped_status": "success"}
+            db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], archive_jobs=[job])
+
+            self.manager.retry_stage(db, project_id="p1", task_id="t1", stage_name="firmware_unpack")
+
+            self.assertEqual("running", task.status)
+            self.assertEqual("firmware_unpack", task.current_stage)
+            self.assertIsNone(task.last_error)
+            self.assertIsNone(task.finished_at)
+            self.assertEqual("pending", job.archive_status)
+            self.assertIsNone(job.owner_id)
+            self.assertIsNone(job.archive_root)
+            self.assertEqual("success", item.status)
+            event_types = [getattr(event, "event_type", "") for event in db.added]
+            self.assertIn("task_archive_retry_requeued", event_types)
+
     def test_retry_stage_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

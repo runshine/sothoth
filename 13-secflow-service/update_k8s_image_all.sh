@@ -32,6 +32,7 @@ Examples:
 Behavior:
   - No args: update all secflow-* deployments in the namespace to :latest for managed repos.
   - global tag: update all secflow-* deployments in the namespace to the same tag for managed repos.
+  - Always force rollout restart for secflow-* deployments, so unchanged tags such as :latest are pulled again.
   - Managed repos:
       ghcr.io/runshine/*
       runshine0819/secflow-*
@@ -207,6 +208,14 @@ while IFS=$'\t' read -r deployment containers; do
 done < <(
   kubectl -n "${NAMESPACE}" get deploy \
     -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .spec.template.spec.containers[*]}{.name}{"="}{.image}{";"}{end}{"\n"}{end}'
+)
+
+echo "[INFO] Forcing rollout restart for secflow deployments"
+while IFS= read -r deployment; do
+  [[ -n "${deployment}" ]] || continue
+  kubectl -n "${NAMESPACE}" rollout restart "deployment/${deployment}"
+done < <(
+  kubectl -n "${NAMESPACE}" get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep '^secflow-'
 )
 
 echo "[INFO] Waiting for secflow deployments to finish rollout"
