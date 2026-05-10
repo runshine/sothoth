@@ -221,6 +221,20 @@ def _llm_round_dirs(run_dir: Path) -> list[Path]:
     return [path for path in _existing_round_dirs(run_dir) if path.name != "round_000"]
 
 
+def _read_final_round_result(run_dir: Path, final_round: int) -> dict | None:
+    candidate_dirs: list[Path] = []
+    if final_round > 0:
+        candidate_dirs.append(_round_dir(run_dir, final_round))
+    for path in reversed(_llm_round_dirs(run_dir)):
+        if path not in candidate_dirs:
+            candidate_dirs.append(path)
+    for round_path in candidate_dirs:
+        payload = _read_json_file(round_path / "results.json")
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
 def _get_task_progress(task_id: str) -> dict:
     task = _get_task_or_404(task_id)
     run_dir = _derive_run_path(task)
@@ -246,6 +260,8 @@ def _get_task_progress(task_id: str) -> dict:
     generated_skill_path = str(task.get("generated_skill_path") or "").strip()
     final_round = int(task.get("rounds") or 0)
     total_llm_rounds = max(1, int(get_max_retries() or 1))
+    final_round_result = _read_final_round_result(run_dir, final_round)
+    final_round_result_status = str((final_round_result or {}).get("status") or "").strip().lower()
 
     def _clamp_round(value: Optional[int]) -> Optional[int]:
         if value is None:
@@ -384,14 +400,27 @@ def _get_task_progress(task_id: str) -> dict:
             review_detail = "LLM 正在评审当前解包结果"
             review_round = _running_review_round()
             if verifier_logs:
-                review_status = "success" if task_status == "success" else ("failed" if task_status == "failed" else "running")
                 review_detail = f"已完成 {len(verifier_logs)} 轮评审"
+                if final_round_result_status in {"review_passed", "success", "completed"}:
+                    review_status = "success"
+                elif final_round_result_status in {"review_failed", "failed", "error"}:
+                    review_status = "failed"
+                elif task_result in {"success"}:
+                    review_status = "success"
+                elif task_result in {"max_retries_reached", "failed"}:
+                    review_status = "failed"
+                elif task_status == "success":
+                    review_status = "success"
+                elif task_status == "failed":
+                    review_status = "failed"
                 if review_status != "running":
                     review_round = _completed_round()
                 else:
                     review_round = _clamp_round(max(len(verifier_logs), len(executor_logs), 1))
-                if task_status == "failed":
-                    review_detail = "评审未通过，任务失败"
+                if review_status == "success":
+                    review_detail = "最终轮评审已通过"
+                elif review_status == "failed":
+                    review_detail = "最终轮评审未通过，任务失败"
             phases[3] = _phase_payload(
                 "llm_review",
                 "LLM 评审",
