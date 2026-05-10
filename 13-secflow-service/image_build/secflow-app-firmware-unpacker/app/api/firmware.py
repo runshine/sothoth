@@ -12,6 +12,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import or_
+from sqlalchemy.orm import load_only
 
 from app.api.dependencies import ensure_project_access, get_current_subject
 from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
@@ -855,6 +856,12 @@ def _read_round_metrics(run_root: Path) -> dict:
         output_delta = payload.get("output_delta") if isinstance(payload.get("output_delta"), dict) else {}
         artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
         context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        paths = payload.get("paths") if isinstance(payload.get("paths"), dict) else {}
+
+        summary_path_raw = str(paths.get("summary_path") or "").strip()
+        reason_path_raw = str(paths.get("reason_path") or "").strip()
+        summary_text = _read_text_file(Path(summary_path_raw)).strip() if summary_path_raw else ""
+        reason_text = _read_text_file(Path(reason_path_raw)).strip() if reason_path_raw else ""
 
         size_delta = _safe_int(
             output_delta.get("size_bytes_delta", output_delta.get("output_total_size_bytes_delta"))
@@ -908,6 +915,8 @@ def _read_round_metrics(run_root: Path) -> dict:
                 ],
                 "summary_preview": artifacts.get("summary_preview"),
                 "reason_preview": artifacts.get("reason_preview"),
+                "summary_text": summary_text or None,
+                "reason_text": reason_text or None,
             },
             "context": {
                 "matched_skill": context.get("matched_skill"),
@@ -1495,7 +1504,52 @@ def _list_tasks(
 
         total = query.count()
         tasks = (
-            query.order_by(UnpackTask.created_at.desc())
+            query.options(
+                load_only(
+                    UnpackTask.id,
+                    UnpackTask.project_id,
+                    UnpackTask.task_origin_type,
+                    UnpackTask.parent_project_id,
+                    UnpackTask.parent_task_id,
+                    UnpackTask.parent_task_type,
+                    UnpackTask.parent_stage_name,
+                    UnpackTask.parent_stage_item_id,
+                    UnpackTask.parent_stage_item_key,
+                    UnpackTask.firmware_path,
+                    UnpackTask.output_path,
+                    UnpackTask.status,
+                    UnpackTask.owner_id,
+                    UnpackTask.current_stage,
+                    UnpackTask.lease_expires_at,
+                    UnpackTask.cancel_requested_at,
+                    UnpackTask.last_progress_at,
+                    UnpackTask.runner_pid,
+                    UnpackTask.runner_started_at,
+                    UnpackTask.runner_heartbeat_at,
+                    UnpackTask.cancel_grace_deadline,
+                    UnpackTask.cancel_force_deadline,
+                    UnpackTask.result_status,
+                    UnpackTask.result_message,
+                    UnpackTask.rounds,
+                    UnpackTask.error_message,
+                    UnpackTask.matched_skill,
+                    UnpackTask.matched_skill_version,
+                    UnpackTask.matched_skill_score,
+                    UnpackTask.fallback_to_llm,
+                    UnpackTask.generated_skill_path,
+                    UnpackTask.generated_skill_status,
+                    UnpackTask.promotion_success_count,
+                    UnpackTask.skill_generation_status,
+                    UnpackTask.skill_generation_error,
+                    UnpackTask.skill_generation_job_id,
+                    UnpackTask.skill_generation_started_at,
+                    UnpackTask.skill_generation_completed_at,
+                    UnpackTask.created_at,
+                    UnpackTask.started_at,
+                    UnpackTask.completed_at,
+                )
+            )
+            .order_by(UnpackTask.created_at.desc())
             .offset(offset)
             .limit(limit)
             .all()

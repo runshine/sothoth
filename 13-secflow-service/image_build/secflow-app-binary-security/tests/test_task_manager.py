@@ -285,6 +285,145 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertEqual(str(target.resolve()), path)
 
+    def test_build_project_stats_aggregates_task_metrics(self):
+        success = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="success",
+            status="success",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw1",
+            output_root="/o1",
+            workspace_root="/w1",
+        )
+        success.metrics = {
+            "firmware_item_count": 2,
+            "unpacked_firmware_count": 2,
+            "failed_firmware_count": 0,
+            "selected_module_count": 3,
+            "candidate_module_count": 5,
+            "high_risk_module_count": 1,
+            "entry_count": 7,
+            "vuln_result_count": 11,
+        }
+        running = BinarySecurityTask(
+            id="t2",
+            project_id="p1",
+            name="running",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw2",
+            output_root="/o2",
+            workspace_root="/w2",
+        )
+        running.metrics = {
+            "firmware_item_count": 1,
+            "unpacked_firmware_count": 0,
+            "failed_firmware_count": 1,
+            "selected_module_count": 2,
+            "candidate_module_count": 4,
+            "high_risk_module_count": 2,
+            "entry_count": 6,
+            "vuln_result_count": 10,
+        }
+
+        stats = self.manager._build_project_stats([success, running])
+
+        self.assertEqual(2, stats.total)
+        self.assertEqual(1, stats.success)
+        self.assertEqual(1, stats.running)
+        self.assertEqual(3, stats.input_count)
+        self.assertEqual(2, stats.unpacked_firmware_count)
+        self.assertEqual(1, stats.failed_firmware_count)
+        self.assertEqual(5, stats.selected_module_count)
+        self.assertEqual(9, stats.candidate_module_count)
+        self.assertEqual(3, stats.high_risk_module_count)
+        self.assertEqual(13, stats.entry_count)
+        self.assertEqual(21, stats.vuln_result_count)
+
+    def test_build_project_stage_aggregates_includes_binary_stage_defaults(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                SimpleNamespace(task_id="t1", stage_name="firmware_unpack"),
+                SimpleNamespace(task_id="t1", stage_name="system_analysis"),
+            ],
+            stage_items=[
+                SimpleNamespace(task_id="t1", stage_name="firmware_unpack", status="success"),
+                SimpleNamespace(task_id="t1", stage_name="system_analysis", status="failed"),
+                SimpleNamespace(task_id="t1", stage_name="system_analysis", status="running"),
+                SimpleNamespace(task_id="t1", stage_name="system_analysis", status="cancelled"),
+            ],
+            archive_jobs=[
+                SimpleNamespace(task_id="t1", stage_name="firmware_unpack", archive_status="success"),
+                SimpleNamespace(task_id="t1", stage_name="system_analysis", archive_status="applying"),
+                SimpleNamespace(task_id="t1", stage_name="system_analysis", archive_status="pending"),
+                SimpleNamespace(task_id="t1", stage_name="system_analysis", archive_status="failed"),
+            ],
+        )
+
+        aggregates = self.manager._build_project_stage_aggregates(db, [task], TASK_TYPE_BINARY)
+        by_stage = {item.stage_name: item for item in aggregates}
+
+        self.assertEqual(
+            ["firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+            [item.stage_name for item in aggregates],
+        )
+        self.assertEqual(1, by_stage["system_analysis"].business.task_count)
+        self.assertEqual(3, by_stage["system_analysis"].business.total_items)
+        self.assertEqual(1, by_stage["system_analysis"].business.failed_items)
+        self.assertEqual(1, by_stage["system_analysis"].business.running_items)
+        self.assertEqual(1, by_stage["system_analysis"].business.cancelled_items)
+        self.assertEqual({"failed": 1, "running": 1, "cancelled": 1}, by_stage["system_analysis"].business.status_counts)
+        self.assertEqual(3, by_stage["system_analysis"].archive.job_count)
+        self.assertEqual(1, by_stage["system_analysis"].archive.failed_count)
+        self.assertEqual(1, by_stage["system_analysis"].archive.applying_count)
+        self.assertEqual(1, by_stage["system_analysis"].archive.pending_count)
+        self.assertEqual(0, by_stage["binary_to_source"].business.total_items)
+        self.assertEqual(0, by_stage["binary_to_source"].archive.job_count)
+
+    def test_build_project_stage_aggregates_uses_source_stage_sequence(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src.zip",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[SimpleNamespace(task_id="t1", stage_name="system_analysis")],
+            stage_items=[SimpleNamespace(task_id="t1", stage_name="system_analysis", status="success")],
+            archive_jobs=[SimpleNamespace(task_id="t1", stage_name="system_analysis", archive_status="success")],
+        )
+
+        aggregates = self.manager._build_project_stage_aggregates(db, [task], TASK_TYPE_SOURCE)
+
+        self.assertEqual(
+            ["system_analysis", "entry_analysis", "dataflow_analysis", "vuln_scan"],
+            [item.stage_name for item in aggregates],
+        )
+        self.assertNotIn("firmware_unpack", [item.stage_name for item in aggregates])
+        self.assertEqual(1, aggregates[0].business.success_items)
+        self.assertEqual(1, aggregates[0].archive.success_count)
+
     def test_aggregate_stage_items_marks_partial_success(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         task.summary = {}
@@ -324,6 +463,7 @@ class TaskManagerTests(unittest.TestCase):
                     "filename": "fw.bin",
                     "unpacked_root": "/tmp/unpacked",
                     "source_root": "/tmp/unpacked",
+                    "task_type": None,
                     "module_key": "m1",
                     "module_name": "openssl",
                     "module_dir": "/tmp/unpacked/modules/openssl",
@@ -1620,7 +1760,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("success", results[0]["status"])
         self.assertEqual([False, True, True], calls)
 
-    def test_run_stage_pool_ignores_concurrency_limit_for_retry_mode(self):
+    def test_run_stage_pool_respects_concurrency_limit_for_retry_mode(self):
         active = 0
         max_active = 0
 
@@ -1661,7 +1801,7 @@ class TaskManagerTests(unittest.TestCase):
             self.manager._is_task_cancelled = original_is_cancelled
 
         self.assertEqual(6, len(results))
-        self.assertEqual(6, max_active)
+        self.assertEqual(2, max_active)
 
     def test_run_with_limits_respects_concurrency(self):
         active = 0

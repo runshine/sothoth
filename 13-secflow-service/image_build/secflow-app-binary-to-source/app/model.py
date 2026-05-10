@@ -146,10 +146,17 @@ def _ensure_task_item_progress_columns(engine) -> None:
         statements.append(f"ALTER TABLE {table_name} ADD COLUMN phase VARCHAR(32) NULL")
     if "progress_json" not in columns:
         statements.append(f"ALTER TABLE {table_name} ADD COLUMN progress_json TEXT NULL")
-    if not statements:
-        return
     with engine.begin() as conn:
         for statement in statements:
+            conn.exec_driver_sql(statement)
+    indexes = {index["name"] for index in inspect(engine).get_indexes(table_name)}
+    index_statements: list[str] = []
+    if "ix_b2s_task_project_created_id" not in indexes:
+        index_statements.append(f"CREATE INDEX ix_b2s_task_project_created_id ON {table_name} (project_id, created_at, id)")
+    if "ix_b2s_task_project_status_created_id" not in indexes:
+        index_statements.append(f"CREATE INDEX ix_b2s_task_project_status_created_id ON {table_name} (project_id, status, created_at, id)")
+    with engine.begin() as conn:
+        for statement in index_statements:
             conn.exec_driver_sql(statement)
 
 

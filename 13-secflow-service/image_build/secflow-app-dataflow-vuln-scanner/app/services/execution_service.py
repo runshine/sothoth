@@ -2009,6 +2009,8 @@ class ExecutionService:
         project_id: str | None = None,
         status_filter: str | None = None,
         profile_id: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
     ) -> List[ScanTaskResponse]:
         project_ids = _project_ids(principal)
         query = db.query(TriggerTask).order_by(TriggerTask.created_at.desc())
@@ -2021,7 +2023,9 @@ class ExecutionService:
             query = query.filter(TriggerTask.status == status_filter)
         if profile_id:
             query = query.filter(TriggerTask.profile_id == profile_id)
-        return [self._scan_task_response(db, item) for item in query.all()]
+        safe_limit = max(1, min(int(limit or 100), 500))
+        safe_offset = max(0, int(offset or 0))
+        return [self._scan_task_response(db, item) for item in query.offset(safe_offset).limit(safe_limit).all()]
 
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:
         trigger = self._trigger_or_404(db, task_id)

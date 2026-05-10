@@ -305,6 +305,7 @@ DEFAULT_CONFIGS = [
     ("max_concurrent", "3", "int", "兼容旧版本：单个 Worker 最大并发解包任务数"),
     ("max_retries", "5", "int", "pi agent 最大重试轮数"),
     ("max_retries_reached_action", "success", "string", "达到最大重试轮数后默认动作：success=按通过处理，failed=按失败处理"),
+    ("reuse_agent_between_rounds", "true", "bool", "不同重试轮次之间复用同一智能体会话：true=复用，false=每轮新建"),
     ("dead_threshold", "300", "int", "Worker 心跳超时秒数"),
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
     ("task_lease_seconds", "45", "int", "已废弃：任务执行不再使用租约，仅兼容清理任务配置"),
@@ -435,6 +436,23 @@ def _ensure_unpack_task_columns() -> None:
         for column_name, statement in statements.items():
             if column_name in columns:
                 continue
+            conn.execute(text(statement))
+    indexes = {index["name"] for index in inspector.get_indexes(UnpackTask.__table__.name)}
+    index_statements = []
+    if "ix_fu_tasks_project_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_tasks_project_created_id ON {UnpackTask.__table__.name} (project_id, created_at, id)"
+        )
+    if "ix_fu_tasks_project_status_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_tasks_project_status_created_id ON {UnpackTask.__table__.name} (project_id, status, created_at, id)"
+        )
+    if "ix_fu_tasks_owner_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_tasks_owner_created_id ON {UnpackTask.__table__.name} (owner_id, created_at, id)"
+        )
+    with engine.begin() as conn:
+        for statement in index_statements:
             conn.execute(text(statement))
 
 

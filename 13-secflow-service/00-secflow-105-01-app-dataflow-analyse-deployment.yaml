@@ -27,6 +27,8 @@ spec:
             value: /app/service.yaml
           - name: FILESERVER_ROOT
             value: /data/files
+          - name: DFA_AGENT_TIMEOUT_SECONDS
+            value: "900"
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -37,10 +39,10 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "256Mi"
+            memory: "512Mi"
             cpu: "200m"
           limits:
-            memory: "1Gi"
+            memory: "2Gi"
             cpu: "1000m"
         livenessProbe:
           httpGet:

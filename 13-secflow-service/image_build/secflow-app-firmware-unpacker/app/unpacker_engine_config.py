@@ -78,6 +78,20 @@ def get_max_retries_reached_action() -> str:
     return value if value in {"success", "failed"} else "success"
 
 
+def get_reuse_agent_between_rounds() -> bool:
+    try:
+        from app.model import get_config_value, get_db_session
+
+        db = get_db_session()
+        try:
+            value = get_config_value(db, "reuse_agent_between_rounds", default="true")
+        finally:
+            db.close()
+    except Exception:
+        value = "true"
+    return str(value or "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def preview_text(text: str, limit: int = 240) -> str:
     compact = " ".join(text.split())
     if len(compact) <= limit:

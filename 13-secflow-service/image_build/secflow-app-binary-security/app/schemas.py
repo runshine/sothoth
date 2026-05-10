@@ -107,11 +107,58 @@ class BinarySecurityTaskResponse(BaseModel):
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
 
 
+class BinarySecurityProjectStats(BaseModel):
+    total: int = 0
+    running: int = 0
+    success: int = 0
+    partial_success: int = 0
+    failed: int = 0
+    cancelled: int = 0
+    selected_module_count: int = 0
+    candidate_module_count: int = 0
+    high_risk_module_count: int = 0
+    entry_count: int = 0
+    vuln_result_count: int = 0
+    input_count: int = 0
+    unpacked_firmware_count: int = 0
+    failed_firmware_count: int = 0
+
+
+class BinarySecurityProjectStageBusinessAggregate(BaseModel):
+    task_count: int = 0
+    total_items: int = 0
+    success_items: int = 0
+    failed_items: int = 0
+    skipped_items: int = 0
+    running_items: int = 0
+    cancelled_items: int = 0
+    status_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class BinarySecurityProjectStageArchiveAggregate(BaseModel):
+    job_count: int = 0
+    success_count: int = 0
+    failed_count: int = 0
+    running_count: int = 0
+    applying_count: int = 0
+    pending_count: int = 0
+    status_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class BinarySecurityProjectStageAggregate(BaseModel):
+    stage_name: str
+    sequence_no: int
+    business: BinarySecurityProjectStageBusinessAggregate = Field(default_factory=BinarySecurityProjectStageBusinessAggregate)
+    archive: BinarySecurityProjectStageArchiveAggregate = Field(default_factory=BinarySecurityProjectStageArchiveAggregate)
+
+
 class BinarySecurityTaskListResponse(BaseModel):
     total: int
     running_count: int = 0
     queued_count: int = 0
     max_concurrent_tasks: int = 50
+    project_stats: BinarySecurityProjectStats = Field(default_factory=BinarySecurityProjectStats)
+    project_stage_aggregates: list[BinarySecurityProjectStageAggregate] = Field(default_factory=list)
     items: list[BinarySecurityTaskResponse] = Field(default_factory=list)
 
 

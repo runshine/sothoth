@@ -170,6 +170,17 @@ def clear_timeline(
     return get_task_manager().clear_timeline(db, project_id=project_id, task_id=task_id)
 
 
+@router.delete("/projects/{project_id}/tasks/{task_id}/timeline/{event_id}", response_model=BinarySecurityActionResponse)
+def delete_timeline_event(
+    project_id: str,
+    task_id: str,
+    event_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().delete_timeline_event(db, project_id=project_id, task_id=task_id, event_id=event_id)
+
+
 @router.get("/projects/{project_id}/tasks/{task_id}/artifacts", response_model=BinarySecurityArtifactsResponse)
 def get_artifacts(
     project_id: str,

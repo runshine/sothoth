@@ -100,6 +100,8 @@ async def list_tasks(
     project_id: Optional[str] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     profile_id: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     subject=Depends(get_current_subject),
     db: Session = Depends(get_db),
 ):
@@ -112,6 +114,8 @@ async def list_tasks(
         project_id=project_id,
         status_filter=status_filter,
         profile_id=profile_id,
+        limit=limit,
+        offset=offset,
     )
 
 

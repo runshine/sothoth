@@ -39,6 +39,7 @@ from app.unpacker_engine_config import (
     VAL_PROMPT_TMPL,
     build_settings_json as _build_settings_json,
     get_max_retries as _get_max_retries,
+    get_reuse_agent_between_rounds as _get_reuse_agent_between_rounds,
     load_agent_def,
     preview_text as _preview_text,
     render_prompt,
@@ -192,6 +193,8 @@ def _run_reviewer(
     llm_binding_snapshot: dict[str, Any] | None = None,
     bind_cancel_client: Optional[Callable[[PiRpcClient | None], None]] = None,
     activity_callback: Optional[Callable[[str], None]] = None,
+    reviewer: PiRpcClient | None = None,
+    session_artifacts_override: dict[str, Any] | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     stage_log_dir = _get_round_dir(log_dir, 0)
     _append_stage_log(
@@ -203,7 +206,7 @@ def _run_reviewer(
         output_path=output_path,
     )
     session_name, round_id = _reviewer_session_name(suffix)
-    session_artifacts = build_session_artifacts(
+    session_artifacts = session_artifacts_override or build_session_artifacts(
         log_dir,
         role="reviewer",
         name=session_name,
@@ -211,7 +214,7 @@ def _run_reviewer(
         phase="review",
         round_id=round_id,
     )
-    validator = PiRpcClient(
+    validator = reviewer or PiRpcClient(
         system_prompt_file=val_sp,
         model=val_def["model"],
         tools=val_def["tools"],
@@ -260,7 +263,8 @@ def _run_reviewer(
     finally:
         if bind_cancel_client:
             bind_cancel_client(None)
-        validator.close()
+        if reviewer is None:
+            validator.close()
 
 
 def _run_skill_unpack(
@@ -396,13 +400,14 @@ def _run_generic_unpack(
         output_path=output_path,
     )
     max_retries = _get_max_retries()
+    reuse_agent_between_rounds = _get_reuse_agent_between_rounds()
     session_artifacts = build_session_artifacts(
         log_dir,
         role="executor",
-        name="round-1",
+        name="shared" if reuse_agent_between_rounds else "round-1",
         provider_role="executor",
         phase="llm_unpack",
-        round_id=1,
+        round_id=None if reuse_agent_between_rounds else 1,
     )
     executor = PiRpcClient(
         system_prompt_file=exec_sp,
@@ -423,12 +428,38 @@ def _run_generic_unpack(
     passed = False
     final_round = 0
     last_reason = ""
+    reviewer: PiRpcClient | None = None
+    reviewer_session_artifacts: dict[str, Any] | None = None
+    if reuse_agent_between_rounds:
+        reviewer_session_artifacts = build_session_artifacts(
+            log_dir,
+            role="reviewer",
+            name="shared",
+            provider_role="reviewer",
+            phase="review",
+            round_id=None,
+        )
+        reviewer = PiRpcClient(
+            system_prompt_file=val_sp,
+            model=val_def["model"],
+            tools=val_def["tools"],
+            provider_role="reviewer",
+            llm_binding_snapshot=llm_binding_snapshot,
+            session_dir=reviewer_session_artifacts["session_dir"],
+            session_path=reviewer_session_artifacts["session_path"],
+            session_role=reviewer_session_artifacts["session_role"],
+            session_name=reviewer_session_artifacts["session_name"],
+            session_phase=reviewer_session_artifacts["phase"],
+            session_round=reviewer_session_artifacts["round"],
+            session_skill_name=reviewer_session_artifacts["skill_name"],
+            task_id=task_id,
+        )
     try:
         for attempt in range(1, max_retries + 1):
             round_dir = _get_round_dir(log_dir, attempt)
             cancel_check(executor)
             final_round = attempt
-            if attempt > 1:
+            if attempt > 1 and not reuse_agent_between_rounds:
                 round_artifacts = build_session_artifacts(
                     log_dir,
                     role="executor",
@@ -519,6 +550,8 @@ def _run_generic_unpack(
                 llm_binding_snapshot=llm_binding_snapshot,
                 bind_cancel_client=cancel_check,
                 activity_callback=activity_callback,
+                reviewer=reviewer,
+                session_artifacts_override=reviewer_session_artifacts,
             )
             log_event(
                 log,
@@ -659,6 +692,8 @@ def _run_generic_unpack(
         return passed, final_round, last_reason
     finally:
         cancel_check(None)
+        if reviewer is not None:
+            reviewer.close()
         executor.close()
 
 

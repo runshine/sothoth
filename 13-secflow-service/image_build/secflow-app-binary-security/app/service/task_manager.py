@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import func, or_, text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 
 from app.config import get_config
 from app.exception import NotFoundError, ValidationError
@@ -42,6 +42,8 @@ from app.schemas import (
     BinarySecurityOverviewArchiveDetail,
     BinarySecurityOverviewBusinessDetail,
     BinarySecurityOverviewNode,
+    BinarySecurityProjectStageAggregate,
+    BinarySecurityProjectStats,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
@@ -68,6 +70,7 @@ from app.time_utils import now_local
 
 
 DB_SUMMARY_ITEM_LIMIT = 50
+DB_FAILURE_ITEM_LIMIT = 20
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 
@@ -76,9 +79,82 @@ def _now() -> datetime:
     return now_local()
 
 
+def _elapsed_seconds_since(value: datetime | None) -> float | None:
+    """Return elapsed seconds for naive DB datetimes across UTC/UTC+8 writers.
+
+    Older rows may have been written as UTC naive values while newer code writes
+    UTC+8 naive values. Calculate both interpretations and use the smallest
+    non-negative age so fresh locks are not reclaimed early and stale locks can
+    still expire.
+    """
+    if value is None:
+        return None
+    candidates = [
+        (_now() - value).total_seconds(),
+        (datetime.utcnow() - value).total_seconds(),
+    ]
+    non_negative = [age for age in candidates if age >= 0]
+    if non_negative:
+        return min(non_negative)
+    return max(candidates)
+
+
 def _slug(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "-", value or "").strip("-")
     return cleaned[:120] or uuid.uuid4().hex[:12]
+
+
+def _normalize_entry_function_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    matches = re.findall(r"([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\(", raw)
+    if matches:
+        return matches[-1]
+    return raw
+
+
+def _entry_key_with_suffix(base_key: str, suffix_source: Any, fallback_index: int) -> str:
+    suffix = _slug(str(suffix_source or fallback_index))[:32]
+    if not suffix:
+        suffix = str(fallback_index)
+    max_base_len = max(1, 119 - len(suffix))
+    return f"{base_key[:max_base_len].rstrip('-')}-{suffix}"
+
+
+def _deduplicate_entry_keys(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep legacy entry keys unless a module produces colliding function/line keys."""
+    buckets: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, entry in enumerate(entries):
+        buckets.setdefault(str(entry.get("entry_key") or ""), []).append((index, entry))
+
+    used: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for index, entry in enumerate(entries):
+        current = dict(entry)
+        base_key = str(current.get("entry_key") or "")
+        bucket = buckets.get(base_key) or []
+        if base_key and len(bucket) == 1 and base_key not in used:
+            used.add(base_key)
+            deduped.append(current)
+            continue
+
+        suffix_source = (
+            current.get("raw_function_name")
+            or current.get("function_qualifier")
+            or current.get("file_name")
+            or current.get("function_name")
+            or index
+        )
+        candidate = _entry_key_with_suffix(base_key or _slug(str(suffix_source)), suffix_source, index + 1)
+        attempt = 2
+        while candidate in used:
+            candidate = _entry_key_with_suffix(base_key or _slug(str(suffix_source)), f"{suffix_source}-{attempt}", index + 1)
+            attempt += 1
+        current["entry_key"] = candidate
+        used.add(candidate)
+        deduped.append(current)
+    return deduped
 
 
 def _read_text(path: Path) -> str:
@@ -561,21 +637,50 @@ class TaskManager:
         return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def list_tasks(self, db: Session, *, project_id: str, status: str | None = None, task_type: str | None = None) -> BinarySecurityTaskListResponse:
-        query = db.query(BinarySecurityTask).filter(BinarySecurityTask.project_id == project_id)
-        if status:
-            query = query.filter(BinarySecurityTask.status == status)
-        if task_type:
-            normalized_task_type = self._validate_task_type(task_type)
+        base_query = db.query(BinarySecurityTask).filter(BinarySecurityTask.project_id == project_id)
+        normalized_task_type = self._validate_task_type(task_type) if task_type else None
+        if normalized_task_type:
             if normalized_task_type == TASK_TYPE_BINARY:
-                query = query.filter(
+                base_query = base_query.filter(
                     or_(
                         BinarySecurityTask.task_type == TASK_TYPE_BINARY,
                         BinarySecurityTask.task_type.is_(None),
                     )
                 )
             else:
-                query = query.filter(BinarySecurityTask.task_type == normalized_task_type)
-        tasks = query.order_by(BinarySecurityTask.created_at.desc()).all()
+                base_query = base_query.filter(BinarySecurityTask.task_type == normalized_task_type)
+        stats_tasks = base_query.options(
+            load_only(
+                BinarySecurityTask.id,
+                BinarySecurityTask.task_type,
+                BinarySecurityTask.status,
+                BinarySecurityTask.metrics_json,
+            )
+        ).all()
+        query = base_query
+        if status:
+            query = query.filter(BinarySecurityTask.status == status)
+        tasks = query.options(
+            load_only(
+                BinarySecurityTask.id,
+                BinarySecurityTask.project_id,
+                BinarySecurityTask.task_type,
+                BinarySecurityTask.name,
+                BinarySecurityTask.status,
+                BinarySecurityTask.current_stage,
+                BinarySecurityTask.firmware_path,
+                BinarySecurityTask.policy_json,
+                BinarySecurityTask.metrics_json,
+                BinarySecurityTask.dispatcher_instance_id,
+                BinarySecurityTask.created_by,
+                BinarySecurityTask.created_at,
+                BinarySecurityTask.updated_at,
+                BinarySecurityTask.started_at,
+                BinarySecurityTask.finished_at,
+                BinarySecurityTask.execution_mode,
+                BinarySecurityTask.target_stage_name,
+            )
+        ).order_by(BinarySecurityTask.created_at.desc()).all()
         queue_info = self._build_queue_info(db, project_id=project_id)
         service_config = self._load_service_config(db)
         return BinarySecurityTaskListResponse(
@@ -583,6 +688,8 @@ class TaskManager:
             running_count=queue_info["running_count"],
             queued_count=queue_info["queued_count"],
             max_concurrent_tasks=service_config.max_concurrent_tasks,
+            project_stats=self._build_project_stats(stats_tasks),
+            project_stage_aggregates=self._build_project_stage_aggregates(db, stats_tasks, normalized_task_type),
             items=[self._task_response(db, task, queue_info=queue_info) for task in tasks],
         )
 
@@ -740,6 +847,25 @@ class TaskManager:
             deleted_event_count=int(deleted_count or 0),
         )
 
+    def delete_timeline_event(self, db: Session, *, project_id: str, task_id: str, event_id: str) -> BinarySecurityActionResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        deleted_count = (
+            db.query(BinarySecurityEvent)
+            .filter(
+                BinarySecurityEvent.task_id == task.id,
+                BinarySecurityEvent.id == event_id,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        if not deleted_count:
+            raise NotFoundError("事件不存在或已删除")
+        return BinarySecurityActionResponse(
+            task_id=task.id,
+            message=f"事件 {event_id} 已删除",
+            deleted_event_count=int(deleted_count or 0),
+        )
+
     def get_artifacts(
         self,
         db: Session,
@@ -800,7 +926,22 @@ class TaskManager:
         task.dispatch_started_at = None
         task.finished_at = task.finished_at or _now()
         self._record_event(db, task, "task_delete_requested", "任务删除已请求")
-        items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+        items = db.query(BinarySecurityStageItem).options(
+            load_only(
+                BinarySecurityStageItem.id,
+                BinarySecurityStageItem.task_id,
+                BinarySecurityStageItem.stage_name,
+                BinarySecurityStageItem.item_key,
+                BinarySecurityStageItem.status,
+                BinarySecurityStageItem.retry_count,
+                BinarySecurityStageItem.downstream_service,
+                BinarySecurityStageItem.downstream_task_id,
+                BinarySecurityStageItem.error_message,
+                BinarySecurityStageItem.started_at,
+                BinarySecurityStageItem.finished_at,
+                BinarySecurityStageItem.created_at,
+            )
+        ).filter(BinarySecurityStageItem.task_id == task.id).all()
         downstream_refs = self._collect_downstream_refs(task, items)
         for item in items:
             if item.status in {"pending", "queued", "running"}:
@@ -1976,7 +2117,6 @@ class TaskManager:
 
     def _reclaim_stale_dispatching_locked(self, db: Session) -> bool:
         service_config = self._load_service_config(db)
-        cutoff = _now().timestamp() - service_config.dispatch_timeout_seconds
         stale_rows = (
             db.query(BinarySecurityTask)
             .filter(
@@ -1995,7 +2135,8 @@ class TaskManager:
         for task in stale_rows:
             if task.id in local_workers:
                 continue
-            if not task.dispatch_started_at or task.dispatch_started_at.timestamp() >= cutoff:
+            elapsed_seconds = _elapsed_seconds_since(task.dispatch_started_at)
+            if elapsed_seconds is None or elapsed_seconds < service_config.dispatch_timeout_seconds:
                 continue
             task.status = "pending"
             task.dispatcher_instance_id = None
@@ -2016,7 +2157,6 @@ class TaskManager:
     def _reclaim_stale_running_locked(self, db: Session) -> bool:
         service_config = self._load_service_config(db)
         timeout_seconds = max(int(service_config.dispatch_timeout_seconds) * 3, 300)
-        cutoff = _now().timestamp() - timeout_seconds
         stale_rows = (
             db.query(BinarySecurityTask)
             .filter(
@@ -2036,7 +2176,8 @@ class TaskManager:
             if task.id in local_workers:
                 continue
             heartbeat_at = task.updated_at or task.dispatch_started_at
-            if not heartbeat_at or heartbeat_at.timestamp() >= cutoff:
+            elapsed_seconds = _elapsed_seconds_since(heartbeat_at)
+            if elapsed_seconds is None or elapsed_seconds < timeout_seconds:
                 continue
             stage_name = task.current_stage or self._stage_sequence_for_task(task)[0]
             stage_run = db.query(BinarySecurityStageRun).filter(
@@ -2675,6 +2816,114 @@ class TaskManager:
                 )
             )
         return nodes
+
+    def _build_project_stats(self, tasks: list[BinarySecurityTask]) -> BinarySecurityProjectStats:
+        active_statuses = {
+            "pending",
+            "dispatching",
+            "running",
+            "pending_upload",
+            "uploading",
+            "ready_to_start",
+            TASK_STATUS_PENDING_MODULE_CONFIRMATION,
+        }
+        stats = BinarySecurityProjectStats(total=len(tasks))
+        for task in tasks:
+            status = task.status or ""
+            metrics = task.metrics or {}
+            if status in active_statuses:
+                stats.running += 1
+            elif status == "success":
+                stats.success += 1
+            elif status == "partial_success":
+                stats.partial_success += 1
+            elif status == "failed":
+                stats.failed += 1
+            elif status == "cancelled":
+                stats.cancelled += 1
+            stats.selected_module_count += int(metrics.get("selected_module_count") or 0)
+            stats.candidate_module_count += int(metrics.get("candidate_module_count") or 0)
+            stats.high_risk_module_count += int(metrics.get("high_risk_module_count") or 0)
+            stats.entry_count += int(metrics.get("entry_count") or 0)
+            stats.vuln_result_count += int(metrics.get("vuln_result_count") or 0)
+            stats.input_count += int(metrics.get("firmware_item_count") or 0)
+            stats.unpacked_firmware_count += int(metrics.get("unpacked_firmware_count") or 0)
+            stats.failed_firmware_count += int(metrics.get("failed_firmware_count") or 0)
+        return stats
+
+    def _build_project_stage_aggregates(
+        self,
+        db: Session,
+        tasks: list[BinarySecurityTask],
+        task_type: str | None = None,
+    ) -> list[BinarySecurityProjectStageAggregate]:
+        if task_type:
+            stage_sequence = list(TASK_STAGE_SEQUENCES.get(task_type, STAGE_SEQUENCE))
+        elif tasks and all(self._task_type(task) == TASK_TYPE_SOURCE for task in tasks):
+            stage_sequence = list(TASK_STAGE_SEQUENCES[TASK_TYPE_SOURCE])
+        else:
+            stage_sequence = list(TASK_STAGE_SEQUENCES[TASK_TYPE_BINARY])
+
+        aggregates = {
+            stage_name: BinarySecurityProjectStageAggregate(stage_name=stage_name, sequence_no=index)
+            for index, stage_name in enumerate(stage_sequence, start=1)
+        }
+        task_ids = [task.id for task in tasks if task.id]
+        if not task_ids:
+            return list(aggregates.values())
+
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id.in_(task_ids)).all()
+        stage_items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id.in_(task_ids)).all()
+        archive_jobs = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id.in_(task_ids)).all()
+
+        entered_task_ids: dict[str, set[str]] = {stage_name: set() for stage_name in stage_sequence}
+        for run in stage_runs:
+            if run.stage_name in entered_task_ids:
+                entered_task_ids[run.stage_name].add(run.task_id)
+
+        for item in stage_items:
+            aggregate = aggregates.get(item.stage_name)
+            if not aggregate:
+                continue
+            entered_task_ids[item.stage_name].add(item.task_id)
+            status = self._normalize_downstream_status(item.status) or item.status or "unknown"
+            business = aggregate.business
+            business.total_items += 1
+            business.status_counts[status] = business.status_counts.get(status, 0) + 1
+            if status == "success":
+                business.success_items += 1
+            elif status == "failed":
+                business.failed_items += 1
+            elif status == "skipped":
+                business.skipped_items += 1
+            elif status == "cancelled":
+                business.cancelled_items += 1
+            if status in {"pending", "queued", "running", "dispatching"}:
+                business.running_items += 1
+
+        for stage_name, task_id_set in entered_task_ids.items():
+            aggregates[stage_name].business.task_count = len(task_id_set)
+
+        for job in archive_jobs:
+            aggregate = aggregates.get(job.stage_name)
+            if not aggregate:
+                continue
+            status = str(job.archive_status or "unknown").strip().lower() or "unknown"
+            archive = aggregate.archive
+            archive.job_count += 1
+            archive.status_counts[status] = archive.status_counts.get(status, 0) + 1
+            if status == "success":
+                archive.success_count += 1
+            elif status == "failed":
+                archive.failed_count += 1
+            elif status == "running":
+                archive.running_count += 1
+            elif status in {"archived", "applying"}:
+                archive.applying_count += 1
+            elif status == "pending":
+                archive.pending_count += 1
+
+        return list(aggregates.values())
 
     def _task_response(self, db: Session, task: BinarySecurityTask, queue_info: dict[str, Any] | None = None) -> BinarySecurityTaskResponse:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).order_by(BinarySecurityStageRun.sequence_no.asc()).all()
@@ -4541,6 +4790,7 @@ class TaskManager:
         entries: list[dict[str, Any]] = []
         for result in entry_results:
             entries.extend(result.get("entries", []))
+        entries = _deduplicate_entry_keys(entries)
         if not entries:
             return "failed", {"error": "没有可用于数据流分析的入口"}
         if retry_existing:
@@ -4613,7 +4863,7 @@ class TaskManager:
         retries: int = 0,
         initial_retry: bool = False,
     ):
-        effective_concurrency = len(items) if initial_retry else concurrency
+        effective_concurrency = concurrency
         semaphore = asyncio.Semaphore(max(1, effective_concurrency))
 
         async def wrapped(item: dict[str, Any]):
@@ -4848,6 +5098,57 @@ class TaskManager:
             session.close()
 
     def _parse_entries(self, artifact_root: Path, module: dict[str, Any]) -> list[dict[str, Any]]:
+        def _rows_from_payload(payload: Any, source: Path) -> list[dict[str, Any]]:
+            if isinstance(payload, dict):
+                raw_entries = payload.get("entries") or payload.get("items") or []
+            elif isinstance(payload, list):
+                raw_entries = payload
+            else:
+                raw_entries = []
+            rows = []
+            for index, entry in enumerate(raw_entries):
+                if not isinstance(entry, dict):
+                    continue
+                raw_function_name = entry.get("function_name") or entry.get("function") or entry.get("name") or ""
+                function_name = _normalize_entry_function_name(raw_function_name)
+                if not function_name:
+                    continue
+                file_name = str(entry.get("file_name") or entry.get("file") or "").strip()
+                line_no = str(entry.get("line_no") or entry.get("line") or index + 1)
+                rows.append(
+                    {
+                        "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
+                        "firmware_key": module.get("firmware_key") or "",
+                        "firmware_name": module.get("firmware_name") or "",
+                        "module_key": module["module_key"],
+                        "module_name": module["module_name"],
+                        "file_name": file_name,
+                        "function_name": function_name,
+                        "raw_function_name": str(raw_function_name or ""),
+                        "line_no": line_no,
+                        "entry_file": str(source),
+                        "source_dir": (module.get("source_root") if module.get("task_type") == TASK_TYPE_SOURCE else None) or module["source_dir"],
+                    }
+                )
+            return _deduplicate_entry_keys(rows)
+
+        function_list_candidates = [
+            artifact_root / "functions.list",
+            artifact_root / "output" / "functions.list",
+        ]
+        if artifact_root.is_dir() and not any(candidate.is_file() for candidate in function_list_candidates):
+            recursive_matches = sorted(artifact_root.rglob("functions.list"))
+            if len(recursive_matches) == 1:
+                function_list_candidates.append(recursive_matches[0])
+        for candidate in function_list_candidates:
+            if candidate.is_file():
+                try:
+                    rows = _rows_from_payload(json.loads(_read_text(candidate) or "[]"), candidate)
+                    if rows:
+                        return rows
+                except Exception:
+                    pass
+
         json_candidates = [
             artifact_root / "result.json",
             artifact_root / "result_json",
@@ -4856,27 +5157,7 @@ class TaskManager:
         for candidate in json_candidates:
             if candidate.is_file():
                 payload = json.loads(_read_text(candidate) or "{}")
-                rows = []
-                for index, entry in enumerate(payload.get("entries") or payload.get("items") or []):
-                    function_name = str(entry.get("function_name") or entry.get("name") or "").strip()
-                    if not function_name:
-                        continue
-                    file_name = str(entry.get("file_name") or entry.get("file") or "").strip()
-                    line_no = str(entry.get("line_no") or entry.get("line") or index + 1)
-                    rows.append(
-                        {
-                            "entry_key": _slug(f"{module['module_key']}-{function_name}-{line_no}"),
-                            "firmware_key": module.get("firmware_key") or "",
-                            "firmware_name": module.get("firmware_name") or "",
-                            "module_key": module["module_key"],
-                            "module_name": module["module_name"],
-                            "file_name": file_name,
-                            "function_name": function_name,
-                            "line_no": line_no,
-                            "entry_file": str(candidate),
-                            "source_dir": module["source_dir"],
-                        }
-                    )
+                rows = _rows_from_payload(payload, candidate)
                 if rows:
                     return rows
         entry_file = artifact_root / "entry-list.md"
@@ -4890,7 +5171,7 @@ class TaskManager:
                 parts = parts[:-1]
             if len(parts) >= 7 and parts[1].isdigit():
                 file_name = parts[2]
-                function_name = parts[3]
+                function_name = _normalize_entry_function_name(parts[3])
                 line_no = parts[4]
                 if file_name and function_name:
                     rows.append(
@@ -4902,12 +5183,13 @@ class TaskManager:
                             "module_name": module["module_name"],
                             "file_name": file_name,
                             "function_name": function_name,
+                            "raw_function_name": parts[3],
                             "line_no": line_no,
                             "entry_file": str(entry_file),
-                            "source_dir": module["source_dir"],
+                            "source_dir": (module.get("source_root") if module.get("task_type") == TASK_TYPE_SOURCE else None) or module["source_dir"],
                         }
                     )
-        return rows
+        return _deduplicate_entry_keys(rows)
 
     async def _run_dataflow_item(
         self,
@@ -5139,8 +5421,10 @@ class TaskManager:
             task.summary = {**task.summary, summary_key: compact_success}
             db.commit()
             return "success", summary
-        failed = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "failed"]
-        cancelled = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "cancelled"]
+        failed_all = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "failed"]
+        cancelled_all = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "cancelled"]
+        failed = failed_all[:DB_FAILURE_ITEM_LIMIT]
+        cancelled = cancelled_all[:DB_FAILURE_ITEM_LIMIT]
         if failed and success:
             status = "partial_success"
         elif failed:
@@ -5154,10 +5438,13 @@ class TaskManager:
             "failed_items": failed,
             "cancelled_items": cancelled,
             "success_count": len(compact_success),
-            "failed_count": len(failed),
+            "failed_count": len(failed_all),
+            "cancelled_count": len(cancelled_all),
             "entry_count": self._entry_count_for_summary(summary_key, compact_success),
             "vuln_result_count": len(compact_success) if summary_key == "vuln_results" else 0,
             "items_truncated": len(db_success) < len(compact_success),
+            "failed_items_truncated": len(failed) < len(failed_all),
+            "cancelled_items_truncated": len(cancelled) < len(cancelled_all),
             "error": failed[0].get("error") if failed else cancelled[0].get("error") if cancelled else None,
         }
         task.summary = {**task.summary, summary_key: compact_success}
@@ -5206,6 +5493,7 @@ class TaskManager:
             "filename": item.get("filename"),
             "unpacked_root": item.get("unpacked_root"),
             "source_root": item.get("source_root"),
+            "task_type": item.get("task_type"),
             "module_key": item.get("module_key"),
             "module_name": item.get("module_name"),
             "module_dir": item.get("module_dir"),

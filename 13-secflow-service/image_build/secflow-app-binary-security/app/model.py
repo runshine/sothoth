@@ -403,6 +403,19 @@ def _ensure_compat_columns(engine) -> None:
         with engine.begin() as conn:
             for statement in statements:
                 conn.execute(text(statement))
+        indexes = {index["name"] for index in inspector.get_indexes(task_table)}
+        index_statements = []
+        if "ix_bst_project_type_created_id" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bst_project_type_created_id ON {task_table} (project_id, task_type, created_at, id)"
+            )
+        if "ix_bst_project_status_created_id" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bst_project_status_created_id ON {task_table} (project_id, status, created_at, id)"
+            )
+        with engine.begin() as conn:
+            for statement in index_statements:
+                conn.execute(text(statement))
 
 
 def get_db():

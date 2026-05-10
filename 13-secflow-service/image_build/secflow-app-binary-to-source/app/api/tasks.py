@@ -75,17 +75,20 @@ async def list_llm_providers(
 async def list_tasks(
     project_id: str,
     status: Optional[str] = Query(None),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
     _: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    query = db.query(B2STask).filter(B2STask.project_id == project_id).order_by(B2STask.created_at.desc())
-    tasks = query.all()
+    query = db.query(B2STask).filter(B2STask.project_id == project_id)
+    if status:
+        query = query.filter(B2STask.status == status)
+    total = query.count()
+    tasks = query.order_by(B2STask.created_at.desc()).offset(offset).limit(limit).all()
     for task in tasks:
         await sync_task(db, task)
-    if status:
-        tasks = [task for task in tasks if task.status == status]
     items = [build_task_response(db, task) for task in tasks]
-    return TaskListResponse(total=len(items), items=items)
+    return TaskListResponse(total=total, items=items)
 
 
 @router.post("/projects/{project_id}/tasks/prepare", response_model=TaskPrepareResponse)
