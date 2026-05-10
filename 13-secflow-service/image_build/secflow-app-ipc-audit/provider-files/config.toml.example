@@ -1,0 +1,2 @@
+# local example file mounted to /root/.codex/config.toml
+model = "gpt-5.5"

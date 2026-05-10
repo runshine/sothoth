@@ -1,0 +1,41 @@
+name: secflow-app-ipc-audit
+
+services:
+  secflow-app-ipc-audit:
+    # Platform template for deployment-time LLM Provider injection.
+    # ConfigCenter env_bindings/file_bindings are merged by platform-agent into this service.
+    image: "${IPC_AUDIT_IMAGE:-secflow-app-ipc-audit:latest}"
+    container_name: secflow-app-ipc-audit
+    restart: unless-stopped
+    ports:
+      - "${IPC_AUDIT_PORT:-8080}:8080"
+    environment:
+      IPC_AUDIT_DATABASE_URL: "sqlite:////var/lib/secflow-ipc-audit/ipc-audit.db"
+      IPC_AUDIT_STATE_ROOT: "/var/lib/secflow-ipc-audit"
+      IPC_AUDIT_EXECUTION_MODE: "${IPC_AUDIT_EXECUTION_MODE:-opencode_cli}"
+      IPC_AUDIT_MAX_PARALLEL_TASKS: "${IPC_AUDIT_MAX_PARALLEL_TASKS:-1}"
+      IPC_AUDIT_DEFAULT_WORKSPACE_ID: "${IPC_AUDIT_DEFAULT_WORKSPACE_ID:-oh61-main}"
+      IPC_AUDIT_CODEX_BIN: "/usr/local/bin/codex"
+      IPC_AUDIT_OPENCODE_BIN: "/usr/local/bin/opencode"
+      HDC_BIN: "/workspace/openharmony_6_1/vendor/edu/docker/src/hdc"
+      LD_LIBRARY_PATH: "/workspace/openharmony_6_1/vendor/edu/docker/src"
+      IPC_AUDIT_POC_ENABLED: "${IPC_AUDIT_POC_ENABLED:-true}"
+      IPC_AUDIT_POC_RUNTIME_AVAILABLE: "${IPC_AUDIT_POC_RUNTIME_AVAILABLE:-true}"
+      IPC_AUDIT_WORKSPACES_JSON: >-
+        [{"workspace_id":"oh61-main","display_name":"OpenHarmony 6.1 Main Tree","repo_root":"/workspace/openharmony_6_1","entries_file":".audit/ipc_entries.txt","bundle_scan_roots":["base","foundation"],"allow_custom_project_path":true,"supports_poc":true,"default_pipeline_mode":"audit_then_poc","is_default":true}]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: ${IPC_AUDIT_STATE_HOST_PATH:-./state}
+        target: /var/lib/secflow-ipc-audit
+      - type: bind
+        source: ${OH_WORKSPACE_HOST_PATH}
+        target: /workspace/openharmony_6_1
+        read_only: true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/app/ipc-audit/health', timeout=5)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

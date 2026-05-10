@@ -1,0 +1,5 @@
+{
+  "provider": "opencode-local-example",
+  "apiBase": "https://api.openai.com/v1",
+  "apiKey": "replace-me"
+}

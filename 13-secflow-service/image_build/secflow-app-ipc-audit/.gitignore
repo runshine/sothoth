@@ -1,0 +1,11 @@
+.pytest_cache/
+__pycache__/
+*.pyc
+config.yaml
+.env
+state/
+.env.platform
+provider-files/codex-auth.json
+provider-files/config.toml
+provider-files/opencode.json
+third_party/hdc/

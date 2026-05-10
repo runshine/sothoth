@@ -1,0 +1,78 @@
+# This manifest intentionally does not hardcode Codex/OpenCode credentials.
+# First-round deployment-time LLM Provider injection is wired through the compose-style
+# platform template `docker-compose.platform.yml`, not through a separate runtime injector.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-ipc-audit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secflow-app-ipc-audit
+  template:
+    metadata:
+      labels:
+        app: secflow-app-ipc-audit
+    spec:
+      containers:
+        - name: secflow-app-ipc-audit
+          image: secflow-app-ipc-audit:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            - name: IPC_AUDIT_DATABASE_URL
+              value: sqlite:////var/lib/secflow-ipc-audit/ipc-audit.db
+            - name: IPC_AUDIT_STATE_ROOT
+              value: /var/lib/secflow-ipc-audit
+            - name: IPC_AUDIT_EXECUTION_MODE
+              value: opencode_cli
+            - name: IPC_AUDIT_MAX_PARALLEL_TASKS
+              value: "1"
+            - name: IPC_AUDIT_DEFAULT_WORKSPACE_ID
+              value: oh61-main
+            - name: IPC_AUDIT_CODEX_BIN
+              value: /usr/local/bin/codex
+            - name: HDC_BIN
+              value: /workspace/openharmony_6_1/vendor/edu/docker/src/hdc
+            - name: LD_LIBRARY_PATH
+              value: /workspace/openharmony_6_1/vendor/edu/docker/src
+            - name: IPC_AUDIT_WORKSPACES_JSON
+              value: >-
+                [{"workspace_id":"oh61-main","display_name":"OpenHarmony 6.1 Main Tree","repo_root":"/workspace/openharmony_6_1","entries_file":".audit/ipc_entries.txt","bundle_scan_roots":["base","foundation"],"allow_custom_project_path":true,"supports_poc":true,"default_pipeline_mode":"audit_then_poc","is_default":true}]
+          volumeMounts:
+            - name: ipc-audit-state
+              mountPath: /var/lib/secflow-ipc-audit
+            - name: oh-workspace
+              mountPath: /workspace/openharmony_6_1
+          readinessProbe:
+            httpGet:
+              path: /api/app/ipc-audit/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/app/ipc-audit/health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      volumes:
+        - name: ipc-audit-state
+          persistentVolumeClaim:
+            claimName: secflow-ipc-audit-state-pvc
+        - name: oh-workspace
+          persistentVolumeClaim:
+            claimName: openharmony-workspace-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-app-ipc-audit
+spec:
+  selector:
+    app: secflow-app-ipc-audit
+  ports:
+    - port: 80
+      targetPort: 8080

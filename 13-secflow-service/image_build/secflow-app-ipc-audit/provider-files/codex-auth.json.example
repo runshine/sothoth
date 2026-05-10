@@ -1,0 +1,4 @@
+{
+  "note": "local example file mounted to /root/.codex/auth.json",
+  "provider": "codex-local-example"
+}
