@@ -892,43 +892,11 @@ class ExecutionService:
         request = metadata.get("dataflow_scan_request")
         if not isinstance(request, dict):
             return None, None
-
-        workspace_ref = request.get("workspace_dir")
-        output_ref = request.get("output_dir")
-        if workspace_ref is None and output_ref is None:
-            return None, None
-        if workspace_ref is None:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="workspace_dir is required when output_dir is provided",
-            )
-        if not isinstance(workspace_ref, dict):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="workspace_dir must be a valid directory ref")
-        if output_ref is not None and not isinstance(output_ref, dict):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="output_dir must be a valid directory ref")
-
-        workspace_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=workspace_ref, expected="workspace_dir")
-        if not workspace_base.is_dir():
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {workspace_base}")
-
-        workspace_base = workspace_base.resolve()
-        output_relative = Path("output")
-        if output_ref is not None:
-            output_base = self._resolve_dataflow_input_ref(project_id=project_id, ref=output_ref, expected="output_dir")
-            if not output_base.is_dir():
-                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {output_base}")
-            output_base = output_base.resolve()
-            try:
-                output_relative = output_base.relative_to(workspace_base)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail="output_dir must be inside workspace_dir",
-                ) from exc
-
-        workspace_root = ensure_dir(workspace_base / sanitize_name(execution_id))
-        output_dir = ensure_dir(workspace_root / output_relative)
-        return workspace_root, output_dir
+        # Dataflow vulnerability scan tasks use the standard task-root layout:
+        # <project>/app/secflow-app-dataflow-vuln-scanner/<task_id>/{input,output,run}.
+        # User-provided workspace/output refs are treated as input metadata only
+        # and must not move runtime or final artifacts outside the task root.
+        return None, None
 
     def _default_dataflow_cli_runs_root(self, project_id: str) -> Path:
         config = get_config()
@@ -953,15 +921,10 @@ class ExecutionService:
         return bool(str(request.get("resume_run_dir") or "").strip())
 
     def _resolve_dataflow_cli_runs_root(self, *, project_id: str, request: dict[str, Any]) -> Path:
-        workspace_ref = request.get("workspace_dir")
-        if workspace_ref is None:
-            return ensure_dir(self._default_dataflow_cli_runs_root(project_id)).resolve()
-        if not isinstance(workspace_ref, dict):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="workspace_dir must be a valid directory ref")
-        runs_root = self._resolve_dataflow_input_ref(project_id=project_id, ref=workspace_ref, expected="workspace_dir")
-        if not runs_root.is_dir():
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {runs_root}")
-        return runs_root.resolve()
+        # Keep every dataflow-vuln task under the service task root. A
+        # workspace_dir request may still be stored in input metadata, but it
+        # must not redirect the task directory outside app/<service>/<task_id>.
+        return ensure_dir(self._default_dataflow_cli_runs_root(project_id)).resolve()
 
     def _build_dataflow_cli_run_name(
         self,
@@ -1034,7 +997,7 @@ class ExecutionService:
         if request.get("output_dir") is not None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="output_dir is not supported by run_vuln_scan.py launcher; choose workspace_dir/runs root instead",
+                detail="output_dir is not supported by run_vuln_scan.py launcher; final outputs are written to the task output directory",
             )
         data_flow_path = self._resolve_dataflow_input_ref(project_id=project_id, ref=data_flow_ref, expected="data_flow")
         if not data_flow_path.is_file():
@@ -1388,9 +1351,6 @@ class ExecutionService:
             / "app"
             / "secflow-app-dataflow-vuln-scanner"
             / sanitize_name(trigger_id)
-            / "run"
-            / "executions"
-            / sanitize_name(execution_id)
         )
 
     def _artifact_uploads_from_refs(self, artifact_refs: list[ArtifactRef]) -> list[dict[str, Any]]:
@@ -1493,7 +1453,7 @@ class ExecutionService:
         )
         input_manifest_path = write_task_manifest(workspace_root / "input" / "tasks.json", normalized_tasks)
         write_json(
-            workspace_root / "execution_meta.json",
+            workspace_root / "run" / "execution_meta.json",
             {
                 "workflow_definition_id": definition.id,
                 "workflow_definition_version_id": definition_version.id,
@@ -1571,7 +1531,7 @@ class ExecutionService:
             execution_id="bootstrap",
             authorization_token=authorization_token,
             created_by=actor,
-        ).parent / "bootstrap"
+        )
         normalized_tasks = self._normalize_trigger_tasks(
             project_id=definition.project_id,
             input_tasks=input_tasks,

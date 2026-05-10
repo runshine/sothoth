@@ -239,13 +239,13 @@ def _task_markdown_for_run(run_root: Path) -> str:
                 content = _read_text_file(Path(task_md_path))
                 if content:
                     return content
+    content = _read_text_file(run_root / "run" / "input" / "task.md")
+    if content:
+        return content
     for candidate in run_root.glob("trigger_inputs/*/input/task.md"):
         content = _read_text_file(candidate)
         if content:
             return content
-    content = _read_text_file(run_root / "run" / "input" / "task.md")
-    if content:
-        return content
     content = _read_text_file(run_root / "input" / "task.md")
     if content:
         return content

@@ -95,8 +95,8 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     run_detail = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}")
     assert run_detail.status_code == 200
     artifact_paths = [item["path"] for item in run_detail.json()["files"]]
-    assert "input/task.md" in artifact_paths
-    assert "run.log" in artifact_paths
+    assert "run/input/task.md" in artifact_paths
+    assert "run/run.log" in artifact_paths
 
 
 def test_create_task_bootstraps_default_profile_when_missing(service_config_path, patch_mock_agent_runtime):
@@ -297,9 +297,9 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     assert cli_plan["launcher"] == "run_vuln_scan.py"
     assert cli_plan["data_flow_file"] == str((case_root / "data_flow.md").resolve())
     assert cli_plan["source_dir"] == str(source_dir.resolve())
-    assert Path(cli_plan["run_dir"]).parent.name == "runs"
-    assert cli_plan["run_name"] == "business-scan"
-    assert Path(cli_plan["run_dir"]).name == "business-scan"
+    assert Path(cli_plan["run_dir"]).parent.name == "secflow-app-dataflow-vuln-scanner"
+    assert cli_plan["run_name"] == task_id
+    assert Path(cli_plan["run_dir"]).name == task_id
 
     execution_id = payload["attempts"][0]["execution_id"]
     _wait_for_task_status(client, task_id)
@@ -315,7 +315,7 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     assert run_payload["config"]["thinking"] == ""
     assert "run_vuln_scan.py" in run_payload["command_display"]
     assert "--model mock/model" in run_payload["command_display"]
-    assert "--run-name business-scan" in run_payload["command_display"]
+    assert f"--run-name {task_id}" in run_payload["command_display"]
     assert "--timeout-max-retries 3" in run_payload["command_display"]
     assert "--timeout-retry-interval-seconds 30" in run_payload["command_display"]
     assert run_payload["raw"]["dataflow_cli"]["command_display"] == run_payload["command_display"]
@@ -323,12 +323,12 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     run_files = client.get(f"/api/dataflow-vuln-scanner/runs/{run_resolve.json()['run_id']}/files")
     assert run_files.status_code == 200
     file_paths = [item["path"] for item in run_files.json()]
-    assert "input/task.md" in file_paths
-    assert "config.json" in file_paths
-    assert "run.log" in file_paths
+    assert "run/input/task.md" in file_paths
+    assert "run/config.json" in file_paths
+    assert "run/run.log" in file_paths
 
 
-def test_business_dataflow_task_uses_selected_runs_root(service_config_path, patch_mock_agent_runtime):
+def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_layout(service_config_path, patch_mock_agent_runtime):
     config = get_config()
     project_root = config.fileserver_service.data_mount_path
     from pathlib import Path
@@ -365,32 +365,33 @@ def test_business_dataflow_task_uses_selected_runs_root(service_config_path, pat
     assert task.status_code == 201
     created_payload = task.json()
     task_id = created_payload["task_id"]
-    assert created_payload["run_name"] == "business-scan-custom-workspace"
-    assert created_payload["runs_root"] == str(runs_root.resolve())
-    assert Path(created_payload["run_path"]).parent == runs_root.resolve()
-    assert created_payload["run"]["name"] == "business-scan-custom-workspace"
-    assert created_payload["run"]["root_path"] == str(runs_root.resolve())
+    service_root = Path(project_root) / "files" / "default" / "app" / "secflow-app-dataflow-vuln-scanner"
+    assert created_payload["run_name"] == task_id
+    assert created_payload["runs_root"] == str(service_root.resolve())
+    assert Path(created_payload["run_path"]).parent == service_root.resolve()
+    assert created_payload["run"]["name"] == task_id
+    assert created_payload["run"]["root_path"] == str(service_root.resolve())
 
     list_payload = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert list_payload.status_code == 200
     listed_task = next(item for item in list_payload.json() if item["task_id"] == task_id)
-    assert listed_task["run_name"] == "business-scan-custom-workspace"
-    assert listed_task["runs_root"] == str(runs_root.resolve())
-    assert Path(listed_task["run_path"]).parent == runs_root.resolve()
-    assert listed_task["run"]["name"] == "business-scan-custom-workspace"
-    assert listed_task["run"]["root_path"] == str(runs_root.resolve())
+    assert listed_task["run_name"] == task_id
+    assert listed_task["runs_root"] == str(service_root.resolve())
+    assert Path(listed_task["run_path"]).parent == service_root.resolve()
+    assert listed_task["run"]["name"] == task_id
+    assert listed_task["run"]["root_path"] == str(service_root.resolve())
 
     detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
     assert detail.status_code == 200
     cli_plan = detail.json()["task_metadata"]["dataflow_cli"]
-    assert cli_plan["runs_root"] == str(runs_root.resolve())
+    assert cli_plan["runs_root"] == str(service_root.resolve())
 
     detail_payload = _wait_for_task_status(client, task_id)
     assert detail_payload["attempts"]
     execution_id = detail_payload["attempts"][0]["execution_id"]
     expected_run_root = Path(detail_payload["attempts"][0]["workspace_root"])
-    assert expected_run_root.parent == runs_root.resolve()
-    assert expected_run_root.name == "business-scan-custom-workspace"
+    assert expected_run_root.parent == service_root.resolve()
+    assert expected_run_root.name == task_id
 
     run_resolve = client.get(
         "/api/dataflow-vuln-scanner/runs/by-task",
@@ -403,8 +404,8 @@ def test_business_dataflow_task_uses_selected_runs_root(service_config_path, pat
     assert run_detail.json()["run_id"] == run_resolve.json()["run_id"]
     assert run_detail.json()["path"] == str(expected_run_root.resolve())
 
-    runtime_config = json.loads((expected_run_root / "config.json").read_text(encoding="utf-8"))
-    assert runtime_config["global"]["workspace_root"] == str((expected_run_root / "workspace").resolve())
+    runtime_config = json.loads((expected_run_root / "run" / "config.json").read_text(encoding="utf-8"))
+    assert runtime_config["global"]["workspace_root"] == str((expected_run_root / "run" / "workspace").resolve())
     assert runtime_config["execution"]["output_dir"] == str((expected_run_root / "output").resolve())
 
 
@@ -465,7 +466,7 @@ def test_dataflow_run_resolve_by_task_reinitializes_missing_pending_run(
     assert run_resolve.status_code == 200
     assert run_resolve.json()["linked_task_id"] == payload["task_id"]
     assert run_root.is_dir()
-    assert (run_root / "input" / "task.md").is_file()
+    assert (run_root / "run" / "input" / "task.md").is_file()
 
 
 def test_dataflow_run_resolve_by_task_recovers_from_metadata_when_workspace_root_missing(
