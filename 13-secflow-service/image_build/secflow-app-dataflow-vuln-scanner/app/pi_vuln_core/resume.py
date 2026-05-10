@@ -63,7 +63,9 @@ class ResumePlan:
 
 def build_resume_plan(run_dir: str | Path) -> tuple[FrameworkConfig, ResumePlan]:
     run_dir = str(Path(run_dir).resolve())
-    config_path = str(Path(run_dir) / "config.json")
+    config_path = str(Path(run_dir) / "run" / "config.json")
+    if not os.path.isfile(config_path):
+        config_path = str(Path(run_dir) / "config.json")
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"未找到配置文件：{config_path}")
 

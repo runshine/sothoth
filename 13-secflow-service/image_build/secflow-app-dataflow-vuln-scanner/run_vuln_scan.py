@@ -49,8 +49,12 @@ def _now_iso() -> str:
     return isoformat_local(now_local()) or ""
 
 
+def _runtime_dir_for_run(run_dir: str | Path) -> Path:
+    return Path(run_dir) / "run"
+
+
 def _run_timestamps_path(run_dir: str | Path) -> Path:
-    return Path(run_dir) / "_meta" / "run_timestamps.json"
+    return _runtime_dir_for_run(run_dir) / "_meta" / "run_timestamps.json"
 
 
 def _load_run_timestamps(run_dir: str | Path) -> dict:
@@ -227,7 +231,7 @@ def _windows_short_ids(run_name: str) -> tuple[str, str]:
 
 def _workspace_root_for_run(run_dir: str) -> str:
     # Windows 默认路径长度限制较严格，使用更短的 ws 目录名。
-    return os.path.join(run_dir, "ws" if IS_WINDOWS else "workspace")
+    return os.path.join(run_dir, "run", "ws" if IS_WINDOWS else "workspace")
 
 
 def generate_config(
@@ -1232,7 +1236,7 @@ def main(argv: list[str] | None = None):
             sys.exit(0)
 
         _mark_run_started(run_dir, mode="resume")
-        log_file = os.path.join(run_dir, "run.log")
+        log_file = os.path.join(str(_runtime_dir_for_run(run_dir)), "run.log")
         actual_log_path = attach_log_file(log_file)
         print(f"  日志文件:   {actual_log_path}")
 
@@ -1313,13 +1317,34 @@ def main(argv: list[str] | None = None):
 
     runs_root = Path(args.runs_root).resolve() if args.runs_root else PROJECT_ROOT / "runs"
     run_dir = str(runs_root / args.run_name)
+    runtime_dir = str(_runtime_dir_for_run(run_dir))
     os.makedirs(os.path.join(run_dir, "input"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "output"), exist_ok=True)
+    os.makedirs(os.path.join(runtime_dir, "input"), exist_ok=True)
 
     task_content = generate_task_md(args.data_flow, args.source_dir)
-    task_file = os.path.join(run_dir, "input", "task.md")
+    task_file = os.path.join(runtime_dir, "input", "task.md")
     with open(task_file, "w", encoding="utf-8") as f:
         f.write(task_content)
+    with open(os.path.join(run_dir, "input", "input_manifest.json"), "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "schema_version": 1,
+                "task": {"run_name": args.run_name},
+                "input": {
+                    "data_flow_file": os.path.abspath(args.data_flow),
+                    "source_dir": os.path.abspath(args.source_dir),
+                },
+                "prompt": {
+                    "task_file": task_file,
+                    "content_length": len(task_content),
+                    "content_sha256": hashlib.sha256(task_content.encode("utf-8")).hexdigest(),
+                },
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     if args.config:
         if not os.path.isfile(args.config):
@@ -1356,12 +1381,12 @@ def main(argv: list[str] | None = None):
     model_display, resolved_thinking_display = _extract_worker_runtime_from_config_dict(config)
     resolved_review_profile_display = _extract_review_profile_from_config(config)
 
-    config_file = os.path.join(run_dir, "config.json")
+    config_file = os.path.join(runtime_dir, "config.json")
     with open(config_file, "w", encoding="utf-8") as f:
         json.dump(config, f, ensure_ascii=False, indent=2)
 
     _mark_run_started(run_dir, mode="fresh")
-    log_file = os.path.join(run_dir, "run.log")
+    log_file = os.path.join(runtime_dir, "run.log")
     actual_log_path = attach_log_file(log_file)
 
     print("═" * 60)

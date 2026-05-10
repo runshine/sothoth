@@ -464,7 +464,10 @@ class ExecutionService:
     def _read_run_process_file(self, run_root: str | Path | None) -> dict[str, Any]:
         if not run_root:
             return {}
-        path = Path(run_root) / "_meta" / "process.json"
+        root = Path(run_root)
+        path = root / "run" / "_meta" / "process.json"
+        if not path.is_file():
+            path = root / "_meta" / "process.json"
         if not path.is_file():
             return {}
         try:
@@ -504,7 +507,7 @@ class ExecutionService:
             payload["finished_at"] = isoformat_local(execution.process_finished_at) or ""
         if return_code is not None:
             payload["return_code"] = return_code
-        write_json(Path(execution.workspace_root) / "_meta" / "process.json", payload)
+        write_json(Path(execution.workspace_root) / "run" / "_meta" / "process.json", payload)
 
     def _resume_command_payload_from_plan(self, *, plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
         argv, _ = self._build_dataflow_cli_argv(
@@ -620,7 +623,9 @@ class ExecutionService:
             root = Path(run_root)
             if not root.exists():
                 return
-            timestamp_path = root / "_meta" / "run_timestamps.json"
+            timestamp_path = root / "run" / "_meta" / "run_timestamps.json"
+            if not timestamp_path.exists() and (root / "_meta").exists():
+                timestamp_path = root / "_meta" / "run_timestamps.json"
             payload: dict[str, Any] = {}
             if timestamp_path.is_file():
                 try:
@@ -928,8 +933,8 @@ class ExecutionService:
             Path(config.fileserver_service.data_mount_path)
             / config.fileserver_service.project_files_dirname
             / sanitize_name(project_id)
-            / config.fileserver_service.dataflow_subproject_name
-            / "runs"
+            / "app"
+            / "secflow-app-dataflow-vuln-scanner"
         ).resolve()
 
     def _normalize_model_override(self, *, model: str | None, provider: str | None) -> str | None:
@@ -955,8 +960,16 @@ class ExecutionService:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"expected directory but got: {runs_root}")
         return runs_root.resolve()
 
-    def _build_dataflow_cli_run_name(self, *, data_flow_path: Path, runs_root: Path, execution_id: str, requested_run_name: str | None = None) -> str:
-        requested = str(requested_run_name or "").strip()
+    def _build_dataflow_cli_run_name(
+        self,
+        *,
+        data_flow_path: Path,
+        runs_root: Path,
+        execution_id: str,
+        requested_run_name: str | None = None,
+        task_id: str | None = None,
+    ) -> str:
+        requested = str(task_id or requested_run_name or "").strip()
         if requested:
             base_name = sanitize_name(requested)
         else:
@@ -988,7 +1001,7 @@ class ExecutionService:
         )
         if not run_dir.is_dir():
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"resume_run_dir not found: {run_dir}")
-        task_md_path = run_dir / "input" / "task.md"
+        task_md_path = run_dir / "run" / "input" / "task.md"
         return {
             "launcher": "run_vuln_scan.py",
             "mode": "resume",
@@ -1031,9 +1044,10 @@ class ExecutionService:
             runs_root=runs_root,
             execution_id=execution_id,
             requested_run_name=options.get("run_name"),
+            task_id=request.get("task_id"),
         )
         run_dir = runs_root / run_name
-        task_md_path = run_dir / "input" / "task.md"
+        task_md_path = run_dir / "run" / "input" / "task.md"
         return {
             "launcher": "run_vuln_scan.py",
             "run_name": run_name,
@@ -1048,6 +1062,17 @@ class ExecutionService:
         run_dir = Path(plan["run_dir"])
         task_md_path = Path(plan["task_md_path"])
         ensure_dir(task_md_path.parent)
+        input_manifest = {
+            "schema_version": 1,
+            "generated_at": isoformat_local(now_local()),
+            "task": {
+                "task_id": plan.get("run_name"),
+                "launcher": plan.get("launcher"),
+                "mode": plan.get("mode") or "fresh",
+            },
+            "input": {},
+            "prompt": {"task_md_path": abs_path(task_md_path)},
+        }
         if plan.get("mode") == "resume":
             if not task_md_path.exists():
                 write_text(
@@ -1058,13 +1083,24 @@ class ExecutionService:
                         f"- Extra cycles: `{plan.get('extra_cycles', 5)}`\n"
                     ),
                 )
+            input_manifest["input"] = {"resume_run_dir": plan.get("resume_run_dir")}
         else:
             from run_vuln_scan import generate_task_md
-
+            task_content = generate_task_md(plan["data_flow_file"], plan["source_dir"]).strip() + "\n"
             write_text(
                 task_md_path,
-                generate_task_md(plan["data_flow_file"], plan["source_dir"]).strip() + "\n",
+                task_content,
             )
+            import hashlib
+            input_manifest["input"] = {
+                "data_flow_file": plan.get("data_flow_file"),
+                "source_dir": plan.get("source_dir"),
+            }
+            input_manifest["prompt"].update({
+                "content_length": len(task_content),
+                "content_sha256": hashlib.sha256(task_content.encode("utf-8")).hexdigest(),
+            })
+        write_json(run_dir / "input" / "input_manifest.json", input_manifest)
         ensure_dir(run_dir / "output")
 
     def _dataflow_cli_config_requires_file(self, *, request: dict[str, Any], runtime_overrides: dict[str, Any]) -> bool:
