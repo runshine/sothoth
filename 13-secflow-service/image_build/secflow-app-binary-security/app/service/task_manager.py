@@ -372,6 +372,14 @@ SERVICE_OUTPUT_FOLDERS = {
     "dataflow_analyse": "dataflow-analyse",
     "dataflow_vuln_scanner": "dataflow-vuln-scanner",
 }
+STAGE_OUTPUT_SERVICES = {
+    "firmware_unpack": ["firmware_unpacker"],
+    "system_analysis": ["system_analyse"],
+    "binary_to_source": ["binary_to_source"],
+    "entry_analysis": ["entry_analyse"],
+    "dataflow_analysis": ["dataflow_analyse"],
+    "vuln_scan": ["dataflow_vuln_scanner"],
+}
 DOWNSTREAM_APP_ROOTS = {
     "firmware_unpacker": "secflow-app-firmware-unpacker",
     "system_analyse": "secflow-app-system-analyse",
@@ -907,6 +915,7 @@ class TaskManager:
             item.finished_at = _now()
         await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
         db.commit()
+        await self._cancel_local_worker(task.id)
         token = self._service_token()
         await asyncio.gather(
             *(self._cancel_downstream(item, token) for item in running_items if item.downstream_task_id),
@@ -969,7 +978,7 @@ class TaskManager:
             cleanup_status=cleanup_status,
         )
 
-    def continue_task(self, db: Session, *, project_id: str, task_id: str) -> str:
+    async def continue_task(self, db: Session, *, project_id: str, task_id: str) -> str:
         task = self._task_or_404(db, project_id, task_id)
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             raise ValidationError(f"当前任务状态不允许继续: {task.status}")
@@ -999,7 +1008,31 @@ class TaskManager:
 
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
+        affected_items = db.query(BinarySecurityStageItem).options(
+            load_only(
+                BinarySecurityStageItem.id,
+                BinarySecurityStageItem.task_id,
+                BinarySecurityStageItem.stage_name,
+                BinarySecurityStageItem.item_key,
+                BinarySecurityStageItem.status,
+                BinarySecurityStageItem.retry_count,
+                BinarySecurityStageItem.downstream_service,
+                BinarySecurityStageItem.downstream_task_id,
+                BinarySecurityStageItem.error_message,
+                BinarySecurityStageItem.started_at,
+                BinarySecurityStageItem.finished_at,
+                BinarySecurityStageItem.created_at,
+            )
+        ).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.stage_name.in_(affected_stages),
+        ).all()
+        downstream_refs = self._collect_downstream_refs(task, affected_items)
+        token = self._service_token()
+        if downstream_refs:
+            await self._delete_downstream_refs(db, task, downstream_refs, token)
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
+        self._clear_stage_output_artifacts(task, affected_stages)
         db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task.id,
             BinarySecurityStageItem.stage_name.in_(affected_stages),
@@ -1061,6 +1094,7 @@ class TaskManager:
         task.dispatch_started_at = None
         task.finished_at = None
         self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
+        self._clear_stage_output_artifacts(task, stage_sequence)
         db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task.id,
             BinarySecurityStageItem.stage_name.in_(stage_sequence),
@@ -1884,6 +1918,7 @@ class TaskManager:
     async def _run_task(self, task_id: str) -> None:
         session_factory = get_session_factory()
         db = session_factory()
+        execution_token: str | None = None
         try:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if (
@@ -1895,6 +1930,7 @@ class TaskManager:
             if task.started_at is None:
                 task.started_at = _now()
             task.dispatch_started_at = task.dispatch_started_at or _now()
+            execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
             task.status = "running"
             self._record_event(
                 db,
@@ -1908,6 +1944,15 @@ class TaskManager:
         except Exception as exc:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if task:
+                current_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
+                same_execution = (
+                    task.dispatcher_instance_id == self.instance_id
+                    and execution_token is not None
+                    and execution_token == current_token
+                    and task.status in {"dispatching", "running"}
+                )
+                if not same_execution:
+                    return
                 task.status = "failed"
                 task.last_error = str(exc)
                 task.dispatcher_instance_id = None
@@ -3589,6 +3634,20 @@ class TaskManager:
         task.metrics = metrics
         task.stage_summary = stage_summary
 
+    def _clear_stage_output_artifacts(self, task: BinarySecurityTask, stage_names: list[str]) -> None:
+        output_root = Path(str(task.output_root or "")).resolve()
+        if not output_root.exists():
+            return
+        services: set[str] = set()
+        for stage_name in stage_names:
+            for downstream_service in STAGE_OUTPUT_SERVICES.get(stage_name, []):
+                services.add(downstream_service)
+        for downstream_service in services:
+            folder = SERVICE_OUTPUT_FOLDERS.get(downstream_service, downstream_service.replace("_", "-"))
+            target = output_root / folder
+            if target.exists():
+                shutil.rmtree(target, ignore_errors=True)
+
     def _clear_single_stage_outputs(self, task: BinarySecurityTask, stage_name: str) -> None:
         summary = dict(task.summary or {})
         metrics = dict(task.metrics or {})
@@ -3600,6 +3659,7 @@ class TaskManager:
         task.summary = summary
         task.metrics = metrics
         task.stage_summary = stage_summary
+        self._clear_stage_output_artifacts(task, [stage_name])
 
     def _list_artifact_page(self, root: Path, *, limit: int, offset: int) -> dict[str, Any]:
         files: list[dict[str, Any]] = []

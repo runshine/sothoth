@@ -47,6 +47,14 @@ ROLE_MODEL_CONFIG_KEYS = {
     "skill_executor": "llm_model_skill_executor",
 }
 
+ROLE_REUSE_CONFIG_KEYS = {
+    "executor": "reuse_agent_between_rounds_executor",
+    "reviewer": "reuse_agent_between_rounds_reviewer",
+    "cleaner": "reuse_agent_between_rounds_cleaner",
+    "skill_author": "reuse_agent_between_rounds_skill_author",
+    "skill_executor": "reuse_agent_between_rounds_skill_executor",
+}
+
 
 def get_max_retries() -> int:
     try:
@@ -78,13 +86,19 @@ def get_max_retries_reached_action() -> str:
     return value if value in {"success", "failed"} else "success"
 
 
-def get_reuse_agent_between_rounds() -> bool:
+def get_reuse_agent_between_rounds(role: str | None = None) -> bool:
     try:
         from app.model import get_config_value, get_db_session
 
         db = get_db_session()
         try:
-            value = get_config_value(db, "reuse_agent_between_rounds", default="true")
+            role_key = ROLE_REUSE_CONFIG_KEYS.get(str(role or "").strip())
+            if role_key:
+                value = get_config_value(db, role_key, default=None)
+                if value is None or str(value).strip() == "":
+                    value = get_config_value(db, "reuse_agent_between_rounds", default="true")
+            else:
+                value = get_config_value(db, "reuse_agent_between_rounds", default="true")
         finally:
             db.close()
     except Exception:

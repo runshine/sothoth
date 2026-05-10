@@ -16,6 +16,7 @@ from app.model import (
     TASK_TYPE_SOURCE,
 )
 from app.schemas import BinarySecurityArchiveJobResponse
+from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
 
 
@@ -27,6 +28,9 @@ class _FakeQuery:
         return self
 
     def order_by(self, *args, **kwargs):
+        return self
+
+    def options(self, *args, **kwargs):
         return self
 
     def all(self):
@@ -90,6 +94,9 @@ class _ModelAwareDb:
         pass
 
     def flush(self):
+        pass
+
+    def close(self):
         pass
 
 
@@ -768,7 +775,12 @@ class TaskManagerTests(unittest.TestCase):
             stage_items=[BinarySecurityStageItem(id="i1", task_id="s1", project_id="p1", stage_name="entry_analysis", item_key="m1")],
         )
 
-        target_stage = self.manager.continue_task(db, project_id="p1", task_id="s1")
+        async def fake_delete_downstream_refs(*args, **kwargs):
+            return 0
+
+        self.manager._delete_downstream_refs = fake_delete_downstream_refs
+
+        target_stage = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
 
         self.assertEqual("entry_analysis", target_stage)
         self.assertEqual("pending", task.status)
@@ -810,9 +822,118 @@ class TaskManagerTests(unittest.TestCase):
             ]
             db = _ModelAwareDb(tasks=[task], stage_runs=runs, archive_jobs=archive_jobs)
 
-            self.manager.continue_task(db, project_id="p1", task_id="s1")
+            async def fake_delete_downstream_refs(*args, **kwargs):
+                return 0
+
+            self.manager._delete_downstream_refs = fake_delete_downstream_refs
+
+            asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
 
             self.assertEqual([], db.archive_jobs)
+
+    def test_continue_task_deletes_affected_downstream_tasks_before_requeue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="s1",
+                project_id="p1",
+                name="source",
+                status="failed",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            runs = [
+                BinarySecurityStageRun(id="sr1", task_id="s1", project_id="p1", stage_name="system_analysis", sequence_no=1, status="failed"),
+                BinarySecurityStageRun(id="sr2", task_id="s1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="pending"),
+            ]
+            items = [
+                BinarySecurityStageItem(
+                    id="i1",
+                    task_id="s1",
+                    project_id="p1",
+                    stage_run_id="sr1",
+                    stage_name="system_analysis",
+                    item_key="m1",
+                    parent_key="m1",
+                    downstream_service="system_analyse",
+                    downstream_task_id="sat_1",
+                    status="failed",
+                ),
+                BinarySecurityStageItem(
+                    id="i2",
+                    task_id="s1",
+                    project_id="p1",
+                    stage_run_id="sr2",
+                    stage_name="entry_analysis",
+                    item_key="m1",
+                    parent_key="m1",
+                    downstream_service="entry_analyse",
+                    downstream_task_id="eat_1",
+                    status="pending",
+                ),
+            ]
+            db = _ModelAwareDb(tasks=[task], stage_runs=runs, stage_items=items)
+            deleted_refs: list[dict[str, str]] = []
+
+            async def fake_delete_downstream_refs(_db, _task, refs, _token):
+                deleted_refs.extend(refs)
+                return len(refs)
+
+            self.manager._delete_downstream_refs = fake_delete_downstream_refs
+
+            target_stage = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
+
+            self.assertEqual("system_analysis", target_stage)
+            self.assertEqual(
+                [
+                    {"service": "system_analyse", "task_id": "sat_1", "project_id": "p1", "stage_name": "system_analysis"},
+                    {"service": "entry_analyse", "task_id": "eat_1", "project_id": "p1", "stage_name": "entry_analysis"},
+                ],
+                deleted_refs,
+            )
+            self.assertEqual([], db.stage_items)
+
+    def test_cancel_task_cancels_local_worker(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="m1",
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        cancelled: list[str] = []
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_cancel_local_worker(task_id: str):
+            cancelled.append(task_id)
+
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        self.manager._cancel_local_worker = fake_cancel_local_worker
+
+        asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
+
+        self.assertEqual(["t1"], cancelled)
+        self.assertEqual("cancelled", task.status)
+        self.assertEqual("cancelled", item.status)
 
     def test_retry_task_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -845,6 +966,35 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertEqual("pending", task.status)
             self.assertEqual([], db.archive_jobs)
+
+    def test_retry_task_clears_stage_output_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_root = workspace / "output"
+            system_output = output_root / "system-analyse"
+            entry_output = output_root / "entry-analyse"
+            system_output.mkdir(parents=True)
+            entry_output.mkdir(parents=True)
+            (system_output / "stale.txt").write_text("old", encoding="utf-8")
+            (entry_output / "stale.txt").write_text("old", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="binary",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(output_root),
+                workspace_root=str(workspace),
+            )
+            db = _ModelAwareDb(tasks=[task])
+
+            self.manager.retry_task(db, project_id="p1", task_id="t1")
+
+            self.assertFalse(system_output.exists())
+            self.assertFalse(entry_output.exists())
 
     def test_retry_stage_requeues_failed_archive_job_and_marks_task_running(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1729,6 +1879,56 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("failed", item.status)
         self.assertIsNotNone(task.finished_at)
         self.assertIn("心跳超时", task.last_error or "")
+
+    def test_run_task_ignores_stale_worker_failure_after_retry(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="dispatching",
+            current_stage="firmware_unpack",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id=self.manager.instance_id,
+        )
+        task.dispatch_started_at = _now()
+        original_token = task.dispatch_started_at
+
+        class _RunTaskDb(_ModelAwareDb):
+            def __init__(self, current_task):
+                super().__init__(tasks=[current_task])
+                self.current_task = current_task
+                self.commits = 0
+                self.closed = False
+
+            def commit(self):
+                self.commits += 1
+
+            def close(self):
+                self.closed = True
+
+        db = _RunTaskDb(task)
+        original_factory = task_manager_module.get_session_factory
+        original_execute_task = self.manager._execute_task
+
+        async def fake_execute_task(task_id: str):
+            task.dispatch_started_at = original_token + timedelta(seconds=1)
+            raise RuntimeError("stale worker boom")
+
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        self.manager._execute_task = fake_execute_task
+        try:
+            asyncio.run(self.manager._run_task("task1"))
+        finally:
+            task_manager_module.get_session_factory = original_factory
+            self.manager._execute_task = original_execute_task
+
+        self.assertEqual("running", task.status)
+        self.assertIsNone(task.last_error)
+        self.assertTrue(db.closed)
 
     def test_run_stage_pool_retries_existing_path_after_first_failure(self):
         calls: list[bool] = []

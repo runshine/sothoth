@@ -400,14 +400,15 @@ def _run_generic_unpack(
         output_path=output_path,
     )
     max_retries = _get_max_retries()
-    reuse_agent_between_rounds = _get_reuse_agent_between_rounds()
+    reuse_executor_between_rounds = _get_reuse_agent_between_rounds("executor")
+    reuse_reviewer_between_rounds = _get_reuse_agent_between_rounds("reviewer")
     session_artifacts = build_session_artifacts(
         log_dir,
         role="executor",
-        name="shared" if reuse_agent_between_rounds else "round-1",
+        name="shared" if reuse_executor_between_rounds else "round-1",
         provider_role="executor",
         phase="llm_unpack",
-        round_id=None if reuse_agent_between_rounds else 1,
+        round_id=None if reuse_executor_between_rounds else 1,
     )
     executor = PiRpcClient(
         system_prompt_file=exec_sp,
@@ -430,7 +431,7 @@ def _run_generic_unpack(
     last_reason = ""
     reviewer: PiRpcClient | None = None
     reviewer_session_artifacts: dict[str, Any] | None = None
-    if reuse_agent_between_rounds:
+    if reuse_reviewer_between_rounds:
         reviewer_session_artifacts = build_session_artifacts(
             log_dir,
             role="reviewer",
@@ -459,7 +460,7 @@ def _run_generic_unpack(
             round_dir = _get_round_dir(log_dir, attempt)
             cancel_check(executor)
             final_round = attempt
-            if attempt > 1 and not reuse_agent_between_rounds:
+            if attempt > 1 and not reuse_executor_between_rounds:
                 round_artifacts = build_session_artifacts(
                     log_dir,
                     role="executor",
