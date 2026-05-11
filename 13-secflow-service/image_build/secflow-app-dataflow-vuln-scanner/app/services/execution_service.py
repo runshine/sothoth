@@ -1127,7 +1127,13 @@ class ExecutionService:
         model = str(config_payload.get("model") or request.get("model") or "").strip()
         review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
         max_cycles = first_present_int(config_payload.get("max_review_cycles"), request.get("max_review_cycles"), default=0)
-        timeout_max_retries = first_present_int(config_payload.get("timeout_max_retries"), request.get("timeout_max_retries"), default=3)
+        agent_run_timeout_seconds = first_present_int(config_payload.get("agent_run_timeout_seconds"), request.get("agent_run_timeout_seconds"), default=3600)
+        agent_timeout_retry_enabled = request.get("agent_timeout_retry_enabled")
+        if agent_timeout_retry_enabled is None:
+            agent_timeout_retry_enabled = config_payload.get("agent_timeout_retry_enabled", True)
+        agent_timeout_retry_enabled = bool(agent_timeout_retry_enabled)
+        agent_timeout_max_retries = first_present_int(config_payload.get("agent_timeout_max_retries"), request.get("agent_timeout_max_retries"), default=3)
+        timeout_max_retries = max(agent_timeout_max_retries + 1, 1) if agent_timeout_retry_enabled else 1
         timeout_retry_interval_seconds = first_present_int(config_payload.get("timeout_retry_interval_seconds"), request.get("timeout_retry_interval_seconds"), default=30)
         result_review_concurrency = first_present_int(config_payload.get("result_review_concurrency"), request.get("result_review_concurrency"), default=3)
 
@@ -1140,6 +1146,8 @@ class ExecutionService:
 
                 json.dump(json_payload, handle, ensure_ascii=False, indent=2)
             argv.extend(["--config", temp_config_path])
+            argv.extend(["--worker-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
+            argv.extend(["--advisor-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
             argv.extend(["--timeout-max-retries", str(max(timeout_max_retries, 1))])
             argv.extend(["--timeout-retry-interval-seconds", str(max(timeout_retry_interval_seconds, 0))])
             return argv, temp_config_path
@@ -1148,6 +1156,8 @@ class ExecutionService:
             argv.extend(["--model", model])
         if max_cycles > 0:
             argv.extend(["--max-cycles", str(max_cycles)])
+        argv.extend(["--worker-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
+        argv.extend(["--advisor-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
         argv.extend(["--timeout-max-retries", str(max(timeout_max_retries, 1))])
         argv.extend(["--timeout-retry-interval-seconds", str(max(timeout_retry_interval_seconds, 0))])
         argv.extend(["--result-review-concurrency", str(max(result_review_concurrency, 1))])
@@ -1921,6 +1931,9 @@ class ExecutionService:
             "model": payload.model,
             "review_profile": payload.review_profile,
             "max_review_cycles": payload.max_review_cycles,
+            "agent_run_timeout_seconds": payload.agent_run_timeout_seconds,
+            "agent_timeout_retry_enabled": payload.agent_timeout_retry_enabled,
+            "agent_timeout_max_retries": payload.agent_timeout_max_retries,
             "worker_timeout": payload.worker_timeout,
             "advisor_timeout": payload.advisor_timeout,
             "timeout_max_retries": payload.timeout_max_retries,
@@ -1964,6 +1977,9 @@ class ExecutionService:
                 "provider": payload.provider,
                 "review_profile": payload.review_profile,
                 "max_review_cycles": payload.max_review_cycles,
+                "agent_run_timeout_seconds": payload.agent_run_timeout_seconds,
+                "agent_timeout_retry_enabled": payload.agent_timeout_retry_enabled,
+                "agent_timeout_max_retries": payload.agent_timeout_max_retries,
                 "worker_timeout": payload.worker_timeout,
                 "advisor_timeout": payload.advisor_timeout,
                 "timeout_max_retries": payload.timeout_max_retries,

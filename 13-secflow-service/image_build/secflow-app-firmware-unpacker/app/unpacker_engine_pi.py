@@ -8,6 +8,8 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -18,6 +20,9 @@ from app.unpacker_engine_config import (
     ROLE_CONFIG_FILE_KEYS,
     ROLE_MODEL_CONFIG_KEYS,
     build_settings_json,
+    get_agent_run_timeout_seconds,
+    get_agent_timeout_max_retries,
+    get_agent_timeout_retry_enabled,
     resolve_provider_selector,
 )
 from app.unpacker_engine_session import update_session_index
@@ -327,9 +332,25 @@ class PiRpcClient:
         self,
         message: str,
         stream_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+        timeout_seconds: int | float | None = None,
     ) -> str:
         self._mark_session_active()
+        timer: threading.Timer | None = None
         try:
+            if timeout_seconds is not None and float(timeout_seconds) > 0:
+                def _kill_for_timeout() -> None:
+                    try:
+                        if self.proc.poll() is None:
+                            pgid = os.getpgid(self.proc.pid)
+                            os.killpg(pgid, signal.SIGKILL)
+                    except Exception:
+                        try:
+                            self.proc.kill()
+                        except Exception:
+                            pass
+                timer = threading.Timer(float(timeout_seconds), _kill_for_timeout)
+                timer.daemon = True
+                timer.start()
             self.send(
                 {
                     "type": "prompt",
@@ -374,15 +395,24 @@ class PiRpcClient:
                     break
 
             return self.extract_assistant_text(events)
+        except RuntimeError:
+            if self.proc.poll() is not None and timeout_seconds is not None and float(timeout_seconds) > 0:
+                raise RuntimeError(f"Prompt timed out after {float(timeout_seconds):.0f}s")
+            raise
         finally:
-            pass
+            if timer is not None:
+                timer.cancel()
 
     def prompt(
         self,
         message: str,
         stream_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> str:
+        timeout_seconds = get_agent_run_timeout_seconds()
+        timeout_retry_enabled = get_agent_timeout_retry_enabled()
+        timeout_max_retries = get_agent_timeout_max_retries()
         busy_retries = 2
+        timeout_failures = 0
         for attempt in range(1 + self.RETRIES):
             try:
                 for busy_attempt in range(busy_retries + 1):
@@ -390,8 +420,29 @@ class PiRpcClient:
                         return self._prompt_once(
                             message,
                             stream_callback=stream_callback,
+                            timeout_seconds=timeout_seconds,
                         )
                     except RuntimeError as exc:
+                        if "timed out after" in str(exc).lower():
+                            timeout_failures += 1
+                            can_retry = timeout_retry_enabled and (
+                                timeout_max_retries < 0 or timeout_failures <= timeout_max_retries
+                            )
+                            if not can_retry:
+                                self._mark_session_failed()
+                                raise
+                            log_event(
+                                log,
+                                logging.WARNING,
+                                "retrying prompt after timeout",
+                                event="pi_prompt_timeout_retry",
+                                retry=timeout_failures,
+                                max_retries=timeout_max_retries,
+                                timeout_seconds=timeout_seconds,
+                            )
+                            self._respawn()
+                            time.sleep(1)
+                            continue
                         if str(exc) != "__PI_BUSY__" or busy_attempt >= busy_retries:
                             raise
                         log_event(

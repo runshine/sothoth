@@ -165,6 +165,9 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     llm_provider_key = (req.llm_provider_key or "").strip() or None
     job_model = await resolve_job_model(llm_provider_key)
     job_concurrency = req.concurrency if req.concurrency and req.concurrency > 0 else pi_cfg.concurrency
+    job_timeout_seconds = req.agent_run_timeout_seconds if req.agent_run_timeout_seconds is not None else pi_cfg.agent_run_timeout_seconds
+    job_timeout_retry_enabled = req.agent_timeout_retry_enabled if req.agent_timeout_retry_enabled is not None else pi_cfg.agent_timeout_retry_enabled
+    job_timeout_max_retries = req.agent_timeout_max_retries if req.agent_timeout_max_retries is not None else pi_cfg.agent_timeout_max_retries
     mode_engine_map = {"fast": "hybrid", "deep": "agent"}
     job_mode = req.mode or ({"hybrid": "fast", "agent": "deep"}.get(req.engine or "") if req.engine else None)
     job_engine = mode_engine_map.get(job_mode or "") or req.engine or pi_cfg.engine
@@ -195,6 +198,9 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "source_elf_path": str(source_elf_path),
             "llm_provider_key": llm_provider_key,
             "concurrency": job_concurrency,
+            "agent_run_timeout_seconds": job_timeout_seconds,
+            "agent_timeout_retry_enabled": job_timeout_retry_enabled,
+            "agent_timeout_max_retries": job_timeout_max_retries,
             "mode": job_mode,
             "engine": job_engine,
             "pi_worker_url": worker_url,
@@ -210,6 +216,9 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
                 "output_dir": item.output_dir,
                 "batch_size": pi_cfg.batch_size,
                 "max_retries": pi_cfg.max_retries,
+                "timeout_seconds": job_timeout_seconds,
+                "timeout_retry_enabled": job_timeout_retry_enabled,
+                "timeout_max_retries": job_timeout_max_retries,
                 "model": job_model,
                 "functions": elf.file_list or None,
                 "clean": False,
@@ -382,6 +391,9 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
 
         item_concurrency = int((item.extra_metadata or {}).get("concurrency") or pi_cfg.concurrency)
         item_engine = str((item.extra_metadata or {}).get("engine") or pi_cfg.engine).strip() or pi_cfg.engine
+        item_timeout_seconds = int((item.extra_metadata or {}).get("agent_run_timeout_seconds") or pi_cfg.agent_run_timeout_seconds)
+        item_timeout_retry_enabled = bool((item.extra_metadata or {}).get("agent_timeout_retry_enabled") if (item.extra_metadata or {}).get("agent_timeout_retry_enabled") is not None else pi_cfg.agent_timeout_retry_enabled)
+        item_timeout_max_retries = int((item.extra_metadata or {}).get("agent_timeout_max_retries") if (item.extra_metadata or {}).get("agent_timeout_max_retries") is not None else pi_cfg.agent_timeout_max_retries)
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
@@ -402,6 +414,9 @@ async def rerun_task(db: Session, task: B2STask, *, clean_output: bool = True, c
                 "output_dir": item.output_dir,
                 "batch_size": pi_cfg.batch_size,
                 "max_retries": pi_cfg.max_retries,
+                "timeout_seconds": item_timeout_seconds,
+                "timeout_retry_enabled": item_timeout_retry_enabled,
+                "timeout_max_retries": item_timeout_max_retries,
                 "model": job_model,
                 "functions": (item.extra_metadata or {}).get("file_list") or None,
                 "clean": True,
@@ -441,6 +456,9 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
             continue
         item_concurrency = int((item.extra_metadata or {}).get("concurrency") or pi_cfg.concurrency)
         item_engine = str((item.extra_metadata or {}).get("engine") or pi_cfg.engine).strip() or pi_cfg.engine
+        item_timeout_seconds = int((item.extra_metadata or {}).get("agent_run_timeout_seconds") or pi_cfg.agent_run_timeout_seconds)
+        item_timeout_retry_enabled = bool((item.extra_metadata or {}).get("agent_timeout_retry_enabled") if (item.extra_metadata or {}).get("agent_timeout_retry_enabled") is not None else pi_cfg.agent_timeout_retry_enabled)
+        item_timeout_max_retries = int((item.extra_metadata or {}).get("agent_timeout_max_retries") if (item.extra_metadata or {}).get("agent_timeout_max_retries") is not None else pi_cfg.agent_timeout_max_retries)
         worker_url = await choose_pi_worker(db, task.id, item.sequence_no)
         metadata = item.extra_metadata or {}
         metadata["pi_worker_url"] = worker_url
@@ -450,6 +468,9 @@ async def retry_task(db: Session, task: B2STask, item_ids: list[str] | None = No
             "output_dir": item.output_dir,
             "batch_size": pi_cfg.batch_size,
             "max_retries": pi_cfg.max_retries,
+            "timeout_seconds": item_timeout_seconds,
+            "timeout_retry_enabled": item_timeout_retry_enabled,
+            "timeout_max_retries": item_timeout_max_retries,
             "model": job_model,
             "functions": (item.extra_metadata or {}).get("file_list") or None,
             "clean": True,

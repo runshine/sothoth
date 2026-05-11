@@ -61,6 +61,9 @@ class PiReAgentConfig(BaseModel):
     timeout: int = 30
     batch_size: int = 8192
     max_retries: int = 3
+    agent_run_timeout_seconds: int = 3600
+    agent_timeout_retry_enabled: bool = True
+    agent_timeout_max_retries: int = 3
     engine: Literal["agent", "hybrid"] = "hybrid"
     concurrency: int = 4
     model: Optional[str] = None

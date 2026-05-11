@@ -29,6 +29,9 @@ class TaskCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     llm_provider_key: Optional[str] = None
     concurrency: Optional[int] = None
+    agent_run_timeout_seconds: Optional[int] = None
+    agent_timeout_retry_enabled: Optional[bool] = None
+    agent_timeout_max_retries: Optional[int] = None
     mode: Optional[Literal["fast", "deep"]] = None
     engine: Optional[Literal["hybrid", "agent"]] = None
     task_origin_type: Optional[str] = None

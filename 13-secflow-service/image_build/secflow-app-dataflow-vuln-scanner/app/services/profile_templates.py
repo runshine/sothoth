@@ -65,6 +65,11 @@ def _extract_defaults(template: dict[str, Any]) -> dict[str, Any]:
             (((template.get("workflows") or {}).get("atomic") or [{}])[-1].get("engine") or {}).get("review_profile")
             or "balanced"
         ),
+        "agent_run_timeout_seconds": worker_runtime.get("timeout_seconds") or 3600,
+        "agent_timeout_retry_enabled": True,
+        "agent_timeout_max_retries": (
+            max((worker_runtime.get("timeout_max_retries") if worker_runtime.get("timeout_max_retries") is not None else advisor_runtime.get("timeout_max_retries") if advisor_runtime.get("timeout_max_retries") is not None else 3) - 1, 0)
+        ),
         "worker_timeout": worker_runtime.get("timeout_seconds") or 3600,
         "advisor_timeout": advisor_runtime.get("timeout_seconds") or 3600,
         "timeout_max_retries": worker_runtime.get("timeout_max_retries") if worker_runtime.get("timeout_max_retries") is not None else advisor_runtime.get("timeout_max_retries") if advisor_runtime.get("timeout_max_retries") is not None else 3,
@@ -131,9 +136,12 @@ class ProfileTemplateService:
         compiled = copy.deepcopy(template)
 
         model = str(normalized_payload.get("model") or "").strip()
-        worker_timeout = int(normalized_payload.get("worker_timeout") or 3600)
-        advisor_timeout = int(normalized_payload.get("advisor_timeout") or 3600)
-        timeout_max_retries = max(_first_present_int(normalized_payload.get("timeout_max_retries"), default=3), 1)
+        agent_run_timeout_seconds = int(normalized_payload.get("agent_run_timeout_seconds") if normalized_payload.get("agent_run_timeout_seconds") is not None else 3600)
+        agent_timeout_retry_enabled = bool(normalized_payload.get("agent_timeout_retry_enabled") if normalized_payload.get("agent_timeout_retry_enabled") is not None else True)
+        agent_timeout_max_retries = max(_first_present_int(normalized_payload.get("agent_timeout_max_retries"), default=3), 0)
+        worker_timeout = agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600
+        advisor_timeout = agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600
+        timeout_max_retries = max(agent_timeout_max_retries + 1, 1) if agent_timeout_retry_enabled else 1
         timeout_retry_interval_seconds = max(_first_present_int(normalized_payload.get("timeout_retry_interval_seconds"), default=30), 0)
         review_profile = normalize_review_profile(normalized_payload.get("review_profile"))
         profile_policy = get_review_profile_policy(review_profile)
@@ -220,6 +228,9 @@ class ProfileTemplateService:
             _sync_engine_max_cycles(compiled)
         apply_profile_thinking_to_config(compiled, profile_policy.name)
         normalized_payload["review_profile"] = profile_policy.name
+        normalized_payload["agent_run_timeout_seconds"] = agent_run_timeout_seconds
+        normalized_payload["agent_timeout_retry_enabled"] = agent_timeout_retry_enabled
+        normalized_payload["agent_timeout_max_retries"] = agent_timeout_max_retries
         normalized_payload["timeout_max_retries"] = timeout_max_retries
         normalized_payload["timeout_retry_interval_seconds"] = timeout_retry_interval_seconds
         normalized_payload["thinking"] = self._extract_resolved_thinking(compiled)

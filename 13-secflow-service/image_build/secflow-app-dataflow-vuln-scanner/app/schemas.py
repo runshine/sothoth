@@ -12,6 +12,9 @@ class ProfileConfigPayload(BaseModel):
     model: str = Field(..., min_length=1)
     review_profile: str = Field(default="balanced", min_length=1)
     max_review_cycles: int = Field(default=6, ge=1)
+    agent_run_timeout_seconds: int = Field(default=3600, ge=-1, description="单次智能体输入最大运行时长（秒），-1=不限制")
+    agent_timeout_retry_enabled: bool = Field(default=True)
+    agent_timeout_max_retries: int = Field(default=3, ge=0)
     worker_timeout: int = Field(default=3600, ge=1, description="Deprecated compatibility field; RPC prompt timeout is controlled by Pi/provider native timeout settings.")
     advisor_timeout: int = Field(default=3600, ge=1, description="Deprecated compatibility field; RPC prompt timeout is controlled by Pi/provider native timeout settings.")
     timeout_max_retries: int = Field(default=3, ge=1)
@@ -104,6 +107,9 @@ class ScanTaskCreateRequest(BaseModel):
     provider: Optional[str] = None
     review_profile: Optional[str] = Field(default=None, min_length=1)
     max_review_cycles: Optional[int] = Field(default=None, ge=1)
+    agent_run_timeout_seconds: Optional[int] = Field(default=None, ge=-1)
+    agent_timeout_retry_enabled: Optional[bool] = None
+    agent_timeout_max_retries: Optional[int] = Field(default=None, ge=0)
     worker_timeout: Optional[int] = Field(default=None, ge=1, description="Deprecated compatibility field; RPC prompt timeout is controlled by Pi/provider native timeout settings.")
     advisor_timeout: Optional[int] = Field(default=None, ge=1, description="Deprecated compatibility field; RPC prompt timeout is controlled by Pi/provider native timeout settings.")
     timeout_max_retries: Optional[int] = Field(default=None, ge=1)

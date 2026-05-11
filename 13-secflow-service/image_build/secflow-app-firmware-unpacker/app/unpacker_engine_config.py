@@ -69,6 +69,46 @@ def get_max_retries() -> int:
         return 5
 
 
+def get_agent_run_timeout_seconds() -> int:
+    try:
+        from app.model import get_config_value, get_db_session
+
+        db = get_db_session()
+        try:
+            return int(get_config_value(db, "agent_run_timeout_seconds", default=3600))
+        finally:
+            db.close()
+    except Exception:
+        return 3600
+
+
+def get_agent_timeout_retry_enabled() -> bool:
+    try:
+        from app.model import get_config_value, get_db_session
+
+        db = get_db_session()
+        try:
+            value = get_config_value(db, "agent_timeout_retry_enabled", default="true")
+        finally:
+            db.close()
+    except Exception:
+        value = "true"
+    return str(value or "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_agent_timeout_max_retries() -> int:
+    try:
+        from app.model import get_config_value, get_db_session
+
+        db = get_db_session()
+        try:
+            return int(get_config_value(db, "agent_timeout_max_retries", default=3))
+        finally:
+            db.close()
+    except Exception:
+        return 3
+
+
 def get_max_retries_reached_action() -> str:
     try:
         from app.model import get_config_value, get_db_session
