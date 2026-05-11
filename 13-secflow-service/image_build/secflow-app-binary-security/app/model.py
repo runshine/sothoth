@@ -17,7 +17,7 @@ from app.time_utils import now_local
 Base = declarative_base()
 
 TASK_TERMINAL_STATUSES = {"success", "partial_success", "failed", "cancelled"}
-ITEM_TERMINAL_STATUSES = {"success", "failed", "skipped", "cancelled"}
+ITEM_TERMINAL_STATUSES = {"success", "failed", "cancelled"}
 STAGE_SEQUENCE = [
     "firmware_unpack",
     "system_analysis",

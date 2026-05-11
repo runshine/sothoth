@@ -982,12 +982,11 @@ class TaskManager:
 
     async def continue_task(self, db: Session, *, project_id: str, task_id: str) -> str:
         task = self._task_or_404(db, project_id, task_id)
-        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
-            raise ValidationError(f"当前任务状态不允许继续: {task.status}")
-        if task.status in {"pending", "dispatching", "running"}:
-            raise ValidationError(f"当前任务正在执行或排队中，不能手动继续: {task.status}")
-        if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
-            raise ValidationError("当前任务等待模块确认，请先确认模块后继续")
+        supported, reason, target_stage = self._task_continue_support(db, task)
+        if not supported:
+            raise ValidationError(reason or "当前任务不可继续")
+        if not target_stage:
+            raise ValidationError("当前任务未找到可继续的阶段")
 
         stage_sequence = self._stage_sequence_for_task(task)
         stage_runs = {
@@ -996,18 +995,6 @@ class TaskManager:
                 BinarySecurityStageRun.task_id == task.id,
             ).all()
         }
-        target_stage = stage_sequence[0]
-        last_success_stage: str | None = None
-        for stage_name in stage_sequence:
-            run = stage_runs.get(stage_name)
-            if run and run.status in {"success", "skipped"}:
-                last_success_stage = stage_name
-                continue
-            target_stage = stage_name
-            break
-        else:
-            raise ValidationError("当前任务所有阶段都已成功，没有可继续的后续阶段")
-
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         affected_items = db.query(BinarySecurityStageItem).options(
@@ -1061,7 +1048,6 @@ class TaskManager:
             stage_name=target_stage,
             payload={
                 "target_stage": target_stage,
-                "last_success_stage": last_success_stage,
                 "cleared_stages": affected_stages,
             },
         )
@@ -1994,7 +1980,7 @@ class TaskManager:
                     return
                 if not self._stage_enabled(task, stage_name):
                     stage_run = self._ensure_stage_run(db, task, stage_name)
-                    stage_run.status = "skipped"
+                    stage_run.status = "success"
                     stage_run.started_at = stage_run.started_at or _now()
                     stage_run.finished_at = _now()
                     self._persist_stage_run_output_summary(task, stage_run, {"reason": "disabled_by_stage_options"})
@@ -2002,12 +1988,13 @@ class TaskManager:
                     task.stage_summary = {
                         **task.stage_summary,
                         stage_name: {
-                            "status": "skipped",
+                            "status": "success",
                             "counts": stage_run.counts,
                             "finished_at": stage_run.finished_at.isoformat(),
+                            "reason": "disabled_by_stage_options",
                         },
                     }
-                    self._record_event(db, task, "stage_skipped", f"阶段跳过: {stage_name}", stage_name=stage_name)
+                    self._record_event(db, task, "stage_completed", f"阶段未启用，按配置完成: {stage_name}", stage_name=stage_name)
                     db.commit()
                     continue
                 task.current_stage = stage_name
@@ -2314,13 +2301,12 @@ class TaskManager:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]
         vuln_run = next((run for run in stage_runs if run.stage_name == "vuln_scan"), None)
-        non_skipped = [status for status in statuses if status != "skipped"]
-        if non_skipped and all(status == "success" for status in non_skipped):
+        if statuses and all(status == "success" for status in statuses):
             task.status = "success"
         elif vuln_run and vuln_run.status in {"success", "partial_success"}:
             task.status = "partial_success" if any(status in {"failed", "partial_success"} for status in statuses) else "success"
         elif any(status in {"failed", "partial_success"} for status in statuses):
-            task.status = "partial_success" if any(status == "success" for status in non_skipped) else "failed"
+            task.status = "partial_success" if any(status == "success" for status in statuses) else "failed"
         else:
             task.status = "success"
         stale_stages = list((task.summary or {}).get("stale_stages") or [])
@@ -2664,10 +2650,11 @@ class TaskManager:
             "cancelled_items": 0,
         }
         for item in items:
-            key = f"{item.status}_items"
+            normalized_status = self._normalize_downstream_status(item.status) or item.status
+            key = f"{normalized_status}_items"
             if key in counts:
                 counts[key] += 1
-            elif item.status in {"pending", "queued", "dispatching"}:
+            elif normalized_status in {"pending", "queued", "dispatching"}:
                 counts["running_items"] += 1
         return counts
 
@@ -2732,9 +2719,9 @@ class TaskManager:
             stage_items = items_by_stage.get(stage_name, [])
             counts = {
                 "total_items": len(stage_items),
-                "success_items": len([item for item in stage_items if item.status == "success"]),
-                "failed_items": len([item for item in stage_items if item.status == "failed"]),
-                "skipped_items": len([item for item in stage_items if item.status == "skipped"]),
+                "success_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "success"]),
+                "failed_items": len([item for item in stage_items if (self._normalize_downstream_status(item.status) or item.status) == "failed"]),
+                "skipped_items": 0,
                 "running_items": len(
                     [
                         item for item in stage_items
@@ -2852,8 +2839,15 @@ class TaskManager:
                 jobs=stage_jobs,
             )
             archive_status = self._aggregate_archive_stage_status([job.archive_status for job in stage_jobs])
-            terminal_item_count = sum(1 for item in current_stage_items if item.status in {"success", "failed", "partial_success", "cancelled", "skipped"})
-            has_non_terminal_items = any(item.status not in {"success", "failed", "partial_success", "cancelled", "skipped"} for item in current_stage_items)
+            terminal_item_count = sum(
+                1
+                for item in current_stage_items
+                if (self._normalize_downstream_status(item.status) or item.status) in {"success", "failed", "partial_success", "cancelled"}
+            )
+            has_non_terminal_items = any(
+                (self._normalize_downstream_status(item.status) or item.status) not in {"success", "failed", "partial_success", "cancelled"}
+                for item in current_stage_items
+            )
             if archive_status == "success" and (has_non_terminal_items or len(stage_jobs) < terminal_item_count):
                 archive_status = "running" if stage_jobs or summary.status in {"running", "dispatching", "applying"} else "pending"
             nodes.append(
@@ -2953,8 +2947,6 @@ class TaskManager:
                 business.success_items += 1
             elif status == "failed":
                 business.failed_items += 1
-            elif status == "skipped":
-                business.skipped_items += 1
             elif status == "cancelled":
                 business.cancelled_items += 1
             if status in {"pending", "queued", "running", "dispatching"}:
@@ -2992,6 +2984,7 @@ class TaskManager:
         queue_position = queue_info.get("pending_positions", {}).get(task.id)
         stage_sequence = self._stage_sequence_for_task(task)
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
+        task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
         return BinarySecurityTaskResponse(
             id=task.id,
@@ -3024,6 +3017,8 @@ class TaskManager:
             failed_firmware_count=int(metrics.get("failed_firmware_count", 0)),
             task_retry_supported=task_retry_supported,
             task_retry_reason=task_retry_reason,
+            task_continue_supported=task_continue_supported,
+            task_continue_reason=task_continue_reason,
             stage_summaries=stage_summaries,
         )
 
@@ -3219,13 +3214,14 @@ class TaskManager:
         for item in items:
             entry = stats.setdefault(item.stage_name, {"total": 0, "success": 0, "failed": 0, "skipped": 0, "running": 0, "cancelled": 0})
             entry["total"] += 1
-            if item.status in entry:
-                entry[item.status] += 1
+            normalized_status = self._normalize_downstream_status(item.status) or item.status
+            if normalized_status in entry:
+                entry[normalized_status] += 1
         return stats
 
     def _next_incomplete_stage(self, db: Session, task: BinarySecurityTask) -> str | None:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
-        completed = {run.stage_name for run in stage_runs if run.status in {"success", "skipped", "waiting_confirmation"}}
+        completed = {run.stage_name for run in stage_runs if run.status in {"success", "waiting_confirmation"}}
         for stage_name in self._stage_sequence_for_task(task):
             if stage_name not in completed:
                 return stage_name
@@ -3363,8 +3359,10 @@ class TaskManager:
             return "success"
         if normalized == "partial_success":
             return "partial_success"
+        if normalized == "skipped":
+            return "failed"
         if normalized in {"invalid_input", "completed_limited"}:
-            return "skipped"
+            return "failed"
         if normalized in {"failed", "error", "failure"}:
             return "failed"
         if normalized in {"cancelled", "canceled"}:
@@ -3513,7 +3511,7 @@ class TaskManager:
             task.finished_at = None
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
-        statuses = [run.status for run in stage_runs if run.status != "skipped"]
+        statuses = [run.status for run in stage_runs]
         if any(status in {"running", "dispatching"} for status in statuses):
             task.status = "running"
             task.finished_at = None
@@ -3781,7 +3779,7 @@ class TaskManager:
             run = stage_runs.get(stage_name)
             if not run:
                 return None
-            if run.status not in {"success", "skipped", "waiting_confirmation"}:
+            if run.status not in {"success", "waiting_confirmation"}:
                 return stage_name
         return None
 
@@ -3794,6 +3792,68 @@ class TaskManager:
         if not stage_sequence:
             return False, "当前任务没有可执行阶段", None
         return True, None, stage_sequence[0]
+
+    def _task_continue_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
+        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+            return False, f"当前任务状态不允许继续: {task.status}", None
+        if task.status in {"pending", "dispatching", "running"}:
+            return False, f"当前任务正在执行或排队中，不能手动继续: {task.status}", None
+        if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+            return False, "当前任务等待模块确认，请先确认模块后继续", None
+
+        stage_sequence = self._stage_sequence_for_task(task)
+        if not stage_sequence:
+            return False, "当前任务没有可执行阶段", None
+
+        stage_runs = {
+            row.stage_name: row
+            for row in db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+            ).all()
+        }
+        target_stage = stage_sequence[0]
+        for stage_name in stage_sequence:
+            run = stage_runs.get(stage_name)
+            if run and run.status == "success":
+                continue
+            target_stage = stage_name
+            break
+        else:
+            return False, "当前任务所有阶段都已成功，没有可继续的后续阶段", None
+
+        reason = self._continue_stage_input_error(task, target_stage)
+        if reason:
+            return False, reason, target_stage
+        return True, None, target_stage
+
+    def _continue_stage_input_error(self, task: BinarySecurityTask, stage_name: str) -> str | None:
+        summary = dict(task.summary or {})
+        if stage_name == "system_analysis":
+            inputs = self._system_analysis_inputs(task)
+            if not inputs:
+                return "系统分析缺少可执行输入，不能继续"
+            return None
+        if stage_name == "binary_to_source":
+            inputs = list(summary.get("selected_modules") or [])
+            if not inputs:
+                return "系统分析尚未产出可用模块，不能继续二进制逆向阶段"
+            return None
+        if stage_name == "entry_analysis":
+            inputs = list(summary.get("selected_modules") or [])
+            if not inputs:
+                return "系统分析尚未产出可用模块，不能继续入口分析阶段"
+            return None
+        if stage_name == "dataflow_analysis":
+            inputs = list(summary.get("entry_results") or [])
+            if not inputs:
+                return "入口分析尚未产出可用入口结果，不能继续数据流分析阶段"
+            return None
+        if stage_name == "vuln_scan":
+            inputs = list(summary.get("dataflow_results") or [])
+            if not inputs:
+                return "数据流分析尚未产出可用结果，不能继续漏洞扫描阶段"
+            return None
+        return None
 
     def _clear_stage_outputs_from(self, task: BinarySecurityTask, stage_name: str, *, mark_stale: bool = True) -> None:
         summary = dict(task.summary or {})
@@ -5483,33 +5543,33 @@ class TaskManager:
             definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
             if not definition_found:
-                item.status = "skipped"
+                item.status = "failed"
                 item.finished_at = _now()
-                item.error_message = "未找到函数定义，跳过数据流分析"
+                item.error_message = "未找到函数定义，无法执行数据流分析"
                 item.result = self._compact_result_for_storage(
                     stage_run.stage_name,
                     {
                         **entry,
-                        "skipped": True,
-                        "skip_reason": item.error_message,
+                        "failed": True,
+                        "failure_reason": item.error_message,
                     },
                 )
                 session.commit()
-                return {"status": "skipped", "error": item.error_message, "item": entry}
+                return {"status": "failed", "error": item.error_message, "item": entry}
             if not taint_params:
-                item.status = "skipped"
+                item.status = "failed"
                 item.finished_at = _now()
-                item.error_message = "未识别到明确污点参数，跳过数据流分析"
+                item.error_message = "未识别到明确污点参数，无法执行数据流分析"
                 item.result = self._compact_result_for_storage(
                     stage_run.stage_name,
                     {
                         **entry,
-                        "skipped": True,
-                        "skip_reason": item.error_message,
+                        "failed": True,
+                        "failure_reason": item.error_message,
                     },
                 )
                 session.commit()
-                return {"status": "skipped", "error": item.error_message, "item": entry}
+                return {"status": "failed", "error": item.error_message, "item": entry}
             prompt = f"分析文件 {definition_file or entry['file_name']} 中函数 {entry['function_name']} 的外部输入数据流"
             line_hint = ""
             if definition_line:
