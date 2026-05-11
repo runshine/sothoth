@@ -1556,6 +1556,103 @@ class TaskManagerTests(unittest.TestCase):
         self.assertFalse(supported)
         self.assertIn("下游服务不匹配", reason or "")
 
+    def test_stage_retry_support_allows_failed_stage_without_items_when_inputs_can_be_rebuilt(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="partial_success",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {}
+        run = BinarySecurityStageRun(
+            id="sr3",
+            task_id="s1",
+            project_id="p1",
+            stage_name="dataflow_analysis",
+            sequence_no=3,
+            status="failed",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            item_name="m1",
+            status="success",
+        )
+        entry_item.result = {
+            "module_key": "m1",
+            "module_name": "m1",
+            "source_dir": "/src/m1",
+            "entries_preview": [{"entry_key": "e1", "function_name": "main", "file_name": "main.c", "line_no": 1}],
+        }
+        db = _ModelAwareDb(stage_runs=[run])
+        original_stage_items = self.manager._stage_items
+
+        def fake_stage_items(_db, _task_id, stage_name):
+            return [entry_item] if stage_name == "entry_analysis" else []
+
+        self.manager._stage_items = fake_stage_items
+        try:
+            supported, reason = self.manager._stage_retry_support(db, task, "dataflow_analysis")
+        finally:
+            self.manager._stage_items = original_stage_items
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+        self.assertEqual(1, len(task.summary["entry_results"]))
+
+    def test_task_continue_support_rebuilds_dataflow_inputs_from_entry_stage_items(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="partial_success",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {}
+        runs = [
+            BinarySecurityStageRun(id="sr1", task_id="s1", project_id="p1", stage_name="system_analysis", sequence_no=1, status="success"),
+            BinarySecurityStageRun(id="sr2", task_id="s1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="success"),
+            BinarySecurityStageRun(id="sr3", task_id="s1", project_id="p1", stage_name="dataflow_analysis", sequence_no=3, status="failed"),
+            BinarySecurityStageRun(id="sr4", task_id="s1", project_id="p1", stage_name="vuln_scan", sequence_no=4, status="pending"),
+        ]
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            item_name="m1",
+            status="success",
+        )
+        entry_item.result = {
+            "module_key": "m1",
+            "module_name": "m1",
+            "source_dir": "/src/m1",
+            "entries_preview": [{"entry_key": "e1", "function_name": "main", "file_name": "main.c", "line_no": 1}],
+        }
+        db = _ModelAwareDb(stage_runs=runs, stage_items=[entry_item])
+
+        supported, reason, target_stage = self.manager._task_continue_support(db, task)
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+        self.assertEqual("dataflow_analysis", target_stage)
+        self.assertEqual(1, len(task.summary["entry_results"]))
+
     def test_stage_retry_clears_only_target_stage_outputs(self):
         task = BinarySecurityTask(
             id="s1",

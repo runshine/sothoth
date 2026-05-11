@@ -4090,7 +4090,10 @@ class TaskManager:
             return False, f"当前阶段状态不允许重试: {stage_run.status}"
         items = self._stage_items(db, task.id, stage_name)
         if not items:
-            return False, "阶段没有历史子任务，无法安全重试"
+            reason = self._continue_stage_input_error(db, task, stage_name)
+            if reason:
+                return False, reason
+            return True, None
         seen: set[str] = set()
         expected_service = mapping[0]
         for item in items:
@@ -4157,12 +4160,53 @@ class TaskManager:
         else:
             return False, "当前任务所有阶段都已成功，没有可继续的后续阶段", None
 
-        reason = self._continue_stage_input_error(task, target_stage)
+        reason = self._continue_stage_input_error(db, task, target_stage)
         if reason:
             return False, reason, target_stage
         return True, None, target_stage
 
-    def _continue_stage_input_error(self, task: BinarySecurityTask, stage_name: str) -> str | None:
+    def _ensure_stage_inputs_available(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
+        """Rebuild target-stage inputs from the previous successful stage when possible."""
+        summary = dict(task.summary or {})
+        if stage_name in {"binary_to_source", "entry_analysis"} and not summary.get("selected_modules"):
+            self._refresh_system_analysis_stage_from_synced_items(db, task)
+            summary = dict(task.summary or {})
+        if stage_name == "entry_analysis" and self._task_type(task) != TASK_TYPE_SOURCE and not summary.get("b2s_results"):
+            self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
+        if stage_name == "dataflow_analysis" and not summary.get("entry_results"):
+            self._rebuild_entry_results_from_stage_items(db, task)
+        if stage_name == "vuln_scan" and not summary.get("dataflow_results"):
+            self._rebuild_summary_results_from_stage_items(db, task, "dataflow_analysis", "dataflow_results")
+
+    def _rebuild_summary_results_from_stage_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        summary_key: str,
+    ) -> list[dict[str, Any]]:
+        items = [
+            item
+            for item in self._stage_items(db, task.id, stage_name)
+            if item.status == "success"
+        ]
+        rebuilt = self._compact_stage_success_items(
+            summary_key,
+            [
+                {
+                    **dict(item.input_ref or {}),
+                    **dict(item.output_ref or {}),
+                    **dict(item.result or {}),
+                }
+                for item in items
+            ],
+        )
+        if rebuilt:
+            task.summary = {**(task.summary or {}), summary_key: rebuilt}
+        return rebuilt
+
+    def _continue_stage_input_error(self, db: Session, task: BinarySecurityTask, stage_name: str) -> str | None:
+        self._ensure_stage_inputs_available(db, task, stage_name)
         summary = dict(task.summary or {})
         if stage_name == "system_analysis":
             inputs = self._system_analysis_inputs(task)
