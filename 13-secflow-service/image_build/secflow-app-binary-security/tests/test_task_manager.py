@@ -270,6 +270,69 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("d1", nodes[0].detail.representative_downstream_task_id)
         self.assertEqual(["firmware_unpacker"], nodes[0].detail.downstream_services)
 
+    def test_build_stage_overview_nodes_keeps_archive_running_when_some_items_not_terminal(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="running",
+        )
+        summaries = [
+            self.manager._build_stage_summaries(
+                _ModelAwareDb(),
+                task,
+                ["entry_analysis"],
+                [BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="running")],
+                [
+                    BinarySecurityStageItem(id="i1", task_id="t1", project_id="p1", stage_run_id="sr1", stage_name="entry_analysis", item_key="m1", status="success"),
+                    BinarySecurityStageItem(id="i2", task_id="t1", project_id="p1", stage_run_id="sr1", stage_name="entry_analysis", item_key="m2", status="running"),
+                ],
+            )[0]
+        ]
+        archive_jobs = [
+            BinarySecurityArchiveJobResponse(
+                id="aj1",
+                stage_name="entry_analysis",
+                item_id="i1",
+                item_key="m1",
+                archive_status="success",
+            )
+        ]
+        stage_items = [
+            BinarySecurityStageItem(
+                id="i1",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="entry_analysis",
+                item_key="m1",
+                status="success",
+                downstream_service="entry_analyse",
+                downstream_task_id="d1",
+            ),
+            BinarySecurityStageItem(
+                id="i2",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr1",
+                stage_name="entry_analysis",
+                item_key="m2",
+                status="running",
+                downstream_service="entry_analyse",
+                downstream_task_id="d2",
+            ),
+        ]
+
+        nodes = self.manager._build_stage_overview_nodes(task, summaries, archive_jobs, stage_items)
+        by_node_id = {node.node_id: node for node in nodes}
+
+        self.assertEqual("running", by_node_id["archive:entry_analysis"].status)
+
     def test_choose_module_binary_handles_relative_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -830,6 +893,44 @@ class TaskManagerTests(unittest.TestCase):
             asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
 
             self.assertEqual([], db.archive_jobs)
+
+    def test_continue_task_deletes_archive_child_outputs_for_affected_stages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_root = workspace / "output"
+            system_output = output_root / "system-analyse"
+            entry_output = output_root / "entry-analyse"
+            system_output.mkdir(parents=True)
+            entry_output.mkdir(parents=True)
+            (system_output / "kept.txt").write_text("old", encoding="utf-8")
+            (entry_output / "stale.txt").write_text("old", encoding="utf-8")
+            task = BinarySecurityTask(
+                id="s1",
+                project_id="p1",
+                name="source",
+                status="partial_success",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="entry_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(output_root),
+                workspace_root=str(workspace),
+            )
+            runs = [
+                BinarySecurityStageRun(id="sr1", task_id="s1", project_id="p1", stage_name="system_analysis", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="s1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="failed"),
+            ]
+            db = _ModelAwareDb(tasks=[task], stage_runs=runs)
+
+            async def fake_delete_downstream_refs(*args, **kwargs):
+                return 0
+
+            self.manager._delete_downstream_refs = fake_delete_downstream_refs
+
+            asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
+
+            self.assertTrue(system_output.exists())
+            self.assertFalse(entry_output.exists())
 
     def test_continue_task_deletes_affected_downstream_tasks_before_requeue(self):
         with tempfile.TemporaryDirectory() as tmp:

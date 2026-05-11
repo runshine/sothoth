@@ -1032,12 +1032,11 @@ class TaskManager:
         if downstream_refs:
             await self._delete_downstream_refs(db, task, downstream_refs, token)
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
-        self._clear_stage_output_artifacts(task, affected_stages)
         db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task.id,
             BinarySecurityStageItem.stage_name.in_(affected_stages),
         ).delete(synchronize_session=False)
-        self._clear_archive_jobs_for_stages(db, task.id, affected_stages)
+        self._delete_archive_children_for_stages(db, task, affected_stages)
         for stage_name in affected_stages:
             stage_run = stage_runs.get(stage_name)
             if stage_run:
@@ -1094,12 +1093,11 @@ class TaskManager:
         task.dispatch_started_at = None
         task.finished_at = None
         self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
-        self._clear_stage_output_artifacts(task, stage_sequence)
         db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task.id,
             BinarySecurityStageItem.stage_name.in_(stage_sequence),
         ).delete(synchronize_session=False)
-        self._clear_archive_jobs_for_stages(db, task.id, stage_sequence)
+        self._delete_archive_children_for_stages(db, task, stage_sequence)
         for current_stage in stage_sequence:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,
@@ -1360,6 +1358,13 @@ class TaskManager:
             .delete(synchronize_session=False)
             or 0
         )
+
+    def _delete_archive_children_for_stages(self, db: Session, task: BinarySecurityTask, stage_names: list[str]) -> int:
+        normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
+        if not normalized:
+            return 0
+        self._clear_stage_output_artifacts(task, normalized)
+        return self._clear_archive_jobs_for_stages(db, task.id, normalized)
 
     def _retry_failed_archive_jobs_for_stage(self, db: Session, task: BinarySecurityTask, stage_name: str) -> bool:
         if task.status in STAGE_RETRY_BLOCKED_TASK_STATUSES:
@@ -2842,6 +2847,10 @@ class TaskManager:
                 jobs=stage_jobs,
             )
             archive_status = self._aggregate_archive_stage_status([job.archive_status for job in stage_jobs])
+            terminal_item_count = sum(1 for item in current_stage_items if item.status in {"success", "failed", "partial_success", "cancelled", "skipped"})
+            has_non_terminal_items = any(item.status not in {"success", "failed", "partial_success", "cancelled", "skipped"} for item in current_stage_items)
+            if archive_status == "success" and (has_non_terminal_items or len(stage_jobs) < terminal_item_count):
+                archive_status = "running" if stage_jobs or summary.status in {"running", "dispatching", "applying"} else "pending"
             nodes.append(
                 BinarySecurityOverviewNode(
                     node_id=f"archive:{stage_name}",
