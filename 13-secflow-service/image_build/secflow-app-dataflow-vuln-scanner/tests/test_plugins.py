@@ -28,7 +28,7 @@ class StaticPlugin(BasePlugin):
         (PluginResultCode.OK_END_STAGE, "end_stage_normal"),
         (PluginResultCode.ERROR_CONTINUE, "completed"),
         (PluginResultCode.ERROR_END_NEXT, "end_stage_skip_next"),
-        (PluginResultCode.ERROR_RESTART, "restart_workflow"),
+        (PluginResultCode.ERROR_RESTART, "exit_workflow"),
         (PluginResultCode.ERROR_EXIT, "exit_workflow"),
     ],
 )

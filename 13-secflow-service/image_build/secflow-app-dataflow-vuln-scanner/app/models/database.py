@@ -120,8 +120,6 @@ class WorkflowExecution(Base):
     output_task_count = Column(Integer, nullable=False, default=0)
     current_stage_id = Column(String(128))
     owner_pod_id = Column(String(128))
-    lease_token = Column(String(128))
-    lease_expires_at = Column(DateTime)
     process_pid = Column(Integer)
     process_host = Column(String(256))
     process_status = Column(String(32))

@@ -142,15 +142,6 @@ class DbExecutionObserver(ExecutionObserver):
             payload_json=payload,
         )
 
-    async def on_workflow_restart(self, **payload: Any) -> None:
-        _write_event(
-            execution_id=self.execution_id,
-            event_type="workflow_restart_requested",
-            message=f"workflow restart requested for attempt {payload.get('attempt')}",
-            level="warning",
-            payload_json=payload,
-        )
-
     async def on_workflow_abnormal_exit(self, **payload: Any) -> None:
         _write_event(
             execution_id=self.execution_id,

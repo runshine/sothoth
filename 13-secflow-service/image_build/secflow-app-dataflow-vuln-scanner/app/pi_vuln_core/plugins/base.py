@@ -28,8 +28,8 @@ class PluginResultCode(Enum):
         ERROR_CONTINUE   - 异常，但允许执行下一个插件
         ERROR_END_NEXT   - 异常，结束当前阶段并进入下一阶段
 
-    异常需重试/退出:
-        ERROR_RESTART    - 异常，重新开始整个工作流
+    异常需退出:
+        ERROR_RESTART    - 历史兼容码；当前按失败退出处理，不允许自动重启整个工作流
         ERROR_EXIT       - 异常，立即退出工作流
     """
     OK_NEXT = "ok_next"

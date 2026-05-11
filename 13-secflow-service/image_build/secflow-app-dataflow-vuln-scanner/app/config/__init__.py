@@ -113,8 +113,8 @@ class RegistryConfig(BaseModel):
 
 class ServiceConfig(BaseModel):
     workspace_base_dir: str = "/data/files"
-    # 0 means unlimited / disabled. We deliberately avoid framework-side
-    # timeout enforcement for the Pi process unless a caller explicitly opts in.
+    # Deprecated compatibility field. Service-side run_vuln_scan.py process
+    # timeout enforcement is disabled; only explicit user cancel/delete stops it.
     default_execution_timeout_seconds: int = 0
     execution_cancel_check_interval_seconds: int = 1
     trigger_retry_limit: int = 0

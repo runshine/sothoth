@@ -33,7 +33,7 @@ class ScanProfileCreateRequest(BaseModel):
     enabled: bool = True
     default_priority: int = 100
     max_retry_count: int = Field(default=0, ge=0)
-    execution_timeout_seconds: int = Field(default=0, ge=0, description="Maximum service-managed run_vuln_scan.py process duration in seconds; 0 means unlimited / disabled.")
+    execution_timeout_seconds: int = Field(default=0, ge=0, description="Deprecated compatibility field; service-managed run_vuln_scan.py process timeout is disabled.")
 
 
 class ScanProfileUpdateRequest(BaseModel):
@@ -45,7 +45,7 @@ class ScanProfileUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     default_priority: Optional[int] = None
     max_retry_count: Optional[int] = Field(default=None, ge=0)
-    execution_timeout_seconds: Optional[int] = Field(default=None, ge=0, description="Maximum service-managed run_vuln_scan.py process duration in seconds; 0 means unlimited / disabled.")
+    execution_timeout_seconds: Optional[int] = Field(default=None, ge=0, description="Deprecated compatibility field; service-managed run_vuln_scan.py process timeout is disabled.")
 
 
 class ScanProfileResponse(BaseModel):

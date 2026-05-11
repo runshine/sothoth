@@ -41,7 +41,7 @@ class AtomicWorkflowResult:
     next_tasks: list[TaskItem] = field(default_factory=list)
     working_dir: str = ""
     error: Optional[str] = None
-    action: str = ""             # "restart_workflow" 等特殊动作
+    action: str = ""             # "exit_workflow" 等特殊动作；整工作流自动重启已禁用
     cycles_used: int = 0
 
     @property

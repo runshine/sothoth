@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-
 from app.models.database import TriggerTask, WorkflowExecution, get_db_session
 from app.schemas import ScanProfileCreateRequest, ScanTaskCreateRequest
 from app.services.execution_service import get_execution_service
@@ -15,7 +13,7 @@ def _create_profile(db):
         ScanProfileCreateRequest(
             project_id="default",
             name="recoverable profile",
-            description="requeue",
+            description="scheduler cleanup",
             template_kind="vuln_scan_default",
             config_payload={
                 "model": "mock/model",
@@ -36,7 +34,7 @@ def _create_profile(db):
     )
 
 
-def test_cleanup_does_not_requeue_expired_running_execution(service_config_path):
+def test_cleanup_does_not_mutate_running_execution(service_config_path):
     db = get_db_session()
     try:
         profile = _create_profile(db)
@@ -65,7 +63,6 @@ def test_cleanup_does_not_requeue_expired_running_execution(service_config_path)
         assert execution is not None
         execution.status = "running"
         execution.owner_pod_id = "dead-pod"
-        execution.lease_expires_at = datetime.now() - timedelta(seconds=30)
         db.add(execution)
         trigger = db.get(TriggerTask, execution.trigger_task_id)
         assert trigger is not None

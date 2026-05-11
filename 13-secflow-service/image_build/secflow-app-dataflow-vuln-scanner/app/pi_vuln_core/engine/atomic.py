@@ -113,19 +113,15 @@ class AtomicWorkflowEngine:
                      workflow_id=self.wf.id, task_id=task_id,
                      work_dir=work_dir)
 
-        max_retry = self.global_cfg.max_workflow_retry
-        for attempt in range(1, max_retry + 1):
-            result = await self._execute_once(work_dir, input_task, task_id)
-            if result.action == "restart_workflow":
-                logger.warning("workflow_restart",
-                               workflow_id=self.wf.id, attempt=attempt)
-                if attempt >= max_retry:
-                    result.status = "failed"
-                    result.error = f"超过最大重试次数 ({max_retry})"
-                    break
-                continue
-            else:
-                break
+        result = await self._execute_once(work_dir, input_task, task_id)
+        if result.action == "restart_workflow":
+            logger.error(
+                "workflow_restart_blocked",
+                workflow_id=self.wf.id,
+                reason="automatic workflow restart is disabled",
+            )
+            result.status = "failed"
+            result.error = result.error or "自动重启整个工作流已禁用"
 
         await self.recorder.record_workflow_result(
             work_dir=work_dir, status=result.status,

@@ -1127,13 +1127,18 @@ class ExecutionService:
         model = str(config_payload.get("model") or request.get("model") or "").strip()
         review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
         max_cycles = first_present_int(config_payload.get("max_review_cycles"), request.get("max_review_cycles"), default=0)
-        agent_run_timeout_seconds = first_present_int(config_payload.get("agent_run_timeout_seconds"), request.get("agent_run_timeout_seconds"), default=3600)
         agent_timeout_retry_enabled = request.get("agent_timeout_retry_enabled")
         if agent_timeout_retry_enabled is None:
             agent_timeout_retry_enabled = config_payload.get("agent_timeout_retry_enabled", True)
         agent_timeout_retry_enabled = bool(agent_timeout_retry_enabled)
-        agent_timeout_max_retries = first_present_int(config_payload.get("agent_timeout_max_retries"), request.get("agent_timeout_max_retries"), default=3)
-        timeout_max_retries = max(agent_timeout_max_retries + 1, 1) if agent_timeout_retry_enabled else 1
+        configured_timeout_max_retries = first_present_int(
+            config_payload.get("agent_timeout_max_retries"),
+            request.get("agent_timeout_max_retries"),
+            config_payload.get("timeout_max_retries"),
+            request.get("timeout_max_retries"),
+            default=3,
+        )
+        timeout_max_retries = max(configured_timeout_max_retries, 1) if agent_timeout_retry_enabled else 1
         timeout_retry_interval_seconds = first_present_int(config_payload.get("timeout_retry_interval_seconds"), request.get("timeout_retry_interval_seconds"), default=30)
         result_review_concurrency = first_present_int(config_payload.get("result_review_concurrency"), request.get("result_review_concurrency"), default=3)
 
@@ -1146,8 +1151,6 @@ class ExecutionService:
 
                 json.dump(json_payload, handle, ensure_ascii=False, indent=2)
             argv.extend(["--config", temp_config_path])
-            argv.extend(["--worker-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
-            argv.extend(["--advisor-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
             argv.extend(["--timeout-max-retries", str(max(timeout_max_retries, 1))])
             argv.extend(["--timeout-retry-interval-seconds", str(max(timeout_retry_interval_seconds, 0))])
             return argv, temp_config_path
@@ -1156,8 +1159,6 @@ class ExecutionService:
             argv.extend(["--model", model])
         if max_cycles > 0:
             argv.extend(["--max-cycles", str(max_cycles)])
-        argv.extend(["--worker-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
-        argv.extend(["--advisor-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
         argv.extend(["--timeout-max-retries", str(max(timeout_max_retries, 1))])
         argv.extend(["--timeout-retry-interval-seconds", str(max(timeout_retry_interval_seconds, 0))])
         argv.extend(["--result-review-concurrency", str(max(result_review_concurrency, 1))])
@@ -1407,8 +1408,6 @@ class ExecutionService:
         execution.finished_at = now
         execution.output_manifest_path = output_manifest_path
         execution.output_task_count = output_task_count
-        execution.lease_token = None
-        execution.lease_expires_at = None
         execution.current_stage_id = None
         if execution.process_status in {"running", "stop_requested", "delete_requested"}:
             execution.process_status = "exited"
@@ -1712,8 +1711,10 @@ class ExecutionService:
 
     def _adopted_run_index_task_status(self, status_text: str | None) -> str:
         value = str(status_text or "").strip().lower()
-        if value in {"pending", "queued", "running", "cancel_requested", "delete_requested", "failed", "cancelled", "orphaned"}:
+        if value in {"pending", "queued", "running", "cancel_requested", "delete_requested", "failed", "cancelled"}:
             return value
+        if value == "orphaned":
+            return "failed"
         if value in {"completed", "succeeded", "success", "passed"}:
             return "succeeded"
         if value in {"interrupted", "stopped"}:
@@ -2320,8 +2321,6 @@ class ExecutionService:
             execution.finished_at = now
             execution.process_status = "exited"
             execution.process_finished_at = now
-            execution.lease_token = None
-            execution.lease_expires_at = None
             db.add(execution)
         if trigger is not None and self._run_index_status_is_active(trigger.status):
             trigger.status = "failed"
@@ -2739,7 +2738,7 @@ class ExecutionService:
         self.record_event(
             db,
             execution_id=execution.id,
-            event_type="execution_requeued",
+            event_type="run_resume_queued",
             message="manual run resume requested",
             payload_json={
                 "run_id": run_index.id,
@@ -2836,67 +2835,6 @@ class ExecutionService:
                 shutil.rmtree(path, ignore_errors=True)
         return {"success": True, "message": "task deleted"}
 
-    def _create_retry_attempt_for_task(
-        self,
-        db: Session,
-        *,
-        trigger: TriggerTask,
-        principal: dict,
-        authorization_token: str | None,
-        recovery_reason: str,
-        increment_retry_count: bool,
-    ) -> ScanTaskResponse:
-        definition = self._definition_or_404(db, trigger.workflow_definition_id)
-        version = self._definition_version_or_404(db, trigger.workflow_definition_version_id)
-        actor = _principal_id(principal)
-        if increment_retry_count:
-            trigger.retry_count += 1
-        manifest = TaskManifest.model_validate(trigger.input_tasks_json)
-        metadata = dict(manifest.tasks[0].metadata or {}) if manifest.tasks else {}
-        if self._is_dataflow_cli_task_metadata(metadata):
-            execution = self._create_dataflow_cli_execution_attempt(
-                db,
-                trigger=trigger,
-                definition=definition,
-                definition_version=version,
-                actor=actor,
-                recovery_reason=recovery_reason,
-            )
-        else:
-            execution = self._create_execution_attempt(
-                db,
-                trigger=trigger,
-                definition=definition,
-                definition_version=version,
-                actor=actor,
-                authorization_token=authorization_token,
-                recovery_reason=recovery_reason,
-            )
-        db.commit()
-        db.refresh(trigger)
-        self.record_event(
-            db,
-            execution_id=execution.id,
-            event_type="execution_requeued",
-            message=recovery_reason,
-            payload_json={"task_id": trigger.id, "attempt_no": execution.attempt_no},
-        )
-        return self._scan_task_response(db, trigger)
-
-    def retry_scan_task(self, db: Session, task_id: str, principal: dict, *, authorization_token: str | None = None) -> ScanTaskResponse:
-        trigger = self._trigger_or_404(db, task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        if trigger.status not in {"failed", "cancelled"}:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task is not retryable")
-        return self._create_retry_attempt_for_task(
-            db,
-            trigger=trigger,
-            principal=principal,
-            authorization_token=authorization_token,
-            recovery_reason="manual retry requested",
-            increment_retry_count=False,
-        )
-
     def update_scan_task_priority(self, db: Session, task_id: str, principal: dict, priority: int) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
@@ -2943,7 +2881,6 @@ class ExecutionService:
         db: Session,
         execution: WorkflowExecution,
         trigger: TriggerTask,
-        execution_timeout_seconds: int | None = None,
     ) -> int:
         if os.environ.get("SECFLOW_DATAFLOW_CLI_IN_PROCESS") == "1":
             import run_vuln_scan
@@ -2991,8 +2928,6 @@ class ExecutionService:
             },
         )
         try:
-            started_monotonic = time.monotonic()
-            timeout_seconds = int(execution_timeout_seconds or 0)
             while process.poll() is None:
                 time.sleep(max(1, int(get_config().service.execution_cancel_check_interval_seconds)))
                 self._write_cli_process_file(
@@ -3004,35 +2939,6 @@ class ExecutionService:
                 )
                 db.expire(execution)
                 db.expire(trigger)
-                if timeout_seconds > 0 and time.monotonic() - started_monotonic >= timeout_seconds:
-                    execution.process_status = "timeout_requested"
-                    execution.message = f"execution timeout exceeded ({timeout_seconds}s)"
-                    trigger.message = execution.message
-                    db.add(execution)
-                    db.add(trigger)
-                    db.commit()
-                    self._write_run_control_state(execution.workspace_root, status_text="timeout_requested", message=execution.message)
-                    self._write_cli_process_file(
-                        execution=execution,
-                        trigger=trigger,
-                        cmd=cmd,
-                        process=process,
-                        status_text="timeout_requested",
-                    )
-                    try:
-                        process.send_signal(signal.SIGINT)
-                    except ProcessLookupError:
-                        return 124
-                    try:
-                        process.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                    return 124
                 if execution.status in {"cancel_requested", "delete_requested"} or trigger.status in {"cancel_requested", "delete_requested"}:
                     execution.process_status = "delete_requested" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "stop_requested"
                     db.add(execution)
@@ -3173,7 +3079,7 @@ class ExecutionService:
                 message = "run_vuln_scan.py stopped for delete" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "run_vuln_scan.py cancelled"
             elif exit_code == 124:
                 terminal_status = "failed"
-                message = f"execution timeout exceeded ({definition.execution_timeout_seconds}s)"
+                message = "run_vuln_scan.py exited with timeout code 124"
             else:
                 terminal_status = "failed"
                 message = f"run_vuln_scan.py failed with exit code {exit_code}"
