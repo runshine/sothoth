@@ -1132,10 +1132,10 @@ class ExecutionService:
             agent_timeout_retry_enabled = config_payload.get("agent_timeout_retry_enabled", True)
         agent_timeout_retry_enabled = bool(agent_timeout_retry_enabled)
         configured_timeout_max_retries = first_present_int(
-            config_payload.get("agent_timeout_max_retries"),
-            request.get("agent_timeout_max_retries"),
-            config_payload.get("timeout_max_retries"),
             request.get("timeout_max_retries"),
+            config_payload.get("timeout_max_retries"),
+            request.get("agent_timeout_max_retries"),
+            config_payload.get("agent_timeout_max_retries"),
             default=3,
         )
         timeout_max_retries = max(configured_timeout_max_retries, 1) if agent_timeout_retry_enabled else 1
@@ -2430,10 +2430,12 @@ class ExecutionService:
         process_pid = execution.process_pid if execution is not None else None
         process_host = execution.process_host if execution is not None else None
         if execution is None and self._run_index_status_is_active(run_index.status):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="active run is not linked to a managed execution; adopt/link it before deleting",
-            )
+            process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+            if process_state.get("is_running"):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="active run is not linked to a managed execution and still appears to be running; retry delete after it stops",
+                )
         if execution is not None and execution.status == "pending":
             execution.status = "cancelled"
             execution.finished_at = now_local()
@@ -2466,12 +2468,54 @@ class ExecutionService:
             db.commit()
             stop_payload = self._signal_local_cli_process(execution.id, wait=True)
             process_pid = stop_payload.get("pid") or process_pid
-            stopped = self._wait_until_execution_inactive(db, execution.id, timeout_seconds=45)
-            if not stopped:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="run deletion requested but run_vuln_scan.py is still stopping; retry delete shortly",
-                )
+            if stop_payload.get("exit_code") is not None or stop_payload.get("signal") == "already_exited":
+                if trigger is not None:
+                    self._set_terminal_state(
+                        db,
+                        execution=execution,
+                        trigger=trigger,
+                        execution_status="cancelled",
+                        message="run_vuln_scan.py stopped for delete",
+                    )
+                else:
+                    execution.status = "cancelled"
+                    execution.message = "run_vuln_scan.py stopped for delete"
+                    execution.finished_at = now_local()
+                    execution.process_status = "exited"
+                    execution.process_finished_at = now_local()
+                    db.add(execution)
+                db.commit()
+            else:
+                stopped = self._wait_until_execution_inactive(db, execution.id, timeout_seconds=45)
+                if not stopped:
+                    db.expire_all()
+                    run_index = db.get(type(run_index), run_index_id)
+                    if run_index is None:
+                        return self._run_mutation_response(
+                            run_id=run_index_id,
+                            project_id=project_id,
+                            status_text="deleted",
+                            message=f"Run {run_name} deleted",
+                            linked_task_id=linked_task_id,
+                            linked_execution_id=linked_execution_id,
+                            process_pid=process_pid,
+                            process_host=process_host,
+                            process_signal=stop_payload.get("signal"),
+                        )
+                    trigger, execution = self._linked_run_index_runtime(db, run_index)
+                    process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+                    if process_state.get("is_running"):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="run deletion requested but run_vuln_scan.py is still stopping; retry delete shortly",
+                        )
+                    self._mark_stale_runtime_exited(
+                        db,
+                        trigger=trigger,
+                        execution=execution,
+                        message="stale delete_requested run assumed stopped during delete",
+                    )
+                    db.commit()
             db.expire_all()
             run_index = db.get(type(run_index), run_index_id)
             if run_index is None:

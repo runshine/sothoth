@@ -630,6 +630,79 @@ def test_run_delete_active_run_stops_process_and_removes_records(service_config_
         assert db.query(WorkflowExecutionEvent).filter(WorkflowExecutionEvent.execution_id == bound["execution_id"]).count() == 0
 
 
+def test_run_delete_active_run_does_not_wait_after_local_process_stopped(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_delete_local_stopped_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "running"
+        execution.status = "running"
+        execution.process_pid = 4242
+        execution.process_status = "running"
+        trigger.status = "running"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+    service = get_execution_service()
+    fake_process = _FakeCliProcess()
+    service._register_cli_process(bound["execution_id"], fake_process)
+
+    def fail_wait(*_args, **_kwargs):
+        raise AssertionError("delete_run should not wait for DB inactivity after local process.wait() returned")
+
+    monkeypatch.setattr(type(service), "_wait_until_execution_inactive", fail_wait)
+
+    delete_response = client.delete(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["status"] == "deleted"
+    assert fake_process.signals[-1] == signal.SIGINT
+    assert not run_root.exists()
+
+
+
+def test_run_delete_stale_active_record_deletes_without_endless_stopping_conflict(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_delete_stale_active_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+
+    with get_db_session() as db:
+        run_index = db.get(RunIndex, bound["run_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        trigger = db.get(TriggerTask, bound["task_id"])
+        assert run_index is not None and execution is not None and trigger is not None
+        run_index.status = "running"
+        execution.status = "running"
+        execution.process_pid = 4242
+        execution.process_status = "running"
+        trigger.status = "running"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+
+    service = get_execution_service()
+    service._forget_cli_process(bound["execution_id"])
+    monkeypatch.setattr(type(service), "_wait_until_execution_inactive", lambda self, db, execution_id, timeout_seconds: False)
+
+    delete_response = client.delete(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert delete_response.status_code == 200
+    payload = delete_response.json()
+    assert payload["status"] == "deleted"
+    assert payload["process_signal"] == "db_flag_only"
+    assert not run_root.exists()
+
+    with get_db_session() as db:
+        assert db.get(RunIndex, bound["run_id"]) is None
+        assert db.get(TriggerTask, bound["task_id"]) is None
+        assert db.get(WorkflowExecution, bound["execution_id"]) is None
+
+
+
 def test_run_retry_execution_uses_resume_cli_argv(service_config_path, monkeypatch):
     app = create_app()
     client = TestClient(app)

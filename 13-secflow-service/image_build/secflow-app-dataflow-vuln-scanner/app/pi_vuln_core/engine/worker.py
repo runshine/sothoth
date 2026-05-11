@@ -438,17 +438,33 @@ class WorkerExecutor:
         """Build the effective Worker system prompt with run-scope guidance.
 
         The prompt file intentionally contains only the stable role/contract.
-        The breadth/depth checklist is injected here so each run receives the
-        right bounded hunting instructions without exposing profile labels.
+        Profile-specific hunting depth is injected here so each run receives the
+        right bounded instructions without fragmenting the base system prompt.
+        Audit adds an optional appendix with a fuller vuln checklist, while
+        fast/balanced stay on the lean base contract.
         """
         base = read_file(system_prompt_file).rstrip()
         dynamic_sections = [
             self._format_profile_worker_scope(ctx),
+            self._load_profile_worker_appendix(system_prompt_file, ctx),
             self._result_report_template(compact=True),
         ]
         return base + "\n\n" + "\n\n".join(
             section for section in dynamic_sections if section.strip()
         ).rstrip() + "\n"
+
+    @staticmethod
+    def _load_profile_worker_appendix(
+        system_prompt_file: str,
+        ctx: WorkflowContext,
+    ) -> str:
+        policy = get_review_profile_policy(ctx.review_profile)
+        if policy.name != "audit":
+            return ""
+        appendix_path = Path(system_prompt_file).with_name("worker_audit_appendix.md")
+        if not appendix_path.exists():
+            return ""
+        return read_file(appendix_path).rstrip()
 
     @staticmethod
     def _result_report_template(*, compact: bool = False) -> str:

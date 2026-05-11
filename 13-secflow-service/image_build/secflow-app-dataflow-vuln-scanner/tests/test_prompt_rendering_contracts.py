@@ -68,6 +68,59 @@ def test_jinja_prompt_rendering_uses_framework_error_type() -> None:
         render_string("Task: {{ missing_var }}", strict=True)
 
 
+def test_worker_system_prompt_appends_audit_appendix_only_for_audit() -> None:
+    executor = WorkerExecutor(agent_registry=None, recorder=None)  # type: ignore[arg-type]
+    audit_ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file="task.md",
+        working_dir="/tmp/work",
+        review_profile="audit",
+    )
+    balanced_ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file="task.md",
+        working_dir="/tmp/work",
+        review_profile="balanced",
+    )
+
+    audit_prompt = executor._build_worker_system_prompt(
+        "prompts/vuln_scan/worker_system.md",
+        audit_ctx,
+    )
+    balanced_prompt = executor._build_worker_system_prompt(
+        "prompts/vuln_scan/worker_system.md",
+        balanced_ctx,
+    )
+
+    assert "## 本轮扩展方法学" in audit_prompt
+    assert "## 漏洞模式补充检查清单" in audit_prompt
+    assert "仅 audit" not in audit_prompt
+    assert " audit " not in audit_prompt.lower()
+    assert "## 本轮扩展方法学" not in balanced_prompt
+
+
+def test_worker_system_prompt_audit_appendix_is_optional_for_custom_prompt(tmp_path: Path) -> None:
+    custom_system = tmp_path / "worker_system.md"
+    custom_system.write_text("custom system\n", encoding="utf-8")
+    ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file="task.md",
+        working_dir=str(tmp_path / "work"),
+        review_profile="audit",
+    )
+
+    prompt = WorkerExecutor(agent_registry=None, recorder=None)._build_worker_system_prompt(  # type: ignore[arg-type]
+        str(custom_system),
+        ctx,
+    )
+
+    assert prompt.startswith("custom system")
+    assert "## 本轮扩展方法学" not in prompt
+
+
 def test_pipeline_worker_prompt_receives_task_alias(tmp_path: Path) -> None:
     task_file = tmp_path / "task.md"
     task_file.write_text("# Docker task\n\n- 输入文件夹路径: /firmware\n", encoding="utf-8")
