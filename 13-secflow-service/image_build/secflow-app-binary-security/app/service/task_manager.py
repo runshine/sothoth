@@ -3363,6 +3363,8 @@ class TaskManager:
             return "success"
         if normalized == "partial_success":
             return "partial_success"
+        if normalized in {"invalid_input", "completed_limited"}:
+            return "skipped"
         if normalized in {"failed", "error", "failure"}:
             return "failed"
         if normalized in {"cancelled", "canceled"}:
@@ -5370,6 +5372,19 @@ class TaskManager:
                         "function_name": function_name,
                         "raw_function_name": str(raw_function_name or ""),
                         "line_no": line_no,
+                        "definition_file": str(entry.get("definition_file") or entry.get("file_name") or entry.get("file") or file_name or "").strip(),
+                        "definition_line": str(entry.get("definition_line") or entry.get("line_no") or entry.get("line") or line_no),
+                        "is_definition_found": bool(entry.get("is_definition_found", True)),
+                        "taint_params": [
+                            str(value).strip()
+                            for value in (entry.get("taints") or entry.get("taint_params") or [])
+                            if str(value).strip()
+                        ],
+                        "signature_params": [
+                            str(value).strip()
+                            for value in (entry.get("signature_params") or [])
+                            if str(value).strip()
+                        ],
                         "entry_file": str(source),
                         "source_dir": (module.get("source_root") if module.get("task_type") == TASK_TYPE_SOURCE else None) or module["source_dir"],
                     }
@@ -5459,7 +5474,46 @@ class TaskManager:
                 retrying=retrying,
             )
             session.commit()
-            prompt = f"分析文件 {entry['file_name']} 中函数 {entry['function_name']} 的外部输入数据流"
+            taint_params = [
+                str(value).strip()
+                for value in (entry.get("taint_params") or [])
+                if str(value).strip()
+            ]
+            definition_found = bool(entry.get("is_definition_found", True))
+            definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
+            definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
+            if not definition_found:
+                item.status = "skipped"
+                item.finished_at = _now()
+                item.error_message = "未找到函数定义，跳过数据流分析"
+                item.result = self._compact_result_for_storage(
+                    stage_run.stage_name,
+                    {
+                        **entry,
+                        "skipped": True,
+                        "skip_reason": item.error_message,
+                    },
+                )
+                session.commit()
+                return {"status": "skipped", "error": item.error_message, "item": entry}
+            if not taint_params:
+                item.status = "skipped"
+                item.finished_at = _now()
+                item.error_message = "未识别到明确污点参数，跳过数据流分析"
+                item.result = self._compact_result_for_storage(
+                    stage_run.stage_name,
+                    {
+                        **entry,
+                        "skipped": True,
+                        "skip_reason": item.error_message,
+                    },
+                )
+                session.commit()
+                return {"status": "skipped", "error": item.error_message, "item": entry}
+            prompt = f"分析文件 {definition_file or entry['file_name']} 中函数 {entry['function_name']} 的外部输入数据流"
+            line_hint = ""
+            if definition_line:
+                line_hint = definition_line if definition_line.upper().startswith("L") else f"L{definition_line}"
             if retrying and self._has_retryable_downstream_task(item):
                 created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
             else:
@@ -5469,13 +5523,17 @@ class TaskManager:
                     entry["source_dir"],
                     prompt,
                     _downstream_origin_payload(task, item),
+                    source_file=definition_file or entry["file_name"],
+                    function_name=entry["function_name"],
+                    line_hint=line_hint,
+                    taint_params=taint_params,
                 )
             item.downstream_task_id = created.get("task_id") or item.downstream_task_id
             session.commit()
             status, payload = await self._poll_until_terminal(
                 lambda: get_dataflow_analyse_client().get_task(item.downstream_task_id),
                 success_statuses={"passed", "success"},
-                failure_statuses={"failed", "error", "cancelled"},
+                failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
                 task=task,
                 item=item,
             )
@@ -5489,7 +5547,10 @@ class TaskManager:
                 item=item,
             )
             data_flow_file = self._find_first(materialized, [r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"])
-            mapped_status = "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            downstream_status = str(payload.get("status") or "").lower()
+            mapped_status = self._map_downstream_status(downstream_status) or (
+                "success" if status == "success" else "cancelled" if status == "cancelled" else "failed"
+            )
             item.status = mapped_status
             item.finished_at = _now()
             archived_dir, archive_job = await self._queue_archive_and_wait(
@@ -5501,7 +5562,7 @@ class TaskManager:
                 before_status="running",
             )
             if mapped_status != "success":
-                item.error_message = payload.get("error") or payload.get("error_message")
+                item.error_message = payload.get("error") or payload.get("error_message") or payload.get("analysis_status") or payload.get("completion_reason")
                 session.commit()
                 return {"status": mapped_status, "error": item.error_message, "item": entry}
             if archived_dir is None:
