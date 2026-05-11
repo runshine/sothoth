@@ -86,9 +86,9 @@ def test_profile_thinking_resolution_by_model_capability(monkeypatch: pytest.Mon
     assert resolve_profile_thinking("openai/gpt-5.4", "balanced") == "high"
     assert resolve_profile_thinking("openai/gpt-5.4", "audit") == "xhigh"
 
-    assert resolve_profile_thinking("icsl/zai-org/GLM-5", "fast") == "low"
-    assert resolve_profile_thinking("icsl/zai-org/GLM-5", "balanced") == "medium"
-    assert resolve_profile_thinking("icsl/zai-org/GLM-5", "audit") == "high"
+    assert resolve_profile_thinking("icsl/zai-org/GLM-5", "fast") == "medium"
+    assert resolve_profile_thinking("icsl/zai-org/GLM-5", "balanced") == "high"
+    assert resolve_profile_thinking("icsl/zai-org/GLM-5", "audit") == "xhigh"
 
     monkeypatch.setitem(_MODEL_THINKING_LEVELS, "mock/two", ("medium", "high"))
     monkeypatch.setitem(_MODEL_THINKING_LEVELS, "mock/one", ("high",))
@@ -99,6 +99,86 @@ def test_profile_thinking_resolution_by_model_capability(monkeypatch: pytest.Mon
     assert resolve_profile_thinking("mock/one", "balanced") == "high"
     assert resolve_profile_thinking("mock/one", "audit") == "high"
     assert resolve_profile_thinking("mock/none", "audit") == ""
+
+
+def test_profile_thinking_resolution_reads_pi_models_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    models_json = tmp_path / "models.json"
+    models_json.write_text(
+        """
+        {
+          "providers": {
+            "my_llm": {
+              "models": [
+                {"id": "MiniMax/MiniMax-M2.5", "reasoning": true}
+              ]
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_MODELS_JSON", str(models_json))
+
+    assert resolve_profile_thinking("my_llm/MiniMax/MiniMax-M2.5", "fast") == "medium"
+    assert resolve_profile_thinking("my_llm/MiniMax/MiniMax-M2.5", "balanced") == "high"
+    assert resolve_profile_thinking("my_llm/MiniMax/MiniMax-M2.5", "audit") == "xhigh"
+
+
+def test_profile_thinking_resolution_uses_explicit_pi_models_json_levels(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    models_json = tmp_path / "models.json"
+    models_json.write_text(
+        """
+        {
+          "providers": {
+            "my_llm": {
+              "models": [
+                {
+                  "id": "zai-org/GLM-5",
+                  "reasoning": true,
+                  "thinkingLevels": ["low", "medium", "high", "xhigh"]
+                }
+              ]
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_MODELS_JSON", str(models_json))
+
+    assert resolve_profile_thinking("my_llm/zai-org/GLM-5", "fast") == "medium"
+    assert resolve_profile_thinking("my_llm/zai-org/GLM-5", "balanced") == "high"
+    assert resolve_profile_thinking("my_llm/zai-org/GLM-5", "audit") == "xhigh"
+
+
+def test_profile_thinking_resolution_honors_pi_models_json_reasoning_false(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    models_json = tmp_path / "models.json"
+    models_json.write_text(
+        """
+        {
+          "providers": {
+            "openai": {
+              "models": [
+                {"id": "gpt-5.4", "reasoning": false}
+              ]
+            }
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PI_MODELS_JSON", str(models_json))
+
+    assert resolve_profile_thinking("openai/gpt-5.4", "audit") == ""
 
 
 def test_generate_config_uses_profile_default_budget_when_max_cycles_not_set(
@@ -294,9 +374,9 @@ def test_profile_template_runtime_overrides_cannot_bypass_thinking_policy() -> N
 
     worker_runtime = config["agents"][0]["runtime_config"]
     advisor_runtime = config["agents"][1]["runtime_config"]
-    assert normalized["thinking"] == "medium"
-    assert worker_runtime["sdk_specific"]["thinking"] == "medium"
-    assert advisor_runtime["sdk_specific"]["thinking"] == "medium"
+    assert normalized["thinking"] == "high"
+    assert worker_runtime["sdk_specific"]["thinking"] == "high"
+    assert advisor_runtime["sdk_specific"]["thinking"] == "high"
 
 
 def test_profile_template_runtime_overrides_cannot_lower_profile_runtime_budgets() -> None:
