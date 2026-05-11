@@ -3681,6 +3681,83 @@ class TaskManager:
                 "unpacked_firmware_count": int(stage_run.counts.get("success_items", 0)),
                 "failed_firmware_count": int(stage_run.counts.get("failed_items", 0)),
             }
+        elif stage_name == "entry_analysis":
+            self._rebuild_entry_results_from_stage_items(db, task, stage_run)
+
+    def _rebuild_entry_results_from_stage_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> list[dict[str, Any]]:
+        """Rebuild full entry_results after downstream sync only updated stage items.
+
+        Stage item result_json intentionally stores only entries_preview to keep DB rows
+        small, so the authoritative source for full entries is the archived artifact.
+        """
+        items = [
+            item
+            for item in self._stage_items(db, task.id, "entry_analysis")
+            if item.status == "success"
+        ]
+        rebuilt: list[dict[str, Any]] = []
+        for item in items:
+            result = dict(item.result or {})
+            input_ref = dict(item.input_ref or {})
+            output_ref = dict(item.output_ref or {})
+            module = {
+                **input_ref,
+                **result,
+                "module_key": str(result.get("module_key") or input_ref.get("module_key") or item.item_key or ""),
+                "module_name": str(result.get("module_name") or input_ref.get("module_name") or item.item_name or ""),
+                "source_dir": str(result.get("source_dir") or input_ref.get("source_dir") or task.firmware_path or ""),
+            }
+            if not module["module_key"] or not module["module_name"]:
+                continue
+            artifact_root_value = (
+                output_ref.get("artifact_root")
+                or output_ref.get("archive_root")
+                or result.get("artifact_root")
+                or result.get("archive_root")
+            )
+            entries = [dict(entry) for entry in result.get("entries") or [] if isinstance(entry, dict)]
+            if artifact_root_value:
+                artifact_root = Path(str(artifact_root_value))
+                parsed_entries = self._parse_entries(artifact_root, module)
+                if parsed_entries:
+                    entries = parsed_entries
+                    module["artifact_root"] = str(artifact_root)
+            if not entries:
+                entries = [dict(entry) for entry in result.get("entries_preview") or [] if isinstance(entry, dict)]
+            if not entries:
+                continue
+            rebuilt.append(self._compact_entry_summary_item({**module, "entries": entries}))
+
+        if not rebuilt:
+            return []
+
+        summary = {**(task.summary or {}), "entry_results": rebuilt}
+        task.summary = summary
+        entry_count = self._entry_count_for_summary("entry_results", rebuilt)
+        task.metrics = {**(task.metrics or {}), "entry_count": entry_count}
+        if stage_run is not None:
+            stage_summary = {
+                "items": self._compact_stage_success_items_for_db("entry_results", rebuilt),
+                "failed_items": [
+                    self._lightweight_stage_failure({"item": dict(item.input_ref or item.result or {}), "error": item.error_message})
+                    for item in self._stage_items(db, task.id, "entry_analysis")
+                    if item.status in {"failed", "cancelled"}
+                ],
+                "success_count": len(rebuilt),
+                "failed_count": int((stage_run.counts or {}).get("failed_items") or 0),
+                "cancelled_count": int((stage_run.counts or {}).get("cancelled_items") or 0),
+                "entry_count": entry_count,
+                "status_synced": True,
+                "sync_status": stage_run.status,
+                **(stage_run.counts or {}),
+            }
+            self._persist_stage_run_output_summary(task, stage_run, stage_summary)
+        return rebuilt
 
     def _refresh_system_analysis_stage_from_synced_items(self, db: Session, task: BinarySecurityTask) -> None:
         stage_run = db.query(BinarySecurityStageRun).filter(
@@ -5362,6 +5439,9 @@ class TaskManager:
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         entry_results = list(task.summary.get("entry_results") or [])
+        if not entry_results:
+            self._rebuild_entry_results_from_stage_items(db, task)
+            entry_results = list(task.summary.get("entry_results") or [])
         entries: list[dict[str, Any]] = []
         for result in entry_results:
             entries.extend(result.get("entries", []))
