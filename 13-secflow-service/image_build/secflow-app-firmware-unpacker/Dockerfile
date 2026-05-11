@@ -14,18 +14,55 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     curl \
     wget \
     ca-certificates \
     git \
     build-essential \
+    pkg-config \
+    cmake \
+    ninja-build \
+    make \
     file \
+    binutils \
+    elfutils \
+    gawk \
+    bsdmainutils \
     software-properties-common \
     python3 \
     python3-pip \
     python3-venv \
     python3-dev \
+    gdb \
+    gdbserver \
+    strace \
+    ltrace \
+    lsof \
+    procps \
+    psmisc \
+    less \
+    vim \
+    nano \
+    tmux \
+    screen \
+    tree \
+    ripgrep \
+    jq \
+    iputils-ping \
+    dnsutils \
+    net-tools \
+    iproute2 \
+    tcpdump \
+    socat \
+    netcat-openbsd \
+    telnet \
+    fdisk \
+    parted \
+    gdisk \
+    dosfstools \
+    e2fsprogs \
+    mtools \
     xz-utils \
     binwalk \
     squashfs-tools \
@@ -43,6 +80,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fd-find \
     zstd \
     unrar \
+    zip \
+    unzip \
+    arj \
+    lrzip \
+    lz4 \
+    nasm \
+    xxd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/python3 /usr/bin/python
@@ -50,11 +94,12 @@ RUN ln -sf /usr/bin/python3 /usr/bin/python
 RUN python3 -m venv "${VIRTUAL_ENV}"
 
 COPY requirements.txt /app/
-RUN pip3 install --no-cache-dir -r /app/requirements.txt
-COPY agentflow/ /app/agentflow/
-RUN pip3 install --no-cache-dir -e /app/agentflow
+RUN pip3 install --no-cache-dir --default-timeout=300 \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
+    -r /app/requirements.txt
 
-RUN pip3 install --no-cache-dir \
+RUN pip3 install --no-cache-dir --default-timeout=300 \
+    -i https://pypi.tuna.tsinghua.edu.cn/simple \
     jefferson \
     ubi_reader
 

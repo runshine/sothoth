@@ -13,11 +13,6 @@ SKILL_STATUS_ACTIVE = "active"
 SKILL_STATUS_CANDIDATE = "candidate"
 SKILL_STATUS_ARCHIVED = "archived"
 DEFAULT_PROMOTION_THRESHOLD = 5
-MAX_SKILL_PROMPT_CHARS = 20_000
-MAX_SKILL_PROMPT_LINES = 200
-MAX_SKILL_PROMPT_LINE_CHARS = 500
-MAX_SKILL_LIST_ITEMS = 20
-MAX_SKILL_LIST_ITEM_CHARS = 80
 
 
 def _parse_list(value: str) -> list[str]:
@@ -69,9 +64,6 @@ def parse_skill_metadata(skill_path: Path, include_prompt: bool = False) -> dict
         "family_id": skill_path.stem,
         "promotion_success_count": 0,
         "promotion_threshold": DEFAULT_PROMOTION_THRESHOLD,
-        "source_run_id": "",
-        "source_node_id": "",
-        "evaluation_batch": "",
         "tools": [],
     }
     current_list_key: str | None = None
@@ -213,9 +205,6 @@ def _serialize_frontmatter(meta: dict[str, Any]) -> str:
         "family_id",
         "promotion_success_count",
         "promotion_threshold",
-        "source_run_id",
-        "source_node_id",
-        "evaluation_batch",
         "tools",
     ]
     lines: list[str] = ["---"]
@@ -255,42 +244,6 @@ def _write_skill(path: Path, meta: dict[str, Any], system_prompt: str) -> None:
     path.write_text(document, encoding="utf-8")
 
 
-def _sanitize_system_prompt(system_prompt: str) -> str:
-    lines = []
-    for line in str(system_prompt or "").splitlines():
-        compact = " ".join(line.split())
-        if compact:
-            lines.append(compact[:MAX_SKILL_PROMPT_LINE_CHARS])
-        if len(lines) >= MAX_SKILL_PROMPT_LINES:
-            break
-    sanitized = "\n".join(lines).strip()
-    truncated = (
-        len(lines) < len(str(system_prompt or "").splitlines())
-        or len(str(system_prompt or "")) > len(sanitized)
-    )
-    if len(sanitized) > MAX_SKILL_PROMPT_CHARS:
-        sanitized = sanitized[:MAX_SKILL_PROMPT_CHARS].rstrip()
-        truncated = True
-    if truncated:
-        sanitized = sanitized.rstrip() + "\n[skill body truncated for safe reuse]"
-    return sanitized or "Reusable firmware unpacking guidance was truncated; inspect source run artifacts before promotion."
-
-
-def _sanitize_skill_metadata(meta: dict[str, Any]) -> None:
-    for key in ("extensions", "keywords", "binwalk_sigs", "tools"):
-        cleaned = []
-        seen = set()
-        for item in meta.get(key) or []:
-            value = " ".join(str(item).split())[:MAX_SKILL_LIST_ITEM_CHARS]
-            if not value or value.lower() in seen:
-                continue
-            cleaned.append(value)
-            seen.add(value.lower())
-            if len(cleaned) >= MAX_SKILL_LIST_ITEMS:
-                break
-        meta[key] = cleaned
-
-
 def save_candidate_skill(skills_dir: Path, raw_document: str, fallback_meta: dict[str, Any]) -> dict[str, Any]:
     meta = validate_skill_document(raw_document)
     family_id = _slugify(meta.get("family_id") or fallback_meta.get("family_id"))
@@ -299,11 +252,6 @@ def save_candidate_skill(skills_dir: Path, raw_document: str, fallback_meta: dic
     meta["skill_status"] = SKILL_STATUS_CANDIDATE
     meta["promotion_success_count"] = 0
     meta["promotion_threshold"] = DEFAULT_PROMOTION_THRESHOLD
-    meta["source_run_id"] = str(fallback_meta.get("source_run_id") or meta.get("source_run_id") or "")
-    meta["source_node_id"] = str(fallback_meta.get("source_node_id") or meta.get("source_node_id") or "")
-    meta["evaluation_batch"] = str(fallback_meta.get("evaluation_batch") or meta.get("evaluation_batch") or "")
-    _sanitize_skill_metadata(meta)
-    meta["system_prompt"] = _sanitize_system_prompt(str(meta.get("system_prompt") or ""))
     existing_versions = [
         int(item.get("skill_version") or 0)
         for item in list_skills(skills_dir)

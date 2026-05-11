@@ -3,6 +3,9 @@ description: Generate a candidate firmware unpacking skill from a successful gen
 ---
 Create one candidate firmware unpacking SKILL for the firmware at $input based on the successful unpack results in $output.
 
+Write the SKILL file into this repository directory:
+$tools
+
 Required family_id: $family_id
 Required promotion_threshold: $promotion_threshold
 

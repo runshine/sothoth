@@ -1,0 +1,2167 @@
+"""Firmware unpacker API routes."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy import or_
+from sqlalchemy.orm import load_only
+
+from app.api.dependencies import ensure_project_access, get_current_subject
+from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
+from app.model import ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
+from app.schemas import (
+    ActionResponse,
+    BatchDeleteRequest,
+    ClusterInfoResponse,
+    ConfigBatchUpdateItem,
+    ConfigEntryResponse,
+    ConfigListResponse,
+    ConfigUpdateRequest,
+    HealthResponse,
+    LlmConfigFileSummaryListResponse,
+    LlmProviderSummaryListResponse,
+    ReadyResponse,
+    TaskEventListResponse,
+    TaskListResponse,
+    TaskLogResponse,
+    TaskMetricsResponse,
+    TaskProgressResponse,
+    TaskResultResponse,
+    TaskResourceUsageResponse,
+    TaskResponse,
+    TaskSubmitResponse,
+    ToolListResponse,
+    UnpackRequest,
+)
+from app.services.pod_metrics import get_pod_resource_usage
+from app.services.configcenter import get_configcenter_client
+from app.services.task_events import list_task_events
+from app.services.task_manager import cancel_task, delete_tasks, request_task_result_cache_refresh, retry_task, submit_unpack_task
+from app.services.worker import get_cluster_snapshot, get_worker_id
+from app.skill_store import list_skills
+from app.unpacker_engine_config import get_max_retries
+from app.unpacker_engine import TOOLS_DIR
+from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, list_round_dirs as _list_round_dirs, read_text_tail
+
+
+router = APIRouter(tags=["Firmware Unpacker"])
+logger = logging.getLogger(__name__)
+MAX_LOG_RENDER_BYTES = 128 * 1024
+
+
+def _normalize_project_id(project_id: Optional[str]) -> Optional[str]:
+    value = str(project_id or "").strip()
+    return value or None
+
+
+def _normalize_runtime_path(path: str) -> str:
+    value = str(path or "").strip()
+    legacy_prefix = "/data/fileserver/files"
+    runtime_prefix = "/data/files"
+    if value == legacy_prefix:
+        return runtime_prefix
+    if value.startswith(f"{legacy_prefix}/"):
+        return f"{runtime_prefix}{value[len(legacy_prefix):]}"
+    return value
+
+
+def _ensure_valid_request_payload(request: UnpackRequest) -> None:
+    request.firmware_path = _normalize_runtime_path(request.firmware_path)
+    if request.output_path is not None:
+        request.output_path = _normalize_runtime_path(request.output_path)
+    if not request.firmware_path.strip():
+        raise ValidationError("firmware_path 不能为空")
+    if not os.path.exists(request.firmware_path):
+        raise NotFoundError("固件文件", request.firmware_path)
+    if not _normalize_project_id(request.project_id):
+        raise ValidationError("project_id 不能为空")
+
+
+def _infer_value_type(value: str) -> str:
+    lowered = str(value or "").strip().lower()
+    if lowered in ("true", "false", "1", "0", "yes", "no"):
+        return "bool"
+    if str(value or "").strip().isdigit():
+        return "int"
+    return "string"
+
+
+def _normalize_runtime_config_value(key: str, value: str) -> str:
+    normalized = str(value or "").strip()
+    if key == "max_retries_reached_action":
+        lowered = normalized.lower()
+        if lowered not in {"success", "failed"}:
+            raise ValidationError("max_retries_reached_action 仅支持 success 或 failed")
+        return lowered
+    return value
+
+
+def _get_task_or_404(task_id: str) -> dict:
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if not task:
+            raise NotFoundError("任务", task_id)
+        return task.to_dict()
+    finally:
+        db.close()
+
+
+def _get_task_resource_usage(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    owner_id = str(task.get("owner_id") or "").strip() or None
+    pod_name = owner_id.split(":", 1)[0] if owner_id else None
+    if not pod_name:
+        return {
+            "task_id": task_id,
+            "owner_id": None,
+            "available": False,
+            "message": "任务当前未绑定运行中的 Worker，无法获取资源使用情况",
+            "containers": [],
+        }
+
+    metrics = get_pod_resource_usage(pod_name)
+    if not metrics:
+        return {
+            "task_id": task_id,
+            "owner_id": owner_id,
+            "available": False,
+            "pod_name": pod_name,
+            "message": "未获取到任务所在 Worker Pod 的资源指标",
+            "containers": [],
+        }
+
+    return {
+        "task_id": task_id,
+        "owner_id": owner_id,
+        "available": True,
+        **metrics,
+    }
+
+
+def _phase_payload(
+    key: str,
+    label: str,
+    status: str,
+    detail: Optional[str] = None,
+    updated_at: Optional[str] = None,
+    current_round: Optional[int] = None,
+    total_rounds: Optional[int] = None,
+) -> dict:
+    return {
+        "key": key,
+        "label": label,
+        "status": status,
+        "detail": detail,
+        "updated_at": updated_at,
+        "current_round": current_round,
+        "total_rounds": total_rounds,
+    }
+
+
+def _read_json_file(path: Path) -> dict | list | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _mtime_iso(path: Path) -> Optional[str]:
+    if not path.exists():
+        return None
+    try:
+        return path.stat().st_mtime_ns and path.stat().st_mtime
+    except Exception:
+        return None
+
+
+def _mtime_iso_text(path: Path) -> Optional[str]:
+    try:
+        timestamp = _mtime_iso(path)
+        if not timestamp:
+            return None
+        from datetime import datetime
+
+        return datetime.fromtimestamp(timestamp).isoformat()
+    except Exception:
+        return None
+
+
+def _derive_run_path(task: dict) -> Path:
+    output_path = str(task.get("output_path") or "").strip()
+    if not output_path:
+        return Path("/tmp")
+    output_dir = Path(output_path)
+    return output_dir.parent / "run" if output_dir.name == "output" else output_dir.parent / "run"
+
+
+def _round_dir(run_dir: Path, round_id: int) -> Path:
+    return run_dir / f"round_{max(0, int(round_id)):03d}"
+
+
+def _round_log_path(run_dir: Path, round_id: int, filename: str) -> Path:
+    return _round_dir(run_dir, round_id) / filename
+
+
+def _existing_round_dirs(run_dir: Path) -> list[Path]:
+    return _list_round_dirs(run_dir)
+
+
+def _llm_round_dirs(run_dir: Path) -> list[Path]:
+    return [path for path in _existing_round_dirs(run_dir) if path.name != "round_000"]
+
+
+def _read_final_round_result(run_dir: Path, final_round: int) -> dict | None:
+    candidate_dirs: list[Path] = []
+    if final_round > 0:
+        candidate_dirs.append(_round_dir(run_dir, final_round))
+    for path in reversed(_llm_round_dirs(run_dir)):
+        if path not in candidate_dirs:
+            candidate_dirs.append(path)
+    for round_path in candidate_dirs:
+        payload = _read_json_file(round_path / "results.json")
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _get_task_progress(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    run_dir = _derive_run_path(task)
+    stage1_path = _round_log_path(run_dir, 0, "preprocess.json")
+    stage2_path = _round_log_path(run_dir, 0, "skill_match.json")
+    stage3_path = _round_log_path(run_dir, 0, "skill_exec.json")
+    stage3_llm_unpack_log = _round_log_path(run_dir, 0, "stage3_llm_unpack.log")
+    stage4_llm_review_log = _round_log_path(run_dir, 0, "stage4_llm_review.log")
+    stage4_path = _round_log_path(run_dir, 0, "fallback.json")
+    stage5_path = _round_log_path(run_dir, 0, "stage5_skill_generate.json")
+    cleaner_path = _round_log_path(run_dir, 0, "cleaner_messages.json")
+    round_dirs = _llm_round_dirs(run_dir)
+    executor_logs = [path / "executor_messages.json" for path in round_dirs if (path / "executor_messages.json").exists()]
+    verifier_logs = [path / "reviewer_messages.json" for path in round_dirs if (path / "reviewer_messages.json").exists()]
+
+    task_status = str(task.get("status") or "").lower()
+    task_result = str(task.get("result_status") or "").lower()
+    task_current_stage = str(task.get("current_stage") or "").strip().lower()
+    result_message = str(task.get("result_message") or "")
+    quick_preprocess_success = "quick pre-process" in result_message.lower()
+    matched_skill = str(task.get("matched_skill") or "").strip()
+    fallback_to_llm = bool(task.get("fallback_to_llm"))
+    generated_skill_path = str(task.get("generated_skill_path") or "").strip()
+    final_round = int(task.get("rounds") or 0)
+    total_llm_rounds = max(1, int(get_max_retries() or 1))
+    final_round_result = _read_final_round_result(run_dir, final_round)
+    final_round_result_status = str((final_round_result or {}).get("status") or "").strip().lower()
+
+    def _clamp_round(value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        return max(1, min(int(value), total_llm_rounds))
+
+    def _running_unpack_round() -> Optional[int]:
+        if task_current_stage != "llm_unpack":
+            return None
+        if executor_logs:
+            return _clamp_round(len(executor_logs))
+        return 1
+
+    def _running_review_round() -> Optional[int]:
+        if task_current_stage != "review":
+            return None
+        base = max(len(executor_logs), len(verifier_logs) + 1, final_round, 1)
+        return _clamp_round(base)
+
+    def _completed_round() -> Optional[int]:
+        if final_round > 0:
+            return _clamp_round(final_round)
+        if verifier_logs:
+            return _clamp_round(max(len(verifier_logs), len(executor_logs), 1))
+        if executor_logs:
+            return _clamp_round(max(len(executor_logs), 1))
+        return None
+
+    phases = [
+        _phase_payload("preprocess", "预处理", "pending"),
+        _phase_payload("tool_match", "工具匹配执行", "pending"),
+        _phase_payload("llm_unpack", "LLM 解包", "pending"),
+        _phase_payload("llm_review", "LLM 评审", "pending"),
+        _phase_payload("llm_cleanup", "LLM 清理", "pending"),
+    ]
+
+    if task_status in {"retry_preparing", "running", "cancelling", "success", "failed", "cancelled"}:
+        phases[0]["status"] = "running"
+        phases[0]["detail"] = "正在识别固件格式并尝试确定性预处理" if task_status != "retry_preparing" else "正在后台重置工作目录并准备重试"
+
+    if stage1_path.exists():
+        stage1_data = _read_json_file(stage1_path)
+        phase1_detail = None
+        if isinstance(stage1_data, list):
+            success_steps = [
+                str(item.get("tool") or item.get("method") or "")
+                for item in stage1_data
+                if isinstance(item, dict) and item.get("success")
+            ]
+            if success_steps:
+                phase1_detail = f"已完成，成功步骤：{success_steps[-1]}"
+            else:
+                phase1_detail = "已完成，但未直接完成解包"
+        phases[0] = _phase_payload(
+            "preprocess",
+            "预处理",
+            "success",
+            phase1_detail or "预处理已完成",
+            _mtime_iso_text(stage1_path),
+        )
+
+    if quick_preprocess_success:
+        phases[1]["status"] = "skipped"
+        phases[1]["detail"] = "预处理已直接完成解包，跳过"
+        phases[2]["status"] = "skipped"
+        phases[2]["detail"] = "预处理已直接完成解包，跳过"
+        phases[3]["status"] = "skipped"
+        phases[3]["detail"] = "预处理已直接完成解包，跳过"
+        phases[4]["status"] = "success" if cleaner_path.exists() else ("running" if task_status == "running" else "pending")
+        phases[4]["detail"] = "正在收尾清理输出目录" if phases[4]["status"] == "running" else "清理已完成"
+        phases[4]["updated_at"] = _mtime_iso_text(cleaner_path)
+    else:
+        if stage2_path.exists():
+            stage2_data = _read_json_file(stage2_path)
+            matched_path = matched_skill
+            matched_score = task.get("matched_skill_score")
+            if isinstance(stage2_data, dict):
+                matched_path = str(stage2_data.get("matched_skill") or matched_path or "")
+                matched_score = stage2_data.get("matched_skill_score", matched_score)
+            if matched_path:
+                status = "success"
+                detail = f"命中工具：{Path(matched_path).name}"
+                if matched_score is not None:
+                    detail += f"（得分 {matched_score}）"
+                if fallback_to_llm:
+                    status = "failed"
+                    detail += "，执行失败后已回退 LLM"
+                elif task_status == "running" and not stage3_path.exists():
+                    status = "running"
+                    detail += "，正在执行"
+                phases[1] = _phase_payload(
+                    "tool_match",
+                    "工具匹配执行",
+                    status,
+                    detail,
+                    _mtime_iso_text(stage3_path if stage3_path.exists() else stage2_path),
+                )
+            elif executor_logs or task_status in {"retry_preparing", "running", "success", "failed", "cancelled"}:
+                phases[1] = _phase_payload(
+                    "tool_match",
+                    "工具匹配执行",
+                    "pending" if task_status == "retry_preparing" else "skipped",
+                    "正在等待重试准备完成" if task_status == "retry_preparing" else "未命中可复用工具，转入 LLM 解包",
+                    _mtime_iso_text(stage2_path),
+                )
+
+        if executor_logs or fallback_to_llm or (task_status == "running" and stage2_path.exists()):
+            unpack_status = "running"
+            unpack_detail = "LLM 正在执行解包"
+            unpack_round = _running_unpack_round()
+            if executor_logs:
+                unpack_round = _clamp_round(max(len(executor_logs), final_round or 0, 1))
+                unpack_detail = f"已执行 {len(executor_logs)} 轮解包"
+                if verifier_logs or task_result in {"success", "max_retries_reached", "failed"}:
+                    unpack_status = "success"
+            if matched_skill and not fallback_to_llm and not executor_logs and task_status != "running":
+                unpack_status = "skipped"
+                unpack_detail = "工具执行成功，未进入 LLM 解包"
+            if task_status == "failed" and not verifier_logs and executor_logs:
+                unpack_status = "failed"
+                unpack_detail = "LLM 解包阶段执行失败"
+            phases[2] = _phase_payload(
+                "llm_unpack",
+                "LLM 解包",
+                unpack_status,
+                unpack_detail,
+                _mtime_iso_text(executor_logs[-1]) if executor_logs else (_mtime_iso_text(stage3_llm_unpack_log) or _mtime_iso_text(stage4_path)),
+                current_round=unpack_round if unpack_status != "skipped" else None,
+                total_rounds=total_llm_rounds if unpack_status != "skipped" else None,
+            )
+        elif matched_skill and not fallback_to_llm:
+            phases[2] = _phase_payload("llm_unpack", "LLM 解包", "skipped", "工具执行成功，未进入 LLM 解包")
+
+        if verifier_logs or task_result in {"success", "max_retries_reached", "failed"}:
+            review_status = "running"
+            review_detail = "LLM 正在评审当前解包结果"
+            review_round = _running_review_round()
+            if verifier_logs:
+                review_detail = f"已完成 {len(verifier_logs)} 轮评审"
+                if final_round_result_status in {"review_passed", "success", "completed"}:
+                    review_status = "success"
+                elif final_round_result_status in {"review_failed", "failed", "error"}:
+                    review_status = "failed"
+                elif task_result in {"success"}:
+                    review_status = "success"
+                elif task_result in {"max_retries_reached", "failed"}:
+                    review_status = "failed"
+                elif task_status == "success":
+                    review_status = "success"
+                elif task_status == "failed":
+                    review_status = "failed"
+                if review_status != "running":
+                    review_round = _completed_round()
+                else:
+                    review_round = _clamp_round(max(len(verifier_logs), len(executor_logs), 1))
+                if review_status == "success":
+                    review_detail = "最终轮评审已通过"
+                elif review_status == "failed":
+                    review_detail = "最终轮评审未通过，任务失败"
+            phases[3] = _phase_payload(
+                "llm_review",
+                "LLM 评审",
+                review_status,
+                review_detail,
+                _mtime_iso_text(verifier_logs[-1]) if verifier_logs else _mtime_iso_text(stage4_llm_review_log),
+                current_round=review_round,
+                total_rounds=total_llm_rounds if review_round is not None else None,
+            )
+        elif matched_skill and not fallback_to_llm:
+            phases[3] = _phase_payload("llm_review", "LLM 评审", "skipped", "工具执行成功后未进入 LLM 评审链路")
+
+        cleanup_status = "pending"
+        cleanup_detail = None
+        if cleaner_path.exists():
+            cleanup_status = "success"
+            cleanup_detail = "清理已完成"
+        elif task_status == "running" and (verifier_logs or (matched_skill and not fallback_to_llm and stage3_path.exists())):
+            cleanup_status = "running"
+            cleanup_detail = "正在清理中间产物和重复文件"
+        elif task_status in {"failed", "cancelled"}:
+            cleanup_status = "skipped"
+            cleanup_detail = "任务未正常完成，未进入清理阶段"
+        phases[4] = _phase_payload(
+            "llm_cleanup",
+            "LLM 清理",
+            cleanup_status,
+            cleanup_detail,
+            _mtime_iso_text(cleaner_path),
+        )
+
+    current_phase = None
+    for phase in phases:
+        if phase["status"] == "running":
+            current_phase = phase["key"]
+            break
+    if current_phase is None:
+        for phase in reversed(phases):
+            if phase["status"] in {"success", "failed"}:
+                current_phase = phase["key"]
+                break
+
+    summary_parts: list[str] = []
+    if matched_skill:
+        summary_parts.append(f"命中工具：{Path(matched_skill).name}")
+    if fallback_to_llm:
+        summary_parts.append("已回退到 LLM 解包")
+    if generated_skill_path:
+        summary_parts.append(f"生成候选工具：{Path(generated_skill_path).name}")
+    summary = "；".join(summary_parts) if summary_parts else "根据运行目录推导当前阶段进展"
+
+    overall_current_round = None
+    overall_total_rounds = None
+    for phase in phases:
+        if phase["key"] in {"llm_unpack", "llm_review"} and phase.get("current_round") is not None:
+            overall_current_round = phase.get("current_round")
+            overall_total_rounds = phase.get("total_rounds")
+            if phase["status"] == "running":
+                break
+    if overall_current_round is None:
+        completed_round = _completed_round()
+        if completed_round is not None:
+            overall_current_round = completed_round
+            overall_total_rounds = total_llm_rounds
+
+    return {
+        "task_id": task_id,
+        "current_phase": current_phase,
+        "summary": summary,
+        "current_round": overall_current_round,
+        "total_rounds": overall_total_rounds,
+        "phases": phases,
+    }
+
+
+def _read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _format_log_file(path: Path) -> str:
+    try:
+        file_size = path.stat().st_size
+    except Exception:
+        file_size = 0
+    if path.suffix.lower() == ".json" and file_size <= MAX_LOG_RENDER_BYTES:
+        payload = _read_json_file(path)
+        if payload is not None:
+            try:
+                return json.dumps(payload, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+    if file_size > MAX_LOG_RENDER_BYTES:
+        return read_text_tail(path, MAX_LOG_RENDER_BYTES, encoding="utf-8")
+    return _read_text_file(path)
+
+
+def _phase_log_files(run_dir: Path, phase: Optional[str]) -> list[Path]:
+    phase_key = str(phase or "").strip()
+    round_zero = _round_dir(run_dir, 0)
+    llm_round_dirs = _llm_round_dirs(run_dir)
+    if not phase_key:
+        files: list[Path] = [
+            round_zero / "preprocess.json",
+            round_zero / "skill_match.json",
+            round_zero / "skill_exec.json",
+            round_zero / "fallback.json",
+            round_zero / "stage5_skill_generate.json",
+            round_zero / "cleaner_messages.json",
+            round_zero / "summary.md",
+            round_zero / "reason.md",
+        ]
+        for llm_round_dir in llm_round_dirs:
+            files.extend(
+                [
+                    llm_round_dir / "executor_messages.json",
+                    llm_round_dir / "executor_transcript.log",
+                    llm_round_dir / "executor_tokens.json",
+                    llm_round_dir / "reviewer_messages.json",
+                    llm_round_dir / "reviewer_transcript.log",
+                    llm_round_dir / "reviewer_tokens.json",
+                    llm_round_dir / "results.json",
+                    llm_round_dir / "summary.md",
+                    llm_round_dir / "reason.md",
+                ]
+            )
+        files.extend(sorted(round_zero.glob("*.log")))
+        return files
+
+    mapping: dict[str, list[Path]] = {
+        "preprocess": [round_zero / "preprocess.log", round_zero / "preprocess.json"],
+        "tool_match": [round_zero / "skill_match.log", round_zero / "skill_match.json", round_zero / "skill_exec.log", round_zero / "skill_exec.json"],
+        "llm_unpack": [
+            round_zero / "stage3_llm_unpack.log",
+            round_zero / "fallback.json",
+            *[path / "executor_transcript.log" for path in llm_round_dirs],
+            *[path / "executor_messages.json" for path in llm_round_dirs],
+        ],
+        "llm_review": [
+            round_zero / "stage4_llm_review.log",
+            *[path / "reviewer_transcript.log" for path in llm_round_dirs],
+            *[path / "reviewer_messages.json" for path in llm_round_dirs],
+            *[path / "reason.md" for path in llm_round_dirs],
+            *[path / "summary.md" for path in llm_round_dirs],
+        ],
+        "llm_cleanup": [
+            round_zero / "cleaner.log",
+            round_zero / "cleaner_transcript.log",
+            round_zero / "cleaner_messages.json",
+            round_zero / "stage5_skill_generate.log",
+            round_zero / "stage5_skill_generate.json",
+            round_zero / "skill_author_transcript.log",
+            round_zero / "skill_author_messages.json",
+        ],
+    }
+    return mapping.get(phase_key, [])
+
+
+def _get_task_logs(task_id: str, phase: Optional[str] = None) -> dict:
+    task = _get_task_or_404(task_id)
+    run_dir = _derive_run_path(task)
+    if not run_dir.exists() or not run_dir.is_dir():
+        return {
+            "task_id": task_id,
+            "run_path": str(run_dir),
+            "available": False,
+            "log_text": "",
+            "files": [],
+            "phase": phase,
+            "message": "运行日志目录不存在",
+        }
+
+    known_files = _phase_log_files(run_dir, phase)
+
+    deduped_files: list[Path] = []
+    seen: set[str] = set()
+    for path in known_files:
+        key = str(path)
+        if not path.exists() or key in seen:
+            continue
+        seen.add(key)
+        deduped_files.append(path)
+
+    if not deduped_files:
+        return {
+            "task_id": task_id,
+            "run_path": str(run_dir),
+            "available": False,
+            "log_text": "",
+            "files": [],
+            "phase": phase,
+            "message": "当前阶段尚未生成可读日志文件" if phase else "当前任务尚未生成可读日志文件",
+        }
+
+    sections: list[str] = []
+    file_names: list[str] = []
+    for path in deduped_files:
+        rendered = _format_log_file(path).strip()
+        if not rendered:
+            continue
+        file_names.append(path.name)
+        sections.append(f"===== {path.name} =====\n{rendered}")
+
+    if not sections:
+        return {
+            "task_id": task_id,
+            "run_path": str(run_dir),
+            "available": False,
+            "log_text": "",
+            "files": file_names,
+            "phase": phase,
+            "message": "日志文件存在，但当前没有可展示内容",
+        }
+
+    return {
+        "task_id": task_id,
+        "run_path": str(run_dir),
+        "available": True,
+        "log_text": "\n\n".join(sections),
+        "files": file_names,
+        "phase": phase,
+        "message": None,
+    }
+
+
+def _get_task_events(task_id: str, limit: int) -> dict:
+    _get_task_or_404(task_id)
+    return list_task_events(task_id, limit=limit)
+
+
+def _count_task_events(task_id: str) -> int:
+    return int(list_task_events(task_id, limit=1).get("total") or 0)
+
+
+def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value))
+    except Exception:
+        return None
+
+
+def _now_iso_like(value: Optional[str]) -> str:
+    parsed = _parse_iso_datetime(value)
+    if parsed and parsed.tzinfo is not None:
+        return datetime.now(parsed.tzinfo).isoformat()
+    return datetime.now().isoformat()
+
+
+def _seconds_between(start: Optional[str], end: Optional[str]) -> Optional[int]:
+    start_dt = _parse_iso_datetime(start)
+    end_dt = _parse_iso_datetime(end)
+    if not start_dt or not end_dt:
+        return None
+    if (start_dt.tzinfo is None) != (end_dt.tzinfo is None):
+        start_dt = start_dt.replace(tzinfo=None)
+        end_dt = end_dt.replace(tzinfo=None)
+    return max(0, int((end_dt - start_dt).total_seconds()))
+
+
+def _seconds_since(start: Optional[str]) -> Optional[int]:
+    start_dt = _parse_iso_datetime(start)
+    if not start_dt:
+        return None
+    now = datetime.now(start_dt.tzinfo) if start_dt.tzinfo is not None else datetime.now()
+    return max(0, int((now - start_dt).total_seconds()))
+
+
+def _usage_percent(used: Optional[int], limit: Optional[int]) -> Optional[float]:
+    if used is None or limit is None or int(limit) <= 0:
+        return None
+    return round(max(0.0, float(used) / float(limit) * 100.0), 2)
+
+
+def _get_latest_task_event(task_id: str) -> Optional[dict]:
+    db = get_db_session()
+    try:
+        event = (
+            db.query(UnpackTaskEvent)
+            .filter(UnpackTaskEvent.task_id == task_id)
+            .order_by(UnpackTaskEvent.created_at.desc())
+            .first()
+        )
+        return event.to_dict() if event else None
+    finally:
+        db.close()
+
+
+def _get_session_metrics(run_root: Path) -> dict:
+    items = _read_json_index_items(run_root / "sessions" / "index.json")
+    running = 0
+    failed = 0
+    closed = 0
+    for item in items:
+        status_value = str(item.get("status") or "").strip().lower()
+        if status_value == "running":
+            running += 1
+        elif status_value == "failed":
+            failed += 1
+        elif status_value == "closed":
+            closed += 1
+    return {
+        "session_count": len(items),
+        "running_session_count": running,
+        "failed_session_count": failed,
+        "closed_session_count": closed,
+    }
+
+
+def _get_cached_result_metrics(run_root: Path) -> dict:
+    cache_path = run_root / TASK_RESULT_CACHE_FILENAME
+    payload = _read_json_file(cache_path)
+    summary = payload.get("summary") if isinstance(payload, dict) and isinstance(payload.get("summary"), dict) else {}
+    if not isinstance(payload, dict):
+        return {
+            "cache_available": False,
+            "cache_updated_at": None,
+            "output_file_count": 0,
+            "output_dir_count": 0,
+            "output_total_size_bytes": 0,
+            "largest_file_size_bytes": 0,
+            "top_level_entry_count": 0,
+            "small_file_count": 0,
+            "medium_file_count": 0,
+            "large_file_count": 0,
+            "executor_rounds": 0,
+            "fallback_to_llm": False,
+            "matched_skill": None,
+            "generated_skill_path": None,
+            "generated_skill_status": None,
+            "promotion_success_count": 0,
+            "skill_generation_status": None,
+        }
+    return {
+        "cache_available": True,
+        "cache_updated_at": _mtime_iso_text(cache_path),
+        "output_file_count": int(summary.get("output_file_count") or 0),
+        "output_dir_count": int(summary.get("output_dir_count") or 0),
+        "output_total_size_bytes": int(summary.get("output_total_size_bytes") or 0),
+        "largest_file_size_bytes": int(summary.get("largest_file_size_bytes") or 0),
+        "top_level_entry_count": int(summary.get("top_level_entry_count") or 0),
+        "small_file_count": int(summary.get("small_file_count") or 0),
+        "medium_file_count": int(summary.get("medium_file_count") or 0),
+        "large_file_count": int(summary.get("large_file_count") or 0),
+        "executor_rounds": int(summary.get("executor_rounds") or 0),
+        "fallback_to_llm": bool(summary.get("fallback_to_llm")),
+        "matched_skill": str(summary.get("matched_skill") or "").strip() or None,
+        "generated_skill_path": str(summary.get("generated_skill_path") or "").strip() or None,
+        "generated_skill_status": str(summary.get("generated_skill_status") or "").strip() or None,
+        "promotion_success_count": int(summary.get("promotion_success_count") or 0),
+        "skill_generation_status": str(summary.get("skill_generation_status") or "").strip() or None,
+    }
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _round_metric_empty(warnings: Optional[list[str]] = None) -> dict:
+    return {
+        "available": False,
+        "round_count": 0,
+        "completed_round_count": 0,
+        "failed_round_count": 0,
+        "running_round": None,
+        "total_duration_seconds": 0.0,
+        "total_tokens": 0,
+        "total_cost": 0.0,
+        "output_growth_bytes": 0,
+        "latest_round": None,
+        "summary": {
+            "status_counts": {},
+            "stage_summary": {},
+        },
+        "items": [],
+        "warnings": list(warnings or []),
+    }
+
+
+def _normalize_round_tokens(payload: dict) -> dict:
+    source = payload if isinstance(payload, dict) else {}
+    input_tokens = _safe_int(source.get("input"))
+    output_tokens = _safe_int(source.get("output"))
+    cache_read = _safe_int(source.get("cache_read", source.get("cacheRead")))
+    cache_write = _safe_int(source.get("cache_write", source.get("cacheWrite")))
+    total = _safe_int(source.get("total"))
+    if total <= 0:
+        total = input_tokens + output_tokens + cache_read + cache_write
+    return {
+        "input": input_tokens,
+        "output": output_tokens,
+        "cache_read": cache_read,
+        "cache_write": cache_write,
+        "total": total,
+        "cost": _safe_float(source.get("cost")),
+    }
+
+
+def _token_total_from_mapping(value) -> int:
+    if not isinstance(value, dict):
+        return 0
+    return _normalize_round_tokens(value)["total"]
+
+
+def _round_number_from_dir(path: Path) -> Optional[int]:
+    name = path.name
+    if not name.startswith("round_"):
+        return None
+    try:
+        return int(name.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def _read_round_metrics(run_root: Path) -> dict:
+    warnings: list[str] = []
+    if not run_root.exists() or not run_root.is_dir():
+        return _round_metric_empty()
+
+    items: list[dict] = []
+    for round_dir in _list_round_dirs(run_root):
+        round_id = _round_number_from_dir(round_dir)
+        if round_id is None or round_id == 0:
+            continue
+        result_path = round_dir / "results.json"
+        if not result_path.exists():
+            continue
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            warning = f"{result_path.relative_to(run_root)} 读取失败: {exc}"
+            warnings.append(warning)
+            continue
+        if not isinstance(payload, dict):
+            warnings.append(f"{result_path.relative_to(run_root)} 格式不是对象")
+            continue
+
+        executor = payload.get("executor") if isinstance(payload.get("executor"), dict) else {}
+        reviewer = payload.get("reviewer") if isinstance(payload.get("reviewer"), dict) else {}
+        tokens_payload = payload.get("tokens") if isinstance(payload.get("tokens"), dict) else {}
+        round_tokens = _normalize_round_tokens(
+            tokens_payload.get("round_total") if isinstance(tokens_payload.get("round_total"), dict) else {}
+        )
+        output_snapshot = payload.get("output_snapshot") if isinstance(payload.get("output_snapshot"), dict) else {}
+        output_delta = payload.get("output_delta") if isinstance(payload.get("output_delta"), dict) else {}
+        artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
+        context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+        paths = payload.get("paths") if isinstance(payload.get("paths"), dict) else {}
+
+        summary_path_raw = str(paths.get("summary_path") or "").strip()
+        reason_path_raw = str(paths.get("reason_path") or "").strip()
+        summary_text = _read_text_file(Path(summary_path_raw)).strip() if summary_path_raw else ""
+        reason_text = _read_text_file(Path(reason_path_raw)).strip() if reason_path_raw else ""
+
+        size_delta = _safe_int(
+            output_delta.get("size_bytes_delta", output_delta.get("output_total_size_bytes_delta"))
+        )
+        file_delta = _safe_int(
+            output_delta.get("file_count_delta", output_delta.get("output_file_count_delta"))
+        )
+        dir_delta = _safe_int(
+            output_delta.get("dir_count_delta", output_delta.get("output_dir_count_delta"))
+        )
+        item = {
+            "round": _safe_int(payload.get("round"), round_id),
+            "status": str(payload.get("status") or "unknown"),
+            "started_at": payload.get("started_at"),
+            "completed_at": payload.get("completed_at"),
+            "duration_seconds": _safe_float(payload.get("duration_seconds")),
+            "executor": {
+                "status": str(executor.get("status") or "completed"),
+                "duration_seconds": _safe_float(executor.get("duration_seconds")),
+                "response_preview": executor.get("response_preview"),
+                "provider_role": executor.get("provider_role"),
+                "session_file": executor.get("session_file"),
+            },
+            "reviewer": {
+                "passed": bool(reviewer.get("passed")),
+                "duration_seconds": _safe_float(reviewer.get("duration_seconds")),
+                "review_preview": reviewer.get("review_preview"),
+                "provider_role": reviewer.get("provider_role"),
+                "session_file": reviewer.get("session_file"),
+            },
+            "tokens": round_tokens,
+            "output_snapshot": {
+                "output_file_count": _safe_int(output_snapshot.get("output_file_count")),
+                "output_dir_count": _safe_int(output_snapshot.get("output_dir_count")),
+                "output_total_size_bytes": _safe_int(output_snapshot.get("output_total_size_bytes")),
+                "largest_file_size_bytes": _safe_int(output_snapshot.get("largest_file_size_bytes")),
+            },
+            "output_delta": {
+                "file_count_delta": file_delta,
+                "dir_count_delta": dir_delta,
+                "size_bytes_delta": size_delta,
+                "baseline_round": output_delta.get("baseline_round"),
+            },
+            "artifacts": {
+                "summary_present": bool(artifacts.get("summary_present")),
+                "reason_present": bool(artifacts.get("reason_present")),
+                "warnings": [
+                    str(item)
+                    for item in (artifacts.get("warnings") or [])
+                    if str(item).strip()
+                ],
+                "summary_preview": artifacts.get("summary_preview"),
+                "reason_preview": artifacts.get("reason_preview"),
+                "summary_text": summary_text or None,
+                "reason_text": reason_text or None,
+            },
+            "context": {
+                "matched_skill": context.get("matched_skill"),
+                "fallback_to_llm": bool(context.get("fallback_to_llm")),
+                "provider_role": context.get("provider_role") or executor.get("provider_role"),
+            },
+            "source_path": str(result_path),
+            "raw": payload,
+        }
+        items.append(item)
+
+    items.sort(key=lambda item: int(item.get("round") or 0))
+    if not items:
+        return _round_metric_empty(warnings)
+
+    status_counts: dict[str, int] = defaultdict(int)
+    completed = 0
+    failed = 0
+    running_round = None
+    total_duration = 0.0
+    total_tokens = 0
+    total_cost = 0.0
+    output_growth = 0
+    stage_summary = {
+        "llm_unpack": {"round_count": 0, "duration_seconds": 0.0, "token_total": 0},
+        "review": {"round_count": 0, "duration_seconds": 0.0, "token_total": 0},
+    }
+    for item in items:
+        status_value = str(item.get("status") or "unknown")
+        status_counts[status_value] += 1
+        if status_value in {"review_passed", "success", "completed"}:
+            completed += 1
+        elif status_value in {"review_failed", "failed", "error"}:
+            failed += 1
+        else:
+            running_round = item.get("round")
+        duration = _safe_float(item.get("duration_seconds"))
+        total_duration += duration
+        tokens = item.get("tokens") if isinstance(item.get("tokens"), dict) else {}
+        total_tokens += _safe_int(tokens.get("total"))
+        total_cost += _safe_float(tokens.get("cost"))
+        delta = item.get("output_delta") if isinstance(item.get("output_delta"), dict) else {}
+        output_growth += _safe_int(delta.get("size_bytes_delta"))
+
+        executor = item.get("executor") if isinstance(item.get("executor"), dict) else {}
+        reviewer = item.get("reviewer") if isinstance(item.get("reviewer"), dict) else {}
+        stage_summary["llm_unpack"]["round_count"] += 1
+        stage_summary["llm_unpack"]["duration_seconds"] += _safe_float(executor.get("duration_seconds"))
+        raw_tokens = item.get("raw", {}).get("tokens", {}) if isinstance(item.get("raw"), dict) else {}
+        stage_summary["llm_unpack"]["token_total"] += _token_total_from_mapping(
+            raw_tokens.get("executor") if isinstance(raw_tokens, dict) else {}
+        )
+        stage_summary["review"]["round_count"] += 1
+        stage_summary["review"]["duration_seconds"] += _safe_float(reviewer.get("duration_seconds"))
+        stage_summary["review"]["token_total"] += _token_total_from_mapping(
+            raw_tokens.get("reviewer") if isinstance(raw_tokens, dict) else {}
+        )
+
+    return {
+        "available": True,
+        "round_count": len(items),
+        "completed_round_count": completed,
+        "failed_round_count": failed,
+        "running_round": running_round,
+        "total_duration_seconds": round(total_duration, 3),
+        "total_tokens": total_tokens,
+        "total_cost": round(total_cost, 6),
+        "output_growth_bytes": output_growth,
+        "latest_round": items[-1].get("round"),
+        "summary": {
+            "status_counts": dict(status_counts),
+            "stage_summary": stage_summary,
+        },
+        "items": items,
+        "warnings": warnings,
+    }
+
+
+def _get_task_metrics(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    status_value = str(task.get("status") or "unknown")
+    terminal = status_value in {"success", "failed", "cancelled", "max_retries_reached"}
+    owner_id = str(task.get("owner_id") or "").strip() or None
+    run_root = _derive_run_path(task)
+    warnings: list[str] = []
+
+    created_at = str(task.get("created_at") or "").strip() or None
+    started_at = str(task.get("started_at") or "").strip() or None
+    completed_at = str(task.get("completed_at") or "").strip() or None
+    duration_end = completed_at if completed_at else (_now_iso_like(started_at) if started_at else None)
+
+    try:
+        resource_payload = _get_task_resource_usage(task_id)
+    except Exception as exc:
+        logger.warning("failed to collect task resource metrics for %s: %s", task_id, exc)
+        resource_payload = {
+            "available": False,
+            "message": "资源指标不可用",
+            "containers": [],
+        }
+    resource_available = bool(resource_payload.get("available"))
+    resource_message = str(resource_payload.get("message") or "").strip() or None
+    if not resource_available and resource_message:
+        warnings.append(resource_message)
+
+    cpu_millicores = resource_payload.get("cpu_millicores")
+    memory_mib = resource_payload.get("memory_mib")
+    cpu_limit = resource_payload.get("pod_cpu_limit_millicores")
+    memory_limit = resource_payload.get("pod_memory_limit_mib")
+    resource = {
+        "available": resource_available,
+        "pod_name": resource_payload.get("pod_name"),
+        "namespace": resource_payload.get("namespace"),
+        "cpu_millicores": cpu_millicores,
+        "memory_mib": memory_mib,
+        "pod_cpu_limit_millicores": cpu_limit,
+        "pod_memory_limit_mib": memory_limit,
+        "cpu_usage_percent": _usage_percent(cpu_millicores, cpu_limit),
+        "memory_usage_percent": _usage_percent(memory_mib, memory_limit),
+        "containers": list(resource_payload.get("containers") or []),
+        "message": resource_message,
+    }
+
+    try:
+        progress_payload = _get_task_progress(task_id)
+    except Exception as exc:
+        logger.warning("failed to collect task progress metrics for %s: %s", task_id, exc)
+        progress_payload = {"phases": []}
+        warnings.append("阶段进展指标不可用")
+    phases = [phase for phase in (progress_payload.get("phases") or []) if isinstance(phase, dict)]
+    progress = {
+        "current_phase": progress_payload.get("current_phase"),
+        "current_round": progress_payload.get("current_round"),
+        "total_rounds": progress_payload.get("total_rounds"),
+        "phase_count": len(phases),
+        "completed_phase_count": sum(1 for phase in phases if phase.get("status") == "success"),
+        "failed_phase_count": sum(1 for phase in phases if phase.get("status") == "failed"),
+        "running_phase_count": sum(1 for phase in phases if phase.get("status") == "running"),
+    }
+
+    event_count = _count_task_events(task_id)
+    latest_event = _get_latest_task_event(task_id) or {}
+    events = {
+        "event_count": event_count,
+        "latest_event_type": latest_event.get("event_type"),
+        "latest_event_summary": latest_event.get("summary"),
+        "latest_event_at": latest_event.get("created_at"),
+    }
+
+    sessions_index_path = run_root / "sessions" / "index.json"
+    sessions = _get_session_metrics(run_root)
+    if started_at and not sessions_index_path.exists():
+        warnings.append("会话索引不存在")
+
+    result = _get_cached_result_metrics(run_root)
+    if not result["cache_available"]:
+        warnings.append("结果缓存不存在，请在结果页手动刷新或等待后台刷新")
+
+    rounds = _read_round_metrics(run_root)
+    warnings.extend(str(item) for item in rounds.get("warnings") or [] if str(item).strip())
+
+    if not terminal and not owner_id:
+        warnings.append("非终态任务缺少 owner")
+
+    return {
+        "task_id": task_id,
+        "task": {
+            "status": status_value,
+            "result_status": task.get("result_status"),
+            "current_stage": task.get("current_stage"),
+            "owner_id": owner_id,
+            "created_at": created_at,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "last_progress_at": str(task.get("last_progress_at") or "").strip() or None,
+            "duration_seconds": _seconds_between(started_at, duration_end),
+            "queue_wait_seconds": _seconds_between(created_at, started_at),
+            "running_seconds": _seconds_since(started_at) if started_at and not terminal else _seconds_between(started_at, completed_at),
+        },
+        "resource": resource,
+        "progress": progress,
+        "events": events,
+        "sessions": sessions,
+        "result": result,
+        "rounds": rounds,
+        "health": {
+            "is_terminal": terminal,
+            "has_owner": bool(owner_id),
+            "resource_available": resource_available,
+            "result_cache_available": bool(result["cache_available"]),
+            "warnings": warnings,
+        },
+    }
+
+
+def _read_json_index_items(path: Path) -> list[dict]:
+    payload = _read_json_file(path)
+    if not isinstance(payload, dict):
+        return []
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        return []
+    return [item for item in raw_items if isinstance(item, dict)]
+
+
+def _normalize_extension(path: Path) -> str:
+    suffix = str(path.suffix or "").strip().lower()
+    return suffix or "(none)"
+
+
+def _relative_depth(output_root: Path, path: Path) -> int:
+    try:
+        relative = path.relative_to(output_root)
+    except Exception:
+        return 0
+    parts = [part for part in relative.parts if part not in {"", "."}]
+    return len(parts)
+
+
+def _entry_sort_key(item: dict) -> tuple[int, int, str]:
+    return (
+        -int(item.get("total_size_bytes") or 0),
+        -int(item.get("file_count") or 0),
+        str(item.get("name") or ""),
+    )
+
+
+def _scan_path_tree(root_path: Path) -> tuple[int, int, int]:
+    file_count = 0
+    dir_count = 0
+    total_size = 0
+
+    if not root_path.exists():
+        return file_count, dir_count, total_size
+
+    if root_path.is_file() and not root_path.is_symlink():
+        try:
+            return 1, 0, root_path.stat().st_size
+        except Exception:
+            return 0, 0, 0
+
+    if not root_path.is_dir():
+        return 0, 0, 0
+
+    for current_root, dirs, files in os.walk(root_path, followlinks=False):
+        current_path = Path(current_root)
+        real_dirs: list[str] = []
+        for directory in dirs:
+            path = current_path / directory
+            if path.is_symlink():
+                continue
+            dir_count += 1
+            real_dirs.append(directory)
+        dirs[:] = real_dirs
+
+        for filename in files:
+            path = current_path / filename
+            if path.is_symlink():
+                continue
+            try:
+                size = path.stat().st_size
+            except Exception:
+                continue
+            file_count += 1
+            total_size += size
+
+    return file_count, dir_count, total_size
+
+
+def _scan_output_tree(output_root: Path) -> dict:
+    file_count = 0
+    dir_count = 0
+    total_size = 0
+    largest_file_path: Optional[str] = None
+    largest_file_size = 0
+    top_level_entry_count = 0
+    largest_files: list[dict] = []
+    extension_stats: dict[str, dict[str, int | str]] = defaultdict(
+        lambda: {"extension": "(none)", "file_count": 0, "total_size_bytes": 0}
+    )
+    top_level_entries: list[dict] = []
+    deepest_path: Optional[str] = None
+    deepest_depth = 0
+    small_file_count = 0
+    medium_file_count = 0
+    large_file_count = 0
+
+    if not output_root.exists() or not output_root.is_dir():
+        return {
+            "output_file_count": file_count,
+            "output_dir_count": dir_count,
+            "output_total_size_bytes": total_size,
+            "largest_file_path": largest_file_path,
+            "largest_file_size_bytes": largest_file_size,
+            "top_level_entry_count": top_level_entry_count,
+            "top_level_entries": top_level_entries,
+            "file_extension_breakdown": [],
+            "largest_files": [],
+            "deepest_path": None,
+            "avg_file_size_bytes": 0,
+            "small_file_count": small_file_count,
+            "medium_file_count": medium_file_count,
+            "large_file_count": large_file_count,
+        }
+
+    top_level_paths: list[Path] = []
+    try:
+        top_level_paths = list(output_root.iterdir())
+        top_level_entry_count = len(top_level_paths)
+    except Exception:
+        top_level_entry_count = 0
+        top_level_paths = []
+
+    for top_level_path in top_level_paths:
+        if top_level_path.is_symlink():
+            continue
+        kind = "dir" if top_level_path.is_dir() else "file"
+        file_stats = _scan_path_tree(top_level_path)
+        top_level_entries.append(
+            {
+                "name": top_level_path.name,
+                "kind": kind,
+                "file_count": int(file_stats[0]),
+                "dir_count": int(file_stats[1]),
+                "total_size_bytes": int(file_stats[2]),
+            }
+        )
+
+    for root, dirs, files in os.walk(output_root, followlinks=False):
+        root_path = Path(root)
+        real_dirs: list[str] = []
+        for directory in dirs:
+            path = root_path / directory
+            if path.is_symlink():
+                continue
+            dir_count += 1
+            real_dirs.append(directory)
+            depth = _relative_depth(output_root, path)
+            if depth > deepest_depth:
+                deepest_depth = depth
+                deepest_path = str(path)
+        dirs[:] = real_dirs
+
+        for filename in files:
+            path = root_path / filename
+            if path.is_symlink():
+                continue
+            try:
+                size = path.stat().st_size
+            except Exception:
+                continue
+            file_count += 1
+            total_size += size
+            if size > largest_file_size:
+                largest_file_size = size
+                largest_file_path = str(path)
+            depth = _relative_depth(output_root, path)
+            if depth > deepest_depth:
+                deepest_depth = depth
+                deepest_path = str(path)
+
+            if size < 4 * 1024:
+                small_file_count += 1
+            elif size < 1024 * 1024:
+                medium_file_count += 1
+            else:
+                large_file_count += 1
+
+            extension = _normalize_extension(path)
+            stats = extension_stats[extension]
+            stats["extension"] = extension
+            stats["file_count"] = int(stats["file_count"]) + 1
+            stats["total_size_bytes"] = int(stats["total_size_bytes"]) + size
+            largest_files.append({"path": str(path), "size_bytes": size})
+
+    top_level_entries.sort(key=_entry_sort_key)
+    file_extension_breakdown = sorted(
+        extension_stats.values(),
+        key=lambda item: (
+            -int(item.get("total_size_bytes") or 0),
+            -int(item.get("file_count") or 0),
+            str(item.get("extension") or ""),
+        ),
+    )
+    largest_files.sort(key=lambda item: (-int(item.get("size_bytes") or 0), str(item.get("path") or "")))
+    avg_file_size_bytes = int(total_size / file_count) if file_count > 0 else 0
+
+    return {
+        "output_file_count": file_count,
+        "output_dir_count": dir_count,
+        "output_total_size_bytes": total_size,
+        "largest_file_path": largest_file_path,
+        "largest_file_size_bytes": largest_file_size,
+        "top_level_entry_count": top_level_entry_count,
+        "top_level_entries": top_level_entries,
+        "file_extension_breakdown": file_extension_breakdown,
+        "largest_files": largest_files[:10],
+        "deepest_path": (
+            {"path": deepest_path, "depth": deepest_depth}
+            if deepest_path is not None
+            else None
+        ),
+        "avg_file_size_bytes": avg_file_size_bytes,
+        "small_file_count": small_file_count,
+        "medium_file_count": medium_file_count,
+        "large_file_count": large_file_count,
+    }
+
+
+def _get_task_result(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    output_root = Path(str(task.get("output_path") or "").strip())
+    run_root = _derive_run_path(task)
+    cache_path = run_root / TASK_RESULT_CACHE_FILENAME
+    summary_path = output_root / "summary.md"
+    reason_path = output_root / "reason.md"
+    tokens_summary_path = _round_log_path(run_root, 0, "tokens_summary.json")
+    sessions_index_path = run_root / "sessions" / "index.json"
+
+    cached_payload = _read_json_file(cache_path)
+    if isinstance(cached_payload, dict):
+        summary = cached_payload.get("summary") if isinstance(cached_payload.get("summary"), dict) else {}
+        summary["event_count"] = _count_task_events(task_id)
+        return {
+            "task_id": task_id,
+            "available": bool(cached_payload.get("available", False)),
+            "status": str(cached_payload.get("status") or task.get("status") or "unknown"),
+            "output_root": cached_payload.get("output_root"),
+            "run_root": cached_payload.get("run_root"),
+            "summary_path": cached_payload.get("summary_path"),
+            "reason_path": cached_payload.get("reason_path"),
+            "tokens_summary_path": cached_payload.get("tokens_summary_path"),
+            "summary_text": cached_payload.get("summary_text"),
+            "reason_text": cached_payload.get("reason_text"),
+            "warnings": list(cached_payload.get("warnings") or []),
+            "summary": summary,
+        }
+
+    warnings: list[str] = []
+    task_status = str(task.get("status") or "").strip() or "unknown"
+    session_count = len(_read_json_index_items(sessions_index_path))
+    event_count = _count_task_events(task_id)
+
+    available = task_status in {"success", "failed", "cancelled"}
+    if not output_root.exists() or not output_root.is_dir():
+        warnings.append("输出目录不存在")
+        available = False
+
+    output_stats = {
+        "output_file_count": 0,
+        "output_dir_count": 0,
+        "output_total_size_bytes": 0,
+        "largest_file_path": None,
+        "largest_file_size_bytes": 0,
+        "top_level_entry_count": 0,
+        "top_level_entries": [],
+        "file_extension_breakdown": [],
+        "largest_files": [],
+        "deepest_path": None,
+        "avg_file_size_bytes": 0,
+        "small_file_count": 0,
+        "medium_file_count": 0,
+        "large_file_count": 0,
+    }
+    if output_root.exists() and output_root.is_dir():
+        output_stats = _scan_output_tree(output_root)
+
+    summary_text = _read_text_file(summary_path).strip() or None
+    reason_text = _read_text_file(reason_path).strip() or None
+    if summary_path.exists() and not summary_text:
+        warnings.append("summary.md 存在但为空")
+    if reason_path.exists() and not reason_text:
+        warnings.append("reason.md 存在但为空")
+    if sessions_index_path.exists() and session_count == 0:
+        warnings.append("会话索引存在但未解析到任何会话")
+
+    started_at = str(task.get("started_at") or "").strip() or None
+    completed_at = str(task.get("completed_at") or "").strip() or None
+    duration_seconds: Optional[int] = None
+    if started_at and completed_at:
+        try:
+            duration_seconds = max(0, int((datetime.fromisoformat(completed_at) - datetime.fromisoformat(started_at)).total_seconds()))
+        except Exception:
+            duration_seconds = None
+
+    return {
+        "task_id": task_id,
+        "available": available,
+        "status": task_status,
+        "output_root": str(output_root) if str(output_root) else None,
+        "run_root": str(run_root),
+        "summary_path": str(summary_path) if summary_path.exists() else None,
+        "reason_path": str(reason_path) if reason_path.exists() else None,
+        "tokens_summary_path": str(tokens_summary_path) if tokens_summary_path.exists() else None,
+        "summary_text": summary_text,
+        "reason_text": reason_text,
+        "warnings": warnings,
+        "summary": {
+            **output_stats,
+            "matched_skill": str(task.get("matched_skill") or "").strip() or None,
+            "fallback_to_llm": bool(task.get("fallback_to_llm")),
+            "generated_skill_path": str(task.get("generated_skill_path") or "").strip() or None,
+            "generated_skill_status": str(task.get("generated_skill_status") or "").strip() or None,
+            "promotion_success_count": int(task.get("promotion_success_count") or 0),
+            "skill_generation_status": str(task.get("skill_generation_status") or "").strip() or None,
+            "skill_generation_error": str(task.get("skill_generation_error") or "").strip() or None,
+            "skill_generation_job_id": str(task.get("skill_generation_job_id") or "").strip() or None,
+            "skill_generation_started_at": str(task.get("skill_generation_started_at") or "").strip() or None,
+            "skill_generation_completed_at": str(task.get("skill_generation_completed_at") or "").strip() or None,
+            "executor_rounds": int(task.get("rounds") or 0),
+            "session_count": session_count,
+            "event_count": event_count,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "duration_seconds": duration_seconds,
+        },
+    }
+
+
+async def _get_task_with_access(task_id: str, token: str) -> dict:
+    task = _get_task_or_404(task_id)
+    project_id = _normalize_project_id(task.get("project_id"))
+    if project_id:
+        await ensure_project_access(project_id, token)
+    return task
+
+
+def _submit_task(project_id: Optional[str], request: UnpackRequest) -> dict:
+    if project_id and not _normalize_project_id(request.project_id):
+        request.project_id = project_id
+    _ensure_valid_request_payload(request)
+    try:
+        result = submit_unpack_task(
+            firmware_path=request.firmware_path,
+            project_id=project_id,
+            task_origin_type=request.task_origin_type,
+            parent_project_id=request.parent_project_id,
+            parent_task_id=request.parent_task_id,
+            parent_task_type=request.parent_task_type,
+            parent_stage_name=request.parent_stage_name,
+            parent_stage_item_id=request.parent_stage_item_id,
+            parent_stage_item_key=request.parent_stage_item_key,
+        )
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    except Exception as exc:
+        logger.exception("failed to submit firmware unpack task for project %s", project_id)
+        raise InternalError("任务提交失败，请检查服务日志") from exc
+    return {
+        "task_id": result["task_id"],
+        "status": "pending",
+        "message": "任务已提交，请轮询任务状态接口获取进度。",
+        "input_path": result.get("input_path"),
+        "output_path": result.get("output_path"),
+        "run_path": result.get("run_path"),
+    }
+
+
+def _list_tasks(
+    project_id: Optional[str],
+    status_filter: Optional[str],
+    owner_id: Optional[str],
+    search: Optional[str],
+    limit: int,
+    offset: int,
+) -> dict:
+    db = get_db_session()
+    try:
+        query = db.query(UnpackTask)
+        if project_id:
+            query = query.filter(UnpackTask.project_id == project_id)
+        if status_filter:
+            query = query.filter(UnpackTask.status == status_filter)
+        if owner_id:
+            query = query.filter(UnpackTask.owner_id == owner_id)
+        if search:
+            like_value = f"%{search}%"
+            query = query.filter(
+                or_(
+                    UnpackTask.id.like(like_value),
+                    UnpackTask.firmware_path.like(like_value),
+                    UnpackTask.output_path.like(like_value),
+                )
+            )
+
+        total = query.count()
+        tasks = (
+            query.options(
+                load_only(
+                    UnpackTask.id,
+                    UnpackTask.project_id,
+                    UnpackTask.task_origin_type,
+                    UnpackTask.parent_project_id,
+                    UnpackTask.parent_task_id,
+                    UnpackTask.parent_task_type,
+                    UnpackTask.parent_stage_name,
+                    UnpackTask.parent_stage_item_id,
+                    UnpackTask.parent_stage_item_key,
+                    UnpackTask.firmware_path,
+                    UnpackTask.output_path,
+                    UnpackTask.status,
+                    UnpackTask.owner_id,
+                    UnpackTask.current_stage,
+                    UnpackTask.lease_expires_at,
+                    UnpackTask.cancel_requested_at,
+                    UnpackTask.last_progress_at,
+                    UnpackTask.runner_pid,
+                    UnpackTask.runner_started_at,
+                    UnpackTask.runner_heartbeat_at,
+                    UnpackTask.cancel_grace_deadline,
+                    UnpackTask.cancel_force_deadline,
+                    UnpackTask.result_status,
+                    UnpackTask.result_message,
+                    UnpackTask.rounds,
+                    UnpackTask.error_message,
+                    UnpackTask.matched_skill,
+                    UnpackTask.matched_skill_version,
+                    UnpackTask.matched_skill_score,
+                    UnpackTask.fallback_to_llm,
+                    UnpackTask.generated_skill_path,
+                    UnpackTask.generated_skill_status,
+                    UnpackTask.promotion_success_count,
+                    UnpackTask.skill_generation_status,
+                    UnpackTask.skill_generation_error,
+                    UnpackTask.skill_generation_job_id,
+                    UnpackTask.skill_generation_started_at,
+                    UnpackTask.skill_generation_completed_at,
+                    UnpackTask.created_at,
+                    UnpackTask.started_at,
+                    UnpackTask.completed_at,
+                )
+            )
+            .order_by(UnpackTask.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "items": [task.to_dict() for task in tasks],
+        }
+    finally:
+        db.close()
+
+
+def _get_config_entries() -> dict:
+    db = get_db_session()
+    try:
+        items = (
+            db.query(ServiceConfig)
+            .order_by(ServiceConfig.key.asc())
+            .all()
+        )
+        return {
+            "total": len(items),
+            "items": [item.to_dict() for item in items],
+        }
+    finally:
+        db.close()
+
+
+def _update_config_entry(key: str, payload: ConfigUpdateRequest) -> dict:
+    normalized_value = _normalize_runtime_config_value(key, payload.value)
+    db = get_db_session()
+    try:
+        row = db.query(ServiceConfig).filter(ServiceConfig.key == key).first()
+        if row is None:
+            row = ServiceConfig(
+                key=key,
+                value=normalized_value,
+                value_type=_infer_value_type(normalized_value),
+                description=payload.description,
+            )
+            db.add(row)
+        else:
+            row.value = normalized_value
+            if payload.description is not None:
+                row.description = payload.description
+        db.commit()
+        db.refresh(row)
+        return row.to_dict()
+    finally:
+        db.close()
+
+
+def _batch_update_config_entries(items: list[ConfigBatchUpdateItem]) -> dict:
+    updated: list[dict] = []
+    for item in items:
+        updated.append(
+            _update_config_entry(
+                item.key,
+                ConfigUpdateRequest(value=item.value, description=item.description),
+            )
+        )
+    return {"total": len(updated), "items": updated}
+
+
+def _list_tools() -> dict:
+    items: list[dict] = []
+    for meta in list_skills(TOOLS_DIR):
+        items.append(
+            {
+                "filename": str(meta.get("filename") or ""),
+                "path": str(meta.get("path") or ""),
+                "name": str(meta.get("name") or ""),
+                "format_id": str(meta.get("format_id") or ""),
+                "description": str(meta.get("description") or ""),
+                "extensions": list(meta.get("extensions") or []),
+                "magic_hex": str(meta.get("magic_hex") or ""),
+                "keywords": list(meta.get("keywords") or []),
+                "binwalk_sigs": list(meta.get("binwalk_sigs") or []),
+                "skill_status": str(meta.get("skill_status") or ""),
+                "skill_version": int(meta.get("skill_version") or 1),
+                "family_id": str(meta.get("family_id") or ""),
+                "promotion_success_count": int(meta.get("promotion_success_count") or 0),
+                "promotion_threshold": int(meta.get("promotion_threshold") or 5),
+            }
+        )
+    return {"total": len(items), "items": items}
+
+
+def _list_llm_provider_summaries() -> dict:
+    payload = get_configcenter_client().list_llm_providers()
+    raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        items.append(
+            {
+                "provider_key": str(item.get("provider_key") or "").strip(),
+                "display_name": str(item.get("display_name") or "").strip(),
+                "provider_type": str(item.get("provider_type") or "").strip(),
+                "enabled": bool(item.get("enabled", False)),
+                "is_default": bool(item.get("is_default", False)),
+                "model": str(item.get("model") or "").strip(),
+                "description": str(item.get("description") or "").strip() or None,
+                "updated_at": str(item.get("updated_at") or "").strip() or None,
+            }
+        )
+    return {
+        "total": len(items),
+        "default_provider_key": str(payload.get("default_provider_key") or "").strip() or None,
+        "items": items,
+    }
+
+
+def _list_llm_config_file_summaries() -> dict:
+    payload = get_configcenter_client().list_llm_config_files()
+    raw_items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    items: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        model_options_raw = item.get("model_options") if isinstance(item.get("model_options"), list) else []
+        items.append(
+            {
+                "config_file_key": str(item.get("config_file_key") or "").strip(),
+                "display_name": str(item.get("display_name") or "").strip(),
+                "provider_type": str(item.get("provider_type") or "").strip(),
+                "enabled": bool(item.get("enabled", False)),
+                "is_default": bool(item.get("is_default", False)),
+                "default_model": str(item.get("default_model") or "").strip() or None,
+                "description": str(item.get("description") or "").strip() or None,
+                "updated_at": str(item.get("updated_at") or "").strip() or None,
+                "model_options": [
+                    {
+                        "value": str(option.get("value") or "").strip(),
+                        "label": str(option.get("label") or option.get("value") or "").strip(),
+                        "source": str(option.get("source") or "").strip() or None,
+                    }
+                    for option in model_options_raw
+                    if isinstance(option, dict) and str(option.get("value") or "").strip()
+                ],
+            }
+        )
+    return {"total": len(items), "items": items}
+
+
+@router.get("/health", response_model=HealthResponse)
+@router.get("/api/app/firmware-unpacker/health", response_model=HealthResponse)
+async def health_check():
+    return {"status": "ok", "owner_id": get_worker_id()}
+
+
+@router.get("/ready", response_model=ReadyResponse)
+@router.get("/api/app/firmware-unpacker/ready", response_model=ReadyResponse)
+async def ready_check():
+    return {"status": "ready", "owner_id": get_worker_id()}
+
+
+@router.get("/api/app/firmware-unpacker/cluster", response_model=ClusterInfoResponse)
+async def get_cluster_info(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return get_cluster_snapshot()
+
+
+@router.get("/api/app/firmware-unpacker/config", response_model=ConfigListResponse)
+async def get_runtime_config(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _get_config_entries()
+
+
+@router.get(
+    "/api/app/firmware-unpacker/llm/providers",
+    response_model=LlmProviderSummaryListResponse,
+)
+async def get_llm_provider_summaries(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _list_llm_provider_summaries()
+
+
+@router.get(
+    "/api/app/firmware-unpacker/llm/config-files",
+    response_model=LlmConfigFileSummaryListResponse,
+)
+async def get_llm_config_file_summaries(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _list_llm_config_file_summaries()
+
+
+@router.get("/api/app/firmware-unpacker/tools", response_model=ToolListResponse)
+async def get_unpacker_tools(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _list_tools()
+
+
+@router.put(
+    "/api/app/firmware-unpacker/config/{key}",
+    response_model=ConfigEntryResponse,
+)
+async def update_runtime_config(
+    key: str,
+    request: ConfigUpdateRequest,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _update_config_entry(key, request)
+
+
+@router.post(
+    "/api/app/firmware-unpacker/config/batch-update",
+    response_model=ConfigListResponse,
+)
+async def batch_update_runtime_config(
+    request: list[ConfigBatchUpdateItem],
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _batch_update_config_entries(request)
+
+
+@router.post(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks",
+    response_model=TaskSubmitResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_project_task(
+    project_id: str,
+    request: UnpackRequest,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    request_project_id = _normalize_project_id(request.project_id)
+    if request_project_id and request_project_id != project_id:
+        raise ValidationError("请求体中的 project_id 与路径参数不一致")
+
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    return _submit_task(project_id, request)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks",
+    response_model=TaskListResponse,
+)
+async def list_project_tasks(
+    project_id: str,
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    owner_id: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    return _list_tasks(project_id, status_filter, owner_id, search, limit, offset)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}",
+    response_model=TaskResponse,
+)
+async def get_project_task(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return task
+
+
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/events",
+    response_model=TaskEventListResponse,
+)
+async def get_project_task_events(
+    project_id: str,
+    task_id: str,
+    limit: int = Query(default=200, ge=1, le=200),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _get_task_events(task_id, limit)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/result",
+    response_model=TaskResultResponse,
+)
+async def get_project_task_result(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _get_task_result(task_id)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/metrics",
+    response_model=TaskMetricsResponse,
+)
+async def get_project_task_metrics(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _get_task_metrics(task_id)
+
+
+@router.post(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/refresh-result-cache",
+    response_model=ActionResponse,
+)
+async def refresh_project_task_result_cache(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    ok, message = request_task_result_cache_refresh(task_id)
+    if not ok:
+        raise ValidationError(message)
+    return {"message": message, "task_id": task_id}
+
+
+@router.delete(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}",
+    response_model=ActionResponse,
+)
+async def delete_project_task(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    deleted_count, skipped_ids = delete_tasks([task_id])
+    if deleted_count == 0:
+        raise ForbiddenError("运行中的任务不能删除，请先取消")
+    return {
+        "message": "任务删除已受理，目录清理将在后台完成",
+        "task_id": task_id,
+        "deleted_count": deleted_count,
+        "skipped_ids": skipped_ids,
+    }
+
+
+@router.post("/api/app/firmware-unpacker/unpack", response_model=TaskSubmitResponse)
+async def submit_unpack_legacy(
+    request: UnpackRequest,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    project_id = _normalize_project_id(request.project_id)
+    if project_id:
+        await ensure_project_access(project_id, token)
+    return _submit_task(project_id, request)
+
+
+@router.get("/api/app/firmware-unpacker/tasks", response_model=TaskListResponse)
+async def list_tasks_legacy(
+    project_id: Optional[str] = Query(default=None),
+    status_filter: Optional[str] = Query(default=None, alias="status"),
+    owner_id: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    normalized_project_id = _normalize_project_id(project_id)
+    if normalized_project_id:
+        await ensure_project_access(normalized_project_id, token)
+    return _list_tasks(
+        normalized_project_id,
+        status_filter,
+        owner_id,
+        search,
+        limit,
+        offset,
+    )
+
+
+@router.get("/api/app/firmware-unpacker/tasks/{task_id}", response_model=TaskResponse)
+async def get_task_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    return await _get_task_with_access(task_id, token)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/resource-usage",
+    response_model=TaskResourceUsageResponse,
+)
+async def get_task_resource_usage_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_resource_usage(task_id)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/progress",
+    response_model=TaskProgressResponse,
+)
+async def get_task_progress_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_progress(task_id)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/events",
+    response_model=TaskEventListResponse,
+)
+async def get_task_events_legacy(
+    task_id: str,
+    limit: int = Query(default=200, ge=1, le=200),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_events(task_id, limit)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/result",
+    response_model=TaskResultResponse,
+)
+async def get_task_result_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_result(task_id)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/metrics",
+    response_model=TaskMetricsResponse,
+)
+async def get_task_metrics_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_metrics(task_id)
+
+
+@router.post(
+    "/api/app/firmware-unpacker/tasks/{task_id}/refresh-result-cache",
+    response_model=ActionResponse,
+)
+async def refresh_task_result_cache_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    ok, message = request_task_result_cache_refresh(task_id)
+    if not ok:
+        raise ValidationError(message)
+    return {"message": message, "task_id": task_id}
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/logs",
+    response_model=TaskLogResponse,
+)
+async def get_task_logs_legacy(
+    task_id: str,
+    phase: Optional[str] = Query(default=None),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_logs(task_id, phase)
+
+
+@router.delete("/api/app/firmware-unpacker/tasks/{task_id}", response_model=ActionResponse)
+async def delete_task_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    deleted_count, skipped_ids = delete_tasks([task_id])
+    if deleted_count == 0:
+        raise ForbiddenError("运行中的任务不能删除，请先取消")
+    return {
+        "message": "任务删除成功",
+        "task_id": task_id,
+        "deleted_count": deleted_count,
+        "skipped_ids": skipped_ids,
+    }
+
+
+@router.post(
+    "/api/app/firmware-unpacker/tasks/{task_id}/cancel",
+    response_model=ActionResponse,
+)
+async def cancel_task_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    ok, message = cancel_task(task_id)
+    if not ok:
+        raise ValidationError(message)
+    return {"message": message, "task_id": task_id}
+
+
+@router.post(
+    "/api/app/firmware-unpacker/tasks/{task_id}/retry",
+    response_model=ActionResponse,
+)
+async def retry_task_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    ok, retried_task_id, message = retry_task(task_id)
+    if not ok or not retried_task_id:
+        raise ValidationError(message)
+    return {
+        "message": message,
+        "task_id": retried_task_id,
+    }
+
+
+@router.post(
+    "/api/app/firmware-unpacker/tasks/batch-delete",
+    response_model=ActionResponse,
+)
+async def batch_delete_task_legacy(
+    request: BatchDeleteRequest,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    for task_id in request.task_ids:
+        await _get_task_with_access(task_id, token)
+    deleted_count, skipped_ids = delete_tasks(request.task_ids)
+    return {
+        "message": "批量删除已受理，目录清理将在后台完成",
+        "deleted_count": deleted_count,
+        "skipped_ids": skipped_ids,
+    }
