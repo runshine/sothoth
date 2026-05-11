@@ -55,7 +55,7 @@ from app.schemas import (
 )
 from app.services.fileserver_client import get_fileserver_client
 from app.services.llm_provider_sync import sync_providers_to_pi
-from app.services.run_index_service import get_run_index_service
+from app.services.run_index_service import _load_externalized_json_payload, get_run_index_service
 from app.services.pi_vuln_adapter import (
     DbExecutionObserver,
     DbExecutionRecorder,
@@ -567,7 +567,7 @@ class ExecutionService:
         process_payload = self._read_run_process_file(run_index.run_root_path)
         if process_payload:
             candidates.append(process_payload)
-        raw_summary = dict(run_index.raw_summary_json or {})
+        raw_summary = dict(_load_externalized_json_payload(run_index.run_root_path, run_index.raw_summary_json) or {})
         raw_cli = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
         if raw_cli:
             candidates.append(dict(raw_cli))

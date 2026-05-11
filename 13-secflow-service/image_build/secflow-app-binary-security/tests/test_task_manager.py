@@ -908,6 +908,57 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertEqual([], db.archive_jobs)
 
+    def test_persist_stage_run_output_summary_externalizes_full_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="demo",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                sequence_no=2,
+                status="running",
+            )
+            full_summary = {
+                "items": [
+                    {
+                        "module_key": "m1",
+                        "module_name": "module-1",
+                        "source_dir": "/src/module-1",
+                        "artifact_root": "/out/module-1",
+                        "entries": [
+                            {"entry_key": f"e{i}", "function_name": f"fn{i}", "file_name": "a.c", "line_no": i}
+                            for i in range(20)
+                        ],
+                    }
+                ],
+                "success_count": 1,
+                "failed_count": 0,
+                "entry_count": 20,
+            }
+
+            compact = self.manager._persist_stage_run_output_summary(task, stage_run, full_summary)
+
+            summary_file = workspace / "run" / "stage-summaries" / "02_entry_analysis.json"
+            self.assertTrue(summary_file.is_file())
+            self.assertEqual(full_summary["entry_count"], compact["entry_count"])
+            self.assertTrue(compact["summary_externalized"])
+            self.assertEqual(str(summary_file), compact["summary_file"])
+            self.assertEqual(1, compact["item_count"])
+            self.assertEqual(20, compact["items_preview"][0]["entry_count"])
+            self.assertLessEqual(len(compact["items_preview"][0]["entries_preview"]), 5)
+
     def test_continue_task_deletes_archive_child_outputs_for_affected_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

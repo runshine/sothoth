@@ -277,7 +277,9 @@ def _count_files(path: Path) -> int:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     ensure_dir(path.parent)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def _is_within_path(base: Path, candidate: Path) -> bool:
@@ -1040,7 +1042,7 @@ class TaskManager:
         for stage_name in affected_stages:
             stage_run = stage_runs.get(stage_name)
             if stage_run:
-                self._reset_stage_run_for_retry(stage_run, increment_retry=False)
+                self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
 
         task.status = "pending"
         task.current_stage = target_stage
@@ -1104,7 +1106,7 @@ class TaskManager:
                 BinarySecurityStageRun.stage_name == current_stage,
             ).first()
             if stage_run:
-                self._reset_stage_run_for_retry(stage_run, increment_retry=True)
+                self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(
             db,
@@ -1136,7 +1138,7 @@ class TaskManager:
             raise ValidationError("目标阶段尚未执行，不能重试")
         self._clear_single_stage_outputs(task, stage_name)
         self._clear_archive_jobs_for_stages(db, task.id, [stage_name])
-        self._reset_stage_run_for_retry(stage_run, increment_retry=True)
+        self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
 
         task.execution_mode = "stage_retry"
         task.target_stage_name = stage_name
@@ -1995,7 +1997,7 @@ class TaskManager:
                     stage_run.status = "skipped"
                     stage_run.started_at = stage_run.started_at or _now()
                     stage_run.finished_at = _now()
-                    stage_run.output_summary = {"reason": "disabled_by_stage_options"}
+                    self._persist_stage_run_output_summary(task, stage_run, {"reason": "disabled_by_stage_options"})
                     stage_run.counts = self._stage_counts(db, stage_run)
                     task.stage_summary = {
                         **task.stage_summary,
@@ -2029,7 +2031,7 @@ class TaskManager:
                 db.refresh(stage_run)
                 stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else status
                 stage_run.finished_at = _now()
-                stage_run.output_summary = summary
+                self._persist_stage_run_output_summary(task, stage_run, summary)
                 stage_run.counts = self._stage_counts(db, stage_run)
                 if status in {"failed", "partial_success"}:
                     stage_run.last_error = summary.get("error")
@@ -2238,11 +2240,14 @@ class TaskManager:
                 stage_run.status = "failed"
                 stage_run.finished_at = _now()
                 stage_run.last_error = "任务执行实例心跳超时，运行状态已回收"
-                stage_run.output_summary = {
-                    **(stage_run.output_summary or {}),
-                    "error": stage_run.last_error,
-                    "reclaimed": True,
-                }
+                self._merge_stage_run_output_summary(
+                    task,
+                    stage_run,
+                    {
+                        "error": stage_run.last_error,
+                        "reclaimed": True,
+                    },
+                )
                 running_items = db.query(BinarySecurityStageItem).filter(
                     BinarySecurityStageItem.task_id == task.id,
                     BinarySecurityStageItem.stage_name == stage_name,
@@ -3041,6 +3046,174 @@ class TaskManager:
             finished_at=item.finished_at,
         )
 
+    def _stage_run_summary_path(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> Path:
+        return Path(task.workspace_root) / "run" / "stage-summaries" / f"{int(stage_run.sequence_no or 0):02d}_{stage_run.stage_name}.json"
+
+    def _load_stage_run_output_summary_full(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun) -> dict[str, Any]:
+        db_summary = dict(stage_run.output_summary or {})
+        summary_file = db_summary.get("summary_file")
+        candidate = Path(str(summary_file)) if summary_file else self._stage_run_summary_path(task, stage_run)
+        if candidate.is_file():
+            try:
+                payload = json.loads(_read_text(candidate) or "{}")
+                if isinstance(payload, dict):
+                    return payload
+            except Exception:
+                pass
+        return {}
+
+    def _compact_stage_output_item_preview(self, stage_name: str, item: dict[str, Any]) -> dict[str, Any]:
+        row = dict(item)
+        if stage_name == "system_analysis":
+            modules = [dict(module) for module in row.get("modules") or [] if isinstance(module, dict)]
+            row["modules"] = self._lightweight_modules_for_storage(modules, limit=5)
+            if "system_analysis_result" in row:
+                result = dict(row.get("system_analysis_result") or {})
+                result["modules"] = self._lightweight_modules_for_storage(list(result.get("modules") or []), limit=5)
+                warnings = result.get("warnings") or []
+                if isinstance(warnings, list):
+                    result["warnings"] = warnings[:10]
+                    result["warning_count"] = len(warnings)
+                row["system_analysis_result"] = result
+            return row
+        if stage_name == "entry_analysis":
+            entries = [dict(entry) for entry in row.get("entries") or row.get("entries_preview") or [] if isinstance(entry, dict)]
+            return {
+                "firmware_key": row.get("firmware_key"),
+                "firmware_name": row.get("firmware_name"),
+                "module_key": row.get("module_key"),
+                "module_name": row.get("module_name"),
+                "module_dir": row.get("module_dir"),
+                "source_dir": row.get("source_dir"),
+                "artifact_root": row.get("artifact_root"),
+                "entry_count": row.get("entry_count") if row.get("entry_count") is not None else len(entries),
+                "entries_preview": self._compact_entry_rows(entries[:5]),
+            }
+        if stage_name == "vuln_scan":
+            artifact_files = row.get("artifact_files_preview") or row.get("artifact_files") or []
+            return {
+                "entry_key": row.get("entry_key"),
+                "module_key": row.get("module_key"),
+                "module_name": row.get("module_name"),
+                "function_name": row.get("function_name"),
+                "file_name": row.get("file_name"),
+                "line_no": row.get("line_no"),
+                "source_dir": row.get("source_dir"),
+                "data_flow_file": row.get("data_flow_file"),
+                "workspace_root": row.get("workspace_root"),
+                "archive_root": row.get("archive_root"),
+                "artifact_file_count": row.get("artifact_file_count") if row.get("artifact_file_count") is not None else len(artifact_files),
+                "artifact_files_preview": list(artifact_files[:5]) if isinstance(artifact_files, list) else [],
+            }
+        if stage_name == "dataflow_analysis":
+            return self._compact_dataflow_summary_item(row)
+        if stage_name == "binary_to_source":
+            return self._compact_b2s_summary_item(row)
+        if stage_name == "firmware_unpack":
+            return self._compact_firmware_unpack_summary_item(row)
+        return row
+
+    def _compact_stage_output_summary_for_db(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        full_summary: dict[str, Any] | None,
+        *,
+        summary_file: str | None = None,
+    ) -> dict[str, Any]:
+        summary = dict(full_summary or {})
+        compact: dict[str, Any] = {
+            "summary_externalized": bool(summary_file),
+        }
+        if summary_file:
+            compact["summary_file"] = summary_file
+        scalar_keys = [
+            "status",
+            "sync_status",
+            "error",
+            "reason",
+            "reclaimed",
+            "archive_blocked",
+            "waiting_manual_confirmation",
+            "success_count",
+            "failed_count",
+            "cancelled_count",
+            "entry_count",
+            "vuln_result_count",
+            "module_count",
+            "high_risk_module_count",
+            "medium_risk_module_count",
+            "low_risk_module_count",
+            "candidate_module_count",
+            "selected_module_count",
+            "total_items",
+            "success_items",
+            "failed_items_count",
+            "running_items",
+            "cancelled_items_count",
+            "skipped_items",
+            "items_truncated",
+            "failed_items_truncated",
+            "cancelled_items_truncated",
+            "status_synced",
+        ]
+        for key in scalar_keys:
+            value = summary.get(key)
+            if value is not None:
+                compact[key] = value
+        for count_key, alias in (("failed_items", "failed_items_count"), ("cancelled_items", "cancelled_items_count")):
+            rows = summary.get(count_key)
+            if isinstance(rows, list):
+                compact[alias] = len(rows)
+        items = summary.get("items")
+        if isinstance(items, list):
+            compact["item_count"] = len(items)
+            compact["items_preview"] = [
+                self._compact_stage_output_item_preview(stage_run.stage_name, item)
+                for item in items[:10]
+                if isinstance(item, dict)
+            ]
+        failed_items = summary.get("failed_items")
+        if isinstance(failed_items, list):
+            compact["failed_items_preview"] = [
+                self._lightweight_stage_failure(item if isinstance(item, dict) else {"item": {}, "error": str(item)})
+                for item in failed_items[:10]
+            ]
+        cancelled_items = summary.get("cancelled_items")
+        if isinstance(cancelled_items, list):
+            compact["cancelled_items_preview"] = [
+                self._lightweight_stage_failure(item if isinstance(item, dict) else {"item": {}, "error": str(item)})
+                for item in cancelled_items[:10]
+            ]
+        return compact
+
+    def _persist_stage_run_output_summary(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        full_summary: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        summary_payload = dict(full_summary or {})
+        summary_file: str | None = None
+        try:
+            path = self._stage_run_summary_path(task, stage_run)
+            _write_json(path, summary_payload)
+            summary_file = str(path)
+        except Exception:
+            summary_file = None
+        compact = self._compact_stage_output_summary_for_db(task, stage_run, summary_payload, summary_file=summary_file)
+        stage_run.output_summary = compact
+        return compact
+
+    def _merge_stage_run_output_summary(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        patch: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged = {**self._load_stage_run_output_summary_full(task, stage_run), **(patch or {})}
+        return self._persist_stage_run_output_summary(task, stage_run, merged)
+
     def _item_stats(self, items: list[BinarySecurityStageItem]) -> dict[str, dict[str, int]]:
         stats: dict[str, dict[str, int]] = {}
         for item in items:
@@ -3224,12 +3397,15 @@ class TaskManager:
         stage_run.status = status
         stage_run.counts = self._stage_counts(db, stage_run)
         stage_run.last_error = next((item.error_message for item in items if item.status == "failed" and item.error_message), None)
-        stage_run.output_summary = {
-            **(stage_run.output_summary or {}),
-            "status_synced": True,
-            "sync_status": status,
-            **stage_run.counts,
-        }
+        self._merge_stage_run_output_summary(
+            task,
+            stage_run,
+            {
+                "status_synced": True,
+                "sync_status": status,
+                **stage_run.counts,
+            },
+        )
         if status in {"running", "pending", "queued"}:
             stage_run.finished_at = None
             stage_run.started_at = stage_run.started_at or _now()
@@ -3307,22 +3483,26 @@ class TaskManager:
         stage_run.started_at = stage_run.started_at or _now()
         stage_run.counts = self._stage_counts(db, stage_run)
         stage_run.last_error = failed[0].get("error") if failed and status == "failed" else None
-        stage_run.output_summary = {
-            "items": self._lightweight_system_analysis_items(success),
-            "failed_items": failed,
-            "success_count": len(success),
-            "failed_count": len(failed),
-            "module_count": len(all_modules),
-            "high_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "高"),
-            "medium_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "中"),
-            "low_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "低"),
-            "candidate_module_count": len(candidate_modules),
-            "selected_module_count": len(selected_modules),
-            "status_synced": True,
-            "sync_status": stage_run.status,
-            "error": stage_run.last_error,
-            **stage_run.counts,
-        }
+        self._persist_stage_run_output_summary(
+            task,
+            stage_run,
+            {
+                "items": self._lightweight_system_analysis_items(success),
+                "failed_items": failed,
+                "success_count": len(success),
+                "failed_count": len(failed),
+                "module_count": len(all_modules),
+                "high_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "高"),
+                "medium_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "中"),
+                "low_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "低"),
+                "candidate_module_count": len(candidate_modules),
+                "selected_module_count": len(selected_modules),
+                "status_synced": True,
+                "sync_status": stage_run.status,
+                "error": stage_run.last_error,
+                **stage_run.counts,
+            },
+        )
 
     def _refresh_task_status_after_sync(self, db: Session, task: BinarySecurityTask) -> None:
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
@@ -3686,7 +3866,7 @@ class TaskManager:
             "files": files,
         }
 
-    def _reset_stage_run_for_retry(self, stage_run: BinarySecurityStageRun, *, increment_retry: bool) -> None:
+    def _reset_stage_run_for_retry(self, task: BinarySecurityTask, stage_run: BinarySecurityStageRun, *, increment_retry: bool) -> None:
         stage_run.status = "pending"
         if increment_retry:
             stage_run.retry_count = int(stage_run.retry_count or 0) + 1
@@ -3697,6 +3877,12 @@ class TaskManager:
         stage_run.output_summary = {}
         stage_run.counts = {}
         stage_run.downstream_refs = {}
+        summary_file = self._stage_run_summary_path(task, stage_run)
+        try:
+            if summary_file.exists():
+                summary_file.unlink()
+        except Exception:
+            pass
 
     async def _run_with_limits(
         self,
