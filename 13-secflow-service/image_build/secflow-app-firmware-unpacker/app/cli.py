@@ -496,19 +496,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             model=ctx.get("executor_model"),
             env=_executor_env(ctx),
             extra_args=ctx.get("executor_extra_args", []),
-            timeout_seconds=None,
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "preprocess",
-                    "value": '"success": true',
-                },
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "skill_gate",
-                    "value": "matched=false",
-                },
-            ],
+            timeout_seconds=_node_timeout(ctx),
         )
         skill_reviewer = python_node(
             task_id="skill_reviewer",
@@ -517,18 +505,6 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             env=_python_node_env(),
             timeout_seconds=_node_timeout(ctx, divisor=2),
             success_criteria=REVIEW_SUCCESS_CRITERIA,
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "preprocess",
-                    "value": '"success": true',
-                },
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "skill_gate",
-                    "value": "matched=false",
-                },
-            ],
         )
         generic_executor = pi(
             task_id="generic_executor",
@@ -568,21 +544,13 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             model=ctx.get("executor_model"),
             env=_executor_env(ctx),
             extra_args=ctx.get("executor_extra_args", []),
-            timeout_seconds=None,
-            skip_if=[],
+            timeout_seconds=_node_timeout(ctx),
         )
         output_summary = python_node(
             task_id="output_summary",
             code=_summary_writer_code(ctx),
             tools="read_only",
             env=_python_node_env(),
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "preprocess",
-                    "value": '"success": true',
-                },
-            ],
         )
         generic_reviewer = python_node(
             task_id="generic_reviewer",
@@ -591,52 +559,24 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             env=_python_node_env(),
             timeout_seconds=_node_timeout(ctx, divisor=2),
             success_criteria=REVIEW_SUCCESS_CRITERIA,
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "preprocess",
-                    "value": '"success": true',
-                },
-            ],
         )
         skill_author = python_node(
             task_id="skill_author",
             code=_skill_author_code(ctx),
             tools="read_write",
             env=_python_node_env(),
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "preprocess",
-                    "value": '"success": true',
-                },
-            ],
         )
         cleanup = python_node(
             task_id="cleanup",
             code=_cleanup_output_code(ctx),
             tools="read_only",
             env=_python_node_env(),
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "preprocess",
-                    "value": '"success": true',
-                },
-            ],
         )
         finalize = python_node(
             task_id="finalize",
             code=_finalize_result_code(ctx),
             tools="read_only",
             env=_python_node_env(),
-            skip_if=[
-                {
-                    "kind": "node_output_contains",
-                    "node_id": "preprocess",
-                    "value": '"success": true',
-                },
-            ],
         )
 
         preprocess >> feature_match >> skill_gate >> skill_executor >> skill_reviewer
