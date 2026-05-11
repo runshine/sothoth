@@ -486,6 +486,10 @@ SOURCE_ARCHIVE_FORMATS = (
 )
 
 
+class StaleTaskExecution(RuntimeError):
+    """Raised when a stale task worker observes that its dispatch token is no longer current."""
+
+
 class TaskManager:
     def __init__(self) -> None:
         self.cfg = get_config()
@@ -999,8 +1003,7 @@ class TaskManager:
         if task.status == "cancelled":
             return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
         task.status = "cancelled"
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
+        self._invalidate_task_execution(task)
         task.finished_at = _now()
         self._record_event(db, task, "task_cancelled", "任务已取消")
         running_items = db.query(BinarySecurityStageItem).filter(
@@ -1028,8 +1031,7 @@ class TaskManager:
     async def delete_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
         task.status = "cancelled"
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
+        self._invalidate_task_execution(task)
         task.finished_at = task.finished_at or _now()
         self._record_event(db, task, "task_delete_requested", "任务删除已请求")
         items = db.query(BinarySecurityStageItem).options(
@@ -1082,6 +1084,8 @@ class TaskManager:
             raise ValidationError(reason or "当前任务不可继续")
         if not target_stage:
             raise ValidationError("当前任务未找到可继续的阶段")
+        self._invalidate_task_execution(task)
+        db.flush()
 
         stage_sequence = self._stage_sequence_for_task(task)
         stage_runs = {
@@ -1131,8 +1135,7 @@ class TaskManager:
         task.execution_mode = None
         task.target_stage_name = None
         task.last_error = None
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
+        self._invalidate_task_execution(task)
         task.finished_at = None
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(
@@ -1167,13 +1170,13 @@ class TaskManager:
             db.commit()
             return
         first_stage = stage_sequence[0]
+        self._invalidate_task_execution(task)
         task.status = "pending"
         task.current_stage = first_stage
         task.execution_mode = None
         task.target_stage_name = None
         task.last_error = None
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
+        self._invalidate_task_execution(task)
         task.finished_at = None
         self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
         db.query(BinarySecurityStageItem).filter(
@@ -1217,17 +1220,32 @@ class TaskManager:
         ).first()
         if not stage_run:
             raise ValidationError("目标阶段尚未执行，不能重试")
-        self._clear_single_stage_outputs(task, stage_name)
-        self._clear_archive_jobs_for_stages(db, task.id, [stage_name])
+        target_index = stage_sequence.index(stage_name)
+        affected_stages = stage_sequence[target_index:]
+        downstream_stages = stage_sequence[target_index + 1 :]
+        self._invalidate_task_execution(task)
+        self._clear_stage_outputs_from(task, stage_name, mark_stale=False)
+        self._delete_archive_children_for_stages(db, task, affected_stages)
+        if downstream_stages:
+            db.query(BinarySecurityStageItem).filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.stage_name.in_(downstream_stages),
+            ).delete(synchronize_session=False)
         self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
+        for downstream_stage in downstream_stages:
+            downstream_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == downstream_stage,
+            ).first()
+            if downstream_run:
+                self._reset_stage_run_for_retry(task, downstream_run, increment_retry=False)
 
         task.execution_mode = "stage_retry"
         task.target_stage_name = stage_name
         task.status = "pending"
         task.current_stage = stage_name
         task.last_error = None
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
+        self._invalidate_task_execution(task)
         task.finished_at = None
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(
@@ -1236,7 +1254,7 @@ class TaskManager:
             "stage_retry_requested",
             f"请求重试阶段: {stage_name}",
             stage_name=stage_name,
-            payload={"retry_semantics": "stage_only_all_items"},
+            payload={"retry_semantics": "stage_and_continue_downstream", "cleared_stages": affected_stages},
         )
         db.commit()
 
@@ -2090,6 +2108,7 @@ class TaskManager:
             task.dispatch_started_at = task.dispatch_started_at or _now()
             execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
             task.status = "running"
+            self._bind_execution_token(task)
             self._record_event(
                 db,
                 task,
@@ -2099,6 +2118,8 @@ class TaskManager:
             )
             db.commit()
             await self._execute_task(task_id)
+        except StaleTaskExecution:
+            return
         except Exception as exc:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if task:
@@ -2130,15 +2151,19 @@ class TaskManager:
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if not task:
                 return
+            self._bind_execution_token(task)
             token = self._service_token()
             stage_sequence = self._stage_sequence_for_task(task)
             start_index = stage_sequence.index(task.current_stage) if task.current_stage in stage_sequence else 0
             stage_retry_mode = task.execution_mode == "stage_retry" and bool(task.target_stage_name)
             task_retry_mode = task.execution_mode == "task_retry" and bool(task.target_stage_name)
             target_stage_name = task.target_stage_name if (stage_retry_mode or task_retry_mode) else None
+            target_stage_index = stage_sequence.index(target_stage_name) if target_stage_name in stage_sequence else start_index
+            if stage_retry_mode:
+                start_index = min(start_index, target_stage_index)
             archive_blocked = False
             for stage_name in stage_sequence[start_index:]:
-                if stage_retry_mode and stage_name != target_stage_name:
+                if stage_retry_mode and stage_sequence.index(stage_name) < target_stage_index:
                     continue
                 db.refresh(task)
                 if task.status == "cancelled":
@@ -2168,7 +2193,7 @@ class TaskManager:
                 stage_run = self._ensure_stage_run(db, task, stage_name)
                 stage_run.status = "running"
                 stage_run.started_at = stage_run.started_at or _now()
-                if stage_retry_mode:
+                if stage_retry_mode and stage_name == target_stage_name:
                     self._record_event(db, task, "stage_retry_started", f"阶段开始重试: {stage_name}", stage_name=stage_name)
                 elif task_retry_mode and self._stage_items(db, task.id, stage_name):
                     self._record_event(db, task, "stage_retry_started", f"阶段开始安全续跑: {stage_name}", stage_name=stage_name)
@@ -2239,7 +2264,7 @@ class TaskManager:
                     )
                     db.commit()
                     break
-                if stage_retry_mode:
+                if stage_retry_mode and stage_name == target_stage_name:
                     self._record_event(
                         db,
                         task,
@@ -2248,7 +2273,6 @@ class TaskManager:
                         stage_name=stage_name,
                         payload={"status": status},
                     )
-                    break
                 if status == "failed":
                     task.last_error = summary.get("error")
                     self._record_event(db, task, "stage_failed", f"阶段失败，停止后续推进: {stage_name}", level="error", stage_name=stage_name)
@@ -2702,6 +2726,40 @@ class TaskManager:
     def _service_token(self) -> str | None:
         return self.cfg.auth_service.service_machine_token
 
+    def _dispatch_token(self, task: BinarySecurityTask) -> str | None:
+        return task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
+
+    def _bind_execution_token(self, task: BinarySecurityTask) -> None:
+        setattr(task, "_execution_dispatcher_id", task.dispatcher_instance_id)
+        setattr(task, "_execution_token", self._dispatch_token(task))
+
+    def _ensure_task_execution_current(self, task: BinarySecurityTask) -> None:
+        expected_dispatcher_id = getattr(task, "_execution_dispatcher_id", None)
+        expected_token = getattr(task, "_execution_token", None)
+        if expected_dispatcher_id is None and expected_token is None and not task.dispatcher_instance_id and not task.dispatch_started_at:
+            return
+        expected_dispatcher_id = expected_dispatcher_id or task.dispatcher_instance_id
+        expected_token = expected_token or self._dispatch_token(task)
+        if not expected_dispatcher_id or not expected_token:
+            raise StaleTaskExecution(f"任务 {task.id} 缺少当前执行 token")
+        session = get_session_factory()()
+        try:
+            row = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+            current_token = row.dispatch_started_at.isoformat() if row and row.dispatch_started_at else None
+            if (
+                row is None
+                or row.status not in {"dispatching", "running"}
+                or row.dispatcher_instance_id != expected_dispatcher_id
+                or current_token != expected_token
+            ):
+                raise StaleTaskExecution(f"任务 {task.id} 当前执行 token 已失效")
+        finally:
+            session.close()
+
+    def _invalidate_task_execution(self, task: BinarySecurityTask) -> None:
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+
     def _stage_enabled(self, task: BinarySecurityTask, stage_name: str) -> bool:
         policy = task.policy or {}
         stage_options = policy.get("stage_options", {})
@@ -3013,8 +3071,12 @@ class TaskManager:
                 (self._normalize_downstream_status(item.status) or item.status) not in {"success", "failed", "partial_success", "cancelled"}
                 for item in current_stage_items
             )
+            # A stage may still be running while some completed items have already
+            # been archived successfully. In that case the archive lane should stay
+            # idle/pending until new terminal items produce new archive jobs,
+            # instead of looking like an actively running archive worker.
             if archive_status == "success" and (has_non_terminal_items or len(stage_jobs) < terminal_item_count):
-                archive_status = "running" if stage_jobs or summary.status in {"running", "dispatching", "applying"} else "pending"
+                archive_status = "pending"
             nodes.append(
                 BinarySecurityOverviewNode(
                     node_id=f"archive:{stage_name}",
@@ -3690,8 +3752,6 @@ class TaskManager:
             summary = dict(task.summary or {})
             summary.pop("stage_retry_context", None)
             task.summary = summary
-            self._finalize_task(db, task)
-            return
         if task_retry_mode:
             task.execution_mode = None
             task.target_stage_name = None
@@ -4302,8 +4362,10 @@ class TaskManager:
 
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
         while True:
+            self._ensure_task_execution_current(task)
             self._touch_task_heartbeat(task.id)
             payload = await fetcher()
+            self._ensure_task_execution_current(task)
             status = str(payload.get("status") or "").lower()
             if status in success_statuses:
                 return "success", payload
@@ -4462,6 +4524,9 @@ class TaskManager:
             }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
+        except StaleTaskExecution:
+            session.rollback()
+            raise
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"
@@ -4705,6 +4770,9 @@ class TaskManager:
             item.output_ref = {**(item.output_ref or {}), "artifact_root": str(archive_root), "archive_root": str(archive_root)}
             session.commit()
             return {"status": item.status, "item": {**result, "modules": modules}, "error": payload.get("error") or payload.get("error_message")}
+        except StaleTaskExecution:
+            session.rollback()
+            raise
         except Exception as exc:
             if "item" in locals():
                 session.rollback()
@@ -5339,13 +5407,17 @@ class TaskManager:
 
         async def wrapped(item: dict[str, Any]):
             async with semaphore:
+                self._ensure_task_execution_current(task)
                 if self._is_task_cancelled(task.id):
                     return {"status": "cancelled", "error": "task cancelled", "item": item}
                 attempts = 0
                 result = await runner(item, initial_retry)
+                self._ensure_task_execution_current(task)
                 while result.get("status") == "failed" and attempts < max(0, retries):
                     attempts += 1
+                    self._ensure_task_execution_current(task)
                     result = await runner(item, True)
+                    self._ensure_task_execution_current(task)
                     result["attempts"] = attempts + 1
                 return result
 
@@ -5439,6 +5511,9 @@ class TaskManager:
             }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
+        except StaleTaskExecution:
+            session.rollback()
+            raise
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"
@@ -5558,6 +5633,9 @@ class TaskManager:
             item.output_ref = {**(item.output_ref or {}), "artifact_root": str(archived_dir), "archive_root": str(archived_dir)}
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
+        except StaleTaskExecution:
+            session.rollback()
+            raise
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"
@@ -5809,6 +5887,9 @@ class TaskManager:
             }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
+        except StaleTaskExecution:
+            session.rollback()
+            raise
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"
@@ -5909,6 +5990,9 @@ class TaskManager:
             }
             session.commit()
             return {"status": item.status, "item": result, "error": payload.get("error") or payload.get("error_message")}
+        except StaleTaskExecution:
+            session.rollback()
+            raise
         except Exception as exc:
             if "item" in locals():
                 item.status = "failed"

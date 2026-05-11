@@ -285,7 +285,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("d1", nodes[0].detail.representative_downstream_task_id)
         self.assertEqual(["firmware_unpacker"], nodes[0].detail.downstream_services)
 
-    def test_build_stage_overview_nodes_keeps_archive_running_when_some_items_not_terminal(self):
+    def test_build_stage_overview_nodes_keeps_archive_pending_when_some_items_not_terminal(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -346,7 +346,7 @@ class TaskManagerTests(unittest.TestCase):
         nodes = self.manager._build_stage_overview_nodes(task, summaries, archive_jobs, stage_items)
         by_node_id = {node.node_id: node for node in nodes}
 
-        self.assertEqual("running", by_node_id["archive:entry_analysis"].status)
+        self.assertEqual("pending", by_node_id["archive:entry_analysis"].status)
 
     def test_choose_module_binary_handles_relative_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -934,6 +934,7 @@ class TaskManagerTests(unittest.TestCase):
                 output_root=str(workspace / "output"),
                 workspace_root=str(workspace),
             )
+            task.summary = {"selected_modules": [{"module_key": "m1", "source_dir": "/src/m1"}]}
             runs = [
                 BinarySecurityStageRun(id="sr1", task_id="s1", project_id="p1", stage_name="system_analysis", sequence_no=1, status="success"),
                 BinarySecurityStageRun(id="sr2", task_id="s1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="failed"),
@@ -1032,6 +1033,7 @@ class TaskManagerTests(unittest.TestCase):
                 output_root=str(output_root),
                 workspace_root=str(workspace),
             )
+            task.summary = {"selected_modules": [{"module_key": "m1", "source_dir": "/src/m1"}]}
             runs = [
                 BinarySecurityStageRun(id="sr1", task_id="s1", project_id="p1", stage_name="system_analysis", sequence_no=1, status="success"),
                 BinarySecurityStageRun(id="sr2", task_id="s1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="failed"),
@@ -1051,6 +1053,7 @@ class TaskManagerTests(unittest.TestCase):
     def test_continue_task_deletes_affected_downstream_tasks_before_requeue(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
+            (workspace / "input").mkdir(parents=True)
             task = BinarySecurityTask(
                 id="s1",
                 project_id="p1",
@@ -1334,7 +1337,7 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("pending", task.status)
             self.assertEqual([], db.archive_jobs)
 
-    def test_refresh_task_status_after_stage_retry_finalizes_without_advancing(self):
+    def test_refresh_task_status_after_stage_retry_requeues_downstream_stage(self):
         task = BinarySecurityTask(
             id="s1",
             project_id="p1",
@@ -1362,8 +1365,8 @@ class TaskManagerTests(unittest.TestCase):
 
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("partial_success", task.status)
-        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual("pending", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.execution_mode)
         self.assertIsNone(task.target_stage_name)
         self.assertNotIn("stage_retry_context", task.summary)
@@ -2228,6 +2231,39 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("success", results[0]["status"])
         self.assertEqual([False, True, True], calls)
+
+    def test_run_stage_pool_stops_when_execution_token_is_invalidated(self):
+        async def runner(item, retrying=False):
+            del item, retrying
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            return {"status": "success"}
+
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id=self.manager.instance_id,
+            dispatch_started_at=_now(),
+        )
+        self.manager._bind_execution_token(task)
+        db = _ModelAwareDb(tasks=[task])
+        original_factory = task_manager_module.get_session_factory
+        original_is_cancelled = self.manager._is_task_cancelled
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        self.manager._is_task_cancelled = lambda task_id: False
+        try:
+            with self.assertRaises(task_manager_module.StaleTaskExecution):
+                asyncio.run(self.manager._run_stage_pool(task, [{"id": 1}], 1, runner))
+        finally:
+            task_manager_module.get_session_factory = original_factory
+            self.manager._is_task_cancelled = original_is_cancelled
 
     def test_run_stage_pool_respects_concurrency_limit_for_retry_mode(self):
         active = 0
