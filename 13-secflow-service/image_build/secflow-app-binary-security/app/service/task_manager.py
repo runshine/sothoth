@@ -114,6 +114,90 @@ def _normalize_entry_function_name(value: Any) -> str:
     return raw
 
 
+def _entry_signature_params(entry: dict[str, Any]) -> list[str]:
+    raw_params = (
+        entry.get("signature_params")
+        or entry.get("parameters")
+        or entry.get("params")
+        or entry.get("input_params")
+        or []
+    )
+    params: list[str] = []
+    if isinstance(raw_params, list):
+        for value in raw_params:
+            if isinstance(value, dict):
+                candidate = value.get("name") or value.get("param") or value.get("parameter")
+            else:
+                candidate = value
+            name = _normalize_parameter_name(candidate)
+            if name:
+                params.append(name)
+    if not params:
+        signature = str(
+            entry.get("raw_function_name")
+            or entry.get("function_signature")
+            or entry.get("signature")
+            or entry.get("function")
+            or entry.get("function_name")
+            or ""
+        )
+        params.extend(_parse_signature_param_names(signature))
+    return _deduplicate_strings(params)
+
+
+def _parse_signature_param_names(signature: str) -> list[str]:
+    match = re.search(r"\((.*)\)", signature or "")
+    if not match:
+        return []
+    return [_normalize_parameter_name(part) for part in _split_signature_params(match.group(1)) if _normalize_parameter_name(part)]
+
+
+def _split_signature_params(raw: str) -> list[str]:
+    params: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for char in raw:
+        if char in "([{<":
+            depth += 1
+        elif char in ")]}>" and depth > 0:
+            depth -= 1
+        if char == "," and depth == 0:
+            params.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    if current:
+        params.append("".join(current).strip())
+    return params
+
+
+def _normalize_parameter_name(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw or raw.lower() in {"void", "..."}:
+        return ""
+    raw = raw.split("=", 1)[0].strip()
+    raw = raw.split(":", 1)[0].strip()
+    raw = re.sub(r"\[[^\]]*\]", "", raw).strip()
+    raw = raw.replace("*", " ").replace("&", " ")
+    tokens = [token for token in re.split(r"\s+", raw) if token]
+    if not tokens:
+        return ""
+    candidate = tokens[-1]
+    match = re.search(r"([A-Za-z_]\w*)$", candidate)
+    return match.group(1) if match else ""
+
+
+def _deduplicate_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
 def _entry_key_with_suffix(base_key: str, suffix_source: Any, fallback_index: int) -> str:
     suffix = _slug(str(suffix_source or fallback_index))[:32]
     if not suffix:
@@ -5440,11 +5524,7 @@ class TaskManager:
                             for value in (entry.get("taints") or entry.get("taint_params") or [])
                             if str(value).strip()
                         ],
-                        "signature_params": [
-                            str(value).strip()
-                            for value in (entry.get("signature_params") or [])
-                            if str(value).strip()
-                        ],
+                        "signature_params": _entry_signature_params({**entry, "raw_function_name": raw_function_name}),
                         "entry_file": str(source),
                         "source_dir": (module.get("source_root") if module.get("task_type") == TASK_TYPE_SOURCE else None) or module["source_dir"],
                     }
@@ -5539,6 +5619,8 @@ class TaskManager:
                 for value in (entry.get("taint_params") or [])
                 if str(value).strip()
             ]
+            if not taint_params:
+                taint_params = _entry_signature_params(entry)
             definition_found = bool(entry.get("is_definition_found", True))
             definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
@@ -5887,6 +5969,12 @@ class TaskManager:
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
+            signature_params = _entry_signature_params(entry)
+            taint_params = [
+                str(value).strip()
+                for value in (entry.get("taint_params") or [])
+                if str(value).strip()
+            ] or signature_params
             rows.append(
                 {
                     "entry_key": entry.get("entry_key"),
@@ -5896,7 +5984,13 @@ class TaskManager:
                     "module_name": entry.get("module_name"),
                     "file_name": entry.get("file_name"),
                     "function_name": entry.get("function_name"),
+                    "raw_function_name": entry.get("raw_function_name"),
                     "line_no": entry.get("line_no"),
+                    "definition_file": entry.get("definition_file") or entry.get("file_name"),
+                    "definition_line": entry.get("definition_line") or entry.get("line_no"),
+                    "is_definition_found": entry.get("is_definition_found", True),
+                    "taint_params": taint_params,
+                    "signature_params": signature_params,
                     "entry_file": entry.get("entry_file"),
                     "source_dir": entry.get("source_dir"),
                 }

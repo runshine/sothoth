@@ -188,7 +188,7 @@ class TaskManagerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "result.json").write_text(
-                '{"entries":[{"file_name":"main.c","function_name":"handle_req","line_no":12}]}',
+                '{"entries":[{"file_name":"main.c","function_name":"int handle_req(int argc, char **argv)","line_no":12}]}',
                 encoding="utf-8",
             )
 
@@ -197,6 +197,7 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual(1, len(rows))
             self.assertEqual("handle_req", rows[0]["function_name"])
             self.assertEqual("main.c", rows[0]["file_name"])
+            self.assertEqual(["argc", "argv"], rows[0]["signature_params"])
 
     def test_parse_entries_falls_back_to_markdown_table(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -622,7 +623,13 @@ class TaskManagerTests(unittest.TestCase):
                                 "module_name": "openssl",
                                 "file_name": "main.c",
                                 "function_name": "main",
+                                "raw_function_name": "main",
                                 "line_no": "10",
+                                "definition_file": "src/main.c",
+                                "definition_line": "42",
+                                "is_definition_found": True,
+                                "taint_params": ["argv", ""],
+                                "signature_params": ["argc", "argv"],
                                 "source_dir": "/tmp/archive/openssl",
                                 "extra_blob": "x" * 4000,
                             }
@@ -636,11 +643,55 @@ class TaskManagerTests(unittest.TestCase):
 
         stored = task.summary["entry_results"][0]
         self.assertEqual("e1", stored["entries"][0]["entry_key"])
+        self.assertEqual("src/main.c", stored["entries"][0]["definition_file"])
+        self.assertEqual("42", stored["entries"][0]["definition_line"])
+        self.assertTrue(stored["entries"][0]["is_definition_found"])
+        self.assertEqual(["argv"], stored["entries"][0]["taint_params"])
+        self.assertEqual(["argc", "argv"], stored["entries"][0]["signature_params"])
         self.assertNotIn("extra_blob", stored["entries"][0])
         self.assertNotIn("downstream", stored)
         self.assertEqual(1, summary["entry_count"])
         self.assertNotIn("entries", summary["items"][0])
         self.assertEqual("e1", summary["items"][0]["entries_preview"][0]["entry_key"])
+        self.assertEqual(["argv"], summary["items"][0]["entries_preview"][0]["taint_params"])
+
+    def test_entry_results_default_missing_taints_to_all_signature_params(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
+        task.summary = {}
+        db = _FakeDb()
+
+        self.manager._aggregate_stage_items(
+            db,
+            task,
+            results=[
+                {
+                    "status": "success",
+                    "item": {
+                        "module_key": "m1",
+                        "module_name": "openssl",
+                        "source_dir": "/tmp/archive/openssl",
+                        "entries": [
+                            {
+                                "entry_key": "e1",
+                                "module_key": "m1",
+                                "module_name": "openssl",
+                                "file_name": "main.c",
+                                "function_name": "main",
+                                "raw_function_name": "int main(int argc, char **argv)",
+                                "line_no": "10",
+                                "signature_params": ["argc", "argv"],
+                                "source_dir": "/tmp/archive/openssl",
+                            }
+                        ],
+                    },
+                }
+            ],
+            summary_key="entry_results",
+        )
+
+        stored = task.summary["entry_results"][0]["entries"][0]
+        self.assertEqual(["argc", "argv"], stored["signature_params"])
+        self.assertEqual(["argc", "argv"], stored["taint_params"])
 
     def test_dataflow_results_keep_vuln_inputs_but_drop_downstream_payload(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
