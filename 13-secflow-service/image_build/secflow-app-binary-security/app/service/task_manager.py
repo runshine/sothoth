@@ -493,6 +493,7 @@ class TaskManager:
         self._running = False
         self._loop_task: Optional[asyncio.Task] = None
         self._archive_loop_task: Optional[asyncio.Task] = None
+        self._downstream_reconcile_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
         self._worker_lock = asyncio.Lock()
 
@@ -502,6 +503,10 @@ class TaskManager:
         self._running = True
         self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
         self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
+        self._downstream_reconcile_task = asyncio.create_task(
+            self._downstream_reconcile_loop(),
+            name="binary-security-downstream-reconcile",
+        )
 
     async def stop(self) -> None:
         self._running = False
@@ -515,6 +520,12 @@ class TaskManager:
             self._archive_loop_task.cancel()
             try:
                 await self._archive_loop_task
+            except asyncio.CancelledError:
+                pass
+        if self._downstream_reconcile_task:
+            self._downstream_reconcile_task.cancel()
+            try:
+                await self._downstream_reconcile_task
             except asyncio.CancelledError:
                 pass
         active = list(self._workers.values())
@@ -1239,6 +1250,8 @@ class TaskManager:
         item_id: str | None = None,
         force: bool = False,
         token: str | None = None,
+        record_request_event: bool = True,
+        record_noop_events: bool = True,
     ) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
         query = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id)
@@ -1252,15 +1265,16 @@ class TaskManager:
         if item_id and not items:
             raise NotFoundError("阶段子任务不存在")
 
-        self._record_event(
-            db,
-            task,
-            "downstream_status_sync_requested",
-            "请求同步下游子任务状态",
-            stage_name=stage_name,
-            payload={"stage_name": stage_name, "item_id": item_id, "force": force},
-        )
-        db.commit()
+        if record_request_event:
+            self._record_event(
+                db,
+                task,
+                "downstream_status_sync_requested",
+                "请求同步下游子任务状态",
+                stage_name=stage_name,
+                payload={"stage_name": stage_name, "item_id": item_id, "force": force},
+            )
+            db.commit()
 
         synced_count = 0
         skipped_count = 0
@@ -1274,15 +1288,16 @@ class TaskManager:
             item_downstream_task_id = item.downstream_task_id
             if not item.downstream_service or not item.downstream_task_id:
                 skipped_count += 1
-                self._record_event(
-                    db,
-                    task,
-                    "downstream_status_sync_skipped",
-                    "跳过同步：子任务缺少下游服务或任务ID",
-                    level="warning",
-                    stage_name=item.stage_name,
-                    item=item,
-                )
+                if record_noop_events:
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_status_sync_skipped",
+                        "跳过同步：子任务缺少下游服务或任务ID",
+                        level="warning",
+                        stage_name=item.stage_name,
+                        item=item,
+                    )
                 continue
             ready_items.append(item)
 
@@ -1305,20 +1320,21 @@ class TaskManager:
                 mapped_status = self._map_downstream_status(downstream_status)
                 if not mapped_status:
                     skipped_count += 1
-                    self._record_event(
-                        db,
-                        task,
-                        "downstream_status_sync_skipped",
-                        f"跳过同步：无法识别下游状态 {downstream_status or '-'}",
-                        level="warning",
-                        stage_name=item.stage_name,
-                        item=item,
-                        payload={
-                            "downstream_service": item.downstream_service,
-                            "downstream_task_id": item.downstream_task_id,
-                            "downstream_status": downstream_status,
-                        },
-                    )
+                    if record_noop_events:
+                        self._record_event(
+                            db,
+                            task,
+                            "downstream_status_sync_skipped",
+                            f"跳过同步：无法识别下游状态 {downstream_status or '-'}",
+                            level="warning",
+                            stage_name=item.stage_name,
+                            item=item,
+                            payload={
+                                "downstream_service": item.downstream_service,
+                                "downstream_task_id": item.downstream_task_id,
+                                "downstream_status": downstream_status,
+                            },
+                        )
                     continue
                 terminal_status = mapped_status in {"success", "partial_success", "failed", "cancelled"}
                 if terminal_status:
@@ -1331,22 +1347,23 @@ class TaskManager:
                         before_status=before_status,
                         force=force,
                     )
-                    self._record_event(
-                        db,
-                        task,
-                        "downstream_archive_job_queued" if job.archive_status in {"pending", "running"} else "downstream_archive_job_reused",
-                        "下游状态已获取，等待产物归档完成后更新状态",
-                        stage_name=item.stage_name,
-                        item=item,
-                        payload={
-                            "archive_job_id": job.id,
-                            "archive_status": job.archive_status,
-                            "downstream_service": item.downstream_service,
-                            "downstream_task_id": item.downstream_task_id,
-                            "downstream_status": downstream_status,
-                            "mapped_status": mapped_status,
-                        },
-                    )
+                    if record_noop_events or force or mapped_status != before_status:
+                        self._record_event(
+                            db,
+                            task,
+                            "downstream_archive_job_queued" if job.archive_status in {"pending", "running"} else "downstream_archive_job_reused",
+                            "下游状态已获取，等待产物归档完成后更新状态",
+                            stage_name=item.stage_name,
+                            item=item,
+                            payload={
+                                "archive_job_id": job.id,
+                                "archive_status": job.archive_status,
+                                "downstream_service": item.downstream_service,
+                                "downstream_task_id": item.downstream_task_id,
+                                "downstream_status": downstream_status,
+                                "mapped_status": mapped_status,
+                            },
+                        )
                     skipped_count += 1
                     continue
                 if mapped_status != before_status:
@@ -1368,21 +1385,22 @@ class TaskManager:
                     synced_count += 1
                 else:
                     skipped_count += 1
-                self._record_event(
-                    db,
-                    task,
-                    "downstream_status_synced" if (force or mapped_status != before_status) else "downstream_status_sync_skipped",
-                    "下游子任务状态已同步" if (force or mapped_status != before_status) else "下游子任务状态一致，无需同步",
-                    stage_name=item.stage_name,
-                    item=item,
-                    payload={
-                        "downstream_service": item.downstream_service,
-                        "downstream_task_id": item.downstream_task_id,
-                        "before_status": before_status,
-                        "downstream_status": downstream_status,
-                        "after_status": mapped_status,
-                    },
-                )
+                if force or mapped_status != before_status or record_noop_events:
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_status_synced" if (force or mapped_status != before_status) else "downstream_status_sync_skipped",
+                        "下游子任务状态已同步" if (force or mapped_status != before_status) else "下游子任务状态一致，无需同步",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "downstream_service": item.downstream_service,
+                            "downstream_task_id": item.downstream_task_id,
+                            "before_status": before_status,
+                            "downstream_status": downstream_status,
+                            "after_status": mapped_status,
+                        },
+                    )
             except Exception as exc:
                 db.rollback()
                 failed_count += 1
@@ -1738,6 +1756,54 @@ class TaskManager:
                 pass
             await asyncio.sleep(max(1, self.cfg.scheduler.poll_interval_seconds))
 
+    async def _downstream_reconcile_loop(self) -> None:
+        interval_seconds = max(5, int(self.cfg.scheduler.stage_poll_interval_seconds or self.cfg.scheduler.poll_interval_seconds or 5))
+        while self._running:
+            db = get_session_factory()()
+            try:
+                task_refs = self._list_tasks_needing_downstream_sync(db)
+                token = self._service_token()
+                results = await self._run_with_limits(
+                    task_refs,
+                    lambda ref: self._reconcile_downstream_task_ref(ref, token),
+                    concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
+                    timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+                )
+                for ref, _, exc in results:
+                    if exc is None:
+                        continue
+                    try:
+                        task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+                        self._record_event(
+                            db,
+                            task,
+                            "downstream_status_reconcile_failed",
+                            f"后台同步下游状态失败: {exc}",
+                            level="warning",
+                            payload={"task_id": ref["task_id"], "project_id": ref["project_id"], "error": str(exc)},
+                        )
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+            finally:
+                db.close()
+            await asyncio.sleep(interval_seconds)
+
+    async def _reconcile_downstream_task_ref(self, ref: dict[str, str], token: str | None) -> None:
+        db = get_session_factory()()
+        try:
+            await self.sync_downstream_status(
+                db,
+                project_id=ref["project_id"],
+                task_id=ref["task_id"],
+                force=False,
+                token=token,
+                record_request_event=False,
+                record_noop_events=False,
+            )
+        finally:
+            db.close()
+
     def _next_archived_job(self) -> str | None:
         session_factory = get_session_factory()
         db = session_factory()
@@ -1769,6 +1835,21 @@ class TaskManager:
             return job.id if updated else None
         finally:
             db.close()
+
+    def _list_tasks_needing_downstream_sync(self, db: Session) -> list[dict[str, str]]:
+        rows = (
+            db.query(BinarySecurityTask.project_id, BinarySecurityTask.id)
+            .join(BinarySecurityStageItem, BinarySecurityStageItem.task_id == BinarySecurityTask.id)
+            .filter(
+                BinarySecurityTask.status.in_(["pending", "dispatching", "running"]),
+                BinarySecurityStageItem.downstream_service.isnot(None),
+                BinarySecurityStageItem.downstream_task_id.isnot(None),
+                BinarySecurityStageItem.status.in_(["pending", "queued", "running", "dispatching"]),
+            )
+            .distinct()
+            .all()
+        )
+        return [{"project_id": str(project_id), "task_id": str(task_id)} for project_id, task_id in rows]
 
     def _claim_archive_job(self) -> str | None:
         session_factory = get_session_factory()
