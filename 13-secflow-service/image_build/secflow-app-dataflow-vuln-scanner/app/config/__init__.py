@@ -117,6 +117,11 @@ class ServiceConfig(BaseModel):
     # timeout enforcement is disabled; only explicit user cancel/delete stops it.
     default_execution_timeout_seconds: int = 0
     execution_cancel_check_interval_seconds: int = 1
+    # run_vuln_scan.py can keep working while the API pod or mounted storage has
+    # short heartbeat stalls. Treat the process as lost only after a long grace
+    # window so transient network/storage jitter does not incorrectly invite
+    # users to resume an already-running scan.
+    process_heartbeat_stale_after_seconds: int = 300
     trigger_retry_limit: int = 0
     public_api_prefix: str = "/api/dataflow-vuln-scanner"
     default_entry_task_type: str = "package_list"
@@ -132,7 +137,7 @@ class SchedulerConfig(BaseModel):
     worker_capacity: int = 2
     poll_interval_seconds: int = 2
     heartbeat_interval_seconds: int = 5
-    worker_timeout_seconds: int = 20
+    worker_timeout_seconds: int = 300
     cleanup_interval_seconds: int = 10
 
 

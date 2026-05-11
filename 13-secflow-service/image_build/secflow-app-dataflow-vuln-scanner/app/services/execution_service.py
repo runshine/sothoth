@@ -532,9 +532,10 @@ class ExecutionService:
 
     def _process_heartbeat_stale_after_seconds(self) -> int:
         cfg = get_config()
+        configured_seconds = max(int(getattr(cfg.service, "process_heartbeat_stale_after_seconds", 0) or 0), 0)
         scheduler_seconds = max(int(getattr(cfg.scheduler, "heartbeat_interval_seconds", 0) or 0) * 3, 0)
         cancel_poll_seconds = max(int(getattr(cfg.service, "execution_cancel_check_interval_seconds", 0) or 0) * 5, 0)
-        return max(scheduler_seconds, cancel_poll_seconds, 30)
+        return max(configured_seconds, scheduler_seconds, cancel_poll_seconds, 30)
 
     def _parse_process_timestamp(self, value: Any) -> datetime | None:
         text = str(value or "").strip()

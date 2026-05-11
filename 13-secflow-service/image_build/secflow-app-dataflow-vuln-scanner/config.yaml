@@ -66,6 +66,7 @@ service:
   workspace_base_dir: /data/files
   default_execution_timeout_seconds: 0
   execution_cancel_check_interval_seconds: 1
+  process_heartbeat_stale_after_seconds: 300
   trigger_retry_limit: 0
   public_api_prefix: /api/dataflow-vuln-scanner
   default_entry_task_type: package_list
@@ -78,5 +79,5 @@ scheduler:
   worker_capacity: 2
   poll_interval_seconds: 1
   heartbeat_interval_seconds: 2
-  worker_timeout_seconds: 10
+  worker_timeout_seconds: 300
   cleanup_interval_seconds: 5
