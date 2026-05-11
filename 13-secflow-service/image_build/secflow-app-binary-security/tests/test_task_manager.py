@@ -100,6 +100,20 @@ class _ModelAwareDb:
         pass
 
 
+class _AppendingModelAwareDb(_ModelAwareDb):
+    def add(self, obj):
+        super().add(obj)
+        model_name = obj.__class__.__name__
+        if model_name == "BinarySecurityStageItem":
+            self.stage_items.append(obj)
+        elif model_name == "BinarySecurityStageRun":
+            self.stage_runs.append(obj)
+        elif model_name == "BinarySecurityArchiveJob":
+            self.archive_jobs.append(obj)
+        elif model_name == "BinarySecurityTask":
+            self.tasks.append(obj)
+
+
 class _StageRun:
     def __init__(self, stage_name, status):
         self.stage_name = stage_name
@@ -1457,6 +1471,58 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual(1, len(rows))
         self.assertEqual("m1", rows[0]["module_key"])
+
+    def test_stage_entry_analysis_precreates_all_selected_modules_as_queued_items(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source-task",
+            task_type=TASK_TYPE_SOURCE,
+            status="pending",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "selected_modules": [
+                {"module_key": "m1", "module_name": "module1", "firmware_key": "source_project_1", "source_dir": "/src/module1"},
+                {"module_key": "m2", "module_name": "module2", "firmware_key": "source_project_2", "source_dir": "/src/module2"},
+                {"module_key": "m3", "module_name": "module3", "firmware_key": "source_project_3", "source_dir": "/src/module3"},
+            ]
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+        async def fake_run_stage_pool(current_task, items, concurrency, runner, retries=0, initial_retry=False):
+            queued_items = [
+                obj for obj in db.added
+                if isinstance(obj, BinarySecurityStageItem) and obj.stage_name == "entry_analysis"
+            ]
+            self.assertEqual(task, current_task)
+            self.assertEqual(3, len(items))
+            self.assertEqual(3, len(queued_items))
+            self.assertEqual(["m1", "m2", "m3"], [item.item_key for item in queued_items])
+            self.assertTrue(all(item.status == "queued" for item in queued_items))
+            self.assertTrue(all(item.started_at is None for item in queued_items))
+            return [
+                {"status": "cancelled", "item": module, "error": "cancelled"}
+                for module in items
+            ]
+
+        self.manager._run_stage_pool = fake_run_stage_pool
+
+        status, summary = asyncio.run(self.manager._stage_entry_analysis(db, task, stage_run, token=None, retry_existing=False))
+
+        self.assertEqual("cancelled", status)
+        self.assertEqual(3, summary["cancelled_count"])
 
     def test_filter_candidate_modules_by_risk_levels(self):
         modules = [

@@ -3466,7 +3466,7 @@ class TaskManager:
         db.flush()
         return item
 
-    def _prepare_stage_items_for_retry(
+    def _prepare_stage_items_for_execution(
         self,
         db: Session,
         *,
@@ -3477,12 +3477,7 @@ class TaskManager:
         identity,
         output_ref,
     ) -> None:
-        """Mark every intended stage item as queued before a stage-only retry starts.
-
-        The actual worker still decides whether to call a native downstream retry or
-        create a new downstream task. This pre-step makes the DB reflect that all
-        current-stage inputs are part of the retry, not only the first concurrency batch.
-        """
+        """Persist every intended stage item as queued before fan-out execution starts."""
         for input_item in inputs:
             item_key, item_name, parent_key, input_ref = identity(input_item)
             item = self._find_stage_item(
@@ -3938,23 +3933,22 @@ class TaskManager:
         input_files = list(task.summary.get("input_files") or [])
         if not input_files:
             return "failed", {"error": "缺少输入文件"}
-        if retry_existing:
-            self._prepare_stage_items_for_retry(
-                db,
-                task=task,
-                stage_run=stage_run,
-                inputs=input_files,
-                downstream_service="firmware_unpacker",
-                identity=lambda input_file: (
-                    input_file["firmware_key"],
-                    input_file["filename"],
-                    input_file["firmware_key"],
-                    {"filename": input_file["filename"], "path": str(Path(task.workspace_root) / "input" / input_file["filename"])},
-                ),
-                output_ref=lambda input_file: {
-                    "output_path": str(Path(task.workspace_root) / "run" / "firmware-unpacker" / input_file["firmware_key"]),
-                },
-            )
+        self._prepare_stage_items_for_execution(
+            db,
+            task=task,
+            stage_run=stage_run,
+            inputs=input_files,
+            downstream_service="firmware_unpacker",
+            identity=lambda input_file: (
+                input_file["firmware_key"],
+                input_file["filename"],
+                input_file["firmware_key"],
+                {"filename": input_file["filename"], "path": str(Path(task.workspace_root) / "input" / input_file["filename"])},
+            ),
+            output_ref=lambda input_file: {
+                "output_path": str(Path(task.workspace_root) / "run" / "firmware-unpacker" / input_file["firmware_key"]),
+            },
+        )
         results = await self._run_stage_pool(
             task,
             input_files,
@@ -4077,21 +4071,20 @@ class TaskManager:
         system_inputs = self._system_analysis_inputs(task)
         if not system_inputs:
             return "failed", {"error": "缺少可用于系统分析的输入"}
-        if retry_existing:
-            self._prepare_stage_items_for_retry(
-                db,
-                task=task,
-                stage_run=stage_run,
-                inputs=system_inputs,
-                downstream_service="system_analyse",
-                identity=lambda analysis_input: (
-                    analysis_input["firmware_key"],
-                    analysis_input.get("firmware_name") or analysis_input["firmware_key"],
-                    analysis_input["firmware_key"],
-                    analysis_input,
-                ),
-                output_ref=lambda _analysis_input: {},
-            )
+        self._prepare_stage_items_for_execution(
+            db,
+            task=task,
+            stage_run=stage_run,
+            inputs=system_inputs,
+            downstream_service="system_analyse",
+            identity=lambda analysis_input: (
+                analysis_input["firmware_key"],
+                analysis_input.get("firmware_name") or analysis_input["firmware_key"],
+                analysis_input["firmware_key"],
+                analysis_input,
+            ),
+            output_ref=lambda _analysis_input: {},
+        )
         results = await self._run_stage_pool(
             task,
             system_inputs,
@@ -4781,21 +4774,20 @@ class TaskManager:
         modules = list(task.summary.get("selected_modules") or [])
         if not modules:
             return "failed", {"error": "缺少已选模块列表"}
-        if retry_existing:
-            self._prepare_stage_items_for_retry(
-                db,
-                task=task,
-                stage_run=stage_run,
-                inputs=modules,
-                downstream_service="binary_to_source",
-                identity=lambda module: (
-                    module["module_key"],
-                    module["module_name"],
-                    module.get("firmware_key"),
-                    module,
-                ),
-                output_ref=lambda _module: {},
-            )
+        self._prepare_stage_items_for_execution(
+            db,
+            task=task,
+            stage_run=stage_run,
+            inputs=modules,
+            downstream_service="binary_to_source",
+            identity=lambda module: (
+                module["module_key"],
+                module["module_name"],
+                module.get("firmware_key"),
+                module,
+            ),
+            output_ref=lambda _module: {},
+        )
         results = await self._run_stage_pool(
             task,
             modules,
@@ -4817,21 +4809,20 @@ class TaskManager:
         b2s_success = self._entry_analysis_inputs(task)
         if not b2s_success:
             return "failed", {"error": "没有可用于入口分析的源码模块"}
-        if retry_existing:
-            self._prepare_stage_items_for_retry(
-                db,
-                task=task,
-                stage_run=stage_run,
-                inputs=b2s_success,
-                downstream_service="entry_analyse",
-                identity=lambda module: (
-                    module["module_key"],
-                    module["module_name"],
-                    module.get("firmware_key"),
-                    module,
-                ),
-                output_ref=lambda _module: {},
-            )
+        self._prepare_stage_items_for_execution(
+            db,
+            task=task,
+            stage_run=stage_run,
+            inputs=b2s_success,
+            downstream_service="entry_analyse",
+            identity=lambda module: (
+                module["module_key"],
+                module["module_name"],
+                module.get("firmware_key"),
+                module,
+            ),
+            output_ref=lambda _module: {},
+        )
         results = await self._run_stage_pool(
             task,
             b2s_success,
@@ -4862,21 +4853,20 @@ class TaskManager:
         entries = _deduplicate_entry_keys(entries)
         if not entries:
             return "failed", {"error": "没有可用于数据流分析的入口"}
-        if retry_existing:
-            self._prepare_stage_items_for_retry(
-                db,
-                task=task,
-                stage_run=stage_run,
-                inputs=entries,
-                downstream_service="dataflow_analyse",
-                identity=lambda entry: (
-                    entry["entry_key"],
-                    entry["function_name"],
-                    entry.get("module_key"),
-                    entry,
-                ),
-                output_ref=lambda _entry: {},
-            )
+        self._prepare_stage_items_for_execution(
+            db,
+            task=task,
+            stage_run=stage_run,
+            inputs=entries,
+            downstream_service="dataflow_analyse",
+            identity=lambda entry: (
+                entry["entry_key"],
+                entry["function_name"],
+                entry.get("module_key"),
+                entry,
+            ),
+            output_ref=lambda _entry: {},
+        )
         results = await self._run_stage_pool(
             task,
             entries,
@@ -4898,21 +4888,20 @@ class TaskManager:
         dataflow_results = list(task.summary.get("dataflow_results") or [])
         if not dataflow_results:
             return "failed", {"error": "没有可用于漏洞扫描的数据流结果"}
-        if retry_existing:
-            self._prepare_stage_items_for_retry(
-                db,
-                task=task,
-                stage_run=stage_run,
-                inputs=dataflow_results,
-                downstream_service="dataflow_vuln_scanner",
-                identity=lambda result: (
-                    result["entry_key"],
-                    result["function_name"],
-                    result.get("module_key"),
-                    result,
-                ),
-                output_ref=lambda _result: {},
-            )
+        self._prepare_stage_items_for_execution(
+            db,
+            task=task,
+            stage_run=stage_run,
+            inputs=dataflow_results,
+            downstream_service="dataflow_vuln_scanner",
+            identity=lambda result: (
+                result["entry_key"],
+                result["function_name"],
+                result.get("module_key"),
+                result,
+            ),
+            output_ref=lambda _result: {},
+        )
         results = await self._run_stage_pool(
             task,
             dataflow_results,
