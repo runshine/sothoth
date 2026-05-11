@@ -35,8 +35,11 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "256Mi"
-            cpu: "200m"
+            memory: "16Gi"
+            cpu: "4"
+          limits:
+            memory: "32Gi"
+            cpu: "8"
         livenessProbe:
           httpGet:
             path: /api/app/system-analyse/health
