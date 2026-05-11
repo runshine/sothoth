@@ -30,12 +30,21 @@
 - `git`
 - `ripgrep`
 - `bash`
+- `qemu-system-aarch64` / `qemu-system-x86_64`
+- `qemu-img`
+- `ipc-audit-qemu` 容器内 QEMU helper
 
 当前镜像还额外显式安装了运行 OpenHarmony 工作区内 `hdc` 所需的基础动态库：
 
 - `libatomic1`
 - `libstdc++6`
 - `libgcc-s1`
+- `libusb-1.0-0`
+- `iproute2`
+- `bridge-utils`
+- `dnsmasq`
+- `procps`
+- `socat`
 
 `Dockerfile` 当前不再固定版本，构建时会直接从 npm 安装当时最新的：
 
@@ -76,6 +85,71 @@
 - `LD_LIBRARY_PATH` 固定为 `/workspace/openharmony_6_1/vendor/edu/docker/src`
 
 如果后续 OpenHarmony 挂载路径或工具链布局变化，再把 `HDC_BIN` / `LD_LIBRARY_PATH` 改成平台配置项，不在第一轮引入仓库内二进制副本。
+
+## Current OHEMU / QEMU PoC Runtime
+
+PoC 阶段现在按“当前 `secflow-app-ipc-audit` 容器内直接启动 QEMU”的方式约束，不再让 agent 使用旧的 `ohemu-container.sh` 额外创建 OHEMU Docker 容器。
+
+镜像内置 helper：
+
+- `/usr/local/bin/ipc-audit-qemu`
+
+这个 helper 会复用挂载的 OpenHarmony 工作区脚本：
+
+- `/workspace/openharmony_6_1/vendor/edu/docker/src/init.sh`
+- `/workspace/openharmony_6_1/vendor/edu/docker/src/network.sh`
+- `/workspace/openharmony_6_1/vendor/edu/docker/src/qemu_common.sh`
+
+默认固定路径和参数：
+
+- `OHEMU_WORKSPACE_ROOT=/workspace/openharmony_6_1`
+- `OHEMU_QCOW2_PREPARED_ROOT=/workspace/openharmony_6_1/vendor/edu/docker/volumes/qcow2_cache`
+- `OHEMU_RUNTIME_ROOT=/var/lib/secflow-ipc-audit/ohemu`
+- `OHEMU_ARCH=arm64`
+- `OHEMU_NETWORK_MODE=bridge`
+- `OHEMU_HDC_BIND=127.0.0.1`
+- `OHEMU_HDC_BASE_PORT=55555`
+- `OHEMU_WAIT_FOR_HDC_READY=1`
+- `OHEMU_HDC_READY_TIMEOUT=180`
+
+磁盘安全约束：
+
+- QEMU 只能运行在每个实例自己的 overlay qcow2 上
+- prepared base qcow2 只作为 backing file，不允许直接写
+- OpenHarmony `out/*/packages/phone/images/*.img` 只作为 boot/raw 来源，不允许直接作为可写运行盘
+- 实例 overlay 默认写到 `/var/lib/secflow-ipc-audit/ohemu/runtime/instances/<instance>/*.qcow2`
+- 如果 overlay 创建失败，PoC runtime 应标记为 `BLOCKED_ENV`，不能退化成直接跑共享 qcow2/raw image
+
+常用命令：
+
+```bash
+ipc-audit-qemu list
+ipc-audit-qemu ensure ipc-audit-poc
+/workspace/openharmony_6_1/vendor/edu/docker/src/hdc tconn 127.0.0.1:<HDC_PORT_FROM_LIST>
+/workspace/openharmony_6_1/vendor/edu/docker/src/hdc list targets
+```
+
+注意：
+
+- `ipc-audit-qemu` 不调用 `ohemu-container.sh`
+- `ipc-audit-qemu` 不调用 `docker run` / `docker exec` / `docker compose`
+- 默认使用 QEMU bridge/tap 网络，guest 通常获得 `192.168.111.x` 地址，helper 会用 `socat` 把 `127.0.0.1:<HDC_PORT>` 转发到 `<GUEST_IP>:55555`
+- `55555` 是 helper 默认分配的容器内 HDC 转发起始端口，不要把 guest 侧 `5555` 当作连接端口
+- `ipc-audit-qemu ensure/start` 默认会继续轮询 `hdc tconn` 和 `hdc list targets -v`，直到 helper 分配的 HDC endpoint 真正 `Connected`，避免把 QEMU `hostfwd` 已监听误判为 hdcd 已就绪
+- `usermode` 下 guest 通常会拿到 `20.20.20.21`，QEMU 会立即监听 `127.0.0.1:<HDC_PORT>`，但 hdcd 可能要在 boot 后约一分钟才可握手；自动化脚本必须等 HDC ready
+- 非 privileged 容器中 `hdc` server 可能因 `libusb_init failed ctxUSB is nullptr` 退出；即使使用 QEMU usermode 网络，也不要把 PoC runtime 降级成普通非 privileged 容器
+- QEMU runtime、state、log 写入 `/var/lib/secflow-ipc-audit/ohemu`
+- 默认要求 OpenHarmony 工作区里已经有 prepared qcow2 cache 和 boot 文件
+- `ipc-audit-qemu ensure/start` 会检查 prepared base qcow2 是否存在，并调用 OpenHarmony `qemu_common.sh` 创建 per-instance overlay
+
+如果缺少 qcow2 cache，可以先在 OpenHarmony 工作区侧准备：
+
+```bash
+cd /home/icsl/openharmony_6_1/vendor/edu/docker
+QEMU_ARCH=arm64 ./ohemu-container.sh prepare
+```
+
+这一条准备命令仍然是宿主机/工作区维护动作，不是 PoC agent 在 `secflow-app-ipc-audit` 容器内要执行的动作。PoC agent 如果发现 helper、QEMU、挂载工作区、qcow2 cache、boot image 或 `hdc` 不可用，应在报告里把 runtime 验证标为 `BLOCKED_ENV` 并记录具体失败命令。
 
 ## Deployment Modes
 
@@ -194,16 +268,27 @@ docker run --rm \
 ```bash
 docker run --rm -d \
   --name secflow-app-ipc-audit \
-  -p 8080:8080 \
+  -p 18080:8080 \
   -e IPC_AUDIT_EXECUTION_MODE=mock \
   -e IPC_AUDIT_MAX_PARALLEL_TASKS=1 \
   -e IPC_AUDIT_CODEX_BIN=/usr/local/bin/codex \
   -e HDC_BIN=/workspace/openharmony_6_1/vendor/edu/docker/src/hdc \
   -e LD_LIBRARY_PATH=/workspace/openharmony_6_1/vendor/edu/docker/src \
+  -e OHEMU_HELPER_BIN=/usr/local/bin/ipc-audit-qemu \
+  -e OHEMU_WORKSPACE_ROOT=/workspace/openharmony_6_1 \
+  -e OHEMU_QCOW2_PREPARED_ROOT=/workspace/openharmony_6_1/vendor/edu/docker/volumes/qcow2_cache \
+  -e OHEMU_RUNTIME_ROOT=/var/lib/secflow-ipc-audit/ohemu \
+  -e OHEMU_ARCH=arm64 \
+  -e OHEMU_NETWORK_MODE=bridge \
+  -e OHEMU_HDC_BIND=127.0.0.1 \
+  -e OHEMU_HDC_BASE_PORT=55555 \
   -e IPC_AUDIT_POC_ENABLED=true \
   -e IPC_AUDIT_POC_RUNTIME_AVAILABLE=true \
   -e IPC_AUDIT_DEFAULT_WORKSPACE_ID=oh61-main \
   -e IPC_AUDIT_WORKSPACES_JSON='[{"workspace_id":"oh61-main","display_name":"OpenHarmony 6.1 Main Tree","repo_root":"/workspace/openharmony_6_1","entries_file":".audit/ipc_entries.txt","bundle_scan_roots":["base","foundation"],"allow_custom_project_path":true,"supports_poc":true,"default_pipeline_mode":"audit_then_poc","is_default":true}]' \
+  --privileged \
+  --cap-add NET_ADMIN \
+  --device /dev/net/tun \
   -v "$(pwd)/state:/var/lib/secflow-ipc-audit" \
   -v /absolute/path/to/your/.codex:/root/.codex \
   -v /absolute/path/to/your/opencode.json:/root/.config/opencode/opencode.json \
@@ -217,8 +302,8 @@ docker run --rm -d \
 启动后可以检查：
 
 ```bash
-curl http://127.0.0.1:8080/api/app/ipc-audit/health
-curl http://127.0.0.1:8080/api/app/ipc-audit/ready
+curl http://127.0.0.1:18080/api/app/ipc-audit/health
+curl http://127.0.0.1:18080/api/app/ipc-audit/ready
 ```
 
 ## Run With Docker Compose
@@ -273,7 +358,7 @@ docker compose up --build -d
 ```bash
 docker compose ps
 docker compose logs -f secflow-app-ipc-audit
-curl http://127.0.0.1:8080/api/app/ipc-audit/ready
+curl http://127.0.0.1:18080/api/app/ipc-audit/ready
 ```
 
 停止：
@@ -408,11 +493,34 @@ IPC_AUDIT_READY_CHECK_FILE_PATHS=/root/.codex/auth.json,/root/.codex/config.toml
 - `opencode` 路径固定为 `/usr/local/bin/opencode`
 - `hdc` 路径固定为 `/workspace/openharmony_6_1/vendor/edu/docker/src/hdc`
 - `hdc` 依赖的 `libusb_shared.so` 来自同一个挂载目录
+- QEMU helper 路径固定为 `/usr/local/bin/ipc-audit-qemu`
+- PoC runtime 默认在当前容器内直接启动 QEMU，不再通过 `ohemu-container.sh` 额外启动 Docker 容器
+- QEMU prepared qcow2 默认读取 `/workspace/openharmony_6_1/vendor/edu/docker/volumes/qcow2_cache`
+- QEMU runtime/state/log 默认写入 `/var/lib/secflow-ipc-audit/ohemu`
+- QEMU 实例盘默认写入 `/var/lib/secflow-ipc-audit/ohemu/runtime/instances/<instance>/*.qcow2` overlay，不直接写 prepared base qcow2 或原始 image
+- QEMU 默认使用 `arm64` + `bridge` 网络，guest 通常在 `192.168.111.x`，容器内 HDC 转发端口默认从 `127.0.0.1:55555` 开始分配
 - `docker-compose.yml` 默认把源码工作区按只读方式挂进去，避免污染源码树
 - `docker-compose.yml` 默认直接模拟 `env_bindings` / `file_bindings` 的最终效果
 - `docker-compose.yml` 默认按单文件方式挂载 `codex` / `opencode` 配置
 - `docker-compose.platform.yml` 不再挂载 `codex` / `opencode` 宿主目录，而是等平台在部署时注入 env/file bindings
 - `docker-compose.yml` 默认还注入了 `host.docker.internal:host-gateway`
+
+本地开发建议创建 gitignore 掉的 `.env`，显式指向真实配置文件：
+
+```bash
+OH_WORKSPACE_HOST_PATH=/home/icsl/openharmony_6_1
+CODEX_AUTH_FILE=/home/icsl/.codex/auth.json
+CODEX_CONFIG_TOML_FILE=/home/icsl/.codex/config.toml
+OPENCODE_CONFIG_FILE=/home/icsl/.config/opencode/opencode.json
+```
+
+如果没有这些变量，compose 会退回到 `provider-files/*.example`，这些文件只用于 ready 链路占位，不能作为真实 `opencode_cli` 配置执行任务。
+
+OpenCode 运行时注意：
+
+- 服务会为每个 task attempt stage 注入独立的 `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME`
+- OpenCode 配置仍从 `/root/.config/opencode/opencode.json` 读取，保留平台 `file_bindings` 注入语义
+- OpenCode 数据库和日志会写到当前 stage 的 `runtime/<stage>/opencode-env/` 下，避免多个并发任务共享 `/root/.local/share/opencode/opencode.db` 导致 SQLite WAL 冲突
 
 如果你确认某个真实执行链路必须改源码树，再把 compose 里的：
 
@@ -429,21 +537,22 @@ IPC_AUDIT_READY_CHECK_FILE_PATHS=/root/.codex/auth.json,/root/.codex/config.toml
 - `mock`
 - `codex_cli`
 
-但要注意，当前服务代码真正接入执行流水线的是 `codex_cli`。`opencode` 现在只是装进了容器，方便你后续在容器内手工调试或扩展后端执行器，并没有替代现有 `codex_cli` 路径。
+但要注意，服务进程自身不直接执行 IPC PoC 逻辑，而是通过 `codex_cli` / `opencode_cli` 拉起 agent，并由 PoC prompt 约束 agent 使用容器内的 QEMU/HDC helper。
 
 `hdc` 也是类似状态：
 
 - 镜像不内置 `hdc` 和 `libusb_shared.so`
 - 容器通过挂载的 OpenHarmony 工作区固定路径调用 `hdc`
-- 但后端 Python 服务当前还没有直接调用 `hdc`
-- 目前仍然是给 `codex` / skill 在容器内自行调用 `hdc` 做准备
+- 后端 Python 服务不直接调用 `hdc`
+- PoC prompt 会要求 agent 在当前容器内通过 `ipc-audit-qemu` 启动/复用 QEMU，再用固定路径 `hdc` 连接
 
 原因是 `codex_cli` 模式除了 Python 服务本身，还依赖容器内存在：
 
 - `codex` 可执行文件
 - 挂载的 OpenHarmony 工作区内 `hdc` 运行时文件（如果 PoC 链路需要）
-- 对应技能、配置与运行时环境
-- 如果要跑真实 PoC，还可能需要额外设备 / OHEMU / `hdc` / 相关工具链
+- `ipc-audit-qemu` helper 和镜像内置 QEMU 运行时
+- 挂载的 OpenHarmony 工作区内 `vendor/edu/docker/src/*.sh`
+- prepared qcow2 cache / boot image
 
 也就是说，当前容器化已经满足：
 
@@ -451,8 +560,9 @@ IPC_AUDIT_READY_CHECK_FILE_PATHS=/root/.codex/auth.json,/root/.codex/config.toml
 - 前端联调和任务流联调
 - 容器内直接使用 `codex` / `opencode`
 - 容器内通过挂载的 OpenHarmony 工作区调用 `hdc`
+- 容器内直接启动或复用 QEMU/OHEMU，并通过容器内 HDC 端口连接
 
-但还没有把“真实 PoC 运行环境”一起完全烘焙进镜像。
+仍然没有烘焙进镜像的是 OpenHarmony 工作区、`hdc`、`libusb_shared.so`、qcow2 cache 和 boot image；这些继续来自挂载的 OpenHarmony 工作区。
 
 ## K8s
 
@@ -465,9 +575,11 @@ IPC_AUDIT_READY_CHECK_FILE_PATHS=/root/.codex/auth.json,/root/.codex/config.toml
 
 还要额外注意一个网络点：
 
-- 如果容器里执行 `hdc tconn 127.0.0.1:5555`，这里的 `127.0.0.1` 指向的是容器自己，不是宿主
-- 在 bridge 网络下，更适合改成 `hdc tconn host.docker.internal:5555`
-- 如果你坚持复用 `127.0.0.1:5555` 这种写法，就要把容器改成 `--network host`
+- 当前推荐路径是在 `secflow-app-ipc-audit` 容器内直接启动 QEMU，并使用 `OHEMU_NETWORK_MODE=bridge`
+- 这种路径下 guest 通常会拿到 `192.168.111.x` 地址，helper 会启动 `socat` 把容器内 `127.0.0.1:<HDC_PORT>` 转发到 `<GUEST_IP>:55555`
+- 因此 `hdc tconn 127.0.0.1:<HDC_PORT>` 仍然是正确入口，但 `<HDC_PORT>` 必须来自 `ipc-audit-qemu list` 或 state 文件，不要写死 guest 端口
+- 如果以后改成连接宿主机或另一个容器里已经存在的 QEMU，才需要重新评估 `host.docker.internal`、Service DNS 或 `--network host`
+- 不要把 guest 侧 HDC 端口和当前容器内 helper 分配出来的 HDC 转发端口混用
 
 如果你下一步要把真实执行也封进容器，建议继续拆两层：
 

@@ -12,6 +12,7 @@ from app.db.database import init_database
 from app.schemas import InputRef, TaskCreateRequest
 from app.services.execution_service import get_execution_service
 from app.services.task_service import get_task_service
+from app.workers.runner import StageContext, build_opencode_process_env
 
 
 class OpenCodeCliModeTest(unittest.TestCase):
@@ -36,6 +37,7 @@ class OpenCodeCliModeTest(unittest.TestCase):
         self._set_env("IPC_AUDIT_OPENCODE_BIN", str(self.fake_opencode))
         self._set_env("IPC_AUDIT_POC_ENABLED", "true")
         self._set_env("IPC_AUDIT_POC_RUNTIME_AVAILABLE", "true")
+        self._set_env("FAKE_OPENCODE_EXPECT_XDG_PREFIX", str(self.state_root))
         self._set_env(
             "IPC_AUDIT_WORKSPACES_JSON",
             json.dumps(
@@ -69,6 +71,7 @@ class OpenCodeCliModeTest(unittest.TestCase):
             "IPC_AUDIT_WORKSPACES_JSON",
             "FAKE_OPENCODE_EMPTY_FIRST",
             "FAKE_OPENCODE_ERROR_FIRST",
+            "FAKE_OPENCODE_EXPECT_XDG_PREFIX",
         ):
             os.environ.pop(key, None)
         self._reset_singletons()
@@ -137,6 +140,8 @@ class OpenCodeCliModeTest(unittest.TestCase):
         poc_log = get_task_service().get_stage_log(task.task_id, str(detail.latest_attempt_id), "poc", lines=240, cursor=None)
         self.assertIn("--dangerously-skip-permissions", poc_log.content)
         self.assertIn("-m openai/gpt-5", poc_log.content)
+        self.assertIn("XDG_DATA_HOME:", poc_log.content)
+        self.assertIn("/opencode-env/data", poc_log.content)
 
     def test_opencode_cli_retries_missing_output_in_same_session(self) -> None:
         self._set_env("FAKE_OPENCODE_EMPTY_FIRST", "1")
@@ -214,6 +219,35 @@ class OpenCodeCliModeTest(unittest.TestCase):
         self.assertIn('"sessionID": "ses_fake_error_retry"', audit_events)
         self.assertIn("# Fake Audit Message", audit_events)
 
+    def test_opencode_env_isolated_between_task_attempts(self) -> None:
+        first = self._stage_context(
+            task_id="ipc-audit-task-first",
+            attempt_id="attempt-first",
+        )
+        second = self._stage_context(
+            task_id="ipc-audit-task-second",
+            attempt_id="attempt-second",
+        )
+
+        first_env = build_opencode_process_env(first)
+        second_env = build_opencode_process_env(second)
+
+        self.assertNotEqual(first_env["XDG_DATA_HOME"], second_env["XDG_DATA_HOME"])
+        self.assertNotEqual(first_env["XDG_CACHE_HOME"], second_env["XDG_CACHE_HOME"])
+        self.assertNotEqual(first_env["XDG_STATE_HOME"], second_env["XDG_STATE_HOME"])
+        self.assertIn("ipc-audit-task-first", first_env["XDG_DATA_HOME"])
+        self.assertIn("attempt-first", first_env["XDG_DATA_HOME"])
+        self.assertIn("ipc-audit-task-second", second_env["XDG_DATA_HOME"])
+        self.assertIn("attempt-second", second_env["XDG_DATA_HOME"])
+
+        for env in (first_env, second_env):
+            data_home = Path(env["XDG_DATA_HOME"])
+            cache_home = Path(env["XDG_CACHE_HOME"])
+            state_home = Path(env["XDG_STATE_HOME"])
+            self.assertTrue(data_home.is_dir())
+            self.assertTrue(cache_home.is_dir())
+            self.assertTrue(state_home.is_dir())
+
     def _write_fake_opencode(self) -> None:
         script = "\n".join(
             [
@@ -236,6 +270,13 @@ class OpenCodeCliModeTest(unittest.TestCase):
                 "    if value == '--session' and index + 1 < len(args):",
                 "        session_id = args[index + 1]",
                 "prompt = args[-1]",
+                "",
+                "xdg_data_home = os.environ.get('XDG_DATA_HOME', '')",
+                "expected_prefix = os.environ.get('FAKE_OPENCODE_EXPECT_XDG_PREFIX', '')",
+                "if expected_prefix and not xdg_data_home.startswith(expected_prefix):",
+                "    raise SystemExit(f'unexpected XDG_DATA_HOME: {xdg_data_home}')",
+                "if 'opencode-env/data' not in xdg_data_home:",
+                "    raise SystemExit(f'missing isolated opencode XDG_DATA_HOME: {xdg_data_home}')",
                 "",
                 "if os.environ.get('FAKE_OPENCODE_ERROR_FIRST') == '1' and session_id is None:",
                 "    events = [",
@@ -278,6 +319,7 @@ class OpenCodeCliModeTest(unittest.TestCase):
                 "",
                 "events = [",
                 "    {'type': 'status', 'message': f'{stage} started'},",
+                "    {'type': 'status', 'message': f'xdg data {xdg_data_home}'},",
                 "    {",
                 "        'type': 'assistant_message',",
                 "        'stage': stage,",
@@ -296,6 +338,26 @@ class OpenCodeCliModeTest(unittest.TestCase):
         )
         self.fake_opencode.write_text(script + "\n", encoding="utf-8")
         self.fake_opencode.chmod(0o755)
+
+    def _stage_context(self, *, task_id: str, attempt_id: str) -> StageContext:
+        attempt_root = self.state_root / "tasks" / task_id / "attempts" / attempt_id
+        return StageContext(
+            task_id=task_id,
+            attempt_id=attempt_id,
+            workspace_id="oh61-main",
+            stage_name="audit",
+            input_kind="custom_project",
+            pipeline_mode="audit_only",
+            project_path="foundation/demo/service",
+            report_path=None,
+            repo_root=self.repo_root,
+            attempt_root=attempt_root,
+            runtime_root=attempt_root / "runtime",
+            logs_dir=attempt_root / "logs",
+            artifacts_dir=attempt_root / "artifacts",
+            scratch_dir=attempt_root / "scratch",
+            effective_config={"executor_mode": "opencode_cli"},
+        )
 
     @staticmethod
     def _set_env(key: str, value: str) -> None:
