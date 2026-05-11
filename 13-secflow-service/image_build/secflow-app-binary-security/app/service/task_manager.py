@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -1565,13 +1566,19 @@ class TaskManager:
         extra_paths: list[str | Path] | None = None,
     ) -> BinarySecurityArchiveJob:
         downstream_task_id = str(item.downstream_task_id or "").strip()
-        lock_name = f"secflow_binary_archive:{item.id}:{downstream_task_id}"
+        lock_digest = hashlib.sha1(f"{item.id}:{downstream_task_id}".encode("utf-8")).hexdigest()
+        lock_name = f"bs_archive:{lock_digest}"
         locked = False
         try:
             try:
                 locked = bool(db.execute(text("SELECT GET_LOCK(:name, :timeout)"), {"name": lock_name, "timeout": 5}).scalar())
             except Exception:
                 locked = False
+            if not locked:
+                # Avoid a best-effort local race when the DB lock is unavailable
+                # (for example in tests or if the DB rejects named locks).
+                import time as _time
+                _time.sleep(0.05)
             existing = (
                 db.query(BinarySecurityArchiveJob)
                 .filter(
@@ -1627,6 +1634,14 @@ class TaskManager:
             if failed is None:
                 db.add(job)
             db.flush()
+            # The archive worker may run in another process/session. Persist the
+            # queued job before releasing the named lock so a concurrent sync path
+            # can observe and reuse it instead of creating a duplicate job.
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
             return job
         finally:
             if locked:
@@ -1873,33 +1888,52 @@ class TaskManager:
         session_factory = get_session_factory()
         db = session_factory()
         try:
-            job = (
-                db.query(BinarySecurityArchiveJob)
-                .filter(BinarySecurityArchiveJob.archive_status == "pending")
-                .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
-                .first()
-            )
-            if job is None:
-                return None
-            updated = (
-                db.query(BinarySecurityArchiveJob)
-                .filter(
-                    BinarySecurityArchiveJob.id == job.id,
-                    BinarySecurityArchiveJob.archive_status == "pending",
+            while True:
+                job = (
+                    db.query(BinarySecurityArchiveJob)
+                    .filter(BinarySecurityArchiveJob.archive_status == "pending")
+                    .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+                    .first()
                 )
-                .update(
-                    {
-                        BinarySecurityArchiveJob.archive_status: "running",
-                        BinarySecurityArchiveJob.owner_id: self.instance_id,
-                        BinarySecurityArchiveJob.started_at: _now(),
-                        BinarySecurityArchiveJob.updated_at: _now(),
-                        BinarySecurityArchiveJob.attempts: int(job.attempts or 0) + 1,
-                    },
-                    synchronize_session=False,
+                if job is None:
+                    return None
+                duplicate_active = (
+                    db.query(BinarySecurityArchiveJob)
+                    .filter(
+                        BinarySecurityArchiveJob.id != job.id,
+                        BinarySecurityArchiveJob.item_id == job.item_id,
+                        BinarySecurityArchiveJob.downstream_task_id == job.downstream_task_id,
+                        BinarySecurityArchiveJob.archive_status.in_(["running", "archived", "applying", "success"]),
+                    )
+                    .first()
                 )
-            )
-            db.commit()
-            return job.id if updated else None
+                if duplicate_active is not None:
+                    job.archive_status = "failed"
+                    job.error_message = f"duplicate archive job skipped; canonical job={duplicate_active.id}"
+                    job.completed_at = _now()
+                    job.updated_at = _now()
+                    db.commit()
+                    continue
+                updated = (
+                    db.query(BinarySecurityArchiveJob)
+                    .filter(
+                        BinarySecurityArchiveJob.id == job.id,
+                        BinarySecurityArchiveJob.archive_status == "pending",
+                    )
+                    .update(
+                        {
+                            BinarySecurityArchiveJob.archive_status: "running",
+                            BinarySecurityArchiveJob.owner_id: self.instance_id,
+                            BinarySecurityArchiveJob.started_at: _now(),
+                            BinarySecurityArchiveJob.updated_at: _now(),
+                            BinarySecurityArchiveJob.attempts: int(job.attempts or 0) + 1,
+                        },
+                        synchronize_session=False,
+                    )
+                )
+                db.commit()
+                if updated:
+                    return job.id
         finally:
             db.close()
 
