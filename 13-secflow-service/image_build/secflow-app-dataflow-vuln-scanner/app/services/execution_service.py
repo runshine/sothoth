@@ -271,7 +271,7 @@ class ExecutionService:
             profile_id=(trigger.profile_id if trigger else None),
         )
 
-    def _scan_task_response(self, db: Session, trigger: TriggerTask) -> ScanTaskResponse:
+    def _scan_task_response(self, db: Session, trigger: TriggerTask, *, include_run_summary: bool = True) -> ScanTaskResponse:
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
         if trigger.workflow_definition_version_id:
             version = self._definition_version_or_404(db, trigger.workflow_definition_version_id)
@@ -286,8 +286,91 @@ class ExecutionService:
             if task_origin_type == "binary_security"
             else "手动任务"
         )
+        def _version_review_profile() -> str:
+            version_config = version.compiled_config_json or version.definition_json or {}
+            for workflow in ((version_config.get("workflows") or {}).get("atomic") or []):
+                if not isinstance(workflow, dict):
+                    continue
+                engine = workflow.get("engine")
+                if isinstance(engine, dict) and (engine.get("review_profile") or workflow.get("id") == "vuln_scan"):
+                    return str(engine.get("review_profile") or "")
+            return ""
+
         run_locator = self._run_locator_for_execution(latest_execution, trigger)
-        run_summary = self._latest_run_summary_for_execution(db, latest_execution, trigger)
+        if include_run_summary:
+            run_summary = self._latest_run_summary_for_execution(db, latest_execution, trigger)
+        else:
+            run_summary = {}
+            if latest_execution is not None:
+                lightweight_run_index = (
+                    db.query(RunIndex)
+                    .filter(RunIndex.linked_execution_id == latest_execution.id)
+                    .first()
+                )
+                if lightweight_run_index is None:
+                    lightweight_run_index = (
+                        db.query(RunIndex)
+                        .filter(RunIndex.linked_task_id == trigger.id)
+                        .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+                        .first()
+                    )
+                if lightweight_run_index is not None:
+                    config_json = dict(lightweight_run_index.config_json or {})
+                    review_profile = str(config_json.get("review_profile") or "")
+                    for workflow in ((config_json.get("workflows") or {}).get("atomic") or []):
+                        if not isinstance(workflow, dict):
+                            continue
+                        engine = workflow.get("engine")
+                        if isinstance(engine, dict) and (engine.get("review_profile") or workflow.get("id") == "vuln_scan"):
+                            review_profile = str(engine.get("review_profile") or "")
+                            break
+                    if not review_profile:
+                        review_profile = _version_review_profile()
+                    run_summary.update({
+                        "run_id": lightweight_run_index.id,
+                        "status": lightweight_run_index.status,
+                        "model": lightweight_run_index.model,
+                        "provider": lightweight_run_index.provider,
+                        "thinking": lightweight_run_index.thinking,
+                        "max_cycles": lightweight_run_index.max_cycles,
+                        "cycles_used": lightweight_run_index.cycles_used,
+                        "result_count": lightweight_run_index.result_count,
+                        "passed_count": lightweight_run_index.passed_count,
+                        "failed_count": lightweight_run_index.failed_count,
+                        "workflow_mode": lightweight_run_index.workflow_mode,
+                        "review_profile": review_profile,
+                        "process_state": self._run_process_state(
+                            db,
+                            lightweight_run_index,
+                            trigger=trigger,
+                            execution=latest_execution,
+                        ),
+                    })
+        if run_summary and "process_state" not in run_summary:
+            run_index_for_state = None
+            run_index_id = str(run_summary.get("run_id") or "").strip()
+            if run_index_id:
+                run_index_for_state = db.get(RunIndex, run_index_id)
+            if run_index_for_state is None and latest_execution is not None:
+                run_index_for_state = (
+                    db.query(RunIndex)
+                    .filter(RunIndex.linked_execution_id == latest_execution.id)
+                    .first()
+                )
+            if run_index_for_state is None:
+                run_index_for_state = (
+                    db.query(RunIndex)
+                    .filter(RunIndex.linked_task_id == trigger.id)
+                    .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+                    .first()
+                )
+            if run_index_for_state is not None:
+                run_summary["process_state"] = self._run_process_state(
+                    db,
+                    run_index_for_state,
+                    trigger=trigger,
+                    execution=latest_execution,
+                )
         if run_locator["run_name"] and run_locator["runs_root"]:
             run_summary = {
                 "name": run_locator["run_name"],
@@ -2065,7 +2148,12 @@ class ExecutionService:
             query = query.filter(TriggerTask.profile_id == profile_id)
         safe_limit = max(1, min(int(limit or 100), 500))
         safe_offset = max(0, int(offset or 0))
-        return [self._scan_task_response(db, item) for item in query.offset(safe_offset).limit(safe_limit).all()]
+        # Keep list rendering lightweight.  Full run indexing / filesystem
+        # inspection can be expensive on NFS and previously made the async API
+        # worker miss health probes under task-list load, producing nginx 502s.
+        # The list only needs the run locator; detail/run endpoints hydrate the
+        # full run summary on demand.
+        return [self._scan_task_response(db, item, include_run_summary=False) for item in query.offset(safe_offset).limit(safe_limit).all()]
 
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:
         trigger = self._trigger_or_404(db, task_id)
@@ -2279,6 +2367,10 @@ class ExecutionService:
                     {
                         "can_retry": True,
                         "is_running": False,
+                        "stale": True,
+                        "display_status": "runtime_lost",
+                        "display_label": "运行失联",
+                        "severity": "warning",
                         "reason": "旧运行记录仍标记 active，但进程心跳已过期，可以通过 resume 重试",
                         "source": "stale_process_heartbeat",
                     }
@@ -2290,6 +2382,10 @@ class ExecutionService:
                 {
                     "can_retry": True,
                     "is_running": False,
+                    "stale": True,
+                    "display_status": "runtime_lost",
+                    "display_label": "运行失联",
+                    "severity": "warning",
                     "reason": "旧运行记录仍标记 active，但未发现本地进程或有效心跳，可以通过 resume 重试",
                     "source": "stale_active_record",
                 }

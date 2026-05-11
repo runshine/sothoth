@@ -18,27 +18,6 @@ spec:
         - name: secflow-app-dataflow-vuln-scanner
           image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest
           imagePullPolicy: Always
-          command:
-            - /bin/bash
-            - -lc
-          args:
-            - |
-              set -euo pipefail
-              restore_archive() {
-                local archive_path="$1"
-                local target_dir="$2"
-                if [ ! -f "$archive_path" ]; then
-                  return 0
-                fi
-                echo "[bootstrap] restoring ${target_dir} from ${archive_path}"
-                rm -rf "$target_dir"
-                mkdir -p /root
-                tar --no-same-owner -xzf "$archive_path" -C /root
-              }
-              restore_archive /opt/runtime-bootstrap/pi-home.tar.gz /root/.pi
-              restore_archive /opt/runtime-bootstrap/copilot-home.tar.gz /root/.copilot
-              export PI_BOOTSTRAP_DIR=/opt/runtime-bootstrap-disabled
-              exec /usr/local/bin/secflow-entrypoint serve
           env:
             - name: TZ
               value: Asia/Shanghai
@@ -66,9 +45,6 @@ spec:
               subPath: config.yaml
             - name: secflow-platform-fileserver-data-nfs-pvc
               mountPath: /data
-            - name: secflow-app-dataflow-vuln-scanner-runtime-home
-              mountPath: /opt/runtime-bootstrap
-              readOnly: true
           resources:
             requests:
               memory: "256Mi"
@@ -82,12 +58,16 @@ spec:
               port: 8080
             initialDelaySeconds: 30
             periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
           readinessProbe:
             httpGet:
               path: /api/dataflow-vuln-scanner/ready
               port: 8080
             initialDelaySeconds: 15
             periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
       volumes:
         - name: secflow-app-dataflow-vuln-scanner-config
           configMap:
@@ -98,7 +78,3 @@ spec:
         - name: secflow-platform-fileserver-data-nfs-pvc
           persistentVolumeClaim:
             claimName: secflow-platform-fileserver-data-nfs-pvc
-        - name: secflow-app-dataflow-vuln-scanner-runtime-home
-          secret:
-            secretName: secflow-app-dataflow-vuln-scanner-runtime-home
-            optional: true

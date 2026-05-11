@@ -655,24 +655,9 @@ python -m pytest tests/unit/test_review_models.py -v
 docker build -t secflow-app-dataflow-vuln-scanner .
 ```
 
-### 1.1 构建时注入本机 `pi` / `copilot` 配置（可选）
+### 1.1 LLM Provider 配置来源
 
-如果你明确要在**当前这台机器本地构建**时，就把本机 `~/.pi` 与 `~/.copilot` 一起打进镜像，可先执行：
-
-```bash
-cd 13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner
-./scripts/stage_local_agent_home.sh
-docker build -t secflow-app-dataflow-vuln-scanner:local-with-agent-home .
-```
-
-说明：
-
-- 脚本会把本机 `~/.pi` / `~/.copilot` 复制到构建上下文中的 `.docker-runtime-home/`
-- `~/.pi/agent/bin`、`~/.pi/agent/sessions` 等大文件/运行时目录会被排除，避免把无关内容打进镜像
-- `.docker-runtime-home/` 已加入 `.gitignore`，不会默认提交到仓库
-- 构建完成后，如不再需要本地副本，可执行 `rm -rf .docker-runtime-home/root`
-- 这种方式只适合**本地私有镜像**；如果镜像会推送到远端仓库，更推荐使用下面的 K8S Secret 方式
-- GitHub Actions 构建机无法读取你本机的 `~/.pi`，因此工作流构建默认不会带入这些本地认证文件
+服务启动时会调用 `sync_providers_to_pi()`，从平台配置中心读取已启用的 LLM Provider，并生成 `/root/.pi/agent/models.json`。如果 `local_pi` Provider 启用了名为 `models.json` 的配置文件注入，则该注入文件会作为最终 Pi 配置原样写入 `/root/.pi/agent/models.json`；否则才按 Provider 表单字段生成。K8S 部署不再通过 Secret 或镜像构建注入本机 `~/.pi` / `~/.copilot`。
 
 可选构建参数：
 
@@ -858,7 +843,7 @@ docker run --rm -it --entrypoint bash secflow-app-dataflow-vuln-scanner:latest
 
 ### 9. K8S
 
-推荐做法是把本机 Agent 配置同步成 Secret，再由 Pod 启动时自动恢复到 `/root/.pi` 与 `/root/.copilot`。仓库里已经接好了对应挂载和恢复逻辑。
+K8S 模式下，`/root/.pi/agent/models.json` 只由服务启动时的 `sync_providers_to_pi()` 生成；数据来自平台配置中心的 LLM Provider。`local_pi` 的 `models.json` 配置文件注入是最高优先级来源，内容必须是合法 JSON。不要再创建或挂载运行时 Agent home Secret。
 
 服务数据库密码与服务间 machine token 不再写入 ConfigMap，部署前需要先创建 Secret：
 
@@ -868,19 +853,7 @@ kubectl -n secflow-ns create secret generic secflow-app-dataflow-vuln-scanner-se
   --from-literal=service-machine-token='<machine-token>'
 ```
 
-然后同步 Agent home：
-
-```bash
-cd 13-secflow-service/image_build/secflow-app-dataflow-vuln-scanner
-./scripts/sync_local_agent_home_secret.sh
-```
-
-该脚本会：
-
-- 打包当前机器的 `~/.pi`（排除 `agent/bin`、`agent/sessions` 等运行时目录）
-- 如存在 `~/.copilot`，一并打包
-- 更新 `secflow-ns` 命名空间中的 Secret `secflow-app-dataflow-vuln-scanner-runtime-home`
-- 自动执行 `kubectl rollout restart deployment/secflow-app-dataflow-vuln-scanner`
+如需修改可用模型、Provider、API Base、API Key、context window 或 max tokens，请在平台配置中心的 LLM Provider 中修改；Pod 重启或任务启动前的同步会写入新的 `models.json`。
 
 当前平台集成清单可参考：
 
