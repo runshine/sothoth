@@ -1038,6 +1038,20 @@ _LOGGED_AGENTFLOW_EVENT_TYPES = {
     "run_cancelled",
 }
 
+_NODE_STAGE_MAP = {
+    "preprocess": "preprocess",
+    "feature_match": "feature_extract",
+    "skill_gate": "skill_match",
+    "skill_executor": "tool_match",
+    "skill_reviewer": "tool_match",
+    "generic_executor": "llm_unpack",
+    "output_summary": "llm_unpack",
+    "generic_reviewer": "review",
+    "skill_author": "cleanup",
+    "cleanup": "cleanup",
+    "finalize": "cleanup",
+}
+
 
 def _event_duration_seconds(event: dict[str, Any]) -> float | None:
     data = event.get("data")
@@ -1055,6 +1069,8 @@ def _bridge_agentflow_events(
     task_id: str | None,
     project_id: str | None,
     agentflow_run_id: str,
+    progress_callback: Callable[[str], None] | None = None,
+    event_callback: Callable[..., None] | None = None,
 ) -> int:
     if not events_path.is_file():
         return offset
@@ -1071,6 +1087,8 @@ def _bridge_agentflow_events(
             if event_type not in _LOGGED_AGENTFLOW_EVENT_TYPES:
                 continue
             data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            node_id = str(event.get("node_id") or "")
+            stage = _NODE_STAGE_MAP.get(node_id)
             log_event(
                 log,
                 logging.INFO,
@@ -1079,11 +1097,28 @@ def _bridge_agentflow_events(
                 task_id=task_id,
                 project_id=project_id,
                 agentflow_run_id=agentflow_run_id,
-                node_id=event.get("node_id"),
+                node_id=node_id or None,
                 status=data.get("status"),
                 duration_seconds=_event_duration_seconds(event),
                 error=data.get("error") or data.get("message"),
             )
+            if stage and progress_callback is not None and event_type == "node_started":
+                try:
+                    progress_callback(stage)
+                except Exception:
+                    pass
+            if stage and event_callback is not None and event_type == "node_started":
+                try:
+                    event_callback(
+                        "agentflow_stage_started",
+                        f"AgentFlow 节点开始执行：{node_id}",
+                        stage_key=stage,
+                        status="running",
+                        detail={"node_id": node_id, "agentflow_run_id": agentflow_run_id},
+                        created_by="agentflow",
+                    )
+                except Exception:
+                    pass
         return handle.tell()
 
 
@@ -1152,12 +1187,73 @@ def _cancelled_result(rounds: int, record: Any | None = None) -> dict[str, Any]:
     }
 
 
+def _normalize_output_reports(output_path: str) -> None:
+    output_root = Path(output_path)
+    for legacy_name, canonical_name in (("summary.txt", "summary.md"), ("reason.txt", "reason.md")):
+        legacy_path = output_root / legacy_name
+        canonical_path = output_root / canonical_name
+        if legacy_path.exists():
+            if canonical_path.exists():
+                legacy_path.unlink(missing_ok=True)
+            else:
+                shutil.move(str(legacy_path), str(canonical_path))
+
+
+def _copy_if_exists(source: Path, target: Path) -> None:
+    if not source.exists():
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+
+def _write_v2_1_compat_artifacts(
+    log_dir: Path | None,
+    output_path: str,
+    result: dict[str, Any],
+    ctx: dict[str, Any],
+) -> None:
+    if log_dir is None:
+        return
+    _normalize_output_reports(output_path)
+    round_zero = log_dir / "round_000"
+    round_zero.mkdir(parents=True, exist_ok=True)
+
+    feature_match_file = Path(ctx["feature_match_output_file"])
+    stage2_file = log_dir / "stage2_skill_match.json"
+    stage3_file = log_dir / "stage3_skill_exec.json"
+    stage4_file = log_dir / "stage4_llm_fallback.json"
+    stage5_file = log_dir / "stage5_skill_generate.json"
+    final_result_file = log_dir / "final_result.json"
+    summary_md = Path(output_path) / "summary.md"
+    reason_md = Path(output_path) / "reason.md"
+
+    _copy_if_exists(Path(ctx["preprocess_output_file"]), round_zero / "preprocess.json")
+    _copy_if_exists(stage2_file if stage2_file.exists() else feature_match_file, round_zero / "skill_match.json")
+    _copy_if_exists(stage3_file, round_zero / "skill_exec.json")
+    _copy_if_exists(stage4_file, round_zero / "fallback.json")
+    _copy_if_exists(stage5_file, round_zero / "stage5_skill_generate.json")
+    _copy_if_exists(summary_md, round_zero / "summary.md")
+    _copy_if_exists(reason_md, round_zero / "reason.md")
+
+    final_round = int(result.get("rounds") or 0)
+    if final_round > 0:
+        round_dir = log_dir / f"round_{final_round:03d}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        _copy_if_exists(summary_md, round_dir / "summary.md")
+        _copy_if_exists(reason_md, round_dir / "reason.md")
+        _copy_if_exists(final_result_file, round_dir / "results.json")
+
+
 def run_unpack_agentflow(
     firmware_path: str,
     output_path: str,
     cancel_check: Callable[[], bool] | None = None,
     task_id: str | None = None,
     project_id: str | None = None,
+    llm_binding_snapshot: dict[str, Any] | None = None,
+    register_cancel_hook: Callable[[Callable[[], None] | None], None] | None = None,
+    progress_callback: Callable[[str], None] | None = None,
+    event_callback: Callable[..., None] | None = None,
 ) -> dict[str, Any]:
     config = get_config()
     firmware_path = str(Path(firmware_path).expanduser().resolve())
@@ -1266,6 +1362,8 @@ def run_unpack_agentflow(
                     task_id=task_id,
                     project_id=project_id,
                     agentflow_run_id=record.id,
+                    progress_callback=progress_callback,
+                    event_callback=event_callback,
                 )
                 if cancel_check and cancel_check():
                     await orchestrator.cancel(record.id)
@@ -1277,10 +1375,13 @@ def run_unpack_agentflow(
                         task_id=task_id,
                         project_id=project_id,
                         agentflow_run_id=record.id,
+                        progress_callback=progress_callback,
+                        event_callback=event_callback,
                     )
                     result = _cancelled_result(_node_attempts(current, "generic_executor"), current)
                     if log_dir is not None:
                         _write_json(log_dir / "final_result.json", result)
+                        _write_v2_1_compat_artifacts(log_dir, output_path, result, ctx)
                     return result
                 current = _cached_run(store, record.id)
                 if current.status.value in {"completed", "failed", "cancelled"}:
@@ -1293,11 +1394,14 @@ def run_unpack_agentflow(
                 task_id=task_id,
                 project_id=project_id,
                 agentflow_run_id=record.id,
+                progress_callback=progress_callback,
+                event_callback=event_callback,
             )
             if current.status.value == "cancelled":
                 result = _cancelled_result(_node_attempts(current, "generic_executor"), current)
                 if log_dir is not None:
                     _write_json(log_dir / "final_result.json", result)
+                    _write_v2_1_compat_artifacts(log_dir, output_path, result, ctx)
                 return result
 
             preprocess_output = _node_output(current, "preprocess")
@@ -1468,6 +1572,7 @@ def run_unpack_agentflow(
                 if sample_path:
                     result["evolution_sample_path"] = sample_path
                     _write_json(log_dir / "final_result.json", result)
+                _write_v2_1_compat_artifacts(log_dir, output_path, result, ctx)
             return result
 
         try:
@@ -1475,7 +1580,10 @@ def run_unpack_agentflow(
         except RuntimeError as exc:
             if str(exc) == "__CANCELLED__":
                 if log_dir is not None:
-                    _write_json(log_dir / "final_result.json", _cancelled_result(0))
+                    cancelled = _cancelled_result(0)
+                    _write_json(log_dir / "final_result.json", cancelled)
+                    _write_v2_1_compat_artifacts(log_dir, output_path, cancelled, ctx)
+                    return cancelled
                 return _cancelled_result(0)
             raise
     finally:

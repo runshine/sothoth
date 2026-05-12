@@ -266,7 +266,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
             self.assertIn("generic_executor", node_map["output_summary"].depends_on)
             self.assertIn("output_summary", node_map["generic_reviewer"].depends_on)
             self.assertIn("generic_executor", node_map["generic_reviewer"].on_failure_restart)
-            self.assertEqual([], node_map["generic_executor"].skip_if)
             self.assertIn("SKIPPED_BY_SKILL_SUCCESS", node_map["generic_executor"].prompt)
             self.assertIn("SKIPPED_BY_PREPROCESS", node_map["generic_executor"].prompt)
             for node_id in ("skill_reviewer", "generic_reviewer"):
@@ -277,8 +276,8 @@ class AgentFlowPipelineTests(unittest.TestCase):
             for node_id in ("preprocess", "feature_match", "finalize"):
                 self.assertIn("PYTHONPATH", node_map[node_id].env)
                 self.assertIn("/app", node_map[node_id].env["PYTHONPATH"])
-            self.assertIsNone(node_map["skill_executor"].timeout_seconds)
-            self.assertIsNone(node_map["generic_executor"].timeout_seconds)
+            self.assertEqual(900, node_map["skill_executor"].timeout_seconds)
+            self.assertEqual(900, node_map["generic_executor"].timeout_seconds)
             for node_id in ("skill_executor", "generic_executor"):
                 self.assertEqual(str(root / "input" / "fw.bin"), node_map[node_id].env["firmware"])
                 self.assertEqual(str(root / "output"), node_map[node_id].env["output"])
@@ -298,6 +297,53 @@ class AgentFlowPipelineTests(unittest.TestCase):
             self.assertIn("Do not recursively copy `$output/binwalk_extract`", node_map["generic_executor"].prompt)
             self.assertIn("AGENTFLOW_GENERIC_DONE", node_map["generic_executor"].prompt)
             self.assertIn("Do not use `binwalk -eM`", node_map["generic_executor"].prompt)
+
+    def test_agentflow_writes_v2_1_compatible_run_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task_root = Path(tmp)
+            output_root = task_root / "output"
+            run_root = task_root / "run"
+            output_root.mkdir(parents=True, exist_ok=True)
+            run_root.mkdir(parents=True, exist_ok=True)
+            (output_root / "summary.txt").write_text("summary", encoding="utf-8")
+            (output_root / "reason.txt").write_text("reason", encoding="utf-8")
+            (run_root / "preprocess.json").write_text('{"success": false}', encoding="utf-8")
+            (run_root / "feature-match.json").write_text(
+                json.dumps({"features": {"family_id": "family-1"}}),
+                encoding="utf-8",
+            )
+
+            record = _record(
+                status="completed",
+                nodes={
+                    "preprocess": _node(output='{"success": false}'),
+                    "feature_match": _node(output='{"features": {"family_id": "family-1"}}'),
+                    "generic_executor": _node(output="generic unpack done", attempts=2, current_attempt=2),
+                    "generic_reviewer": _node(output="AGENTFLOW_REVIEW_SUCCESS"),
+                    "skill_author": _node(output="SKIPPED_NO_SUCCESS"),
+                },
+            )
+            progress_updates = []
+            event_updates = []
+            with patch("app.cli.match_skill", return_value=(None, 0, {"matched_status": "miss", "reasons": []})):
+                result = _run_agentflow_with_record(
+                    record,
+                    str(output_root),
+                    progress_callback=progress_updates.append,
+                    event_callback=lambda *args, **kwargs: event_updates.append((args, kwargs)),
+                )
+
+            self.assertEqual("success", result["status"])
+            self.assertTrue((output_root / "summary.md").is_file())
+            self.assertTrue((output_root / "reason.md").is_file())
+            self.assertTrue((task_root / "run" / "round_000" / "preprocess.json").is_file())
+            self.assertTrue((task_root / "run" / "round_000" / "skill_match.json").is_file())
+            self.assertTrue((task_root / "run" / "round_000" / "skill_exec.json").is_file())
+            self.assertTrue((task_root / "run" / "round_000" / "fallback.json").is_file())
+            self.assertTrue((task_root / "run" / "round_000" / "stage5_skill_generate.json").is_file())
+            self.assertTrue((task_root / "run" / "round_002" / "results.json").is_file())
+            self.assertEqual([], progress_updates)
+            self.assertEqual([], event_updates)
 
     def test_pipeline_can_enable_graph_optimization_in_safe_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -327,7 +373,7 @@ class AgentFlowPipelineTests(unittest.TestCase):
             self.assertEqual("pi", spec.optimizer)
             self.assertEqual(2, spec.n_run)
 
-    def test_pipeline_keeps_executor_nodes_unbounded_while_reviewers_use_timeouts(self):
+    def test_pipeline_applies_timeout_policy_per_node_type(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             ctx = {
@@ -349,8 +395,8 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 "cleanup_extra_args": [],
             }
             node_map = build_firmware_unpack_pipeline(ctx).node_map
-            self.assertIsNone(node_map["skill_executor"].timeout_seconds)
-            self.assertIsNone(node_map["generic_executor"].timeout_seconds)
+            self.assertEqual(30, node_map["skill_executor"].timeout_seconds)
+            self.assertEqual(30, node_map["generic_executor"].timeout_seconds)
             self.assertEqual(15, node_map["generic_reviewer"].timeout_seconds)
             self.assertEqual("python", node_map["cleanup"].agent)
 

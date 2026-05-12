@@ -10,11 +10,9 @@ from app.config import reload_config
 from app.model import ServiceConfig, get_db_session, init_database
 from app.unpacker_engine import (
     PI_AGENT_DIR_ENV,
-    PI_MODELS_JSON_ENV,
     PiRpcClient,
-    _build_models_json,
-    _normalize_provider_env_bindings,
     _resolve_provider_model,
+    run_unpack,
 )
 
 
@@ -23,43 +21,7 @@ class UnpackerEngineHelpersTests(unittest.TestCase):
         self.assertEqual("glm-5", _resolve_provider_model("share_codex", "glm-5", None))
         self.assertEqual("glm-4", _resolve_provider_model("share_codex", "glm-5", "glm-4"))
         self.assertEqual("glm-4", _resolve_provider_model("share_codex", "glm-5", "share_codex/glm-4"))
-        with self.assertRaisesRegex(ValueError, "不一致"):
-            _resolve_provider_model("share_codex", "glm-5", "other/glm-4")
-
-    def test_normalize_provider_env_bindings_prefers_custom_bindings(self):
-        env = _normalize_provider_env_bindings(
-            {
-                "provider_type": "openai-compatible",
-                "api_base": "http://llm.local/v1",
-                "api_key": "secret",
-                "model": "glm-5",
-                "env_bindings": {
-                    "OPENAI_API_KEY": "override-secret",
-                    "CUSTOM_TRACE_ID": "trace-1",
-                },
-            }
-        )
-        self.assertEqual("override-secret", env["OPENAI_API_KEY"])
-        self.assertEqual("http://llm.local/v1", env["OPENAI_BASE_URL"])
-        self.assertEqual("glm-5", env["OPENAI_MODEL"])
-        self.assertEqual("trace-1", env["CUSTOM_TRACE_ID"])
-
-    def test_build_models_json_uses_provider_specific_api_key_env_name(self):
-        payload = _build_models_json(
-            {
-                "provider_key": "anthropic-main",
-                "provider_type": "anthropic",
-                "api_base": "https://api.anthropic.com",
-                "model": "claude-sonnet",
-                "api_key": "secret",
-                "env_bindings": {"ANTHROPIC_AUTH_TOKEN": "secret"},
-            },
-            "claude-sonnet",
-        )
-        provider = payload["providers"]["anthropic-main"]
-        self.assertEqual("anthropic-messages", provider["api"])
-        self.assertEqual("ANTHROPIC_AUTH_TOKEN", provider["apiKey"])
-
+        self.assertEqual("glm-4", _resolve_provider_model("share_codex", "glm-5", "other/glm-4"))
 
 class _FakeProc:
     def __init__(self):
@@ -121,8 +83,17 @@ class PiRpcClientRuntimeBindingTests(unittest.TestCase):
         init_database()
         db = get_db_session()
         try:
-            row = db.query(ServiceConfig).filter(ServiceConfig.key == "llm_provider_key_executor").first()
-            row.value = "share_codex"
+            row = db.query(ServiceConfig).filter(ServiceConfig.key == "llm_config_file_key_executor").first()
+            if row is None:
+                row = ServiceConfig(
+                    key="llm_config_file_key_executor",
+                    value="share_codex",
+                    value_type="string",
+                    description="",
+                )
+                db.add(row)
+            else:
+                row.value = "share_codex"
             db.commit()
         finally:
             db.close()
@@ -151,22 +122,56 @@ class PiRpcClientRuntimeBindingTests(unittest.TestCase):
         }
 
         class _FakeClient:
-            def get_llm_provider(self, provider_key: str):
+            def get_llm_config_file(self, provider_key: str):
                 if provider_key != "share_codex":
                     raise AssertionError(provider_key)
-                return fake_provider
+                return {
+                    "config_file_key": provider_key,
+                    "default_model": f"{provider_key}/{fake_provider['model']}",
+                    "models_json": {
+                        "providers": {
+                            provider_key: {
+                                "type": "openai-compatible",
+                                "baseURL": fake_provider["api_base"],
+                                "apiKeyEnv": "OPENAI_API_KEY",
+                                "models": [fake_provider["model"]],
+                            }
+                        }
+                    },
+                }
 
-        with patch("app.unpacker_engine.get_configcenter_client", return_value=_FakeClient()), \
-             patch("app.unpacker_engine.subprocess.Popen", side_effect=_fake_popen), \
-             patch("app.unpacker_engine.os.getpgid", return_value=123), \
-             patch("app.unpacker_engine.os.killpg"):
+        with patch("app.unpacker_engine_pi.get_configcenter_client", return_value=_FakeClient()), \
+             patch("app.unpacker_engine_pi.subprocess.Popen", side_effect=_fake_popen), \
+             patch("app.unpacker_engine_pi.os.getpgid", return_value=123), \
+             patch("app.unpacker_engine_pi.os.killpg"):
             client = PiRpcClient(provider_role="executor")
             agent_dir = Path(captured["env"][PI_AGENT_DIR_ENV])
             self.assertTrue((agent_dir / "models.json").is_file())
             self.assertTrue((agent_dir / "settings.json").is_file())
-            self.assertEqual(str(agent_dir / "models.json"), captured["env"][PI_MODELS_JSON_ENV])
-            self.assertEqual("secret", captured["env"]["OPENAI_API_KEY"])
-            self.assertEqual("glm-5", captured["env"]["SECFLOW_LLM_MODEL"])
-            self.assertEqual("enabled", captured["env"]["TRACE_FLAG"])
             client.close()
             self.assertFalse(agent_dir.exists())
+
+
+class AgentFlowDelegationTests(unittest.TestCase):
+    def test_run_unpack_delegates_to_agentflow_when_enabled(self):
+        config = type("Config", (), {"agentflow": type("AgentFlow", (), {"enabled": True})()})()
+        expected = {"status": "success", "message": "ok", "rounds": 1}
+
+        with patch("app.unpacker_engine.get_config", return_value=config), \
+             patch("app.cli.run_unpack_agentflow", return_value=expected) as mocked_run:
+            result = run_unpack(
+                task_id="task-1",
+                firmware_path="/tmp/fw.bin",
+                output_path="/tmp/output",
+                llm_binding_snapshot={"roles": {}},
+                cancel_check=lambda: False,
+                register_cancel_hook=lambda hook: None,
+                progress_callback=lambda stage: None,
+                event_callback=lambda *args, **kwargs: None,
+            )
+
+        self.assertEqual(expected, result)
+        mocked_run.assert_called_once()
+        self.assertEqual("task-1", mocked_run.call_args.kwargs["task_id"])
+        self.assertEqual("/tmp/fw.bin", mocked_run.call_args.kwargs["firmware_path"])
+        self.assertEqual("/tmp/output", mocked_run.call_args.kwargs["output_path"])

@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from app.config import get_config
 from app.logging_utils import log_event
 from app.preprocess import detect_format, run_preprocess
 from app.skill_store import (
@@ -955,6 +956,21 @@ def run_unpack(
     event_callback: Optional[Callable[..., None]] = None,
 ) -> dict:
     """Execute the firmware unpacking pipeline."""
+
+    if getattr(get_config(), "agentflow", None) and get_config().agentflow.enabled:
+        from app.cli import run_unpack_agentflow
+
+        return run_unpack_agentflow(
+            firmware_path=firmware_path,
+            output_path=output_path,
+            cancel_check=cancel_check,
+            task_id=task_id,
+            project_id=None,
+            llm_binding_snapshot=llm_binding_snapshot,
+            register_cancel_hook=register_cancel_hook,
+            progress_callback=progress_callback,
+            event_callback=event_callback,
+        )
 
     active_client: PiRpcClient | None = None
 
