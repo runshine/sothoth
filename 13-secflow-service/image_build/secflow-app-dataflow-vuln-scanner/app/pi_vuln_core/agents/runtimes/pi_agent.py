@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import platform
 import time
 import uuid
@@ -365,6 +366,30 @@ class PiAgentRuntime(BaseAgentRuntime):
             if normalized in {"0", "false", "no", "off"}:
                 return False
         return default
+
+    def _subprocess_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        runtime_env = self.runtime_config.get("env")
+        if isinstance(runtime_env, dict):
+            for key, value in runtime_env.items():
+                text_key = str(key or "").strip()
+                if not text_key:
+                    continue
+                env[text_key] = str(value)
+        home_dir = str(self.runtime_config.get("agent_home_dir") or env.get("SECFLOW_PI_AGENT_HOME") or "").strip()
+        skills_dir = str(self.runtime_config.get("skills_dir") or env.get("SECFLOW_PI_SKILLS_DIR") or "").strip()
+        memory_dir = str(self.runtime_config.get("memory_dir") or env.get("SECFLOW_PI_MEMORY_DIR") or "").strip()
+        if home_dir:
+            Path(home_dir).mkdir(parents=True, exist_ok=True)
+            env["PI_CODING_AGENT_DIR"] = home_dir
+            env.setdefault("SECFLOW_PI_AGENT_HOME", home_dir)
+        if skills_dir:
+            Path(skills_dir).mkdir(parents=True, exist_ok=True)
+            env["SECFLOW_PI_SKILLS_DIR"] = skills_dir
+        if memory_dir:
+            Path(memory_dir).mkdir(parents=True, exist_ok=True)
+            env["SECFLOW_PI_MEMORY_DIR"] = memory_dir
+        return env
 
     @staticmethod
     async def _terminate_process(proc, *, grace_seconds: float = 5.0) -> None:
@@ -783,6 +808,7 @@ class PiAgentRuntime(BaseAgentRuntime):
         启动失败 (FileNotFoundError / OSError) 直接抛出，由调用方捕获并重试。
         """
         started_monotonic = time.monotonic()
+        child_env = self._subprocess_env()
 
         # 启动子进程（异常向上抛，由 send_message 的 launch retry 处理）
         if IS_WINDOWS:
@@ -791,6 +817,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=working_dir,
+                env=child_env,
             )
         else:
             proc = await asyncio.create_subprocess_exec(
@@ -798,6 +825,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=working_dir,
+                env=child_env,
             )
 
         # Cancel monitor
@@ -1211,6 +1239,7 @@ class PiAgentRuntime(BaseAgentRuntime):
             return proc
 
         await self._close_rpc_process_for_session(session)
+        child_env = self._subprocess_env()
         if IS_WINDOWS:
             proc = await asyncio.create_subprocess_shell(
                 command_display(cmd_args),
@@ -1218,6 +1247,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=working_dir,
+                env=child_env,
             )
         else:
             proc = await asyncio.create_subprocess_exec(
@@ -1226,6 +1256,7 @@ class PiAgentRuntime(BaseAgentRuntime):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=working_dir,
+                env=child_env,
             )
 
         session["rpc_proc"] = proc

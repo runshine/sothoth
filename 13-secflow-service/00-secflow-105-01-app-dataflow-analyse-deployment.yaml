@@ -39,23 +39,33 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "8Gi"
-            cpu: "4"
-          limits:
-            memory: "16Gi"
+            memory: "12Gi"
             cpu: "8"
+          limits:
+            memory: "12Gi"
+            cpu: "8"
+        startupProbe:
+          httpGet:
+            path: /api/app/dataflow-analyse/health
+            port: 8080
+          periodSeconds: 10
+          failureThreshold: 18
         livenessProbe:
           httpGet:
             path: /api/app/dataflow-analyse/health
             port: 8080
-          initialDelaySeconds: 30
+          initialDelaySeconds: 60
           periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 6
         readinessProbe:
           httpGet:
             path: /api/app/dataflow-analyse/health
             port: 8080
-          initialDelaySeconds: 15
+          initialDelaySeconds: 20
           periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 6
       volumes:
       - name: secflow-app-dataflow-analyse-config
         configMap:

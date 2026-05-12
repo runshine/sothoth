@@ -332,7 +332,14 @@ def _add_new_result_cycle_fixture(run_root: Path) -> None:
     })
 
 
-def _create_execution_bound_run(client: TestClient, run_root: Path, *, title: str = "scan demo package") -> dict:
+def _create_execution_bound_run(
+    client: TestClient,
+    run_root: Path,
+    *,
+    title: str = "scan demo package",
+    task_purpose: str = "normal",
+    agent_state_roots: dict | None = None,
+) -> dict:
     _create_run_workspace(run_root)
     profile_response = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
     assert profile_response.status_code == 201
@@ -359,13 +366,18 @@ def _create_execution_bound_run(client: TestClient, run_root: Path, *, title: st
                     "task_type": "dataflow_vuln_scan_cli",
                     "title": title,
                     "task_md_path": str(run_root / "input" / "task.md"),
-                    "metadata": {"task_title": title},
+                    "metadata": {
+                        "task_title": title,
+                        "task_purpose": task_purpose,
+                        "agent_state_roots": agent_state_roots or {},
+                    },
                     "upstream_refs": [],
                 }]
             },
             priority=120,
             status="succeeded",
             submitted_by="tester",
+            task_purpose=task_purpose,
             retry_count=0,
             max_retry_count=2,
             message="completed",
@@ -1404,3 +1416,101 @@ def test_task_list_survives_run_summary_sync_failure(service_config_path, monkey
     assert task["title"] == "sync failure tolerant"
     assert task["run"]["name"] == bound["run_name"]
     assert task["run"]["path"] == bound["run_root"]
+
+
+def test_task_create_defaults_normal_purpose_and_shared_agent_dirs(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    profile_response = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload("purpose default profile"))
+    assert profile_response.status_code == 201
+    profile = profile_response.json()
+
+    response = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "default purpose task",
+            "task_markdown": "# Demo\n",
+        },
+    )
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["task_purpose"] == "normal"
+    assert payload["agent_state_dirs"]
+    for item in payload["agent_state_dirs"].values():
+        assert item["source"] == "shared_default"
+        assert item["root_dir"].endswith(f"/agent-state/shared/{item['agent_id']}")
+        assert item["skills_dir"] == f"{item['root_dir']}/skills"
+        assert item["memory_dir"] == f"{item['root_dir']}/memory"
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{payload['task_id']}")
+    assert detail.status_code == 200
+    detail_payload = detail.json()
+    assert detail_payload["task_purpose"] == "normal"
+    assert detail_payload["agent_state_dirs"] == payload["agent_state_dirs"]
+
+
+def test_task_create_rejects_agent_state_root_escape(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    profile_response = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload("purpose escape profile"))
+    assert profile_response.status_code == 201
+    profile = profile_response.json()
+
+    response = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "bad evolution task",
+            "task_markdown": "# Demo\n",
+            "task_purpose": "evolution",
+            "agent_state_roots": {
+                "pi-worker": {
+                    "root_dir": {
+                        "source": "project_filesystem",
+                        "path": "/../../escape",
+                    }
+                }
+            },
+        },
+    )
+    assert response.status_code == 422
+    assert "escapes project root" in response.json()["detail"]
+
+
+def test_run_detail_exposes_linked_task_purpose_and_agent_state_dirs(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    project_root = (
+        Path(get_config().fileserver_service.data_mount_path)
+        / "files"
+        / "default"
+    )
+    worker_root = project_root / "DATAFLOW_VULN_SCANNER" / "evolution" / "pi-worker-custom"
+    worker_root.mkdir(parents=True, exist_ok=True)
+    bound = _create_execution_bound_run(
+        client,
+        _project_runs_root() / "bound_evolution_task_20260512_010203",
+        title="evolution bound scan",
+        task_purpose="evolution",
+        agent_state_roots={
+            "pi-worker": {
+                "root_dir": {
+                    "source": "project_filesystem",
+                    "path": "/DATAFLOW_VULN_SCANNER/evolution/pi-worker-custom",
+                }
+            }
+        },
+    )
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert detail.status_code == 200
+    payload = detail.json()
+    assert payload["linked_task_purpose"] == "evolution"
+    assert payload["linked_task_agent_state_dirs"]
+    assert payload["linked_task_agent_state_dirs"]["pi-worker"]["source"] == "task_override"
+    assert payload["linked_task_agent_state_dirs"]["pi-worker"]["root_dir"] == str(worker_root.resolve())
+    assert payload["linked_task_agent_state_dirs"]["pi-worker"]["skills_dir"] == f"{worker_root.resolve()}/skills"
+    assert payload["linked_task_agent_state_dirs"]["pi-worker"]["memory_dir"] == f"{worker_root.resolve()}/memory"

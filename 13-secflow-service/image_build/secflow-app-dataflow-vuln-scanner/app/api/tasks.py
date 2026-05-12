@@ -8,8 +8,10 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import ensure_project_access, get_current_subject, get_db
 from app.config import get_config
 from app.schemas import (
+    CreateEvolutionTaskRequest,
     ProjectFilesystemChildrenResponse,
     ProjectFilesystemRootResponse,
+    ReplayReadyResponse,
     RunCycleResponse,
     RunDetailResponse,
     RunFileContentResponse,
@@ -125,6 +127,32 @@ async def list_tasks(
 async def get_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_scan_task(db, task_id, principal)
+
+
+@router.get("/tasks/{task_id}/replay-ready", response_model=ReplayReadyResponse)
+async def get_task_replay_ready(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().get_task_replay_ready(db, task_id, principal)
+
+
+@router.post("/tasks/{task_id}/create-evolution", response_model=ScanTaskResponse, status_code=status.HTTP_201_CREATED)
+async def create_evolution_task(
+    task_id: str,
+    payload: CreateEvolutionTaskRequest,
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, token = subject
+    created = get_execution_service().create_evolution_task(
+        db,
+        source_task_id=task_id,
+        payload=payload,
+        principal=principal,
+        authorization_token=token,
+    )
+    get_scheduler_service().start_execution_now(created.latest_execution_id)
+    db.expire_all()
+    return get_execution_service().get_scan_task_summary(db, created.task_id, principal)
 
 
 @router.get("/runs", response_model=List[RunSummaryResponse])

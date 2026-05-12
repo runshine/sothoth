@@ -1424,6 +1424,172 @@ class TaskManagerTests(unittest.TestCase):
             self.assertFalse(system_output.exists())
             self.assertFalse(entry_output.exists())
 
+    def test_binary_to_source_existing_retry_uses_rerun_api(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_key="module1",
+            item_name="mod.so",
+            parent_key="fw1",
+            downstream_service="binary_to_source",
+            downstream_task_id="b2s-1",
+            status="failed",
+        )
+
+        class _FakeB2SClient:
+            def __init__(self):
+                self.calls = []
+
+            async def rerun_task(self, project_id, task_id, token, *, clean_output=True, cancel_running=True):
+                self.calls.append(
+                    {
+                        "project_id": project_id,
+                        "task_id": task_id,
+                        "token": token,
+                        "clean_output": clean_output,
+                        "cancel_running": cancel_running,
+                    }
+                )
+                return {"status": "ok"}
+
+        fake_client = _FakeB2SClient()
+        original = task_manager_module.get_binary_to_source_client
+        task_manager_module.get_binary_to_source_client = lambda: fake_client
+        try:
+            result = asyncio.run(
+                self.manager._invoke_existing_downstream_retry(
+                    "binary_to_source",
+                    task=task,
+                    item=item,
+                    token="tok",
+                )
+            )
+        finally:
+            task_manager_module.get_binary_to_source_client = original
+
+        self.assertEqual({"status": "ok"}, result)
+        self.assertEqual(
+            [
+                {
+                    "project_id": "p1",
+                    "task_id": "b2s-1",
+                    "token": "tok",
+                    "clean_output": True,
+                    "cancel_running": True,
+                }
+            ],
+            fake_client.calls,
+        )
+
+    def test_retry_task_full_restart_cleans_existing_downstream_refs(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="item1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="fw1",
+            item_name="fw1",
+            parent_key="fw1",
+            downstream_service="system_analyse",
+            downstream_task_id="sa-1",
+            status="failed",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        calls = []
+
+        async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
+            calls.append(
+                {
+                    "db": db_arg,
+                    "task_id": task_arg.id,
+                    "refs": refs_arg,
+                    "token": token_arg,
+                }
+            )
+
+        original_cleanup = self.manager._cleanup_downstream_refs
+        original_run_sync = self.manager._run_sync
+        self.manager._cleanup_downstream_refs = fake_cleanup
+        self.manager._run_sync = lambda coro: asyncio.run(coro)
+        try:
+            self.manager.retry_task(db, project_id="p1", task_id="task1")
+        finally:
+            self.manager._cleanup_downstream_refs = original_cleanup
+            self.manager._run_sync = original_run_sync
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("task1", calls[0]["task_id"])
+        self.assertEqual("sa-1", calls[0]["refs"][0]["task_id"])
+
+    def test_continue_task_prefers_existing_downstream_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+            task.summary = {
+                "firmware_unpack_results": [{"firmware_key": "fw1"}],
+                "selected_modules": [{"module_key": "m1"}],
+                "entry_results": [{"entry_key": "e1"}],
+            }
+            stage_runs = [
+                SimpleNamespace(task_id="task1", stage_name="firmware_unpack", status="success"),
+                BinarySecurityStageRun(id="sr1", task_id="task1", stage_name="system_analysis", status="failed"),
+                BinarySecurityStageRun(id="sr2", task_id="task1", stage_name="binary_to_source", status="pending"),
+            ]
+            item = BinarySecurityStageItem(
+                id="item1",
+                task_id="task1",
+                project_id="p1",
+                stage_name="system_analysis",
+                item_key="fw1",
+                item_name="fw1",
+                parent_key="fw1",
+                downstream_service="system_analyse",
+                downstream_task_id="sa-1",
+                status="failed",
+            )
+            db = _ModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=[item])
+
+            stage = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="task1"))
+
+            self.assertEqual("system_analysis", stage)
+            self.assertEqual("task_retry", task.execution_mode)
+            self.assertEqual("system_analysis", task.target_stage_name)
+            self.assertEqual(1, len(db.stage_items))
+
     def test_retry_stage_requeues_failed_archive_job_and_marks_task_running(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

@@ -1,0 +1,131 @@
+name: build-secflow-app-binary-evolution-center-image
+on:
+  push:
+    branches:
+      - 'v2.*'
+    paths:
+      - .github/workflows/build-secflow-app-binary-evolution-center-image.yaml
+      - 13-secflow-service/image_build/secflow-app-binary-evolution-center
+      - 13-secflow-service/image_build/secflow-app-binary-evolution-center/**
+      - 13-secflow-service/00-secflow-110-**
+      - 99-external-service/13-secflow-00-ingress-for-release.yaml
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      date_tag: ${{ steps.date.outputs.date_tag }}
+    steps:
+      - name: Generate date tag
+        id: date
+        run: echo "date_tag=$(date +'%Y%m%d')-${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+
+  build-amd64:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build amd64 image
+        run: |
+          docker build \
+            --file 13-secflow-service/image_build/secflow-app-binary-evolution-center/Dockerfile \
+            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-latest \
+            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-${{ needs.prepare.outputs.date_tag }} \
+            13-secflow-service/image_build/secflow-app-binary-evolution-center/
+
+      - name: Push amd64 image
+        run: |
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-latest
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-${{ needs.prepare.outputs.date_tag }}
+
+  build-arm64:
+    needs: prepare
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build arm64 image
+        run: |
+          docker build \
+            --file 13-secflow-service/image_build/secflow-app-binary-evolution-center/Dockerfile \
+            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-latest \
+            --tag ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-${{ needs.prepare.outputs.date_tag }} \
+            13-secflow-service/image_build/secflow-app-binary-evolution-center/
+
+      - name: Push arm64 image
+        run: |
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-latest
+          docker push ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-${{ needs.prepare.outputs.date_tag }}
+
+  merge-manifest:
+    needs: [prepare, build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest (latest)
+        run: |
+          docker manifest create ghcr.io/runshine/secflow-app-binary-evolution-center:latest \
+            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-latest \
+            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-latest
+          docker manifest push ghcr.io/runshine/secflow-app-binary-evolution-center:latest
+
+      - name: Create and push multi-arch manifest (date tag)
+        run: |
+          docker manifest create ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:amd64-${{ needs.prepare.outputs.date_tag }} \
+            --amend ghcr.io/runshine/secflow-app-binary-evolution-center:arm64-${{ needs.prepare.outputs.date_tag }}
+          docker manifest push ghcr.io/runshine/secflow-app-binary-evolution-center:${{ needs.prepare.outputs.date_tag }}

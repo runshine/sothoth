@@ -103,6 +103,12 @@ def _case_payload(item: Case) -> dict:
             "parent_task_id": source_task.get("parent_task_id"),
             "parent_stage_name": source_task.get("parent_stage_name"),
             "parent_stage_item_id": source_task.get("parent_stage_item_id"),
+            "task_purpose": source_task.get("task_purpose"),
+            "evolution_task_id": source_task.get("evolution_task_id"),
+            "evolution_round": source_task.get("evolution_round"),
+            "evolution_source_task_id": source_task.get("evolution_source_task_id"),
+            "evolution_source_execution_id": source_task.get("evolution_source_execution_id"),
+            "reported_severity": source_task.get("reported_severity"),
         } if source_task else None,
         "files_root_path": fileserver_root.get("root_path"),
         "fileserver_root": fileserver_root,
@@ -260,6 +266,9 @@ async def list_cases(
     source_service_name: str | None = Query(None),
     source_task_id: str | None = Query(None),
     source_execution_id: str | None = Query(None),
+    pool_type: str | None = Query(None),
+    evolution_task_id: str | None = Query(None),
+    evolution_round: int | None = Query(None),
     user_and_token: tuple[dict, str] = Depends(get_current_subject),
     db: Session = Depends(get_db),
 ):
@@ -288,6 +297,23 @@ async def list_cases(
         payloads = [
             item for item in payloads
             if str((item.get("source_task") or {}).get("execution_id") or "") == source_execution_id
+        ]
+    if pool_type:
+        payloads = [
+            item for item in payloads
+            if str((item.get("metadata") or {}).get("pool_type") or "") == pool_type
+        ]
+    if evolution_task_id:
+        payloads = [
+            item for item in payloads
+            if str((item.get("source_task") or {}).get("evolution_task_id") or "") == evolution_task_id
+            or str(((item.get("metadata") or {}).get("source") or {}).get("evolution_task_id") or "") == evolution_task_id
+        ]
+    if evolution_round is not None:
+        payloads = [
+            item for item in payloads
+            if str((item.get("source_task") or {}).get("evolution_round") or "") == str(evolution_round)
+            or str(((item.get("metadata") or {}).get("source") or {}).get("evolution_round") or "") == str(evolution_round)
         ]
     return {"items": payloads, "total": len(payloads)}
 

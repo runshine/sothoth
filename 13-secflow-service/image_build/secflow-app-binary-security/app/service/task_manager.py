@@ -943,6 +943,31 @@ class TaskManager:
             **task.metrics,
             "selected_module_count": len(selected),
         }
+        stage_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == "system_analysis",
+        ).first()
+        if stage_run:
+            stage_run.status = "success"
+            stage_run.started_at = stage_run.started_at or _now()
+            stage_run.finished_at = stage_run.finished_at or _now()
+            stage_run.last_error = None
+            stage_run.counts = self._stage_counts(db, stage_run)
+            self._merge_stage_run_output_summary(
+                task,
+                stage_run,
+                {
+                    "status": "success",
+                    "sync_status": "success",
+                    "error": None,
+                    "waiting_manual_confirmation": False,
+                    "selected_module_count": len(selected),
+                    "candidate_module_count": len(candidate_modules),
+                    "module_count": len(list(summary.get("system_analysis_modules") or [])),
+                    "high_risk_module_count": len(selected),
+                    "status_synced": True,
+                },
+            )
         current_stage = str(task.current_stage or "").strip()
         task.status = "pending"
         next_stage = self._next_incomplete_stage(db, task)
@@ -1143,16 +1168,7 @@ class TaskManager:
         }
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
-        affected_items = self._stage_items_for_stages(db, task.id, affected_stages)
-        downstream_refs = self._collect_downstream_refs(task, affected_items)
-        token = self._service_token()
-        if downstream_refs:
-            await self._cleanup_downstream_refs(db, task, downstream_refs, token)
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
-        db.query(BinarySecurityStageItem).filter(
-            BinarySecurityStageItem.task_id == task.id,
-            BinarySecurityStageItem.stage_name.in_(affected_stages),
-        ).delete(synchronize_session=False)
         self._delete_archive_children_for_stages(db, task, affected_stages)
         for stage_name in affected_stages:
             stage_run = stage_runs.get(stage_name)
@@ -1161,8 +1177,8 @@ class TaskManager:
 
         task.status = "pending"
         task.current_stage = target_stage
-        task.execution_mode = None
-        task.target_stage_name = None
+        task.execution_mode = "task_retry"
+        task.target_stage_name = target_stage
         task.last_error = None
         self._invalidate_task_execution(task)
         task.finished_at = None
@@ -1171,11 +1187,12 @@ class TaskManager:
             db,
             task,
             "task_continue_requested",
-            f"手动继续任务，将从阶段 {target_stage} 开始推进",
+            f"手动继续任务，将从阶段 {target_stage} 开始推进，并尽量复用旧下游任务",
             stage_name=target_stage,
             payload={
                 "target_stage": target_stage,
                 "cleared_stages": affected_stages,
+                "retry_semantics": "continue_with_existing_downstream",
             },
         )
         db.commit()
@@ -1187,19 +1204,12 @@ class TaskManager:
         if not supported or not stage_name:
             raise ValidationError(reason or "当前任务不支持安全重试")
         stage_sequence = self._stage_sequence_for_task(task)
-        archive_retried = False
-        archive_retry_stage: str | None = None
-        for current_stage in stage_sequence:
-            stage_archive_retried = self._retry_failed_archive_jobs_for_stage(db, task, current_stage)
-            if stage_archive_retried and archive_retry_stage is None:
-                archive_retry_stage = current_stage
-            archive_retried = stage_archive_retried or archive_retried
-        if archive_retried:
-            self._mark_task_waiting_for_archive_retry(db, task, archive_retry_stage or stage_name)
-            db.commit()
-            return
         first_stage = stage_sequence[0]
         self._invalidate_task_execution(task)
+        all_items = self._stage_items_for_stages(db, task.id, stage_sequence)
+        downstream_refs = self._collect_downstream_refs(task, all_items)
+        if downstream_refs:
+            self._run_sync(self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token()))
         task.status = "pending"
         task.current_stage = first_stage
         task.execution_mode = None
@@ -1225,7 +1235,7 @@ class TaskManager:
             db,
             task,
             "task_retried",
-            f"任务已重置，将从第一阶段 {first_stage} 重新开始",
+            f"任务已清空全部阶段和下游任务，将从第一阶段 {first_stage} 重新开始",
             stage_name=first_stage,
             payload={"target_stage": first_stage, "cleared_stages": stage_sequence, "retry_semantics": "full_restart"},
         )
@@ -1253,16 +1263,16 @@ class TaskManager:
         affected_stages = stage_sequence[target_index:]
         downstream_stages = stage_sequence[target_index + 1 :]
         self._invalidate_task_execution(task)
-        affected_items = self._stage_items_for_stages(db, task.id, affected_stages)
-        downstream_refs = self._collect_downstream_refs(task, affected_items)
+        downstream_items = self._stage_items_for_stages(db, task.id, downstream_stages)
+        downstream_refs = self._collect_downstream_refs(task, downstream_items)
         if downstream_refs:
             self._run_sync(self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token()))
         self._clear_stage_outputs_from(task, stage_name, mark_stale=False)
         self._delete_archive_children_for_stages(db, task, affected_stages)
-        if affected_stages:
+        if downstream_stages:
             db.query(BinarySecurityStageItem).filter(
                 BinarySecurityStageItem.task_id == task.id,
-                BinarySecurityStageItem.stage_name.in_(affected_stages),
+                BinarySecurityStageItem.stage_name.in_(downstream_stages),
             ).delete(synchronize_session=False)
         self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
         for downstream_stage in downstream_stages:
@@ -1285,9 +1295,9 @@ class TaskManager:
             db,
             task,
             "stage_retry_requested",
-            f"请求重试阶段: {stage_name}",
+            f"请求重试阶段: {stage_name}，并尽量复用该阶段旧下游任务",
             stage_name=stage_name,
-            payload={"retry_semantics": "stage_and_continue_downstream", "cleared_stages": affected_stages},
+            payload={"retry_semantics": "stage_retry_reuse_current_downstream", "cleared_stages": affected_stages},
         )
         db.commit()
 
@@ -1983,7 +1993,7 @@ class TaskManager:
                     .first()
                 )
                 if duplicate_active is not None:
-                    job.archive_status = "failed"
+                    job.archive_status = "skipped"
                     job.error_message = f"duplicate archive job skipped; canonical job={duplicate_active.id}"
                     job.completed_at = _now()
                     job.updated_at = _now()
@@ -3021,6 +3031,7 @@ class TaskManager:
             "running": "running",
             "applying": "applying",
             "success": "success",
+            "skipped": "skipped",
             "partial_success": "partial_success",
             "failed": "failed",
             "cancelled": "cancelled",
@@ -3091,7 +3102,8 @@ class TaskManager:
             return "applying"
         if any(status == "failed" for status in normalized):
             return "failed"
-        if all(status == "success" for status in normalized):
+        terminal = [status for status in normalized if status != "skipped"]
+        if terminal and all(status == "success" for status in terminal):
             return "success"
         return "pending"
 
@@ -3167,7 +3179,7 @@ class TaskManager:
                 first_created_at=first_created_at,
                 last_updated_at=last_updated_at,
                 duration_seconds=duration_seconds,
-                latest_error=next((job.error_message for job in reversed(stage_jobs) if job.error_message), None),
+                latest_error=next((job.error_message for job in reversed(stage_jobs) if job.archive_status == "failed" and job.error_message), None),
                 jobs=stage_jobs,
             )
             archive_status = self._aggregate_archive_stage_status([job.archive_status for job in stage_jobs])
@@ -3185,6 +3197,8 @@ class TaskManager:
             # idle/pending until new terminal items produce new archive jobs,
             # instead of looking like an actively running archive worker.
             if archive_status == "success" and (has_non_terminal_items or len(stage_jobs) < terminal_item_count):
+                archive_status = "pending"
+            if stage_name == "system_analysis" and summary.status == "waiting_confirmation":
                 archive_status = "pending"
             nodes.append(
                 BinarySecurityOverviewNode(
@@ -3557,7 +3571,7 @@ class TaskManager:
 
     def _next_incomplete_stage(self, db: Session, task: BinarySecurityTask) -> str | None:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
-        completed = {run.stage_name for run in stage_runs if run.status in {"success", "waiting_confirmation"}}
+        completed = {run.stage_name for run in stage_runs if run.status == "success"}
         for stage_name in self._stage_sequence_for_task(task):
             if stage_name not in completed:
                 return stage_name
@@ -4128,7 +4142,13 @@ class TaskManager:
         if stage_name == "system_analysis":
             return get_system_analyse_client().restart_task(downstream_task_id)
         if stage_name == "binary_to_source":
-            return get_binary_to_source_client().retry_task(task.project_id, downstream_task_id, token or "")
+            return get_binary_to_source_client().rerun_task(
+                task.project_id,
+                downstream_task_id,
+                token or "",
+                clean_output=True,
+                cancel_running=True,
+            )
         if stage_name == "entry_analysis":
             return get_entry_analyse_client().restart_task(downstream_task_id)
         if stage_name == "dataflow_analysis":
@@ -4210,7 +4230,7 @@ class TaskManager:
             run = stage_runs.get(stage_name)
             if not run:
                 return None
-            if run.status not in {"success", "waiting_confirmation"}:
+            if run.status != "success":
                 return stage_name
         return None
 

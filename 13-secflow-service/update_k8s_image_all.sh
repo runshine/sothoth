@@ -4,6 +4,7 @@ set -euo pipefail
 NAMESPACE="${NAMESPACE:-secflow-ns}"
 DEFAULT_IMAGE_TAG="${DEFAULT_IMAGE_TAG:-latest}"
 B2S_IMAGE_REPO="${B2S_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-to-source}"
+BIN_EVOLUTION_IMAGE_REPO="${BIN_EVOLUTION_IMAGE_REPO:-ghcr.io/runshine/secflow-app-binary-evolution-center}"
 RESOURCE_IMAGE_REPO="${RESOURCE_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource}"
 GATEWAY_WORKER_IMAGE_REPO="${GATEWAY_WORKER_IMAGE_REPO:-ghcr.io/runshine/secflow-platform-resource-file-gateway-worker}"
 FW_UNPACKER_IMAGE_REPO="${FW_UNPACKER_IMAGE_REPO:-ghcr.io/runshine/secflow-app-firmware-unpacker}"
@@ -13,18 +14,23 @@ B2S_MANAGER_DEPLOYMENT="secflow-app-binary-to-source-manager"
 B2S_WORKER_DEPLOYMENT="secflow-app-binary-to-source-worker"
 B2S_MANAGER_CONTAINER="secflow-app-binary-to-source-manager"
 B2S_WORKER_CONTAINER="secflow-app-binary-to-source-worker"
+BIN_EVOLUTION_MANAGER_DEPLOYMENT="secflow-app-binary-evolution-center-manager"
+BIN_EVOLUTION_WORKER_DEPLOYMENT="secflow-app-binary-evolution-center-worker"
+BIN_EVOLUTION_MANAGER_CONTAINER="secflow-app-binary-evolution-center-manager"
+BIN_EVOLUTION_WORKER_CONTAINER="secflow-app-binary-evolution-center-worker"
 
 usage() {
   cat <<'HELP'
 Usage:
   ./update_k8s_image_all.sh
   ./update_k8s_image_all.sh [global_tag]
-  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>]
+  ./update_k8s_image_all.sh --tag <tag> [--b2s-image <image_or_tag>] [--binary-evolution-image <image_or_tag>] [--resource-image <image_or_tag>] [--gateway-worker-image <image_or_tag>] [--firmware-unpacker-image <image_or_tag>]
 
 Examples:
   ./update_k8s_image_all.sh
   ./update_k8s_image_all.sh latest
   ./update_k8s_image_all.sh --tag 20260508-abcdef0
+  ./update_k8s_image_all.sh --binary-evolution-image 20260512-abcdef0
   ./update_k8s_image_all.sh --resource-image 20260403
   ./update_k8s_image_all.sh --gateway-worker-image ghcr.io/runshine/secflow-platform-resource-file-gateway-worker:20260403
   ./update_k8s_image_all.sh --firmware-unpacker-image 20260428
@@ -37,6 +43,7 @@ Behavior:
       ghcr.io/runshine/*
       runshine0819/secflow-*
   - b2s image: override binary-to-source manager/worker image.
+  - binary-evolution image: override binary-evolution-center manager/worker image.
   - resource image: override secflow-platform-resource image.
   - gateway-worker image: update file_gateway.worker_image in resource ConfigMap template vars.
   - firmware-unpacker image: override secflow-app-firmware-unpacker image.
@@ -105,6 +112,7 @@ update_deployment_container() {
 }
 
 B2S_IMAGE_ARG=""
+BIN_EVOLUTION_IMAGE_ARG=""
 RESOURCE_IMAGE_ARG=""
 GATEWAY_WORKER_IMAGE_ARG=""
 FW_UNPACKER_IMAGE_ARG=""
@@ -122,6 +130,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --b2s-image)
       B2S_IMAGE_ARG="${2:-}"
+      shift 2
+      ;;
+    --binary-evolution-image)
+      BIN_EVOLUTION_IMAGE_ARG="${2:-}"
       shift 2
       ;;
     --resource-image)
@@ -151,6 +163,7 @@ done
 
 GLOBAL_TAG="${GLOBAL_TAG_ARG:-${DEFAULT_IMAGE_TAG}}"
 B2S_IMAGE="$(resolve_image "${B2S_IMAGE_ARG}" "${B2S_IMAGE_REPO}")"
+BIN_EVOLUTION_IMAGE="$(resolve_image "${BIN_EVOLUTION_IMAGE_ARG}" "${BIN_EVOLUTION_IMAGE_REPO}")"
 RESOURCE_IMAGE="$(resolve_image "${RESOURCE_IMAGE_ARG}" "${RESOURCE_IMAGE_REPO}")"
 GATEWAY_WORKER_IMAGE="$(resolve_image "${GATEWAY_WORKER_IMAGE_ARG}" "${GATEWAY_WORKER_IMAGE_REPO}")"
 FW_UNPACKER_IMAGE="$(resolve_image "${FW_UNPACKER_IMAGE_ARG}" "${FW_UNPACKER_IMAGE_REPO}")"
@@ -195,6 +208,9 @@ while IFS=$'\t' read -r deployment containers; do
     case "${deployment}:${container}" in
       "${B2S_MANAGER_DEPLOYMENT}:${B2S_MANAGER_CONTAINER}"|"${B2S_WORKER_DEPLOYMENT}:${B2S_WORKER_CONTAINER}")
         [[ -n "${B2S_IMAGE}" ]] && requested_tag="${B2S_IMAGE}"
+        ;;
+      "${BIN_EVOLUTION_MANAGER_DEPLOYMENT}:${BIN_EVOLUTION_MANAGER_CONTAINER}"|"${BIN_EVOLUTION_WORKER_DEPLOYMENT}:${BIN_EVOLUTION_WORKER_CONTAINER}")
+        [[ -n "${BIN_EVOLUTION_IMAGE}" ]] && requested_tag="${BIN_EVOLUTION_IMAGE}"
         ;;
       "secflow-platform-resource:secflow-platform-resource")
         [[ -n "${RESOURCE_IMAGE}" ]] && requested_tag="${RESOURCE_IMAGE}"

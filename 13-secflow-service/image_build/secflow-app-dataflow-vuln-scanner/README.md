@@ -126,6 +126,48 @@ python3 run_vuln_scan.py \
 
 > 说明：当 `transport=rpc` 时，加载配置后会自动清理旧的 `no_progress_timeout_seconds` / `max_wall_seconds` / `max_retry_wall_seconds` 以及 reflection 对应 watchdog 字段，避免误以为框架仍会主动截断 Pi prompt。
 
+### 任务用途与 Agent 状态目录
+
+数据流漏洞挖掘服务把任务来源和任务用途拆成两个正交字段：
+
+| 字段 | 取值 | 含义 |
+|------|------|------|
+| `task_origin_type` | `manual` / `binary_security` | 任务来自哪里，用于链路来源标识 |
+| `task_purpose` | `normal` / `evolution` | 任务拿来做什么，用于区分正常扫描和进化重放 |
+
+创建任务时可额外传 `task_purpose` 与 `agent_state_roots`：
+
+```json
+{
+  "project_id": "default",
+  "title": "evolution replay",
+  "data_flow": { "source": "project_filesystem", "path": "/input/dataflow.md" },
+  "source_dir": { "source": "project_filesystem", "path": "/src" },
+  "task_purpose": "evolution",
+  "agent_state_roots": {
+    "pi-worker": {
+      "root_dir": { "source": "project_filesystem", "path": "/DATAFLOW_VULN_SCANNER/replay/worker-a" }
+    },
+    "pi-advisor": {
+      "root_dir": { "source": "project_filesystem", "path": "/DATAFLOW_VULN_SCANNER/replay/advisor-a" }
+    }
+  }
+}
+```
+
+目录规则固定如下：
+
+| 任务类型 | root_dir | skills_dir | memory_dir |
+|------|------|------|------|
+| `normal` | `/data/files/<project_id>/DATAFLOW_VULN_SCANNER/agent-state/shared/<agent_id>` | `<root>/skills` | `<root>/memory` |
+| `evolution` 且传自定义目录 | 创建时传入的 `root_dir` | `<root>/skills` | `<root>/memory` |
+| `evolution` 且未传某个 agent | 回退到该 agent 的 `normal` 默认目录 | `<root>/skills` | `<root>/memory` |
+
+- `agent_state_roots` 只在创建时生效，后续重试、恢复、adopt 会沿用原始目录。
+- 自定义 `root_dir` 必须仍位于项目可访问的共享 PVC / fileserver 范围内，不允许越界到任意主机绝对路径。
+- 运行时服务会自动确保目录存在，并把实际生效目录回写到任务详情 / Run 详情中的 `agent_state_dirs`。
+- 正常任务默认使用共享 PVC 目录，每个 agent 的 `skills` 和 `memory` 彼此隔离。
+
 ### 输出
 
 运行结束后，最终产出位于 `runs/{run_name}/workspace/.../final_output/`（Windows 下默认为 `runs/{run_name}/ws/.../final_output/`）：

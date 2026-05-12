@@ -83,6 +83,7 @@ class TriggerTask(Base):
     profile_id = Column(String(64), nullable=True)
     project_id = Column(String(64), nullable=False)
     trigger_type = Column(String(16), nullable=False, default="manual")
+    task_purpose = Column(String(32), nullable=False, default="normal", index=True)
     task_origin_type = Column(String(32), nullable=True, index=True)
     parent_project_id = Column(String(64), nullable=True, index=True)
     parent_task_id = Column(String(64), nullable=True, index=True)
@@ -848,6 +849,7 @@ def run_auto_migrations() -> None:
         (tables["workflow_definition_version"], "compiled_config_json", f"ALTER TABLE {tables['workflow_definition_version']} ADD COLUMN compiled_config_json {_column_sql(dialect, 'JSON')} NULL"),
         (tables["trigger_task"], "workflow_definition_version_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN workflow_definition_version_id VARCHAR(64) NULL"),
         (tables["trigger_task"], "profile_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN profile_id VARCHAR(64) NULL"),
+        (tables["trigger_task"], "task_purpose", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN task_purpose VARCHAR(32) NOT NULL DEFAULT 'normal'"),
         (tables["trigger_task"], "task_origin_type", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN task_origin_type VARCHAR(32) NULL"),
         (tables["trigger_task"], "parent_project_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_project_id VARCHAR(64) NULL"),
         (tables["trigger_task"], "parent_task_id", f"ALTER TABLE {tables['trigger_task']} ADD COLUMN parent_task_id VARCHAR(64) NULL"),
@@ -957,6 +959,13 @@ def run_auto_migrations() -> None:
                         "MODIFY COLUMN source_mtime DOUBLE NOT NULL DEFAULT 0"
                     ))
                     inspector = inspect(connection)
+
+        if tables["trigger_task"] in inspector.get_table_names() and _column_exists(inspector, tables["trigger_task"], "task_purpose"):
+            connection.execute(text(
+                f"UPDATE {tables['trigger_task']} "
+                "SET task_purpose = 'normal' "
+                "WHERE task_purpose IS NULL OR task_purpose = ''"
+            ))
 
         inspector = inspect(connection)
         _migrate_legacy_run_tables(connection, inspector)

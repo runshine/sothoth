@@ -1474,7 +1474,7 @@ class RunIndexService:
         ]
 
     def get_run_detail(self, db: Session, run_index: RunIndex) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=False)
+        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=True)
         payload = self._summary_payload(run_index)
         raw_summary = dict(_load_externalized_json_payload(run_index.run_root_path, run_index.raw_summary_json) or {})
         cli_payload = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
@@ -1521,9 +1521,8 @@ class RunIndexService:
                 "manifests": _load_externalized_mapping_payload(run_index.run_root_path, run_index.manifests_json),
                 "latest_issues": latest_issues,
                 "atomic_work_path": run_index.atomic_work_path or "",
-                # Keep the overview endpoint responsive; sessions/files are loaded by their dedicated tab APIs.
-                "files": [],
-                "sessions": [],
+                "files": self._list_run_files_rows(db, run_index, limit=1200),
+                "sessions": self._list_run_sessions_rows(db, run_index),
                 "run_log": run_index.log_tail_text or "",
                 "command": [str(item) for item in command],
                 "command_display": command_display,

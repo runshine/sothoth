@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -94,6 +94,53 @@ class DataflowInputRef(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class DataflowAgentStateRootPayload(BaseModel):
+    root_dir: DataflowInputRef
+
+
+class DataflowAgentStateDirResponse(BaseModel):
+    agent_id: str
+    root_dir: str
+    skills_dir: str
+    memory_dir: str
+    source: Literal["shared_default", "task_override"] = "shared_default"
+
+
+class CreateEvolutionTaskRequest(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=128)
+    profile_id: Optional[str] = None
+    priority: Optional[int] = None
+    agent_state_roots: Dict[str, DataflowAgentStateRootPayload] = Field(default_factory=dict)
+    model: Optional[str] = Field(default=None, min_length=1)
+    provider: Optional[str] = None
+    review_profile: Optional[str] = Field(default=None, min_length=1)
+    max_review_cycles: Optional[int] = Field(default=None, ge=1)
+    agent_run_timeout_seconds: Optional[int] = Field(default=None, ge=-1)
+    agent_timeout_retry_enabled: Optional[bool] = None
+    agent_timeout_max_retries: Optional[int] = Field(default=None, ge=0)
+    timeout_max_retries: Optional[int] = Field(default=None, ge=1)
+    timeout_retry_interval_seconds: Optional[int] = Field(default=None, ge=0)
+    result_review_concurrency: Optional[int] = Field(default=None, ge=1)
+    scan_options: Dict[str, Any] = Field(default_factory=dict)
+    runtime_overrides: Dict[str, Any] = Field(default_factory=dict)
+    auto_report_vulnerabilities: Optional[bool] = None
+    evolution_task_id: Optional[str] = None
+    evolution_round: Optional[int] = Field(default=None, ge=1)
+    evolution_source_task_id: Optional[str] = None
+    evolution_source_execution_id: Optional[str] = None
+
+
+class ReplayReadyResponse(BaseModel):
+    task_id: str
+    project_id: str
+    task_purpose: Literal["normal", "evolution"]
+    replay_ready: bool
+    reason: Optional[str] = None
+    latest_execution_id: Optional[str] = None
+    latest_run_id: Optional[str] = None
+    agent_state_dirs: Dict[str, DataflowAgentStateDirResponse] = Field(default_factory=dict)
+
+
 class ScanTaskCreateRequest(BaseModel):
     project_id: str = Field(..., min_length=1)
     profile_id: Optional[str] = None
@@ -119,6 +166,8 @@ class ScanTaskCreateRequest(BaseModel):
     artifact_refs: List[ArtifactRef] = Field(default_factory=list)
     priority: Optional[int] = None
     runtime_overrides: Dict[str, Any] = Field(default_factory=dict)
+    task_purpose: Literal["normal", "evolution"] = "normal"
+    agent_state_roots: Dict[str, DataflowAgentStateRootPayload] = Field(default_factory=dict)
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None
@@ -146,6 +195,12 @@ class ScanTaskPriorityUpdateRequest(BaseModel):
 class ScanTaskResponse(BaseModel):
     task_id: str
     project_id: str
+    task_purpose: Literal["normal", "evolution"] = "normal"
+    agent_state_dirs: Dict[str, DataflowAgentStateDirResponse] = Field(default_factory=dict)
+    derived_from_task_id: Optional[str] = None
+    derived_from_execution_id: Optional[str] = None
+    derived_from_run_id: Optional[str] = None
+    derivation_kind: Optional[Literal["evolution_replay"]] = None
     task_origin_type: Optional[str] = None
     parent_project_id: Optional[str] = None
     parent_task_id: Optional[str] = None
@@ -357,6 +412,8 @@ class RunSummaryResponse(BaseModel):
     updated_at: Optional[str] = None
     process_state: Dict[str, Any] = Field(default_factory=dict)
     retry_command_display: Optional[str] = None
+    linked_task_purpose: Optional[Literal["normal", "evolution"]] = None
+    linked_task_agent_state_dirs: Dict[str, DataflowAgentStateDirResponse] = Field(default_factory=dict)
 
 
 class RunFileResponse(BaseModel):

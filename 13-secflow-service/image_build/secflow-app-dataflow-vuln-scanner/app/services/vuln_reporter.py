@@ -237,6 +237,12 @@ class VulnReportService:
             "parent_task_id": trigger.parent_task_id,
             "parent_stage_name": trigger.parent_stage_name,
             "parent_stage_item_id": trigger.parent_stage_item_id,
+            "task_purpose": str(trigger.task_purpose or "normal"),
+            "evolution_task_id": _task_metadata(trigger).get("derivation", {}).get("evolution_task_id"),
+            "evolution_round": _task_metadata(trigger).get("derivation", {}).get("evolution_round"),
+            "evolution_source_task_id": _task_metadata(trigger).get("derivation", {}).get("evolution_source_task_id"),
+            "evolution_source_execution_id": _task_metadata(trigger).get("derivation", {}).get("evolution_source_execution_id"),
+            "reported_severity": severity,
         }
         report_id = f"dfvs:{trigger.id}:{execution.id}:{result.filename}"
         subject_locator = str(raw.get("subject_locator") or raw.get("locator") or result_path or result.filename)
@@ -279,11 +285,13 @@ class VulnReportService:
             ],
             "metadata": {
                 "source": source,
+                "pool_type": "evolution" if str(trigger.task_purpose or "normal") == "evolution" else "normal",
                 "dataflow_vuln_scanner": {
                     "run_status": run_index.status,
                     "review_verdict": result.verdict,
                     "review_cycle": result.review_cycle,
                     "lifecycle_status": result.lifecycle_status,
+                    "linked_task_purpose": str(trigger.task_purpose or "normal"),
                 },
             },
         }

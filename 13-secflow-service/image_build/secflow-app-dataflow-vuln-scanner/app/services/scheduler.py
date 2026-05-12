@@ -372,6 +372,8 @@ class SchedulerService:
                 db.add(worker)
 
             db.commit()
+            get_execution_service().reconcile_stale_active_executions(db)
+            db.commit()
         finally:
             db.close()
 

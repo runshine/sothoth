@@ -48,6 +48,10 @@ from app.pi_vuln_core.utils.logger import attach_log_file, detach_log_file
 from app.pi_vuln_core.utils.win_compat import ensure_event_loop_policy
 from app.schemas import (
     ArtifactRef,
+    CreateEvolutionTaskRequest,
+    DataflowAgentStateDirResponse,
+    DataflowInputRef,
+    ReplayReadyResponse,
     RunRetryRequest,
     ScanTaskAttemptResponse,
     ScanTaskCreateRequest,
@@ -74,6 +78,11 @@ from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 
 
 logger = logging.getLogger("dataflow_vuln.execution")
+
+_TASK_PURPOSE_LABELS = {
+    "normal": "正常任务",
+    "evolution": "进化任务",
+}
 
 
 def _new_id(prefix: str) -> str:
@@ -192,6 +201,260 @@ class ExecutionService:
         first_task = manifest.tasks[0] if manifest.tasks else None
         return dict(first_task.metadata or {}) if first_task else {}
 
+    def _normalize_task_purpose(self, value: str | None) -> str:
+        normalized = str(value or "").strip().lower()
+        return normalized if normalized in {"normal", "evolution"} else "normal"
+
+    def _task_derivation_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
+        payload = metadata.get("derivation") if isinstance(metadata, dict) else None
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def _task_effective_profile_id(self, trigger: TriggerTask) -> str:
+        return str(trigger.profile_id or trigger.workflow_definition_id or "").strip()
+
+    def _source_run_index_for_trigger(self, db: Session, trigger: TriggerTask, execution: WorkflowExecution | None) -> RunIndex | None:
+        if execution is not None:
+            run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+            if run_index is not None:
+                return run_index
+        return (
+            db.query(RunIndex)
+            .filter(RunIndex.linked_task_id == trigger.id)
+            .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+            .first()
+        )
+
+    def _default_evolution_title(self, source_title: str) -> str:
+        title = f"Evolution of {str(source_title or '').strip()}".strip()
+        title = title[:128].rstrip()
+        return title or "Evolution Task"
+
+    def _input_ref_or_none(self, value: Any, *, label: str) -> DataflowInputRef | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{label} ref is invalid")
+        try:
+            return DataflowInputRef.model_validate(value)
+        except Exception as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{label} ref is invalid") from exc
+
+    def _artifact_refs_from_metadata(self, metadata: dict[str, Any]) -> list[ArtifactRef]:
+        items: list[ArtifactRef] = []
+        for item in metadata.get("artifact_refs") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                items.append(ArtifactRef.model_validate(item))
+            except Exception as exc:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="artifact_refs in source task metadata is invalid") from exc
+        return items
+
+    def _merged_scan_options_for_evolution(self, source_request: dict[str, Any], payload: CreateEvolutionTaskRequest) -> dict[str, Any]:
+        merged = dict(source_request.get("options") or {})
+        merged.pop("run_name", None)
+        merged.update(dict(payload.scan_options or {}))
+        return merged
+
+    def _build_evolution_create_payload(
+        self,
+        *,
+        db: Session,
+        source_trigger: TriggerTask,
+        source_execution: WorkflowExecution | None,
+        payload: CreateEvolutionTaskRequest,
+    ) -> tuple[ScanTaskCreateRequest, dict[str, Any]]:
+        task_metadata = self._trigger_task_metadata(source_trigger)
+        if self._normalize_task_purpose(getattr(source_trigger, "task_purpose", None) or task_metadata.get("task_purpose")) != "normal":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="only normal tasks can create evolution tasks")
+        if not self._is_dataflow_cli_task_metadata(task_metadata):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="source task is not a run_vuln_scan.py launcher task")
+        source_request = task_metadata.get("dataflow_scan_request") if isinstance(task_metadata.get("dataflow_scan_request"), dict) else {}
+        if not isinstance(source_request.get("data_flow"), dict) or not isinstance(source_request.get("source_dir"), dict):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="source task is missing reusable data_flow/source_dir inputs")
+
+        if source_trigger.workflow_definition_version_id:
+            version = self._definition_version_or_404(db, source_trigger.workflow_definition_version_id)
+        else:
+            version = get_workflow_service().get_profile_version_model(db, source_trigger.workflow_definition_id)
+        source_config_payload = dict(version.config_payload_json or {})
+        source_run_index = self._source_run_index_for_trigger(db, source_trigger, source_execution)
+        source_run_id = source_run_index.id if source_run_index is not None else None
+        source_title = self._trigger_title(source_trigger)
+        source_profile_id = self._task_effective_profile_id(source_trigger)
+        source_origin_type = str(source_trigger.task_origin_type or task_metadata.get("task_origin_type") or "manual").strip() or "manual"
+        source_runtime_overrides = dict(task_metadata.get("runtime_overrides") or {})
+        merged_runtime_overrides = {**source_runtime_overrides, **dict(payload.runtime_overrides or {})}
+        derivation = {
+            "kind": "evolution_replay",
+            "source_task_id": source_trigger.id,
+            "source_execution_id": source_execution.id if source_execution is not None else None,
+            "source_run_id": source_run_id,
+            "source_task_purpose": "normal",
+            "evolution_task_id": payload.evolution_task_id,
+            "evolution_round": payload.evolution_round,
+            "evolution_source_task_id": payload.evolution_source_task_id or source_trigger.id,
+            "evolution_source_execution_id": payload.evolution_source_execution_id or (source_execution.id if source_execution is not None else None),
+        }
+
+        create_payload = ScanTaskCreateRequest(
+            project_id=source_trigger.project_id,
+            profile_id=payload.profile_id or source_profile_id,
+            title=(payload.title.strip() if isinstance(payload.title, str) else "") or self._default_evolution_title(source_title),
+            workspace_dir=self._input_ref_or_none(source_request.get("workspace_dir"), label="workspace_dir"),
+            data_flow=self._input_ref_or_none(source_request.get("data_flow"), label="data_flow"),
+            source_dir=self._input_ref_or_none(source_request.get("source_dir"), label="source_dir"),
+            output_dir=self._input_ref_or_none(source_request.get("output_dir"), label="output_dir"),
+            model=payload.model if payload.model is not None else source_request.get("model") or source_config_payload.get("model"),
+            provider=payload.provider if payload.provider is not None else source_request.get("provider"),
+            review_profile=payload.review_profile if payload.review_profile is not None else source_request.get("review_profile") or source_config_payload.get("review_profile"),
+            max_review_cycles=payload.max_review_cycles if payload.max_review_cycles is not None else source_request.get("max_review_cycles") or source_config_payload.get("max_review_cycles"),
+            agent_run_timeout_seconds=payload.agent_run_timeout_seconds if payload.agent_run_timeout_seconds is not None else source_request.get("agent_run_timeout_seconds") if source_request.get("agent_run_timeout_seconds") is not None else source_config_payload.get("agent_run_timeout_seconds"),
+            agent_timeout_retry_enabled=payload.agent_timeout_retry_enabled if payload.agent_timeout_retry_enabled is not None else source_request.get("agent_timeout_retry_enabled") if source_request.get("agent_timeout_retry_enabled") is not None else source_config_payload.get("agent_timeout_retry_enabled"),
+            agent_timeout_max_retries=payload.agent_timeout_max_retries if payload.agent_timeout_max_retries is not None else source_request.get("agent_timeout_max_retries") if source_request.get("agent_timeout_max_retries") is not None else source_config_payload.get("agent_timeout_max_retries"),
+            worker_timeout=source_request.get("worker_timeout") if source_request.get("worker_timeout") is not None else source_config_payload.get("worker_timeout"),
+            advisor_timeout=source_request.get("advisor_timeout") if source_request.get("advisor_timeout") is not None else source_config_payload.get("advisor_timeout"),
+            timeout_max_retries=payload.timeout_max_retries if payload.timeout_max_retries is not None else source_request.get("timeout_max_retries") if source_request.get("timeout_max_retries") is not None else source_config_payload.get("timeout_max_retries"),
+            timeout_retry_interval_seconds=payload.timeout_retry_interval_seconds if payload.timeout_retry_interval_seconds is not None else source_request.get("timeout_retry_interval_seconds") if source_request.get("timeout_retry_interval_seconds") is not None else source_config_payload.get("timeout_retry_interval_seconds"),
+            result_review_concurrency=payload.result_review_concurrency if payload.result_review_concurrency is not None else source_request.get("result_review_concurrency") if source_request.get("result_review_concurrency") is not None else source_config_payload.get("result_review_concurrency"),
+            scan_options=self._merged_scan_options_for_evolution(source_request, payload),
+            artifact_refs=self._artifact_refs_from_metadata(task_metadata),
+            priority=payload.priority if payload.priority is not None else source_trigger.priority,
+            runtime_overrides=merged_runtime_overrides,
+            task_purpose="evolution",
+            agent_state_roots=dict(payload.agent_state_roots or {}),
+            task_origin_type=source_origin_type,
+            auto_report_vulnerabilities=bool(task_metadata.get("auto_report_vulnerabilities", True)) if payload.auto_report_vulnerabilities is None else bool(payload.auto_report_vulnerabilities),
+        )
+        return create_payload, {"derivation": derivation}
+
+    def _agent_ids_from_compiled_config(self, compiled_config: dict[str, Any] | None) -> list[str]:
+        agent_ids: list[str] = []
+        for agent in (compiled_config or {}).get("agents") or []:
+            if not isinstance(agent, dict):
+                continue
+            agent_id = str(agent.get("id") or "").strip()
+            if agent_id and agent_id not in agent_ids:
+                agent_ids.append(agent_id)
+        return agent_ids
+
+    def _default_agent_state_root(self, *, project_id: str, agent_id: str) -> Path:
+        config = get_config()
+        return (
+            self._project_files_root(project_id)
+            / sanitize_name(config.fileserver_service.dataflow_subproject_name)
+            / "agent-state"
+            / "shared"
+            / sanitize_name(agent_id)
+        )
+
+    def _resolve_directory_ref(
+        self,
+        *,
+        project_id: str,
+        ref: dict[str, Any],
+        expected: str,
+        require_exists: bool,
+    ) -> Path:
+        source = str(ref.get("source") or "project_filesystem").strip()
+        if source in {"project_filesystem", "project_path", "project"}:
+            project_root = self._project_files_root(project_id)
+            normalized = self._normalize_project_path(str(ref.get("path") or ""))
+            resolved = self._ensure_path_within(path=project_root / normalized.lstrip("/"), root=project_root, label=expected)
+        elif source in {"fileserver_storage", "storage_key", "managed_file"}:
+            storage_key = str(ref.get("storage_key") or ref.get("path") or "").strip()
+            if not storage_key:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} storage_key is required")
+            resolved = self._resolve_project_storage_key(project_id=project_id, storage_key=storage_key, label=expected)
+        elif source in {"absolute", "absolute_path", "local_path"}:
+            if not get_config().service.allow_absolute_input_refs:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} absolute_path input is disabled")
+            raw = str(ref.get("path") or "").strip()
+            if not raw:
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} path is required")
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} absolute path is required")
+            resolved = self._ensure_path_within(path=candidate, root=self._project_files_root(project_id), label=expected)
+        else:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"unsupported {expected} source: {source}")
+        if require_exists and not resolved.exists():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} not found: {resolved}")
+        if resolved.exists() and not resolved.is_dir():
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"{expected} must be a directory: {resolved}")
+        return resolved
+
+    def _agent_state_dirs_from_metadata(
+        self,
+        *,
+        project_id: str,
+        compiled_config: dict[str, Any] | None,
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, dict[str, str]]:
+        metadata = metadata or {}
+        configured_roots = metadata.get("agent_state_roots") if isinstance(metadata.get("agent_state_roots"), dict) else {}
+        response: dict[str, dict[str, str]] = {}
+        for agent_id in self._agent_ids_from_compiled_config(compiled_config):
+            root_path: Path
+            source = "shared_default"
+            root_payload = configured_roots.get(agent_id) if isinstance(configured_roots.get(agent_id), dict) else {}
+            root_ref = root_payload.get("root_dir") if isinstance(root_payload.get("root_dir"), dict) else None
+            if root_ref is not None:
+                root_path = self._resolve_directory_ref(
+                    project_id=project_id,
+                    ref=root_ref,
+                    expected=f"{agent_id} root_dir",
+                    require_exists=False,
+                )
+                source = "task_override"
+            else:
+                root_path = self._default_agent_state_root(project_id=project_id, agent_id=agent_id)
+            response[agent_id] = {
+                "agent_id": agent_id,
+                "root_dir": abs_path(root_path),
+                "skills_dir": abs_path(root_path / "skills"),
+                "memory_dir": abs_path(root_path / "memory"),
+                "source": source,
+            }
+        return response
+
+    def _ensure_agent_state_dirs(self, agent_state_dirs: dict[str, dict[str, str]]) -> None:
+        for item in agent_state_dirs.values():
+            root_dir = ensure_dir(item["root_dir"])
+            skills_dir = ensure_dir(item["skills_dir"])
+            memory_dir = ensure_dir(item["memory_dir"])
+            home_skills = root_dir / "skills"
+            home_memory = root_dir / "memory"
+            if home_skills != skills_dir:
+                ensure_dir(home_skills)
+            if home_memory != memory_dir:
+                ensure_dir(home_memory)
+
+    def _apply_agent_state_dirs_to_compiled_config(
+        self,
+        *,
+        compiled_config: dict[str, Any],
+        agent_state_dirs: dict[str, dict[str, str]],
+    ) -> dict[str, Any]:
+        payload = copy.deepcopy(compiled_config or {})
+        for agent in payload.get("agents") or []:
+            if not isinstance(agent, dict):
+                continue
+            agent_id = str(agent.get("id") or "").strip()
+            state_dirs = agent_state_dirs.get(agent_id)
+            if not state_dirs:
+                continue
+            runtime_config = agent.setdefault("runtime_config", {})
+            env_payload = runtime_config.setdefault("env", {})
+            env_payload["PI_CODING_AGENT_DIR"] = state_dirs["root_dir"]
+            env_payload["SECFLOW_PI_AGENT_HOME"] = state_dirs["root_dir"]
+            env_payload["SECFLOW_PI_SKILLS_DIR"] = state_dirs["skills_dir"]
+            env_payload["SECFLOW_PI_MEMORY_DIR"] = state_dirs["memory_dir"]
+            runtime_config["agent_home_dir"] = state_dirs["root_dir"]
+            runtime_config["skills_dir"] = state_dirs["skills_dir"]
+            runtime_config["memory_dir"] = state_dirs["memory_dir"]
+        return payload
+
     def _trigger_uses_run_directory(self, trigger: TriggerTask | None) -> bool:
         metadata = self._trigger_task_metadata(trigger)
         return (
@@ -296,7 +559,11 @@ class ExecutionService:
             version = self._definition_version_or_404(db, trigger.workflow_definition_version_id)
         else:
             version = get_workflow_service().get_profile_version_model(db, trigger.workflow_definition_id)
+        compiled_config = version.compiled_config_json or version.definition_json or {}
+        task_metadata = self._trigger_task_metadata(trigger)
         task_origin_type = str(trigger.task_origin_type or "").strip() or "manual"
+        task_purpose = self._normalize_task_purpose(getattr(trigger, "task_purpose", None) or task_metadata.get("task_purpose"))
+        derivation = self._task_derivation_metadata(task_metadata)
         parent_task_type = str(trigger.parent_task_type or "").strip() or None
         origin_label = (
             "二进制安全-源码扫描"
@@ -405,6 +672,10 @@ class ExecutionService:
         return ScanTaskResponse(
             task_id=trigger.id,
             project_id=trigger.project_id,
+            derived_from_task_id=str(derivation.get("source_task_id") or "").strip() or None,
+            derived_from_execution_id=str(derivation.get("source_execution_id") or "").strip() or None,
+            derived_from_run_id=str(derivation.get("source_run_id") or "").strip() or None,
+            derivation_kind="evolution_replay" if str(derivation.get("kind") or "").strip() == "evolution_replay" else None,
             task_origin_type=task_origin_type,
             parent_project_id=trigger.parent_project_id,
             parent_task_id=trigger.parent_task_id,
@@ -416,6 +687,15 @@ class ExecutionService:
             parent_task_display=trigger.parent_task_id,
             profile_id=trigger.profile_id or trigger.workflow_definition_id,
             profile_version=version.version_no,
+            task_purpose=task_purpose,
+            agent_state_dirs={
+                key: DataflowAgentStateDirResponse.model_validate(value)
+                for key, value in self._agent_state_dirs_from_metadata(
+                    project_id=trigger.project_id,
+                    compiled_config=compiled_config,
+                    metadata=task_metadata,
+                ).items()
+            },
             title=self._trigger_title(trigger),
             status=trigger.status,
             latest_attempt_no=latest_execution.attempt_no if latest_execution else 0,
@@ -434,7 +714,7 @@ class ExecutionService:
             run=run_summary,
             latest_run=run_summary,
             auto_report_vulnerabilities=bool(
-                self._trigger_task_metadata(trigger).get("auto_report_vulnerabilities", True)
+                task_metadata.get("auto_report_vulnerabilities", True)
             ),
             vuln_report_status=get_task_vuln_report_status(
                 db,
@@ -663,6 +943,7 @@ class ExecutionService:
             request=request,
             compiled_config={},
             runtime_overrides={},
+            agent_state_dirs={},
         )
         command = [sys.executable, str(Path(__file__).resolve().parents[2] / "run_vuln_scan.py"), *argv]
         return {
@@ -1228,6 +1509,7 @@ class ExecutionService:
         request: dict[str, Any],
         compiled_config: dict[str, Any],
         runtime_overrides: dict[str, Any],
+        agent_state_dirs: dict[str, dict[str, str]],
     ) -> tuple[list[str], str | None]:
         if plan.get("mode") == "resume" or self._is_dataflow_cli_resume_request(request):
             argv = [
@@ -1283,10 +1565,13 @@ class ExecutionService:
         timeout_retry_interval_seconds = first_present_int(config_payload.get("timeout_retry_interval_seconds"), request.get("timeout_retry_interval_seconds"), default=30)
         result_review_concurrency = first_present_int(config_payload.get("result_review_concurrency"), request.get("result_review_concurrency"), default=3)
 
-        if self._dataflow_cli_config_requires_file(request=request, runtime_overrides=runtime_overrides):
+        if agent_state_dirs or self._dataflow_cli_config_requires_file(request=request, runtime_overrides=runtime_overrides):
             fd, temp_config_path = tempfile.mkstemp(prefix="secflow-dataflow-cli-", suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json_payload = copy.deepcopy(compiled_config or {})
+                json_payload = self._apply_agent_state_dirs_to_compiled_config(
+                    compiled_config=compiled_config or {},
+                    agent_state_dirs=agent_state_dirs,
+                )
                 apply_profile_runtime_policy_to_config(json_payload, review_profile)
                 import json
 
@@ -1785,6 +2070,7 @@ class ExecutionService:
             profile_id=definition.id,
             project_id=definition.project_id,
             trigger_type="manual",
+            task_purpose=self._normalize_task_purpose(payload.task_purpose),
             task_origin_type=str(payload.task_origin_type or "").strip() or "manual",
             parent_project_id=payload.parent_project_id,
             parent_task_id=payload.parent_task_id,
@@ -2057,6 +2343,7 @@ class ExecutionService:
         principal: dict,
         *,
         authorization_token: str | None = None,
+        extra_task_metadata: dict[str, Any] | None = None,
     ) -> ScanTaskResponse:
         self._ensure_project_access(principal, payload.project_id)
         workflow_service = get_workflow_service()
@@ -2099,6 +2386,11 @@ class ExecutionService:
             "artifact_refs": [item.model_dump(mode="json") for item in payload.artifact_refs],
             "task_input_uploads": self._artifact_uploads_from_refs(payload.artifact_refs),
             "runtime_overrides": payload.runtime_overrides,
+            "task_purpose": self._normalize_task_purpose(payload.task_purpose),
+            "agent_state_roots": {
+                agent_id: item.model_dump(mode="json")
+                for agent_id, item in (payload.agent_state_roots or {}).items()
+            },
             "task_title": requested_title,
             "task_origin_type": str(payload.task_origin_type or "").strip() or "manual",
             "parent_project_id": payload.parent_project_id,
@@ -2109,6 +2401,8 @@ class ExecutionService:
             "parent_stage_item_key": payload.parent_stage_item_key,
             "auto_report_vulnerabilities": bool(payload.auto_report_vulnerabilities),
         }
+        if extra_task_metadata:
+            metadata.update(dict(extra_task_metadata))
         if payload.data_flow and payload.source_dir:
             scan_options = dict(payload.scan_options or {})
             if requested_title:
@@ -2134,6 +2428,11 @@ class ExecutionService:
                 "result_review_concurrency": payload.result_review_concurrency,
                 "options": scan_options,
             }
+        self._agent_state_dirs_from_metadata(
+            project_id=payload.project_id,
+            compiled_config=definition_version.compiled_config_json or definition_version.definition_json or definition.definition_json or {},
+            metadata=metadata,
+        )
         if payload.data_flow and payload.source_dir:
             trigger, _ = self._create_dataflow_cli_task_record(
                 db,
@@ -2164,6 +2463,7 @@ class ExecutionService:
                 authorization_token=authorization_token,
             )
             trigger.task_origin_type = str(payload.task_origin_type or "").strip() or "manual"
+            trigger.task_purpose = self._normalize_task_purpose(payload.task_purpose)
             trigger.parent_project_id = payload.parent_project_id
             trigger.parent_task_id = payload.parent_task_id
             trigger.parent_task_type = payload.parent_task_type
@@ -2186,6 +2486,78 @@ class ExecutionService:
                 payload_json={"task_id": trigger.id, "attempt_no": latest_execution.attempt_no},
             )
         return self._scan_task_response(db, trigger)
+
+    def create_evolution_task(
+        self,
+        db: Session,
+        *,
+        source_task_id: str,
+        payload: CreateEvolutionTaskRequest,
+        principal: dict,
+        authorization_token: str | None = None,
+    ) -> ScanTaskResponse:
+        source_trigger = self._trigger_or_404(db, source_task_id)
+        self._ensure_project_access(principal, source_trigger.project_id)
+        source_execution = self._latest_execution_for_trigger(db, source_trigger.id)
+        create_payload, extra_metadata = self._build_evolution_create_payload(
+            db=db,
+            source_trigger=source_trigger,
+            source_execution=source_execution,
+            payload=payload,
+        )
+        created = self.create_scan_task(
+            db,
+            create_payload,
+            principal,
+            authorization_token=authorization_token,
+            extra_task_metadata=extra_metadata,
+        )
+        if created.latest_execution_id:
+            self.record_event(
+                db,
+                execution_id=created.latest_execution_id,
+                event_type="task_evolution_created",
+                message="evolution task created from normal source task",
+                payload_json={
+                    "source_task_id": source_trigger.id,
+                    "source_execution_id": source_execution.id if source_execution is not None else None,
+                    "source_run_id": extra_metadata.get("derivation", {}).get("source_run_id"),
+                    "created_task_id": created.task_id,
+                },
+            )
+        return created
+
+    def get_task_replay_ready(self, db: Session, task_id: str, principal: dict) -> ReplayReadyResponse:
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        metadata = self._trigger_task_metadata(trigger)
+        task_purpose = self._normalize_task_purpose(getattr(trigger, "task_purpose", None) or metadata.get("task_purpose"))
+        latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+        latest_run = self._source_run_index_for_trigger(db, trigger, latest_execution)
+        reason = None
+        replay_ready = True
+        if task_purpose != "normal":
+            replay_ready = False
+            reason = "only normal tasks can create evolution tasks"
+        elif not self._is_dataflow_cli_task_metadata(metadata):
+            replay_ready = False
+            reason = "source task is not a run_vuln_scan.py launcher task"
+        else:
+            source_request = metadata.get("dataflow_scan_request") if isinstance(metadata.get("dataflow_scan_request"), dict) else {}
+            if not isinstance(source_request.get("data_flow"), dict) or not isinstance(source_request.get("source_dir"), dict):
+                replay_ready = False
+                reason = "source task is missing reusable data_flow/source_dir inputs"
+        task_payload = self._scan_task_response(db, trigger, include_run_summary=False)
+        return ReplayReadyResponse(
+            task_id=trigger.id,
+            project_id=trigger.project_id,
+            task_purpose=task_purpose,
+            replay_ready=replay_ready,
+            reason=reason,
+            latest_execution_id=latest_execution.id if latest_execution is not None else None,
+            latest_run_id=latest_run.id if latest_run is not None else None,
+            agent_state_dirs=task_payload.agent_state_dirs,
+        )
 
     def list_scan_tasks(
         self,
@@ -2221,11 +2593,21 @@ class ExecutionService:
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
+        latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+        run_index = self._ensure_run_index_for_execution(db, latest_execution, trigger) if latest_execution is not None else None
+        if self._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=latest_execution):
+            db.commit()
+            db.refresh(trigger)
         return self._scan_task_detail(db, trigger)
 
     def get_scan_task_summary(self, db: Session, task_id: str, principal: dict) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
+        latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+        run_index = self._ensure_run_index_for_execution(db, latest_execution, trigger) if latest_execution is not None else None
+        if self._reconcile_stale_runtime(db, run_index=run_index, trigger=trigger, execution=latest_execution):
+            db.commit()
+            db.refresh(trigger)
         return self._scan_task_response(db, trigger)
 
     def _run_index_or_404(self, db: Session, run_index_id: str, principal: dict) -> Any:
@@ -2498,6 +2880,13 @@ class ExecutionService:
         enriched["process_state"] = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
         retry_command = self._retry_command_display(db, run_index=run_index, trigger=trigger, execution=execution)
         enriched["retry_command_display"] = retry_command or None
+        if trigger is not None:
+            task_payload = self._scan_task_response(db, trigger, include_run_summary=False)
+            enriched["linked_task_purpose"] = task_payload.task_purpose
+            enriched["linked_task_agent_state_dirs"] = {
+                key: value.model_dump(mode="json")
+                for key, value in task_payload.agent_state_dirs.items()
+            }
         return enriched
 
     def _mark_stale_runtime_exited(
@@ -2522,6 +2911,114 @@ class ExecutionService:
             trigger.finished_at = now
             db.add(trigger)
         db.flush()
+
+    def _reconcile_stale_runtime(
+        self,
+        db: Session,
+        *,
+        run_index: RunIndex | None,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+    ) -> bool:
+        if run_index is None or (trigger is None and execution is None):
+            return False
+        process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+        if not bool(process_state.get("stale")):
+            return False
+
+        execution_status = str(execution.status or "").strip().lower() if execution is not None else ""
+        trigger_status = str(trigger.status or "").strip().lower() if trigger is not None else ""
+        if execution_status not in _ACTIVE_RUN_INDEX_STATUSES and trigger_status not in _ACTIVE_RUN_INDEX_STATUSES:
+            return False
+
+        if execution_status in {"cancel_requested", "delete_requested"} or trigger_status in {"cancel_requested", "delete_requested"}:
+            delete_requested = execution_status == "delete_requested" or trigger_status == "delete_requested"
+            message = (
+                "stale delete_requested runtime assumed stopped"
+                if delete_requested
+                else "stale cancel_requested runtime assumed cancelled"
+            )
+            if execution is not None and trigger is not None:
+                self._set_terminal_state(
+                    db,
+                    execution=execution,
+                    trigger=trigger,
+                    execution_status="cancelled",
+                    message=message,
+                    output_manifest_path=execution.output_manifest_path,
+                    output_task_count=int(execution.output_task_count or run_index.result_count or 0),
+                )
+            else:
+                now = now_local()
+                if execution is not None:
+                    execution.status = "cancelled"
+                    execution.message = message
+                    execution.finished_at = now
+                    execution.process_status = "exited"
+                    execution.process_finished_at = now
+                    db.add(execution)
+                if trigger is not None:
+                    trigger.status = "cancelled"
+                    trigger.message = message
+                    trigger.finished_at = now
+                    db.add(trigger)
+                db.flush()
+            self._write_run_control_state(run_index.run_root_path, status_text="cancelled", message=message)
+            get_run_index_service().sync_execution_run(db, execution)
+            db.flush()
+            if execution is not None:
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="execution_cancelled",
+                    message=message,
+                    level="warning",
+                    payload_json={"reason": "stale_runtime_reconciled", "process_state": process_state},
+                )
+            return True
+
+        message = "stale active runtime assumed failed"
+        self._mark_stale_runtime_exited(
+            db,
+            trigger=trigger,
+            execution=execution,
+            message=message,
+        )
+        self._write_run_control_state(run_index.run_root_path, status_text="failed", message=message)
+        get_run_index_service().sync_execution_run(db, execution)
+        db.flush()
+        if execution is not None:
+            self.record_event(
+                db,
+                execution_id=execution.id,
+                event_type="execution_failed",
+                message=message,
+                level="warning",
+                payload_json={"reason": "stale_runtime_reconciled", "process_state": process_state},
+            )
+        return True
+
+    def reconcile_stale_active_executions(self, db: Session, *, limit: int = 200) -> int:
+        reconciled = 0
+        rows = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.status.in_(tuple(_ACTIVE_RUN_INDEX_STATUSES)))
+            .order_by(WorkflowExecution.updated_at.asc())
+            .limit(limit)
+            .all()
+        )
+        for execution in rows:
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            run_index = self._ensure_run_index_for_execution(db, execution, trigger)
+            if self._reconcile_stale_runtime(
+                db,
+                run_index=run_index,
+                trigger=trigger,
+                execution=execution,
+            ):
+                reconciled += 1
+                db.commit()
+        return reconciled
 
     def _preflight_run_resume(self, *, run_index, payload: RunRetryRequest) -> dict[str, Any]:
         run_dir = Path(run_index.run_root_path)
@@ -3272,6 +3769,12 @@ class ExecutionService:
         runtime_overrides = dict(metadata.get("runtime_overrides") or {})
         config_payload = version.config_payload_json or definition.config_payload_json or {}
         compiled_config = version.compiled_config_json or version.definition_json or definition.definition_json
+        agent_state_dirs = self._agent_state_dirs_from_metadata(
+            project_id=trigger.project_id,
+            compiled_config=compiled_config,
+            metadata=metadata,
+        )
+        self._ensure_agent_state_dirs(agent_state_dirs)
         temp_config_path: str | None = None
         argv: list[str] = []
         try:
@@ -3281,10 +3784,12 @@ class ExecutionService:
                 request=request,
                 compiled_config=compiled_config,
                 runtime_overrides=runtime_overrides,
+                agent_state_dirs=agent_state_dirs,
             )
             command = [sys.executable, str(Path(__file__).resolve().parents[2] / "run_vuln_scan.py"), *argv]
             metadata["dataflow_cli"] = {
                 **plan,
+                "agent_state_dirs": agent_state_dirs,
                 "argv": argv,
                 "command": command,
                 "command_display": _command_display(command),
@@ -3423,6 +3928,16 @@ class ExecutionService:
                 )
                 return
             compiled_config = version.compiled_config_json or version.definition_json or definition.definition_json
+            agent_state_dirs = self._agent_state_dirs_from_metadata(
+                project_id=trigger.project_id,
+                compiled_config=compiled_config,
+                metadata=task_metadata,
+            )
+            self._ensure_agent_state_dirs(agent_state_dirs)
+            compiled_config = self._apply_agent_state_dirs_to_compiled_config(
+                compiled_config=compiled_config,
+                agent_state_dirs=agent_state_dirs,
+            )
             workspace_root = Path(execution.workspace_root) if execution.workspace_root else self._build_workspace_root(execution.id, definition)
             input_manifest_path = workspace_root / "input" / "tasks.json"
             if not input_manifest_path.exists():

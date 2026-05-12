@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-app-binary-evolution-center
+  namespace: secflow-ns
+spec:
+  type: ClusterIP
+  selector:
+    app: secflow-app-binary-evolution-center
+    role: manager
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: secflow-app-binary-evolution-center

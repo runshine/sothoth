@@ -49,6 +49,24 @@ class BinaryToSourceClient(JsonHttpClient):
             json_body={"item_ids": item_ids},
         )
 
+    async def rerun_task(
+        self,
+        project_id: str,
+        task_id: str,
+        token: str,
+        *,
+        clean_output: bool = True,
+        cancel_running: bool = True,
+    ) -> dict:
+        return await self.post(
+            f"/projects/{project_id}/tasks/{task_id}/rerun",
+            token=token,
+            json_body={
+                "clean_output": clean_output,
+                "cancel_running": cancel_running,
+            },
+        )
+
     async def delete_task(self, project_id: str, task_id: str, token: str) -> dict:
         return await self.delete(f"/projects/{project_id}/tasks/{task_id}", token=token)
 

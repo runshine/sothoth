@@ -184,6 +184,57 @@ async def test_pi_agent_runtime_records_command_and_prompts(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
+async def test_pi_agent_runtime_injects_agent_state_directories(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    home_dir = tmp_path / "agent-home"
+    skills_dir = tmp_path / "custom-skills"
+    memory_dir = tmp_path / "custom-memory"
+    runtime = PiAgentRuntime(
+        {
+            "id": "pi-test",
+            "name": "Pi Test",
+            "type": "pi_agent",
+            "reset_context": False,
+            "runtime_config": {
+                "model": "claude-test",
+                "agent_home_dir": str(home_dir),
+                "skills_dir": str(skills_dir),
+                "memory_dir": str(memory_dir),
+                "env": {
+                    "SECFLOW_PI_AGENT_HOME": str(home_dir),
+                    "SECFLOW_PI_SKILLS_DIR": str(skills_dir),
+                    "SECFLOW_PI_MEMORY_DIR": str(memory_dir),
+                },
+            },
+        }
+    )
+
+    captured: dict[str, object] = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        return _FakeProc(stdout=b"assistant output", stderr=b"", returncode=0)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    response = await runtime.send_message(
+        message="user prompt body",
+        system_prompt="system prompt body",
+        session_id="pi_test_session",
+        working_dir=str(tmp_path),
+    )
+
+    assert response.success is True
+    env = captured["env"]
+    assert env["PI_CODING_AGENT_DIR"] == str(home_dir)
+    assert env["SECFLOW_PI_AGENT_HOME"] == str(home_dir)
+    assert env["SECFLOW_PI_SKILLS_DIR"] == str(skills_dir)
+    assert env["SECFLOW_PI_MEMORY_DIR"] == str(memory_dir)
+    assert home_dir.is_dir()
+    assert skills_dir.is_dir()
+    assert memory_dir.is_dir()
+
+
+@pytest.mark.asyncio
 async def test_pi_agent_runtime_omits_thinking_argument_when_unresolved(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

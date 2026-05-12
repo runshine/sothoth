@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import time
 from datetime import timedelta
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from app.config import get_config
 from app.main import create_app
 from app.artifacts.io import write_json
-from app.models.database import RunIndex, TriggerTask, WorkflowDefinitionVersion, WorkflowExecution, get_db_session
+from app.models.database import RunIndex, TriggerTask, WorkflowDefinitionVersion, WorkflowExecution, WorkflowExecutionEvent, get_db_session
 from app.services.execution_service import get_execution_service
 from app.time_utils import isoformat_local, now_local
 
@@ -48,6 +49,53 @@ def _profile_payload() -> dict:
         "max_retry_count": 2,
         "execution_timeout_seconds": 600,
     }
+
+
+def _prepare_business_case(case_name: str) -> Path:
+    config = get_config()
+    case_root = Path(config.fileserver_service.data_mount_path) / "files" / "default" / case_name
+    source_dir = case_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
+    (case_root / "data_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+    return case_root
+
+
+def _create_business_dataflow_task(
+    client: TestClient,
+    *,
+    profile_id: str,
+    case_name: str,
+    title: str,
+    extra_payload: dict | None = None,
+) -> dict:
+    _prepare_business_case(case_name)
+    payload = {
+        "project_id": "default",
+        "profile_id": profile_id,
+        "title": title,
+        "data_flow": {"source": "project_filesystem", "path": f"/{case_name}/data_flow.md"},
+        "source_dir": {"source": "project_filesystem", "path": f"/{case_name}/source"},
+        "model": "mock/model",
+        "review_profile": "fast",
+        "max_review_cycles": 1,
+        "result_review_concurrency": 1,
+    }
+    if extra_payload:
+        payload.update(extra_payload)
+    response = client.post("/api/dataflow-vuln-scanner/tasks", json=payload)
+    assert response.status_code == 201
+    return response.json()
+
+
+def _disable_scheduler_start(monkeypatch):
+    from app.api import tasks as task_api
+
+    class NoopScheduler:
+        def start_execution_now(self, execution_id):
+            return False
+
+    monkeypatch.setattr(task_api, "get_scheduler_service", lambda: NoopScheduler())
 
 
 def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_agent_runtime):
@@ -846,6 +894,232 @@ def test_dataflow_task_creates_missing_profile_version_snapshot(service_config_p
     versions = client.get(f"/api/dataflow-vuln-scanner/profiles/{profile_id}/versions")
     assert versions.status_code == 200
     assert versions.json()[0]["version"] == 1
+
+
+def test_create_evolution_task_from_normal_task_inherits_defaults_and_derivation(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    source = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-evolution-source",
+        title="normal source scan",
+    )
+    source_detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{source['task_id']}").json()
+    source_execution_id = source_detail["latest_execution_id"]
+    source_run = client.get(
+        "/api/dataflow-vuln-scanner/runs/by-task",
+        params={"project_id": "default", "task_id": source["task_id"], "execution_id": source_execution_id},
+    )
+    assert source_run.status_code == 200
+    source_run_id = source_run.json()["run_id"]
+
+    created = client.post(
+        f"/api/dataflow-vuln-scanner/tasks/{source['task_id']}/create-evolution",
+        json={},
+    )
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["task_purpose"] == "evolution"
+    assert payload["derived_from_task_id"] == source["task_id"]
+    assert payload["derived_from_execution_id"] == source_execution_id
+    assert payload["derived_from_run_id"] == source_run_id
+    assert payload["derivation_kind"] == "evolution_replay"
+    assert payload["task_origin_type"] == source["task_origin_type"]
+    assert payload["title"] == "Evolution of normal source scan"
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{payload['task_id']}").json()
+    assert detail["task_purpose"] == "evolution"
+    assert detail["derived_from_task_id"] == source["task_id"]
+    assert detail["task_metadata"]["derivation"]["kind"] == "evolution_replay"
+    assert detail["task_metadata"]["derivation"]["source_task_id"] == source["task_id"]
+    assert detail["task_metadata"]["derivation"]["source_execution_id"] == source_execution_id
+    assert detail["task_metadata"]["derivation"]["source_run_id"] == source_run_id
+    assert detail["task_metadata"]["derivation"]["source_task_purpose"] == "normal"
+    assert detail["task_metadata"]["dataflow_scan_request"]["data_flow"] == source_detail["task_metadata"]["dataflow_scan_request"]["data_flow"]
+    assert detail["task_metadata"]["dataflow_scan_request"]["source_dir"] == source_detail["task_metadata"]["dataflow_scan_request"]["source_dir"]
+
+    db = get_db_session()
+    try:
+        event = (
+            db.query(WorkflowExecutionEvent)
+            .filter(
+                WorkflowExecutionEvent.execution_id == payload["latest_execution_id"],
+                WorkflowExecutionEvent.event_type == "task_evolution_created",
+            )
+            .order_by(WorkflowExecutionEvent.created_at.desc())
+            .first()
+        )
+        assert event is not None
+        assert event.payload_json["source_task_id"] == source["task_id"]
+        assert event.payload_json["source_execution_id"] == source_execution_id
+        assert event.payload_json["source_run_id"] == source_run_id
+        assert event.payload_json["created_task_id"] == detail["task_id"]
+    finally:
+        db.close()
+
+
+def test_create_evolution_task_allows_running_failed_and_cancelled_source_statuses(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    source = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-evolution-statuses",
+        title="status source scan",
+    )
+    source_detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{source['task_id']}").json()
+    source_execution_id = source_detail["latest_execution_id"]
+
+    for status_name in ("running", "failed", "cancelled"):
+        db = get_db_session()
+        try:
+            trigger = db.get(TriggerTask, source["task_id"])
+            execution = db.get(WorkflowExecution, source_execution_id)
+            assert trigger is not None and execution is not None
+            trigger.status = status_name
+            execution.status = status_name
+            if status_name == "running":
+                trigger.finished_at = None
+                execution.finished_at = None
+            db.add(trigger)
+            db.add(execution)
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.post(
+            f"/api/dataflow-vuln-scanner/tasks/{source['task_id']}/create-evolution",
+            json={"title": f"evolution from {status_name}"},
+        )
+        assert response.status_code == 201
+        created = response.json()
+        assert created["task_purpose"] == "evolution"
+        assert created["derived_from_task_id"] == source["task_id"]
+
+
+def test_create_evolution_task_rejects_evolution_source_and_non_cli_source(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    source = _create_business_dataflow_task(
+        client,
+        profile_id=profile["profile_id"],
+        case_name="case-evolution-reject",
+        title="reject source scan",
+    )
+    evolution = client.post(
+        f"/api/dataflow-vuln-scanner/tasks/{source['task_id']}/create-evolution",
+        json={"title": "first evolution"},
+    )
+    assert evolution.status_code == 201
+    second_hop = client.post(
+        f"/api/dataflow-vuln-scanner/tasks/{evolution.json()['task_id']}/create-evolution",
+        json={},
+    )
+    assert second_hop.status_code == 409
+    assert "only normal tasks" in second_hop.text
+
+    manual = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "title": "manual non cli task",
+            "task_markdown": "# Manual\n",
+        },
+    )
+    assert manual.status_code == 201
+    rejected = client.post(
+        f"/api/dataflow-vuln-scanner/tasks/{manual.json()['task_id']}/create-evolution",
+        json={},
+    )
+    assert rejected.status_code == 422
+    assert "run_vuln_scan.py launcher" in rejected.text
+
+
+def test_create_evolution_task_applies_overrides_and_agent_state_roots(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    _disable_scheduler_start(monkeypatch)
+    app = create_app()
+    client = TestClient(app)
+    base_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+    alt_profile_payload = _profile_payload()
+    alt_profile_payload["name"] = "alternate scanner"
+    alt_profile_payload["config_payload"]["review_profile"] = "audit"
+    alt_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=alt_profile_payload).json()
+    source = _create_business_dataflow_task(
+        client,
+        profile_id=base_profile["profile_id"],
+        case_name="case-evolution-overrides",
+        title="override source scan",
+        extra_payload={
+            "workspace_dir": {"source": "project_filesystem", "path": "/case-evolution-overrides/workspace"},
+            "runtime_overrides": {"base_toggle": True},
+        },
+    )
+    source_detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{source['task_id']}").json()
+
+    project_root = Path(get_config().fileserver_service.data_mount_path) / "files" / "default"
+    worker_root = project_root / "evolution-roots" / "worker-a"
+    worker_root.mkdir(parents=True, exist_ok=True)
+
+    created = client.post(
+        f"/api/dataflow-vuln-scanner/tasks/{source['task_id']}/create-evolution",
+        json={
+            "title": "custom evolution replay",
+            "profile_id": alt_profile["profile_id"],
+            "priority": 77,
+            "model": "mock/override-model",
+            "review_profile": "audit",
+            "max_review_cycles": 3,
+            "agent_run_timeout_seconds": 99,
+            "agent_timeout_retry_enabled": False,
+            "agent_timeout_max_retries": 1,
+            "timeout_max_retries": 2,
+            "timeout_retry_interval_seconds": 0,
+            "result_review_concurrency": 2,
+            "runtime_overrides": {"extra_toggle": "yes"},
+            "scan_options": {"custom_option": "enabled"},
+            "auto_report_vulnerabilities": False,
+            "agent_state_roots": {
+                "pi-worker": {
+                    "root_dir": {"source": "project_filesystem", "path": "/evolution-roots/worker-a"}
+                }
+            },
+        },
+    )
+    assert created.status_code == 201
+    payload = created.json()
+    assert payload["profile_id"] == alt_profile["profile_id"]
+    assert payload["priority"] == 77
+    assert payload["task_purpose"] == "evolution"
+    assert payload["agent_state_dirs"]["pi-worker"]["source"] == "task_override"
+    assert payload["agent_state_dirs"]["pi-worker"]["root_dir"] == str(worker_root.resolve())
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{payload['task_id']}").json()
+    request_payload = detail["task_metadata"]["dataflow_scan_request"]
+    assert detail["task_origin_type"] == source["task_origin_type"]
+    assert detail["auto_report_vulnerabilities"] is False
+    assert detail["runtime_overrides"]["base_toggle"] is True
+    assert detail["runtime_overrides"]["extra_toggle"] == "yes"
+    assert request_payload["data_flow"] == source_detail["task_metadata"]["dataflow_scan_request"]["data_flow"]
+    assert request_payload["source_dir"] == source_detail["task_metadata"]["dataflow_scan_request"]["source_dir"]
+    assert request_payload["workspace_dir"] == source_detail["task_metadata"]["dataflow_scan_request"]["workspace_dir"]
+    assert request_payload["model"] == "mock/override-model"
+    assert request_payload["review_profile"] == "audit"
+    assert request_payload["max_review_cycles"] == 3
+    assert request_payload["agent_run_timeout_seconds"] == 99
+    assert request_payload["agent_timeout_retry_enabled"] is False
+    assert request_payload["agent_timeout_max_retries"] == 1
+    assert request_payload["timeout_max_retries"] == 2
+    assert request_payload["timeout_retry_interval_seconds"] == 0
+    assert request_payload["result_review_concurrency"] == 2
+    assert request_payload["options"]["custom_option"] == "enabled"
 
 
 def test_project_filesystem_browser_uses_local_project_tree(service_config_path):
