@@ -40,7 +40,7 @@ def test_review_profiles_have_monotonic_execution_budgets() -> None:
     assert [fast.advisor_max_internal_turns, balanced.advisor_max_internal_turns, audit.advisor_max_internal_turns] == [0, 0, 0]
     assert fast.advisor_rpc_stdout_trace_bytes < balanced.advisor_rpc_stdout_trace_bytes < audit.advisor_rpc_stdout_trace_bytes
     assert [fast.advisor_rpc_stdout_abort_bytes, balanced.advisor_rpc_stdout_abort_bytes, audit.advisor_rpc_stdout_abort_bytes] == [0, 0, 0]
-    assert fast.reflection_passes_per_cycle < balanced.reflection_passes_per_cycle < audit.reflection_passes_per_cycle
+    assert [fast.reflection_passes_per_cycle, balanced.reflection_passes_per_cycle, audit.reflection_passes_per_cycle] == [0, 1, 1]
     assert [fast.reflection_max_internal_turns, balanced.reflection_max_internal_turns, audit.reflection_max_internal_turns] == [0, 0, 0]
     assert fast.reflection_rpc_stdout_trace_bytes < balanced.reflection_rpc_stdout_trace_bytes < audit.reflection_rpc_stdout_trace_bytes
     assert [fast.reflection_rpc_stdout_abort_bytes, balanced.reflection_rpc_stdout_abort_bytes, audit.reflection_rpc_stdout_abort_bytes] == [0, 0, 0]
@@ -202,7 +202,7 @@ def test_generate_config_uses_profile_default_budget_when_max_cycles_not_set(
     advisor_runtime = config["agents"][1]["runtime_config"]
 
     assert engine["max_worker_turns_per_cycle"] == get_review_profile_policy("audit").max_worker_turns_per_cycle
-    assert engine["reflection_passes_per_cycle"] == 3
+    assert engine["reflection_passes_per_cycle"] == 1
     assert engine["reflection_max_internal_turns"] == 0
     assert engine["reflection_rpc_stdout_abort_bytes"] == get_review_profile_policy("audit").reflection_rpc_stdout_abort_bytes
     assert "reflection_max_wall_seconds" not in engine
@@ -252,7 +252,7 @@ def test_generate_config_respects_explicit_cycles_but_keeps_profile_depth_budget
     assert config["global"]["max_review_cycles"] == 4
     assert engine["max_review_cycles"] == 4
     assert engine["max_worker_turns_per_cycle"] == get_review_profile_policy("audit").max_worker_turns_per_cycle
-    assert engine["reflection_passes_per_cycle"] == 3
+    assert engine["reflection_passes_per_cycle"] == 1
     assert "reflection_max_wall_seconds" not in engine
     assert "reflection_no_progress_timeout_seconds" not in engine
     assert engine["min_discovery_cycles_before_pass"] == 3

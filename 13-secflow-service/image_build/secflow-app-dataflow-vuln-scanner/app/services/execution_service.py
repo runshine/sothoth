@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import posixpath
+import re
 import shutil
 import shlex
 import signal
@@ -68,6 +69,15 @@ from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:20]}"
+
+
+def _sanitize_dataflow_run_name(value: str) -> str:
+    cleaned = re.sub(r"\s+", "-", str(value or "").strip())
+    cleaned = re.sub(r"[\\/:\0]+", "-", cleaned)
+    cleaned = re.sub(r"[^\w.-]+", "-", cleaned, flags=re.UNICODE).strip("-.")
+    if cleaned in {"", ".", ".."}:
+        return "item"
+    return cleaned
 
 
 def _principal_id(principal: dict) -> str:
@@ -1018,13 +1028,12 @@ class ExecutionService:
         runs_root: Path,
         execution_id: str,
         requested_run_name: str | None = None,
-        task_id: str | None = None,
     ) -> str:
-        requested = str(task_id or requested_run_name or "").strip()
+        requested = str(requested_run_name or "").strip()
         if requested:
-            base_name = sanitize_name(requested)
+            base_name = _sanitize_dataflow_run_name(requested)
         else:
-            base_name = f"{sanitize_name(data_flow_path.stem)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            base_name = f"{_sanitize_dataflow_run_name(data_flow_path.stem)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         run_name = base_name or f"dataflow_vuln_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         if not (runs_root / run_name).exists():
             return run_name
@@ -1097,7 +1106,6 @@ class ExecutionService:
             runs_root=runs_root,
             execution_id=execution_id,
             requested_run_name=options.get("run_name"),
-            task_id=request.get("task_id"),
         )
         run_dir = runs_root / run_name
         task_md_path = run_dir / "run" / "input" / "task.md"
@@ -1681,6 +1689,9 @@ class ExecutionService:
             }
         metadata["dataflow_cli"] = plan
         self._write_dataflow_cli_task_preview(plan)
+        if not str(metadata.get("task_title") or "").strip():
+            metadata["task_title"] = plan["run_name"]
+            task.title = plan["run_name"]
         task.task_md_path = plan["task_md_path"]
         task.metadata = metadata
         trigger.input_tasks_json = TaskManifest(tasks=[task, *manifest.tasks[1:]]).model_dump(mode="json")
@@ -1748,7 +1759,7 @@ class ExecutionService:
                 TaskItem(
                     task_id=_new_id("task"),
                     task_type="dataflow_vuln_scan_cli",
-                    title=payload.title,
+                    title=str(payload.title or "").strip() or "Pending dataflow vulnerability scan",
                     task_md_path=abs_path(self._default_dataflow_cli_runs_root(definition.project_id) / "_pending" / trigger.id / "task.md"),
                     metadata=metadata,
                     upstream_refs=[],
@@ -2034,11 +2045,12 @@ class ExecutionService:
             runtime_overrides=payload.runtime_overrides,
             config_payload_overrides={key: value for key, value in config_payload_overrides.items() if value is not None},
         )
+        requested_title = str(payload.title or "").strip()
         metadata = {
             "artifact_refs": [item.model_dump(mode="json") for item in payload.artifact_refs],
             "task_input_uploads": self._artifact_uploads_from_refs(payload.artifact_refs),
             "runtime_overrides": payload.runtime_overrides,
-            "task_title": payload.title,
+            "task_title": requested_title,
             "task_origin_type": str(payload.task_origin_type or "").strip() or "manual",
             "parent_project_id": payload.parent_project_id,
             "parent_task_id": payload.parent_task_id,
@@ -2049,8 +2061,8 @@ class ExecutionService:
         }
         if payload.data_flow and payload.source_dir:
             scan_options = dict(payload.scan_options or {})
-            if str(payload.title or "").strip():
-                scan_options.setdefault("run_name", str(payload.title).strip())
+            if requested_title:
+                scan_options.setdefault("run_name", requested_title)
             metadata["dataflow_scan_request"] = {
                 "launcher": "run_vuln_scan.py",
                 "project_id": payload.project_id,
@@ -2090,7 +2102,7 @@ class ExecutionService:
                 input_tasks=[
                     TriggerTaskInputTask(
                         task_id=_new_id("task"),
-                        title=payload.title,
+                        title=requested_title or f"Task {datetime.now().strftime('%Y%m%d_%H%M%S')}",
                         task_markdown=payload.task_markdown,
                         metadata=metadata,
                         upstream_refs=[],

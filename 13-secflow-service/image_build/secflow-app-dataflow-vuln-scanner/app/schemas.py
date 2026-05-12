@@ -97,7 +97,7 @@ class DataflowInputRef(BaseModel):
 class ScanTaskCreateRequest(BaseModel):
     project_id: str = Field(..., min_length=1)
     profile_id: Optional[str] = None
-    title: str = Field(..., min_length=1)
+    title: str = Field(default="", max_length=128)
     task_markdown: Optional[str] = Field(default=None, min_length=1)
     workspace_dir: Optional[DataflowInputRef] = None
     data_flow: Optional[DataflowInputRef] = None
@@ -383,6 +383,8 @@ class RunDetailResponse(RunSummaryResponse):
     run_log: str = ""
     command: List[str] = Field(default_factory=list)
     command_display: str = ""
+    current_step: Dict[str, Any] = Field(default_factory=dict)
+    step_history: List[Dict[str, Any]] = Field(default_factory=list)
     raw: Dict[str, Any] = Field(default_factory=dict)
 
 

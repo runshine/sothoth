@@ -95,9 +95,15 @@ def _read_text_file(path: Path) -> str:
 
 def _write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _run_index_db_meta_dir(run_root: str | Path) -> Path:
@@ -166,11 +172,20 @@ def _truncate_log_summary(content: str, max_chars: int = RUN_INDEX_LOG_SUMMARY_M
 
 def _raw_summary_db_view(payload: dict[str, Any]) -> dict[str, Any]:
     cli_payload = payload.get("dataflow_cli") if isinstance(payload.get("dataflow_cli"), dict) else {}
+    current_step = payload.get("current_step") if isinstance(payload.get("current_step"), dict) else {}
+    step_history = payload.get("step_history") if isinstance(payload.get("step_history"), list) else []
     return {
         "start_time": str(payload.get("start_time") or ""),
         "command": list(payload.get("command") or []) if isinstance(payload.get("command"), list) else [],
         "command_display": str(payload.get("command_display") or ""),
         "dataflow_cli": cli_payload,
+        "current_step": {
+            "cycle": current_step.get("cycle"),
+            "phase": current_step.get("phase"),
+            "step_key": current_step.get("step_key"),
+            "status": current_step.get("status"),
+        },
+        "step_history_count": len(step_history),
         "summary_markdown_length": len(str(payload.get("summary_markdown") or "")),
         "task_markdown_length": len(str(payload.get("task_markdown") or "")),
     }
@@ -896,6 +911,8 @@ class RunIndexService:
             "start_time": str(summary.get("start_time") or ""),
             "summary_markdown": _summary_markdown_for_run(run_root, atomic_work_path),
             "task_markdown": _task_markdown_for_run(run_root),
+            "current_step": dict(detail.get("current_step") or {}),
+            "step_history": list(detail.get("step_history") or []),
         }
         command_payload = _run_command_payload(
             db,
@@ -1372,6 +1389,8 @@ class RunIndexService:
                 "run_log": run_index.log_tail_text or "",
                 "command": [str(item) for item in command],
                 "command_display": command_display,
+                "current_step": dict(raw_summary.get("current_step") or {}),
+                "step_history": list(raw_summary.get("step_history") or []),
                 "raw": raw_summary,
             }
         )

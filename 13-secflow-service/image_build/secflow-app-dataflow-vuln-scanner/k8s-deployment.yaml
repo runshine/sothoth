@@ -44,6 +44,13 @@ spec:
           subPath: config.yaml
         - name: secflow-platform-fileserver-data
           mountPath: /data
+        resources:
+          requests:
+            memory: "11Gi"
+            cpu: "4"
+          limits:
+            memory: "16Gi"
+            cpu: "4"
         readinessProbe:
           httpGet:
             path: /api/dataflow-vuln-scanner/ready

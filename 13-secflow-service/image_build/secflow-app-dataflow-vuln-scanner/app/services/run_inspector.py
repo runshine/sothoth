@@ -728,6 +728,56 @@ def _load_manifest_summary(atomic: Path) -> dict[str, Any]:
     }
 
 
+_CHECKPOINT_PHASE_ORDER = {
+    "worker": 10,
+    "reflect": 20,
+    "summary": 30,
+    "global_review": 40,
+    "result_review": 50,
+}
+
+
+def _load_current_step_checkpoint(atomic: Path) -> dict[str, Any]:
+    payload = _read_json(atomic / "_meta" / "checkpoints" / "current_step.json")
+    if not payload:
+        return {}
+    return {
+        **payload,
+        "path": "_meta/checkpoints/current_step.json",
+    }
+
+
+def _collect_step_checkpoints(atomic: Path, limit: int = 240) -> list[dict[str, Any]]:
+    steps_root = atomic / "_meta" / "checkpoints" / "steps"
+    if not steps_root.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for checkpoint_path in steps_root.rglob("*.json"):
+        payload = _read_json(checkpoint_path)
+        if not payload:
+            continue
+        try:
+            mtime = checkpoint_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        items.append(
+            {
+                **payload,
+                "path": _rel_to_atomic(checkpoint_path, atomic),
+                "mtime": mtime,
+            }
+        )
+    items.sort(
+        key=lambda item: (
+            int(item.get("cycle") or 0),
+            _CHECKPOINT_PHASE_ORDER.get(str(item.get("phase") or ""), 90),
+            str(item.get("step_key") or ""),
+            float(item.get("mtime") or 0.0),
+        )
+    )
+    return items[-limit:]
+
+
 def _rel_to_atomic(path: Path, atomic: Path) -> str:
     return str(path.relative_to(atomic))
 
@@ -901,6 +951,8 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
             "manifests": {},
             "atomic_work_path": "",
             "atomic_work_dir": "",
+            "current_step": {},
+            "step_history": [],
         }
 
     workflow_result = _read_json(atomic / "_meta" / "workflow_result.json")
@@ -963,6 +1015,8 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
         "latest_issues": latest_issues,
         "atomic_work_path": str(atomic),
         "atomic_work_dir": str(atomic),
+        "current_step": _load_current_step_checkpoint(atomic),
+        "step_history": _collect_step_checkpoints(atomic),
     }
 
 
