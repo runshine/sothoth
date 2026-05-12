@@ -52,6 +52,10 @@ class BinarySecurityUploadCompletePayload(BaseModel):
     files: list[BinarySecurityInputFile] = Field(default_factory=list)
 
 
+class BinarySecurityTaskConcurrencyUpdatePayload(BaseModel):
+    stage_parallelism: dict[str, int] = Field(default_factory=dict)
+
+
 class BinarySecurityTaskPrepareResponse(BaseModel):
     task_id: str
 

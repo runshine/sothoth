@@ -15,7 +15,7 @@ from app.model import (
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
 )
-from app.schemas import BinarySecurityArchiveJobResponse
+from app.schemas import BinarySecurityArchiveJobResponse, BinarySecurityTaskConcurrencyUpdatePayload
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
 
@@ -1118,6 +1118,95 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual(1, compact["item_count"])
             self.assertEqual(20, compact["items_preview"][0]["entry_count"])
             self.assertLessEqual(len(compact["items_preview"][0]["entries_preview"]), 5)
+
+    def test_update_task_concurrency_updates_binary_stage_parallelism(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="success",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {
+            "max_stage_parallelism": 4,
+            "max_retries_per_item": 3,
+            "continue_on_item_failure": False,
+            "stage_parallelism": {
+                "firmware_unpack": 4,
+                "system_analysis": 4,
+                "binary_to_source": 4,
+                "entry_analysis": 4,
+                "dataflow_analysis": 4,
+                "vuln_scan": 4,
+            },
+        }
+        db = _ModelAwareDb(tasks=[task])
+
+        detail = self.manager.update_task_concurrency(
+            db,
+            project_id="p1",
+            task_id="t1",
+            payload=BinarySecurityTaskConcurrencyUpdatePayload(
+                stage_parallelism={"firmware_unpack": 2, "vuln_scan": 8}
+            ),
+        )
+
+        self.assertEqual(8, detail.policy["max_stage_parallelism"])
+        self.assertEqual(2, detail.policy["stage_parallelism"]["firmware_unpack"])
+        self.assertEqual(8, detail.policy["stage_parallelism"]["vuln_scan"])
+        self.assertEqual(4, detail.policy["stage_parallelism"]["system_analysis"])
+        self.assertEqual(3, detail.policy["max_retries_per_item"])
+        self.assertFalse(detail.policy["continue_on_item_failure"])
+
+    def test_update_task_concurrency_rejects_stages_outside_source_flow(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {"stage_parallelism": {"system_analysis": 4, "entry_analysis": 4, "dataflow_analysis": 4, "vuln_scan": 4}}
+        db = _ModelAwareDb(tasks=[task])
+
+        with self.assertRaisesRegex(Exception, "阶段不属于当前任务流程"):
+            self.manager.update_task_concurrency(
+                db,
+                project_id="p1",
+                task_id="t1",
+                payload=BinarySecurityTaskConcurrencyUpdatePayload(stage_parallelism={"firmware_unpack": 2}),
+            )
+
+    def test_update_task_concurrency_rejects_invalid_parallelism_value(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.policy = {"stage_parallelism": {"system_analysis": 4, "entry_analysis": 4, "dataflow_analysis": 4, "vuln_scan": 4}}
+        db = _ModelAwareDb(tasks=[task])
+
+        with self.assertRaisesRegex(Exception, "并发必须是 1 到 32 之间的整数"):
+            self.manager.update_task_concurrency(
+                db,
+                project_id="p1",
+                task_id="t1",
+                payload=BinarySecurityTaskConcurrencyUpdatePayload(stage_parallelism={"system_analysis": 33}),
+            )
 
     def test_continue_task_deletes_archive_child_outputs_for_affected_stages(self):
         with tempfile.TemporaryDirectory() as tmp:

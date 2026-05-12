@@ -19,6 +19,7 @@ from app.schemas import (
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
     BinarySecurityServiceConfigResponse,
+    BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskCreate,
     BinarySecurityUploadCompletePayload,
     BinarySecurityTaskDetailResponse,
@@ -148,6 +149,17 @@ def get_task(
     db: Session = Depends(get_db),
 ):
     return get_task_manager().get_task_detail(db, project_id=project_id, task_id=task_id)
+
+
+@router.put("/projects/{project_id}/tasks/{task_id}/concurrency", response_model=BinarySecurityTaskDetailResponse)
+def update_task_concurrency(
+    project_id: str,
+    task_id: str,
+    payload: BinarySecurityTaskConcurrencyUpdatePayload,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().update_task_concurrency(db, project_id=project_id, task_id=task_id, payload=payload)
 
 
 @router.get("/projects/{project_id}/tasks/{task_id}/timeline", response_model=BinarySecurityTimelineResponse)

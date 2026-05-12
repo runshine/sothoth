@@ -52,6 +52,7 @@ from app.schemas import (
     BinarySecurityStageItemResponse,
     BinarySecurityStageSummary,
     BinarySecurityTaskCreate,
+    BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskEventResponse,
     BinarySecurityTaskListResponse,
@@ -852,6 +853,51 @@ class TaskManager:
                 items,
             ),
         )
+
+    def update_task_concurrency(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        payload: BinarySecurityTaskConcurrencyUpdatePayload,
+    ) -> BinarySecurityTaskDetailResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        stage_sequence = self._stage_sequence_for_task(task)
+        allowed_stages = set(stage_sequence)
+        requested = payload.stage_parallelism or {}
+        invalid_stage = next((stage for stage in requested if stage not in allowed_stages), None)
+        if invalid_stage:
+            raise ValidationError(f"阶段不属于当前任务流程: {invalid_stage}")
+
+        policy = dict(task.policy or {})
+        current_parallelism = policy.get("stage_parallelism") if isinstance(policy.get("stage_parallelism"), dict) else {}
+        before = {
+            stage: max(1, int(current_parallelism.get(stage) or policy.get("max_stage_parallelism") or 1))
+            for stage in stage_sequence
+        }
+        updated = dict(before)
+        for stage_name, raw_value in requested.items():
+            try:
+                value = int(raw_value)
+            except (TypeError, ValueError):
+                raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数") from None
+            if value < 1 or value > 32:
+                raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数")
+            updated[stage_name] = value
+
+        policy["stage_parallelism"] = updated
+        policy["max_stage_parallelism"] = max(updated.values()) if updated else 1
+        task.policy = policy
+        self._record_event(
+            db,
+            task,
+            "task_concurrency_updated",
+            "任务阶段并发配置已更新",
+            payload={"before": before, "after": updated},
+        )
+        db.commit()
+        return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def get_module_selection(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityModuleSelectionResponse:
         task = self._task_or_404(db, project_id, task_id)
