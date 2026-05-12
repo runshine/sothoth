@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 _heartbeat_thread: Optional[threading.Thread] = None
 _cleanup_thread: Optional[threading.Thread] = None
-_skill_generation_thread: Optional[threading.Thread] = None
+_evolution_thread: Optional[threading.Thread] = None
 _stop_event = threading.Event()
 _active_lock = threading.Lock()
 
@@ -262,18 +262,18 @@ def _cleanup_loop(interval: int) -> None:
             logger.warning("workspace cleanup loop warning: %s", exc)
 
 
-def _skill_generation_loop(interval: int) -> None:
-    from app.services.task_manager import process_skill_generation_jobs
+def _evolution_loop(interval: int) -> None:
+    from app.services.task_manager import process_evolution_jobs
 
     while not _stop_event.wait(timeout=interval):
         try:
-            process_skill_generation_jobs()
+            process_evolution_jobs()
         except Exception as exc:
-            logger.warning("skill generation loop warning: %s", exc)
+            logger.warning("evolution loop warning: %s", exc)
 
 
 def start_heartbeat(interval: Optional[int] = None) -> None:
-    global _heartbeat_thread, _cleanup_thread, _skill_generation_thread
+    global _heartbeat_thread, _cleanup_thread, _evolution_thread
 
     if _heartbeat_thread and _heartbeat_thread.is_alive():
         return
@@ -294,13 +294,13 @@ def start_heartbeat(interval: Optional[int] = None) -> None:
         daemon=True,
     )
     _cleanup_thread.start()
-    _skill_generation_thread = threading.Thread(
-        target=_skill_generation_loop,
+    _evolution_thread = threading.Thread(
+        target=_evolution_loop,
         args=(max(5, loop_interval),),
-        name="fw-skill-generation",
+        name="fw-evolution",
         daemon=True,
     )
-    _skill_generation_thread.start()
+    _evolution_thread.start()
     logger.info("worker heartbeat started")
 
 
@@ -310,6 +310,6 @@ def stop_heartbeat() -> None:
         _heartbeat_thread.join(timeout=5)
     if _cleanup_thread and _cleanup_thread.is_alive():
         _cleanup_thread.join(timeout=5)
-    if _skill_generation_thread and _skill_generation_thread.is_alive():
-        _skill_generation_thread.join(timeout=5)
+    if _evolution_thread and _evolution_thread.is_alive():
+        _evolution_thread.join(timeout=5)
     logger.info("worker heartbeat stopped")

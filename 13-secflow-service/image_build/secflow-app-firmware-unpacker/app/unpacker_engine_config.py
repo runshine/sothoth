@@ -20,12 +20,17 @@ EXEC_AGENT_DEF = str(AGENT_DIR / "firmware-unpacker.md")
 VAL_AGENT_DEF = str(AGENT_DIR / "firmware-unpack-reviewer.md")
 CLEAN_AGENT_DEF = str(AGENT_DIR / "firmware-extract-cleanup.md")
 AUTHOR_AGENT_DEF = str(AGENT_DIR / "firmware-skill-author.md")
+EVOLUTION_EXEC_AGENT_DEF = str(AGENT_DIR / "firmware-skill-executor.md")
+EVOLUTION_IMPROVER_AGENT_DEF = str(AGENT_DIR / "firmware-skill-evolver.md")
 
 EXEC_FIRST_TMPL = AGENT_DIR / "prompt" / "unpack-firmware.md"
 EXEC_RETRY_TMPL = AGENT_DIR / "prompt" / "retry-firmware-unpack.md"
 VAL_PROMPT_TMPL = AGENT_DIR / "prompt" / "review-firmware-unpack.md"
 CLEAN_PROMPT_TMPL = AGENT_DIR / "prompt" / "cleanup-firmware.md"
 AUTHOR_PROMPT_TMPL = AGENT_DIR / "prompt" / "author-firmware-skill.md"
+EVOLUTION_EXEC_PROMPT_TMPL = AGENT_DIR / "prompt" / "execute-firmware-skill.md"
+EVOLUTION_REVIEW_PROMPT_TMPL = AGENT_DIR / "prompt" / "review-firmware-skill-execution.md"
+EVOLUTION_IMPROVER_PROMPT_TMPL = AGENT_DIR / "prompt" / "evolve-firmware-skill.md"
 
 TOOLS_DIR = Path(os.environ.get("UNPACKER_TOOLS_DIR", "/data/secflow-app-firmware-unpacker/tools"))
 LOG_OUTPUT_DIR = Path(os.environ.get("UNPACKER_LOG_DIR", "/workspace/log_output"))
@@ -37,6 +42,7 @@ ROLE_CONFIG_FILE_KEYS = {
     "cleaner": "llm_config_file_key_cleaner",
     "skill_author": "llm_config_file_key_skill_author",
     "skill_executor": "llm_config_file_key_skill_executor",
+    "evolution_improver": "llm_config_file_key_evolution_improver",
 }
 
 ROLE_MODEL_CONFIG_KEYS = {
@@ -45,6 +51,7 @@ ROLE_MODEL_CONFIG_KEYS = {
     "cleaner": "llm_model_cleaner",
     "skill_author": "llm_model_skill_author",
     "skill_executor": "llm_model_skill_executor",
+    "evolution_improver": "llm_model_evolution_improver",
 }
 
 ROLE_REUSE_CONFIG_KEYS = {
@@ -53,6 +60,7 @@ ROLE_REUSE_CONFIG_KEYS = {
     "cleaner": "reuse_agent_between_rounds_cleaner",
     "skill_author": "reuse_agent_between_rounds_skill_author",
     "skill_executor": "reuse_agent_between_rounds_skill_executor",
+    "evolution_improver": "reuse_agent_between_rounds_evolution_improver",
 }
 
 

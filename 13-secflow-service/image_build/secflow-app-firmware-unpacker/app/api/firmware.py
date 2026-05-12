@@ -16,7 +16,7 @@ from sqlalchemy.orm import load_only
 
 from app.api.dependencies import ensure_project_access, get_current_subject
 from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
-from app.model import ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
+from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
 from app.schemas import (
     ActionResponse,
     BatchDeleteRequest,
@@ -26,6 +26,11 @@ from app.schemas import (
     ConfigListResponse,
     ConfigUpdateRequest,
     HealthResponse,
+    EvolutionJobListResponse,
+    EvolutionJobResponse,
+    EvolutionJobSubmitResponse,
+    EvolutionRoundResponse,
+    EvolutionSessionIndexResponse,
     LlmConfigFileSummaryListResponse,
     LlmProviderSummaryListResponse,
     ReadyResponse,
@@ -44,7 +49,19 @@ from app.schemas import (
 from app.services.pod_metrics import get_pod_resource_usage
 from app.services.configcenter import get_configcenter_client
 from app.services.task_events import list_task_events
-from app.services.task_manager import cancel_task, delete_tasks, request_task_result_cache_refresh, retry_task, submit_unpack_task
+from app.services.task_manager import (
+    cancel_task,
+    delete_tasks,
+    get_evolution_job,
+    get_evolution_log,
+    get_evolution_sessions,
+    list_evolution_jobs,
+    list_evolution_rounds,
+    request_task_result_cache_refresh,
+    retry_task,
+    submit_evolution_job,
+    submit_unpack_task,
+)
 from app.services.worker import get_cluster_snapshot, get_worker_id
 from app.skill_store import list_skills
 from app.unpacker_engine_config import get_max_retries
@@ -110,7 +127,20 @@ def _get_task_or_404(task_id: str) -> dict:
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if not task:
             raise NotFoundError("任务", task_id)
-        return task.to_dict()
+        payload = task.to_dict()
+        latest = (
+            db.query(FirmwareEvolutionJob)
+            .filter(FirmwareEvolutionJob.task_id == task.id)
+            .order_by(FirmwareEvolutionJob.created_at.desc())
+            .first()
+        )
+        if latest is not None:
+            payload["latest_evolution_job_id"] = latest.id
+            payload["latest_evolution_status"] = latest.status
+            payload["latest_evolution_started_at"] = str(latest.started_at.isoformat()) if latest.started_at else None
+            payload["latest_evolution_completed_at"] = str(latest.completed_at.isoformat()) if latest.completed_at else None
+            payload["latest_evolution_final_skill_path"] = latest.final_skill_path
+        return payload
     finally:
         db.close()
 
@@ -1929,6 +1959,44 @@ async def refresh_project_task_result_cache(
     return {"message": message, "task_id": task_id}
 
 
+@router.post(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/evolution",
+    response_model=EvolutionJobSubmitResponse,
+)
+async def create_project_task_evolution(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    try:
+        return submit_evolution_job(task_id)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.get(
+    "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/evolution-jobs",
+    response_model=EvolutionJobListResponse,
+)
+async def list_project_task_evolution_jobs(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    items = list_evolution_jobs(task_id)
+    return {"total": len(items), "items": items}
+
+
 @router.delete(
     "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}",
     response_model=ActionResponse,
@@ -1964,6 +2032,111 @@ async def submit_unpack_legacy(
     if project_id:
         await ensure_project_access(project_id, token)
     return _submit_task(project_id, request)
+
+
+@router.post(
+    "/api/app/firmware-unpacker/tasks/{task_id}/evolution",
+    response_model=EvolutionJobSubmitResponse,
+)
+async def create_task_evolution_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    try:
+        return submit_evolution_job(task_id)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+@router.get(
+    "/api/app/firmware-unpacker/tasks/{task_id}/evolution-jobs",
+    response_model=EvolutionJobListResponse,
+)
+async def list_task_evolution_jobs_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    items = list_evolution_jobs(task_id)
+    return {"total": len(items), "items": items}
+
+
+@router.get(
+    "/api/app/firmware-unpacker/evolution-jobs/{job_id}",
+    response_model=EvolutionJobResponse,
+)
+async def get_evolution_job_legacy(
+    job_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    job = get_evolution_job(job_id)
+    if job is None:
+        raise NotFoundError("进化任务", job_id)
+    await _get_task_with_access(str(job.get("task_id") or ""), token)
+    return job
+
+
+@router.get(
+    "/api/app/firmware-unpacker/evolution-jobs/{job_id}/rounds",
+    response_model=list[EvolutionRoundResponse],
+)
+async def list_evolution_rounds_legacy(
+    job_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    job = get_evolution_job(job_id)
+    if job is None:
+        raise NotFoundError("进化任务", job_id)
+    await _get_task_with_access(str(job.get("task_id") or ""), token)
+    return list_evolution_rounds(job_id)
+
+
+@router.get(
+    "/api/app/firmware-unpacker/evolution-jobs/{job_id}/sessions",
+    response_model=EvolutionSessionIndexResponse,
+)
+async def get_evolution_sessions_legacy(
+    job_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    job = get_evolution_job(job_id)
+    if job is None:
+        raise NotFoundError("进化任务", job_id)
+    await _get_task_with_access(str(job.get("task_id") or ""), token)
+    payload = get_evolution_sessions(job_id)
+    if payload is None:
+        raise NotFoundError("进化任务会话", job_id)
+    return payload
+
+
+@router.get(
+    "/api/app/firmware-unpacker/evolution-jobs/{job_id}/logs",
+    response_model=TaskLogResponse,
+)
+async def get_evolution_logs_legacy(
+    job_id: str,
+    round: int = Query(default=1, ge=1),
+    role: str = Query(default="tool_executor"),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    job = get_evolution_job(job_id)
+    if job is None:
+        raise NotFoundError("进化任务", job_id)
+    await _get_task_with_access(str(job.get("task_id") or ""), token)
+    try:
+        payload = get_evolution_log(job_id, round, role)
+    except ValueError as exc:
+        raise ValidationError(str(exc)) from exc
+    if payload is None:
+        raise NotFoundError("进化任务日志", job_id)
+    return payload
 
 
 @router.get("/api/app/firmware-unpacker/tasks", response_model=TaskListResponse)

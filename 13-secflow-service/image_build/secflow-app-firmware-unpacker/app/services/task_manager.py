@@ -47,12 +47,21 @@ STAGE_LABELS = {
     "llm_unpack": "LLM 解包",
     "review": "LLM 评审",
     "cleanup": "清理收尾",
+    "evolution": "手动进化",
+    "tool_execute": "工具执行",
+    "evolve": "工具进化",
 }
 SKILL_GENERATION_PENDING = "pending"
 SKILL_GENERATION_RUNNING = "running"
 SKILL_GENERATION_SUCCESS = "success"
 SKILL_GENERATION_FAILED = "failed"
 SKILL_GENERATION_NOT_APPLICABLE = "not_applicable"
+EVOLUTION_PENDING = "pending"
+EVOLUTION_RUNNING = "running"
+EVOLUTION_SUCCESS = "success"
+EVOLUTION_FAILED = "failed"
+EVOLUTION_CANCELLED = "cancelled"
+EVOLUTION_MAX_ROUNDS = 3
 
 
 def _executor_capacity() -> int:
@@ -352,6 +361,25 @@ def _active_runner_count() -> int:
     return sum(1 for _, pid in rows if _is_process_alive(pid))
 
 
+def _local_running_evolution_job_count() -> int:
+    from app.model import FirmwareEvolutionJob, get_db_session
+    from app.services.worker import get_worker_id
+
+    owner_id = get_worker_id()
+    db = get_db_session()
+    try:
+        return int(
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.owner_id == owner_id,
+                FirmwareEvolutionJob.status == EVOLUTION_RUNNING,
+            )
+            .count()
+        )
+    finally:
+        db.close()
+
+
 def _register_cancel_hook(task_id: str, hook) -> None:
     with _active_cancel_hooks_lock:
         if hook is None:
@@ -443,7 +471,8 @@ def _trigger_cancel_hook(task_id: str) -> None:
 
 
 def get_local_active_task_count() -> int:
-    return _active_runner_count()
+    # Keep manual evolution within the same worker capacity budget as unpack tasks.
+    return _active_runner_count() + _local_running_evolution_job_count()
 
 
 def recover_stale_owned_tasks() -> None:
@@ -839,7 +868,7 @@ def enqueue_workspace_cleanup(
 
 
 def process_workspace_cleanup_jobs(limit: int = 2) -> int:
-    from app.model import SkillGenerationJob, TaskStatus, UnpackTask, WorkspaceCleanupJob, get_db_session, get_worker_id
+    from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, SkillGenerationJob, TaskStatus, UnpackTask, WorkspaceCleanupJob, get_db_session, get_worker_id
 
     owner_id = get_worker_id()
     processed = 0
@@ -927,9 +956,18 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
                     task.skill_generation_job_id = None
                     task.skill_generation_started_at = None
                     task.skill_generation_completed_at = None
+                    task.latest_evolution_job_id = None
+                    task.latest_evolution_status = None
+                    task.latest_evolution_started_at = None
+                    task.latest_evolution_completed_at = None
+                    task.latest_evolution_final_skill_path = None
                     task.started_at = None
                     task.completed_at = None
                     db.query(SkillGenerationJob).filter(SkillGenerationJob.task_id == task.id).delete()
+                    evolution_jobs = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.task_id == task.id).all()
+                    for evolution_job in evolution_jobs:
+                        db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == evolution_job.id).delete()
+                    db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.task_id == task.id).delete()
                     if not task.llm_binding_snapshot:
                         snapshot = _build_llm_binding_snapshot(db)
                         task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
@@ -1832,6 +1870,71 @@ def _derive_run_root_from_output_path(output_path: str) -> Path:
     return output_root.parent / "run" if output_root.name == "output" else output_root.parent / "run"
 
 
+def _derive_evolution_root_from_output_path(output_path: str) -> Path:
+    return _derive_run_root_from_output_path(output_path) / "evolution_jobs"
+
+
+def _derive_evolution_job_root(output_path: str, job_id: str) -> Path:
+    return _derive_evolution_root_from_output_path(output_path) / str(job_id).strip()
+
+
+def _enrich_evolution_job_payload(
+    payload: dict[str, Any],
+    *,
+    task: Any | None,
+    job_root: Path | None,
+) -> dict[str, Any]:
+    enriched = dict(payload or {})
+    source_skill_path = str(getattr(task, "matched_skill", "") or "").strip() or None
+    enriched["source_skill_path"] = source_skill_path
+    enriched["started_without_matched_skill"] = not bool(source_skill_path)
+    enriched["working_skill_path"] = None
+    enriched["generated_new_skill"] = False
+    if job_root is None:
+        return enriched
+    result_path = job_root / "evolution_result.json"
+    if not result_path.exists():
+        return enriched
+    try:
+        result_payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except Exception:
+        return enriched
+    if isinstance(result_payload, dict):
+        enriched["working_skill_path"] = str(result_payload.get("working_skill_path") or "").strip() or None
+        enriched["source_skill_path"] = str(result_payload.get("source_skill_path") or source_skill_path or "").strip() or None
+        enriched["started_without_matched_skill"] = bool(result_payload.get("started_without_matched_skill"))
+        enriched["generated_new_skill"] = bool(result_payload.get("generated_new_skill"))
+        rounds = result_payload.get("rounds")
+        if isinstance(rounds, list):
+            enriched["round_count"] = len(rounds)
+            enriched["rounds"] = []
+            for item in rounds:
+                if not isinstance(item, dict):
+                    continue
+                enriched["rounds"].append(
+                    {
+                        "id": str(item.get("id") or "").strip() or f"{str(enriched.get('id') or '').strip()}-{int(item.get('round') or 0)}",
+                        "job_id": str(item.get("job_id") or enriched.get("id") or "").strip(),
+                        "round": int(item.get("round") or 0),
+                        "status": str(item.get("status") or "failed"),
+                        "tool_skill_path_before": str(item.get("tool_skill_path_before") or "").strip() or None,
+                        "tool_skill_path_after": str(item.get("tool_skill_path_after") or "").strip() or None,
+                        "tool_changed": bool(item.get("tool_changed")),
+                        "review_result": str(item.get("review_result") or "").strip() or None,
+                        "summary_path": str(item.get("summary_path") or "").strip() or None,
+                        "reason_path": str(item.get("reason_path") or "").strip() or None,
+                        "source_skill_path": str(item.get("source_skill_path") or enriched["source_skill_path"] or "").strip() or None,
+                        "started_without_matched_skill": bool(item.get("started_without_matched_skill")),
+                        "generated_new_skill": bool(item.get("generated_new_skill")),
+                        "executed_tool": bool(item.get("executed_tool")),
+                        "tool_response_preview": str(item.get("tool_response_preview") or "").strip() or None,
+                        "created_at": str(item.get("created_at") or "").strip() or None,
+                        "completed_at": str(item.get("completed_at") or "").strip() or None,
+                    }
+                )
+    return enriched
+
+
 def _read_session_count(run_root: Path) -> int:
     index_path = run_root / "sessions" / "index.json"
     if not index_path.exists():
@@ -1853,6 +1956,35 @@ def _safe_read_text(path: Path) -> Optional[str]:
         return None
 
 
+def _latest_evolution_summary(db: Any, task_id: str) -> dict[str, Any] | None:
+    from app.model import FirmwareEvolutionJob
+
+    row = (
+        db.query(FirmwareEvolutionJob)
+        .filter(FirmwareEvolutionJob.task_id == task_id)
+        .order_by(FirmwareEvolutionJob.created_at.desc())
+        .first()
+    )
+    return row.to_dict() if row is not None else None
+
+
+def _evolution_session_index_payload(job_root: Path) -> dict[str, Any]:
+    session_root = job_root / "sessions"
+    index_path = session_root / "index.json"
+    if not index_path.exists():
+        return {"version": 1, "session_root": str(session_root), "items": []}
+    try:
+        payload = json.loads(index_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = {"version": 1, "items": []}
+    if not isinstance(payload, dict):
+        payload = {"version": 1, "items": []}
+    payload["session_root"] = str(session_root)
+    if not isinstance(payload.get("items"), list):
+        payload["items"] = []
+    return payload
+
+
 def _write_task_result_cache(task_id: str) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
@@ -1861,6 +1993,7 @@ def _write_task_result_cache(task_id: str) -> None:
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if task is None:
             return
+        latest_evolution = _latest_evolution_summary(db, task_id)
 
         output_root = Path(str(task.output_path or "").strip())
         run_root = _derive_run_root_from_output_path(task.output_path or "")
@@ -1943,6 +2076,11 @@ def _write_task_result_cache(task_id: str) -> None:
                 "skill_generation_job_id": str(task.skill_generation_job_id or "").strip() or None,
                 "skill_generation_started_at": isoformat_local(task.skill_generation_started_at),
                 "skill_generation_completed_at": isoformat_local(task.skill_generation_completed_at),
+                "latest_evolution_job": str((latest_evolution or {}).get("id") or "").strip() or None,
+                "latest_evolution_status": str((latest_evolution or {}).get("status") or "").strip() or None,
+                "latest_evolution_started_at": str((latest_evolution or {}).get("started_at") or "").strip() or None,
+                "latest_evolution_completed_at": str((latest_evolution or {}).get("completed_at") or "").strip() or None,
+                "latest_evolution_final_skill_path": str((latest_evolution or {}).get("final_skill_path") or "").strip() or None,
                 "executor_rounds": int(task.rounds or 0),
                 "session_count": session_count,
                 "event_count": 0,
@@ -1999,6 +2137,361 @@ def _enqueue_skill_generation_job(db: Any, task: Any, *, created_by: str = "task
     task.skill_generation_started_at = None
     task.skill_generation_completed_at = None
     return job_id
+
+
+def submit_evolution_job(task_id: str, *, created_by: str = "task_manager") -> dict[str, Any]:
+    from app.model import FirmwareEvolutionJob, TaskStatus, UnpackTask, generate_id, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        if task is None:
+            raise ValueError("任务不存在")
+        if task.status != TaskStatus.SUCCESS.value:
+            raise ValueError("仅主任务 success 后允许发起进化")
+        existing = (
+            db.query(FirmwareEvolutionJob)
+            .filter(
+                FirmwareEvolutionJob.task_id == task.id,
+                FirmwareEvolutionJob.status.in_([EVOLUTION_PENDING, EVOLUTION_RUNNING]),
+            )
+            .first()
+        )
+        if existing is not None:
+            raise ValueError("当前任务已有运行中的进化任务")
+        job_id = generate_id()
+        job = FirmwareEvolutionJob(
+            id=job_id,
+            task_id=task.id,
+            project_id=task.project_id,
+            status=EVOLUTION_PENDING,
+            current_round=0,
+            max_rounds=EVOLUTION_MAX_ROUNDS,
+            current_stage="tool_execute" if str(task.matched_skill or "").strip() else "evolve",
+            created_by=created_by,
+        )
+        db.add(job)
+        task.latest_evolution_job_id = job_id
+        task.latest_evolution_status = EVOLUTION_PENDING
+        task.latest_evolution_started_at = None
+        task.latest_evolution_completed_at = None
+        task.latest_evolution_final_skill_path = None
+        db.commit()
+        _record_task_event_from_row(
+            task,
+            event_type="evolution_queued",
+            summary="手动进化任务已创建",
+            stage_key="evolution",
+            status=task.status,
+            detail={"job_id": job_id, "max_rounds": EVOLUTION_MAX_ROUNDS},
+            created_by=created_by,
+        )
+        _write_task_result_cache(task.id)
+        return {"job_id": job_id, "status": EVOLUTION_PENDING, "max_rounds": EVOLUTION_MAX_ROUNDS}
+    finally:
+        db.close()
+
+
+def list_evolution_jobs(task_id: str) -> list[dict[str, Any]]:
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+        rows = (
+            db.query(FirmwareEvolutionJob)
+            .filter(FirmwareEvolutionJob.task_id == task_id)
+            .order_by(FirmwareEvolutionJob.created_at.desc())
+            .all()
+        )
+        output_path = str(task.output_path or "").strip() if task is not None else ""
+        return [
+            _enrich_evolution_job_payload(
+                row.to_dict(),
+                task=task,
+                job_root=_derive_evolution_job_root(output_path, row.id) if output_path else None,
+            )
+            for row in rows
+        ]
+    finally:
+        db.close()
+
+
+def get_evolution_job(job_id: str) -> dict[str, Any] | None:
+    from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            return None
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        rounds = (
+            db.query(FirmwareEvolutionRound)
+            .filter(FirmwareEvolutionRound.job_id == job.id)
+            .order_by(FirmwareEvolutionRound.round.asc())
+            .all()
+        )
+        output_path = str(task.output_path or "").strip() if task is not None else ""
+        job_root = _derive_evolution_job_root(output_path, job.id) if output_path else Path("/tmp")
+        payload = _enrich_evolution_job_payload(
+            job.to_dict(),
+            task=task,
+            job_root=job_root,
+        )
+        payload.update(
+            {
+                "run_root": str(job_root),
+                "session_root": str(job_root / "sessions"),
+                "task_output_path": output_path or None,
+                "round_count": int(payload.get("round_count") or len(rounds)),
+                "rounds": payload.get("rounds") or [item.to_dict() for item in rounds],
+            }
+        )
+        return payload
+    finally:
+        db.close()
+
+
+def list_evolution_rounds(job_id: str) -> list[dict[str, Any]]:
+    from app.model import FirmwareEvolutionRound, get_db_session
+
+    db = get_db_session()
+    try:
+        rows = (
+            db.query(FirmwareEvolutionRound)
+            .filter(FirmwareEvolutionRound.job_id == job_id)
+            .order_by(FirmwareEvolutionRound.round.asc())
+            .all()
+        )
+        return [row.to_dict() for row in rows]
+    finally:
+        db.close()
+
+
+def get_evolution_sessions(job_id: str) -> dict[str, Any] | None:
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            return None
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if task is None:
+            return None
+        job_root = _derive_evolution_job_root(task.output_path, job.id)
+        return _evolution_session_index_payload(job_root)
+    finally:
+        db.close()
+
+
+def get_evolution_log(job_id: str, round_id: int, role: str) -> dict[str, Any] | None:
+    from app.model import FirmwareEvolutionJob, UnpackTask, get_db_session
+    from app.unpacker_engine_logs import read_text_tail
+
+    role_file_map = {
+        "tool_executor": ["tool_executor_transcript.log", "tool_executor_messages.json"],
+        "reviewer": ["reviewer_transcript.log", "reviewer_messages.json"],
+        "evolver": ["evolver_transcript.log", "evolver_messages.json"],
+    }
+    files = role_file_map.get(str(role or "").strip())
+    if not files:
+        raise ValueError("不支持的 evolution log role")
+
+    db = get_db_session()
+    try:
+        job = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+        if job is None:
+            return None
+        task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+        if task is None:
+            return None
+        round_dir = _derive_evolution_job_root(task.output_path, job.id) / f"round_{max(1, int(round_id)):03d}"
+        existing_files = [str(round_dir / name) for name in files if (round_dir / name).exists()]
+        text_chunks = []
+        for name in files:
+            path = round_dir / name
+            if path.exists():
+                text_chunks.append(f"===== {name} =====\n{read_text_tail(path, 128 * 1024)}")
+        return {
+            "task_id": job.task_id,
+            "run_path": str(round_dir),
+            "available": bool(text_chunks),
+            "log_text": "\n\n".join(text_chunks),
+            "files": existing_files,
+            "phase": f"evolution:{role}:round_{max(1, int(round_id)):03d}",
+            "message": None if text_chunks else "当前轮次日志不存在",
+        }
+    finally:
+        db.close()
+
+
+def process_evolution_jobs(limit: int = 1) -> int:
+    from app.evolution_engine import run_evolution_job
+    from app.model import FirmwareEvolutionJob, FirmwareEvolutionRound, UnpackTask, get_db_session, get_worker_id, generate_id
+
+    owner_id = get_worker_id()
+    processed = 0
+    while processed < max(1, limit):
+        available_slots = _runtime_max_concurrent() - get_local_active_task_count()
+        if available_slots <= 0:
+            break
+        db = get_db_session()
+        job = None
+        now = now_local()
+        try:
+            job = (
+                db.query(FirmwareEvolutionJob)
+                .filter(
+                    (FirmwareEvolutionJob.status == EVOLUTION_PENDING)
+                    | (
+                        (FirmwareEvolutionJob.status == EVOLUTION_RUNNING)
+                        & (
+                            (FirmwareEvolutionJob.lease_expires_at.is_(None))
+                            | (FirmwareEvolutionJob.lease_expires_at < now)
+                        )
+                    )
+                )
+                .order_by(FirmwareEvolutionJob.created_at.asc())
+                .first()
+            )
+            if job is None:
+                db.close()
+                break
+            task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
+            if task is None:
+                raise RuntimeError("进化任务对应主任务不存在")
+            job.status = EVOLUTION_RUNNING
+            job.owner_id = owner_id
+            job.started_at = job.started_at or now
+            job.completed_at = None
+            job.error_message = None
+            job.attempts = int(job.attempts or 0) + 1
+            job.lease_expires_at = _skill_generation_job_lease_deadline(now)
+            task.latest_evolution_job_id = job.id
+            task.latest_evolution_status = EVOLUTION_RUNNING
+            task.latest_evolution_started_at = job.started_at
+            task.latest_evolution_completed_at = None
+            db.commit()
+            _record_task_event_from_row(
+                task,
+                event_type="evolution_started",
+                summary="手动进化任务开始执行",
+                stage_key="evolution",
+                status=task.status,
+                detail={"job_id": job.id},
+                owner_id=owner_id,
+                created_by="task_manager",
+            )
+            task_id = task.id
+            job_id = job.id
+            project_id = task.project_id
+            firmware_path = task.firmware_path
+            output_path = task.output_path
+            active_skill_path = str(task.matched_skill or "").strip()
+            llm_binding_snapshot = _parse_llm_binding_snapshot(task.llm_binding_snapshot)
+            max_rounds = int(job.max_rounds or EVOLUTION_MAX_ROUNDS)
+        finally:
+            db.close()
+
+        result: dict[str, Any] | None = None
+        error_message: Optional[str] = None
+        try:
+            def _progress(round_id: int, stage: str) -> None:
+                db = get_db_session()
+                try:
+                    current = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+                    task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+                    if current is not None:
+                        current.current_round = round_id
+                        current.current_stage = stage
+                        current.lease_expires_at = _skill_generation_job_lease_deadline(now_local())
+                    if task is not None:
+                        task.latest_evolution_status = EVOLUTION_RUNNING
+                    db.commit()
+                finally:
+                    db.close()
+
+            result = run_evolution_job(
+                task_id=task_id,
+                evolution_job_id=job_id,
+                firmware_path=firmware_path,
+                unpack_output_path=output_path,
+                active_skill_path=active_skill_path,
+                llm_binding_snapshot=llm_binding_snapshot,
+                max_rounds=max_rounds,
+                progress_callback=_progress,
+            )
+        except Exception as exc:
+            error_message = str(exc)
+            logger.warning("failed to process evolution job %s task %s: %s", job_id, task_id, exc)
+
+        db = get_db_session()
+        try:
+            current = db.query(FirmwareEvolutionJob).filter(FirmwareEvolutionJob.id == job_id).first()
+            task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
+            if current is None or task is None:
+                processed += 1
+                continue
+            db.query(FirmwareEvolutionRound).filter(FirmwareEvolutionRound.job_id == job_id).delete()
+            for item in list((result or {}).get("rounds") or []):
+                if not isinstance(item, dict):
+                    continue
+                db.add(
+                    FirmwareEvolutionRound(
+                        id=generate_id(),
+                        job_id=job_id,
+                        round=int(item.get("round") or 0),
+                        status=str(item.get("status") or "failed"),
+                        tool_skill_path_before=str(item.get("tool_skill_path_before") or "").strip() or None,
+                        tool_skill_path_after=str(item.get("tool_skill_path_after") or "").strip() or None,
+                        tool_changed=bool(item.get("tool_changed")),
+                        review_result=str(item.get("review_result") or "").strip() or None,
+                        summary_path=str(item.get("summary_path") or "").strip() or None,
+                        reason_path=str(item.get("reason_path") or "").strip() or None,
+                        created_at=now_local(),
+                        completed_at=now_local(),
+                    )
+                )
+            completed_at = now_local()
+            current.owner_id = owner_id
+            current.lease_expires_at = None
+            current.completed_at = completed_at
+            current.current_round = int((result or {}).get("current_round") or current.current_round or 0)
+            current.current_stage = "review" if (result or {}).get("review_passed") else "evolve"
+            current.status = EVOLUTION_FAILED if error_message else str((result or {}).get("status") or EVOLUTION_FAILED)
+            current.error_message = error_message
+            current.final_skill_path = str((result or {}).get("final_skill_path") or "").strip() or None
+            current.replaced_skill_path = str((result or {}).get("replaced_skill_path") or "").strip() or None
+            current.review_passed = bool((result or {}).get("review_passed"))
+            task.latest_evolution_job_id = job_id
+            task.latest_evolution_status = current.status
+            task.latest_evolution_started_at = current.started_at
+            task.latest_evolution_completed_at = completed_at
+            task.latest_evolution_final_skill_path = current.final_skill_path
+            db.commit()
+            _record_task_event_from_row(
+                task,
+                event_type="evolution_failed" if error_message or current.status != EVOLUTION_SUCCESS else "evolution_completed",
+                summary="手动进化任务失败" if error_message or current.status != EVOLUTION_SUCCESS else "手动进化任务完成",
+                stage_key="evolution",
+                status=task.status,
+                detail={
+                    "job_id": job_id,
+                    "evolution_status": current.status,
+                    "current_round": current.current_round,
+                    "final_skill_path": current.final_skill_path,
+                    "error": error_message,
+                },
+                owner_id=owner_id,
+                created_by="task_manager",
+            )
+            _write_task_result_cache(task_id)
+        finally:
+            db.close()
+        processed += 1
+    return processed
 
 
 def _run_task_result_cache_refresh(task_id: str) -> None:
@@ -2214,7 +2707,6 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
-    queued_skill_generation_job_id: Optional[str] = None
     try:
         query = db.query(UnpackTask).filter(UnpackTask.id == task_id)
         if run_token:
@@ -2262,16 +2754,11 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
         task.generated_skill_path = result.get("generated_skill_path")
         task.generated_skill_status = result.get("generated_skill_status")
         task.promotion_success_count = result.get("promotion_success_count")
+        task.skill_generation_status = SKILL_GENERATION_NOT_APPLICABLE
         task.skill_generation_error = None
-        skill_generation_requested = bool(result.get("skill_generation_requested"))
-        if task.status == TaskStatus.SUCCESS.value and skill_generation_requested:
-            queued_skill_generation_job_id = _enqueue_skill_generation_job(db, task)
-        else:
-            task.skill_generation_status = SKILL_GENERATION_NOT_APPLICABLE
-            task.skill_generation_error = None
-            task.skill_generation_job_id = None
-            task.skill_generation_started_at = None
-            task.skill_generation_completed_at = None
+        task.skill_generation_job_id = None
+        task.skill_generation_started_at = None
+        task.skill_generation_completed_at = None
         task.completed_at = now_local()
         task.last_progress_at = now_local()
         db.commit()
@@ -2290,16 +2777,6 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
-        if queued_skill_generation_job_id:
-            _record_task_event_from_row(
-                task,
-                event_type="skill_generation_queued",
-                summary="候选 SKILL 已入队，等待后台异步沉淀",
-                stage_key="skill_generation",
-                status=task.status,
-                detail={"job_id": queued_skill_generation_job_id},
-                created_by="task_manager",
-            )
         _write_task_result_cache(task_id)
     finally:
         db.close()

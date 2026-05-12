@@ -87,6 +87,11 @@ class UnpackTask(Base):
     skill_generation_job_id = Column(String(32), nullable=True, index=True)
     skill_generation_started_at = Column(DateTime, nullable=True)
     skill_generation_completed_at = Column(DateTime, nullable=True)
+    latest_evolution_job_id = Column(String(32), nullable=True, index=True)
+    latest_evolution_status = Column(String(32), nullable=True)
+    latest_evolution_started_at = Column(DateTime, nullable=True)
+    latest_evolution_completed_at = Column(DateTime, nullable=True)
+    latest_evolution_final_skill_path = Column(String(512), nullable=True)
     llm_binding_snapshot = Column(Text, nullable=True)
     created_at = Column(DateTime, default=now_local)
     started_at = Column(DateTime, nullable=True)
@@ -140,6 +145,11 @@ class UnpackTask(Base):
             "skill_generation_job_id": self.skill_generation_job_id,
             "skill_generation_started_at": isoformat_local(self.skill_generation_started_at),
             "skill_generation_completed_at": isoformat_local(self.skill_generation_completed_at),
+            "latest_evolution_job_id": self.latest_evolution_job_id,
+            "latest_evolution_status": self.latest_evolution_status,
+            "latest_evolution_started_at": isoformat_local(self.latest_evolution_started_at),
+            "latest_evolution_completed_at": isoformat_local(self.latest_evolution_completed_at),
+            "latest_evolution_final_skill_path": self.latest_evolution_final_skill_path,
             "created_at": isoformat_local(self.created_at),
             "started_at": isoformat_local(self.started_at),
             "completed_at": isoformat_local(self.completed_at),
@@ -295,6 +305,84 @@ class SkillGenerationJob(Base):
         }
 
 
+class FirmwareEvolutionJob(Base):
+    __tablename__ = "secflow_app_firmware_unpacker_evolution_jobs"
+
+    id = Column(String(32), primary_key=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    project_id = Column(String(64), nullable=True, index=True)
+    status = Column(String(32), nullable=False, default="pending", index=True)
+    current_round = Column(Integer, nullable=True)
+    max_rounds = Column(Integer, nullable=False, default=3)
+    current_stage = Column(String(32), nullable=True, index=True)
+    owner_id = Column(String(96), nullable=True, index=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text, nullable=True)
+    created_by = Column(String(64), nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    final_skill_path = Column(String(512), nullable=True)
+    replaced_skill_path = Column(String(512), nullable=True)
+    review_passed = Column(Boolean, nullable=False, default=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "project_id": self.project_id,
+            "status": self.status,
+            "current_round": self.current_round,
+            "max_rounds": self.max_rounds,
+            "current_stage": self.current_stage,
+            "owner_id": self.owner_id,
+            "lease_expires_at": isoformat_local(self.lease_expires_at),
+            "attempts": self.attempts,
+            "error_message": self.error_message,
+            "created_by": self.created_by,
+            "created_at": isoformat_local(self.created_at),
+            "started_at": isoformat_local(self.started_at),
+            "completed_at": isoformat_local(self.completed_at),
+            "final_skill_path": self.final_skill_path,
+            "replaced_skill_path": self.replaced_skill_path,
+            "review_passed": bool(self.review_passed),
+        }
+
+
+class FirmwareEvolutionRound(Base):
+    __tablename__ = "secflow_app_firmware_unpacker_evolution_rounds"
+
+    id = Column(String(32), primary_key=True)
+    job_id = Column(String(32), nullable=False, index=True)
+    round = Column(Integer, nullable=False)
+    status = Column(String(32), nullable=False, index=True)
+    tool_skill_path_before = Column(String(512), nullable=True)
+    tool_skill_path_after = Column(String(512), nullable=True)
+    tool_changed = Column(Boolean, nullable=False, default=False)
+    review_result = Column(Text, nullable=True)
+    summary_path = Column(String(512), nullable=True)
+    reason_path = Column(String(512), nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "job_id": self.job_id,
+            "round": self.round,
+            "status": self.status,
+            "tool_skill_path_before": self.tool_skill_path_before,
+            "tool_skill_path_after": self.tool_skill_path_after,
+            "tool_changed": bool(self.tool_changed),
+            "review_result": self.review_result,
+            "summary_path": self.summary_path,
+            "reason_path": self.reason_path,
+            "created_at": isoformat_local(self.created_at),
+            "completed_at": isoformat_local(self.completed_at),
+        }
+
+
 DEFAULT_CONFIGS = [
     ("concurrency_mode", "auto", "string", "并发控制模式：auto=按 Pod CPU/内存自动计算，manual=手动指定"),
     ("manual_max_concurrent", "3", "int", "手动模式下单个 Pod 最大并发解包任务数"),
@@ -314,6 +402,7 @@ DEFAULT_CONFIGS = [
     ("reuse_agent_between_rounds_cleaner", "true", "bool", "是否复用固件解包清理器智能体会话：true=复用，false=每次新建"),
     ("reuse_agent_between_rounds_skill_author", "true", "bool", "是否复用固件解包技能生成器智能体会话：true=复用，false=每次新建"),
     ("reuse_agent_between_rounds_skill_executor", "true", "bool", "是否复用固件解包命中技能执行器智能体会话：true=复用，false=每次新建"),
+    ("reuse_agent_between_rounds_evolution_improver", "true", "bool", "是否复用固件解包工具进化器智能体会话：true=复用，false=每次新建"),
     ("dead_threshold", "300", "int", "Worker 心跳超时秒数"),
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
     ("task_lease_seconds", "45", "int", "已废弃：任务执行不再使用租约，仅兼容清理任务配置"),
@@ -331,6 +420,8 @@ DEFAULT_CONFIGS = [
     ("llm_model_skill_author", "", "string", "固件解包技能生成器角色绑定的模型；留空则使用配置文件默认模型"),
     ("llm_config_file_key_skill_executor", "", "string", "固件解包命中技能执行器角色绑定的 models.json 配置文件 key"),
     ("llm_model_skill_executor", "", "string", "固件解包命中技能执行器角色绑定的模型；留空则使用配置文件默认模型"),
+    ("llm_config_file_key_evolution_improver", "", "string", "固件解包工具进化器角色绑定的 models.json 配置文件 key"),
+    ("llm_model_evolution_improver", "", "string", "固件解包工具进化器角色绑定的模型；留空则使用配置文件默认模型"),
 ]
 
 
@@ -389,6 +480,8 @@ def apply_table_prefix_if_needed() -> None:
     UnpackTaskEvent.__table__.name = f"{prefix}task_events"
     WorkspaceCleanupJob.__table__.name = f"{prefix}workspace_cleanup_jobs"
     SkillGenerationJob.__table__.name = f"{prefix}skill_generation_jobs"
+    FirmwareEvolutionJob.__table__.name = f"{prefix}evolution_jobs"
+    FirmwareEvolutionRound.__table__.name = f"{prefix}evolution_rounds"
 
 
 def init_database() -> None:
@@ -437,6 +530,11 @@ def _ensure_unpack_task_columns() -> None:
         "skill_generation_job_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_job_id VARCHAR(32)",
         "skill_generation_started_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_started_at DATETIME",
         "skill_generation_completed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_completed_at DATETIME",
+        "latest_evolution_job_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN latest_evolution_job_id VARCHAR(32)",
+        "latest_evolution_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN latest_evolution_status VARCHAR(32)",
+        "latest_evolution_started_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN latest_evolution_started_at DATETIME",
+        "latest_evolution_completed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN latest_evolution_completed_at DATETIME",
+        "latest_evolution_final_skill_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN latest_evolution_final_skill_path VARCHAR(512)",
         "llm_binding_snapshot": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN llm_binding_snapshot TEXT",
     }
 

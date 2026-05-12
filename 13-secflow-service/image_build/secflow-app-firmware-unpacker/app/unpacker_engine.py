@@ -1118,7 +1118,6 @@ def run_unpack(
     fallback_to_llm = False
     matched_skill = skill_meta
     promotion_success_count = None
-    skill_generation_requested = False
 
     try:
         if skill_meta:
@@ -1209,30 +1208,7 @@ def run_unpack(
                 activity_callback=_report_activity,
             )
             passed = generic_passed
-            if passed:
-                skill_generation_requested = True
-                _write_json_log(
-                    global_round_dir,
-                    SKILL_GENERATION_CONTEXT_FILENAME,
-                    {
-                        "task_id": task_id,
-                        "firmware_path": firmware_path,
-                        "output_path": output_path,
-                        "features": features,
-                        "review_result": last_reason or '{"result":"success"}',
-                        "family_id": compute_family_id(features),
-                        "llm_binding_snapshot": llm_binding_snapshot,
-                        "created_at": datetime.now().isoformat(),
-                    },
-                )
-                _append_stage_log(
-                    global_round_dir,
-                    "stage5_skill_generate.log",
-                    "skill generation context prepared for async job",
-                    family_id=compute_family_id(features),
-                    context_file=SKILL_GENERATION_CONTEXT_FILENAME,
-                )
-            else:
+            if not passed:
                 _append_stage_log(
                     global_round_dir,
                     "stage3_llm_unpack.log",
@@ -1281,7 +1257,6 @@ def run_unpack(
         "generated_skill_path": None,
         "generated_skill_status": None,
         "promotion_success_count": promotion_success_count,
-        "skill_generation_requested": skill_generation_requested,
     }
 
 
