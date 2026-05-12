@@ -10,9 +10,27 @@ from app.core.auth import Subject
 from app.core.config import load_config
 from app.db.database import init_database
 from app.schemas import InputRef, TaskCreateRequest
+from app.services.provider_client import ProviderNotFoundError
 from app.services.execution_service import get_execution_service
 from app.services.task_service import get_task_service
 from app.workers.runner import StageContext, build_opencode_process_env
+
+
+class FakeProviderClient:
+    def __init__(self, details: dict[str, dict]) -> None:
+        self.details = details
+
+    def list_providers(self) -> dict:
+        return {
+            "total": len(self.details),
+            "default_provider_key": next(iter(self.details.keys()), None),
+            "items": list(self.details.values()),
+        }
+
+    def get_provider_detail(self, provider_key: str) -> dict:
+        if provider_key not in self.details:
+            raise ProviderNotFoundError(f"provider not found: {provider_key}")
+        return self.details[provider_key]
 
 
 class OpenCodeCliModeTest(unittest.TestCase):
@@ -59,6 +77,37 @@ class OpenCodeCliModeTest(unittest.TestCase):
         load_config()
         init_database()
         self.subject = Subject(username="tester")
+        self.provider_details = {
+            "opencode-prod": {
+                "provider_key": "opencode-prod",
+                "display_name": "OpenCode Prod",
+                "provider_type": "openai",
+                "enabled": True,
+                "is_default": True,
+                "api_base": "https://api.openai.com/v1",
+                "model": "openai/gpt-5-create",
+                "updated_at": "2026-05-12T00:00:00Z",
+                "api_key": "top-secret",
+                "env_bindings": {
+                    "OPENAI_API_KEY": "sk-create-secret",
+                },
+                "file_bindings": [
+                    {
+                        "name": "opencode.json",
+                        "path": "/root/.config/opencode/opencode.json",
+                        "content": "{\"provider\":\"create-secret\"}",
+                        "enabled": True,
+                    },
+                    {
+                        "name": "auth.json",
+                        "path": "/root/.codex/auth.json",
+                        "content": "{\"token\":\"create-secret\"}",
+                        "enabled": True,
+                    },
+                ],
+            }
+        }
+        self._install_provider_client()
 
     def tearDown(self) -> None:
         for key in (
@@ -72,6 +121,9 @@ class OpenCodeCliModeTest(unittest.TestCase):
             "FAKE_OPENCODE_EMPTY_FIRST",
             "FAKE_OPENCODE_ERROR_FIRST",
             "FAKE_OPENCODE_EXPECT_XDG_PREFIX",
+            "FAKE_OPENCODE_EXPECT_XDG_CONFIG_PREFIX",
+            "FAKE_OPENCODE_EXPECT_OPENAI_API_KEY",
+            "FAKE_OPENCODE_EXPECT_OPENCODE_PROVIDER",
         ):
             os.environ.pop(key, None)
         self._reset_singletons()
@@ -141,7 +193,7 @@ class OpenCodeCliModeTest(unittest.TestCase):
         self.assertIn("--dangerously-skip-permissions", poc_log.content)
         self.assertIn("-m openai/gpt-5", poc_log.content)
         self.assertIn("XDG_DATA_HOME:", poc_log.content)
-        self.assertIn("/opencode-env/data", poc_log.content)
+        self.assertIn("/runtime/provider/xdg-data", poc_log.content)
 
     def test_opencode_cli_retries_missing_output_in_same_session(self) -> None:
         self._set_env("FAKE_OPENCODE_EMPTY_FIRST", "1")
@@ -233,6 +285,8 @@ class OpenCodeCliModeTest(unittest.TestCase):
         second_env = build_opencode_process_env(second)
 
         self.assertNotEqual(first_env["XDG_DATA_HOME"], second_env["XDG_DATA_HOME"])
+        self.assertNotEqual(first_env["HOME"], second_env["HOME"])
+        self.assertNotEqual(first_env["XDG_CONFIG_HOME"], second_env["XDG_CONFIG_HOME"])
         self.assertNotEqual(first_env["XDG_CACHE_HOME"], second_env["XDG_CACHE_HOME"])
         self.assertNotEqual(first_env["XDG_STATE_HOME"], second_env["XDG_STATE_HOME"])
         self.assertIn("ipc-audit-task-first", first_env["XDG_DATA_HOME"])
@@ -242,11 +296,51 @@ class OpenCodeCliModeTest(unittest.TestCase):
 
         for env in (first_env, second_env):
             data_home = Path(env["XDG_DATA_HOME"])
+            config_home = Path(env["XDG_CONFIG_HOME"])
+            home_dir = Path(env["HOME"])
             cache_home = Path(env["XDG_CACHE_HOME"])
             state_home = Path(env["XDG_STATE_HOME"])
+            self.assertTrue(home_dir.is_dir())
+            self.assertTrue(config_home.is_dir())
             self.assertTrue(data_home.is_dir())
             self.assertTrue(cache_home.is_dir())
             self.assertTrue(state_home.is_dir())
+
+    def test_opencode_cli_refetches_provider_runtime_env_and_model(self) -> None:
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="provider-bound-opencode",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_only",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+                executor_mode="opencode_cli",
+                provider_keys=["opencode-prod"],
+            ),
+            self.subject,
+        )
+
+        self.provider_details["opencode-prod"]["model"] = "openai/gpt-5-runtime"
+        self.provider_details["opencode-prod"]["env_bindings"]["OPENAI_API_KEY"] = "sk-runtime-secret"
+        self.provider_details["opencode-prod"]["file_bindings"][0]["content"] = "{\"provider\":\"runtime-secret\"}"
+        self._set_env("FAKE_OPENCODE_EXPECT_XDG_PREFIX", str(self.state_root))
+        self._set_env("FAKE_OPENCODE_EXPECT_XDG_CONFIG_PREFIX", str(self.state_root))
+        self._set_env("FAKE_OPENCODE_EXPECT_OPENAI_API_KEY", "sk-runtime-secret")
+        self._set_env("FAKE_OPENCODE_EXPECT_OPENCODE_PROVIDER", "runtime-secret")
+
+        attempt_id = get_task_service().claim_next_attempt("tester-worker")
+        self.assertIsNotNone(attempt_id)
+        get_execution_service().run_attempt(str(attempt_id))
+
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+        self.assertEqual(detail.status, "succeeded")
+        self.assertEqual(attempt.status, "succeeded")
+
+        audit_log = get_task_service().get_stage_log(task.task_id, str(detail.latest_attempt_id), "audit", lines=260, cursor=None)
+        self.assertIn("-m openai/gpt-5-runtime", audit_log.content)
+        self.assertIn("Provider keys: ['opencode-prod']", audit_log.content)
+        self.assertNotIn("sk-runtime-secret", audit_log.content)
+        self.assertNotIn("runtime-secret", audit_log.content)
 
     def _write_fake_opencode(self) -> None:
         script = "\n".join(
@@ -275,8 +369,20 @@ class OpenCodeCliModeTest(unittest.TestCase):
                 "expected_prefix = os.environ.get('FAKE_OPENCODE_EXPECT_XDG_PREFIX', '')",
                 "if expected_prefix and not xdg_data_home.startswith(expected_prefix):",
                 "    raise SystemExit(f'unexpected XDG_DATA_HOME: {xdg_data_home}')",
-                "if 'opencode-env/data' not in xdg_data_home:",
+                "if 'runtime/provider/xdg-data' not in xdg_data_home:",
                 "    raise SystemExit(f'missing isolated opencode XDG_DATA_HOME: {xdg_data_home}')",
+                "xdg_config_home = os.environ.get('XDG_CONFIG_HOME', '')",
+                "expected_config_prefix = os.environ.get('FAKE_OPENCODE_EXPECT_XDG_CONFIG_PREFIX', '')",
+                "if expected_config_prefix and not xdg_config_home.startswith(expected_config_prefix):",
+                "    raise SystemExit(f'unexpected XDG_CONFIG_HOME: {xdg_config_home}')",
+                "expected_openai_key = os.environ.get('FAKE_OPENCODE_EXPECT_OPENAI_API_KEY', '')",
+                "if expected_openai_key and os.environ.get('OPENAI_API_KEY') != expected_openai_key:",
+                "    raise SystemExit('unexpected OPENAI_API_KEY')",
+                "expected_provider = os.environ.get('FAKE_OPENCODE_EXPECT_OPENCODE_PROVIDER', '')",
+                "if expected_provider:",
+                "    provider_file = Path(xdg_config_home) / 'opencode' / 'opencode.json'",
+                "    if expected_provider not in provider_file.read_text(encoding='utf-8'):",
+                "        raise SystemExit(f'opencode.json missing expected provider: {provider_file}')",
                 "",
                 "if os.environ.get('FAKE_OPENCODE_ERROR_FIRST') == '1' and session_id is None:",
                 "    events = [",
@@ -363,6 +469,11 @@ class OpenCodeCliModeTest(unittest.TestCase):
     def _set_env(key: str, value: str) -> None:
         os.environ[key] = value
 
+    def _install_provider_client(self) -> None:
+        import app.services.provider_client as provider_client_module
+
+        provider_client_module._provider_client = FakeProviderClient(self.provider_details)
+
     @staticmethod
     def _reset_singletons() -> None:
         import app.core.config as config_module
@@ -371,6 +482,8 @@ class OpenCodeCliModeTest(unittest.TestCase):
         import app.services.catalog_service as catalog_module
         import app.services.event_service as event_module
         import app.services.execution_service as execution_module
+        import app.services.provider_client as provider_client_module
+        import app.services.provider_runtime as provider_runtime_module
         import app.services.task_service as task_module
         import app.services.workspace_service as workspace_module
         import app.workers.scheduler as scheduler_module
@@ -381,6 +494,8 @@ class OpenCodeCliModeTest(unittest.TestCase):
         catalog_module._catalog_service = None
         event_module._event_service = None
         execution_module._execution_service = None
+        provider_client_module._provider_client = None
+        provider_runtime_module._provider_runtime_service = None
         task_module._task_service = None
         workspace_module._workspace_service = None
         scheduler_module._scheduler_service = None

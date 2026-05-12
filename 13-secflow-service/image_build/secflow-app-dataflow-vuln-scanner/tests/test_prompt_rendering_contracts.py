@@ -474,7 +474,7 @@ def test_staged_rework_sequence_uses_one_worker_session_and_checkpoints(tmp_path
     assert all(item["kind"] == "send_message" for item in agent.messages[1:])
     assert "全面性评审 -> 漏报补扫信号" in agent.messages[0]["message"]
     assert "误报压制与失败结果修复" in agent.messages[1]["message"]
-    assert "评审驱动的漏报补扫与深挖" in agent.messages[2]["message"]
+    assert "依据评审缺口挖掘遗漏漏洞" in agent.messages[2]["message"]
     assert "Rework Handoff" in agent.messages[3]["message"]
 
     for step_key in (

@@ -320,9 +320,17 @@ class TaskSubmitResponse(BaseModel):
 
 class TaskStatusResponse(BaseModel):
     task_id: str
+    task_type: Optional[str] = None
+    project_id: Optional[str] = None
     status: str
     progress: float
     accepted_at: datetime
     finished_at: Optional[datetime] = None
     result: Optional[dict] = None
     error: Optional[str] = None
+
+
+class ArchiveTaskCreateRequest(BaseModel):
+    project_id: str = Field(..., min_length=1, max_length=32)
+    items: List[str] = Field(default_factory=list)
+    archive_name: Optional[str] = Field(None, min_length=1, max_length=255)

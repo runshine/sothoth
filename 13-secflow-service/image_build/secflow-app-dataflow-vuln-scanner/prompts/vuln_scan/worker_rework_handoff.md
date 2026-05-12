@@ -1,6 +1,6 @@
-# 第 {cycle} 轮 Rework Handoff：漏洞产出闭环记录
+# 第 {cycle} 轮 Rework Handoff：交接本轮漏洞变化
 
-本节点不继续扩张攻击面。目标是把本轮 rework 的真实漏洞产出、误报撤回、证伪路径和 residual 整理成 summary 阶段可直接消费的 handoff。
+本节点不继续扩张攻击面、不再做源码审计。目标是把本轮真正影响漏洞结论的变化交接给后续 summary：新增了什么真实漏洞，修正了什么真漏洞，撤回了什么误报，还有哪些高价值缺口仍需要下一轮看。
 
 {rework_session_context}
 
@@ -10,8 +10,16 @@
 ## 重复阻塞项
 {repeated_issue_summary}
 
-## 本轮闭环记录要求
-创建或更新 `{supporting_docs_dir}/rework_closure_cycle_{cycle}.md`，记录新增真实漏洞、修正真实漏洞、撤回/证伪误报、source_closed 路径、accepted_residual / external_blocked。不要手工编辑 `_meta/coverage_ledger.json` 或 `_meta/issue_ledger.json`。
+## Handoff 规则
+- 只记录会影响最终漏洞结论或下一轮审计优先级的信息。
+- 必须覆盖：新增 result、修改后的 result、撤回/证伪的 result、重要 residual、下一轮仍值得看的高价值漏报方向。
+- 不要为了关闭 issue/coverage 数字写大段 source_closed；低收益项可以一句话说明已跳过。
+- 不要手工编辑 `_meta/coverage_ledger.json` 或 `_meta/issue_ledger.json`。
+- 不创建 JSON manifest。
 
-{issue_closure_template}
+## 输出要求
+如果本轮有新增、修改、撤回或重要 residual，创建或更新 `{supporting_docs_dir}/rework_closure_cycle_{cycle}.md`，控制在 80 行以内，只引用 `results/...` 和 `supporting_docs/...`。
+
+如果本轮没有实际漏洞变化，只在回复中简短说明“无新增/修改/撤回”，不要额外创建文件。
+
 {direct_read_instruction}

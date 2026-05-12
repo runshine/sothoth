@@ -1143,29 +1143,11 @@ class TaskManager:
         }
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
-        affected_items = db.query(BinarySecurityStageItem).options(
-            load_only(
-                BinarySecurityStageItem.id,
-                BinarySecurityStageItem.task_id,
-                BinarySecurityStageItem.stage_name,
-                BinarySecurityStageItem.item_key,
-                BinarySecurityStageItem.status,
-                BinarySecurityStageItem.retry_count,
-                BinarySecurityStageItem.downstream_service,
-                BinarySecurityStageItem.downstream_task_id,
-                BinarySecurityStageItem.error_message,
-                BinarySecurityStageItem.started_at,
-                BinarySecurityStageItem.finished_at,
-                BinarySecurityStageItem.created_at,
-            )
-        ).filter(
-            BinarySecurityStageItem.task_id == task.id,
-            BinarySecurityStageItem.stage_name.in_(affected_stages),
-        ).all()
+        affected_items = self._stage_items_for_stages(db, task.id, affected_stages)
         downstream_refs = self._collect_downstream_refs(task, affected_items)
         token = self._service_token()
         if downstream_refs:
-            await self._delete_downstream_refs(db, task, downstream_refs, token)
+            await self._cleanup_downstream_refs(db, task, downstream_refs, token)
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
         db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task.id,
@@ -1271,12 +1253,16 @@ class TaskManager:
         affected_stages = stage_sequence[target_index:]
         downstream_stages = stage_sequence[target_index + 1 :]
         self._invalidate_task_execution(task)
+        affected_items = self._stage_items_for_stages(db, task.id, affected_stages)
+        downstream_refs = self._collect_downstream_refs(task, affected_items)
+        if downstream_refs:
+            self._run_sync(self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token()))
         self._clear_stage_outputs_from(task, stage_name, mark_stale=False)
         self._delete_archive_children_for_stages(db, task, affected_stages)
-        if downstream_stages:
+        if affected_stages:
             db.query(BinarySecurityStageItem).filter(
                 BinarySecurityStageItem.task_id == task.id,
-                BinarySecurityStageItem.stage_name.in_(downstream_stages),
+                BinarySecurityStageItem.stage_name.in_(affected_stages),
             ).delete(synchronize_session=False)
         self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
         for downstream_stage in downstream_stages:
@@ -1304,6 +1290,49 @@ class TaskManager:
             payload={"retry_semantics": "stage_and_continue_downstream", "cleared_stages": affected_stages},
         )
         db.commit()
+
+    def _run_sync(self, coro):
+        return asyncio.run(coro)
+
+    def _stage_items_for_stages(
+        self,
+        db: Session,
+        task_id: str,
+        stage_names: list[str],
+    ) -> list[BinarySecurityStageItem]:
+        if not stage_names:
+            return []
+        return db.query(BinarySecurityStageItem).options(
+            load_only(
+                BinarySecurityStageItem.id,
+                BinarySecurityStageItem.task_id,
+                BinarySecurityStageItem.stage_name,
+                BinarySecurityStageItem.item_key,
+                BinarySecurityStageItem.status,
+                BinarySecurityStageItem.retry_count,
+                BinarySecurityStageItem.downstream_service,
+                BinarySecurityStageItem.downstream_task_id,
+                BinarySecurityStageItem.error_message,
+                BinarySecurityStageItem.started_at,
+                BinarySecurityStageItem.finished_at,
+                BinarySecurityStageItem.created_at,
+            )
+        ).filter(
+            BinarySecurityStageItem.task_id == task_id,
+            BinarySecurityStageItem.stage_name.in_(stage_names),
+        ).all()
+
+    async def _cleanup_downstream_refs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        refs: list[dict[str, str]],
+        token: str | None,
+    ) -> None:
+        if not refs:
+            return
+        await self._cancel_downstream_refs(db, task, refs, token)
+        await self._delete_downstream_refs(db, task, refs, token)
 
     async def sync_downstream_status(
         self,
@@ -4111,6 +4140,23 @@ class TaskManager:
     def _has_retryable_downstream_task(self, item: BinarySecurityStageItem) -> bool:
         return bool(str(item.downstream_task_id or "").strip())
 
+    async def _active_downstream_payload(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        token: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._has_retryable_downstream_task(item):
+            return None
+        try:
+            payload = await self._fetch_downstream_task_payload(task, item, token or "")
+        except Exception:
+            return None
+        mapped_status = self._map_downstream_status(str(payload.get("status") or ""))
+        if mapped_status in {"queued", "running"}:
+            return payload
+        return None
+
     def _stage_retry_support(
         self,
         db: Session,
@@ -4905,25 +4951,35 @@ class TaskManager:
                 retrying=retrying,
             )
             session.commit()
-            if retrying and self._has_retryable_downstream_task(item):
-                created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
-            else:
-                created = await get_system_analyse_client().create_task(
-                    task.project_id,
-                    f"{task.name}-{firmware['firmware_name']}-system-analysis",
-                    firmware["unpacked_root"],
-                    _downstream_origin_payload(task, item),
-                    analysis_mode=self._task_type(task),
+            active_payload = await self._active_downstream_payload(task, item)
+            if active_payload is not None:
+                status, payload = await self._poll_until_terminal(
+                    lambda: get_system_analyse_client().get_task(item.downstream_task_id),
+                    success_statuses={"passed", "success"},
+                    failure_statuses={"failed", "error", "cancelled"},
+                    task=task,
+                    item=item,
                 )
-            item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-            session.commit()
-            status, payload = await self._poll_until_terminal(
-                lambda: get_system_analyse_client().get_task(item.downstream_task_id),
-                success_statuses={"passed", "success"},
-                failure_statuses={"failed", "error", "cancelled"},
-                task=task,
-                item=item,
-            )
+            else:
+                if retrying and self._has_retryable_downstream_task(item):
+                    created = await self._invoke_existing_downstream_retry(stage_run.stage_name, task=task, item=item, token=None)
+                else:
+                    created = await get_system_analyse_client().create_task(
+                        task.project_id,
+                        f"{task.name}-{firmware['firmware_name']}-system-analysis",
+                        firmware["unpacked_root"],
+                        _downstream_origin_payload(task, item),
+                        analysis_mode=self._task_type(task),
+                    )
+                item.downstream_task_id = created.get("task_id") or item.downstream_task_id
+                session.commit()
+                status, payload = await self._poll_until_terminal(
+                    lambda: get_system_analyse_client().get_task(item.downstream_task_id),
+                    success_statuses={"passed", "success"},
+                    failure_statuses={"failed", "error", "cancelled"},
+                    task=task,
+                    item=item,
+                )
             result_payload = {}
             if status == "success":
                 try:

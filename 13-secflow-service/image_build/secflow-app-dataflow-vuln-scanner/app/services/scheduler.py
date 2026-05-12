@@ -32,6 +32,23 @@ class SchedulerService:
         self._worker_status = "active"
 
     @property
+    def role(self) -> str:
+        role = str(get_config().scheduler.role or "standalone").strip().lower()
+        return role if role in {"standalone", "manager", "worker"} else "standalone"
+
+    @property
+    def is_worker_role(self) -> bool:
+        return self.role in {"standalone", "worker"} and self.capacity > 0
+
+    @property
+    def runs_worker(self) -> bool:
+        return get_config().scheduler.enabled and self.is_worker_role
+
+    @property
+    def runs_manager(self) -> bool:
+        return get_config().scheduler.enabled and self.role in {"standalone", "manager"}
+
+    @property
     def pod_id(self) -> str:
         return get_config().scheduler.pod_id
 
@@ -48,18 +65,25 @@ class SchedulerService:
             return
         self._started = True
         self._worker_status = "active"
-        await asyncio.to_thread(self._heartbeat_once)
-        self._tasks = [
-            asyncio.create_task(self._heartbeat_loop(), name="scheduler-heartbeat"),
-            asyncio.create_task(self._dispatch_loop(), name="scheduler-dispatch"),
-            asyncio.create_task(self._cleanup_loop(), name="scheduler-cleanup"),
-        ]
+        self._tasks = []
+        if self.runs_worker:
+            await asyncio.to_thread(self._heartbeat_once)
+            self._tasks.extend(
+                [
+                    asyncio.create_task(self._heartbeat_loop(), name="scheduler-heartbeat"),
+                    asyncio.create_task(self._dispatch_loop(), name="scheduler-dispatch"),
+                ]
+            )
+        if self.runs_manager or self.runs_worker:
+            self._tasks.append(asyncio.create_task(self._cleanup_loop(), name="scheduler-cleanup"))
+        logger.info("scheduler started role=%s worker_enabled=%s capacity=%s", self.role, self.runs_worker, self.capacity)
 
     async def stop(self) -> None:
         if not self._started:
             return
         self._worker_status = "draining"
-        await asyncio.to_thread(self._heartbeat_once)
+        if self.runs_worker:
+            await asyncio.to_thread(self._heartbeat_once)
         self._started = False
         for task in self._tasks:
             task.cancel()
@@ -69,17 +93,18 @@ class SchedulerService:
             except asyncio.CancelledError:
                 pass
         self._tasks.clear()
-        db = get_db_session()
-        try:
-            worker = db.get(SchedulerWorker, self.pod_id)
-            if worker is not None:
-                worker.status = "offline"
-                worker.running_count = len(self._running_tasks)
-                worker.last_heartbeat_at = now_local()
-                db.add(worker)
-                db.commit()
-        finally:
-            db.close()
+        if self.runs_worker:
+            db = get_db_session()
+            try:
+                worker = db.get(SchedulerWorker, self.pod_id)
+                if worker is not None:
+                    worker.status = "offline"
+                    worker.running_count = len(self._running_tasks)
+                    worker.last_heartbeat_at = now_local()
+                    db.add(worker)
+                    db.commit()
+            finally:
+                db.close()
 
     def health_payload(self) -> Dict[str, str]:
         return {
@@ -87,6 +112,8 @@ class SchedulerService:
             "pod_id": self.pod_id,
             "database": "ok",
             "scheduler": "running" if self._started else "stopped",
+            "scheduler_role": self.role,
+            "worker_enabled": "true" if self.runs_worker else "false",
         }
 
     def local_running_count(self) -> int:
@@ -120,6 +147,8 @@ class SchedulerService:
             await asyncio.to_thread(self._heartbeat_once)
 
     def _heartbeat_once(self) -> None:
+        if not self.runs_worker:
+            return
         db = get_db_session()
         try:
             worker = db.get(SchedulerWorker, self.pod_id)
@@ -132,7 +161,7 @@ class SchedulerService:
                     running_count=len(self._running_tasks),
                     last_heartbeat_at=now,
                     status=self._worker_status,
-                    metadata_json={"service": "secflow-app-dataflow-vuln-scanner"},
+                    metadata_json={"service": "secflow-app-dataflow-vuln-scanner", "role": self.role},
                 )
             else:
                 self._worker_status = worker.status if worker.status in {"active", "draining"} else self._worker_status
@@ -141,7 +170,7 @@ class SchedulerService:
                 worker.running_count = len(self._running_tasks)
                 worker.last_heartbeat_at = now
                 worker.status = self._worker_status
-                worker.metadata_json = {"service": "secflow-app-dataflow-vuln-scanner"}
+                worker.metadata_json = {"service": "secflow-app-dataflow-vuln-scanner", "role": self.role}
             db.add(worker)
             db.commit()
         finally:
@@ -151,6 +180,8 @@ class SchedulerService:
         interval = get_config().scheduler.poll_interval_seconds
         while True:
             await asyncio.sleep(interval)
+            if not self.runs_worker:
+                continue
             if self._worker_status != "active":
                 continue
             while self.local_running_count() < self.capacity:
@@ -160,6 +191,8 @@ class SchedulerService:
                 self._schedule_execution(execution_id)
 
     def _claim_next_execution(self) -> str | None:
+        if not self.is_worker_role:
+            return None
         db = get_db_session()
         try:
             candidates = (
@@ -220,6 +253,8 @@ class SchedulerService:
             db.close()
 
     def _claim_execution_now(self, execution_id: str) -> str | None:
+        if not self.is_worker_role:
+            return None
         db = get_db_session()
         try:
             execution = db.get(WorkflowExecution, execution_id)
@@ -272,6 +307,8 @@ class SchedulerService:
 
     def start_execution_now(self, execution_id: str | None) -> bool:
         if not execution_id or execution_id in self._running_tasks:
+            return False
+        if not self.is_worker_role:
             return False
         if self._worker_status != "active" or self.local_running_count() >= self.capacity:
             return False

@@ -29,6 +29,12 @@ class TaskSubmitResponse(BaseModel):
     run_path: Optional[str] = None
 
 
+class EvolutionJobSubmitResponse(BaseModel):
+    job_id: str
+    status: str
+    max_rounds: int
+
+
 class ActionResponse(BaseModel):
     message: str
     task_id: Optional[str] = None
@@ -93,6 +99,11 @@ class TaskResponse(BaseModel):
     skill_generation_job_id: Optional[str] = None
     skill_generation_started_at: Optional[str] = None
     skill_generation_completed_at: Optional[str] = None
+    latest_evolution_job_id: Optional[str] = None
+    latest_evolution_status: Optional[str] = None
+    latest_evolution_started_at: Optional[str] = None
+    latest_evolution_completed_at: Optional[str] = None
+    latest_evolution_final_skill_path: Optional[str] = None
     created_at: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -178,6 +189,11 @@ class TaskResultSummaryResponse(BaseModel):
     skill_generation_job_id: Optional[str] = None
     skill_generation_started_at: Optional[str] = None
     skill_generation_completed_at: Optional[str] = None
+    latest_evolution_job: Optional[str] = None
+    latest_evolution_status: Optional[str] = None
+    latest_evolution_started_at: Optional[str] = None
+    latest_evolution_completed_at: Optional[str] = None
+    latest_evolution_final_skill_path: Optional[str] = None
     executor_rounds: int = 0
     session_count: int = 0
     event_count: int = 0
@@ -329,6 +345,67 @@ class TaskListResponse(BaseModel):
     offset: int
     limit: int
     items: List[TaskResponse]
+
+
+class EvolutionRoundResponse(BaseModel):
+    id: str
+    job_id: str
+    round: int
+    status: str
+    tool_skill_path_before: Optional[str] = None
+    tool_skill_path_after: Optional[str] = None
+    tool_changed: bool = False
+    review_result: Optional[str] = None
+    summary_path: Optional[str] = None
+    reason_path: Optional[str] = None
+    source_skill_path: Optional[str] = None
+    started_without_matched_skill: bool = False
+    generated_new_skill: bool = False
+    executed_tool: bool = False
+    tool_response_preview: Optional[str] = None
+    created_at: Optional[str] = None
+    completed_at: Optional[str] = None
+
+
+class EvolutionJobResponse(BaseModel):
+    id: str
+    task_id: str
+    project_id: Optional[str] = None
+    status: str
+    current_round: Optional[int] = None
+    max_rounds: int
+    current_stage: Optional[str] = None
+    owner_id: Optional[str] = None
+    lease_expires_at: Optional[str] = None
+    attempts: int
+    error_message: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    final_skill_path: Optional[str] = None
+    replaced_skill_path: Optional[str] = None
+    review_passed: bool = False
+    source_skill_path: Optional[str] = None
+    working_skill_path: Optional[str] = None
+    generated_new_skill: bool = False
+    started_without_matched_skill: bool = False
+    run_root: Optional[str] = None
+    session_root: Optional[str] = None
+    task_output_path: Optional[str] = None
+    round_count: int = 0
+    rounds: List[EvolutionRoundResponse] = []
+
+
+class EvolutionJobListResponse(BaseModel):
+    total: int
+    items: List[EvolutionJobResponse]
+
+
+class EvolutionSessionIndexResponse(BaseModel):
+    version: int = 1
+    session_root: Optional[str] = None
+    items: List[dict] = []
 
 
 class WorkerInstanceResponse(BaseModel):

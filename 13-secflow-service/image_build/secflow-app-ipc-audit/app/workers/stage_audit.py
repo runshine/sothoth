@@ -12,15 +12,14 @@ from app.workers.runner import (
     StageHooks,
     build_codex_exec_command,
     build_opencode_exec_command,
-    build_opencode_process_env,
+    build_process_env_and_summary,
     command_line_string,
     copy_file,
     extract_opencode_session_id,
-    opencode_env_summary,
     opencode_last_event_is_error,
     project_label,
     resolve_executor_mode,
-    resolve_executor_model,
+    resolve_stage_executor_model,
     run_logged_command,
     write_last_message_from_jsonl,
     write_text_file,
@@ -31,7 +30,7 @@ def run_audit_stage(context: StageContext, hooks: StageHooks) -> StageExecutionR
     cfg = get_config().execution
     audit_skill = str(context.effective_config.get("audit_skill") or cfg.default_audit_skill)
     executor_mode = resolve_executor_mode(context.effective_config)
-    executor_model = resolve_executor_model(context.effective_config)
+    executor_model = resolve_stage_executor_model(context)
     prompt_path = context.stage_session_file("prompt.txt")
     events_path = context.stage_session_file("events.jsonl")
     last_message_path = context.stage_session_file("last-message.md")
@@ -174,6 +173,7 @@ def _run_codex_stage(
 ) -> StageExecutionResult:
     output_path = _attempt_output_path(context)
     cfg = get_config().execution
+    process_env, provider_summary, provider_metadata = build_process_env_and_summary(context)
     cmd = build_codex_exec_command(
         prompt,
         repo_root=context.repo_root,
@@ -194,6 +194,8 @@ def _run_codex_stage(
             f"Executor mode: codex_cli",
             f"Model: {executor_model or '(default)'}",
             f"Output report path: {output_path}",
+            "=== provider runtime ===",
+            provider_summary,
             "=== command ===",
             command_line_string(cmd),
             "=== prompt ===",
@@ -210,6 +212,7 @@ def _run_codex_stage(
         hooks=hooks,
         timeout_seconds=int(get_config().execution.task_timeout_seconds),
         mirror_output_paths=[events_path] if cfg.codex_json_output else None,
+        process_env=process_env,
     )
     session_files = [prompt_path]
     if events_path.exists():
@@ -231,6 +234,7 @@ def _run_codex_stage(
                 "audit_skill": audit_skill,
                 "output_path": str(output_path),
                 "duration_seconds": result.duration_seconds,
+                **provider_metadata,
             },
         )
     if result.timed_out:
@@ -248,6 +252,7 @@ def _run_codex_stage(
                 "audit_skill": audit_skill,
                 "output_path": str(output_path),
                 "duration_seconds": result.duration_seconds,
+                **provider_metadata,
             },
         )
     if result.return_code != 0:
@@ -265,6 +270,7 @@ def _run_codex_stage(
                 "audit_skill": audit_skill,
                 "output_path": str(output_path),
                 "duration_seconds": result.duration_seconds,
+                **provider_metadata,
             },
         )
     if not output_path.exists() or output_path.stat().st_size == 0:
@@ -300,6 +306,7 @@ def _run_codex_stage(
             "audit_skill": audit_skill,
             "output_path": str(output_path),
             "duration_seconds": result.duration_seconds,
+            **provider_metadata,
         },
     )
 
@@ -318,7 +325,7 @@ def _run_opencode_stage(
     executor_model: str | None,
 ) -> StageExecutionResult:
     output_path = _attempt_output_path(context)
-    opencode_env = build_opencode_process_env(context)
+    process_env, provider_summary, provider_metadata = build_process_env_and_summary(context)
     cmd = build_opencode_exec_command(
         prompt,
         repo_root=context.repo_root,
@@ -334,8 +341,8 @@ def _run_opencode_stage(
             f"Executor mode: opencode_cli",
             f"Model: {executor_model or '(default)'}",
             f"Output report path: {output_path}",
-            "=== opencode environment ===",
-            opencode_env_summary(opencode_env),
+            "=== provider runtime ===",
+            provider_summary,
             "=== command ===",
             command_line_string(cmd),
             "=== prompt ===",
@@ -352,7 +359,7 @@ def _run_opencode_stage(
         hooks=hooks,
         timeout_seconds=int(get_config().execution.task_timeout_seconds),
         mirror_output_paths=[events_path],
-        env=opencode_env,
+        process_env=process_env,
     )
     retry_count = 0
     total_duration = result.duration_seconds
@@ -395,8 +402,8 @@ def _run_opencode_stage(
                 f"Retry reason: {retry_reason}",
                 f"Previous return code: {previous_return_code}",
                 f"Output report path: {output_path}",
-                "=== opencode environment ===",
-                opencode_env_summary(opencode_env),
+                "=== provider runtime ===",
+                provider_summary,
                 "=== command ===",
                 command_line_string(retry_cmd),
                 "=== retry prompt ===",
@@ -414,7 +421,7 @@ def _run_opencode_stage(
             timeout_seconds=int(get_config().execution.task_timeout_seconds),
             mirror_output_paths=[events_path],
             append=True,
-            env=opencode_env,
+            process_env=process_env,
         )
         total_duration += result.duration_seconds
     session_files = [prompt_path]
@@ -432,6 +439,7 @@ def _run_opencode_stage(
         "opencode_recovery_retry_count": retry_count,
         "missing_output_retry_count": retry_count,
         "opencode_last_event_error": opencode_last_event_is_error(events_path),
+        **provider_metadata,
     }
     if result.cancelled:
         return StageExecutionResult(

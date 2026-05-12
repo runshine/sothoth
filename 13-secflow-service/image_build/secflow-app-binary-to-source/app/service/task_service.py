@@ -17,6 +17,7 @@ from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
 from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SArtifact, B2SArtifactContentResponse, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsDimension, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsMeta, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, ReviewAnalyticsTrendInsight, ReviewAnalyticsTrendPoint, ReviewAnalyticsTrendSeries, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskItemResponse, TaskResponse
+from app.service.config_service import get_config_service, normalize_budget_exhausted_action
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
@@ -29,6 +30,9 @@ PI_STATUS_MAP = {
     "completed": "success",
     "failed": "failed",
     "cancelled": "cancelled",
+    "max_rounds_exceeded": "failed",
+    "max_retries_reached": "failed",
+    "timeout_max_retries_exceeded": "failed",
 }
 
 PI_PHASE_MAP = {
@@ -50,6 +54,51 @@ PHASE_LABELS = {
     "failed": "失败",
     "cancelled": "已取消",
 }
+
+_BUDGET_EXHAUSTED_MARKERS = (
+    "max_rounds_exceeded",
+    "max_retries_reached",
+    "timeout_max_retries_exceeded",
+    "agent_timeout_max_retries",
+    "timeout max retries",
+    "budget exhausted",
+    "review budget exhausted",
+    "max turns reached",
+)
+
+
+def _budget_exhausted_action_for_project(db: Session, project_id: str) -> str:
+    cfg = get_config_service().get_config(db, project_id)
+    return normalize_budget_exhausted_action(cfg.get("budget_exhausted_action"))
+
+
+def _budget_exhausted_action_for_item(db: Session, item: B2STaskItem) -> str:
+    metadata = item.extra_metadata or {}
+    frozen = metadata.get("budget_exhausted_action")
+    if frozen:
+        return normalize_budget_exhausted_action(str(frozen))
+    return _budget_exhausted_action_for_project(db, item.project_id)
+
+
+def _is_budget_exhausted_failure(job: dict | None, error_reason: str | None = None) -> bool:
+    if isinstance(job, dict):
+        raw_status = str(job.get("status") or "").strip().lower()
+        if raw_status in {"max_rounds_exceeded", "max_retries_reached", "timeout_max_retries_exceeded"}:
+            return True
+        payloads = [
+            job.get("error"),
+            job.get("message"),
+            job.get("detail"),
+            job.get("status_reason"),
+            job.get("failure_type"),
+            json.dumps(job.get("progress") or {}, ensure_ascii=False),
+            json.dumps(job.get("output") or {}, ensure_ascii=False),
+        ]
+    else:
+        payloads = []
+    payloads.append(error_reason or "")
+    normalized = "\n".join(str(part or "") for part in payloads).lower()
+    return any(marker in normalized for marker in _BUDGET_EXHAUSTED_MARKERS)
 
 
 def _task_origin_payload(task: B2STask) -> dict:
@@ -169,6 +218,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     job_timeout_seconds = req.agent_run_timeout_seconds if req.agent_run_timeout_seconds is not None else pi_cfg.agent_run_timeout_seconds
     job_timeout_retry_enabled = req.agent_timeout_retry_enabled if req.agent_timeout_retry_enabled is not None else pi_cfg.agent_timeout_retry_enabled
     job_timeout_max_retries = req.agent_timeout_max_retries if req.agent_timeout_max_retries is not None else pi_cfg.agent_timeout_max_retries
+    budget_exhausted_action = _budget_exhausted_action_for_project(db, project_id)
     mode_engine_map = {"fast": "hybrid", "deep": "agent"}
     job_mode = req.mode or ({"hybrid": "fast", "agent": "deep"}.get(req.engine or "") if req.engine else None)
     job_engine = mode_engine_map.get(job_mode or "") or req.engine or pi_cfg.engine
@@ -202,6 +252,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "agent_run_timeout_seconds": job_timeout_seconds,
             "agent_timeout_retry_enabled": job_timeout_retry_enabled,
             "agent_timeout_max_retries": job_timeout_max_retries,
+            "budget_exhausted_action": budget_exhausted_action,
             "mode": job_mode,
             "engine": job_engine,
             "pi_worker_url": worker_url,
@@ -274,6 +325,11 @@ async def sync_task(db: Session, task: B2STask) -> None:
         new_status = map_pi_status(job.get("status"))
         new_phase = map_pi_phase(job.get("phase"), job.get("status"))
         new_progress = build_item_progress(item, job)
+        if new_status == "failed" and _is_budget_exhausted_failure(job, item.error_reason):
+            action = _budget_exhausted_action_for_item(db, item)
+            if action == "treat_as_passed":
+                new_status = "success"
+                new_phase = "completed"
         if item.status != new_status:
             item.status = new_status
             changed = True
@@ -294,6 +350,9 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.phase = "failed"
             item.failure_type = "pi-re-agent"
             item.error_reason = job.get("error")
+        elif new_status == "success":
+            item.failure_type = None
+            item.error_reason = None
         changed = True
     if changed:
         recompute_task_status(db, task)
