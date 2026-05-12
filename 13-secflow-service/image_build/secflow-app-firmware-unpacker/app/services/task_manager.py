@@ -17,6 +17,27 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from app.config import get_config
+from app.evolution import (
+    DEFAULT_EVOLUTION_OPTIMIZER,
+    DEFAULT_EVOLUTION_TARGET_AGENT,
+    EVOLUTION_FAILED,
+    EVOLUTION_NOT_APPLICABLE,
+    EVOLUTION_PENDING,
+    EVOLUTION_RUNNING,
+    EVOLUTION_SUCCESS,
+    EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR,
+    archive_success_sample,
+    ensure_tuner_profile,
+    evolution_archive_root,
+    evolution_enabled,
+    evolution_target_nodes,
+    is_generic_success_result,
+    max_concurrent_evolution_jobs,
+    register_family_tuned_agent,
+    tuned_agent_alias,
+    tuned_manifest_path,
+    tuned_profile_name,
+)
 from app.time_utils import isoformat_local, now_local
 from app.unpacker_engine_config import get_max_retries_reached_action
 from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, atomic_write_json, scan_output_tree
@@ -48,12 +69,6 @@ STAGE_LABELS = {
     "review": "LLM 评审",
     "cleanup": "清理收尾",
 }
-SKILL_GENERATION_PENDING = "pending"
-SKILL_GENERATION_RUNNING = "running"
-SKILL_GENERATION_SUCCESS = "success"
-SKILL_GENERATION_FAILED = "failed"
-SKILL_GENERATION_NOT_APPLICABLE = "not_applicable"
-
 
 def _executor_capacity() -> int:
     return max(1, int(get_config().service.max_background_workers))
@@ -236,7 +251,7 @@ def _cleanup_job_lease_deadline(now: Optional[datetime] = None) -> datetime:
     return (now or now_local()) + timedelta(seconds=_cleanup_job_lease_seconds())
 
 
-def _skill_generation_job_lease_deadline(now: Optional[datetime] = None) -> datetime:
+def _evolution_job_lease_deadline(now: Optional[datetime] = None) -> datetime:
     return (now or now_local()) + timedelta(seconds=_cleanup_job_lease_seconds())
 
 
@@ -839,7 +854,7 @@ def enqueue_workspace_cleanup(
 
 
 def process_workspace_cleanup_jobs(limit: int = 2) -> int:
-    from app.model import SkillGenerationJob, TaskStatus, UnpackTask, WorkspaceCleanupJob, get_db_session, get_worker_id
+    from app.model import EvolutionJob, TaskStatus, UnpackTask, WorkspaceCleanupJob, get_db_session, get_worker_id
 
     owner_id = get_worker_id()
     processed = 0
@@ -927,9 +942,19 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
                     task.skill_generation_job_id = None
                     task.skill_generation_started_at = None
                     task.skill_generation_completed_at = None
+                    task.evolution_status = None
+                    task.evolution_error = None
+                    task.evolution_job_id = None
+                    task.evolution_started_at = None
+                    task.evolution_completed_at = None
+                    task.evolution_target_node = None
+                    task.evolution_source_run_id = None
+                    task.tuned_agent_path = None
+                    task.tuned_agent_status = None
+                    task.tuned_agent_version = None
                     task.started_at = None
                     task.completed_at = None
-                    db.query(SkillGenerationJob).filter(SkillGenerationJob.task_id == task.id).delete()
+                    db.query(EvolutionJob).filter(EvolutionJob.task_id == task.id).delete()
                     if not task.llm_binding_snapshot:
                         snapshot = _build_llm_binding_snapshot(db)
                         task.llm_binding_snapshot = json.dumps(snapshot, ensure_ascii=False)
@@ -985,58 +1010,61 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
     return processed
 
 
-def process_skill_generation_jobs(limit: int = 1) -> int:
-    from app.model import SkillGenerationJob, UnpackTask, get_db_session, get_worker_id
-    from app.unpacker_engine import _generate_candidate_skill
+def process_evolution_jobs(limit: int | None = None) -> int:
+    from agentflow.tuned_agents import run_evolution_from_payload
+    from app.model import EvolutionJob, UnpackTask, get_db_session, get_worker_id
 
     owner_id = get_worker_id()
     processed = 0
-    while processed < max(1, limit):
+    effective_limit = max(1, int(limit or max_concurrent_evolution_jobs()))
+    while processed < effective_limit:
         db = get_db_session()
         job = None
         now = now_local()
         try:
             job = (
-                db.query(SkillGenerationJob)
+                db.query(EvolutionJob)
                 .filter(
-                    (SkillGenerationJob.status == SKILL_GENERATION_PENDING)
+                    (EvolutionJob.status == EVOLUTION_PENDING)
                     | (
-                        (SkillGenerationJob.status == SKILL_GENERATION_RUNNING)
+                        (EvolutionJob.status == EVOLUTION_RUNNING)
                         & (
-                            (SkillGenerationJob.lease_expires_at.is_(None))
-                            | (SkillGenerationJob.lease_expires_at < now)
+                            (EvolutionJob.lease_expires_at.is_(None))
+                            | (EvolutionJob.lease_expires_at < now)
                         )
                     )
                 )
-                .order_by(SkillGenerationJob.created_at.asc())
+                .order_by(EvolutionJob.created_at.asc())
                 .first()
             )
             if job is None:
                 db.close()
                 break
-            job.status = SKILL_GENERATION_RUNNING
+            job.status = EVOLUTION_RUNNING
             job.owner_id = owner_id
             job.started_at = job.started_at or now
             job.completed_at = None
             job.error_message = None
             job.attempts = int(job.attempts or 0) + 1
-            job.lease_expires_at = _skill_generation_job_lease_deadline(now)
+            job.lease_expires_at = _evolution_job_lease_deadline(now)
             task = db.query(UnpackTask).filter(UnpackTask.id == job.task_id).first()
             if task is not None:
-                task.skill_generation_status = SKILL_GENERATION_RUNNING
-                task.skill_generation_error = None
-                task.skill_generation_job_id = job.id
-                task.skill_generation_started_at = job.started_at
-                task.skill_generation_completed_at = None
+                task.evolution_status = EVOLUTION_RUNNING
+                task.evolution_error = None
+                task.evolution_job_id = job.id
+                task.evolution_started_at = job.started_at
+                task.evolution_completed_at = None
+                task.evolution_target_node = job.target_node
+                task.evolution_source_run_id = job.source_run_id
             db.commit()
             if task is not None:
                 _record_task_event_from_row(
                     task,
-                    event_type="skill_generation_started",
-                    summary="候选 SKILL 开始异步生成",
-                    stage_key="skill_generation",
+                    event_type="evolution_started",
+                    summary="AgentFlow tuned evolution 开始执行",
+                    stage_key="evolution",
                     status=task.status,
-                    detail={"job_id": job.id},
+                    detail={"job_id": job.id, "target_node": job.target_node},
                     owner_id=owner_id,
                     created_by="task_manager",
                 )
@@ -1048,75 +1076,105 @@ def process_skill_generation_jobs(limit: int = 1) -> int:
             db.close()
 
         error_message: Optional[str] = None
-        saved_skill: Optional[dict[str, Any]] = None
+        evolution_result: Optional[dict[str, Any]] = None
+        tuned_manifest: Optional[dict[str, Any]] = None
         try:
             db = get_db_session()
             try:
                 task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
                 if task is None:
-                    raise RuntimeError("任务不存在，无法执行异步 SKILL 沉淀")
-                context_path = _skill_generation_context_path(task.output_path)
-                if not context_path.exists():
-                    raise RuntimeError(f"缺少 SKILL 沉淀上下文文件: {context_path}")
-                context = json.loads(context_path.read_text(encoding="utf-8"))
-                features = context.get("features") or {}
-                if not isinstance(features, dict) or not features:
-                    raise RuntimeError("SKILL 沉淀上下文缺少 features")
-                review_result = str(context.get("review_result") or "").strip()
-                if not review_result:
-                    raise RuntimeError("SKILL 沉淀上下文缺少 review_result")
-                llm_binding_snapshot = None
-                if task.llm_binding_snapshot:
-                    try:
-                        llm_binding_snapshot = json.loads(task.llm_binding_snapshot)
-                    except Exception:
-                        llm_binding_snapshot = None
-                saved_skill = _generate_candidate_skill(
+                    raise RuntimeError("任务不存在，无法执行 evolution")
+                if not task.evolution_source_run_id:
+                    raise RuntimeError("缺少 evolution source run id")
+                family_id = str(task.evolution_target_node or job.target_node or "").strip() or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR
+                source_family_id = str(job.source_family_id or "").strip() or "generic"
+                workspace = Path(task.output_path).expanduser().resolve().parent
+                profile = tuned_profile_name(job.target_node or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR, source_family_id)
+                alias = tuned_agent_alias(job.target_node or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR, source_family_id)
+                ensure_tuner_profile(workspace, profile=profile, alias=alias)
+                payload = {
+                    "profile": profile,
+                    "target": DEFAULT_EVOLUTION_TARGET_AGENT,
+                    "optimizer": DEFAULT_EVOLUTION_OPTIMIZER,
+                    "source_nodes": [job.target_node or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR],
+                    "run_id": task.evolution_source_run_id,
+                    "trace_paths": {
+                        job.target_node or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR: str(
+                            Path(job.artifact_path or "") / "traces" / f"{job.target_node or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR}.trace.jsonl"
+                        ),
+                    },
+                    "workspace_dir": str(workspace),
+                }
+                evolution_result = run_evolution_from_payload(payload)
+                version = str(evolution_result.get("version") or "").strip()
+                manifest_path = tuned_manifest_path(
+                    evolution_archive_root(),
+                    job.target_node or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR,
+                    source_family_id,
+                    version,
+                )
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                tuned_manifest = {
+                    "target_node": job.target_node or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR,
+                    "family_id": source_family_id,
+                    "source_run_id": task.evolution_source_run_id,
+                    "task_id": task.id,
+                    "version": version,
+                    "status": "active",
+                    "created_at": now_local().isoformat(),
+                    "artifact_path": evolution_result.get("repo_path"),
+                    "agent_name": evolution_result.get("agent_name") or alias,
+                    "executable": evolution_result.get("executable"),
+                }
+                manifest_path.write_text(json.dumps(tuned_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+                register_family_tuned_agent(
+                    root=evolution_archive_root(),
+                    target_node=job.target_node or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR,
+                    family_id=source_family_id,
+                    agent_name=str(tuned_manifest.get("agent_name") or alias),
+                    version=version,
                     task_id=task.id,
-                    firmware_path=str(context.get("firmware_path") or task.firmware_path),
-                    output_path=task.output_path,
-                    features=features,
-                    review_result=review_result,
-                    log_dir=context_path.parent,
-                    llm_binding_snapshot=llm_binding_snapshot,
+                    run_id=task.evolution_source_run_id,
                 )
             finally:
                 db.close()
         except Exception as exc:
             error_message = str(exc)
-            logger.warning("failed to process skill generation job %s task %s: %s", job_id, task_id, exc)
+            logger.warning("failed to process evolution job %s task %s: %s", job_id, task_id, exc)
 
         db = get_db_session()
         try:
-            current = db.query(SkillGenerationJob).filter(SkillGenerationJob.id == job_id).first()
+            current = db.query(EvolutionJob).filter(EvolutionJob.id == job_id).first()
             task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
             completed_at = now_local()
             if current is not None:
                 current.owner_id = owner_id
                 current.lease_expires_at = None
                 current.completed_at = completed_at
-                current.status = SKILL_GENERATION_FAILED if error_message else SKILL_GENERATION_SUCCESS
+                current.status = EVOLUTION_FAILED if error_message else EVOLUTION_SUCCESS
                 current.error_message = error_message
+                current.result_json = json.dumps(evolution_result or tuned_manifest or {}, ensure_ascii=False)
             if task is not None:
-                task.skill_generation_status = SKILL_GENERATION_FAILED if error_message else SKILL_GENERATION_SUCCESS
-                task.skill_generation_error = error_message
-                task.skill_generation_job_id = job_id
-                task.skill_generation_completed_at = completed_at
-                if saved_skill:
-                    task.generated_skill_path = saved_skill.get("path")
-                    task.generated_skill_status = saved_skill.get("skill_status")
-                    task.promotion_success_count = saved_skill.get("promotion_success_count")
+                task.evolution_status = EVOLUTION_FAILED if error_message else EVOLUTION_SUCCESS
+                task.evolution_error = error_message
+                task.evolution_job_id = job_id
+                task.evolution_completed_at = completed_at
+                if tuned_manifest:
+                    task.tuned_agent_path = str(tuned_manifest.get("artifact_path") or "")
+                    task.tuned_agent_status = str(tuned_manifest.get("status") or "")
+                    task.tuned_agent_version = str(tuned_manifest.get("version") or "")
             db.commit()
             if task is not None:
                 _record_task_event_from_row(
                     task,
-                    event_type="skill_generation_failed" if error_message else "skill_generation_completed",
-                    summary="候选 SKILL 生成失败" if error_message else "候选 SKILL 已异步生成",
-                    stage_key="skill_generation",
+                    event_type="evolution_failed" if error_message else "evolution_completed",
+                    summary="AgentFlow tuned evolution 失败" if error_message else "AgentFlow tuned evolution 已完成",
+                    stage_key="evolution",
                     status=task.status,
                     detail={
-                        "skill_generation_status": task.skill_generation_status,
-                        "generated_skill_path": task.generated_skill_path,
+                        "evolution_status": task.evolution_status,
+                        "tuned_agent_path": task.tuned_agent_path,
+                        "tuned_agent_version": task.tuned_agent_version,
                         "error": error_message,
                     },
                     owner_id=owner_id,
@@ -1127,6 +1185,10 @@ def process_skill_generation_jobs(limit: int = 1) -> int:
             db.close()
         processed += 1
     return processed
+
+
+def process_skill_generation_jobs(limit: int = 1) -> int:
+    return process_evolution_jobs(limit=limit)
 
 
 def resolve_task_runtime_paths(
@@ -1943,6 +2005,16 @@ def _write_task_result_cache(task_id: str) -> None:
                 "skill_generation_job_id": str(task.skill_generation_job_id or "").strip() or None,
                 "skill_generation_started_at": isoformat_local(task.skill_generation_started_at),
                 "skill_generation_completed_at": isoformat_local(task.skill_generation_completed_at),
+                "evolution_status": str(task.evolution_status or "").strip() or None,
+                "evolution_error": str(task.evolution_error or "").strip() or None,
+                "evolution_job_id": str(task.evolution_job_id or "").strip() or None,
+                "evolution_started_at": isoformat_local(task.evolution_started_at),
+                "evolution_completed_at": isoformat_local(task.evolution_completed_at),
+                "evolution_target_node": str(task.evolution_target_node or "").strip() or None,
+                "evolution_source_run_id": str(task.evolution_source_run_id or "").strip() or None,
+                "tuned_agent_path": str(task.tuned_agent_path or "").strip() or None,
+                "tuned_agent_status": str(task.tuned_agent_status or "").strip() or None,
+                "tuned_agent_version": str(task.tuned_agent_version or "").strip() or None,
                 "executor_rounds": int(task.rounds or 0),
                 "session_count": session_count,
                 "event_count": 0,
@@ -1956,48 +2028,67 @@ def _write_task_result_cache(task_id: str) -> None:
         db.close()
 
 
-def _skill_generation_context_path(output_path: str) -> Path:
-    from app.unpacker_engine import SKILL_GENERATION_CONTEXT_FILENAME
-
-    return _derive_run_root_from_output_path(output_path) / "round_000" / SKILL_GENERATION_CONTEXT_FILENAME
-
-
-def _enqueue_skill_generation_job(db: Any, task: Any, *, created_by: str = "task_manager") -> Optional[str]:
-    from app.model import SkillGenerationJob, generate_id
+def _enqueue_evolution_job(
+    db: Any,
+    task: Any,
+    *,
+    created_by: str = "task_manager",
+    source_run_id: str,
+    source_family_id: str,
+    target_node: str = EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR,
+    artifact_path: str | None = None,
+) -> Optional[str]:
+    from app.model import EvolutionJob, generate_id
 
     if task is None:
         return None
+    if not evolution_enabled():
+        task.evolution_status = EVOLUTION_NOT_APPLICABLE
+        return None
+    target_node = str(target_node or "").strip() or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR
+    if target_node not in evolution_target_nodes():
+        task.evolution_status = EVOLUTION_NOT_APPLICABLE
+        return None
     existing = (
-        db.query(SkillGenerationJob)
+        db.query(EvolutionJob)
         .filter(
-            SkillGenerationJob.task_id == task.id,
-            SkillGenerationJob.status.in_([SKILL_GENERATION_PENDING, SKILL_GENERATION_RUNNING]),
+            EvolutionJob.task_id == task.id,
+            EvolutionJob.status.in_([EVOLUTION_PENDING, EVOLUTION_RUNNING]),
         )
         .first()
     )
     if existing is not None:
-        task.skill_generation_status = existing.status
-        task.skill_generation_job_id = existing.id
-        task.skill_generation_error = None
-        task.skill_generation_started_at = existing.started_at
-        task.skill_generation_completed_at = existing.completed_at
+        task.evolution_status = existing.status
+        task.evolution_job_id = existing.id
+        task.evolution_error = None
+        task.evolution_started_at = existing.started_at
+        task.evolution_completed_at = existing.completed_at
+        task.evolution_target_node = existing.target_node
+        task.evolution_source_run_id = existing.source_run_id
         return existing.id
 
     job_id = generate_id()
     db.add(
-        SkillGenerationJob(
+        EvolutionJob(
             id=job_id,
             task_id=task.id,
             project_id=task.project_id,
-            status=SKILL_GENERATION_PENDING,
+            status=EVOLUTION_PENDING,
             created_by=created_by,
+            target_node=target_node,
+            source_run_id=source_run_id,
+            source_family_id=source_family_id,
+            source_stage=target_node,
+            artifact_path=artifact_path,
         )
     )
-    task.skill_generation_status = SKILL_GENERATION_PENDING
-    task.skill_generation_error = None
-    task.skill_generation_job_id = job_id
-    task.skill_generation_started_at = None
-    task.skill_generation_completed_at = None
+    task.evolution_status = EVOLUTION_PENDING
+    task.evolution_error = None
+    task.evolution_job_id = job_id
+    task.evolution_started_at = None
+    task.evolution_completed_at = None
+    task.evolution_target_node = target_node
+    task.evolution_source_run_id = source_run_id
     return job_id
 
 
@@ -2093,7 +2184,7 @@ def _run_claimed_task(task_id: str) -> None:
 
 def run_claimed_task_process(task_id: str, *, owner_id: str, run_token: str) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
-    from app.unpacker_engine import run_unpack
+    from app.cli import run_unpack_agentflow as run_unpack
 
     db = get_db_session()
     try:
@@ -2214,7 +2305,7 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
     from app.model import TaskStatus, UnpackTask, get_db_session
 
     db = get_db_session()
-    queued_skill_generation_job_id: Optional[str] = None
+    queued_evolution_job_id: Optional[str] = None
     try:
         query = db.query(UnpackTask).filter(UnpackTask.id == task_id)
         if run_token:
@@ -2263,15 +2354,45 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
         task.generated_skill_status = result.get("generated_skill_status")
         task.promotion_success_count = result.get("promotion_success_count")
         task.skill_generation_error = None
-        skill_generation_requested = bool(result.get("skill_generation_requested"))
-        if task.status == TaskStatus.SUCCESS.value and skill_generation_requested:
-            queued_skill_generation_job_id = _enqueue_skill_generation_job(db, task)
+        task.evolution_target_node = result.get("evolution_target_node")
+        task.evolution_source_run_id = result.get("evolution_source_run_id") or result.get("agentflow_run_id")
+        if task.status == TaskStatus.SUCCESS.value and is_generic_success_result(result):
+            sample_path = result.get("evolution_sample_path")
+            if not sample_path:
+                run_root = _derive_run_root_from_output_path(task.output_path)
+                family_id = str(result.get("family_id") or "").strip() or "generic"
+                run_id = str(result.get("agentflow_run_id") or result.get("run_id") or "").strip() or task.id
+                tokens = {}
+                tokens_path = run_root / "tokens_summary.json"
+                if tokens_path.exists():
+                    try:
+                        tokens = json.loads(tokens_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        tokens = {}
+                archived = archive_success_sample(
+                    task_id=task.id,
+                    project_id=task.project_id,
+                    family_id=family_id,
+                    run_id=run_id,
+                    run_dir=run_root,
+                    final_result=result,
+                    tokens_summary=tokens,
+                )
+                sample_path = str(archived.sample_dir)
+            queued_evolution_job_id = _enqueue_evolution_job(
+                db,
+                task,
+                source_run_id=str(result.get("agentflow_run_id") or result.get("run_id") or ""),
+                source_family_id=str(result.get("family_id") or "generic"),
+                target_node=str(result.get("evolution_target_node") or EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR),
+                artifact_path=str(sample_path),
+            )
         else:
-            task.skill_generation_status = SKILL_GENERATION_NOT_APPLICABLE
-            task.skill_generation_error = None
-            task.skill_generation_job_id = None
-            task.skill_generation_started_at = None
-            task.skill_generation_completed_at = None
+            task.evolution_status = EVOLUTION_NOT_APPLICABLE
+            task.evolution_error = None
+            task.evolution_job_id = None
+            task.evolution_started_at = None
+            task.evolution_completed_at = None
         task.completed_at = now_local()
         task.last_progress_at = now_local()
         db.commit()
@@ -2290,14 +2411,14 @@ def _update_task_result(task_id: str, result: dict, *, run_token: Optional[str] 
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
-        if queued_skill_generation_job_id:
+        if queued_evolution_job_id:
             _record_task_event_from_row(
                 task,
-                event_type="skill_generation_queued",
-                summary="候选 SKILL 已入队，等待后台异步沉淀",
-                stage_key="skill_generation",
+                event_type="evolution_queued",
+                summary="AgentFlow tuned evolution 已入队",
+                stage_key="evolution",
                 status=task.status,
-                detail={"job_id": queued_skill_generation_job_id},
+                detail={"job_id": queued_evolution_job_id, "target_node": task.evolution_target_node},
                 created_by="task_manager",
             )
         _write_task_result_cache(task_id)

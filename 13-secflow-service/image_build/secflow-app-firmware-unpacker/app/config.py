@@ -20,6 +20,9 @@ class AgentFlowConfig(BaseModel):
     graph_optimizer: str = "codex"
     graph_optimization_rounds: int = 1
     evolution_archive_dir: str = ""
+    evolution_enabled: bool = True
+    max_concurrent_evolution_jobs: int = 1
+    evolution_target_nodes: str = "generic_executor"
     cleanup_runs_retention_days: int = 7
 
 
@@ -260,6 +263,18 @@ def _apply_env_overrides(cfg: Config) -> Config:
     cfg.agentflow.evolution_archive_dir = os.environ.get(
         "AGENTFLOW_EVOLUTION_ARCHIVE_DIR",
         cfg.agentflow.evolution_archive_dir,
+    )
+    cfg.agentflow.evolution_enabled = _env_bool(
+        "AGENTFLOW_EVOLUTION_ENABLED",
+        cfg.agentflow.evolution_enabled,
+    )
+    cfg.agentflow.max_concurrent_evolution_jobs = _env_int(
+        "AGENTFLOW_MAX_CONCURRENT_EVOLUTION_JOBS",
+        cfg.agentflow.max_concurrent_evolution_jobs,
+    )
+    cfg.agentflow.evolution_target_nodes = os.environ.get(
+        "AGENTFLOW_EVOLUTION_TARGET_NODES",
+        cfg.agentflow.evolution_target_nodes,
     )
     cfg.agentflow.cleanup_runs_retention_days = _env_int(
         "AGENTFLOW_CLEANUP_RUNS_RETENTION_DAYS",

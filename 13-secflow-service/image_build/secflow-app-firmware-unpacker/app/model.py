@@ -87,6 +87,16 @@ class UnpackTask(Base):
     skill_generation_job_id = Column(String(32), nullable=True, index=True)
     skill_generation_started_at = Column(DateTime, nullable=True)
     skill_generation_completed_at = Column(DateTime, nullable=True)
+    evolution_status = Column(String(32), nullable=True)
+    evolution_error = Column(Text, nullable=True)
+    evolution_job_id = Column(String(32), nullable=True, index=True)
+    evolution_started_at = Column(DateTime, nullable=True)
+    evolution_completed_at = Column(DateTime, nullable=True)
+    evolution_target_node = Column(String(64), nullable=True)
+    evolution_source_run_id = Column(String(64), nullable=True)
+    tuned_agent_path = Column(String(1024), nullable=True)
+    tuned_agent_status = Column(String(32), nullable=True)
+    tuned_agent_version = Column(String(64), nullable=True)
     llm_binding_snapshot = Column(Text, nullable=True)
     created_at = Column(DateTime, default=now_local)
     started_at = Column(DateTime, nullable=True)
@@ -140,6 +150,16 @@ class UnpackTask(Base):
             "skill_generation_job_id": self.skill_generation_job_id,
             "skill_generation_started_at": isoformat_local(self.skill_generation_started_at),
             "skill_generation_completed_at": isoformat_local(self.skill_generation_completed_at),
+            "evolution_status": self.evolution_status,
+            "evolution_error": self.evolution_error,
+            "evolution_job_id": self.evolution_job_id,
+            "evolution_started_at": isoformat_local(self.evolution_started_at),
+            "evolution_completed_at": isoformat_local(self.evolution_completed_at),
+            "evolution_target_node": self.evolution_target_node,
+            "evolution_source_run_id": self.evolution_source_run_id,
+            "tuned_agent_path": self.tuned_agent_path,
+            "tuned_agent_status": self.tuned_agent_status,
+            "tuned_agent_version": self.tuned_agent_version,
             "created_at": isoformat_local(self.created_at),
             "started_at": isoformat_local(self.started_at),
             "completed_at": isoformat_local(self.completed_at),
@@ -262,8 +282,8 @@ class WorkspaceCleanupJob(Base):
         }
 
 
-class SkillGenerationJob(Base):
-    __tablename__ = "secflow_app_firmware_unpacker_skill_generation_jobs"
+class EvolutionJob(Base):
+    __tablename__ = "secflow_app_firmware_unpacker_evolution_jobs"
 
     id = Column(String(32), primary_key=True)
     task_id = Column(String(32), nullable=False, index=True)
@@ -277,6 +297,12 @@ class SkillGenerationJob(Base):
     created_at = Column(DateTime, default=now_local, nullable=False)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    target_node = Column(String(64), nullable=True)
+    source_run_id = Column(String(64), nullable=True)
+    source_family_id = Column(String(128), nullable=True)
+    source_stage = Column(String(64), nullable=True)
+    artifact_path = Column(String(1024), nullable=True)
+    result_json = Column(Text, nullable=True)
 
     def to_dict(self) -> dict:
         return {
@@ -292,7 +318,15 @@ class SkillGenerationJob(Base):
             "created_at": isoformat_local(self.created_at),
             "started_at": isoformat_local(self.started_at),
             "completed_at": isoformat_local(self.completed_at),
+            "target_node": self.target_node,
+            "source_run_id": self.source_run_id,
+            "source_family_id": self.source_family_id,
+            "source_stage": self.source_stage,
+            "artifact_path": self.artifact_path,
         }
+
+
+SkillGenerationJob = EvolutionJob
 
 
 DEFAULT_CONFIGS = [
@@ -312,7 +346,6 @@ DEFAULT_CONFIGS = [
     ("reuse_agent_between_rounds_executor", "true", "bool", "不同重试轮次之间是否复用固件解包通用执行器智能体会话：true=复用，false=每轮新建"),
     ("reuse_agent_between_rounds_reviewer", "true", "bool", "不同重试轮次之间是否复用固件解包评审器智能体会话：true=复用，false=每轮新建"),
     ("reuse_agent_between_rounds_cleaner", "true", "bool", "是否复用固件解包清理器智能体会话：true=复用，false=每次新建"),
-    ("reuse_agent_between_rounds_skill_author", "true", "bool", "是否复用固件解包技能生成器智能体会话：true=复用，false=每次新建"),
     ("reuse_agent_between_rounds_skill_executor", "true", "bool", "是否复用固件解包命中技能执行器智能体会话：true=复用，false=每次新建"),
     ("dead_threshold", "300", "int", "Worker 心跳超时秒数"),
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
@@ -327,10 +360,11 @@ DEFAULT_CONFIGS = [
     ("llm_model_reviewer", "", "string", "固件解包评审器角色绑定的模型；留空则使用配置文件默认模型"),
     ("llm_config_file_key_cleaner", "", "string", "固件解包清理器角色绑定的 models.json 配置文件 key"),
     ("llm_model_cleaner", "", "string", "固件解包清理器角色绑定的模型；留空则使用配置文件默认模型"),
-    ("llm_config_file_key_skill_author", "", "string", "固件解包技能生成器角色绑定的 models.json 配置文件 key"),
-    ("llm_model_skill_author", "", "string", "固件解包技能生成器角色绑定的模型；留空则使用配置文件默认模型"),
     ("llm_config_file_key_skill_executor", "", "string", "固件解包命中技能执行器角色绑定的 models.json 配置文件 key"),
     ("llm_model_skill_executor", "", "string", "固件解包命中技能执行器角色绑定的模型；留空则使用配置文件默认模型"),
+    ("evolution_enabled", "true", "bool", "是否启用 AgentFlow tuned evolution 异步任务"),
+    ("max_concurrent_evolution_jobs", "1", "int", "后台最大并发 evolution job 数"),
+    ("evolution_target_nodes", "generic_executor", "string", "允许触发 tuned evolution 的节点，逗号分隔"),
 ]
 
 
@@ -388,7 +422,7 @@ def apply_table_prefix_if_needed() -> None:
     ServiceConfig.__table__.name = f"{prefix}service_configs"
     UnpackTaskEvent.__table__.name = f"{prefix}task_events"
     WorkspaceCleanupJob.__table__.name = f"{prefix}workspace_cleanup_jobs"
-    SkillGenerationJob.__table__.name = f"{prefix}skill_generation_jobs"
+    EvolutionJob.__table__.name = f"{prefix}evolution_jobs"
 
 
 def init_database() -> None:
@@ -437,6 +471,16 @@ def _ensure_unpack_task_columns() -> None:
         "skill_generation_job_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_job_id VARCHAR(32)",
         "skill_generation_started_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_started_at DATETIME",
         "skill_generation_completed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_completed_at DATETIME",
+        "evolution_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN evolution_status VARCHAR(32)",
+        "evolution_error": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN evolution_error TEXT",
+        "evolution_job_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN evolution_job_id VARCHAR(32)",
+        "evolution_started_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN evolution_started_at DATETIME",
+        "evolution_completed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN evolution_completed_at DATETIME",
+        "evolution_target_node": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN evolution_target_node VARCHAR(64)",
+        "evolution_source_run_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN evolution_source_run_id VARCHAR(64)",
+        "tuned_agent_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN tuned_agent_path VARCHAR(1024)",
+        "tuned_agent_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN tuned_agent_status VARCHAR(32)",
+        "tuned_agent_version": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN tuned_agent_version VARCHAR(64)",
         "llm_binding_snapshot": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN llm_binding_snapshot TEXT",
     }
 

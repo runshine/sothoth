@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .skill_store import register_skill_success, save_candidate_skill
+from .skill_store import register_skill_success
 
 
 def _write_json(path: str, data: Any) -> None:
@@ -66,7 +66,6 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
     skill_review = str((nodes.get("skill_reviewer") or {}).get("output") or "")
     generic_output = str((nodes.get("generic_executor") or {}).get("output") or "")
     generic_review = str((nodes.get("generic_reviewer") or {}).get("output") or "")
-    author_output = str((nodes.get("skill_author") or {}).get("output") or "")
     skill_status = str((nodes.get("skill_executor") or {}).get("status") or "").strip()
     generic_status = str((nodes.get("generic_executor") or {}).get("status") or "").strip()
 
@@ -89,9 +88,7 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
     passed = preprocess_passed or skill_passed or generic_passed
     fallback_to_llm = bool(matched_skill_path and not skill_passed)
 
-    generated_skill = None
     skill_update_error = None
-    generated_skill_error = None
     matched_skill_after_update = matched_skill_path
     promotion_success_count = None
 
@@ -103,23 +100,6 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
             promotion_success_count = updated_skill.get("promotion_success_count")
         except Exception as exc:
             skill_update_error = str(exc)
-
-    author_file = Path(payload["skill_author_output_file"])
-    if author_file.is_file():
-        author_output = author_file.read_text(encoding="utf-8", errors="replace")
-    if passed and generic_passed and author_output.strip() and "SKIPPED" not in author_output:
-        try:
-            generated_skill = save_candidate_skill(
-                Path(payload["tools_dir"]),
-                _extract_markdown_document(author_output),
-                {
-                    "family_id": features.get("family_id") or "generic-firmware",
-                    "source_run_id": "",
-                    "source_node_id": "generic_executor",
-                },
-            )
-        except Exception as exc:
-            generated_skill_error = str(exc)
 
     failure_summary: dict[str, Any] = {"failed_nodes": []}
     if not passed:
@@ -140,12 +120,15 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
         "matched_skill_version": matched_skill_version,
         "matched_skill_score": matched_skill_score if matched_skill_after_update else None,
         "fallback_to_llm": fallback_to_llm,
-        "generated_skill_path": generated_skill.get("path") if generated_skill else None,
-        "generated_skill_status": generated_skill.get("skill_status") if generated_skill else None,
-        "promotion_success_count": promotion_success_count if promotion_success_count is not None else (generated_skill.get("promotion_success_count") if generated_skill else None),
+        "generated_skill_path": None,
+        "generated_skill_status": None,
+        "promotion_success_count": promotion_success_count,
         "firmware_path": payload["firmware_path"],
         "output_path": payload["output_path"],
         "run_path": str(Path(payload["final_result_file"]).parent),
+        "family_id": features.get("family_id") or "generic-firmware",
+        "evolution_target_node": "generic_executor" if generic_passed else None,
+        "evolution_source_run_id": None,
         "node_attempts": {
             "skill_executor": {"status": skill_status},
             "generic_executor": {"status": generic_status},
@@ -154,7 +137,6 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
         "failure_category": failure_summary["failed_nodes"][0]["classification"]["failure_category"] if failure_summary["failed_nodes"] else None,
         "total_tokens": 0,
         "skill_update_error": skill_update_error,
-        "generated_skill_error": generated_skill_error,
     }
 
     _write_json(payload["stage2_file"], feature_payload)
@@ -176,21 +158,11 @@ def run(payload: dict[str, Any], nodes: dict[str, Any] | None = None) -> None:
             "reason": _preview(generic_review or skill_review, 400),
         },
     )
-    _write_json(
-        payload["stage5_file"],
-        {
-            "generated_skill_path": generated_skill.get("path") if generated_skill else None,
-            "generated_skill_status": generated_skill.get("skill_status") if generated_skill else None,
-            "promotion_success_count": promotion_success_count,
-            "source_node_id": "generic_executor" if generated_skill else None,
-            "error": generated_skill_error,
-        },
-    )
     _write_json(payload["final_result_file"], result)
     print(
         f"AGENTFLOW_PROGRESS stage=finalize event=finish "
         f"status={result['status']} fallback_to_llm={result['fallback_to_llm']} "
-        f"generated_skill={bool(result['generated_skill_path'])}",
+        f"evolution_target={result['evolution_target_node'] or 'none'}",
         flush=True,
     )
     print(json.dumps(result, ensure_ascii=False))

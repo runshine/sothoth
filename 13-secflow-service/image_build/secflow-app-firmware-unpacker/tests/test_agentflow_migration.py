@@ -7,8 +7,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
-from app.cli import _token_summary, run_unpack_agentflow
-from app.cli import _skill_author_code, build_firmware_unpack_pipeline
+from app.cli import _token_summary, build_firmware_unpack_pipeline, run_unpack_agentflow
 from app.cli import reload_config
 
 
@@ -185,6 +184,9 @@ class AgentFlowConfigTests(unittest.TestCase):
                     "graph_optimizer",
                     "graph_optimization_rounds",
                     "evolution_archive_dir",
+                    "evolution_enabled",
+                    "max_concurrent_evolution_jobs",
+                    "evolution_target_nodes",
                     "cleanup_runs_retention_days",
                 },
                 set(cfg.agentflow.model_dump()),
@@ -226,7 +228,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 "tools_dir": str(root / "tools"),
                 "preprocess_output_file": str(root / "run" / "preprocess.json"),
                 "feature_match_output_file": str(root / "run" / "feature-match.json"),
-                "skill_author_output_file": str(root / "run" / "generated_skill.md"),
                 "final_result_file": str(root / "run" / "final_result.json"),
                 "agentflow_concurrency": 2,
                 "max_retries": 3,
@@ -234,7 +235,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 "use_worktree": False,
                 "executor_extra_args": ["--append-system-prompt", "/tmp/exec.md"],
                 "review_extra_args": ["--append-system-prompt", "/tmp/review.md"],
-                "author_extra_args": ["--append-system-prompt", "/tmp/author.md"],
                 "cleanup_extra_args": ["--append-system-prompt", "/tmp/cleanup.md"],
             }
             spec = build_firmware_unpack_pipeline(ctx)
@@ -249,7 +249,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
                     "generic_executor",
                     "output_summary",
                     "generic_reviewer",
-                    "skill_author",
                     "cleanup",
                     "finalize",
                 },
@@ -320,7 +319,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
                     "feature_match": _node(output='{"features": {"family_id": "family-1"}}'),
                     "generic_executor": _node(output="generic unpack done", attempts=2, current_attempt=2),
                     "generic_reviewer": _node(output="AGENTFLOW_REVIEW_SUCCESS"),
-                    "skill_author": _node(output="SKIPPED_NO_SUCCESS"),
                 },
             )
             progress_updates = []
@@ -340,8 +338,11 @@ class AgentFlowPipelineTests(unittest.TestCase):
             self.assertTrue((task_root / "run" / "round_000" / "skill_match.json").is_file())
             self.assertTrue((task_root / "run" / "round_000" / "skill_exec.json").is_file())
             self.assertTrue((task_root / "run" / "round_000" / "fallback.json").is_file())
-            self.assertTrue((task_root / "run" / "round_000" / "stage5_skill_generate.json").is_file())
+            self.assertFalse((task_root / "run" / "round_000" / "stage5_skill_generate.json").exists())
             self.assertTrue((task_root / "run" / "round_002" / "results.json").is_file())
+            self.assertEqual("generic_executor", result["evolution_target_node"])
+            self.assertEqual("family-1", result["family_id"])
+            self.assertTrue(result["evolution_sample_path"])
             self.assertEqual([], progress_updates)
             self.assertEqual([], event_updates)
 
@@ -355,7 +356,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 "tools_dir": str(root / "tools"),
                 "preprocess_output_file": str(root / "run" / "preprocess.json"),
                 "feature_match_output_file": str(root / "run" / "feature-match.json"),
-                "skill_author_output_file": str(root / "run" / "generated_skill.md"),
                 "final_result_file": str(root / "run" / "final_result.json"),
                 "agentflow_concurrency": 2,
                 "max_retries": 3,
@@ -366,7 +366,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 "graph_optimization_rounds": 2,
                 "executor_extra_args": [],
                 "review_extra_args": [],
-                "author_extra_args": [],
                 "cleanup_extra_args": [],
             }
             spec = build_firmware_unpack_pipeline(ctx)
@@ -383,7 +382,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 "tools_dir": str(root / "tools"),
                 "preprocess_output_file": str(root / "run" / "preprocess.json"),
                 "feature_match_output_file": str(root / "run" / "feature-match.json"),
-                "skill_author_output_file": str(root / "run" / "generated_skill.md"),
                 "final_result_file": str(root / "run" / "final_result.json"),
                 "agentflow_concurrency": 1,
                 "max_retries": 1,
@@ -391,7 +389,6 @@ class AgentFlowPipelineTests(unittest.TestCase):
                 "use_worktree": False,
                 "executor_extra_args": [],
                 "review_extra_args": [],
-                "author_extra_args": [],
                 "cleanup_extra_args": [],
             }
             node_map = build_firmware_unpack_pipeline(ctx).node_map
@@ -400,38 +397,13 @@ class AgentFlowPipelineTests(unittest.TestCase):
             self.assertEqual(15, node_map["generic_reviewer"].timeout_seconds)
             self.assertEqual("python", node_map["cleanup"].agent)
 
-    def test_skill_author_caps_generated_skill_size(self):
+    def test_skill_author_is_removed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            output = root / "output"
             run = root / "run"
-            output.mkdir()
             run.mkdir()
-            (output / "summary.txt").write_text(("very long summary line " * 200) + "\n" * 2 + "keep this\n", encoding="utf-8")
-            feature_payload = {
-                "features": {
-                    "family_id": "cc-00000000-lzma-compressed-data-properties",
-                    "ext": ".cc",
-                    "magic_hex": "00000000",
-                    "binwalk_sigs": [f"signature {index} " + ("x" * 300) for index in range(100)],
-                }
-            }
-            feature_file = run / "feature-match.json"
-            feature_file.write_text(json.dumps(feature_payload), encoding="utf-8")
             skill_file = run / "generated_skill.md"
-            ctx = {
-                "feature_match_output_file": str(feature_file),
-                "output_path": str(output),
-                "skill_author_output_file": str(skill_file),
-            }
-
-            code = _skill_author_code(ctx).replace("{{ nodes.generic_reviewer.output }}", "AGENTFLOW_REVIEW_SUCCESS")
-            exec(code, {})
-            generated = skill_file.read_text(encoding="utf-8")
-
-            self.assertLess(skill_file.stat().st_size, 20_000)
-            self.assertLess(max(len(line) for line in generated.splitlines()), 1_000)
-            self.assertIn("[summary truncated for reusable skill size]", generated)
+            self.assertFalse(skill_file.exists())
 
 
 class AgentFlowRunnerAdapterTests(unittest.TestCase):
@@ -553,36 +525,30 @@ class AgentFlowRunnerAdapterTests(unittest.TestCase):
             self.assertFalse(result["fallback_to_llm"])
             register.assert_called_once()
 
-    def test_skill_failure_falls_back_to_generic_and_saves_candidate_skill(self):
+    def test_skill_failure_falls_back_to_generic_and_exposes_evolution_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = str(Path(tmp) / "task" / "output")
             skill = {"path": "/data/tools/skills/router.md", "skill_version": "1.0"}
-            generated = {
-                "path": "/data/tools/candidates/family-1.md",
-                "skill_status": "candidate",
-                "promotion_success_count": 0,
-            }
             record = _record(
                 nodes={
                     "preprocess": _node('{"success": false}'),
                     "skill_reviewer": _node("AGENTFLOW_REVIEW_FAIL reason=bad output"),
                     "generic_executor": _node("generic unpack done", attempts=2),
                     "generic_reviewer": _node("AGENTFLOW_REVIEW_SUCCESS"),
-                    "skill_author": _node("# Skill\n\nReusable guidance."),
                 },
                 status="completed",
             )
             with patch("app.cli.match_skill", return_value=(skill, 80, {"matched_status": "hit"})):
-                with patch("app.cli.save_candidate_skill", return_value=generated) as save_skill:
-                    result = _run_agentflow_with_record(record, output)
+                result = _run_agentflow_with_record(record, output)
 
             self.assertEqual("success", result["status"])
             self.assertEqual(2, result["rounds"])
             self.assertTrue(result["fallback_to_llm"])
-            self.assertEqual("/data/tools/candidates/family-1.md", result["generated_skill_path"])
-            self.assertEqual("candidate", result["generated_skill_status"])
+            self.assertIsNone(result["generated_skill_path"])
+            self.assertIsNone(result["generated_skill_status"])
+            self.assertEqual("generic_executor", result["evolution_target_node"])
+            self.assertEqual("run-1", result["evolution_source_run_id"])
             self.assertEqual("STRUCTURAL_FAILURE", result["failure_summary"]["failed_nodes"][0]["classification"]["category"])
-            save_skill.assert_called_once()
 
     def test_failed_run_reports_attempt_rounds(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -774,9 +740,9 @@ class AgentFlowRunnerSmokeTests(unittest.TestCase):
             self.assertEqual("success", result["status"])
             self.assertEqual(str(skill_path), result["matched_skill"])
             self.assertTrue(result["fallback_to_llm"])
-            self.assertEqual("candidate", result["generated_skill_status"])
-            self.assertTrue(result["generated_skill_path"])
-            self.assertTrue(Path(result["generated_skill_path"]).is_file())
+            self.assertEqual("generic_executor", result["evolution_target_node"])
+            self.assertEqual(result["agentflow_run_id"], result["evolution_source_run_id"])
+            self.assertTrue(result["evolution_sample_path"])
 
 
 if __name__ == "__main__":

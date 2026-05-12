@@ -25,14 +25,21 @@ _local_agentflow = _repo_root / "agentflow"
 if _local_agentflow.exists() and str(_local_agentflow) not in sys.path:
     sys.path.insert(0, str(_local_agentflow))
 
-from agentflow import Graph, pi, python_node
+from agentflow import Graph, python_node
+from agentflow.dsl import _node as agent_node
 from agentflow.orchestrator import Orchestrator
 from agentflow.store import RunStore
 
 from app.agent.defs import AUTHOR_AGENT_DEF, CLEAN_AGENT_DEF, EXEC_AGENT_DEF, VAL_AGENT_DEF, load_agent_def
 from app.pipeline_stages.s02_feature_match.features import extract_firmware_features
 from app.pipeline_stages.s02_feature_match.skill_store import compute_family_id, match_skill
-from app.pipeline_stages.s09_finalize.skill_store import register_skill_success, save_candidate_skill
+from app.evolution import (
+    EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR,
+    archive_success_sample,
+    register_family_tuned_agent,
+    resolve_family_tuned_agent,
+)
+from app.pipeline_stages.s09_finalize.skill_store import register_skill_success
 
 
 import os
@@ -55,6 +62,9 @@ class AgentFlowConfig(BaseModel):
     graph_optimizer: str = "codex"
     graph_optimization_rounds: int = 1
     evolution_archive_dir: str = ""
+    evolution_enabled: bool = True
+    max_concurrent_evolution_jobs: int = 1
+    evolution_target_nodes: str = "generic_executor"
     cleanup_runs_retention_days: int = 7
 
 
@@ -128,6 +138,18 @@ def _apply_env_overrides(cfg: Config) -> Config:
     cfg.agentflow.evolution_archive_dir = os.environ.get(
         "AGENTFLOW_EVOLUTION_ARCHIVE_DIR",
         cfg.agentflow.evolution_archive_dir,
+    )
+    cfg.agentflow.evolution_enabled = _env_bool(
+        "AGENTFLOW_EVOLUTION_ENABLED",
+        cfg.agentflow.evolution_enabled,
+    )
+    cfg.agentflow.max_concurrent_evolution_jobs = _env_int(
+        "AGENTFLOW_MAX_CONCURRENT_EVOLUTION_JOBS",
+        cfg.agentflow.max_concurrent_evolution_jobs,
+    )
+    cfg.agentflow.evolution_target_nodes = os.environ.get(
+        "AGENTFLOW_EVOLUTION_TARGET_NODES",
+        cfg.agentflow.evolution_target_nodes,
     )
     cfg.agentflow.cleanup_runs_retention_days = _env_int(
         "AGENTFLOW_CLEANUP_RUNS_RETENTION_DAYS",
@@ -233,7 +255,7 @@ _local_agentflow = _repo_root / "agentflow"
 if _local_agentflow.exists() and str(_local_agentflow) not in sys.path:
     sys.path.insert(0, str(_local_agentflow))
 
-from agentflow import Graph, pi, python_node
+from agentflow import Graph, python_node
 
 
 REVIEW_SUCCESS_CRITERIA = [
@@ -344,12 +366,10 @@ def _finalize_result_code(ctx: dict[str, Any]) -> str:
         "output_path": ctx["output_path"],
         "tools_dir": ctx["tools_dir"],
         "feature_match_output_file": ctx["feature_match_output_file"],
-        "skill_author_output_file": ctx["skill_author_output_file"],
         "final_result_file": ctx["final_result_file"],
         "stage2_file": str(Path(ctx["final_result_file"]).parent / "stage2_skill_match.json"),
         "stage3_file": str(Path(ctx["final_result_file"]).parent / "stage3_skill_exec.json"),
         "stage4_file": str(Path(ctx["final_result_file"]).parent / "stage4_llm_fallback.json"),
-        "stage5_file": str(Path(ctx["final_result_file"]).parent / "stage5_skill_generate.json"),
     }
     return _stage_call_code(
         "s09_finalize",
@@ -367,7 +387,6 @@ def _finalize_result_code(ctx: dict[str, Any]) -> str:
                 "status": "{{ nodes.generic_executor.status }}",
             },
             "generic_reviewer": {"output": "{{ nodes.generic_reviewer.output }}"},
-            "skill_author": {"output": "{{ nodes.skill_author.output }}"},
             "cleanup": {"output": "{{ nodes.cleanup.output }}"},
         },
     )
@@ -402,16 +421,8 @@ def _generic_review_code(ctx: dict[str, Any]) -> str:
 
 
 def _skill_author_code(ctx: dict[str, Any]) -> str:
-    payload = {
-        "feature_match_output_file": ctx["feature_match_output_file"],
-        "output_path": ctx["output_path"],
-        "skill_author_output_file": ctx["skill_author_output_file"],
-    }
-    return _stage_call_code(
-        "s07_skill_author",
-        payload,
-        nodes={"generic_reviewer": {"output": "{{ nodes.generic_reviewer.output }}"}},
-    )
+    del ctx
+    return "print('SKIPPED_REMOVED_SKILL_AUTHOR')\n"
 
 
 def _input_path(ctx: dict[str, Any]) -> str:
@@ -431,6 +442,16 @@ def _executor_env(ctx: dict[str, Any]) -> dict[str, str]:
         "FIRMWARE_PATH": firmware_path,
         "FIRMWARE_OUTPUT": output_path,
     }
+
+
+def _resolve_generic_executor_agent(ctx: dict[str, Any]) -> str:
+    family_id = str(ctx.get("family_id") or "").strip()
+    if not family_id:
+        return "pi"
+    record = resolve_family_tuned_agent(EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR, family_id)
+    if not record:
+        return "pi"
+    return str(record.get("agent_name") or "pi")
 
 
 def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
@@ -470,7 +491,8 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             tools="read_only",
             env=_python_node_env(),
         )
-        skill_executor = pi(
+        skill_executor = agent_node(
+            "pi",
             task_id="skill_executor",
             prompt=(
                 "Output protocol: print exactly one final marker line when skipping.\n"
@@ -506,7 +528,8 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             timeout_seconds=_node_timeout(ctx, divisor=2),
             success_criteria=REVIEW_SUCCESS_CRITERIA,
         )
-        generic_executor = pi(
+        generic_executor = agent_node(
+            str(ctx.get("generic_executor_agent") or "pi"),
             task_id="generic_executor",
             prompt=(
                 "Output protocol: print exactly one final marker line when skipping.\n"
@@ -560,12 +583,6 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
             timeout_seconds=_node_timeout(ctx, divisor=2),
             success_criteria=REVIEW_SUCCESS_CRITERIA,
         )
-        skill_author = python_node(
-            task_id="skill_author",
-            code=_skill_author_code(ctx),
-            tools="read_write",
-            env=_python_node_env(),
-        )
         cleanup = python_node(
             task_id="cleanup",
             code=_cleanup_output_code(ctx),
@@ -584,7 +601,7 @@ def build_firmware_unpack_pipeline(ctx: dict[str, Any]):
         skill_reviewer >> generic_executor
         generic_executor >> output_summary >> generic_reviewer
         generic_reviewer.on_failure >> generic_executor
-        generic_reviewer >> skill_author >> cleanup >> finalize
+        generic_reviewer >> cleanup >> finalize
 
     return g.to_spec()
 
@@ -687,15 +704,13 @@ def build_firmware_unpack_context_from_env() -> dict[str, Any]:
         "graph_optimization_rounds": graph_optimization_rounds,
         "preprocess_output_file": str(run_dir / "preprocess.json"),
         "feature_match_output_file": str(run_dir / "feature-match.json"),
-        "skill_author_output_file": str(run_dir / "generated_skill.md"),
         "final_result_file": str(run_dir / "final_result.json"),
+        "generic_executor_agent": _resolve_generic_executor_agent({"family_id": os.environ.get("FIRMWARE_FAMILY_ID", "")}),
         "executor_model": agent_defs["exec"].get("model"),
         "review_model": agent_defs["review"].get("model"),
-        "author_model": agent_defs["author"].get("model"),
         "cleanup_model": agent_defs["cleanup"].get("model"),
         "executor_extra_args": ["--append-system-prompt", str(prompt_paths["exec"])],
         "review_extra_args": ["--append-system-prompt", str(prompt_paths["review"])],
-        "author_extra_args": ["--append-system-prompt", str(prompt_paths["author"])],
         "cleanup_extra_args": ["--append-system-prompt", str(prompt_paths["cleanup"])],
     }
 
@@ -1125,21 +1140,23 @@ def _bridge_agentflow_events(
 def _archive_success_sample(log_dir: Path | None, record: Any, result: dict[str, Any], tokens: dict[str, Any]) -> str | None:
     if log_dir is None or result.get("status") != "success":
         return None
-    sample_dir = log_dir / "evolution_samples" / str(getattr(record, "id", "run"))
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(sample_dir / "manifest.json", {"result": result, "tokens": tokens, "node_attempts": result.get("node_attempts", {})})
-    for name in ("final_result.json", "stage1_preprocess.json", "stage2_skill_match.json", "stage3_skill_exec.json", "stage4_llm_fallback.json", "stage5_skill_generate.json"):
-        source = log_dir / name
-        if source.exists():
-            shutil.copy2(source, sample_dir / name)
+    archived = archive_success_sample(
+        task_id=str(result.get("task_id") or "run"),
+        project_id=str(result.get("project_id") or "") or None,
+        family_id=str(result.get("family_id") or "generic"),
+        run_id=str(getattr(record, "id", "run")),
+        run_dir=log_dir,
+        final_result=result,
+        tokens_summary=tokens,
+    )
     run_dir = log_dir / "agentflow" / "runs" / str(getattr(record, "id", ""))
     if run_dir.exists():
-        traces_dir = sample_dir / "traces"
+        traces_dir = archived.sample_dir / "traces"
         traces_dir.mkdir(exist_ok=True)
         for trace in run_dir.glob("artifacts/*/trace.jsonl"):
             target = traces_dir / f"{trace.parent.name}.trace.jsonl"
             shutil.copy2(trace, target)
-    return str(sample_dir)
+    return str(archived.sample_dir)
 
 
 def _json_output(text: str) -> dict[str, Any]:
@@ -1222,7 +1239,6 @@ def _write_v2_1_compat_artifacts(
     stage2_file = log_dir / "stage2_skill_match.json"
     stage3_file = log_dir / "stage3_skill_exec.json"
     stage4_file = log_dir / "stage4_llm_fallback.json"
-    stage5_file = log_dir / "stage5_skill_generate.json"
     final_result_file = log_dir / "final_result.json"
     summary_md = Path(output_path) / "summary.md"
     reason_md = Path(output_path) / "reason.md"
@@ -1231,7 +1247,6 @@ def _write_v2_1_compat_artifacts(
     _copy_if_exists(stage2_file if stage2_file.exists() else feature_match_file, round_zero / "skill_match.json")
     _copy_if_exists(stage3_file, round_zero / "skill_exec.json")
     _copy_if_exists(stage4_file, round_zero / "fallback.json")
-    _copy_if_exists(stage5_file, round_zero / "stage5_skill_generate.json")
     _copy_if_exists(summary_md, round_zero / "summary.md")
     _copy_if_exists(reason_md, round_zero / "reason.md")
 
@@ -1263,7 +1278,7 @@ def run_unpack_agentflow(
         if cancel_check and cancel_check():
             raise RuntimeError("__CANCELLED__")
 
-    def _build_ctx(log_dir: Path | None, temp_paths: dict[str, Path], exec_def: dict[str, Any], val_def: dict[str, Any], author_def: dict[str, Any], clean_def: dict[str, Any], features: dict[str, Any], skill_meta: dict[str, Any] | None, skill_score: int, skill_match: dict[str, Any]) -> dict[str, Any]:
+    def _build_ctx(log_dir: Path | None, temp_paths: dict[str, Path], exec_def: dict[str, Any], val_def: dict[str, Any], clean_def: dict[str, Any], features: dict[str, Any], skill_meta: dict[str, Any] | None, skill_score: int, skill_match: dict[str, Any]) -> dict[str, Any]:
         output_root = Path(output_path)
         task_root = output_root.parent if output_root.name == "output" else output_root.parent
         run_root = (log_dir or task_root / "run")
@@ -1290,15 +1305,14 @@ def run_unpack_agentflow(
             "graph_optimization_rounds": int(getattr(config.agentflow, "graph_optimization_rounds", 1) or 1),
             "preprocess_output_file": str(run_root / "preprocess.json"),
             "feature_match_output_file": str(run_root / "feature-match.json"),
-            "skill_author_output_file": str(run_root / "generated_skill.md"),
             "final_result_file": str(run_root / "final_result.json"),
+            "generic_executor_agent": _resolve_generic_executor_agent({"family_id": features.get("family_id")}),
+            "family_id": features.get("family_id"),
             "executor_model": exec_def.get("model"),
             "review_model": val_def.get("model"),
-            "author_model": author_def.get("model"),
             "cleanup_model": clean_def.get("model"),
             "executor_extra_args": ["--append-system-prompt", str(temp_paths["exec"])],
             "review_extra_args": ["--append-system-prompt", str(temp_paths["review"])],
-            "author_extra_args": ["--append-system-prompt", str(temp_paths["author"])],
             "cleanup_extra_args": ["--append-system-prompt", str(temp_paths["cleanup"])],
         }
 
@@ -1325,7 +1339,6 @@ def run_unpack_agentflow(
         for key, path in {
             "exec": EXEC_AGENT_DEF,
             "review": VAL_AGENT_DEF,
-            "author": AUTHOR_AGENT_DEF,
             "cleanup": CLEAN_AGENT_DEF,
         }.items():
             agent_def, temp_path = _load_agent_prompt_file(path)
@@ -1337,7 +1350,6 @@ def run_unpack_agentflow(
             temp_paths,
             agent_defs["exec"],
             agent_defs["review"],
-            agent_defs["author"],
             agent_defs["cleanup"],
             features,
             skill_meta,
@@ -1409,10 +1421,6 @@ def run_unpack_agentflow(
             skill_review = _node_output(current, "skill_reviewer")
             generic_output = _node_output(current, "generic_executor")
             generic_review = _node_output(current, "generic_reviewer")
-            author_output = _node_output(current, "skill_author")
-            author_output_file = Path(ctx.get("skill_author_output_file") or "")
-            if author_output_file.is_file():
-                author_output = author_output_file.read_text(encoding="utf-8", errors="replace")
 
             preprocess_passed = bool(_json_output(preprocess_output).get("success"))
             skill_status = _node_status(current, "skill_executor")
@@ -1449,7 +1457,6 @@ def run_unpack_agentflow(
             matched_skill = skill_meta
             fallback_to_llm = bool(skill_meta and not skill_passed)
             promotion_success_count = None
-            generated_skill = None
             pipeline_result = {}
             pipeline_final_result = Path(ctx.get("final_result_file") or "")
             if pipeline_final_result.is_file():
@@ -1472,17 +1479,6 @@ def run_unpack_agentflow(
                     matched_skill = updated_skill
                     promotion_success_count = updated_skill.get("promotion_success_count")
 
-            if passed and generic_passed and author_output.strip() and "SKIPPED" not in author_output:
-                generated_skill = save_candidate_skill(
-                    TOOLS_DIR,
-                    _extract_markdown_document(author_output),
-                    {
-                        "family_id": features["family_id"],
-                        "source_run_id": current.id,
-                        "source_node_id": "generic_executor",
-                    },
-                )
-
             result = {
                 "status": "success" if passed else "failed",
                 "message": (
@@ -1495,16 +1491,15 @@ def run_unpack_agentflow(
                 "matched_skill_version": matched_skill.get("skill_version") if matched_skill else None,
                 "matched_skill_score": skill_score if matched_skill else None,
                 "fallback_to_llm": fallback_to_llm,
-                "generated_skill_path": generated_skill.get("path") if generated_skill else None,
-                "generated_skill_status": generated_skill.get("skill_status") if generated_skill else None,
-                "promotion_success_count": (
-                    promotion_success_count
-                    if promotion_success_count is not None
-                    else generated_skill.get("promotion_success_count") if generated_skill else None
-                ),
+                "generated_skill_path": None,
+                "generated_skill_status": None,
+                "promotion_success_count": promotion_success_count,
                 "agentflow_run_id": current.id,
                 "agentflow_run_dir": str(run_store_dir / current.id),
                 "run_path": str(log_dir) if log_dir else None,
+                "family_id": features.get("family_id"),
+                "evolution_target_node": EVOLUTION_TARGET_NODE_GENERIC_EXECUTOR if generic_passed else None,
+                "evolution_source_run_id": current.id if generic_passed else None,
                 "node_attempts": node_attempts,
                 "failure_summary": failure_summary,
                 "failure_category": (
@@ -1555,16 +1550,6 @@ def run_unpack_agentflow(
                             "generic_executor": node_attempts.get("generic_executor"),
                             "generic_reviewer": node_attempts.get("generic_reviewer"),
                         },
-                    },
-                )
-                _write_json(
-                    log_dir / "stage5_skill_generate.json",
-                    {
-                        "generated_skill_path": generated_skill.get("path") if generated_skill else None,
-                        "generated_skill_status": generated_skill.get("skill_status") if generated_skill else None,
-                        "promotion_success_count": promotion_success_count,
-                        "source_run_id": current.id if generated_skill else None,
-                        "source_node_id": "generic_executor" if generated_skill else None,
                     },
                 )
                 _write_json(log_dir / "tokens_summary.json", tokens)

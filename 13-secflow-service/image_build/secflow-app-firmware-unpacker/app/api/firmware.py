@@ -16,7 +16,8 @@ from sqlalchemy.orm import load_only
 
 from app.api.dependencies import ensure_project_access, get_current_subject
 from app.exception import ForbiddenError, InternalError, NotFoundError, ValidationError
-from app.model import ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
+from app.evolution import evolution_archive_root, load_family_registry
+from app.model import EvolutionJob, ServiceConfig, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
 from app.schemas import (
     ActionResponse,
     BatchDeleteRequest,
@@ -651,6 +652,62 @@ def _get_task_logs(task_id: str, phase: Optional[str] = None) -> dict:
 def _get_task_events(task_id: str, limit: int) -> dict:
     _get_task_or_404(task_id)
     return list_task_events(task_id, limit=limit)
+
+
+def _get_task_evolution(task_id: str) -> dict:
+    task = _get_task_or_404(task_id)
+    db = get_db_session()
+    try:
+        job = None
+        job_id = str(task.get("evolution_job_id") or "").strip()
+        if job_id:
+            row = db.query(EvolutionJob).filter(EvolutionJob.id == job_id).first()
+            job = row.to_dict() if row is not None else None
+    finally:
+        db.close()
+    return {
+        "task_id": task_id,
+        "status": str(task.get("evolution_status") or "").strip() or None,
+        "error": str(task.get("evolution_error") or "").strip() or None,
+        "job_id": str(task.get("evolution_job_id") or "").strip() or None,
+        "started_at": str(task.get("evolution_started_at") or "").strip() or None,
+        "completed_at": str(task.get("evolution_completed_at") or "").strip() or None,
+        "target_node": str(task.get("evolution_target_node") or "").strip() or None,
+        "source_run_id": str(task.get("evolution_source_run_id") or "").strip() or None,
+        "tuned_agent_path": str(task.get("tuned_agent_path") or "").strip() or None,
+        "tuned_agent_status": str(task.get("tuned_agent_status") or "").strip() or None,
+        "tuned_agent_version": str(task.get("tuned_agent_version") or "").strip() or None,
+        "job": job,
+    }
+
+
+def _list_evolution_jobs(limit: int, offset: int) -> dict:
+    db = get_db_session()
+    try:
+        query = db.query(EvolutionJob).order_by(EvolutionJob.created_at.desc())
+        total = query.count()
+        items = query.offset(offset).limit(limit).all()
+        return {
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "items": [item.to_dict() for item in items],
+        }
+    finally:
+        db.close()
+
+
+def _list_tuned_agents() -> dict:
+    registry = load_family_registry(evolution_archive_root())
+    items: list[dict] = []
+    for target_node, family_map in (registry.get("targets") or {}).items():
+        if not isinstance(family_map, dict):
+            continue
+        for record in family_map.values():
+            if isinstance(record, dict):
+                items.append(record)
+    items.sort(key=lambda item: (str(item.get("target_node") or ""), str(item.get("family_id") or "")))
+    return {"total": len(items), "items": items}
 
 
 def _count_task_events(task_id: str) -> int:
@@ -1455,6 +1512,16 @@ def _get_task_result(task_id: str) -> dict:
             "skill_generation_job_id": str(task.get("skill_generation_job_id") or "").strip() or None,
             "skill_generation_started_at": str(task.get("skill_generation_started_at") or "").strip() or None,
             "skill_generation_completed_at": str(task.get("skill_generation_completed_at") or "").strip() or None,
+            "evolution_status": str(task.get("evolution_status") or "").strip() or None,
+            "evolution_error": str(task.get("evolution_error") or "").strip() or None,
+            "evolution_job_id": str(task.get("evolution_job_id") or "").strip() or None,
+            "evolution_started_at": str(task.get("evolution_started_at") or "").strip() or None,
+            "evolution_completed_at": str(task.get("evolution_completed_at") or "").strip() or None,
+            "evolution_target_node": str(task.get("evolution_target_node") or "").strip() or None,
+            "evolution_source_run_id": str(task.get("evolution_source_run_id") or "").strip() or None,
+            "tuned_agent_path": str(task.get("tuned_agent_path") or "").strip() or None,
+            "tuned_agent_status": str(task.get("tuned_agent_status") or "").strip() or None,
+            "tuned_agent_version": str(task.get("tuned_agent_version") or "").strip() or None,
             "executor_rounds": int(task.get("rounds") or 0),
             "session_count": session_count,
             "event_count": event_count,
@@ -1573,6 +1640,16 @@ def _list_tasks(
                     UnpackTask.skill_generation_job_id,
                     UnpackTask.skill_generation_started_at,
                     UnpackTask.skill_generation_completed_at,
+                    UnpackTask.evolution_status,
+                    UnpackTask.evolution_error,
+                    UnpackTask.evolution_job_id,
+                    UnpackTask.evolution_started_at,
+                    UnpackTask.evolution_completed_at,
+                    UnpackTask.evolution_target_node,
+                    UnpackTask.evolution_source_run_id,
+                    UnpackTask.tuned_agent_path,
+                    UnpackTask.tuned_agent_status,
+                    UnpackTask.tuned_agent_version,
                     UnpackTask.created_at,
                     UnpackTask.started_at,
                     UnpackTask.completed_at,
@@ -1892,6 +1969,20 @@ async def get_project_task_result(
     return _get_task_result(task_id)
 
 
+@router.get("/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/evolution")
+async def get_project_task_evolution(
+    project_id: str,
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await ensure_project_access(project_id, token)
+    task = _get_task_or_404(task_id)
+    if _normalize_project_id(task.get("project_id")) != project_id:
+        raise NotFoundError("任务", task_id)
+    return _get_task_evolution(task_id)
+
+
 @router.get(
     "/api/app/firmware-unpacker/projects/{project_id}/tasks/{task_id}/metrics",
     response_model=TaskMetricsResponse,
@@ -1999,6 +2090,16 @@ async def get_task_legacy(
     return await _get_task_with_access(task_id, token)
 
 
+@router.get("/api/app/firmware-unpacker/tasks/{task_id}/evolution")
+async def get_task_evolution_legacy(
+    task_id: str,
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    _, token = subject_and_token
+    await _get_task_with_access(task_id, token)
+    return _get_task_evolution(task_id)
+
+
 @router.get(
     "/api/app/firmware-unpacker/tasks/{task_id}/resource-usage",
     response_model=TaskResourceUsageResponse,
@@ -2063,6 +2164,22 @@ async def get_task_metrics_legacy(
     _, token = subject_and_token
     await _get_task_with_access(task_id, token)
     return _get_task_metrics(task_id)
+
+
+@router.get("/api/app/firmware-unpacker/evolution/jobs")
+async def list_evolution_jobs_legacy(
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _list_evolution_jobs(limit, offset)
+
+
+@router.get("/api/app/firmware-unpacker/evolution/tuned-agents")
+async def list_tuned_agents_legacy(
+    subject_and_token: tuple[dict, str] = Depends(get_current_subject),
+):
+    return _list_tuned_agents()
 
 
 @router.post(
