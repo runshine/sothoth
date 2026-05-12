@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import os
 import posixpath
+import re
 import shutil
 import shlex
 import signal
@@ -55,19 +57,36 @@ from app.schemas import (
 )
 from app.services.fileserver_client import get_fileserver_client
 from app.services.llm_provider_sync import sync_providers_to_pi
-from app.services.run_index_service import get_run_index_service
+from app.services.run_index_service import (
+    _load_externalized_json_payload,
+    _load_externalized_mapping_payload,
+    get_run_index_service,
+)
 from app.services.pi_vuln_adapter import (
     DbExecutionObserver,
     DbExecutionRecorder,
     build_core_tasks,
     write_final_task_manifest,
 )
+from app.services.vuln_reporter import get_task_vuln_report_status, get_vuln_report_service
 from app.services.workflow_service import get_workflow_service
 from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 
 
+logger = logging.getLogger("dataflow_vuln.execution")
+
+
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:20]}"
+
+
+def _sanitize_dataflow_run_name(value: str) -> str:
+    cleaned = re.sub(r"\s+", "-", str(value or "").strip())
+    cleaned = re.sub(r"[\\/:\0]+", "-", cleaned)
+    cleaned = re.sub(r"[^\w.-]+", "-", cleaned, flags=re.UNICODE).strip("-.")
+    if cleaned in {"", ".", ".."}:
+        return "item"
+    return cleaned
 
 
 def _principal_id(principal: dict) -> str:
@@ -271,7 +290,7 @@ class ExecutionService:
             profile_id=(trigger.profile_id if trigger else None),
         )
 
-    def _scan_task_response(self, db: Session, trigger: TriggerTask) -> ScanTaskResponse:
+    def _scan_task_response(self, db: Session, trigger: TriggerTask, *, include_run_summary: bool = True) -> ScanTaskResponse:
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
         if trigger.workflow_definition_version_id:
             version = self._definition_version_or_404(db, trigger.workflow_definition_version_id)
@@ -286,8 +305,94 @@ class ExecutionService:
             if task_origin_type == "binary_security"
             else "手动任务"
         )
+        def _version_review_profile() -> str:
+            version_config = version.compiled_config_json or version.definition_json or {}
+            for workflow in ((version_config.get("workflows") or {}).get("atomic") or []):
+                if not isinstance(workflow, dict):
+                    continue
+                engine = workflow.get("engine")
+                if isinstance(engine, dict) and (engine.get("review_profile") or workflow.get("id") == "vuln_scan"):
+                    return str(engine.get("review_profile") or "")
+            return ""
+
         run_locator = self._run_locator_for_execution(latest_execution, trigger)
-        run_summary = self._latest_run_summary_for_execution(db, latest_execution, trigger)
+        if include_run_summary:
+            run_summary = self._latest_run_summary_for_execution(db, latest_execution, trigger)
+        else:
+            run_summary = {}
+            if latest_execution is not None:
+                lightweight_run_index = (
+                    db.query(RunIndex)
+                    .filter(RunIndex.linked_execution_id == latest_execution.id)
+                    .first()
+                )
+                if lightweight_run_index is None:
+                    lightweight_run_index = (
+                        db.query(RunIndex)
+                        .filter(RunIndex.linked_task_id == trigger.id)
+                        .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+                        .first()
+                    )
+                if lightweight_run_index is not None:
+                    config_json = _load_externalized_mapping_payload(
+                        lightweight_run_index.run_root_path,
+                        lightweight_run_index.config_json,
+                    )
+                    review_profile = str(config_json.get("review_profile") or "")
+                    for workflow in ((config_json.get("workflows") or {}).get("atomic") or []):
+                        if not isinstance(workflow, dict):
+                            continue
+                        engine = workflow.get("engine")
+                        if isinstance(engine, dict) and (engine.get("review_profile") or workflow.get("id") == "vuln_scan"):
+                            review_profile = str(engine.get("review_profile") or "")
+                            break
+                    if not review_profile:
+                        review_profile = _version_review_profile()
+                    run_summary.update({
+                        "run_id": lightweight_run_index.id,
+                        "status": lightweight_run_index.status,
+                        "model": lightweight_run_index.model,
+                        "provider": lightweight_run_index.provider,
+                        "thinking": lightweight_run_index.thinking,
+                        "max_cycles": lightweight_run_index.max_cycles,
+                        "cycles_used": lightweight_run_index.cycles_used,
+                        "result_count": lightweight_run_index.result_count,
+                        "passed_count": lightweight_run_index.passed_count,
+                        "failed_count": lightweight_run_index.failed_count,
+                        "workflow_mode": lightweight_run_index.workflow_mode,
+                        "review_profile": review_profile,
+                        "process_state": self._run_process_state(
+                            db,
+                            lightweight_run_index,
+                            trigger=trigger,
+                            execution=latest_execution,
+                        ),
+                    })
+        if run_summary and "process_state" not in run_summary:
+            run_index_for_state = None
+            run_index_id = str(run_summary.get("run_id") or "").strip()
+            if run_index_id:
+                run_index_for_state = db.get(RunIndex, run_index_id)
+            if run_index_for_state is None and latest_execution is not None:
+                run_index_for_state = (
+                    db.query(RunIndex)
+                    .filter(RunIndex.linked_execution_id == latest_execution.id)
+                    .first()
+                )
+            if run_index_for_state is None:
+                run_index_for_state = (
+                    db.query(RunIndex)
+                    .filter(RunIndex.linked_task_id == trigger.id)
+                    .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+                    .first()
+                )
+            if run_index_for_state is not None:
+                run_summary["process_state"] = self._run_process_state(
+                    db,
+                    run_index_for_state,
+                    trigger=trigger,
+                    execution=latest_execution,
+                )
         if run_locator["run_name"] and run_locator["runs_root"]:
             run_summary = {
                 "name": run_locator["run_name"],
@@ -328,6 +433,14 @@ class ExecutionService:
             run_path=run_locator["run_path"],
             run=run_summary,
             latest_run=run_summary,
+            auto_report_vulnerabilities=bool(
+                self._trigger_task_metadata(trigger).get("auto_report_vulnerabilities", True)
+            ),
+            vuln_report_status=get_task_vuln_report_status(
+                db,
+                trigger,
+                latest_execution.id if latest_execution else None,
+            ),
         )
 
     def _scan_task_detail(self, db: Session, trigger: TriggerTask) -> ScanTaskDetailResponse:
@@ -449,9 +562,10 @@ class ExecutionService:
 
     def _process_heartbeat_stale_after_seconds(self) -> int:
         cfg = get_config()
+        configured_seconds = max(int(getattr(cfg.service, "process_heartbeat_stale_after_seconds", 0) or 0), 0)
         scheduler_seconds = max(int(getattr(cfg.scheduler, "heartbeat_interval_seconds", 0) or 0) * 3, 0)
         cancel_poll_seconds = max(int(getattr(cfg.service, "execution_cancel_check_interval_seconds", 0) or 0) * 5, 0)
-        return max(scheduler_seconds, cancel_poll_seconds, 30)
+        return max(configured_seconds, scheduler_seconds, cancel_poll_seconds, 30)
 
     def _parse_process_timestamp(self, value: Any) -> datetime | None:
         text = str(value or "").strip()
@@ -513,6 +627,35 @@ class ExecutionService:
             payload["return_code"] = return_code
         write_json(Path(execution.workspace_root) / "run" / "_meta" / "process.json", payload)
 
+    def _try_write_cli_process_file(
+        self,
+        *,
+        execution: WorkflowExecution,
+        trigger: TriggerTask,
+        cmd: list[str],
+        process: subprocess.Popen,
+        status_text: str,
+        return_code: int | None = None,
+    ) -> bool:
+        try:
+            self._write_cli_process_file(
+                execution=execution,
+                trigger=trigger,
+                cmd=cmd,
+                process=process,
+                status_text=status_text,
+                return_code=return_code,
+            )
+            return True
+        except OSError as exc:
+            logger.warning(
+                "run process metadata write failed; child process will continue: execution_id=%s status=%s error=%s",
+                execution.id,
+                status_text,
+                exc,
+            )
+            return False
+
     def _resume_command_payload_from_plan(self, *, plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
         argv, _ = self._build_dataflow_cli_argv(
             plan=plan,
@@ -567,7 +710,7 @@ class ExecutionService:
         process_payload = self._read_run_process_file(run_index.run_root_path)
         if process_payload:
             candidates.append(process_payload)
-        raw_summary = dict(run_index.raw_summary_json or {})
+        raw_summary = dict(_load_externalized_json_payload(run_index.run_root_path, run_index.raw_summary_json) or {})
         raw_cli = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
         if raw_cli:
             candidates.append(dict(raw_cli))
@@ -934,13 +1077,12 @@ class ExecutionService:
         runs_root: Path,
         execution_id: str,
         requested_run_name: str | None = None,
-        task_id: str | None = None,
     ) -> str:
-        requested = str(task_id or requested_run_name or "").strip()
+        requested = str(requested_run_name or "").strip()
         if requested:
-            base_name = sanitize_name(requested)
+            base_name = _sanitize_dataflow_run_name(requested)
         else:
-            base_name = f"{sanitize_name(data_flow_path.stem)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            base_name = f"{_sanitize_dataflow_run_name(data_flow_path.stem)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         run_name = base_name or f"dataflow_vuln_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         if not (runs_root / run_name).exists():
             return run_name
@@ -1013,7 +1155,6 @@ class ExecutionService:
             runs_root=runs_root,
             execution_id=execution_id,
             requested_run_name=options.get("run_name"),
-            task_id=request.get("task_id"),
         )
         run_dir = runs_root / run_name
         task_md_path = run_dir / "run" / "input" / "task.md"
@@ -1127,13 +1268,18 @@ class ExecutionService:
         model = str(config_payload.get("model") or request.get("model") or "").strip()
         review_profile = str(config_payload.get("review_profile") or request.get("review_profile") or "balanced").strip() or "balanced"
         max_cycles = first_present_int(config_payload.get("max_review_cycles"), request.get("max_review_cycles"), default=0)
-        agent_run_timeout_seconds = first_present_int(config_payload.get("agent_run_timeout_seconds"), request.get("agent_run_timeout_seconds"), default=3600)
         agent_timeout_retry_enabled = request.get("agent_timeout_retry_enabled")
         if agent_timeout_retry_enabled is None:
             agent_timeout_retry_enabled = config_payload.get("agent_timeout_retry_enabled", True)
         agent_timeout_retry_enabled = bool(agent_timeout_retry_enabled)
-        agent_timeout_max_retries = first_present_int(config_payload.get("agent_timeout_max_retries"), request.get("agent_timeout_max_retries"), default=3)
-        timeout_max_retries = max(agent_timeout_max_retries + 1, 1) if agent_timeout_retry_enabled else 1
+        configured_timeout_max_retries = first_present_int(
+            request.get("timeout_max_retries"),
+            config_payload.get("timeout_max_retries"),
+            request.get("agent_timeout_max_retries"),
+            config_payload.get("agent_timeout_max_retries"),
+            default=3,
+        )
+        timeout_max_retries = max(configured_timeout_max_retries, 1) if agent_timeout_retry_enabled else 1
         timeout_retry_interval_seconds = first_present_int(config_payload.get("timeout_retry_interval_seconds"), request.get("timeout_retry_interval_seconds"), default=30)
         result_review_concurrency = first_present_int(config_payload.get("result_review_concurrency"), request.get("result_review_concurrency"), default=3)
 
@@ -1146,8 +1292,6 @@ class ExecutionService:
 
                 json.dump(json_payload, handle, ensure_ascii=False, indent=2)
             argv.extend(["--config", temp_config_path])
-            argv.extend(["--worker-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
-            argv.extend(["--advisor-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
             argv.extend(["--timeout-max-retries", str(max(timeout_max_retries, 1))])
             argv.extend(["--timeout-retry-interval-seconds", str(max(timeout_retry_interval_seconds, 0))])
             return argv, temp_config_path
@@ -1156,8 +1300,6 @@ class ExecutionService:
             argv.extend(["--model", model])
         if max_cycles > 0:
             argv.extend(["--max-cycles", str(max_cycles)])
-        argv.extend(["--worker-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
-        argv.extend(["--advisor-timeout", str(agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600)])
         argv.extend(["--timeout-max-retries", str(max(timeout_max_retries, 1))])
         argv.extend(["--timeout-retry-interval-seconds", str(max(timeout_retry_interval_seconds, 0))])
         argv.extend(["--result-review-concurrency", str(max(result_review_concurrency, 1))])
@@ -1407,8 +1549,6 @@ class ExecutionService:
         execution.finished_at = now
         execution.output_manifest_path = output_manifest_path
         execution.output_task_count = output_task_count
-        execution.lease_token = None
-        execution.lease_expires_at = None
         execution.current_stage_id = None
         if execution.process_status in {"running", "stop_requested", "delete_requested"}:
             execution.process_status = "exited"
@@ -1598,6 +1738,9 @@ class ExecutionService:
             }
         metadata["dataflow_cli"] = plan
         self._write_dataflow_cli_task_preview(plan)
+        if not str(metadata.get("task_title") or "").strip():
+            metadata["task_title"] = plan["run_name"]
+            task.title = plan["run_name"]
         task.task_md_path = plan["task_md_path"]
         task.metadata = metadata
         trigger.input_tasks_json = TaskManifest(tasks=[task, *manifest.tasks[1:]]).model_dump(mode="json")
@@ -1665,7 +1808,7 @@ class ExecutionService:
                 TaskItem(
                     task_id=_new_id("task"),
                     task_type="dataflow_vuln_scan_cli",
-                    title=payload.title,
+                    title=str(payload.title or "").strip() or "Pending dataflow vulnerability scan",
                     task_md_path=abs_path(self._default_dataflow_cli_runs_root(definition.project_id) / "_pending" / trigger.id / "task.md"),
                     metadata=metadata,
                     upstream_refs=[],
@@ -1712,8 +1855,10 @@ class ExecutionService:
 
     def _adopted_run_index_task_status(self, status_text: str | None) -> str:
         value = str(status_text or "").strip().lower()
-        if value in {"pending", "queued", "running", "cancel_requested", "delete_requested", "failed", "cancelled", "orphaned"}:
+        if value in {"pending", "queued", "running", "cancel_requested", "delete_requested", "failed", "cancelled"}:
             return value
+        if value == "orphaned":
+            return "failed"
         if value in {"completed", "succeeded", "success", "passed"}:
             return "succeeded"
         if value in {"interrupted", "stopped"}:
@@ -1949,11 +2094,12 @@ class ExecutionService:
             runtime_overrides=payload.runtime_overrides,
             config_payload_overrides={key: value for key, value in config_payload_overrides.items() if value is not None},
         )
+        requested_title = str(payload.title or "").strip()
         metadata = {
             "artifact_refs": [item.model_dump(mode="json") for item in payload.artifact_refs],
             "task_input_uploads": self._artifact_uploads_from_refs(payload.artifact_refs),
             "runtime_overrides": payload.runtime_overrides,
-            "task_title": payload.title,
+            "task_title": requested_title,
             "task_origin_type": str(payload.task_origin_type or "").strip() or "manual",
             "parent_project_id": payload.parent_project_id,
             "parent_task_id": payload.parent_task_id,
@@ -1961,11 +2107,12 @@ class ExecutionService:
             "parent_stage_name": payload.parent_stage_name,
             "parent_stage_item_id": payload.parent_stage_item_id,
             "parent_stage_item_key": payload.parent_stage_item_key,
+            "auto_report_vulnerabilities": bool(payload.auto_report_vulnerabilities),
         }
         if payload.data_flow and payload.source_dir:
             scan_options = dict(payload.scan_options or {})
-            if str(payload.title or "").strip():
-                scan_options.setdefault("run_name", str(payload.title).strip())
+            if requested_title:
+                scan_options.setdefault("run_name", requested_title)
             metadata["dataflow_scan_request"] = {
                 "launcher": "run_vuln_scan.py",
                 "project_id": payload.project_id,
@@ -2005,7 +2152,7 @@ class ExecutionService:
                 input_tasks=[
                     TriggerTaskInputTask(
                         task_id=_new_id("task"),
-                        title=payload.title,
+                        title=requested_title or f"Task {datetime.now().strftime('%Y%m%d_%H%M%S')}",
                         task_markdown=payload.task_markdown,
                         metadata=metadata,
                         upstream_refs=[],
@@ -2064,7 +2211,12 @@ class ExecutionService:
             query = query.filter(TriggerTask.profile_id == profile_id)
         safe_limit = max(1, min(int(limit or 100), 500))
         safe_offset = max(0, int(offset or 0))
-        return [self._scan_task_response(db, item) for item in query.offset(safe_offset).limit(safe_limit).all()]
+        # Keep list rendering lightweight.  Full run indexing / filesystem
+        # inspection can be expensive on NFS and previously made the async API
+        # worker miss health probes under task-list load, producing nginx 502s.
+        # The list only needs the run locator; detail/run endpoints hydrate the
+        # full run summary on demand.
+        return [self._scan_task_response(db, item, include_run_summary=False) for item in query.offset(safe_offset).limit(safe_limit).all()]
 
     def get_scan_task(self, db: Session, task_id: str, principal: dict) -> ScanTaskDetailResponse:
         trigger = self._trigger_or_404(db, task_id)
@@ -2154,6 +2306,41 @@ class ExecutionService:
         payload = get_run_index_service().get_run_detail(db, run_index)
         db.refresh(run_index)
         return self._enrich_run_payload(db, run_index, payload)
+
+    def report_run_vulnerabilities(
+        self,
+        db: Session,
+        run_index_id: str,
+        principal: dict,
+        result_files: list[str],
+    ) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        trigger, execution = self._linked_run_index_runtime(db, run_index)
+        if trigger is None or execution is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="run is not linked to a managed scan task")
+        selected = [str(item or "").strip() for item in result_files if str(item or "").strip()]
+        if not selected:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="result_files must not be empty")
+        try:
+            report_status = get_vuln_report_service().report_run_results(
+                db,
+                trigger=trigger,
+                execution=execution,
+                run_index=run_index,
+                result_files=selected,
+            )
+        except Exception as exc:
+            db.rollback()
+            report_status = {"status": "failed", "enabled": True, "error": str(exc), "items": []}
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="vuln_report_manual",
+            message=f"manual vulnerability suspicion report {report_status.get('status', 'unknown')}",
+            level="warning" if report_status.get("status") in {"failed", "partial_failed"} else "info",
+            payload_json={**report_status, "result_files": selected},
+        )
+        return report_status
 
     def get_run_cycle(self, db: Session, run_index_id: str, cycle: int, principal: dict) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
@@ -2278,6 +2465,10 @@ class ExecutionService:
                     {
                         "can_retry": True,
                         "is_running": False,
+                        "stale": True,
+                        "display_status": "runtime_lost",
+                        "display_label": "运行失联",
+                        "severity": "warning",
                         "reason": "旧运行记录仍标记 active，但进程心跳已过期，可以通过 resume 重试",
                         "source": "stale_process_heartbeat",
                     }
@@ -2289,6 +2480,10 @@ class ExecutionService:
                 {
                     "can_retry": True,
                     "is_running": False,
+                    "stale": True,
+                    "display_status": "runtime_lost",
+                    "display_label": "运行失联",
+                    "severity": "warning",
                     "reason": "旧运行记录仍标记 active，但未发现本地进程或有效心跳，可以通过 resume 重试",
                     "source": "stale_active_record",
                 }
@@ -2320,8 +2515,6 @@ class ExecutionService:
             execution.finished_at = now
             execution.process_status = "exited"
             execution.process_finished_at = now
-            execution.lease_token = None
-            execution.lease_expires_at = None
             db.add(execution)
         if trigger is not None and self._run_index_status_is_active(trigger.status):
             trigger.status = "failed"
@@ -2366,6 +2559,15 @@ class ExecutionService:
                 checkpoint_phase=plan.checkpoint_phase,
                 checkpoint_step_key=plan.checkpoint_step_key,
                 checkpoint_status=plan.checkpoint_status,
+                resume_cursor=plan.resume_cursor,
+                resume_start_cycle=plan.resume_start_cycle,
+                resume_target_node={
+                    "cycle": int((plan.resume_cursor or {}).get("cycle") or 0),
+                    "phase": plan.resume_target_phase,
+                    "step_key": plan.resume_target_step_key,
+                    "node_kind": str((plan.resume_cursor or {}).get("node_kind") or ""),
+                } if plan.resume_target_phase else None,
+                node_resume_policy=plan.node_resume_policy,
                 model_display=launcher._format_model_display(display_model),  # type: ignore[attr-defined]
                 thinking=display_thinking,
                 task_file=plan.task_file,
@@ -2377,7 +2579,16 @@ class ExecutionService:
                 "current_status": plan.current_status,
                 "completed_cycles": plan.completed_cycles,
                 "extra_cycles": payload.extra_cycles,
-                "resume_total_cycle_limit": plan.completed_cycles + payload.extra_cycles,
+                "resume_start_cycle": plan.resume_start_cycle,
+                "resume_total_cycle_limit": max(plan.completed_cycles, plan.resume_start_cycle) + payload.extra_cycles,
+                "resume_cursor": plan.resume_cursor,
+                "resume_target_node": {
+                    "cycle": int((plan.resume_cursor or {}).get("cycle") or 0),
+                    "phase": plan.resume_target_phase,
+                    "step_key": plan.resume_target_step_key,
+                    "node_kind": str((plan.resume_cursor or {}).get("node_kind") or ""),
+                } if plan.resume_target_phase else None,
+                "node_resume_policy": plan.node_resume_policy,
             }
         except HTTPException:
             raise
@@ -2431,10 +2642,12 @@ class ExecutionService:
         process_pid = execution.process_pid if execution is not None else None
         process_host = execution.process_host if execution is not None else None
         if execution is None and self._run_index_status_is_active(run_index.status):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="active run is not linked to a managed execution; adopt/link it before deleting",
-            )
+            process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+            if process_state.get("is_running"):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="active run is not linked to a managed execution and still appears to be running; retry delete after it stops",
+                )
         if execution is not None and execution.status == "pending":
             execution.status = "cancelled"
             execution.finished_at = now_local()
@@ -2467,12 +2680,54 @@ class ExecutionService:
             db.commit()
             stop_payload = self._signal_local_cli_process(execution.id, wait=True)
             process_pid = stop_payload.get("pid") or process_pid
-            stopped = self._wait_until_execution_inactive(db, execution.id, timeout_seconds=45)
-            if not stopped:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="run deletion requested but run_vuln_scan.py is still stopping; retry delete shortly",
-                )
+            if stop_payload.get("exit_code") is not None or stop_payload.get("signal") == "already_exited":
+                if trigger is not None:
+                    self._set_terminal_state(
+                        db,
+                        execution=execution,
+                        trigger=trigger,
+                        execution_status="cancelled",
+                        message="run_vuln_scan.py stopped for delete",
+                    )
+                else:
+                    execution.status = "cancelled"
+                    execution.message = "run_vuln_scan.py stopped for delete"
+                    execution.finished_at = now_local()
+                    execution.process_status = "exited"
+                    execution.process_finished_at = now_local()
+                    db.add(execution)
+                db.commit()
+            else:
+                stopped = self._wait_until_execution_inactive(db, execution.id, timeout_seconds=45)
+                if not stopped:
+                    db.expire_all()
+                    run_index = db.get(type(run_index), run_index_id)
+                    if run_index is None:
+                        return self._run_mutation_response(
+                            run_id=run_index_id,
+                            project_id=project_id,
+                            status_text="deleted",
+                            message=f"Run {run_name} deleted",
+                            linked_task_id=linked_task_id,
+                            linked_execution_id=linked_execution_id,
+                            process_pid=process_pid,
+                            process_host=process_host,
+                            process_signal=stop_payload.get("signal"),
+                        )
+                    trigger, execution = self._linked_run_index_runtime(db, run_index)
+                    process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+                    if process_state.get("is_running"):
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="run deletion requested but run_vuln_scan.py is still stopping; retry delete shortly",
+                        )
+                    self._mark_stale_runtime_exited(
+                        db,
+                        trigger=trigger,
+                        execution=execution,
+                        message="stale delete_requested run assumed stopped during delete",
+                    )
+                    db.commit()
             db.expire_all()
             run_index = db.get(type(run_index), run_index_id)
             if run_index is None:
@@ -2739,7 +2994,7 @@ class ExecutionService:
         self.record_event(
             db,
             execution_id=execution.id,
-            event_type="execution_requeued",
+            event_type="run_resume_queued",
             message="manual run resume requested",
             payload_json={
                 "run_id": run_index.id,
@@ -2836,67 +3091,6 @@ class ExecutionService:
                 shutil.rmtree(path, ignore_errors=True)
         return {"success": True, "message": "task deleted"}
 
-    def _create_retry_attempt_for_task(
-        self,
-        db: Session,
-        *,
-        trigger: TriggerTask,
-        principal: dict,
-        authorization_token: str | None,
-        recovery_reason: str,
-        increment_retry_count: bool,
-    ) -> ScanTaskResponse:
-        definition = self._definition_or_404(db, trigger.workflow_definition_id)
-        version = self._definition_version_or_404(db, trigger.workflow_definition_version_id)
-        actor = _principal_id(principal)
-        if increment_retry_count:
-            trigger.retry_count += 1
-        manifest = TaskManifest.model_validate(trigger.input_tasks_json)
-        metadata = dict(manifest.tasks[0].metadata or {}) if manifest.tasks else {}
-        if self._is_dataflow_cli_task_metadata(metadata):
-            execution = self._create_dataflow_cli_execution_attempt(
-                db,
-                trigger=trigger,
-                definition=definition,
-                definition_version=version,
-                actor=actor,
-                recovery_reason=recovery_reason,
-            )
-        else:
-            execution = self._create_execution_attempt(
-                db,
-                trigger=trigger,
-                definition=definition,
-                definition_version=version,
-                actor=actor,
-                authorization_token=authorization_token,
-                recovery_reason=recovery_reason,
-            )
-        db.commit()
-        db.refresh(trigger)
-        self.record_event(
-            db,
-            execution_id=execution.id,
-            event_type="execution_requeued",
-            message=recovery_reason,
-            payload_json={"task_id": trigger.id, "attempt_no": execution.attempt_no},
-        )
-        return self._scan_task_response(db, trigger)
-
-    def retry_scan_task(self, db: Session, task_id: str, principal: dict, *, authorization_token: str | None = None) -> ScanTaskResponse:
-        trigger = self._trigger_or_404(db, task_id)
-        self._ensure_project_access(principal, trigger.project_id)
-        if trigger.status not in {"failed", "cancelled"}:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task is not retryable")
-        return self._create_retry_attempt_for_task(
-            db,
-            trigger=trigger,
-            principal=principal,
-            authorization_token=authorization_token,
-            recovery_reason="manual retry requested",
-            increment_retry_count=False,
-        )
-
     def update_scan_task_priority(self, db: Session, task_id: str, principal: dict, priority: int) -> ScanTaskResponse:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
@@ -2943,7 +3137,6 @@ class ExecutionService:
         db: Session,
         execution: WorkflowExecution,
         trigger: TriggerTask,
-        execution_timeout_seconds: int | None = None,
     ) -> int:
         if os.environ.get("SECFLOW_DATAFLOW_CLI_IN_PROCESS") == "1":
             import run_vuln_scan
@@ -2971,7 +3164,7 @@ class ExecutionService:
         execution.process_finished_at = None
         db.add(execution)
         db.commit()
-        self._write_cli_process_file(
+        self._try_write_cli_process_file(
             execution=execution,
             trigger=trigger,
             cmd=cmd,
@@ -2991,11 +3184,9 @@ class ExecutionService:
             },
         )
         try:
-            started_monotonic = time.monotonic()
-            timeout_seconds = int(execution_timeout_seconds or 0)
             while process.poll() is None:
                 time.sleep(max(1, int(get_config().service.execution_cancel_check_interval_seconds)))
-                self._write_cli_process_file(
+                self._try_write_cli_process_file(
                     execution=execution,
                     trigger=trigger,
                     cmd=cmd,
@@ -3004,40 +3195,11 @@ class ExecutionService:
                 )
                 db.expire(execution)
                 db.expire(trigger)
-                if timeout_seconds > 0 and time.monotonic() - started_monotonic >= timeout_seconds:
-                    execution.process_status = "timeout_requested"
-                    execution.message = f"execution timeout exceeded ({timeout_seconds}s)"
-                    trigger.message = execution.message
-                    db.add(execution)
-                    db.add(trigger)
-                    db.commit()
-                    self._write_run_control_state(execution.workspace_root, status_text="timeout_requested", message=execution.message)
-                    self._write_cli_process_file(
-                        execution=execution,
-                        trigger=trigger,
-                        cmd=cmd,
-                        process=process,
-                        status_text="timeout_requested",
-                    )
-                    try:
-                        process.send_signal(signal.SIGINT)
-                    except ProcessLookupError:
-                        return 124
-                    try:
-                        process.wait(timeout=30)
-                    except subprocess.TimeoutExpired:
-                        process.terminate()
-                        try:
-                            process.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            process.kill()
-                            process.wait()
-                    return 124
                 if execution.status in {"cancel_requested", "delete_requested"} or trigger.status in {"cancel_requested", "delete_requested"}:
                     execution.process_status = "delete_requested" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "stop_requested"
                     db.add(execution)
                     db.commit()
-                    self._write_cli_process_file(
+                    self._try_write_cli_process_file(
                         execution=execution,
                         trigger=trigger,
                         cmd=cmd,
@@ -3067,7 +3229,7 @@ class ExecutionService:
                 execution.process_finished_at = now_local()
                 db.add(execution)
                 db.commit()
-                self._write_cli_process_file(
+                self._try_write_cli_process_file(
                     execution=execution,
                     trigger=trigger,
                     cmd=cmd,
@@ -3173,7 +3335,7 @@ class ExecutionService:
                 message = "run_vuln_scan.py stopped for delete" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "run_vuln_scan.py cancelled"
             elif exit_code == 124:
                 terminal_status = "failed"
-                message = f"execution timeout exceeded ({definition.execution_timeout_seconds}s)"
+                message = "run_vuln_scan.py exited with timeout code 124"
             else:
                 terminal_status = "failed"
                 message = f"run_vuln_scan.py failed with exit code {exit_code}"
@@ -3189,6 +3351,27 @@ class ExecutionService:
             db.commit()
             get_run_index_service().sync_execution_run(db, execution)
             db.commit()
+            report_status = {}
+            if terminal_status == "succeeded":
+                try:
+                    run_index = get_run_index_service().get_run_index_by_execution(db, execution)
+                    report_status = get_vuln_report_service().report_execution_results(
+                        db,
+                        trigger=trigger,
+                        execution=execution,
+                        run_index=run_index,
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    report_status = {"status": "failed", "enabled": True, "error": str(exc)}
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="vuln_report_finished",
+                    message=f"vulnerability suspicion auto-report {report_status.get('status', 'unknown')}",
+                    level="warning" if report_status.get("status") in {"failed", "partial_failed"} else "info",
+                    payload_json=report_status,
+                )
             event_type = "execution_finished"
             if terminal_status == "cancelled":
                 event_type = "execution_cancelled"
@@ -3207,6 +3390,7 @@ class ExecutionService:
                     "run_dir": abs_path(run_dir),
                     "output_manifest_path": execution.output_manifest_path,
                     "output_task_count": execution.output_task_count,
+                    "vuln_report_status": report_status,
                 },
             )
         finally:

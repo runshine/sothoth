@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import uuid
@@ -29,6 +30,8 @@ from app.models.database import (
 )
 from app.services.run_inspector import (
     _session_runtime_metadata,
+    collect_new_results_by_cycle,
+    derive_profile_gate_summary,
     inspect_cycle_detail,
     inspect_file,
     inspect_files,
@@ -37,6 +40,7 @@ from app.services.run_inspector import (
     inspect_run_summary,
     inspect_session_file,
     inspect_sessions,
+    load_active_issue_records_from_ledger,
 )
 from app.time_utils import UTC_PLUS_8, ensure_local, isoformat_local, now_local
 
@@ -47,6 +51,18 @@ _SOURCE_MTIME_COMPARE_EPSILON = 1e-6
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:20]}"
+
+
+def _safe_path_component(value: Any) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    return text[:160] or "unknown"
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -87,11 +103,111 @@ def _read_text_file(path: Path) -> str:
         return ""
 
 
+def _write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _run_index_db_meta_dir(run_root: str | Path) -> Path:
+    return Path(run_root) / "run" / "_meta" / "run_index_db"
+
+
+def _relative_to_run_root(run_root: str | Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(Path(run_root).resolve()))
+    except Exception:
+        return str(path)
+
+
+def _externalize_json_payload(
+    run_root: str | Path,
+    relative_name: str,
+    payload: Any,
+    *,
+    summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    path = _run_index_db_meta_dir(run_root) / relative_name
+    _write_json_file(path, payload)
+    result = dict(summary or {})
+    result["externalized"] = True
+    result["raw_file"] = _relative_to_run_root(run_root, path)
+    return result
+
+
+def _load_externalized_json_payload(run_root: str | Path, stored: Any) -> Any:
+    if not isinstance(stored, dict):
+        return stored
+    raw_file = str(stored.get("raw_file") or "").strip()
+    if not raw_file:
+        return stored
+    path = Path(run_root) / raw_file
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return stored
+
+
+def _load_externalized_mapping_payload(run_root: str | Path, stored: Any) -> dict[str, Any]:
+    payload = _load_externalized_json_payload(run_root, stored)
+    return dict(payload) if isinstance(payload, dict) else {}
+
+
+def _load_externalized_list_payload(run_root: str | Path, stored: Any) -> list[Any]:
+    payload = _load_externalized_json_payload(run_root, stored)
+    return list(payload) if isinstance(payload, list) else []
+
+
+def _externalized_list_summary(payload: list[Any], *, preview_limit: int = 20) -> dict[str, Any]:
+    preview = payload[:preview_limit] if isinstance(payload, list) else []
+    return {
+        "count": len(payload) if isinstance(payload, list) else 0,
+        "preview": preview,
+    }
+
+
 def _truncate_log_summary(content: str, max_chars: int = RUN_INDEX_LOG_SUMMARY_MAX_CHARS) -> str:
     text = str(content or "")
     if max_chars <= 0 or len(text) <= max_chars:
         return text
     return text[-max_chars:]
+
+
+def _raw_summary_db_view(payload: dict[str, Any]) -> dict[str, Any]:
+    cli_payload = payload.get("dataflow_cli") if isinstance(payload.get("dataflow_cli"), dict) else {}
+    current_step = payload.get("current_step") if isinstance(payload.get("current_step"), dict) else {}
+    step_history = payload.get("step_history") if isinstance(payload.get("step_history"), list) else []
+    cycle_timing = payload.get("cycle_timing") if isinstance(payload.get("cycle_timing"), dict) else {}
+    return {
+        "start_time": str(payload.get("start_time") or ""),
+        "command": list(payload.get("command") or []) if isinstance(payload.get("command"), list) else [],
+        "command_display": str(payload.get("command_display") or ""),
+        "dataflow_cli": cli_payload,
+        "current_step": {
+            "cycle": current_step.get("cycle"),
+            "phase": current_step.get("phase"),
+            "step_key": current_step.get("step_key"),
+            "status": current_step.get("status"),
+            "started_at": current_step.get("started_at"),
+            "started_epoch": current_step.get("started_epoch"),
+            "finished_at": current_step.get("finished_at"),
+            "finished_epoch": current_step.get("finished_epoch"),
+            "duration_seconds": current_step.get("duration_seconds"),
+            "duration_ms": current_step.get("duration_ms"),
+            "elapsed_seconds": current_step.get("elapsed_seconds"),
+        },
+        "step_history_count": len(step_history),
+        "cycle_timing": cycle_timing,
+        "summary_markdown_length": len(str(payload.get("summary_markdown") or "")),
+        "task_markdown_length": len(str(payload.get("task_markdown") or "")),
+    }
 
 
 def _compute_source_mtime(path: Path) -> float:
@@ -373,6 +489,19 @@ def _run_index_is_active(record: RunIndex) -> bool:
     return str(record.status or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES
 
 
+def _new_results_by_cycle_for_index(run_index: RunIndex) -> dict[int, list[dict[str, Any]]]:
+    atomic_work_path = str(run_index.atomic_work_path or "").strip()
+    if not atomic_work_path:
+        return {}
+    try:
+        atomic = Path(atomic_work_path)
+    except Exception:
+        return {}
+    if not atomic.is_dir():
+        return {}
+    return collect_new_results_by_cycle(atomic)
+
+
 def _project_files_root(project_id: str) -> Path:
     config = get_config()
     return Path(config.fileserver_service.data_mount_path) / config.fileserver_service.project_files_dirname / str(project_id or "").strip()
@@ -428,14 +557,23 @@ class RunIndexService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="run not found")
         return record
 
-    def _delete_children(self, db: Session, run_index_id: str) -> None:
+    def _delete_children(
+        self,
+        db: Session,
+        run_index_id: str,
+        *,
+        include_sessions: bool = True,
+        include_files: bool = True,
+    ) -> None:
         db.query(RunIndexCycle).filter(RunIndexCycle.run_index_id == run_index_id).delete(synchronize_session=False)
         db.query(RunIndexGlobalReview).filter(RunIndexGlobalReview.run_index_id == run_index_id).delete(synchronize_session=False)
         db.query(RunIndexResult).filter(RunIndexResult.run_index_id == run_index_id).delete(synchronize_session=False)
         db.query(RunIndexResultReview).filter(RunIndexResultReview.run_index_id == run_index_id).delete(synchronize_session=False)
         db.query(RunIndexRemovedResult).filter(RunIndexRemovedResult.run_index_id == run_index_id).delete(synchronize_session=False)
-        db.query(RunIndexSession).filter(RunIndexSession.run_index_id == run_index_id).delete(synchronize_session=False)
-        db.query(RunIndexFile).filter(RunIndexFile.run_index_id == run_index_id).delete(synchronize_session=False)
+        if include_sessions:
+            db.query(RunIndexSession).filter(RunIndexSession.run_index_id == run_index_id).delete(synchronize_session=False)
+        if include_files:
+            db.query(RunIndexFile).filter(RunIndexFile.run_index_id == run_index_id).delete(synchronize_session=False)
 
     def _managed_project_run_root(self, project_id: str, run_root: str | Path) -> Path:
         project_root = _project_files_root(project_id).resolve()
@@ -462,8 +600,24 @@ class RunIndexService:
                 items.append((execution, path))
         return items
 
-    def _sync_children(self, db: Session, run_index_id: str, detail: dict[str, Any], sessions: list[dict[str, Any]], files: list[dict[str, Any]]) -> None:
-        self._delete_children(db, run_index_id)
+    def _sync_children(
+        self,
+        db: Session,
+        run_index_id: str,
+        detail: dict[str, Any],
+        sessions: list[dict[str, Any]],
+        files: list[dict[str, Any]],
+        *,
+        include_sessions: bool = True,
+        include_files: bool = True,
+    ) -> None:
+        self._delete_children(
+            db,
+            run_index_id,
+            include_sessions=include_sessions,
+            include_files=include_files,
+        )
+        run_root = Path(str(detail.get("path") or "")).resolve()
 
         for cycle in detail.get("cycles") or []:
             cycle_no = int(cycle.get("cycle") or 0)
@@ -488,15 +642,44 @@ class RunIndexService:
                     result_total=int(cycle.get("result_total") or 0),
                     result_passed=int(cycle.get("result_passed") or 0),
                     result_failed=int(cycle.get("result_failed") or 0),
-                    scores_json=dict(cycle.get("scores") or {}),
-                    metrics_json=dict(cycle_detail.get("metrics") or {}),
-                    issues_json=list(cycle.get("issues") or []),
-                    plateau_status_json=dict(cycle.get("plateau_status") or {}),
+                    scores_json=_externalize_json_payload(
+                        run_root,
+                        f"cycles/cycle_{cycle_no:03d}.scores.json",
+                        dict(cycle.get("scores") or {}),
+                    ),
+                    metrics_json=_externalize_json_payload(
+                        run_root,
+                        f"cycles/cycle_{cycle_no:03d}.metrics.json",
+                        dict(cycle_detail.get("metrics") or {}),
+                    ),
+                    issues_json=_externalize_json_payload(
+                        run_root,
+                        f"cycles/cycle_{cycle_no:03d}.issues.json",
+                        list(cycle.get("issues") or []),
+                        summary=_externalized_list_summary(list(cycle.get("issues") or [])),
+                    ),
+                    plateau_status_json=_externalize_json_payload(
+                        run_root,
+                        f"cycles/cycle_{cycle_no:03d}.plateau_status.json",
+                        dict(cycle.get("plateau_status") or {}),
+                    ),
                     summary_snapshot_text=str(cycle_detail.get("summary_snapshot") or ""),
-                    raw_json=dict(cycle),
+                    raw_json=_externalize_json_payload(
+                        run_root,
+                        f"cycles/cycle_{cycle_no:03d}.json",
+                        dict(cycle),
+                        summary={
+                            "cycle": cycle_no,
+                            "outcome": str(cycle.get("outcome") or ""),
+                            "result_total": int(cycle.get("result_total") or 0),
+                            "new_result_count": _safe_int(cycle.get("new_result_count")),
+                            "issue_count": len(list(cycle.get("issues") or [])),
+                        },
+                    ),
                 )
             )
             for review in cycle_detail.get("global_reviews") or []:
+                advisor_id = _safe_path_component(review.get("advisor_id") or "unknown")
                 db.add(
                     RunIndexGlobalReview(
                         id=_new_id("rigr"),
@@ -508,18 +691,43 @@ class RunIndexService:
                         passed=bool(review.get("passed")),
                         verdict=str(review.get("verdict") or ""),
                         confidence=float(review.get("confidence") or 0),
-                        scores_json=dict(review.get("scores") or {}),
+                        scores_json=_externalize_json_payload(
+                            run_root,
+                            f"global_reviews/cycle_{cycle_no:03d}/{advisor_id}.scores.json",
+                            dict(review.get("scores") or {}),
+                        ),
                         feedback=str(review.get("feedback") or ""),
                         feedback_detail=str(review.get("feedback_detail") or ""),
                         schema_valid=review.get("schema_valid"),
                         parser_mode=str(review.get("parser_mode") or ""),
                         repair_attempts=int(review.get("repair_attempts") or 0),
-                        issues_json=list(review.get("issues") or []),
-                        resolved_issue_ids_json=list(review.get("resolved_issue_ids") or []),
-                        raw_json=dict(review),
+                        issues_json=_externalize_json_payload(
+                            run_root,
+                            f"global_reviews/cycle_{cycle_no:03d}/{advisor_id}.issues.json",
+                            list(review.get("issues") or []),
+                            summary=_externalized_list_summary(list(review.get("issues") or [])),
+                        ),
+                        resolved_issue_ids_json=_externalize_json_payload(
+                            run_root,
+                            f"global_reviews/cycle_{cycle_no:03d}/{advisor_id}.resolved_issue_ids.json",
+                            list(review.get("resolved_issue_ids") or []),
+                            summary=_externalized_list_summary(list(review.get("resolved_issue_ids") or [])),
+                        ),
+                        raw_json=_externalize_json_payload(
+                            run_root,
+                            f"global_reviews/cycle_{cycle_no:03d}/{advisor_id}.json",
+                            dict(review),
+                            summary={
+                                "advisor_id": advisor_id,
+                                "passed": bool(review.get("passed")),
+                                "verdict": str(review.get("verdict") or ""),
+                            },
+                        ),
                     )
                 )
             for review in cycle_detail.get("result_reviews") or []:
+                advisor_id = _safe_path_component(review.get("advisor_id") or "unknown")
+                result_file = _safe_path_component(review.get("result_file") or "unknown")
                 db.add(
                     RunIndexResultReview(
                         id=_new_id("rirr"),
@@ -536,11 +744,22 @@ class RunIndexService:
                         schema_valid=review.get("schema_valid"),
                         parser_mode=str(review.get("parser_mode") or ""),
                         repair_attempts=int(review.get("repair_attempts") or 0),
-                        raw_json=dict(review),
+                        raw_json=_externalize_json_payload(
+                            run_root,
+                            f"result_reviews/cycle_{cycle_no:03d}/{result_file}__{advisor_id}.json",
+                            dict(review),
+                            summary={
+                                "result_file": result_file,
+                                "advisor_id": advisor_id,
+                                "passed": bool(review.get("passed")),
+                                "verdict": str(review.get("verdict") or ""),
+                            },
+                        ),
                     )
                 )
 
         for result in detail.get("results") or []:
+            filename = _safe_path_component(result.get("filename") or "unknown")
             db.add(
                 RunIndexResult(
                     id=_new_id("rir"),
@@ -564,13 +783,29 @@ class RunIndexService:
                     taskable=bool(result.get("taskable", True)),
                     delivery_bucket=str(result.get("delivery_bucket") or ""),
                     multi_finding=bool(result.get("multi_finding")),
-                    vulnerability_headings_json=list(result.get("vulnerability_headings") or []),
+                    vulnerability_headings_json=_externalize_json_payload(
+                        run_root,
+                        f"results/{filename}.vulnerability_headings.json",
+                        list(result.get("vulnerability_headings") or []),
+                        summary=_externalized_list_summary(list(result.get("vulnerability_headings") or [])),
+                    ),
                     related_to=str(result.get("related_to") or ""),
-                    raw_json=dict(result),
+                    raw_json=_externalize_json_payload(
+                        run_root,
+                        f"results/{filename}.json",
+                        dict(result),
+                        summary={
+                            "filename": filename,
+                            "passed": result.get("passed"),
+                            "verdict": str(result.get("verdict") or ""),
+                            "confidence": float(result.get("confidence") or 0),
+                        },
+                    ),
                 )
             )
 
         for result in detail.get("removed_results") or []:
+            filename = _safe_path_component(result.get("filename") or "unknown")
             db.add(
                 RunIndexRemovedResult(
                     id=_new_id("rirm"),
@@ -581,40 +816,82 @@ class RunIndexService:
                     cycle=int(result.get("cycle") or 0),
                     lifecycle_status=str(result.get("lifecycle_status") or ""),
                     reason=str(result.get("reason") or ""),
-                    signals_json=list(result.get("signals") or []),
-                    raw_json=dict(result),
+                    signals_json=_externalize_json_payload(
+                        run_root,
+                        f"removed_results/{filename}.signals.json",
+                        list(result.get("signals") or []),
+                        summary=_externalized_list_summary(list(result.get("signals") or [])),
+                    ),
+                    raw_json=_externalize_json_payload(
+                        run_root,
+                        f"removed_results/{filename}.json",
+                        dict(result),
+                        summary={
+                            "filename": filename,
+                            "cycle": int(result.get("cycle") or 0),
+                            "lifecycle_status": str(result.get("lifecycle_status") or ""),
+                        },
+                    ),
                 )
             )
 
-        for session in sessions:
-            db.add(
-                RunIndexSession(
-                    id=_new_id("ris"),
-                    run_index_id=run_index_id,
-                    session_id=str(session.get("session_id") or ""),
-                    format=str(session.get("format") or ""),
-                    worker_id=str(session.get("worker_id") or ""),
-                    jsonl_path=str(session.get("jsonl_path") or ""),
-                    size=int(session.get("size") or 0),
-                    mtime=float(session.get("mtime") or 0),
-                    calls_json=list(session.get("calls") or []),
-                    raw_json=dict(session),
+        if include_sessions:
+            for session in sessions:
+                session_id = _safe_path_component(session.get("session_id") or "unknown")
+                db.add(
+                    RunIndexSession(
+                        id=_new_id("ris"),
+                        run_index_id=run_index_id,
+                        session_id=str(session.get("session_id") or ""),
+                        format=str(session.get("format") or ""),
+                        worker_id=str(session.get("worker_id") or ""),
+                        jsonl_path=str(session.get("jsonl_path") or ""),
+                        size=int(session.get("size") or 0),
+                        mtime=float(session.get("mtime") or 0),
+                        calls_json=_externalize_json_payload(
+                            run_root,
+                            f"sessions/{session_id}.calls.json",
+                            list(session.get("calls") or []),
+                            summary=_externalized_list_summary(list(session.get("calls") or [])),
+                        ),
+                        raw_json=_externalize_json_payload(
+                            run_root,
+                            f"sessions/{session_id}.json",
+                            dict(session),
+                            summary={
+                                "session_id": session_id,
+                                "worker_id": str(session.get("worker_id") or ""),
+                                "format": str(session.get("format") or ""),
+                                "event_count": int(session.get("event_count") or 0),
+                                "line_count": int(session.get("line_count") or 0),
+                                "warnings": list(session.get("warnings") or []),
+                                "display_name": str(session.get("display_name") or ""),
+                                "stage_group": str(session.get("stage_group") or ""),
+                                "role_name": str(session.get("role_name") or ""),
+                                "watch_project_path": str(session.get("watch_project_path") or ""),
+                                "model": str(session.get("model") or ""),
+                                "raw_model": str(session.get("raw_model") or ""),
+                                "provider": str(session.get("provider") or ""),
+                                "thinking": str(session.get("thinking") or ""),
+                            },
+                        ),
+                    )
                 )
-            )
 
-        for entry in files:
-            db.add(
-                RunIndexFile(
-                    id=_new_id("rif"),
-                    run_index_id=run_index_id,
-                    category=str(entry.get("category") or ""),
-                    path=str(entry.get("path") or ""),
-                    name=str(entry.get("name") or ""),
-                    size=int(entry.get("size") or 0),
-                    mtime=float(entry.get("mtime") or 0),
-                    type=str(entry.get("type") or ""),
+        if include_files:
+            for entry in files:
+                db.add(
+                    RunIndexFile(
+                        id=_new_id("rif"),
+                        run_index_id=run_index_id,
+                        category=str(entry.get("category") or ""),
+                        path=str(entry.get("path") or ""),
+                        name=str(entry.get("name") or ""),
+                        size=int(entry.get("size") or 0),
+                        mtime=float(entry.get("mtime") or 0),
+                        type=str(entry.get("type") or ""),
+                    )
                 )
-            )
 
     def sync_run_path(
         self,
@@ -626,6 +903,7 @@ class RunIndexService:
         linked_execution: WorkflowExecution | None = None,
         linked_task: TriggerTask | None = None,
         profile_id: str | None = None,
+        include_runtime_assets: bool = True,
     ) -> RunIndex:
         run_root = run_root.resolve()
         if not run_root.is_dir():
@@ -656,7 +934,11 @@ class RunIndexService:
                 db.add(record)
                 db.flush()
                 return record
-        source_mtime = _compute_source_mtime(run_root)
+        source_mtime = (
+            _compute_source_mtime(run_root)
+            if include_runtime_assets
+            else _compute_source_mtime_hint(run_root, record.atomic_work_path if record is not None else None)
+        )
         if record is not None and _source_mtime_is_current(source_mtime, stored_source_mtime) and not _run_index_needs_parser_resync(record):
             self._refresh_record_bindings(
                 record,
@@ -674,8 +956,8 @@ class RunIndexService:
 
         summary = inspect_run_summary(run_root)
         detail = inspect_run_detail(run_root)
-        sessions = inspect_sessions(run_root)
-        files = inspect_files(run_root, limit=20000)
+        sessions = inspect_sessions(run_root) if include_runtime_assets else []
+        files = inspect_files(run_root, limit=20000) if include_runtime_assets else []
         run_log = inspect_log(run_root, lines=2000).get("content", "")
         run_timestamps = _read_json_file(run_root / "run" / "_meta" / "run_timestamps.json") or _read_json_file(run_root / "_meta" / "run_timestamps.json")
         started_at = _parse_datetime(str(run_timestamps.get("started_at") or "")) or _datetime_from_epoch(summary.get("start_epoch"))
@@ -693,6 +975,9 @@ class RunIndexService:
             "start_time": str(summary.get("start_time") or ""),
             "summary_markdown": _summary_markdown_for_run(run_root, atomic_work_path),
             "task_markdown": _task_markdown_for_run(run_root),
+            "current_step": dict(detail.get("current_step") or {}),
+            "step_history": list(detail.get("step_history") or []),
+            "cycle_timing": dict(detail.get("cycle_timing") or {}),
         }
         command_payload = _run_command_payload(
             db,
@@ -744,10 +1029,28 @@ class RunIndexService:
             target.failed_count = int(summary.get("failed_count") or 0)
             target.workflow_mode = str(summary.get("workflow_mode") or "")
             target.error = str(detail.get("error") or "")
-            target.config_json = dict(detail.get("config") or {})
-            target.manifests_json = dict(detail.get("manifests") or {})
-            target.latest_issues_json = list(detail.get("latest_issues") or [])
-            target.raw_summary_json = raw_summary
+            target.config_json = _externalize_json_payload(
+                run_root,
+                "config.json",
+                dict(detail.get("config") or {}),
+            )
+            target.manifests_json = _externalize_json_payload(
+                run_root,
+                "manifests.json",
+                dict(detail.get("manifests") or {}),
+            )
+            target.latest_issues_json = _externalize_json_payload(
+                run_root,
+                "latest_issues.json",
+                list(detail.get("latest_issues") or []),
+                summary=_externalized_list_summary(list(detail.get("latest_issues") or [])),
+            )
+            target.raw_summary_json = _externalize_json_payload(
+                run_root,
+                "run_summary.json",
+                raw_summary,
+                summary=_raw_summary_db_view(raw_summary),
+            )
             target.log_tail_text = _truncate_log_summary(run_log)
             target.log_size_bytes = log_path.stat().st_size if log_path.is_file() else 0
             target.source_mtime = source_mtime
@@ -778,7 +1081,15 @@ class RunIndexService:
             db.add(record)
             db.flush()
         detail["path"] = str(run_root)
-        self._sync_children(db, record.id, detail, sessions, files)
+        self._sync_children(
+            db,
+            record.id,
+            detail,
+            sessions,
+            files,
+            include_sessions=include_runtime_assets,
+            include_files=include_runtime_assets,
+        )
         db.flush()
         return record
 
@@ -827,17 +1138,36 @@ class RunIndexService:
                 continue
         db.commit()
 
-    def refresh_run_index(self, db: Session, run_index: RunIndex) -> RunIndex:
+    def refresh_run_index(
+        self,
+        db: Session,
+        run_index: RunIndex,
+        *,
+        include_runtime_assets: bool = True,
+        force_runtime_assets: bool = False,
+    ) -> RunIndex:
         run_root = Path(run_index.run_root_path)
         if not run_root.is_dir():
             return run_index
         stored_source_mtime = _stored_source_mtime(run_index.source_mtime)
-        if not _run_index_is_active(run_index) and not _run_index_needs_parser_resync(run_index):
+        if (
+            not force_runtime_assets
+            and not _run_index_is_active(run_index)
+            and not _run_index_needs_parser_resync(run_index)
+        ):
             hint_mtime = _compute_source_mtime_hint(run_root, run_index.atomic_work_path)
             if _source_mtime_is_current(hint_mtime, stored_source_mtime):
                 return run_index
-        current_mtime = _compute_source_mtime(run_root)
-        if _source_mtime_is_current(current_mtime, stored_source_mtime) and not _run_index_needs_parser_resync(run_index):
+        current_mtime = (
+            _compute_source_mtime(run_root)
+            if include_runtime_assets or force_runtime_assets
+            else _compute_source_mtime_hint(run_root, run_index.atomic_work_path)
+        )
+        if (
+            not force_runtime_assets
+            and _source_mtime_is_current(current_mtime, stored_source_mtime)
+            and not _run_index_needs_parser_resync(run_index)
+        ):
             return run_index
         linked_execution = db.get(WorkflowExecution, run_index.linked_execution_id) if run_index.linked_execution_id else None
         linked_task = db.get(TriggerTask, run_index.linked_task_id) if run_index.linked_task_id else None
@@ -849,6 +1179,7 @@ class RunIndexService:
             linked_execution=linked_execution,
             linked_task=linked_task,
             profile_id=run_index.profile_id,
+            include_runtime_assets=include_runtime_assets,
         )
         db.commit()
         return run_index
@@ -862,7 +1193,7 @@ class RunIndexService:
             RunIndex.run_root_path == str(candidate.resolve()),
         ).first()
         if record is not None:
-            return self.refresh_run_index(db, record)
+            return self.refresh_run_index(db, record, include_runtime_assets=False)
         self.sync_project_runs(db, project_id)
         record = db.query(RunIndex).filter(
             RunIndex.project_id == project_id,
@@ -874,6 +1205,7 @@ class RunIndexService:
         return record
 
     def _summary_payload(self, run_index: RunIndex) -> dict[str, Any]:
+        config = _load_externalized_mapping_payload(run_index.run_root_path, run_index.config_json)
         return {
             "run_id": run_index.id,
             "project_id": run_index.project_id,
@@ -886,14 +1218,14 @@ class RunIndexService:
             "path": run_index.run_root_path,
             "root_path": _parent_root(run_index.run_root_path),
             "status": run_index.status,
-            "start_time": str((run_index.raw_summary_json or {}).get("start_time") or ""),
+            "start_time": str((_load_externalized_json_payload(run_index.run_root_path, run_index.raw_summary_json) or {}).get("start_time") or ""),
             "start_epoch": int(run_index.started_at.replace(tzinfo=timezone.utc).timestamp()) if run_index.started_at else 0,
             "duration_seconds": run_index.duration_seconds,
             "last_activity": _iso_or_empty(run_index.last_activity_at),
             "model": run_index.model,
             "provider": run_index.provider,
             "thinking": run_index.thinking,
-            "review_profile": str((run_index.config_json or {}).get("review_profile") or ""),
+            "review_profile": str(config.get("review_profile") or ""),
             "max_cycles": run_index.max_cycles,
             "cycles_used": run_index.cycles_used,
             "result_count": run_index.result_count,
@@ -927,45 +1259,77 @@ class RunIndexService:
         run_index = self.refresh_run_index(db, run_index)
         return self._summary_payload(run_index)
 
-    def _cycle_payloads(self, db: Session, run_index_id: str) -> list[dict[str, Any]]:
+    def _cycle_payloads(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
         cycles = (
             db.query(RunIndexCycle)
-            .filter(RunIndexCycle.run_index_id == run_index_id)
+            .filter(RunIndexCycle.run_index_id == run_index.id)
             .order_by(RunIndexCycle.cycle.asc())
             .all()
         )
-        return [
-            {
-                "cycle": item.cycle,
-                "timestamp": item.timestamp,
-                "outcome": item.outcome,
-                "workflow_mode": item.workflow_mode,
-                "global_passed": item.global_passed,
-                "failed_advisor_id": item.failed_advisor_id,
-                "failed_role_name": item.failed_role_name,
-                "result_total": item.result_total,
-                "result_passed": item.result_passed,
-                "result_failed": item.result_failed,
-                "scores": dict(item.scores_json or {}),
-                "global_failure_scope": dict(item.metrics_json or {}).get("global_failure_scope", ""),
-                "failed_result_count": dict(item.metrics_json or {}).get("failed_result_count", item.result_failed),
-                "current_failed_result_count": dict(item.metrics_json or {}).get("current_failed_result_count", item.result_failed),
-                "historical_removed_result_count": dict(item.metrics_json or {}).get("historical_removed_result_count", 0),
-                "unreviewed_new_result_count": dict(item.metrics_json or {}).get("unreviewed_new_result_count", 0),
-                "unreviewed_new_result_files": dict(item.metrics_json or {}).get("unreviewed_new_result_files", []),
-                "issue_count": len(item.issues_json or []),
-                "issue_ids": dict(item.metrics_json or {}).get("issue_ids", []),
-                "summary_size": dict(item.metrics_json or {}).get("summary_size", 0),
-                "plateau_status": dict(item.plateau_status_json or {}),
-                "issues": list(item.issues_json or []),
-            }
-            for item in cycles
-        ]
+        rows: list[dict[str, Any]] = []
+        derived_new_results_by_cycle: dict[int, list[dict[str, Any]]] | None = None
+        for item in cycles:
+            metrics = _load_externalized_mapping_payload(run_index.run_root_path, item.metrics_json)
+            issues = _load_externalized_list_payload(run_index.run_root_path, item.issues_json)
+            raw_cycle = _load_externalized_json_payload(run_index.run_root_path, item.raw_json) or {}
+            new_results = raw_cycle.get("new_results") if isinstance(raw_cycle.get("new_results"), list) else None
+            if new_results is None:
+                if derived_new_results_by_cycle is None:
+                    derived_new_results_by_cycle = _new_results_by_cycle_for_index(run_index)
+                new_results = derived_new_results_by_cycle.get(item.cycle, [])
+            raw_global_review = raw_cycle.get("global_review") if isinstance(raw_cycle.get("global_review"), dict) else {}
+            if not raw_global_review:
+                raw_global_review = {
+                    "passed": item.global_passed,
+                    "feedback_preview": metrics.get("global_feedback_preview", ""),
+                    "issues": issues,
+                    "total_advisor_count": raw_cycle.get("global_advisor_total", 0),
+                    "passed_advisor_count": raw_cycle.get("global_advisor_passed", 0),
+                    "failed_advisor_id": item.failed_advisor_id,
+                    "failed_role_name": item.failed_role_name,
+                }
+            metrics_with_issues = dict(metrics)
+            metrics_with_issues["issues"] = issues
+            profile_gate = derive_profile_gate_summary(raw_global_review, metrics_with_issues)
+            rows.append(
+                {
+                    "cycle": item.cycle,
+                    "timestamp": item.timestamp,
+                    "outcome": item.outcome,
+                    "workflow_mode": item.workflow_mode,
+                    "global_passed": item.global_passed,
+                    "global_feedback_preview": str(raw_global_review.get("feedback_preview") or metrics.get("global_feedback_preview") or ""),
+                    "global_advisor_total": int(profile_gate.get("total_advisor_count") or 0),
+                    "global_advisor_passed": int(profile_gate.get("passed_advisor_count") or 0),
+                    "global_aggregate_status": str(raw_global_review.get("aggregate_status") or ""),
+                    "profile_gate": profile_gate,
+                    "failed_advisor_id": item.failed_advisor_id,
+                    "failed_role_name": item.failed_role_name,
+                    "result_total": item.result_total,
+                    "result_passed": item.result_passed,
+                    "result_failed": item.result_failed,
+                    "scores": _load_externalized_mapping_payload(run_index.run_root_path, item.scores_json),
+                    "global_failure_scope": str(metrics.get("global_failure_scope") or ""),
+                    "failed_result_count": metrics.get("failed_result_count", item.result_failed),
+                    "current_failed_result_count": metrics.get("current_failed_result_count", item.result_failed),
+                    "historical_removed_result_count": metrics.get("historical_removed_result_count", 0),
+                    "unreviewed_new_result_count": metrics.get("unreviewed_new_result_count", 0),
+                    "unreviewed_new_result_files": list(metrics.get("unreviewed_new_result_files") or []),
+                    "issue_count": len(issues),
+                    "issue_ids": list(metrics.get("issue_ids") or []),
+                    "summary_size": metrics.get("summary_size", 0),
+                    "plateau_status": _load_externalized_mapping_payload(run_index.run_root_path, item.plateau_status_json),
+                    "issues": issues,
+                    "new_result_count": _safe_int(raw_cycle.get("new_result_count"), len(new_results)),
+                    "new_results": new_results,
+                }
+            )
+        return rows
 
-    def _result_payloads(self, db: Session, run_index_id: str) -> list[dict[str, Any]]:
+    def _result_payloads(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
         results = (
             db.query(RunIndexResult)
-            .filter(RunIndexResult.run_index_id == run_index_id)
+            .filter(RunIndexResult.run_index_id == run_index.id)
             .order_by(RunIndexResult.filename.asc())
             .all()
         )
@@ -990,16 +1354,16 @@ class RunIndexService:
                 "taskable": item.taskable,
                 "delivery_bucket": item.delivery_bucket,
                 "multi_finding": item.multi_finding,
-                "vulnerability_headings": list(item.vulnerability_headings_json or []),
+                "vulnerability_headings": _load_externalized_list_payload(run_index.run_root_path, item.vulnerability_headings_json),
                 "related_to": item.related_to,
             }
             for item in results
         ]
 
-    def _removed_result_payloads(self, db: Session, run_index_id: str) -> list[dict[str, Any]]:
+    def _removed_result_payloads(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
         results = (
             db.query(RunIndexRemovedResult)
-            .filter(RunIndexRemovedResult.run_index_id == run_index_id)
+            .filter(RunIndexRemovedResult.run_index_id == run_index.id)
             .order_by(RunIndexRemovedResult.cycle.asc(), RunIndexRemovedResult.filename.asc())
             .all()
         )
@@ -1011,13 +1375,18 @@ class RunIndexService:
                 "cycle": item.cycle,
                 "lifecycle_status": item.lifecycle_status,
                 "reason": item.reason or "",
-                "signals": list(item.signals_json or []),
+                "signals": _load_externalized_list_payload(run_index.run_root_path, item.signals_json),
             }
             for item in results
         ]
 
     def list_run_sessions(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
-        run_index = self.refresh_run_index(db, run_index)
+        run_index = self.refresh_run_index(
+            db,
+            run_index,
+            include_runtime_assets=True,
+            force_runtime_assets=True,
+        )
         return self._list_run_sessions_rows(db, run_index)
 
     def _list_run_sessions_rows(self, db: Session, run_index: RunIndex) -> list[dict[str, Any]]:
@@ -1030,7 +1399,7 @@ class RunIndexService:
         rows: list[dict[str, Any]] = []
         atomic = Path(run_index.atomic_work_path) if run_index.atomic_work_path else None
         for item in sessions:
-            raw = dict(item.raw_json or {})
+            raw = dict(_load_externalized_json_payload(run_index.run_root_path, item.raw_json) or {})
             if item.format in {"jsonl", "hybrid"} and item.jsonl_path and "line_count" not in raw:
                 try:
                     parsed_session = inspect_session_file(run_index.run_root_path, item.jsonl_path)
@@ -1070,13 +1439,18 @@ class RunIndexService:
                     "raw_model": str(raw.get("raw_model") or runtime_meta.get("raw_model") or raw.get("model") or runtime_meta.get("model") or ""),
                     "provider": str(raw.get("provider") or runtime_meta.get("provider") or ""),
                     "thinking": str(raw.get("thinking") or runtime_meta.get("thinking") or ""),
-                    "calls": list(item.calls_json or []),
+                    "calls": _load_externalized_list_payload(run_index.run_root_path, item.calls_json),
                 }
             )
         return rows
 
     def list_run_files(self, db: Session, run_index: RunIndex, limit: int = 1200) -> list[dict[str, Any]]:
-        run_index = self.refresh_run_index(db, run_index)
+        run_index = self.refresh_run_index(
+            db,
+            run_index,
+            include_runtime_assets=True,
+            force_runtime_assets=True,
+        )
         return self._list_run_files_rows(db, run_index, limit=limit)
 
     def _list_run_files_rows(self, db: Session, run_index: RunIndex, limit: int = 1200) -> list[dict[str, Any]]:
@@ -1100,9 +1474,9 @@ class RunIndexService:
         ]
 
     def get_run_detail(self, db: Session, run_index: RunIndex) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index)
+        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=False)
         payload = self._summary_payload(run_index)
-        raw_summary = dict(run_index.raw_summary_json or {})
+        raw_summary = dict(_load_externalized_json_payload(run_index.run_root_path, run_index.raw_summary_json) or {})
         cli_payload = raw_summary.get("dataflow_cli") if isinstance(raw_summary.get("dataflow_cli"), dict) else {}
         command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else raw_summary.get("command")
         if not isinstance(command, list):
@@ -1121,33 +1495,48 @@ class RunIndexService:
                 raw_summary["dataflow_cli"] = cli_payload
                 raw_summary["command"] = cli_payload.get("command") or []
                 raw_summary["command_display"] = cli_payload.get("command_display") or ""
-                run_index.raw_summary_json = raw_summary
+                run_index.raw_summary_json = _externalize_json_payload(
+                    run_index.run_root_path,
+                    "run_summary.json",
+                    raw_summary,
+                    summary=_raw_summary_db_view(raw_summary),
+                )
                 db.add(run_index)
                 db.commit()
                 command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else []
                 command_display = str(cli_payload.get("command_display") or "")
+        latest_issues = _load_externalized_list_payload(run_index.run_root_path, run_index.latest_issues_json)
+        if run_index.atomic_work_path and not _run_index_is_active(run_index):
+            active_issues = load_active_issue_records_from_ledger(run_index.atomic_work_path)
+            if active_issues is not None:
+                latest_issues = active_issues
+
         payload.update(
             {
-                "config": dict(run_index.config_json or {}),
+                "config": _load_externalized_mapping_payload(run_index.run_root_path, run_index.config_json),
                 "error": run_index.error or None,
-                "cycles": self._cycle_payloads(db, run_index.id),
-                "results": self._result_payloads(db, run_index.id),
-                "removed_results": self._removed_result_payloads(db, run_index.id),
-                "manifests": dict(run_index.manifests_json or {}),
-                "latest_issues": list(run_index.latest_issues_json or []),
+                "cycles": self._cycle_payloads(db, run_index),
+                "results": self._result_payloads(db, run_index),
+                "removed_results": self._removed_result_payloads(db, run_index),
+                "manifests": _load_externalized_mapping_payload(run_index.run_root_path, run_index.manifests_json),
+                "latest_issues": latest_issues,
                 "atomic_work_path": run_index.atomic_work_path or "",
-                "files": self._list_run_files_rows(db, run_index, limit=20000),
-                "sessions": self._list_run_sessions_rows(db, run_index),
+                # Keep the overview endpoint responsive; sessions/files are loaded by their dedicated tab APIs.
+                "files": [],
+                "sessions": [],
                 "run_log": run_index.log_tail_text or "",
                 "command": [str(item) for item in command],
                 "command_display": command_display,
+                "current_step": dict(raw_summary.get("current_step") or {}),
+                "step_history": list(raw_summary.get("step_history") or []),
+                "cycle_timing": dict(raw_summary.get("cycle_timing") or {}),
                 "raw": raw_summary,
             }
         )
         return payload
 
     def get_run_cycle(self, db: Session, run_index: RunIndex, cycle: int) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index)
+        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=False)
         cycle_row = (
             db.query(RunIndexCycle)
             .filter(RunIndexCycle.run_index_id == run_index.id, RunIndexCycle.cycle == cycle)
@@ -1167,6 +1556,26 @@ class RunIndexService:
             .order_by(RunIndexResultReview.result_file.asc(), RunIndexResultReview.advisor_id.asc())
             .all()
         )
+        metrics = _load_externalized_mapping_payload(run_index.run_root_path, cycle_row.metrics_json)
+        issues = _load_externalized_list_payload(run_index.run_root_path, cycle_row.issues_json)
+        raw_cycle = _load_externalized_json_payload(run_index.run_root_path, cycle_row.raw_json) or {}
+        new_results = raw_cycle.get("new_results") if isinstance(raw_cycle.get("new_results"), list) else None
+        if new_results is None:
+            new_results = _new_results_by_cycle_for_index(run_index).get(cycle, [])
+        raw_global_review = raw_cycle.get("global_review") if isinstance(raw_cycle.get("global_review"), dict) else {}
+        if not raw_global_review:
+            raw_global_review = {
+                "passed": cycle_row.global_passed,
+                "feedback_preview": metrics.get("global_feedback_preview", ""),
+                "issues": issues,
+                "total_advisor_count": raw_cycle.get("global_advisor_total", len(global_reviews)),
+                "passed_advisor_count": raw_cycle.get("global_advisor_passed", len([item for item in global_reviews if item.passed])),
+                "failed_advisor_id": cycle_row.failed_advisor_id,
+                "failed_role_name": cycle_row.failed_role_name,
+            }
+        metrics_with_issues = dict(metrics)
+        metrics_with_issues["issues"] = issues
+        profile_gate = derive_profile_gate_summary(raw_global_review, metrics_with_issues)
         return {
             "cycle": cycle,
             "global_reviews": [
@@ -1176,15 +1585,15 @@ class RunIndexService:
                     "role_name": item.role_name,
                     "passed": item.passed,
                     "verdict": item.verdict,
-                    "scores": dict(item.scores_json or {}),
+                    "scores": _load_externalized_mapping_payload(run_index.run_root_path, item.scores_json),
                     "confidence": item.confidence,
                     "feedback": item.feedback or "",
                     "feedback_detail": item.feedback_detail or "",
                     "schema_valid": item.schema_valid,
                     "parser_mode": item.parser_mode,
                     "repair_attempts": item.repair_attempts,
-                    "issues": list(item.issues_json or []),
-                    "resolved_issue_ids": list(item.resolved_issue_ids_json or []),
+                    "issues": _load_externalized_list_payload(run_index.run_root_path, item.issues_json),
+                    "resolved_issue_ids": _load_externalized_list_payload(run_index.run_root_path, item.resolved_issue_ids_json),
                 }
                 for item in global_reviews
             ],
@@ -1205,19 +1614,23 @@ class RunIndexService:
                 for item in result_reviews
             ],
             "summary_snapshot": cycle_row.summary_snapshot_text or "",
-            "metrics": dict(cycle_row.metrics_json or {}),
+            "metrics": metrics,
+            "global_review_summary": raw_global_review,
+            "profile_gate": profile_gate,
+            "new_result_count": _safe_int(raw_cycle.get("new_result_count"), len(new_results)),
+            "new_results": new_results,
         }
 
     def get_run_file(self, db: Session, run_index: RunIndex, path: str) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index)
+        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=False)
         return inspect_file(run_index.run_root_path, path)
 
     def get_run_session_file(self, db: Session, run_index: RunIndex, path: str) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index)
+        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=False)
         return inspect_session_file(run_index.run_root_path, path)
 
     def get_run_log(self, db: Session, run_index: RunIndex, lines: int = 300) -> dict[str, Any]:
-        run_index = self.refresh_run_index(db, run_index)
+        run_index = self.refresh_run_index(db, run_index, include_runtime_assets=False)
         return inspect_log(run_index.run_root_path, lines=lines)
 
     def get_run_index_by_execution(self, db: Session, execution: WorkflowExecution) -> RunIndex | None:

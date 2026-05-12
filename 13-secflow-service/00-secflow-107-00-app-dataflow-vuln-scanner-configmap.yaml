@@ -50,6 +50,12 @@ data:
       base_url: "http://secflow-platform-configcenter/api/configcenter"
       timeout: 30
 
+    vuln_engine_service:
+      enabled: true
+      base_url: "http://secflow-platform-vuln"
+      submit_path: "/api/vuln/public/intake/submissions"
+      timeout: 30
+
     runs:
       enabled: true
 
@@ -78,6 +84,7 @@ data:
       workspace_base_dir: "/data/files"
       default_execution_timeout_seconds: 0
       execution_cancel_check_interval_seconds: 1
+      process_heartbeat_stale_after_seconds: 300
       trigger_retry_limit: 0
       public_api_prefix: "/api/dataflow-vuln-scanner"
       default_entry_task_type: "package_list"
@@ -87,10 +94,10 @@ data:
 
     scheduler:
       enabled: true
-      worker_capacity: 2
+      worker_capacity: 1
       poll_interval_seconds: 2
       heartbeat_interval_seconds: 5
-      worker_timeout_seconds: 20
+      worker_timeout_seconds: 300
       cleanup_interval_seconds: 10
 
     logging:

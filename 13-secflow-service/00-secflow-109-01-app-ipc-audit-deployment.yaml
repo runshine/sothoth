@@ -1,0 +1,103 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-ipc-audit
+  namespace: secflow-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: secflow-app-ipc-audit
+  template:
+    metadata:
+      labels:
+        name: secflow-app-ipc-audit
+    spec:
+      containers:
+        - name: secflow-app-ipc-audit
+          image: ghcr.io/runshine/secflow-app-ipc-audit:latest
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: SECFLOW_IPC_AUDIT_CONFIG
+              value: /app/config.yaml
+            - name: HDC_BIN
+              value: /workspace/files/vendor/edu/docker/src/hdc
+            - name: LD_LIBRARY_PATH
+              value: /workspace/files/vendor/edu/docker/src
+            - name: OHEMU_HELPER_BIN
+              value: /usr/local/bin/ipc-audit-qemu
+            - name: OHEMU_WORKSPACE_ROOT
+              value: /workspace/files
+            - name: OHEMU_QCOW2_PREPARED_ROOT
+              value: /workspace/files/vendor/edu/docker/volumes/qcow2_cache
+            - name: OHEMU_RUNTIME_ROOT
+              value: /var/lib/secflow-app-ipc-audit/ohemu
+            - name: OHEMU_ARCH
+              value: arm64
+            - name: OHEMU_NETWORK_MODE
+              value: bridge
+            - name: OHEMU_HDC_BIND
+              value: 127.0.0.1
+            - name: OHEMU_HDC_BASE_PORT
+              value: "55555"
+            - name: OHEMU_WAIT_FOR_HDC_READY
+              value: "1"
+            - name: OHEMU_HDC_READY_TIMEOUT
+              value: "180"
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: secflow-app-ipc-audit-config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: secflow-app-ipc-audit-data-nfs-pvc
+              mountPath: /var/lib/secflow-app-ipc-audit
+            - name: secflow-app-ipc-audit-data-nfs-pvc
+              mountPath: /workspace/files
+              subPath: files
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          readinessProbe:
+            httpGet:
+              path: /api/app/ipc-audit/ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/app/ipc-audit/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: secflow-app-ipc-audit-config
+          configMap:
+            name: secflow-app-ipc-audit-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: secflow-app-ipc-audit-data-nfs-pvc
+          persistentVolumeClaim:
+            claimName: secflow-app-ipc-audit-data-nfs-pvc
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice

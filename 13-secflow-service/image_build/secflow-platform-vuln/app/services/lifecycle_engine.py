@@ -151,6 +151,18 @@ def ensure_default_workflow(db: Session) -> WorkflowDefinition:
 def create_case_with_runtime(db: Session, request: CaseCreateRequest, *, initial_status: str = RECEIVE_STATUS_INTAKE_CREATED) -> Case:
     workflow = ensure_default_workflow(db)
     source_meta, target_meta, display_meta = request.build_storage_payloads()
+    report_id = str(source_meta.get("report_id") or "").strip()
+    fingerprint = str(source_meta.get("fingerprint") or "").strip()
+    if report_id or fingerprint:
+        for existing in db.query(Case).filter(Case.project_id == request.project_id).all():
+            try:
+                existing_source = json.loads(existing.source_meta_json or "{}")
+            except Exception:
+                existing_source = {}
+            if report_id and str(existing_source.get("report_id") or "").strip() == report_id:
+                return existing
+            if fingerprint and str(existing_source.get("fingerprint") or "").strip() == fingerprint:
+                return existing
     case_id = generate_case_id()
     fileserver_root = build_case_fileserver_root(case_id)
     display_meta["fileserver_root"] = fileserver_root

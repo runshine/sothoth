@@ -101,6 +101,7 @@ class ResultReviewExecutor:
         parallel: bool = True,
         concurrency_limit: int = 3,
         advisor_sessions: dict[str, str] | None = None,
+        resume_cursor: dict | None = None,
     ) -> tuple[bool, list[FailedResultItem]]:
         """
         执行结果评审
@@ -130,6 +131,20 @@ class ResultReviewExecutor:
         advisors_dicts = [a.model_dump() for a in advisors_cfg]
         pending = review_state.get_pending_results(
             all_result_files, advisors_dicts, current_fingerprints)
+        incomplete_current_cycle = self._results_with_incomplete_current_cycle(
+            advisors_cfg=advisors_cfg,
+            work_dir=work_dir,
+            cycle=cycle,
+            result_files=all_result_files,
+        )
+        if incomplete_current_cycle:
+            pending = sorted(set(pending) | set(incomplete_current_cycle))
+            logger.info(
+                "result_review_resume_pending_incomplete_nodes",
+                cycle=cycle,
+                files=incomplete_current_cycle,
+                resume_cursor=resume_cursor or {},
+            )
         carried_failed_items = [
             FailedResultItem(
                 filename=result_file,
@@ -241,6 +256,40 @@ class ResultReviewExecutor:
                      failed=len(failed_items))
 
         return all_passed, failed_items
+
+    def _results_with_incomplete_current_cycle(
+        self,
+        *,
+        advisors_cfg: list[AdvisorInstanceDef],
+        work_dir: str,
+        cycle: int,
+        result_files: list[str],
+    ) -> list[str]:
+        """Find result files whose current-cycle advisor nodes are partial."""
+        incomplete: list[str] = []
+        for result_file in result_files:
+            cycle_dir = (
+                Path(work_dir)
+                / "reviews"
+                / "results"
+                / Path(result_file).stem
+                / f"cycle_{cycle:03d}"
+            )
+            if not cycle_dir.is_dir():
+                continue
+            for advisor_def in advisors_cfg:
+                existing = self._load_existing_result_review_record(
+                    work_dir=work_dir,
+                    cycle=cycle,
+                    advisor_def=advisor_def,
+                    result_file=result_file,
+                )
+                if existing is None:
+                    incomplete.append(result_file)
+                    break
+                if not bool(existing.get("passed", False)):
+                    break
+        return sorted(set(incomplete))
 
     @staticmethod
     def _build_result_review_session_hint(

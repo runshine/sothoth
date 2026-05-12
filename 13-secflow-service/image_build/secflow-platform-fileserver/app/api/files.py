@@ -9,6 +9,7 @@ import os
 import posixpath
 import shutil
 import tempfile
+import zipfile
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, Header, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
@@ -49,6 +50,7 @@ from app.schemas import (
     ProjectFilesystemMoveRequest,
     ProjectFilesystemRenameRequest,
     ProjectFilesystemRootResponse,
+    ArchiveTaskCreateRequest,
     TaskStatusResponse,
     TaskSubmitResponse,
     StoragePVCResponse,
@@ -76,6 +78,9 @@ from app.task_manager import get_task_manager
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/fileserver", tags=["fileserver"])
 SPECIAL_VULN_SUBPROJECT_NAME = "__vuln_cases__"
+ARCHIVE_TASK_TYPE = "archive_download"
+ARCHIVE_TASK_RETENTION_SECONDS = 3600
+ARCHIVE_TASK_SUBDIR = ".archive_tasks"
 
 
 async def run_in_queue(queue_class: str, coro):
@@ -411,6 +416,144 @@ async def submit_move_tree_task(
     )
 
 
+@router.post("/project-filesystem/archive-tasks", response_model=TaskSubmitResponse)
+async def submit_project_filesystem_archive_task(
+    payload: ArchiveTaskCreateRequest,
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(payload.project_id, authorization)
+    if not payload.items:
+        raise ValidationError("items 不能为空")
+    entries, dedup_items = collect_project_fs_archive_entries(payload.project_id, payload.items)
+    archive_filename = ensure_archive_name(payload.archive_name)
+
+    async def _runner():
+        async def _inner():
+            archive_dir = archive_workspace_root()
+            archive_path = os.path.join(archive_dir, f"{datetime.now(timezone.utc).strftime('%Y%m%d')}-{os.urandom(4).hex()}-{archive_filename}")
+            file_count, archive_size = await run_io(build_archive_file, archive_path, entries)
+            expires_at = datetime.now(timezone.utc).timestamp() + ARCHIVE_TASK_RETENTION_SECONDS
+            return {
+                "project_id": payload.project_id,
+                "mode": "project_filesystem",
+                "items": dedup_items,
+                "archive_name": archive_filename,
+                "download_path": archive_path,
+                "archive_size": archive_size,
+                "file_count": file_count,
+                "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
+            }
+        return await run_in_queue("IO_HEAVY", _inner())
+
+    task = await get_task_manager().submit(_runner, task_type=ARCHIVE_TASK_TYPE, project_id=payload.project_id)
+    return TaskSubmitResponse(
+        task_id=task.task_id,
+        status=task.status,
+        accepted_at=task.accepted_at,
+        request_id=get_request_id(),
+        queue_class="IO_HEAVY",
+    )
+
+
+@router.post("/vuln/project-path/archive-tasks", response_model=TaskSubmitResponse)
+async def submit_vuln_project_path_archive_task(
+    payload: ArchiveTaskCreateRequest,
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(payload.project_id, authorization)
+    if not payload.items:
+        raise ValidationError("items 不能为空")
+    entries, dedup_items = collect_vuln_archive_entries(payload.project_id, payload.items)
+    archive_filename = ensure_archive_name(payload.archive_name)
+
+    async def _runner():
+        async def _inner():
+            archive_dir = archive_workspace_root()
+            archive_path = os.path.join(archive_dir, f"{datetime.now(timezone.utc).strftime('%Y%m%d')}-{os.urandom(4).hex()}-{archive_filename}")
+            file_count, archive_size = await run_io(build_archive_file, archive_path, entries)
+            expires_at = datetime.now(timezone.utc).timestamp() + ARCHIVE_TASK_RETENTION_SECONDS
+            return {
+                "project_id": payload.project_id,
+                "mode": "vuln_project_path",
+                "items": dedup_items,
+                "archive_name": archive_filename,
+                "download_path": archive_path,
+                "archive_size": archive_size,
+                "file_count": file_count,
+                "expires_at": datetime.fromtimestamp(expires_at, timezone.utc).isoformat(),
+            }
+        return await run_in_queue("IO_HEAVY", _inner())
+
+    task = await get_task_manager().submit(_runner, task_type=ARCHIVE_TASK_TYPE, project_id=payload.project_id)
+    return TaskSubmitResponse(
+        task_id=task.task_id,
+        status=task.status,
+        accepted_at=task.accepted_at,
+        request_id=get_request_id(),
+        queue_class="IO_HEAVY",
+    )
+
+
+@router.get("/archive-tasks", response_model=List[TaskStatusResponse])
+async def list_archive_tasks(
+    project_id: str = Query(...),
+    limit: int = Query(100, ge=1, le=1000),
+    authorization: Optional[str] = Header(None),
+):
+    await verify_project_access(project_id, authorization)
+    tasks = await get_task_manager().list(task_type=ARCHIVE_TASK_TYPE, project_id=project_id)
+    items = tasks[:limit]
+    return [
+        TaskStatusResponse(
+            task_id=task.task_id,
+            task_type=task.task_type,
+            project_id=task.project_id,
+            status=task.status,
+            progress=task.progress,
+            accepted_at=task.accepted_at,
+            finished_at=task.finished_at,
+            result=task.result,
+            error=task.error,
+        )
+        for task in items
+    ]
+
+
+@router.get("/archive-tasks/{task_id}/download")
+async def download_archive_task_file(
+    task_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    task = await get_task_manager().get(task_id)
+    if task is None:
+        raise NotFoundError("任务", task_id)
+    if task.task_type != ARCHIVE_TASK_TYPE:
+        raise ValidationError("仅支持下载 archive_download 类型任务")
+    if not task.project_id:
+        raise ValidationError("任务缺少 project_id")
+    await verify_project_access(task.project_id, authorization)
+    if task.status != "succeeded" or not task.result:
+        raise ConflictError("任务未完成，暂不可下载")
+    download_path = str(task.result.get("download_path") or "")
+    if not download_path or not os.path.exists(download_path):
+        raise NotFoundError("归档文件", task_id)
+    expires_at = str(task.result.get("expires_at") or "")
+    if expires_at:
+        try:
+            expiry = datetime.fromisoformat(expires_at)
+            if datetime.now(timezone.utc) > expiry:
+                raise ConflictError("归档文件已过期，请重新发起打包")
+        except ValueError:
+            pass
+    filename = str(task.result.get("archive_name") or f"{task_id}.zip")
+    return FileResponse(
+        path=download_path,
+        filename=filename,
+        media_type="application/zip",
+        headers={"X-Queue-Class": "STREAM"},
+    )
+
+
 @router.get("/tasks/{task_id}", response_model=TaskStatusResponse)
 async def get_task_status(task_id: str, authorization: Optional[str] = Header(None)):
     del authorization
@@ -419,6 +562,8 @@ async def get_task_status(task_id: str, authorization: Optional[str] = Header(No
         raise NotFoundError("任务", task_id)
     return TaskStatusResponse(
         task_id=task.task_id,
+        task_type=task.task_type,
+        project_id=task.project_id,
         status=task.status,
         progress=task.progress,
         accepted_at=task.accepted_at,
@@ -1111,6 +1256,126 @@ def infer_preview_mode_by_filename(filename: str, content_type: Optional[str]) -
     if extension in {"yml", "yaml", "md", "log", "csv", "sql", "sh", "py", "java", "go", "ts", "js", "tsx", "jsx", "xml", "json", "txt"}:
         return "text"
     return "binary"
+
+
+def ensure_archive_name(name: Optional[str]) -> str:
+    if not name:
+        return f"secflow-archive-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.zip"
+    safe = sanitize_name(name).replace(" ", "_")
+    return safe if safe.lower().endswith(".zip") else f"{safe}.zip"
+
+
+def archive_workspace_root() -> str:
+    base = os.path.join(get_config().storage.root_dir, ARCHIVE_TASK_SUBDIR)
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def collect_project_fs_archive_entries(project_id: str, items: list[str]) -> tuple[list[dict[str, str]], list[str]]:
+    normalized_items: list[str] = []
+    for item in items:
+        _, normalized = normalize_project_filesystem_path(item)
+        if normalized == "/":
+            raise ValidationError("不允许打包项目根目录")
+        normalized_items.append(normalized)
+
+    dedup = sorted(set(normalized_items))
+    entries: list[dict[str, str]] = []
+    for normalized in dedup:
+        target_path, _ = project_filesystem_target_path(project_id, normalized)
+        if not os.path.lexists(target_path):
+            raise NotFoundError("项目文件", normalized)
+        arc_base = normalized.lstrip("/")
+        if os.path.isdir(target_path) and not os.path.islink(target_path):
+            entries.append({"kind": "dir", "src": target_path, "arc": arc_base})
+        else:
+            entries.append({"kind": "file", "src": target_path, "arc": arc_base})
+    return entries, dedup
+
+
+def collect_vuln_archive_entries(project_id: str, items: list[str]) -> tuple[list[dict[str, str]], list[str]]:
+    db = get_db_session()
+    try:
+        subproject = ensure_special_subproject(db, project_id)
+        normalized_items: list[str] = []
+        for item in items:
+            _, normalized, _ = normalize_special_project_path(item)
+            if normalized == f"/{SPECIAL_VULN_SUBPROJECT_NAME}":
+                raise ValidationError("不允许打包疑点文件根目录")
+            normalized_items.append(normalized)
+
+        dedup = sorted(set(normalized_items))
+        entries: list[dict[str, str]] = []
+        for normalized in dedup:
+            _, _, special_relative = normalize_special_project_path(normalized)
+            parts = split_special_relative_path(special_relative)
+            if not parts:
+                raise ValidationError("无效疑点路径")
+
+            filename = parts[-1]
+            parent_dir = lookup_directory_by_special_path(
+                db, project_id, subproject, "/" + "/".join(parts[:-1])
+            ) if len(parts) > 1 else None
+
+            file_record = db.query(ManagedFile).filter(
+                ManagedFile.project_id == project_id,
+                ManagedFile.subproject_id == subproject.id,
+                ManagedFile.directory_id == (parent_dir.id if parent_dir else None),
+                ManagedFile.filename == filename,
+            ).first()
+            arc_base = normalized.lstrip("/")
+            if file_record is not None:
+                entries.append({"kind": "file", "src": absolute_storage_path(file_record.storage_key), "arc": arc_base})
+                continue
+
+            directory = lookup_directory_by_special_path(db, project_id, subproject, special_relative)
+            if directory is None:
+                raise NotFoundError("对象", normalized)
+            target_path = get_directory_storage_path(project_id, subproject.id, directory)
+            entries.append({"kind": "dir", "src": target_path, "arc": arc_base})
+        return entries, dedup
+    finally:
+        db.close()
+
+
+def build_archive_file(archive_path: str, entries: list[dict[str, str]]) -> tuple[int, int]:
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    count = 0
+    with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for entry in entries:
+            source = entry["src"]
+            arc = entry["arc"].strip("/")
+            if not arc:
+                continue
+            kind = entry["kind"]
+            if kind == "file":
+                if not os.path.lexists(source):
+                    continue
+                zf.write(source, arcname=arc)
+                count += 1
+                continue
+
+            # directory
+            if os.path.isdir(source):
+                has_children = False
+                for root, dirs, files in os.walk(source):
+                    rel = os.path.relpath(root, source)
+                    rel_norm = "" if rel == "." else rel.replace("\\", "/")
+                    dir_arc = arc if not rel_norm else f"{arc}/{rel_norm}"
+                    if not files and not dirs:
+                        zf.writestr(f"{dir_arc.rstrip('/')}/", b"")
+                    for filename in files:
+                        has_children = True
+                        file_src = os.path.join(root, filename)
+                        file_arc = f"{dir_arc.rstrip('/')}/{filename}" if dir_arc else filename
+                        zf.write(file_src, arcname=file_arc)
+                        count += 1
+                if not has_children and not os.path.isdir(source):
+                    zf.writestr(f"{arc.rstrip('/')}/", b"")
+            else:
+                zf.writestr(f"{arc.rstrip('/')}/", b"")
+    size = os.path.getsize(archive_path) if os.path.exists(archive_path) else 0
+    return count, size
 
 
 def safe_dir_has_children(path: str) -> bool:

@@ -52,6 +52,10 @@ class BinarySecurityUploadCompletePayload(BaseModel):
     files: list[BinarySecurityInputFile] = Field(default_factory=list)
 
 
+class BinarySecurityTaskConcurrencyUpdatePayload(BaseModel):
+    stage_parallelism: dict[str, int] = Field(default_factory=dict)
+
+
 class BinarySecurityTaskPrepareResponse(BaseModel):
     task_id: str
 
@@ -104,6 +108,8 @@ class BinarySecurityTaskResponse(BaseModel):
     failed_firmware_count: int = 0
     task_retry_supported: bool = False
     task_retry_reason: Optional[str] = None
+    task_continue_supported: bool = False
+    task_continue_reason: Optional[str] = None
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
 
 

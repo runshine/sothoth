@@ -1,3 +1,11 @@
+x-dataflow-vuln-scanner-env: &dataflow-vuln-scanner-env
+  CONFIG_PATH: /app/config.yaml
+  SECFLOW_DATAFLOW_ROLE: ${SECFLOW_DATAFLOW_ROLE:-standalone}
+  HOME: /root
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+
 x-dataflow-vuln-scanner-base: &dataflow-vuln-scanner-base
   image: ${IMAGE_NAME:-secflow-app-dataflow-vuln-scanner:latest}
   build:
@@ -8,11 +16,7 @@ x-dataflow-vuln-scanner-base: &dataflow-vuln-scanner-base
       PI_NPM_PACKAGE: ${PI_NPM_PACKAGE:-@mariozechner/pi-coding-agent}
   working_dir: /app
   environment:
-    CONFIG_PATH: /app/config.yaml
-    HOME: /root
-    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    <<: *dataflow-vuln-scanner-env
   volumes:
     - ${HOST_CONFIG_FILE:-./config.yaml}:/app/config.yaml:ro
     - ${HOST_RUNS_DIR:-./runs}:/app/runs
@@ -22,8 +26,19 @@ x-dataflow-vuln-scanner-base: &dataflow-vuln-scanner-base
 services:
   dataflow-vuln-scanner:
     <<: *dataflow-vuln-scanner-base
+    environment:
+      <<: *dataflow-vuln-scanner-env
+      SECFLOW_DATAFLOW_ROLE: manager
     ports:
       - "${SERVICE_PORT:-8080}:8080"
+    command:
+      - serve
+
+  dataflow-vuln-scanner-worker:
+    <<: *dataflow-vuln-scanner-base
+    environment:
+      <<: *dataflow-vuln-scanner-env
+      SECFLOW_DATAFLOW_ROLE: worker
     command:
       - serve
 

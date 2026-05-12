@@ -93,6 +93,22 @@ class B2STaskItem(Base):
         self.progress_json = json.dumps(value or {}, ensure_ascii=False)
 
 
+class B2SProjectConfig(Base):
+    __tablename__ = "secflow_b2s_project_config"
+
+    project_id = Column(String(64), primary_key=True)
+    config_json = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
+
+    @property
+    def config(self) -> dict[str, Any]:
+        return _loads(self.config_json, {})
+
+    @config.setter
+    def config(self, value: dict[str, Any] | None) -> None:
+        self.config_json = json.dumps(value or {}, ensure_ascii=False)
+
+
 def _loads(raw: Optional[str], default: Any) -> Any:
     if not raw:
         return default

@@ -68,6 +68,7 @@ def _case_payload(item: Case) -> dict:
     display_meta = json.loads(item.display_meta_json or "{}")
     lifecycle = get_lifecycle_state(item)
     metadata = display_meta.get("metadata") or {}
+    source_task = metadata.get("source") if isinstance(metadata.get("source"), dict) else {}
     fileserver_root = display_meta.get("fileserver_root") or {}
     return {
         "id": item.id,
@@ -89,6 +90,20 @@ def _case_payload(item: Case) -> dict:
         "evidence": display_meta.get("evidence") or {},
         "artifacts": display_meta.get("artifacts") or [],
         "metadata": metadata,
+        "source_task": {
+            "service_name": source_task.get("service_name"),
+            "service_id": source_task.get("service_id"),
+            "task_id": source_task.get("task_id"),
+            "execution_id": source_task.get("execution_id"),
+            "run_id": source_task.get("run_id"),
+            "run_name": source_task.get("run_name"),
+            "result_file": source_task.get("result_file"),
+            "result_path": source_task.get("result_path"),
+            "project_id": source_task.get("project_id"),
+            "parent_task_id": source_task.get("parent_task_id"),
+            "parent_stage_name": source_task.get("parent_stage_name"),
+            "parent_stage_item_id": source_task.get("parent_stage_item_id"),
+        } if source_task else None,
         "files_root_path": fileserver_root.get("root_path"),
         "fileserver_root": fileserver_root,
         "current_stage": item.current_stage,
@@ -242,6 +257,9 @@ async def create_draft_case(
 async def list_cases(
     project_id: str | None = Query(None),
     current_stage: str | None = Query(None),
+    source_service_name: str | None = Query(None),
+    source_task_id: str | None = Query(None),
+    source_execution_id: str | None = Query(None),
     user_and_token: tuple[dict, str] = Depends(get_current_subject),
     db: Session = Depends(get_db),
 ):
@@ -254,7 +272,24 @@ async def list_cases(
     if current_stage:
         query = query.filter(Case.current_stage == current_stage)
     items = query.order_by(Case.updated_at.desc()).all()
-    return {"items": [_case_payload(item) for item in items], "total": len(items)}
+    payloads = [_case_payload(item) for item in items]
+    if source_service_name:
+        payloads = [
+            item for item in payloads
+            if str((item.get("source_task") or {}).get("service_name") or "") == source_service_name
+            or str((item.get("source_task") or {}).get("service_id") or "") == source_service_name
+        ]
+    if source_task_id:
+        payloads = [
+            item for item in payloads
+            if str((item.get("source_task") or {}).get("task_id") or "") == source_task_id
+        ]
+    if source_execution_id:
+        payloads = [
+            item for item in payloads
+            if str((item.get("source_task") or {}).get("execution_id") or "") == source_execution_id
+        ]
+    return {"items": payloads, "total": len(payloads)}
 
 
 @router.get("/{case_id}")

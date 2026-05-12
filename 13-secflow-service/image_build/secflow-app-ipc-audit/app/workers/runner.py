@@ -184,6 +184,27 @@ def build_opencode_exec_command(
     return cmd
 
 
+def build_opencode_process_env(context: StageContext) -> dict[str, str]:
+    env = os.environ.copy()
+    opencode_root = context.stage_session_dir() / "opencode-env"
+    data_home = opencode_root / "data"
+    cache_home = opencode_root / "cache"
+    state_home = opencode_root / "state"
+    for path in (data_home, cache_home, state_home):
+        path.mkdir(parents=True, exist_ok=True)
+    # Keep XDG_CONFIG_HOME untouched so deployment-time file_bindings under
+    # /root/.config/opencode remain active, while isolating per-process DB/logs.
+    env["XDG_DATA_HOME"] = str(data_home)
+    env["XDG_CACHE_HOME"] = str(cache_home)
+    env["XDG_STATE_HOME"] = str(state_home)
+    return env
+
+
+def opencode_env_summary(env: dict[str, str]) -> str:
+    keys = ("XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME")
+    return "\n".join(f"{key}: {env.get(key, '')}" for key in keys)
+
+
 def extract_opencode_session_id(events_path: Path) -> str | None:
     if not events_path.exists():
         return None
@@ -265,6 +286,7 @@ def run_logged_command(
     timeout_seconds: int,
     mirror_output_paths: list[Path] | None = None,
     append: bool = False,
+    env: dict[str, str] | None = None,
 ) -> LoggedCommandResult:
     cfg: ExecutionConfig = get_config().execution
     heartbeat_interval = max(float(cfg.heartbeat_interval_seconds), 1.0)
@@ -292,6 +314,7 @@ def run_logged_command(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=env,
     )
     selector = selectors.DefaultSelector()
     if process.stdout is not None:

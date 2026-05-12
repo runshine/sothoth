@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 from pathlib import Path
 from uuid import uuid4
@@ -15,7 +16,8 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
-from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemResponse, TaskResponse
+from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SArtifact, B2SArtifactContentResponse, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsDimension, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsMeta, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, ReviewAnalyticsTrendInsight, ReviewAnalyticsTrendPoint, ReviewAnalyticsTrendSeries, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskItemResponse, TaskResponse
+from app.service.config_service import get_config_service, normalize_budget_exhausted_action
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
@@ -28,6 +30,9 @@ PI_STATUS_MAP = {
     "completed": "success",
     "failed": "failed",
     "cancelled": "cancelled",
+    "max_rounds_exceeded": "failed",
+    "max_retries_reached": "failed",
+    "timeout_max_retries_exceeded": "failed",
 }
 
 PI_PHASE_MAP = {
@@ -49,6 +54,51 @@ PHASE_LABELS = {
     "failed": "失败",
     "cancelled": "已取消",
 }
+
+_BUDGET_EXHAUSTED_MARKERS = (
+    "max_rounds_exceeded",
+    "max_retries_reached",
+    "timeout_max_retries_exceeded",
+    "agent_timeout_max_retries",
+    "timeout max retries",
+    "budget exhausted",
+    "review budget exhausted",
+    "max turns reached",
+)
+
+
+def _budget_exhausted_action_for_project(db: Session, project_id: str) -> str:
+    cfg = get_config_service().get_config(db, project_id)
+    return normalize_budget_exhausted_action(cfg.get("budget_exhausted_action"))
+
+
+def _budget_exhausted_action_for_item(db: Session, item: B2STaskItem) -> str:
+    metadata = item.extra_metadata or {}
+    frozen = metadata.get("budget_exhausted_action")
+    if frozen:
+        return normalize_budget_exhausted_action(str(frozen))
+    return _budget_exhausted_action_for_project(db, item.project_id)
+
+
+def _is_budget_exhausted_failure(job: dict | None, error_reason: str | None = None) -> bool:
+    if isinstance(job, dict):
+        raw_status = str(job.get("status") or "").strip().lower()
+        if raw_status in {"max_rounds_exceeded", "max_retries_reached", "timeout_max_retries_exceeded"}:
+            return True
+        payloads = [
+            job.get("error"),
+            job.get("message"),
+            job.get("detail"),
+            job.get("status_reason"),
+            job.get("failure_type"),
+            json.dumps(job.get("progress") or {}, ensure_ascii=False),
+            json.dumps(job.get("output") or {}, ensure_ascii=False),
+        ]
+    else:
+        payloads = []
+    payloads.append(error_reason or "")
+    normalized = "\n".join(str(part or "") for part in payloads).lower()
+    return any(marker in normalized for marker in _BUDGET_EXHAUSTED_MARKERS)
 
 
 def _task_origin_payload(task: B2STask) -> dict:
@@ -168,6 +218,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
     job_timeout_seconds = req.agent_run_timeout_seconds if req.agent_run_timeout_seconds is not None else pi_cfg.agent_run_timeout_seconds
     job_timeout_retry_enabled = req.agent_timeout_retry_enabled if req.agent_timeout_retry_enabled is not None else pi_cfg.agent_timeout_retry_enabled
     job_timeout_max_retries = req.agent_timeout_max_retries if req.agent_timeout_max_retries is not None else pi_cfg.agent_timeout_max_retries
+    budget_exhausted_action = _budget_exhausted_action_for_project(db, project_id)
     mode_engine_map = {"fast": "hybrid", "deep": "agent"}
     job_mode = req.mode or ({"hybrid": "fast", "agent": "deep"}.get(req.engine or "") if req.engine else None)
     job_engine = mode_engine_map.get(job_mode or "") or req.engine or pi_cfg.engine
@@ -201,6 +252,7 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, created_by:
             "agent_run_timeout_seconds": job_timeout_seconds,
             "agent_timeout_retry_enabled": job_timeout_retry_enabled,
             "agent_timeout_max_retries": job_timeout_max_retries,
+            "budget_exhausted_action": budget_exhausted_action,
             "mode": job_mode,
             "engine": job_engine,
             "pi_worker_url": worker_url,
@@ -273,6 +325,11 @@ async def sync_task(db: Session, task: B2STask) -> None:
         new_status = map_pi_status(job.get("status"))
         new_phase = map_pi_phase(job.get("phase"), job.get("status"))
         new_progress = build_item_progress(item, job)
+        if new_status == "failed" and _is_budget_exhausted_failure(job, item.error_reason):
+            action = _budget_exhausted_action_for_item(db, item)
+            if action == "treat_as_passed":
+                new_status = "success"
+                new_phase = "completed"
         if item.status != new_status:
             item.status = new_status
             changed = True
@@ -293,6 +350,9 @@ async def sync_task(db: Session, task: B2STask) -> None:
             item.phase = "failed"
             item.failure_type = "pi-re-agent"
             item.error_reason = job.get("error")
+        elif new_status == "success":
+            item.failure_type = None
+            item.error_reason = None
         changed = True
     if changed:
         recompute_task_status(db, task)
@@ -886,6 +946,191 @@ def _collect_advanced_files(paths: list[Path], base: Path, include_content: bool
     return files
 
 
+ISSUE_LABELS = {"Length Logic": "长度校验逻辑反转", "Return Code": "accepted 返回值错误", "Extra Check": "多余校验条件", "Semantic": "语义问题", "Validation": "输入校验", "Return": "返回语义", "Call": "调用关系", "Type": "类型结构"}
+ISSUE_DETAILS = {
+    "Length Logic": "序列号长度判断方向错误，导致有效输入路径被错误处理。",
+    "Return Code": "accepted 分支返回值与原始二进制语义不一致。",
+    "Extra Check": "输出中出现原始逻辑不存在的 hex_len == 0 校验。",
+    "Semantic": "还原代码与原始二进制语义存在偏差。",
+}
+CATEGORY_LABELS = {"Validation": "输入校验", "Return": "返回语义", "Call": "调用关系", "Type": "类型结构", "Semantic": "语义一致性"}
+SEVERITY_LABELS = {"blocking": "阻断", "major": "重要", "warning": "警告"}
+STATUS_LABELS = {"resolved": "已解决", "remaining": "未解决"}
+RISK_LABELS = {"low": "低", "low-medium": "低-中", "medium": "中", "high": "高", "unknown": "未知"}
+
+QUALITY_DIMENSION_GROUPS = [
+    {
+        "key": "logic_accuracy",
+        "label": "代码逻辑准确性",
+        "color_hint": "logic",
+        "description": "控制流、返回值和关键条件高度匹配原始程序",
+        "formula": "0.15*completeness + 0.25*control_flow + 0.20*return_semantics + 0.25*input_validation + 0.15*call_fidelity",
+        "terms": [("completeness", 0.15), ("control_flow", 0.25), ("return_semantics", 0.2), ("input_validation", 0.25), ("call_fidelity", 0.15)],
+    },
+    {
+        "key": "data_structure_accuracy",
+        "label": "数据结构准确性",
+        "color_hint": "structure",
+        "description": "类型、结构体和参数含义还原合理",
+        "formula": "0.55*type_struct_fidelity + 0.25*call_fidelity + 0.20*completeness",
+        "terms": [("type_struct_fidelity", 0.55), ("call_fidelity", 0.25), ("completeness", 0.2)],
+    },
+    {
+        "key": "readability",
+        "label": "可读性",
+        "color_hint": "readability",
+        "description": "命名、代码结构和表达便于人工审查",
+        "formula": "0.45*completeness + 0.35*type_struct_fidelity + 0.20*call_fidelity",
+        "terms": [("completeness", 0.45), ("type_struct_fidelity", 0.35), ("call_fidelity", 0.2)],
+    },
+]
+
+
+def _quality_level(score: int) -> tuple[str, str]:
+    if score >= 90:
+        return "excellent", "优秀"
+    if score >= 80:
+        return "good", "良好"
+    if score >= 70:
+        return "usable", "可用"
+    return "needs_work", "待优化"
+
+
+def _verdict_label(verdict: str) -> str:
+    verdict = (verdict or "UNKNOWN").upper()
+    return "通过" if verdict == "PASS" else "失败" if verdict == "FAIL" else "未知"
+
+
+def _dimension_score(radar: ReviewAnalyticsRadar, terms: list[tuple[str, float]]) -> int:
+    total_weight = sum(weight for _, weight in terms)
+    weighted = sum(float(getattr(radar, key, 0) or 0) * weight for key, weight in terms)
+    return round(weighted / total_weight) if total_weight else 0
+
+
+def _build_review_dimensions(radar: list[ReviewAnalyticsRadar]) -> list[ReviewAnalyticsDimension]:
+    if not radar:
+        return []
+    dimensions: list[ReviewAnalyticsDimension] = []
+    final_radar = radar[-1]
+    for group in QUALITY_DIMENSION_GROUPS:
+        points = [ReviewAnalyticsTrendPoint(attempt_no=round_.attempt_no, label=f"第{round_.attempt_no}轮", score=_dimension_score(round_, group["terms"])) for round_ in radar]
+        initial_score = points[0].score if points else 0
+        final_score = points[-1].score if points else 0
+        delta = max(0, final_score - initial_score)
+        delta_percent = round(delta / initial_score * 100) if initial_score > 0 else 0
+        level, level_label = _quality_level(final_score)
+        components = {key: int(getattr(final_radar, key, 0) or 0) for key, _ in group["terms"]}
+        dimensions.append(ReviewAnalyticsDimension(
+            key=group["key"], label=group["label"], score=final_score, initial_score=initial_score,
+            delta=delta, delta_percent=delta_percent, level=level, level_label=level_label,
+            description=group["description"], formula=group["formula"], color_hint=group["color_hint"],
+            points=points, components=components,
+        ))
+    return dimensions
+
+
+def _quality_scores_from_dimensions(dimensions: list[ReviewAnalyticsDimension], fallback_initial: int = 0, fallback_final: int = 0) -> tuple[int, int, int, int, str, str]:
+    if dimensions:
+        initial = round(sum(item.initial_score for item in dimensions) / len(dimensions))
+        final = round(sum(item.score for item in dimensions) / len(dimensions))
+    else:
+        initial, final = fallback_initial, fallback_final
+    delta = max(0, final - initial)
+    delta_percent = round(delta / initial * 100) if initial > 0 else 0
+    level, label = _quality_level(final)
+    return initial, final, delta, delta_percent, level, label
+
+
+def _build_review_trend_insight(attempts: list[ReviewAnalyticsAttempt], dimensions: list[ReviewAnalyticsDimension] | None = None) -> ReviewAnalyticsTrendInsight:
+    if not attempts:
+        return ReviewAnalyticsTrendInsight()
+    first = attempts[0]
+    final = attempts[-1]
+    if dimensions:
+        first_score, final_score, delta, _, _, _ = _quality_scores_from_dimensions(dimensions, int(first.semantic_score or first.confidence or 0), int(final.semantic_score or final.confidence or 0))
+    else:
+        first_score = int(first.quality_score or first.semantic_score or first.confidence or 0)
+        final_score = int(final.quality_score or final.semantic_score or final.confidence or 0)
+        delta = final_score - first_score
+    series = [ReviewAnalyticsTrendSeries(key=item.key, label=item.label, color_hint=item.color_hint, points=item.points) for item in dimensions or []]
+    if len(attempts) < 2:
+        title = "等待下一轮评审"
+        conclusion = "当前仅有 1 轮评审数据，建议结合后续轮次观察质量变化。"
+        tone = "neutral"
+    elif delta >= 20:
+        title = "质量显著提升"
+        conclusion = f"经过 {len(attempts)} 轮评审修复，语义质量从 {first_score} 提升至 {final_score}，累计提升 {delta} 分。"
+        tone = "positive"
+    elif delta >= 8:
+        title = "质量稳步提升"
+        conclusion = f"经过 {len(attempts)} 轮评审修复，语义质量提升 {delta} 分，整体趋势向好。"
+        tone = "positive"
+    elif delta >= 0:
+        title = "质量基本稳定"
+        conclusion = f"{len(attempts)} 轮评审后质量保持稳定，最终语义质量为 {final_score}。"
+        tone = "neutral"
+    else:
+        title = "质量出现回落"
+        conclusion = f"最近轮次语义质量较初始下降 {abs(delta)} 分，建议优先复核新引入的问题。"
+        tone = "warning"
+    return ReviewAnalyticsTrendInsight(title=title, conclusion=conclusion, tone=tone, primary_metric="质量分", first_score=first_score, final_score=final_score, delta=delta, series=series)
+
+
+def _finalize_review_analytics(task_id: str, item_id: str, attempts: list[ReviewAnalyticsAttempt], issues: list[ReviewAnalyticsIssue], matrix: list[ReviewAnalyticsFunction], radar: list[ReviewAnalyticsRadar], *, final_verdict: str, final_confidence: int, closure: float, residual: str, mock: bool) -> ReviewAnalyticsResponse:
+    for issue in issues:
+        issue.display_label = issue.display_label or ISSUE_LABELS.get(issue.label, issue.label)
+        issue.description = issue.description or ISSUE_DETAILS.get(issue.label, f"{issue.category} · {issue.severity}")
+        issue.category_label = issue.category_label or CATEGORY_LABELS.get(issue.category, issue.category)
+        issue.severity_label = issue.severity_label or SEVERITY_LABELS.get(issue.severity, issue.severity)
+        issue.status_label = issue.status_label or STATUS_LABELS.get(issue.status, issue.status)
+
+    dimensions = _build_review_dimensions(radar)
+    fallback_initial = attempts[0].semantic_score if attempts else 0
+    fallback_final = attempts[-1].semantic_score if attempts else final_confidence
+    initial_quality, final_quality, quality_delta, quality_delta_percent, _, final_quality_label = _quality_scores_from_dimensions(dimensions, fallback_initial, fallback_final)
+
+    for attempt in attempts:
+        discovered = sum(1 for issue in issues if issue.introduced_attempt == attempt.attempt_no)
+        resolved_at = sum(1 for issue in issues if issue.resolved_attempt == attempt.attempt_no)
+        open_after = sum(1 for issue in issues if issue.introduced_attempt <= attempt.attempt_no and (not issue.resolved_attempt or issue.resolved_attempt > attempt.attempt_no))
+        round_radar = next((item for item in radar if item.attempt_no == attempt.attempt_no), None)
+        round_dimensions = _build_review_dimensions([round_radar]) if round_radar else []
+        round_quality = round(sum(item.score for item in round_dimensions) / len(round_dimensions)) if round_dimensions else (attempt.semantic_score or attempt.confidence or 0)
+        attempt.label = attempt.label or f"第 {attempt.attempt_no} 轮"
+        attempt.verdict_label = attempt.verdict_label or _verdict_label(attempt.verdict)
+        attempt.quality_score = round_quality
+        attempt.issues_discovered = discovered
+        attempt.issues_resolved = resolved_at
+        attempt.issues_open_after_attempt = open_after
+        attempt.status_label = attempt.status_label or ("最终轮" if attempt is attempts[-1] else "已通过" if attempt.verdict == "PASS" else "需修复")
+
+    resolved_count = sum(1 for issue in issues if issue.status == "resolved")
+    remaining_count = sum(1 for issue in issues if issue.status != "resolved")
+    trend = _build_review_trend_insight(attempts, dimensions)
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return ReviewAnalyticsResponse(
+        task_id=task_id,
+        item_id=item_id,
+        status="ready",
+        meta=ReviewAnalyticsMeta(generated_at=generated_at, mock=mock),
+        summary=ReviewAnalyticsSummary(
+            attempts=len(attempts), attempt_count=len(attempts), final_verdict=final_verdict,
+            final_verdict_label=_verdict_label(final_verdict), final_confidence=final_confidence,
+            final_quality_score=final_quality, final_quality_label=final_quality_label,
+            initial_quality_score=initial_quality, quality_delta=quality_delta, quality_delta_percent=quality_delta_percent,
+            issue_total=len(issues), issue_resolved=resolved_count, issue_remaining=remaining_count,
+            issue_closure_rate=closure, residual_risk=residual, residual_risk_label=RISK_LABELS.get(residual, residual), mock=mock,
+        ),
+        attempts=attempts,
+        issues=issues,
+        dimensions=dimensions,
+        trend=trend,
+        function_matrix=matrix,
+        radar=radar,
+        trend_insight=trend,
+    )
+
+
 def _mock_review_analytics(task_id: str, item_id: str) -> ReviewAnalyticsResponse:
     attempts = [
         ReviewAnalyticsAttempt(attempt_no=1, verdict="FAIL", total_functions=10, verified_functions=8, blocking_issues=3, semantic_score=68, confidence=64),
@@ -902,7 +1147,7 @@ def _mock_review_analytics(task_id: str, item_id: str) -> ReviewAnalyticsRespons
         ReviewAnalyticsRadar(attempt_no=1, completeness=100, control_flow=70, return_semantics=55, input_validation=45, call_fidelity=94, type_struct_fidelity=88),
         ReviewAnalyticsRadar(attempt_no=2, completeness=100, control_flow=95, return_semantics=96, input_validation=96, call_fidelity=95, type_struct_fidelity=95),
     ]
-    return ReviewAnalyticsResponse(task_id=task_id, item_id=item_id, summary=ReviewAnalyticsSummary(attempts=2, final_verdict="PASS", final_confidence=89, issue_closure_rate=1.0, residual_risk="low-medium", mock=True), attempts=attempts, issues=issues, function_matrix=matrix, radar=radar)
+    return _finalize_review_analytics(task_id, item_id, attempts, issues, matrix, radar, final_verdict="PASS", final_confidence=89, closure=1.0, residual="low-medium", mock=True)
 
 
 def _parse_review_file(file: AdvancedFile) -> dict:
@@ -983,7 +1228,7 @@ def build_task_item_review_analytics(item: B2STaskItem, mock: bool = False) -> R
     closure = resolved / len(issues) if issues else (1.0 if final["verdict"] == "PASS" else 0.0)
     confidence = max(0, min(100, round(final["score"] * 0.42 + closure * 38 + (14 if final["verdict"] == "PASS" else 0) + min(len(parsed), 3) * 2)))
     residual = "high" if final["verdict"] != "PASS" or final["issues"] else ("low" if confidence >= 92 else "low-medium" if confidence >= 82 else "medium")
-    return ReviewAnalyticsResponse(task_id=item.task_id, item_id=item.id, summary=ReviewAnalyticsSummary(attempts=len(parsed), final_verdict=final["verdict"], final_confidence=confidence, issue_closure_rate=closure, residual_risk=residual, mock=False), attempts=attempts, issues=issues, function_matrix=matrix, radar=radar)
+    return _finalize_review_analytics(item.task_id, item.id, attempts, issues, matrix, radar, final_verdict=final["verdict"], final_confidence=confidence, closure=closure, residual=residual, mock=False)
 
 
 def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) -> TaskItemAdvancedResponse:
@@ -1050,6 +1295,108 @@ def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) ->
         work_dir=str(work_dir) if work_dir else None,
         runs=runs,
         ida_files=ida_files,
+    )
+
+
+def _artifact_id(path: str) -> str:
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()[:24]
+
+
+def _artifact_mime_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return "application/json"
+    if suffix == ".jsonl":
+        return "application/x-jsonlines"
+    if suffix in {".c", ".h"}:
+        return "text/x-c"
+    if suffix == ".md":
+        return "text/markdown"
+    return "text/plain"
+
+
+def _iter_advanced_files(advanced: TaskItemAdvancedResponse) -> list[AdvancedFile]:
+    files: list[AdvancedFile] = []
+    files.extend(advanced.ida_files)
+    for run in advanced.runs:
+        files.extend(run.files)
+        files.extend(run.agent_sessions)
+        for batch in run.batches:
+            for file in [batch.disasm, batch.source]:
+                if file:
+                    files.append(file)
+            files.extend(batch.review_snapshots)
+            files.extend(batch.reviews)
+    return files
+
+
+def build_task_item_artifacts(item: B2STaskItem) -> TaskItemArtifactsResponse:
+    advanced = build_task_item_advanced(item, include_content=False)
+    base = Path(advanced.output_dir).resolve()
+    artifacts: list[B2SArtifact] = []
+    for file in _iter_advanced_files(advanced):
+        try:
+            relative_path = str(Path(file.path).resolve().relative_to(base))
+        except Exception:
+            relative_path = file.name
+        artifact_id = _artifact_id(file.path)
+        content_url = f"/api/app/binary-to-source/projects/{item.project_id}/tasks/{item.task_id}/items/{item.id}/artifacts/{artifact_id}/content"
+        artifacts.append(B2SArtifact(
+            id=artifact_id, name=file.name, path=file.path, relative_path=relative_path, kind=file.kind, size=file.size,
+            stage=file.stage, stage_order=file.stage_order, section=file.section, section_order=file.section_order,
+            round=file.round, round_order=file.round_order, agent=file.agent, role=file.role, batch_no=file.batch_no,
+            attempt_no=file.attempt_no, content_url=content_url,
+        ))
+    return TaskItemArtifactsResponse(
+        task_id=item.task_id,
+        item_id=item.id,
+        output_dir=advanced.output_dir,
+        work_dir=advanced.work_dir,
+        artifacts=sorted(artifacts, key=lambda file: ((file.stage_order or 0), (file.section_order or 0), (file.round_order or 0), file.relative_path)),
+        counts={
+            "artifacts": len(artifacts),
+            "batches": sum(len(run.batches) for run in advanced.runs),
+            "reviews": sum(len(batch.reviews) + len(batch.review_snapshots) for run in advanced.runs for batch in run.batches),
+            "sessions": sum(len(run.agent_sessions) for run in advanced.runs),
+            "ida_files": len(advanced.ida_files),
+        },
+    )
+
+
+def build_task_item_artifact_content(item: B2STaskItem, artifact_id: str, offset: int = 0, limit: int = ADVANCED_MAX_BYTES) -> B2SArtifactContentResponse:
+    advanced = build_task_item_advanced(item, include_content=False)
+    file = next((candidate for candidate in _iter_advanced_files(advanced) if _artifact_id(candidate.path) == artifact_id), None)
+    if not file:
+        raise NotFoundError("产物文件不存在")
+    path = Path(file.path).resolve()
+    base = Path(advanced.output_dir).resolve()
+    try:
+        path.relative_to(base)
+    except Exception as exc:
+        raise ValidationError("产物路径越界") from exc
+    if not path.is_file():
+        raise NotFoundError("产物文件不存在")
+    safe_offset = max(0, int(offset or 0))
+    safe_limit = max(1, min(int(limit or ADVANCED_MAX_BYTES), ADVANCED_MAX_BYTES))
+    size = path.stat().st_size
+    with path.open("rb") as fp:
+        fp.seek(safe_offset)
+        raw = fp.read(safe_limit + 1)
+    truncated = len(raw) > safe_limit
+    content = raw[:safe_limit].decode("utf-8", errors="replace")
+    next_offset = safe_offset + safe_limit if truncated or safe_offset + len(raw[:safe_limit]) < size else None
+    return B2SArtifactContentResponse(
+        artifact_id=artifact_id,
+        name=file.name,
+        path=str(path),
+        kind=file.kind,
+        mime_type=_artifact_mime_type(path),
+        size=size,
+        offset=safe_offset,
+        limit=safe_limit,
+        content=content,
+        truncated=bool(next_offset),
+        next_offset=next_offset,
     )
 
 

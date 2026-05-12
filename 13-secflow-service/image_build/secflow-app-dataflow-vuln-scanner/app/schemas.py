@@ -33,7 +33,7 @@ class ScanProfileCreateRequest(BaseModel):
     enabled: bool = True
     default_priority: int = 100
     max_retry_count: int = Field(default=0, ge=0)
-    execution_timeout_seconds: int = Field(default=0, ge=0, description="Maximum service-managed run_vuln_scan.py process duration in seconds; 0 means unlimited / disabled.")
+    execution_timeout_seconds: int = Field(default=0, ge=0, description="Deprecated compatibility field; service-managed run_vuln_scan.py process timeout is disabled.")
 
 
 class ScanProfileUpdateRequest(BaseModel):
@@ -45,7 +45,7 @@ class ScanProfileUpdateRequest(BaseModel):
     enabled: Optional[bool] = None
     default_priority: Optional[int] = None
     max_retry_count: Optional[int] = Field(default=None, ge=0)
-    execution_timeout_seconds: Optional[int] = Field(default=None, ge=0, description="Maximum service-managed run_vuln_scan.py process duration in seconds; 0 means unlimited / disabled.")
+    execution_timeout_seconds: Optional[int] = Field(default=None, ge=0, description="Deprecated compatibility field; service-managed run_vuln_scan.py process timeout is disabled.")
 
 
 class ScanProfileResponse(BaseModel):
@@ -97,7 +97,7 @@ class DataflowInputRef(BaseModel):
 class ScanTaskCreateRequest(BaseModel):
     project_id: str = Field(..., min_length=1)
     profile_id: Optional[str] = None
-    title: str = Field(..., min_length=1)
+    title: str = Field(default="", max_length=128)
     task_markdown: Optional[str] = Field(default=None, min_length=1)
     workspace_dir: Optional[DataflowInputRef] = None
     data_flow: Optional[DataflowInputRef] = None
@@ -126,6 +126,7 @@ class ScanTaskCreateRequest(BaseModel):
     parent_stage_name: Optional[str] = None
     parent_stage_item_id: Optional[str] = None
     parent_stage_item_key: Optional[str] = None
+    auto_report_vulnerabilities: bool = True
 
     @model_validator(mode="after")
     def validate_task_input(self) -> "ScanTaskCreateRequest":
@@ -173,6 +174,8 @@ class ScanTaskResponse(BaseModel):
     run_path: Optional[str] = None
     run: Dict[str, Any] = Field(default_factory=dict)
     latest_run: Dict[str, Any] = Field(default_factory=dict)
+    auto_report_vulnerabilities: bool = True
+    vuln_report_status: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ScanTaskAttemptResponse(BaseModel):
@@ -288,6 +291,21 @@ class RunRetryRequest(BaseModel):
     clean_workspace: bool = False
 
 
+class RunVulnReportRequest(BaseModel):
+    result_files: List[str] = Field(default_factory=list)
+
+
+class RunVulnReportResponse(BaseModel):
+    status: str
+    enabled: bool = True
+    total: int = 0
+    reported: int = 0
+    failed: int = 0
+    pending: int = 0
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
 class RunMutationResponse(BaseModel):
     success: bool = True
     run_id: str
@@ -306,6 +324,8 @@ class HealthResponse(BaseModel):
     pod_id: str
     database: str
     scheduler: str
+    scheduler_role: str = "standalone"
+    worker_enabled: str = "true"
 
 
 class RunSummaryResponse(BaseModel):
@@ -383,6 +403,9 @@ class RunDetailResponse(RunSummaryResponse):
     run_log: str = ""
     command: List[str] = Field(default_factory=list)
     command_display: str = ""
+    current_step: Dict[str, Any] = Field(default_factory=dict)
+    step_history: List[Dict[str, Any]] = Field(default_factory=list)
+    cycle_timing: Dict[str, Any] = Field(default_factory=dict)
     raw: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -390,8 +413,12 @@ class RunCycleResponse(BaseModel):
     cycle: int
     global_reviews: List[Dict[str, Any]] = Field(default_factory=list)
     result_reviews: List[Dict[str, Any]] = Field(default_factory=list)
+    new_result_count: int = 0
+    new_results: List[Dict[str, Any]] = Field(default_factory=list)
     summary_snapshot: str = ""
     metrics: Dict[str, Any] = Field(default_factory=dict)
+    global_review_summary: Dict[str, Any] = Field(default_factory=dict)
+    profile_gate: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RunFileContentResponse(BaseModel):

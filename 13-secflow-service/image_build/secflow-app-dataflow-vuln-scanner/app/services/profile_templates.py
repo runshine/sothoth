@@ -139,9 +139,17 @@ class ProfileTemplateService:
         agent_run_timeout_seconds = int(normalized_payload.get("agent_run_timeout_seconds") if normalized_payload.get("agent_run_timeout_seconds") is not None else 3600)
         agent_timeout_retry_enabled = bool(normalized_payload.get("agent_timeout_retry_enabled") if normalized_payload.get("agent_timeout_retry_enabled") is not None else True)
         agent_timeout_max_retries = max(_first_present_int(normalized_payload.get("agent_timeout_max_retries"), default=3), 0)
+        explicit_timeout_max_retries = None
+        if isinstance(config_payload, dict) and "timeout_max_retries" in config_payload:
+            explicit_timeout_max_retries = max(_first_present_int(config_payload.get("timeout_max_retries"), default=3), 1)
         worker_timeout = agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600
         advisor_timeout = agent_run_timeout_seconds if agent_run_timeout_seconds > 0 else 3600
-        timeout_max_retries = max(agent_timeout_max_retries + 1, 1) if agent_timeout_retry_enabled else 1
+        if explicit_timeout_max_retries is not None:
+            timeout_max_retries = explicit_timeout_max_retries
+            agent_timeout_max_retries = max(timeout_max_retries - 1, 0)
+            agent_timeout_retry_enabled = timeout_max_retries > 1
+        else:
+            timeout_max_retries = max(agent_timeout_max_retries + 1, 1) if agent_timeout_retry_enabled else 1
         timeout_retry_interval_seconds = max(_first_present_int(normalized_payload.get("timeout_retry_interval_seconds"), default=30), 0)
         review_profile = normalize_review_profile(normalized_payload.get("review_profile"))
         profile_policy = get_review_profile_policy(review_profile)

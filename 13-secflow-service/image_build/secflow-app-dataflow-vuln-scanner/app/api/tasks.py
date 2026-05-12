@@ -20,6 +20,8 @@ from app.schemas import (
     RunRetryRequest,
     RunSessionResponse,
     RunSummaryResponse,
+    RunVulnReportRequest,
+    RunVulnReportResponse,
     ScanTaskCreateRequest,
     ScanTaskDetailResponse,
     ScanTaskPriorityUpdateRequest,
@@ -174,6 +176,17 @@ async def get_run(run_id: str, subject=Depends(get_current_subject), db: Session
     return get_execution_service().get_run(db, run_id, principal)
 
 
+@router.post("/runs/{run_id}/report-vulnerabilities", response_model=RunVulnReportResponse)
+async def report_run_vulnerabilities(
+    run_id: str,
+    payload: RunVulnReportRequest,
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().report_run_vulnerabilities(db, run_id, principal, payload.result_files)
+
+
 @router.get("/runs/{run_id}/cycles/{cycle}", response_model=RunCycleResponse)
 async def get_run_cycle(
     run_id: str,
@@ -282,15 +295,6 @@ async def cancel_task(task_id: str, subject=Depends(get_current_subject), db: Se
 async def delete_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().delete_scan_task(db, task_id, principal)
-
-
-@router.post("/tasks/{task_id}/retry", response_model=ScanTaskResponse)
-async def retry_task(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
-    principal, token = subject
-    updated = get_execution_service().retry_scan_task(db, task_id, principal, authorization_token=token)
-    get_scheduler_service().start_execution_now(updated.latest_execution_id)
-    db.expire_all()
-    return get_execution_service().get_scan_task_summary(db, task_id, principal)
 
 
 @router.post("/tasks/{task_id}/priority", response_model=ScanTaskResponse)

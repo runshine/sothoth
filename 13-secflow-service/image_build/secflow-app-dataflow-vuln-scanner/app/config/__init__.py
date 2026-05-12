@@ -82,6 +82,18 @@ class ConfigCenterServiceConfig(BaseModel):
     timeout: int = 30
 
 
+class VulnEngineServiceConfig(BaseModel):
+    enabled: bool = True
+    base_url: str = "http://secflow-platform-vuln"
+    submit_path: str = "/api/vuln/public/intake/submissions"
+    timeout: int = 30
+    service_machine_token: Optional[str] = None
+
+    @property
+    def submit_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}{self.submit_path}"
+
+
 class RunsConfig(BaseModel):
     enabled: bool = True
 
@@ -113,10 +125,15 @@ class RegistryConfig(BaseModel):
 
 class ServiceConfig(BaseModel):
     workspace_base_dir: str = "/data/files"
-    # 0 means unlimited / disabled. We deliberately avoid framework-side
-    # timeout enforcement for the Pi process unless a caller explicitly opts in.
+    # Deprecated compatibility field. Service-side run_vuln_scan.py process
+    # timeout enforcement is disabled; only explicit user cancel/delete stops it.
     default_execution_timeout_seconds: int = 0
     execution_cancel_check_interval_seconds: int = 1
+    # run_vuln_scan.py can keep working while the API pod or mounted storage has
+    # short heartbeat stalls. Treat the process as lost only after a long grace
+    # window so transient network/storage jitter does not incorrectly invite
+    # users to resume an already-running scan.
+    process_heartbeat_stale_after_seconds: int = 300
     trigger_retry_limit: int = 0
     public_api_prefix: str = "/api/dataflow-vuln-scanner"
     default_entry_task_type: str = "package_list"
@@ -127,12 +144,15 @@ class ServiceConfig(BaseModel):
 
 class SchedulerConfig(BaseModel):
     enabled: bool = True
+    # standalone keeps the historical single-pod behavior.  manager serves API
+    # traffic only; worker performs queue heartbeats and execution.
+    role: str = Field(default_factory=lambda: os.getenv("SECFLOW_DATAFLOW_ROLE") or os.getenv("ROLE") or "standalone")
     pod_id: str = Field(default_factory=lambda: os.getenv("POD_ID") or os.getenv("HOSTNAME") or "local-pod")
     host_name: str = Field(default_factory=lambda: os.getenv("HOSTNAME") or "localhost")
-    worker_capacity: int = 2
+    worker_capacity: int = 1
     poll_interval_seconds: int = 2
     heartbeat_interval_seconds: int = 5
-    worker_timeout_seconds: int = 20
+    worker_timeout_seconds: int = 300
     cleanup_interval_seconds: int = 10
 
 
@@ -148,6 +168,7 @@ class Config(BaseModel):
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     fileserver_service: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
     configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
+    vuln_engine_service: VulnEngineServiceConfig = Field(default_factory=VulnEngineServiceConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)

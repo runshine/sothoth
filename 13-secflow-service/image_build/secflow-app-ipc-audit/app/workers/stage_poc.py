@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -13,9 +14,11 @@ from app.workers.runner import (
     StageHooks,
     build_codex_exec_command,
     build_opencode_exec_command,
+    build_opencode_process_env,
     command_line_string,
     copy_file,
     extract_opencode_session_id,
+    opencode_env_summary,
     opencode_last_event_is_error,
     resolve_executor_mode,
     resolve_executor_model,
@@ -59,6 +62,7 @@ def run_poc_stage(context: StageContext, hooks: StageHooks, *, source_audit_repo
         output_report_path=_attempt_output_report(context),
         output_json_path=_attempt_output_json(context),
         report_language=str(context.effective_config.get("report_language") or "zh-CN"),
+        qemu_instance_name=_poc_qemu_instance_name(context),
     )
     write_text_file(prompt_path, prompt)
 
@@ -170,6 +174,9 @@ def _run_mock_stage(
         json.dumps(
             {
                 "project": context.project_path,
+                "vulnerabilities_found": 0,
+                "pocs_developed": 0,
+                "info_findings": 0,
                 "audit_findings_total": 0,
                 "poc_confirmed_problem_count": 0,
                 "poc_built_success_count": 0,
@@ -357,6 +364,7 @@ def _run_opencode_stage(
 ) -> StageExecutionResult:
     workspace_output_report = _attempt_output_report(context)
     workspace_output_json = _attempt_output_json(context)
+    opencode_env = build_opencode_process_env(context)
     cmd = build_opencode_exec_command(
         prompt,
         repo_root=context.repo_root,
@@ -373,6 +381,8 @@ def _run_opencode_stage(
             f"Model: {executor_model or '(default)'}",
             f"Output PoC report path: {workspace_output_report}",
             f"Output audited result json path: {workspace_output_json}",
+            "=== opencode environment ===",
+            opencode_env_summary(opencode_env),
             "=== command ===",
             command_line_string(cmd),
             "=== prompt ===",
@@ -389,6 +399,7 @@ def _run_opencode_stage(
         hooks=hooks,
         timeout_seconds=int(get_config().execution.task_timeout_seconds),
         mirror_output_paths=[events_path],
+        env=opencode_env,
     )
     retry_count = 0
     total_duration = result.duration_seconds
@@ -432,6 +443,8 @@ def _run_opencode_stage(
                 f"Previous return code: {previous_return_code}",
                 f"Output PoC report path: {workspace_output_report}",
                 f"Output audited result json path: {workspace_output_json}",
+                "=== opencode environment ===",
+                opencode_env_summary(opencode_env),
                 "=== command ===",
                 command_line_string(retry_cmd),
                 "=== retry prompt ===",
@@ -449,6 +462,7 @@ def _run_opencode_stage(
             timeout_seconds=int(get_config().execution.task_timeout_seconds),
             mirror_output_paths=[events_path],
             append=True,
+            env=opencode_env,
         )
         total_duration += result.duration_seconds
     session_files = [prompt_path]
@@ -554,6 +568,7 @@ def _build_prompt(
     output_report_path: Path,
     output_json_path: Path,
     report_language: str,
+    qemu_instance_name: str,
 ) -> str:
     language_line = "PoC report language: 简体中文."
     if report_language and report_language.lower() not in {"zh-cn", "zh_hans", "zh"}:
@@ -567,6 +582,8 @@ def _build_prompt(
             f"Output PoC report path: {output_report_path}",
             f"Output audited result json path: {output_json_path}",
             language_line + " Do not translate code blocks, paths, identifiers, or classification tokens.",
+            "",
+            _build_in_container_qemu_prompt(qemu_instance_name),
             "",
             _POC_WORKFLOW_PROMPT,
         ]
@@ -596,9 +613,78 @@ def _build_missing_poc_output_retry_prompt(
             "",
             reason_text,
             "Do not restart the task or ask for clarification. Continue from the existing session context.",
+            "Keep using the in-container QEMU/HDC workflow from the original prompt; do not call ohemu-container.sh, docker run, docker exec, or docker compose.",
             "Inspect or build more only if needed, then create parent directories and write both required output files exactly to the required paths.",
             "Before your final response, verify that both files exist and are non-empty.",
             "The JSON file must include the required per-project statistics fields, even when all counts are zero.",
+        ]
+    )
+
+
+def _poc_qemu_instance_name(context: StageContext) -> str:
+    raw = context.task_id.replace("ipc-audit-task-", "")
+    safe = "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in raw).strip("-")
+    return f"ipc-audit-{(safe or 'task')[:20]}"
+
+
+def _env_value(name: str, default: str) -> str:
+    value = str(os.environ.get(name) or "").strip()
+    return value or default
+
+
+def _build_in_container_qemu_prompt(qemu_instance_name: str) -> str:
+    hdc_bin = _env_value("HDC_BIN", "/workspace/openharmony_6_1/vendor/edu/docker/src/hdc")
+    helper_bin = _env_value("OHEMU_HELPER_BIN", "/usr/local/bin/ipc-audit-qemu")
+    workspace_root = _env_value("OHEMU_WORKSPACE_ROOT", "/workspace/openharmony_6_1")
+    qcow2_root = _env_value(
+        "OHEMU_QCOW2_PREPARED_ROOT",
+        f"{workspace_root}/vendor/edu/docker/volumes/qcow2_cache",
+    )
+    runtime_root = _env_value("OHEMU_RUNTIME_ROOT", "/var/lib/secflow-ipc-audit/ohemu")
+    overlay_root = f"{runtime_root}/runtime/instances/{qemu_instance_name}"
+    arch = _env_value("OHEMU_ARCH", "arm64")
+    network_mode = _env_value("OHEMU_NETWORK_MODE", "bridge")
+    hdc_bind = _env_value("OHEMU_HDC_BIND", "127.0.0.1")
+    hdc_port = _env_value("OHEMU_HDC_BASE_PORT", "55555")
+    boot_dir = _env_value("OHEMU_BOOT_DIR", f"{qcow2_root}/{arch}/boot")
+    ohemu_src = _env_value("OHEMU_SRC_DIR", f"{workspace_root}/vendor/edu/docker/src")
+    return "\n".join(
+        [
+            "Container PoC runtime rules:",
+            "- You are already inside the secflow-app-ipc-audit container.",
+            "- Do not start an additional service/OHEMU Docker container. Do not call ohemu-container.sh, docker run, docker exec, or docker compose.",
+            f"- Use the in-container QEMU helper: {helper_bin}",
+            f"- The helper sources OpenHarmony QEMU scripts from: {ohemu_src}",
+            f"- OpenHarmony workspace root: {workspace_root}",
+            f"- Prepared qcow2 root: {qcow2_root}",
+            f"- Default boot dir: {boot_dir}",
+            f"- QEMU runtime/state root: {runtime_root}",
+            f"- Per-task overlay disk root: {overlay_root}",
+            f"- Default QEMU arch/network: {arch}/{network_mode}",
+            f"- Default HDC endpoint in this container: {hdc_bind}:{hdc_port}",
+            f"- HDC binary: {hdc_bin}",
+            f"- Preferred instance name for this task: {qemu_instance_name}",
+            "",
+            "Use these commands when runtime testing is needed:",
+            f"  {helper_bin} list",
+            f"  {helper_bin} ensure {qemu_instance_name}",
+            f"  {hdc_bin} tconn {hdc_bind}:<HDC_PORT_FROM_HELPER_LIST>",
+            f"  {hdc_bin} list targets",
+            "",
+            "Network rules:",
+            f"- In bridge mode, the guest normally receives a 192.168.111.x address and {helper_bin} starts socat to forward {hdc_bind}:<HDC_PORT> to <GUEST_IP>:55555.",
+            "- Prefer the HDC endpoint printed by the helper or recorded in the runtime/state/*.env file; do not guess the IP/port.",
+            "- The helper waits for the helper-reported HDC endpoint to become Connected before returning, unless OHEMU_WAIT_FOR_HDC_READY=0 is explicitly set.",
+            "- If bridge setup is unavailable, usermode may show a 20.20.20.x guest IP and QEMU hostfwd may listen before hdcd is ready; still use the helper-reported HDC endpoint and wait for Connected.",
+            "",
+            "Disk safety rules:",
+            f"- QEMU must run only with per-task overlay qcow2 files under {overlay_root}.",
+            f"- The prepared base qcow2 files under {qcow2_root}/{arch}/base are backing files only; do not write to them.",
+            "- Do not run QEMU directly on OpenHarmony out/*/images/*.img, prepared base qcow2 files, or any shared qcow2 cache file.",
+            "- If overlay creation fails or no per-task overlay exists, classify runtime verification as BLOCKED_ENV instead of running on the shared images.",
+            "",
+            "Read the HDC port from the helper output or from the state file under the runtime/state directory; do not assume guest-side port 5555 is the host-connect port.",
+            "If the helper, qemu binary, mounted workspace, prepared qcow2 cache, boot images, or hdc binary is missing, classify runtime verification as BLOCKED_ENV and record the exact failing command and output.",
         ]
     )
 
@@ -658,9 +744,9 @@ Validation workflow:
 PoC workflow when feasible:
 1. Derive the minimal trigger details: target SA/service, how to obtain IRemoteObject, request code, interface token, parameter order, and malformed payload.
 2. Prefer a small standalone native PoC source under a task-local or repo-local audit directory. Keep it focused and do not add/modify GN targets by default.
-3. Prefer host-side manual clang++ compilation from existing out/<product> metadata when available. Use existing obj/**/<target>.ninja, *_module_info.json, packaged .so files, and generated sources instead of running GN.
+3. Prefer manual clang++ compilation inside the current container from existing out/<product> metadata when available. Use existing obj/**/<target>.ninja, *_module_info.json, packaged .so files, and generated sources instead of running GN.
 4. If the current build outputs do not contain enough metadata/generated code/libraries, record BLOCKED_ENV or CONFIRMED_NO_POC with exact missing prerequisites instead of modifying BUILD.gn.
-5. If runtime testing is possible, boot or reuse OHEMU, connect with hdc, deploy the PoC, run it, and collect stdout/stderr, hilog, tombstone/faultlogger, or service death/restart evidence.
+5. If runtime testing is possible, use the in-container QEMU helper from the runtime rules above to boot or reuse OHEMU/QEMU inside the current container, connect with hdc, deploy the PoC, run it, and collect stdout/stderr, hilog, tombstone/faultlogger, or service death/restart evidence.
 6. If the PoC builds but does not crash after one minimal adjustment, classify as CONFIRMED_BUT_NOT_REPRODUCED and record evidence.
 
 PoC report requirements:
@@ -668,13 +754,16 @@ PoC report requirements:
 - Preserve code, paths, commands, logs, return codes, GN targets, identifiers, and classification tokens verbatim.
 - Include Source report path and short summary.
 - Include Issue validation for every issue with classification and code evidence.
-- Include PoC design, build commands/results, runtime commands/results, selected OHEMU container/HDC port if used, and limitations.
+- Include PoC design, build commands/results, runtime commands/results, selected in-container QEMU instance/HDC port if used, and limitations.
 - If no PoC was attempted, explain why using the classification evidence.
 
 JSON stats requirements:
 - Write valid JSON to Output audited result json path.
 - Use this stable schema:
 {
+  "vulnerabilities_found": 0,
+  "pocs_developed": 0,
+  "info_findings": 0,
   "report": {
     "project_report": "<Project report>",
     "poc_report": "<Output PoC report path>"
@@ -687,6 +776,9 @@ JSON stats requirements:
   },
   "notes": []
 }
+- vulnerabilities_found counts confirmed real vulnerability findings, including CONFIRMED_POC_FEASIBLE, CONFIRMED_NO_POC, and CONFIRMED_BUT_NOT_REPRODUCED.
+- pocs_developed counts generated PoC programs/scripts/binaries.
+- info_findings counts informational findings, environmental blockers, unresolved items, or non-vulnerability observations worth surfacing.
 - audit_findings_total counts issues described in Project report.
 - poc_confirmed_problem_count counts confirmed real problems, including CONFIRMED_POC_FEASIBLE, CONFIRMED_NO_POC, and CONFIRMED_BUT_NOT_REPRODUCED.
 - poc_generated_count counts generated PoC programs/scripts/binaries.

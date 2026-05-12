@@ -44,6 +44,12 @@ class TaskCreate(BaseModel):
     elf_tasks: list[ElfTaskInput]
 
 
+class B2SServiceConfig(BaseModel):
+    project_id: str
+    budget_exhausted_action: Literal["treat_as_passed", "treat_as_failed"] = "treat_as_passed"
+    updated_at: Optional[str] = None
+
+
 class RetryRequest(BaseModel):
     item_ids: Optional[list[str]] = None
 
@@ -183,6 +189,50 @@ class TaskItemAdvancedResponse(BaseModel):
     ida_files: list[AdvancedFile] = Field(default_factory=list)
 
 
+class B2SArtifact(BaseModel):
+    id: str
+    name: str
+    path: str
+    relative_path: str
+    kind: str
+    size: int = 0
+    stage: Optional[str] = None
+    stage_order: Optional[int] = None
+    section: Optional[str] = None
+    section_order: Optional[int] = None
+    round: Optional[str] = None
+    round_order: Optional[int] = None
+    agent: Optional[str] = None
+    role: Optional[str] = None
+    batch_no: Optional[int] = None
+    attempt_no: Optional[int] = None
+    content_url: str
+
+
+class TaskItemArtifactsResponse(BaseModel):
+    task_id: str
+    item_id: str
+    output_dir: str
+    work_dir: Optional[str] = None
+    artifacts: list[B2SArtifact] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+
+
+class B2SArtifactContentResponse(BaseModel):
+    artifact_id: str
+    name: str
+    path: str
+    kind: str
+    mime_type: str = "text/plain"
+    encoding: str = "utf-8"
+    size: int = 0
+    offset: int = 0
+    limit: int = 0
+    content: str = ""
+    truncated: bool = False
+    next_offset: Optional[int] = None
+
+
 class TaskListResponse(BaseModel):
     total: int
     items: list[TaskResponse]
@@ -190,24 +240,36 @@ class TaskListResponse(BaseModel):
 
 class ReviewAnalyticsAttempt(BaseModel):
     attempt_no: int
+    label: Optional[str] = None
     verdict: str = "UNKNOWN"
+    verdict_label: Optional[str] = None
     total_functions: int = 0
     verified_functions: int = 0
     blocking_issues: int = 0
     warnings: int = 0
     semantic_score: int = 0
     confidence: int = 0
+    quality_score: int = 0
+    issues_discovered: int = 0
+    issues_resolved: int = 0
+    issues_open_after_attempt: int = 0
+    status_label: Optional[str] = None
 
 
 class ReviewAnalyticsIssue(BaseModel):
     id: str
     label: str
+    display_label: Optional[str] = None
+    description: Optional[str] = None
     function: str = "global"
     category: str = "Semantic"
+    category_label: Optional[str] = None
     severity: str = "blocking"
+    severity_label: Optional[str] = None
     introduced_attempt: int
     resolved_attempt: Optional[int] = None
     status: str = "remaining"
+    status_label: Optional[str] = None
 
 
 class ReviewAnalyticsFunctionAttempt(BaseModel):
@@ -233,21 +295,86 @@ class ReviewAnalyticsRadar(BaseModel):
 
 class ReviewAnalyticsSummary(BaseModel):
     attempts: int = 0
+    attempt_count: int = 0
     final_verdict: str = "UNKNOWN"
+    final_verdict_label: Optional[str] = None
     final_confidence: int = 0
+    final_quality_score: int = 0
+    final_quality_label: Optional[str] = None
+    initial_quality_score: int = 0
+    quality_delta: int = 0
+    quality_delta_percent: int = 0
+    issue_total: int = 0
+    issue_resolved: int = 0
+    issue_remaining: int = 0
     issue_closure_rate: float = 0
     residual_risk: str = "unknown"
+    residual_risk_label: Optional[str] = None
     mock: bool = False
+
+
+class ReviewAnalyticsMeta(BaseModel):
+    schema_version: str = "review_analytics.v2"
+    scoring_version: str = "b2s_quality.v1"
+    source: str = "validator_verdict"
+    data_quality: str = "estimated"
+    generated_at: Optional[str] = None
+    mock: bool = False
+
+
+class ReviewAnalyticsTrendPoint(BaseModel):
+    attempt_no: int
+    label: str
+    score: int
+
+
+class ReviewAnalyticsTrendSeries(BaseModel):
+    key: str
+    label: str
+    color_hint: Optional[str] = None
+    points: list[ReviewAnalyticsTrendPoint] = Field(default_factory=list)
+
+
+class ReviewAnalyticsTrendInsight(BaseModel):
+    title: str = "逐轮质量趋势"
+    conclusion: str = "暂无足够轮次数据生成趋势结论。"
+    tone: str = "neutral"
+    primary_metric: str = "质量分"
+    first_score: int = 0
+    final_score: int = 0
+    delta: int = 0
+    series: list[ReviewAnalyticsTrendSeries] = Field(default_factory=list)
+
+
+class ReviewAnalyticsDimension(BaseModel):
+    key: str
+    label: str
+    score: int = 0
+    initial_score: int = 0
+    delta: int = 0
+    delta_percent: int = 0
+    level: str = "unknown"
+    level_label: str = "未知"
+    description: str = ""
+    formula: Optional[str] = None
+    color_hint: Optional[str] = None
+    points: list[ReviewAnalyticsTrendPoint] = Field(default_factory=list)
+    components: dict[str, int] = Field(default_factory=dict)
 
 
 class ReviewAnalyticsResponse(BaseModel):
     task_id: str
     item_id: str
+    status: str = "ready"
+    meta: ReviewAnalyticsMeta = Field(default_factory=ReviewAnalyticsMeta)
     summary: ReviewAnalyticsSummary
     attempts: list[ReviewAnalyticsAttempt] = Field(default_factory=list)
     issues: list[ReviewAnalyticsIssue] = Field(default_factory=list)
+    dimensions: list[ReviewAnalyticsDimension] = Field(default_factory=list)
+    trend: Optional[ReviewAnalyticsTrendInsight] = None
     function_matrix: list[ReviewAnalyticsFunction] = Field(default_factory=list)
     radar: list[ReviewAnalyticsRadar] = Field(default_factory=list)
+    trend_insight: Optional[ReviewAnalyticsTrendInsight] = None
 
 
 class LlmProviderSummary(BaseModel):

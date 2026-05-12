@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 ReviewProfileName = Literal["fast", "balanced", "audit"]
@@ -52,12 +55,22 @@ class ReviewScoreThresholdPolicy:
 _THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = ("low", "medium", "high", "xhigh")
 
 _MODEL_THINKING_LEVELS: dict[str, tuple[ThinkingLevel, ...]] = {
-    "icsl/zai-org/glm-5": ("low", "medium", "high"),
+    "icsl/zai-org/glm-5": ("medium", "high", "xhigh"),
 }
 
 _MODEL_PREFIX_THINKING_LEVELS: tuple[tuple[str, tuple[ThinkingLevel, ...]], ...] = (
     ("openai/gpt-", ("low", "medium", "high", "xhigh")),
     ("anthropic/", ("low", "medium", "high", "xhigh")),
+)
+
+_PI_MODELS_REASONING_DEFAULT_LEVELS: tuple[ThinkingLevel, ...] = ("medium", "high", "xhigh")
+_PI_MODELS_LEVEL_KEYS = (
+    "thinking_levels",
+    "thinkingLevels",
+    "supported_thinking_levels",
+    "supportedThinkingLevels",
+    "reasoning_levels",
+    "reasoningLevels",
 )
 
 
@@ -150,7 +163,7 @@ _PROFILE_POLICIES: dict[str, ReviewProfilePolicy] = {
         allow_summary_only_evidence=False,
         default_max_review_cycles=10,
         max_worker_turns_per_cycle=260,
-        reflection_passes_per_cycle=3,
+        reflection_passes_per_cycle=1,
         reflection_max_internal_turns=0,
         reflection_rpc_stdout_trace_bytes=2 * 1024 * 1024,
         reflection_rpc_stdout_abort_bytes=0,
@@ -313,10 +326,114 @@ def get_review_profile_policy(value: str | None) -> ReviewProfilePolicy:
     return _PROFILE_POLICIES[normalize_review_profile(value)]
 
 
+def _normalize_thinking_levels(value: Any) -> tuple[ThinkingLevel, ...]:
+    raw_levels: list[Any]
+    if isinstance(value, str):
+        raw_levels = [item.strip() for item in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        raw_levels = list(value)
+    else:
+        return ()
+
+    levels: list[ThinkingLevel] = []
+    for raw in raw_levels:
+        normalized = str(raw or "").strip().lower().replace("-", "")
+        if normalized == "xhigh":
+            level: ThinkingLevel = "xhigh"
+        elif normalized in {"low", "medium", "high"}:
+            level = normalized  # type: ignore[assignment]
+        else:
+            continue
+        if level not in levels:
+            levels.append(level)
+    return tuple(level for level in _THINKING_LEVEL_ORDER if level in levels)
+
+
+def _models_json_path() -> Path:
+    explicit_path = str(os.environ.get("PI_MODELS_JSON") or "").strip()
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+    pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
+    return pi_dir / "models.json"
+
+
+def _model_reasoning_levels(model_entry: dict[str, Any]) -> tuple[ThinkingLevel, ...]:
+    for key in _PI_MODELS_LEVEL_KEYS:
+        levels = _normalize_thinking_levels(model_entry.get(key))
+        if levels:
+            return levels
+
+    reasoning = model_entry.get("reasoning")
+    if isinstance(reasoning, dict):
+        for key in ("levels", "thinking_levels", "thinkingLevels", "supportedLevels"):
+            levels = _normalize_thinking_levels(reasoning.get(key))
+            if levels:
+                return levels
+        if reasoning.get("enabled") is False or reasoning.get("supported") is False:
+            return ()
+        if reasoning.get("enabled") is True or reasoning.get("supported") is True:
+            return _PI_MODELS_REASONING_DEFAULT_LEVELS
+    if reasoning is True:
+        return _PI_MODELS_REASONING_DEFAULT_LEVELS
+    if reasoning is False:
+        return ()
+
+    return ()
+
+
+def _pi_models_json_thinking_levels(model: str | None) -> tuple[ThinkingLevel, ...] | None:
+    requested = str(model or "").strip()
+    if not requested:
+        return None
+    normalized_requested = requested.lower()
+    models_path = _models_json_path()
+    try:
+        payload = json.loads(models_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    providers = payload.get("providers") if isinstance(payload, dict) else None
+    if not isinstance(providers, dict):
+        return None
+
+    for provider_key, provider_cfg in providers.items():
+        provider_name = str(provider_key or "").strip()
+        provider_prefix = f"{provider_name}/".lower()
+        provider_matches = normalized_requested.startswith(provider_prefix)
+        requested_model_id = requested[len(provider_name) + 1:] if provider_matches else requested
+        model_entries = provider_cfg.get("models") if isinstance(provider_cfg, dict) else None
+        if not isinstance(model_entries, list):
+            continue
+        for model_entry in model_entries:
+            if isinstance(model_entry, str):
+                model_record = {"id": model_entry}
+            elif isinstance(model_entry, dict):
+                model_record = model_entry
+            else:
+                continue
+            model_id = str(model_record.get("id") or "").strip()
+            model_name = str(model_record.get("name") or "").strip()
+            candidates = {
+                model_id.lower(),
+                model_name.lower(),
+                f"{provider_name}/{model_id}".lower() if model_id else "",
+                f"{provider_name}/{model_name}".lower() if model_name else "",
+            }
+            if provider_matches:
+                candidates.add(requested_model_id.lower())
+                if model_id.lower() == requested_model_id.lower() or model_name.lower() == requested_model_id.lower():
+                    return _model_reasoning_levels(model_record)
+            if normalized_requested in candidates:
+                return _model_reasoning_levels(model_record)
+    return None
+
+
 def supported_thinking_levels_for_model(model: str | None) -> tuple[ThinkingLevel, ...]:
     normalized = str(model or "").strip().lower()
     if not normalized:
         return ()
+    pi_models_levels = _pi_models_json_thinking_levels(model)
+    if pi_models_levels is not None:
+        return pi_models_levels
     if normalized in _MODEL_THINKING_LEVELS:
         return _MODEL_THINKING_LEVELS[normalized]
     for prefix, levels in _MODEL_PREFIX_THINKING_LEVELS:

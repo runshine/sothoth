@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -49,11 +50,148 @@ _TERMINAL_STATUSES = {
 _GENERIC_TERMINAL_STATUSES = {"failed", "error"}
 
 
+def _is_profile_gate_issue(issue: dict[str, Any]) -> bool:
+    issue_id = str(issue.get("id") or "").strip().upper()
+    category = str(issue.get("category") or "").strip().lower()
+    blocking_type = str(issue.get("blocking_type") or "").strip().lower()
+    return (
+        issue_id.startswith("PROFILE-")
+        or category == "coverage_gate"
+        or blocking_type
+        in {
+            "coverage_obligation_open",
+            "summary_only_evidence",
+            "coverage_ledger_under_extracted",
+            "metadata_sync",
+        }
+    )
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def derive_profile_gate_summary(global_review: dict[str, Any], metrics: dict[str, Any] | None = None) -> dict[str, Any]:
+    metrics = metrics or {}
+    provided_gate = global_review.get("profile_gate") if isinstance(global_review.get("profile_gate"), dict) else {}
+    advisor_results = [
+        item for item in (global_review.get("advisor_results") or [])
+        if isinstance(item, dict)
+    ]
+    total_advisors = _safe_int(
+        global_review.get("total_advisor_count")
+        or provided_gate.get("total_advisor_count")
+        or len(advisor_results)
+    )
+    passed_advisors = _safe_int(
+        global_review.get("passed_advisor_count")
+        or provided_gate.get("passed_advisor_count")
+        or len([item for item in advisor_results if item.get("passed", False)])
+    )
+    advisors_all_passed = total_advisors > 0 and passed_advisors == total_advisors
+    issues = [
+        item for item in (global_review.get("issues") or metrics.get("issues") or [])
+        if isinstance(item, dict)
+    ]
+    profile_issues = [dict(item) for item in issues if _is_profile_gate_issue(item)]
+    if not profile_issues:
+        profile_issues = [
+            dict(item) for item in (provided_gate.get("issues") or [])
+            if isinstance(item, dict)
+        ]
+    feedback = str(
+        global_review.get("feedback_preview")
+        or provided_gate.get("feedback_preview")
+        or metrics.get("global_feedback_preview")
+        or ""
+    )
+    feedback_mentions_gate = (
+        "框架范围验收硬门槛未通过" in feedback
+        or "[profile_min_discovery_cycles]" in feedback
+        or "PROFILE-" in feedback
+        or "coverage gate" in feedback.lower()
+    )
+    global_passed = bool(global_review.get("passed", False))
+    failed = (not global_passed) and (
+        bool(provided_gate.get("failed"))
+        or bool(profile_issues)
+        or feedback_mentions_gate
+        or str(global_review.get("aggregate_status") or "") == "profile_gate_failed"
+    )
+    status = "failed" if failed else "passed" if global_passed else "not_applicable"
+    return {
+        "status": status,
+        "failed": failed,
+        "passed": global_passed and not failed,
+        "advisor_all_passed": advisors_all_passed,
+        "passed_advisor_count": passed_advisors,
+        "total_advisor_count": total_advisors,
+        "feedback_preview": feedback[:500],
+        "issue_count": len(profile_issues),
+        "issues": profile_issues,
+    }
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _issue_record_from_ledger_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    issue = entry.get("issue") if isinstance(entry.get("issue"), dict) else {}
+    record = dict(issue)
+    issue_ids = [str(item).strip() for item in (entry.get("issue_ids") or []) if str(item).strip()]
+    advisor_ids = [str(item).strip() for item in (entry.get("advisor_ids") or []) if str(item).strip()]
+    if not record.get("id"):
+        record["id"] = issue_ids[0] if issue_ids else str(entry.get("signature") or "")
+    record.setdefault("signature", str(entry.get("signature") or ""))
+    record.setdefault("semantic_key", str(entry.get("semantic_key") or ""))
+    record.setdefault("first_seen_cycle", _safe_int(entry.get("first_seen_cycle")))
+    record.setdefault("last_seen_cycle", _safe_int(entry.get("last_seen_cycle")))
+    record.setdefault("seen_count", _safe_int(entry.get("seen_count")))
+    record.setdefault("consecutive_count", _safe_int(entry.get("consecutive_count")))
+    if entry.get("actionable_by") and not record.get("actionable_by"):
+        record["actionable_by"] = str(entry.get("actionable_by") or "")
+    if entry.get("blocking_type") and not record.get("blocking_type"):
+        record["blocking_type"] = str(entry.get("blocking_type") or "")
+    if entry.get("acceptance_criteria") and not record.get("acceptance_criteria"):
+        record["acceptance_criteria"] = str(entry.get("acceptance_criteria") or "")
+    if advisor_ids and not record.get("advisor_id"):
+        record["advisor_id"] = ",".join(advisor_ids)
+    return record
+
+
+def load_active_issue_records_from_ledger(atomic: str | Path) -> list[dict[str, Any]] | None:
+    ledger_file = Path(atomic) / "_meta" / "issue_ledger.json"
+    if not ledger_file.is_file():
+        return None
+    ledger = _read_json(ledger_file)
+    if not isinstance(ledger.get("entries"), list):
+        return None
+    entries = [
+        item for item in ledger.get("entries", [])
+        if isinstance(item, dict) and bool(item.get("active")) and not bool(item.get("resolved"))
+    ]
+    entries.sort(
+        key=lambda item: (
+            -_safe_int(item.get("last_seen_cycle")),
+            -_safe_int(item.get("seen_count")),
+            str(item.get("signature") or ""),
+        )
+    )
+    return [_issue_record_from_ledger_entry(item) for item in entries]
 
 
 def _read_text(path: Path, max_bytes: int = 0) -> str:
@@ -728,8 +866,157 @@ def _load_manifest_summary(atomic: Path) -> dict[str, Any]:
     }
 
 
+_CHECKPOINT_PHASE_ORDER = {
+    "worker": 10,
+    "reflect": 20,
+    "summary": 30,
+    "global_review": 40,
+    "result_review": 50,
+}
+
+
+def _load_current_step_checkpoint(atomic: Path) -> dict[str, Any]:
+    payload = _read_json(atomic / "_meta" / "checkpoints" / "current_step.json")
+    if not payload:
+        return {}
+    return _enrich_checkpoint_timing({
+        **payload,
+        "path": "_meta/checkpoints/current_step.json",
+    })
+
+
+def _enrich_checkpoint_timing(item: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(item)
+    started_epoch = _safe_float(payload.get("started_epoch"))
+    finished_epoch = _safe_float(payload.get("finished_epoch"))
+    status = str(payload.get("status") or "").strip().lower()
+    if started_epoch > 0 and finished_epoch <= 0 and status in {"started", "running"}:
+        payload["elapsed_seconds"] = max(int(time.time() - started_epoch), 0)
+    return payload
+
+
+def _checkpoint_identity(item: dict[str, Any]) -> tuple[int, str, str, str]:
+    return (
+        _safe_int(item.get("cycle")),
+        str(item.get("phase") or ""),
+        str(item.get("step_key") or ""),
+        str(item.get("status") or ""),
+    )
+
+
+def _collect_step_checkpoints(atomic: Path, limit: int = 240) -> list[dict[str, Any]]:
+    steps_root = atomic / "_meta" / "checkpoints" / "steps"
+    if not steps_root.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for checkpoint_path in steps_root.rglob("*.json"):
+        payload = _read_json(checkpoint_path)
+        if not payload:
+            continue
+        try:
+            mtime = checkpoint_path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        items.append(
+            _enrich_checkpoint_timing({
+                **payload,
+                "path": _rel_to_atomic(checkpoint_path, atomic),
+                "mtime": mtime,
+            })
+        )
+    items.sort(
+        key=lambda item: (
+            int(item.get("cycle") or 0),
+            _CHECKPOINT_PHASE_ORDER.get(str(item.get("phase") or ""), 90),
+            str(item.get("step_key") or ""),
+            float(item.get("mtime") or 0.0),
+        )
+    )
+    return items[-limit:]
+
+
+def _collect_cycle_timing(step_history: list[dict[str, Any]], current_step: dict[str, Any] | None = None) -> dict[str, Any]:
+    now_epoch = time.time()
+    items = [item for item in step_history if isinstance(item, dict)]
+    if current_step:
+        current_identity = _checkpoint_identity(current_step)
+        if current_identity and not any(_checkpoint_identity(item) == current_identity for item in items):
+            items.append(current_step)
+
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for item in items:
+        cycle = _safe_int(item.get("cycle"))
+        if cycle <= 0:
+            continue
+        if _safe_float(item.get("started_epoch")) <= 0:
+            continue
+        grouped.setdefault(cycle, []).append(item)
+
+    timing: dict[str, Any] = {}
+    for cycle, cycle_items in sorted(grouped.items()):
+        starts = [_safe_float(item.get("started_epoch")) for item in cycle_items]
+        starts = [value for value in starts if value > 0]
+        if not starts:
+            continue
+        finishes = [_safe_float(item.get("finished_epoch")) for item in cycle_items]
+        finishes = [value for value in finishes if value > 0]
+        running_items = [
+            item for item in cycle_items
+            if str(item.get("status") or "").strip().lower() in {"started", "running"}
+            and _safe_float(item.get("finished_epoch")) <= 0
+        ]
+        started_epoch = min(starts)
+        finished_epoch = max(finishes) if finishes else 0.0
+        running = bool(running_items)
+        entry: dict[str, Any] = {
+            "cycle": cycle,
+            "started_epoch": started_epoch,
+            "started_at": min((str(item.get("started_at") or "") for item in cycle_items if item.get("started_at")), default=""),
+            "finished_at": "",
+            "node_count": len(cycle_items),
+            "running": running,
+        }
+        if running:
+            entry["elapsed_seconds"] = max(int(now_epoch - started_epoch), 0)
+        elif finished_epoch > 0:
+            entry["finished_epoch"] = finished_epoch
+            entry["finished_at"] = max((str(item.get("finished_at") or "") for item in cycle_items if item.get("finished_at")), default="")
+            entry["duration_seconds"] = max(int(round(finished_epoch - started_epoch)), 0)
+        timing[str(cycle)] = entry
+    return timing
+
+
 def _rel_to_atomic(path: Path, atomic: Path) -> str:
     return str(path.relative_to(atomic))
+
+
+_RESULT_MARKDOWN_RE = re.compile(r"^result_\d+\.md$")
+_RESULT_CYCLE_DIR_RE = re.compile(r"cycle_(\d+)$")
+
+
+def _result_filename_from_review(result_dir: Path, payload: dict[str, Any]) -> str:
+    filename = str(payload.get("result_file") or f"{result_dir.name}.md").strip()
+    if filename and not filename.endswith(".md"):
+        filename = f"{filename}.md"
+    return filename
+
+
+def _extract_markdown_title(path: Path) -> str:
+    for line in _read_text(path, max_bytes=600).splitlines():
+        if line.startswith("#"):
+            return re.sub(r"^#+\s*", "", line).strip()
+    return ""
+
+
+def _result_manifest_entries_by_name(atomic: Path) -> dict[str, dict[str, Any]]:
+    results_manifest = _read_json(atomic / "_meta" / "results_manifest.json")
+    relations_manifest = _read_json(atomic / "_meta" / "result_relations_manifest.json")
+    entries = results_manifest.get("entries") or relations_manifest.get("relationships") or []
+    return {
+        str(item.get("filename") or ""): item
+        for item in entries
+        if isinstance(item, dict)
+    }
 
 
 def _collect_results(atomic: Path) -> list[dict[str, Any]]:
@@ -738,14 +1025,7 @@ def _collect_results(atomic: Path) -> list[dict[str, Any]]:
         results_dir = atomic / "final_output" / "results"
     if not results_dir.is_dir():
         return []
-    results_manifest = _read_json(atomic / "_meta" / "results_manifest.json")
-    relations_manifest = _read_json(atomic / "_meta" / "result_relations_manifest.json")
-    entries = results_manifest.get("entries") or relations_manifest.get("relationships") or []
-    entry_by_name = {
-        str(item.get("filename") or ""): item
-        for item in entries
-        if isinstance(item, dict)
-    }
+    entry_by_name = _result_manifest_entries_by_name(atomic)
     results: list[dict[str, Any]] = []
     for file_path in sorted(results_dir.glob("result_*.md")):
         review_dir = atomic / "reviews" / "results" / file_path.stem
@@ -759,11 +1039,7 @@ def _collect_results(atomic: Path) -> list[dict[str, Any]]:
                     break
                 if latest_review:
                     break
-        title = ""
-        for line in _read_text(file_path, max_bytes=600).splitlines():
-            if line.startswith("#"):
-                title = re.sub(r"^#+\s*", "", line).strip()
-                break
+        title = _extract_markdown_title(file_path)
         manifest_entry = entry_by_name.get(file_path.name, {})
         results.append(
             {
@@ -817,6 +1093,108 @@ def _collect_removed_results(atomic: Path) -> list[dict[str, Any]]:
             }
         )
     return removed
+
+
+def collect_new_results_by_cycle(atomic: str | Path) -> dict[int, list[dict[str, Any]]]:
+    atomic_path = Path(atomic)
+    result_root = atomic_path / "reviews" / "results"
+    if not result_root.is_dir():
+        return {}
+
+    first_reviews: dict[str, dict[str, Any]] = {}
+    latest_reviews: dict[str, dict[str, Any]] = {}
+    for result_dir in sorted(item for item in result_root.iterdir() if item.is_dir()):
+        for cycle_dir in sorted(item for item in result_dir.iterdir() if item.is_dir()):
+            match = _RESULT_CYCLE_DIR_RE.match(cycle_dir.name)
+            dir_cycle = _safe_int(match.group(1)) if match else 0
+            for review_file in sorted(cycle_dir.glob("*.json")):
+                payload = _read_json(review_file)
+                filename = _result_filename_from_review(result_dir, payload)
+                if not _RESULT_MARKDOWN_RE.match(filename):
+                    continue
+                review_cycle = _safe_int(payload.get("cycle"), dir_cycle)
+                if review_cycle <= 0:
+                    review_cycle = dir_cycle
+                if review_cycle <= 0:
+                    continue
+                review_item = {
+                    "filename": filename,
+                    "cycle": review_cycle,
+                    "path": _rel_to_atomic(review_file, atomic_path),
+                    "passed": payload.get("passed"),
+                    "verdict": str(payload.get("verdict") or ""),
+                    "confidence": _safe_float(payload.get("confidence")),
+                }
+                first_key = (
+                    _safe_int(first_reviews.get(filename, {}).get("cycle"), default=10**9),
+                    str(first_reviews.get(filename, {}).get("path") or ""),
+                )
+                current_key = (review_cycle, review_item["path"])
+                if filename not in first_reviews or current_key < first_key:
+                    first_reviews[filename] = review_item
+                latest_key = (
+                    _safe_int(latest_reviews.get(filename, {}).get("cycle")),
+                    str(latest_reviews.get(filename, {}).get("path") or ""),
+                )
+                if filename not in latest_reviews or current_key >= latest_key:
+                    latest_reviews[filename] = review_item
+
+    active_by_name = {str(item.get("filename") or ""): item for item in _collect_results(atomic_path)}
+    removed_by_name: dict[str, dict[str, Any]] = {}
+    for item in _collect_removed_results(atomic_path):
+        filename = str(item.get("filename") or "")
+        if not filename:
+            continue
+        previous = removed_by_name.get(filename)
+        if previous is None or _safe_int(item.get("cycle")) >= _safe_int(previous.get("cycle")):
+            removed_by_name[filename] = item
+    manifest_by_name = _result_manifest_entries_by_name(atomic_path)
+
+    by_cycle: dict[int, list[dict[str, Any]]] = {}
+    for filename, first in first_reviews.items():
+        latest = latest_reviews.get(filename, first)
+        active = active_by_name.get(filename, {})
+        removed = removed_by_name.get(filename, {})
+        manifest = manifest_by_name.get(filename, {})
+        path = str(active.get("path") or removed.get("path") or "")
+        title = str(active.get("title") or "")
+        if not title and path:
+            markdown_path = atomic_path / path
+            if markdown_path.is_file():
+                title = _extract_markdown_title(markdown_path)
+        is_removed = bool(removed)
+        lifecycle_status = str(
+            active.get("lifecycle_status")
+            or removed.get("lifecycle_status")
+            or manifest.get("lifecycle_status")
+            or ("inactive" if is_removed else "")
+        )
+        candidate = {
+            "filename": filename,
+            "title": title,
+            "path": path,
+            "first_seen_cycle": _safe_int(first.get("cycle")),
+            "first_review_path": str(first.get("path") or ""),
+            "first_review_verdict": str(first.get("verdict") or ""),
+            "first_review_passed": first.get("passed"),
+            "first_review_confidence": _safe_float(first.get("confidence")),
+            "current_review_cycle": _safe_int(latest.get("cycle")),
+            "current_verdict": str(latest.get("verdict") or active.get("verdict") or ""),
+            "current_passed": latest.get("passed") if "passed" in latest else active.get("passed"),
+            "current_confidence": _safe_float(latest.get("confidence", active.get("confidence", 0))),
+            "active": bool(active.get("active", manifest.get("active", not is_removed))) and not is_removed,
+            "taskable": bool(active.get("taskable", manifest.get("taskable", not is_removed))) and not is_removed,
+            "lifecycle_status": lifecycle_status,
+            "removed": is_removed,
+            "removed_cycle": _safe_int(removed.get("cycle")) if is_removed else 0,
+            "vulnerability_headings": list(active.get("vulnerability_headings") or manifest.get("vulnerability_headings") or []),
+            "related_to": str(active.get("related_to") or manifest.get("related_to") or ""),
+        }
+        by_cycle.setdefault(candidate["first_seen_cycle"], []).append(candidate)
+
+    for items in by_cycle.values():
+        items.sort(key=lambda item: str(item.get("filename") or ""))
+    return dict(sorted(by_cycle.items(), key=lambda item: item[0]))
 
 
 def inspect_run_summary(workspace_root: str | Path) -> dict[str, Any]:
@@ -901,12 +1279,16 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
             "manifests": {},
             "atomic_work_path": "",
             "atomic_work_dir": "",
+            "current_step": {},
+            "step_history": [],
+            "cycle_timing": {},
         }
 
     workflow_result = _read_json(atomic / "_meta" / "workflow_result.json")
     state = _read_json(atomic / "_meta" / "state.json")
     status = _normalize_run_status(workflow_result.get("status", state.get("current_state", "running")), run_meta)
     cycles: list[dict[str, Any]] = []
+    new_results_by_cycle = collect_new_results_by_cycle(atomic)
     for summary_file in _sorted_json_files(atomic / "_meta" / "review_summaries"):
         summary = _read_json(summary_file)
         cycle_num = int(summary.get("cycle", 0) or 0)
@@ -914,6 +1296,9 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
         issue_data = _read_json(atomic / "_meta" / "review_feedback" / f"cycle_{cycle_num:03d}.json")
         global_review = summary.get("global_review", {})
         result_review = summary.get("result_review", {})
+        metrics_with_issues = dict(metrics)
+        metrics_with_issues["issues"] = issue_data.get("issues", [])
+        profile_gate = derive_profile_gate_summary(global_review, metrics_with_issues)
         cycles.append(
             {
                 "cycle": cycle_num,
@@ -922,6 +1307,11 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
                 "workflow_mode": summary.get("workflow_mode", ""),
                 "global_passed": global_review.get("passed", False),
                 "global_advisors": global_review.get("advisor_results", []),
+                "global_feedback_preview": global_review.get("feedback_preview", ""),
+                "global_advisor_total": global_review.get("total_advisor_count", 0),
+                "global_advisor_passed": global_review.get("passed_advisor_count", 0),
+                "global_aggregate_status": global_review.get("aggregate_status", ""),
+                "profile_gate": profile_gate,
                 "failed_advisor_id": global_review.get("failed_advisor_id", ""),
                 "failed_role_name": global_review.get("failed_role_name", ""),
                 "result_total": result_review.get("total", 0),
@@ -941,11 +1331,29 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
                 "summary_size": metrics.get("summary_size", 0),
                 "plateau_status": summary.get("plateau_status", {}),
                 "issues": issue_data.get("issues", []),
+                "new_result_count": len(new_results_by_cycle.get(cycle_num, [])),
+                "new_results": new_results_by_cycle.get(cycle_num, []),
             }
         )
     feedback_files = _sorted_json_files(atomic / "_meta" / "review_feedback")
     latest_issues = _read_json(feedback_files[-1]).get("issues", []) if feedback_files else []
+    active_issues = load_active_issue_records_from_ledger(atomic)
+    ledger_file = atomic / "_meta" / "issue_ledger.json"
+    latest_feedback_file = feedback_files[-1] if feedback_files else None
+    ledger_is_fresh = (
+        active_issues is not None
+        and (
+            latest_feedback_file is None
+            or not latest_feedback_file.is_file()
+            or ledger_file.stat().st_mtime >= latest_feedback_file.stat().st_mtime
+        )
+    )
+    if ledger_is_fresh:
+        latest_issues = active_issues
     last_activity = _find_last_activity(atomic, run_dir)
+    current_step = _load_current_step_checkpoint(atomic)
+    step_history = _collect_step_checkpoints(atomic)
+    cycle_timing = _collect_cycle_timing(step_history, current_step)
     return {
         "name": run_dir.name,
         "config": cfg_summary,
@@ -963,6 +1371,9 @@ def inspect_run_detail(workspace_root: str | Path) -> dict[str, Any]:
         "latest_issues": latest_issues,
         "atomic_work_path": str(atomic),
         "atomic_work_dir": str(atomic),
+        "current_step": current_step,
+        "step_history": step_history,
+        "cycle_timing": cycle_timing,
     }
 
 
@@ -971,6 +1382,13 @@ def inspect_cycle_detail(workspace_root: str | Path, cycle: int) -> dict[str, An
     atomic = _find_atomic_work_dir(run_dir)
     if not atomic:
         raise HTTPException(404, "atomic work dir not found")
+    summary = _read_json(atomic / "_meta" / "review_summaries" / f"cycle_{cycle:03d}.json")
+    metrics = _read_json(atomic / "_meta" / "cycle_metrics" / f"cycle_{cycle:03d}.json")
+    issue_data = _read_json(atomic / "_meta" / "review_feedback" / f"cycle_{cycle:03d}.json")
+    global_review_summary = summary.get("global_review", {}) if isinstance(summary.get("global_review"), dict) else {}
+    metrics_with_issues = dict(metrics)
+    metrics_with_issues["issues"] = issue_data.get("issues", [])
+    profile_gate = derive_profile_gate_summary(global_review_summary, metrics_with_issues)
     global_reviews: list[dict[str, Any]] = []
     global_dir = atomic / "reviews" / "global" / f"cycle_{cycle:03d}"
     if global_dir.is_dir():
@@ -1019,12 +1437,17 @@ def inspect_cycle_detail(workspace_root: str | Path, cycle: int) -> dict[str, An
                     }
                 )
     snapshot_path = atomic / "_meta" / "summary_snapshots" / f"cycle_{cycle:03d}_after_summary.md"
+    new_results = collect_new_results_by_cycle(atomic).get(cycle, [])
     return {
         "cycle": cycle,
         "global_reviews": global_reviews,
         "result_reviews": result_reviews,
         "summary_snapshot": _read_text(snapshot_path, max_bytes=50_000) if snapshot_path.is_file() else "",
-        "metrics": _read_json(atomic / "_meta" / "cycle_metrics" / f"cycle_{cycle:03d}.json"),
+        "metrics": metrics,
+        "global_review_summary": global_review_summary,
+        "profile_gate": profile_gate,
+        "new_result_count": len(new_results),
+        "new_results": new_results,
     }
 
 

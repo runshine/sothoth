@@ -19,6 +19,11 @@ spec:
         - name: secflow-app-ipc-audit
           image: secflow-app-ipc-audit:latest
           imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
           ports:
             - containerPort: 8080
           env:
@@ -34,10 +39,32 @@ spec:
               value: oh61-main
             - name: IPC_AUDIT_CODEX_BIN
               value: /usr/local/bin/codex
+            - name: IPC_AUDIT_OPENCODE_BIN
+              value: /usr/local/bin/opencode
             - name: HDC_BIN
               value: /workspace/openharmony_6_1/vendor/edu/docker/src/hdc
             - name: LD_LIBRARY_PATH
               value: /workspace/openharmony_6_1/vendor/edu/docker/src
+            - name: OHEMU_HELPER_BIN
+              value: /usr/local/bin/ipc-audit-qemu
+            - name: OHEMU_WORKSPACE_ROOT
+              value: /workspace/openharmony_6_1
+            - name: OHEMU_QCOW2_PREPARED_ROOT
+              value: /workspace/openharmony_6_1/vendor/edu/docker/volumes/qcow2_cache
+            - name: OHEMU_RUNTIME_ROOT
+              value: /var/lib/secflow-ipc-audit/ohemu
+            - name: OHEMU_ARCH
+              value: arm64
+            - name: OHEMU_NETWORK_MODE
+              value: bridge
+            - name: OHEMU_HDC_BIND
+              value: 127.0.0.1
+            - name: OHEMU_HDC_BASE_PORT
+              value: "55555"
+            - name: OHEMU_WAIT_FOR_HDC_READY
+              value: "1"
+            - name: OHEMU_HDC_READY_TIMEOUT
+              value: "180"
             - name: IPC_AUDIT_WORKSPACES_JSON
               value: >-
                 [{"workspace_id":"oh61-main","display_name":"OpenHarmony 6.1 Main Tree","repo_root":"/workspace/openharmony_6_1","entries_file":".audit/ipc_entries.txt","bundle_scan_roots":["base","foundation"],"allow_custom_project_path":true,"supports_poc":true,"default_pipeline_mode":"audit_then_poc","is_default":true}]
@@ -46,6 +73,9 @@ spec:
               mountPath: /var/lib/secflow-ipc-audit
             - name: oh-workspace
               mountPath: /workspace/openharmony_6_1
+              readOnly: true
+            - name: dev-net-tun
+              mountPath: /dev/net/tun
           readinessProbe:
             httpGet:
               path: /api/app/ipc-audit/ready
@@ -65,6 +95,10 @@ spec:
         - name: oh-workspace
           persistentVolumeClaim:
             claimName: openharmony-workspace-pvc
+        - name: dev-net-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
 ---
 apiVersion: v1
 kind: Service

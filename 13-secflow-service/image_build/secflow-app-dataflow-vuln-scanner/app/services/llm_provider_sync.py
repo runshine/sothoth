@@ -16,6 +16,7 @@ logger = logging.getLogger("dataflow_vuln.llm_sync")
 
 _DEFAULT_CONTEXT_WINDOW = 128000
 _DEFAULT_MAX_TOKENS = 8192
+_LOCAL_PI_PROVIDER_KEY = "local_pi"
 
 
 def _provider_api(provider_type: str) -> str:
@@ -96,6 +97,58 @@ def build_models_json(providers: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _is_models_json_binding(binding: dict[str, Any]) -> bool:
+    name = str(binding.get("name") or "").strip().lower()
+    path = str(binding.get("path") or "").strip().replace("\\", "/").lower()
+    return name == "models.json" or path.endswith("/models.json") or path == "models.json"
+
+
+def _local_pi_injected_models_json(providers: list[dict[str, Any]]) -> str | None:
+    for provider in providers:
+        if not provider.get("enabled"):
+            continue
+        provider_key = str(provider.get("provider_key") or "").strip()
+        if provider_key != _LOCAL_PI_PROVIDER_KEY:
+            continue
+        file_bindings = provider.get("file_bindings") if isinstance(provider.get("file_bindings"), list) else []
+        for binding in file_bindings:
+            if not isinstance(binding, dict) or not binding.get("enabled", True):
+                continue
+            if not _is_models_json_binding(binding):
+                continue
+            content = binding.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+    return None
+
+
+def _validated_models_json_provider_count(content: str) -> int:
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        raise ValueError("models.json top-level value must be an object")
+    providers = parsed.get("providers")
+    if not isinstance(providers, dict) or not providers:
+        raise ValueError("models.json must contain a non-empty providers object")
+    return len(providers)
+
+
+def _write_models_json(models_path: Path, content: str) -> None:
+    models_path.parent.mkdir(parents=True, exist_ok=True)
+    if models_path.is_symlink():
+        models_path.unlink()
+    tmp_path = models_path.with_suffix(".json.tmp")
+    tmp_path.write_text(content, encoding="utf-8")
+    os.replace(tmp_path, models_path)
+
+
+def _models_json_path() -> Path:
+    explicit_path = str(os.environ.get("PI_MODELS_JSON") or "").strip()
+    if explicit_path:
+        return Path(explicit_path).expanduser()
+    pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
+    return pi_dir / "models.json"
+
+
 def sync_providers_to_pi() -> bool:
     config = get_config()
     cc = config.configcenter_service
@@ -119,18 +172,25 @@ def sync_providers_to_pi() -> bool:
         if not items:
             logger.warning("ConfigCenter returned empty LLM provider list, skip sync")
             return False
+        models_path = _models_json_path()
+
+        injected_models_json = _local_pi_injected_models_json(items)
+        if injected_models_json is not None:
+            provider_count = _validated_models_json_provider_count(injected_models_json)
+            _write_models_json(models_path, injected_models_json)
+            logger.info(
+                "copied %s injected models.json with %d providers to %s",
+                _LOCAL_PI_PROVIDER_KEY,
+                provider_count,
+                models_path,
+            )
+            return True
+
         models_json = build_models_json(items)
         if not models_json["providers"]:
             logger.warning("ConfigCenter returned no enabled LLM providers, skip sync")
             return False
-        pi_dir = Path(os.environ.get("PI_CODING_AGENT_DIR", "/root/.pi/agent"))
-        pi_dir.mkdir(parents=True, exist_ok=True)
-        models_path = pi_dir / "models.json"
-        if models_path.is_symlink():
-            models_path.unlink()
-        tmp_path = models_path.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(models_json, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp_path, models_path)
+        _write_models_json(models_path, json.dumps(models_json, ensure_ascii=False, indent=2))
         logger.info("synced %d LLM providers to %s", len(models_json["providers"]), models_path)
         for provider_key, provider_cfg in models_json["providers"].items():
             for model in provider_cfg.get("models", []):

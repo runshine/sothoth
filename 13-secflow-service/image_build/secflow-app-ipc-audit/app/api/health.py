@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -29,6 +30,30 @@ def _parse_ready_check_paths() -> list[str]:
     return normalized
 
 
+def _validate_opencode_config(opencode_bin: str) -> bool:
+    if shutil.which(opencode_bin) is None:
+        return False
+    if any(
+        str(os.environ.get(key) or "").strip()
+        for key in ("OPENAI_API_KEY", "OPENCODE_API_KEY", "AZURE_OPENAI_API_KEY", "ANTHROPIC_API_KEY")
+    ):
+        return True
+    config_path = Path(
+        str(
+            os.environ.get("IPC_AUDIT_OPENCODE_CONFIG_PATH")
+            or os.environ.get("OPENCODE_CONFIG_PATH")
+            or "/root/.config/opencode/opencode.json"
+        )
+    )
+    if not config_path.exists() or not config_path.is_file():
+        return False
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(payload, dict) and bool(payload)
+
+
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", service="secflow-app-ipc-audit")
@@ -53,6 +78,7 @@ def ready() -> ReadyResponse:
         "executor_binary": True,
         "executor_binary:codex_cli": shutil.which(cfg.execution.codex_bin) is not None,
         "executor_binary:opencode_cli": shutil.which(cfg.execution.opencode_bin) is not None,
+        "executor_config:opencode_cli": True,
     }
     try:
         with get_database().connect() as conn:
@@ -73,11 +99,19 @@ def ready() -> ReadyResponse:
         checks["executor_binary"] = checks["executor_binary:codex_cli"]
     elif cfg.execution.mode == "opencode_cli":
         checks["executor_binary"] = checks["executor_binary:opencode_cli"]
+        checks["executor_config:opencode_cli"] = _validate_opencode_config(cfg.execution.opencode_bin)
     for ready_path in _parse_ready_check_paths():
         checks[f"bound_file:{ready_path}"] = Path(ready_path).exists()
+    critical_checks = (
+        checks["database"],
+        checks["state_root"],
+        checks["workspace"],
+        checks["scheduler"],
+        checks["executor_binary"],
+    )
     return ReadyResponse(
-        status="ok" if all(checks.values()) else "degraded",
+        status="ok" if all(critical_checks) else "degraded",
         service="secflow-app-ipc-audit",
-        ready=all(checks.values()),
+        ready=all(critical_checks),
         checks=checks,
     )

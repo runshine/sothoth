@@ -5,12 +5,18 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
 from app.pi_vuln_core.config.models import FrameworkConfig
 from app.pi_vuln_core.engine.atomic import AtomicWorkflowEngine
 from app.pi_vuln_core.engine.composite import WorkflowRegistry
-from app.pi_vuln_core.engine.checkpoint import load_current_checkpoint
+from app.pi_vuln_core.engine.checkpoint import (
+    is_terminal_checkpoint,
+    load_current_checkpoint,
+    load_step_checkpoints,
+    node_kind_for,
+)
 from app.pi_vuln_core.engine.models import CompositeWorkflowResult
 from app.pi_vuln_core.plugins.executor import PluginChainExecutor
 from app.pi_vuln_core.plugins.registry import PluginRegistry
@@ -29,11 +35,19 @@ from app.pi_vuln_core.review.state import (
 from app.pi_vuln_core.runner import RunnerArtifacts, load_framework_config_from_path
 from app.pi_vuln_core.utils.file_ops import read_json, write_json
 from app.pi_vuln_core.utils.logger import get_logger, setup_logging
+from app.pi_vuln_core.utils.result_docs import list_result_report_files
 from app.pi_vuln_core.utils.win_compat import safe_rmtree
 from app.pi_vuln_core.workspace.manager import WorkspaceManager
 
 logger = get_logger("resume")
 _CYCLE_RE = re.compile(r"cycle_(\d+)")
+_NODE_RESUME_POLICY = "rerun_current_node"
+_WORKER_REWORK_STEP_ORDER = (
+    "worker::rework_triage",
+    "worker::rework_fp_repair",
+    "worker::rework_missed_hunt",
+    "worker::rework_handoff",
+)
 
 
 @dataclass
@@ -50,6 +64,11 @@ class ResumePlan:
     worker_session_id: str
     current_status: str
     resume_state: str = ""
+    resume_cursor: dict[str, Any] | None = None
+    resume_start_cycle: int = 0
+    resume_target_phase: str = ""
+    resume_target_step_key: str = ""
+    node_resume_policy: str = _NODE_RESUME_POLICY
     timeout_detected: bool = False
     timeout_call_dir: str = ""
     timeout_agent_id: str = ""
@@ -100,6 +119,9 @@ def build_resume_plan(run_dir: str | Path) -> tuple[FrameworkConfig, ResumePlan]
     state_detail = _load_atomic_state_detail(atomic_work_dir)
     timeout_info = None if current_status == "completed" else _find_latest_timeout_call(atomic_work_dir)
     checkpoint = None if current_status == "completed" else load_current_checkpoint(atomic_work_dir)
+    if checkpoint is None and current_status != "completed":
+        historical_checkpoints = load_step_checkpoints(atomic_work_dir)
+        checkpoint = historical_checkpoints[-1] if historical_checkpoints else None
     checkpoint_phase = str((checkpoint or {}).get("phase") or "").strip()
     checkpoint_status = str((checkpoint or {}).get("status") or "").strip()
     checkpoint_step_key = str((checkpoint or {}).get("step_key") or "").strip()
@@ -107,9 +129,21 @@ def build_resume_plan(run_dir: str | Path) -> tuple[FrameworkConfig, ResumePlan]
         checkpoint_cycle = int((checkpoint or {}).get("cycle") or 0)
     except (TypeError, ValueError):
         checkpoint_cycle = 0
+    resume_cursor = _build_resume_cursor(
+        checkpoint=checkpoint,
+        completed_cycles=completed_cycles,
+        atomic_wf=atomic_wf,
+        atomic_work_dir=atomic_work_dir,
+    )
+    resume_start_cycle = _resume_start_cycle(
+        completed_cycles=completed_cycles,
+        resume_cursor=resume_cursor,
+    )
 
     resume_state = state_detail.get("current_state", "")
-    if checkpoint_phase and checkpoint_status != "completed":
+    if resume_cursor:
+        resume_state = str(resume_cursor.get("phase") or resume_state)
+    elif checkpoint_phase and checkpoint_status != "completed":
         resume_state = checkpoint_phase
     elif timeout_info and state_detail.get("previous_state"):
         # WorkerStageError 会先把 state 切到 failed，真正应恢复的位置保存在 previous_state。
@@ -128,6 +162,11 @@ def build_resume_plan(run_dir: str | Path) -> tuple[FrameworkConfig, ResumePlan]
         worker_session_id=worker_session_id,
         current_status=current_status,
         resume_state=resume_state,
+        resume_cursor=resume_cursor,
+        resume_start_cycle=resume_start_cycle,
+        resume_target_phase=str((resume_cursor or {}).get("phase") or resume_state or ""),
+        resume_target_step_key=str((resume_cursor or {}).get("step_key") or ""),
+        node_resume_policy=_NODE_RESUME_POLICY,
         timeout_detected=bool(timeout_info),
         timeout_call_dir=str(timeout_info.get("call_dir", "")) if timeout_info else "",
         timeout_agent_id=str(timeout_info.get("agent_id", "")) if timeout_info else "",
@@ -138,6 +177,308 @@ def build_resume_plan(run_dir: str | Path) -> tuple[FrameworkConfig, ResumePlan]
         checkpoint_step_key=checkpoint_step_key,
         checkpoint_status=checkpoint_status,
     )
+
+
+def _resume_start_cycle(
+    *,
+    completed_cycles: int,
+    resume_cursor: dict[str, Any] | None,
+) -> int:
+    if not resume_cursor:
+        return completed_cycles
+    try:
+        cursor_cycle = int(resume_cursor.get("cycle") or 0)
+    except (TypeError, ValueError):
+        cursor_cycle = 0
+    if cursor_cycle <= completed_cycles:
+        return completed_cycles
+    return max(completed_cycles, cursor_cycle - 1)
+
+
+def _build_resume_cursor(
+    *,
+    checkpoint: dict[str, Any] | None,
+    completed_cycles: int,
+    atomic_wf,
+    atomic_work_dir: str,
+) -> dict[str, Any] | None:
+    if not isinstance(checkpoint, dict):
+        return None
+    try:
+        cycle = int(checkpoint.get("cycle") or 0)
+    except (TypeError, ValueError):
+        cycle = 0
+    if cycle <= 0 or cycle <= completed_cycles:
+        return None
+
+    source_phase = str(checkpoint.get("phase") or "").strip()
+    source_step_key = str(checkpoint.get("step_key") or "").strip()
+    source_status = str(checkpoint.get("status") or "").strip()
+    if not source_phase:
+        return None
+    if source_phase == "worker":
+        source_step_key = _worker_checkpoint_step_key(checkpoint)
+    elif not source_step_key:
+        source_step_key = source_phase
+
+    if is_terminal_checkpoint(checkpoint):
+        target_phase, target_step_key = _next_node_after_checkpoint(
+            atomic_wf=atomic_wf,
+            atomic_work_dir=atomic_work_dir,
+            cycle=cycle,
+            source_phase=source_phase,
+            source_step_key=source_step_key,
+            checkpoint=checkpoint,
+        )
+    else:
+        target_phase, target_step_key = source_phase, source_step_key
+
+    return {
+        "cycle": cycle,
+        "phase": target_phase,
+        "step_key": target_step_key,
+        "status": source_status,
+        "node_kind": node_kind_for(target_phase, target_step_key),
+        "policy": _NODE_RESUME_POLICY,
+        "source": {
+            "cycle": cycle,
+            "phase": source_phase,
+            "step_key": source_step_key,
+            "status": source_status,
+            "node_kind": str(checkpoint.get("node_kind") or node_kind_for(source_phase, source_step_key)),
+            "terminal_status": is_terminal_checkpoint(checkpoint),
+        },
+    }
+
+
+def _worker_checkpoint_step_key(checkpoint: dict[str, Any]) -> str:
+    step_key = str(checkpoint.get("step_key") or "").strip()
+    if step_key in {"worker::work", "worker::rework", *_WORKER_REWORK_STEP_ORDER}:
+        return step_key
+    extra = checkpoint.get("extra") if isinstance(checkpoint.get("extra"), dict) else {}
+    prompt_kind = str(
+        extra.get("prompt_kind")
+        or extra.get("worker_prompt_kind")
+        or checkpoint.get("prompt_kind")
+        or ""
+    ).strip().lower()
+    return "worker::rework" if prompt_kind == "rework" else "worker::work"
+
+
+def _next_node_after_checkpoint(
+    *,
+    atomic_wf,
+    atomic_work_dir: str,
+    cycle: int,
+    source_phase: str,
+    source_step_key: str,
+    checkpoint: dict[str, Any],
+) -> tuple[str, str]:
+    if source_phase == "worker":
+        source_status = str(checkpoint.get("status") or "").strip()
+        if source_step_key in _WORKER_REWORK_STEP_ORDER:
+            try:
+                index = _WORKER_REWORK_STEP_ORDER.index(source_step_key)
+            except ValueError:
+                index = -1
+            if index >= 0 and index + 1 < len(_WORKER_REWORK_STEP_ORDER):
+                return "worker", _WORKER_REWORK_STEP_ORDER[index + 1]
+            return "summary", "summary"
+        if source_step_key == "worker::rework" or source_status == "partial_salvaged":
+            return "summary", "summary"
+        first_reflection = _first_reflection_step_key(atomic_wf)
+        return ("reflect", first_reflection) if first_reflection else ("summary", "summary")
+
+    if source_phase == "reflect":
+        next_reflection = _next_step_key(_reflection_step_keys(atomic_wf), source_step_key)
+        return ("reflect", next_reflection) if next_reflection else ("summary", "summary")
+
+    if source_phase == "summary":
+        first_global = _first_global_review_step_key(atomic_wf, cycle)
+        return ("global_review", first_global) if first_global else ("result_review", _first_result_review_step_key(atomic_wf, atomic_work_dir) or "result::*")
+
+    if source_phase == "global_review":
+        next_global = _next_global_review_step_key(
+            atomic_wf=atomic_wf,
+            atomic_work_dir=atomic_work_dir,
+            cycle=cycle,
+        )
+        if next_global:
+            return "global_review", next_global
+        return "result_review", _first_result_review_step_key(atomic_wf, atomic_work_dir) or "result::*"
+
+    if source_phase == "result_review":
+        next_result = _next_result_review_step_key(
+            atomic_wf=atomic_wf,
+            atomic_work_dir=atomic_work_dir,
+            cycle=cycle,
+        )
+        return "result_review", next_result or source_step_key or "result::*"
+
+    return source_phase, source_step_key
+
+
+def _reflection_step_keys(atomic_wf) -> list[str]:
+    worker = getattr(getattr(atomic_wf, "roles", None), "worker", None)
+    worker_prompts = getattr(worker, "prompts", None)
+    prompts = list(getattr(worker_prompts, "reflection", []) or [])
+    if not prompts:
+        return []
+    engine = getattr(atomic_wf, "engine", None)
+    configured_passes = getattr(engine, "reflection_passes_per_cycle", None)
+    if configured_passes is None:
+        policy = get_review_profile_policy(getattr(engine, "review_profile", "balanced"))
+        reflection_passes = policy.reflection_passes_per_cycle
+    else:
+        try:
+            reflection_passes = int(configured_passes)
+        except (TypeError, ValueError):
+            reflection_passes = 0
+    if reflection_passes <= 0:
+        return []
+    return [
+        f"reflect::{reflect_cfg.id}::pass_{pass_index:02d}"
+        for pass_index in range(1, reflection_passes + 1)
+        for reflect_cfg in prompts
+    ]
+
+
+def _first_reflection_step_key(atomic_wf) -> str:
+    keys = _reflection_step_keys(atomic_wf)
+    return keys[0] if keys else ""
+
+
+def _global_review_step_keys(atomic_wf, cycle: int) -> list[str]:
+    advisors_root = getattr(getattr(atomic_wf, "roles", None), "advisors", None)
+    advisors = list(getattr(advisors_root, "global_review", []) or [])
+    return [
+        f"global::{advisor.instance_id}"
+        for advisor in advisors
+        if not (cycle > 1 and not advisor.re_review_on_cycle)
+    ]
+
+
+def _first_global_review_step_key(atomic_wf, cycle: int) -> str:
+    keys = _global_review_step_keys(atomic_wf, cycle)
+    return keys[0] if keys else ""
+
+
+def _next_global_review_step_key(
+    *,
+    atomic_wf,
+    atomic_work_dir: str,
+    cycle: int,
+) -> str:
+    for key in _global_review_step_keys(atomic_wf, cycle):
+        advisor_id = key.split("::", 1)[1]
+        if not _global_review_record_valid(
+            atomic_work_dir=atomic_work_dir,
+            cycle=cycle,
+            advisor_id=advisor_id,
+        ):
+            return key
+    return ""
+
+
+def _first_result_review_step_key(atomic_wf, atomic_work_dir: str) -> str:
+    advisors_root = getattr(getattr(atomic_wf, "roles", None), "advisors", None)
+    advisors = list(getattr(advisors_root, "result_review", []) or [])
+    results_dir = Path(atomic_work_dir) / "results"
+    result_files = list_result_report_files(str(results_dir)) if results_dir.is_dir() else []
+    if not advisors or not result_files:
+        return ""
+    return f"result::{result_files[0]}::{advisors[0].instance_id}"
+
+
+def _next_result_review_step_key(
+    *,
+    atomic_wf,
+    atomic_work_dir: str,
+    cycle: int,
+) -> str:
+    advisors_root = getattr(getattr(atomic_wf, "roles", None), "advisors", None)
+    advisors = list(getattr(advisors_root, "result_review", []) or [])
+    results_dir = Path(atomic_work_dir) / "results"
+    result_files = list_result_report_files(str(results_dir)) if results_dir.is_dir() else []
+    if not advisors or not result_files:
+        return ""
+
+    for result_file in result_files:
+        for advisor in advisors:
+            record = _load_valid_result_review_record(
+                atomic_work_dir=atomic_work_dir,
+                cycle=cycle,
+                result_file=result_file,
+                advisor_id=advisor.instance_id,
+            )
+            if record is None:
+                return f"result::{result_file}::{advisor.instance_id}"
+            if not bool(record.get("passed", False)):
+                break
+    return ""
+
+
+def _next_step_key(keys: list[str], current_key: str) -> str:
+    if not keys:
+        return ""
+    if current_key not in keys:
+        return keys[0]
+    next_index = keys.index(current_key) + 1
+    return keys[next_index] if next_index < len(keys) else ""
+
+
+def _load_valid_result_review_record(
+    *,
+    atomic_work_dir: str,
+    cycle: int,
+    result_file: str,
+    advisor_id: str,
+) -> dict[str, Any] | None:
+    path = (
+        Path(atomic_work_dir)
+        / "reviews"
+        / "results"
+        / Path(result_file).stem
+        / f"cycle_{cycle:03d}"
+        / f"{advisor_id}.json"
+    )
+    if not path.is_file():
+        return None
+    try:
+        data = read_json(path)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or _invalid_review_record(data):
+        return None
+    return data
+
+
+def _global_review_record_valid(
+    *,
+    atomic_work_dir: str,
+    cycle: int,
+    advisor_id: str,
+) -> bool:
+    path = (
+        Path(atomic_work_dir)
+        / "reviews"
+        / "global"
+        / f"cycle_{cycle:03d}"
+        / f"{advisor_id}.json"
+    )
+    if not path.is_file():
+        return False
+    try:
+        data = read_json(path)
+    except Exception:
+        return False
+    return isinstance(data, dict) and not _invalid_review_record(data)
+
+
+def _invalid_review_record(data: dict[str, Any]) -> bool:
+    parser_mode = str(data.get("parser_mode") or "").strip()
+    verdict = str(data.get("verdict") or "").strip()
+    return parser_mode == "agent_error" or verdict == "ERROR"
 
 
 def _discover_atomic_work_dir(stage_dir: str | Path) -> str:
@@ -315,6 +656,8 @@ def rebuild_review_state(atomic_work_dir: str | Path) -> ReviewState:
                     data = read_json(review_file)
                 except Exception:
                     continue
+                if not isinstance(data, dict) or _invalid_review_record(data):
+                    continue
                 passed = bool(data.get("passed", False))
                 feedback = str(
                     data.get("feedback_detail")
@@ -399,6 +742,8 @@ def rebuild_review_state(atomic_work_dir: str | Path) -> ReviewState:
                     try:
                         data = read_json(review_file)
                     except Exception:
+                        continue
+                    if not isinstance(data, dict) or _invalid_review_record(data):
                         continue
                     if cycle >= latest_cycle:
                         latest_cycle = cycle
@@ -584,7 +929,7 @@ async def resume_run(
         )
 
         review_state = rebuild_review_state(plan.atomic_work_dir)
-        total_cycle_limit = plan.completed_cycles + extra_cycles
+        total_cycle_limit = max(plan.completed_cycles, plan.resume_start_cycle) + extra_cycles
 
         logger.info(
             "resume_run_start",
@@ -592,18 +937,21 @@ async def resume_run(
             atomic_work_dir=plan.atomic_work_dir,
             worker_session_id=plan.worker_session_id,
             completed_cycles=plan.completed_cycles,
+            start_cycle=plan.resume_start_cycle,
             total_cycle_limit=total_cycle_limit,
+            resume_cursor=plan.resume_cursor or {},
         )
 
         atomic_result = await engine.resume_from_existing(
             task_file=plan.task_file,
             task_id=plan.task_id,
             work_dir=plan.atomic_work_dir,
-            start_cycle=plan.completed_cycles,
+            start_cycle=plan.resume_start_cycle,
             total_cycle_limit=total_cycle_limit,
             review_state=review_state,
             worker_session_id=plan.worker_session_id,
-            resume_state=plan.resume_state if plan.timeout_detected else None,
+            resume_state=plan.resume_state or None,
+            resume_cursor=plan.resume_cursor,
         )
 
         composite_result = await _write_composite_result(

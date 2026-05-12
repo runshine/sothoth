@@ -29,9 +29,6 @@ class ExecutionObserver:
     async def on_summary_completed(self, **payload: Any) -> None:
         return None
 
-    async def on_workflow_restart(self, **payload: Any) -> None:
-        return None
-
     async def on_workflow_abnormal_exit(self, **payload: Any) -> None:
         return None
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.config import get_config
-from app.models.database import TriggerTask, WorkflowDefinition, WorkflowExecution, get_db_session
+from app.models.database import SchedulerWorker, TriggerTask, WorkflowDefinition, WorkflowExecution, get_db_session
 from app.services.scheduler import SchedulerService
 
 
@@ -99,5 +99,43 @@ def test_scheduler_claim_allows_multiple_running_executions_per_definition(
         assert len(running) == 2
         assert {item.owner_pod_id for item in running} == {"pod-a", "pod-b"}
         assert pending == []
+    finally:
+        db.close()
+
+
+def test_manager_role_does_not_register_or_execute_worker(service_config_path: Path):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "manager"
+    config.scheduler.pod_id = "manager-pod"
+
+    scheduler = SchedulerService()
+    scheduler._heartbeat_once()
+
+    db = get_db_session()
+    try:
+        assert db.get(SchedulerWorker, "manager-pod") is None
+    finally:
+        db.close()
+    assert scheduler.start_execution_now("exec-should-not-run") is False
+    assert scheduler.health_payload()["worker_enabled"] == "false"
+
+
+def test_worker_role_registers_single_capacity_worker(service_config_path: Path):
+    config = get_config()
+    config.scheduler.enabled = True
+    config.scheduler.role = "worker"
+    config.scheduler.pod_id = "worker-pod"
+    config.scheduler.worker_capacity = 1
+
+    scheduler = SchedulerService()
+    scheduler._heartbeat_once()
+
+    db = get_db_session()
+    try:
+        worker = db.get(SchedulerWorker, "worker-pod")
+        assert worker is not None
+        assert worker.capacity == 1
+        assert worker.metadata_json["role"] == "worker"
     finally:
         db.close()

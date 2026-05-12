@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import sys
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -71,6 +72,20 @@ def _load_run_timestamps(run_dir: str | Path) -> dict:
         return {}
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def _write_run_timestamps(run_dir: str | Path, **updates) -> dict:
     path = _run_timestamps_path(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,7 +93,7 @@ def _write_run_timestamps(run_dir: str | Path, **updates) -> dict:
     for key, value in updates.items():
         payload[key] = value
     payload["last_updated_at"] = _now_iso()
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
     return payload
 
 
@@ -943,9 +958,14 @@ def _write_resume_preview_file(
     checkpoint_phase: str = "",
     checkpoint_step_key: str = "",
     checkpoint_status: str = "",
+    resume_cursor: dict | None = None,
+    resume_start_cycle: int | None = None,
+    resume_target_node: dict | None = None,
+    node_resume_policy: str = "rerun_current_node",
 ) -> str:
     preview_path = Path(atomic_work_dir) / "_meta" / "resume_preview.json"
     preview_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_start_cycle = completed_cycles if resume_start_cycle is None else int(resume_start_cycle)
     payload = {
         "generated_at": datetime.now().isoformat(),
         "run_dir": run_dir,
@@ -953,9 +973,13 @@ def _write_resume_preview_file(
         "current_status": current_status,
         "completed_cycles": completed_cycles,
         "extra_cycles_requested": extra_cycles,
-        "resume_total_cycle_limit": completed_cycles + extra_cycles,
+        "resume_start_cycle": effective_start_cycle,
+        "resume_total_cycle_limit": max(completed_cycles, effective_start_cycle) + extra_cycles,
         "worker_session_id": worker_session_id,
         "resume_state": resume_state,
+        "resume_cursor": resume_cursor or None,
+        "resume_target_node": resume_target_node or None,
+        "node_resume_policy": node_resume_policy,
         "step_checkpoint": {
             "cycle": checkpoint_cycle,
             "phase": checkpoint_phase,
@@ -1196,6 +1220,15 @@ def main(argv: list[str] | None = None):
             checkpoint_phase=plan.checkpoint_phase,
             checkpoint_step_key=plan.checkpoint_step_key,
             checkpoint_status=plan.checkpoint_status,
+            resume_cursor=plan.resume_cursor,
+            resume_start_cycle=plan.resume_start_cycle,
+            resume_target_node={
+                "cycle": int((plan.resume_cursor or {}).get("cycle") or 0),
+                "phase": plan.resume_target_phase,
+                "step_key": plan.resume_target_step_key,
+                "node_kind": str((plan.resume_cursor or {}).get("node_kind") or ""),
+            } if plan.resume_target_phase else None,
+            node_resume_policy=plan.node_resume_policy,
             model_display=model_display,
             thinking=display_thinking,
             task_file=plan.task_file,
@@ -1222,6 +1255,13 @@ def main(argv: list[str] | None = None):
                 f"  Step检查点: cycle={plan.checkpoint_cycle}, "
                 f"phase={plan.checkpoint_phase}, step={plan.checkpoint_step_key or '-'}, "
                 f"status={plan.checkpoint_status or '-'}"
+            )
+        if plan.resume_cursor:
+            print(
+                f"  节点恢复:   cycle={(plan.resume_cursor or {}).get('cycle')}, "
+                f"phase={plan.resume_target_phase or '-'}, "
+                f"step={plan.resume_target_step_key or '-'}, "
+                f"policy={plan.node_resume_policy}"
             )
         if plan.timeout_detected:
             print(f"  超时恢复点: {plan.resume_state or 'unknown'}")

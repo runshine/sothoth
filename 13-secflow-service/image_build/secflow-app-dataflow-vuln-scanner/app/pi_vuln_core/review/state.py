@@ -634,6 +634,38 @@ class ReviewState:
         entries.sort(key=lambda item: (-item.last_seen_cycle, -item.seen_count, item.signature))
         return [entry.to_dict() for entry in entries]
 
+    def get_current_issue_records(self, *, include_framework: bool = True) -> list[dict[str, Any]]:
+        """Return active unresolved issues in the UI/API-facing issue shape."""
+        records: list[dict[str, Any]] = []
+        for entry in self.get_active_issue_entries(include_framework=include_framework):
+            issue = entry.get("issue") if isinstance(entry.get("issue"), dict) else {}
+            record = dict(issue)
+            issue_ids = [str(item).strip() for item in (entry.get("issue_ids") or []) if str(item).strip()]
+            advisor_ids = [
+                str(item).strip()
+                for item in (entry.get("advisor_ids") or [])
+                if str(item).strip()
+            ]
+
+            if not record.get("id"):
+                record["id"] = issue_ids[0] if issue_ids else entry.get("signature") or ""
+            record.setdefault("signature", entry.get("signature") or "")
+            record.setdefault("semantic_key", entry.get("semantic_key") or "")
+            record.setdefault("first_seen_cycle", entry.get("first_seen_cycle") or 0)
+            record.setdefault("last_seen_cycle", entry.get("last_seen_cycle") or 0)
+            record.setdefault("seen_count", entry.get("seen_count") or 0)
+            record.setdefault("consecutive_count", entry.get("consecutive_count") or 0)
+            if entry.get("actionable_by") and not record.get("actionable_by"):
+                record["actionable_by"] = entry.get("actionable_by")
+            if entry.get("blocking_type") and not record.get("blocking_type"):
+                record["blocking_type"] = entry.get("blocking_type")
+            if entry.get("acceptance_criteria") and not record.get("acceptance_criteria"):
+                record["acceptance_criteria"] = entry.get("acceptance_criteria")
+            if advisor_ids and not record.get("advisor_id"):
+                record["advisor_id"] = ",".join(advisor_ids)
+            records.append(record)
+        return records
+
     def format_open_issue_backlog(
         self,
         *,

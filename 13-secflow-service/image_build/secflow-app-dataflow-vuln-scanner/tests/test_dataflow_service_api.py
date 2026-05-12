@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import time
+from datetime import timedelta
 
 from fastapi.testclient import TestClient
 
 from app.config import get_config
 from app.main import create_app
-from app.models.database import RunIndex, WorkflowDefinitionVersion, WorkflowExecution, get_db_session
+from app.artifacts.io import write_json
+from app.models.database import RunIndex, TriggerTask, WorkflowDefinitionVersion, WorkflowExecution, get_db_session
+from app.services.execution_service import get_execution_service
+from app.time_utils import isoformat_local, now_local
 
 
 def _wait_for_task_status(client: TestClient, task_id: str, expected: set[str] | None = None, timeout: float = 10.0) -> dict:
@@ -97,6 +101,175 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     artifact_paths = [item["path"] for item in run_detail.json()["files"]]
     assert "run/input/task.md" in artifact_paths
     assert "run/run.log" in artifact_paths
+
+
+def test_task_list_uses_lightweight_run_locator_without_full_run_summary(service_config_path, patch_mock_agent_runtime, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+
+    create_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+    assert create_profile.status_code == 201
+    profile_id = create_profile.json()["profile_id"]
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile_id,
+            "title": "lightweight list scan",
+            "task_markdown": "# Package List\n\n- demo.tar.gz\n",
+            "artifact_refs": [],
+            "runtime_overrides": {},
+        },
+    )
+    assert task.status_code == 201
+    _wait_for_task_status(client, task.json()["task_id"])
+
+    def fail_full_summary(*_args, **_kwargs):
+        raise AssertionError("task list must not parse full run summary")
+
+    monkeypatch.setattr(type(get_execution_service()), "_latest_run_summary_for_execution", fail_full_summary)
+
+    response = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
+    assert response.status_code == 200
+    items = response.json()
+    assert items
+    listed = next(item for item in items if item["task_id"] == task.json()["task_id"])
+    assert listed["run_name"]
+    assert listed["runs_root"]
+    assert listed["latest_run"]["name"] == listed["run_name"]
+    assert "process_state" in listed["latest_run"]
+
+
+def test_task_list_marks_stale_running_process_as_runtime_lost(service_config_path, patch_mock_agent_runtime):
+    app = create_app()
+    client = TestClient(app)
+
+    create_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+    assert create_profile.status_code == 201
+    profile_id = create_profile.json()["profile_id"]
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile_id,
+            "title": "stale runtime list scan",
+            "task_markdown": "# Package List\n\n- demo.tar.gz\n",
+            "artifact_refs": [],
+            "runtime_overrides": {},
+        },
+    )
+    assert task.status_code == 201
+    task_id = task.json()["task_id"]
+    _wait_for_task_status(client, task_id)
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        execution = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.trigger_task_id == task_id)
+            .order_by(WorkflowExecution.created_at.desc())
+            .first()
+        )
+        run_index = (
+            db.query(RunIndex)
+            .filter(RunIndex.linked_task_id == task_id)
+            .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+            .first()
+        )
+        assert trigger is not None and execution is not None and run_index is not None
+        run_index.status = "running"
+        execution.status = "running"
+        execution.process_status = "running"
+        trigger.status = "running"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+        write_json(
+            run_index.run_root_path + "/_meta/process.json",
+            {
+                "execution_id": execution.id,
+                "trigger_task_id": trigger.id,
+                "pid": 4242,
+                "pod_id": "old-pod",
+                "status": "running",
+                "heartbeat_at": "2026-04-28T01:02:03+08:00",
+            },
+        )
+
+    response = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
+    assert response.status_code == 200
+    listed = next(item for item in response.json() if item["task_id"] == task_id)
+    process_state = listed["latest_run"]["process_state"]
+    assert process_state["display_status"] == "runtime_lost"
+    assert process_state["display_label"] == "运行失联"
+    assert process_state["source"] == "stale_process_heartbeat"
+    assert process_state["can_retry"] is True
+
+
+def test_task_list_keeps_recent_heartbeat_grace_as_running(service_config_path, patch_mock_agent_runtime):
+    app = create_app()
+    client = TestClient(app)
+
+    create_profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
+    assert create_profile.status_code == 201
+    profile_id = create_profile.json()["profile_id"]
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile_id,
+            "title": "heartbeat grace scan",
+            "task_markdown": "# Package List\n\n- demo.tar.gz\n",
+            "artifact_refs": [],
+            "runtime_overrides": {},
+        },
+    )
+    assert task.status_code == 201
+    task_id = task.json()["task_id"]
+    _wait_for_task_status(client, task_id)
+
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, task_id)
+        execution = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.trigger_task_id == task_id)
+            .order_by(WorkflowExecution.created_at.desc())
+            .first()
+        )
+        run_index = (
+            db.query(RunIndex)
+            .filter(RunIndex.linked_task_id == task_id)
+            .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+            .first()
+        )
+        assert trigger is not None and execution is not None and run_index is not None
+        run_index.status = "running"
+        execution.status = "running"
+        execution.process_status = "running"
+        trigger.status = "running"
+        db.add_all([run_index, execution, trigger])
+        db.commit()
+        write_json(
+            run_index.run_root_path + "/_meta/process.json",
+            {
+                "execution_id": execution.id,
+                "trigger_task_id": trigger.id,
+                "pid": 4242,
+                "pod_id": "slow-but-live-pod",
+                "status": "running",
+                "heartbeat_at": isoformat_local(now_local() - timedelta(seconds=151)),
+            },
+        )
+
+    response = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
+    assert response.status_code == 200
+    listed = next(item for item in response.json() if item["task_id"] == task_id)
+    process_state = listed["latest_run"]["process_state"]
+    assert process_state["source"] == "process_file_heartbeat"
+    assert process_state["is_running"] is True
+    assert process_state["can_retry"] is False
+    assert process_state.get("display_status") != "runtime_lost"
+    assert process_state["stale_after_seconds"] >= 300
+
 
 
 def test_create_task_bootstraps_default_profile_when_missing(service_config_path, patch_mock_agent_runtime):
@@ -294,12 +467,13 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     payload = detail.json()
     assert "漏洞挖掘任务" in payload["task_markdown"]
     cli_plan = payload["task_metadata"]["dataflow_cli"]
+    expected_run_name = "business-scan"
     assert cli_plan["launcher"] == "run_vuln_scan.py"
     assert cli_plan["data_flow_file"] == str((case_root / "data_flow.md").resolve())
     assert cli_plan["source_dir"] == str(source_dir.resolve())
     assert Path(cli_plan["run_dir"]).parent.name == "secflow-app-dataflow-vuln-scanner"
-    assert cli_plan["run_name"] == task_id
-    assert Path(cli_plan["run_dir"]).name == task_id
+    assert cli_plan["run_name"] == expected_run_name
+    assert Path(cli_plan["run_dir"]).name == expected_run_name
 
     execution_id = payload["attempts"][0]["execution_id"]
     _wait_for_task_status(client, task_id)
@@ -315,7 +489,7 @@ def test_business_dataflow_task_materializes_inputs_and_runs(service_config_path
     assert run_payload["config"]["thinking"] == ""
     assert "run_vuln_scan.py" in run_payload["command_display"]
     assert "--model mock/model" in run_payload["command_display"]
-    assert f"--run-name {task_id}" in run_payload["command_display"]
+    assert f"--run-name {expected_run_name}" in run_payload["command_display"]
     assert "--timeout-max-retries 3" in run_payload["command_display"]
     assert "--timeout-retry-interval-seconds 30" in run_payload["command_display"]
     assert run_payload["raw"]["dataflow_cli"]["command_display"] == run_payload["command_display"]
@@ -365,20 +539,21 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
     assert task.status_code == 201
     created_payload = task.json()
     task_id = created_payload["task_id"]
+    expected_run_name = "business-scan-custom-workspace"
     service_root = Path(project_root) / "files" / "default" / "app" / "secflow-app-dataflow-vuln-scanner"
-    assert created_payload["run_name"] == task_id
+    assert created_payload["run_name"] == expected_run_name
     assert created_payload["runs_root"] == str(service_root.resolve())
     assert Path(created_payload["run_path"]).parent == service_root.resolve()
-    assert created_payload["run"]["name"] == task_id
+    assert created_payload["run"]["name"] == expected_run_name
     assert created_payload["run"]["root_path"] == str(service_root.resolve())
 
     list_payload = client.get("/api/dataflow-vuln-scanner/tasks", params={"project_id": "default"})
     assert list_payload.status_code == 200
     listed_task = next(item for item in list_payload.json() if item["task_id"] == task_id)
-    assert listed_task["run_name"] == task_id
+    assert listed_task["run_name"] == expected_run_name
     assert listed_task["runs_root"] == str(service_root.resolve())
     assert Path(listed_task["run_path"]).parent == service_root.resolve()
-    assert listed_task["run"]["name"] == task_id
+    assert listed_task["run"]["name"] == expected_run_name
     assert listed_task["run"]["root_path"] == str(service_root.resolve())
 
     detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}")
@@ -391,7 +566,7 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
     execution_id = detail_payload["attempts"][0]["execution_id"]
     expected_run_root = Path(detail_payload["attempts"][0]["workspace_root"])
     assert expected_run_root.parent == service_root.resolve()
-    assert expected_run_root.name == task_id
+    assert expected_run_root.name == expected_run_name
 
     run_resolve = client.get(
         "/api/dataflow-vuln-scanner/runs/by-task",
@@ -407,6 +582,46 @@ def test_business_dataflow_task_ignores_selected_runs_root_for_standard_task_lay
     runtime_config = json.loads((expected_run_root / "run" / "config.json").read_text(encoding="utf-8"))
     assert runtime_config["global"]["workspace_root"] == str((expected_run_root / "run" / "workspace").resolve())
     assert runtime_config["execution"]["output_dir"] == str((expected_run_root / "output").resolve())
+
+
+def test_business_dataflow_task_without_title_uses_dataflow_file_and_time_run_name(service_config_path, patch_mock_agent_runtime):
+    config = get_config()
+    project_root = config.fileserver_service.data_mount_path
+    from pathlib import Path
+
+    case_root = Path(project_root) / "files" / "default" / "case-no-title"
+    source_dir = case_root / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    (source_dir / "demo.c").write_text("int demo(char *p) { return p[0]; }\n", encoding="utf-8")
+    (case_root / "custom_flow.md").write_text("# 数据流追踪：demo\n\n| 📌 USED | 1 |\nINPUT-1\n", encoding="utf-8")
+
+    app = create_app()
+    client = TestClient(app)
+    profile = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload()).json()
+
+    task = client.post(
+        "/api/dataflow-vuln-scanner/tasks",
+        json={
+            "project_id": "default",
+            "profile_id": profile["profile_id"],
+            "data_flow": {"source": "project_filesystem", "path": "/case-no-title/custom_flow.md"},
+            "source_dir": {"source": "project_filesystem", "path": "/case-no-title/source"},
+            "model": "mock/model",
+            "review_profile": "fast",
+            "max_review_cycles": 1,
+            "result_review_concurrency": 1,
+        },
+    )
+    assert task.status_code == 201
+    payload = task.json()
+    assert payload["run_name"].startswith("custom_flow_")
+    assert payload["title"] == payload["run_name"]
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/tasks/{payload['task_id']}")
+    assert detail.status_code == 200
+    cli_plan = detail.json()["task_metadata"]["dataflow_cli"]
+    assert cli_plan["run_name"] == payload["run_name"]
+    assert Path(cli_plan["run_dir"]).name == payload["run_name"]
 
 
 def test_dataflow_run_resolve_by_task_reinitializes_missing_pending_run(

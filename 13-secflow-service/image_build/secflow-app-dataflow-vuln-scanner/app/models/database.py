@@ -120,8 +120,6 @@ class WorkflowExecution(Base):
     output_task_count = Column(Integer, nullable=False, default=0)
     current_stage_id = Column(String(128))
     owner_pod_id = Column(String(128))
-    lease_token = Column(String(128))
-    lease_expires_at = Column(DateTime)
     process_pid = Column(Integer)
     process_host = Column(String(256))
     process_status = Column(String(32))
@@ -341,6 +339,28 @@ class RunIndexFile(Base):
     updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
 
 
+class VulnReportSubmission(Base):
+    __tablename__ = _prefix("vuln_report_submission")
+
+    id = Column(String(64), primary_key=True)
+    task_id = Column(String(64), nullable=False)
+    execution_id = Column(String(64), nullable=False)
+    run_index_id = Column(String(64), nullable=True)
+    result_file = Column(String(255), nullable=False)
+    result_path = Column(String(1024), nullable=False, default="")
+    report_id = Column(String(512), nullable=False, default="")
+    payload_hash = Column(String(64), nullable=False, default="")
+    case_id = Column(String(64), nullable=True)
+    status = Column(String(32), nullable=False, default="pending")
+    attempt_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text)
+    reported_at = Column(DateTime)
+    payload_json = Column(JSON, nullable=False, default=dict)
+    response_json = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, default=now_utc)
+    updated_at = Column(DateTime, default=now_utc, onupdate=now_utc)
+
+
 class SchedulerWorker(Base):
     __tablename__ = _prefix("scheduler_worker")
 
@@ -369,6 +389,7 @@ MODEL_CLASSES = [
     RunIndexRemovedResult,
     RunIndexSession,
     RunIndexFile,
+    VulnReportSubmission,
     SchedulerWorker,
 ]
 
@@ -416,6 +437,9 @@ INDEX_DEFINITIONS = [
     (RunIndexSession.__tablename__, "ix_dfvs_ris_run", "CREATE INDEX ix_dfvs_ris_run ON {table} (run_index_id)"),
     (RunIndexFile.__tablename__, "ix_dfvs_rif_run", "CREATE INDEX ix_dfvs_rif_run ON {table} (run_index_id)"),
     (RunIndexFile.__tablename__, "ix_dfvs_rif_run_path", "CREATE INDEX ix_dfvs_rif_run_path ON {table} (run_index_id, path)"),
+    (VulnReportSubmission.__tablename__, "ix_dfvs_vrs_task", "CREATE INDEX ix_dfvs_vrs_task ON {table} (task_id)"),
+    (VulnReportSubmission.__tablename__, "ix_dfvs_vrs_exec", "CREATE INDEX ix_dfvs_vrs_exec ON {table} (execution_id)"),
+    (VulnReportSubmission.__tablename__, "ux_dfvs_vrs_result", "CREATE UNIQUE INDEX ux_dfvs_vrs_result ON {table} (task_id, execution_id, result_file)"),
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_heartbeat", "CREATE INDEX ix_dfvs_worker_heartbeat ON {table} (last_heartbeat_at)"),
     (SchedulerWorker.__tablename__, "ix_dfvs_worker_status", "CREATE INDEX ix_dfvs_worker_status ON {table} (status)"),
 ]

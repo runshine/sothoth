@@ -26,7 +26,6 @@ class PluginChainResult:
     # completed            - 所有插件正常执行完毕
     # end_stage_normal     - 某插件返回 OK_END_STAGE
     # end_stage_skip_next  - 某插件返回 ERROR_END_NEXT
-    # restart_workflow     - 某插件返回 ERROR_RESTART
     # exit_workflow        - 某插件返回 ERROR_EXIT
 
     results: list[PluginResult] = field(default_factory=list)
@@ -42,7 +41,7 @@ class PluginChainExecutor:
     - OK_END_STAGE:     跳过后续插件，正常结束阶段
     - ERROR_CONTINUE:   记录错误但继续下一个插件
     - ERROR_END_NEXT:   结束当前阶段，进入下一阶段
-    - ERROR_RESTART:    重新开始整个工作流
+    - ERROR_RESTART:    历史兼容码；按失败退出处理，禁止自动重启整个工作流
     - ERROR_EXIT:       立即退出工作流
     """
 
@@ -162,13 +161,13 @@ class PluginChainExecutor:
                         error=result.message)
 
                 case PluginResultCode.ERROR_RESTART:
-                    logger.error("plugin_error_restart",
+                    logger.error("plugin_error_restart_blocked",
                                  plugin_id=plugin_id,
                                  error=result.message)
                     return PluginChainResult(
-                        action="restart_workflow",
+                        action="exit_workflow",
                         results=results,
-                        error=result.message)
+                        error=result.message or "自动重启整个工作流已禁用")
 
                 case PluginResultCode.ERROR_EXIT:
                     logger.error("plugin_error_exit",

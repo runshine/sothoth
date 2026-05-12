@@ -15,6 +15,7 @@ import contextlib
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
 from app.pi_vuln_core.config.models import AdvisorInstanceDef, EngineConfig
@@ -114,7 +115,7 @@ class GlobalReviewExecutor:
     """
     全局评审执行器
 
-    串行调用每个全局评审参谋，任一不通过则整体不通过。
+    并行调用每个全局评审参谋，任一不通过则整体不通过。
     """
 
     def __init__(
@@ -136,6 +137,7 @@ class GlobalReviewExecutor:
         review_state: ReviewState,
         advisor_sessions: dict[str, str],
         engine_config: EngineConfig | None = None,
+        resume_cursor: dict | None = None,
     ) -> tuple[bool, str]:
         """
         执行全局评审
@@ -188,6 +190,12 @@ class GlobalReviewExecutor:
                 advisor_def=advisor_def,
             )
             if existing is not None:
+                logger.info(
+                    "global_review_resume_skip_existing_advisor",
+                    advisor=advisor_def.instance_id,
+                    cycle=cycle,
+                    resume_cursor=resume_cursor or {},
+                )
                 tasks.append(_already_done(existing))
                 continue
             tasks.append(self._run_single_advisor(
@@ -241,6 +249,10 @@ class GlobalReviewExecutor:
             aggregate_scores = self._merge_scores_min(
                 aggregate_scores, outcome["scores"],
             )
+            outcome_issues = self._enrich_advisor_issues(
+                outcome.get("issues", []),
+                advisor_id=str(outcome.get("advisor_id") or advisor_def.instance_id),
+            )
             if not outcome.get("already_recorded"):
                 review_state.global_review_history.append(
                     GlobalReviewRecord(
@@ -249,13 +261,13 @@ class GlobalReviewExecutor:
                         passed=outcome["passed"],
                         feedback=outcome["detail_feedback"] or outcome["feedback"],
                         scores=outcome["scores"] or {},
-                        issues=outcome.get("issues", []),
+                        issues=outcome_issues,
                     )
                 )
 
             if not outcome["passed"]:
                 all_passed = False
-                all_issues.extend(outcome.get("issues", []))
+                all_issues.extend(outcome_issues)
                 feedback_parts.append(
                     outcome["detail_feedback"] or outcome["feedback"]
                 )
@@ -682,6 +694,20 @@ class GlobalReviewExecutor:
                     await agent.close_session(session_id)
                 if advisor_sessions.get(session_key) == session_id:
                     advisor_sessions.pop(session_key, None)
+
+    @staticmethod
+    def _enrich_advisor_issues(
+        issues: list[dict[str, Any]] | None,
+        *,
+        advisor_id: str,
+    ) -> list[dict[str, Any]]:
+        enriched: list[dict[str, Any]] = []
+        for item in issues or []:
+            issue = dict(item) if isinstance(item, dict) else {"detail": str(item)}
+            if advisor_id and not issue.get("advisor_id"):
+                issue["advisor_id"] = advisor_id
+            enriched.append(issue)
+        return enriched
 
     @staticmethod
     def _build_global_review_session_hint(
@@ -1543,14 +1569,15 @@ class GlobalReviewExecutor:
     ) -> None:
         snapshot_dir = Path(work_dir) / "_meta" / "review_feedback"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
-        recent_issues = review_state.get_recent_issues(last_n=1)
+        current_issues = review_state.get_current_issue_records()
         write_json(
             snapshot_dir / f"cycle_{cycle:03d}.json",
             {
                 "cycle": cycle,
                 "workflow_mode": review_state.workflow_mode,
-                "issue_count": len(recent_issues),
-                "issues": recent_issues,
+                "issue_count": len(current_issues),
+                "issues": current_issues,
+                "issue_ledger_status": review_state.get_issue_ledger_status(),
                 "last_global_scores": review_state.last_global_scores,
                 "last_global_feedback": review_state.last_global_feedback,
             },
