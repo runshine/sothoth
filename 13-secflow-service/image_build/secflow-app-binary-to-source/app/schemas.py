@@ -44,6 +44,12 @@ class TaskCreate(BaseModel):
     elf_tasks: list[ElfTaskInput]
 
 
+class B2SServiceConfig(BaseModel):
+    project_id: str
+    budget_exhausted_action: Literal["treat_as_passed", "treat_as_failed"] = "treat_as_passed"
+    updated_at: Optional[str] = None
+
+
 class RetryRequest(BaseModel):
     item_ids: Optional[list[str]] = None
 
