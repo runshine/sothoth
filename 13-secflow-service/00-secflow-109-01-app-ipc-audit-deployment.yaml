@@ -59,7 +59,7 @@ spec:
               subPath: config.yaml
             - name: secflow-app-ipc-audit-data-nfs-pvc
               mountPath: /var/lib/secflow-app-ipc-audit
-            - name: secflow-platform-fileserver-data-nfs-pvc
+            - name: secflow-app-ipc-audit-data-nfs-pvc
               mountPath: /workspace/files
               subPath: files
             - name: dev-net-tun
@@ -97,9 +97,6 @@ spec:
         - name: secflow-app-ipc-audit-data-nfs-pvc
           persistentVolumeClaim:
             claimName: secflow-app-ipc-audit-data-nfs-pvc
-        - name: secflow-platform-fileserver-data-nfs-pvc
-          persistentVolumeClaim:
-            claimName: secflow-platform-fileserver-data-nfs-pvc
         - name: dev-net-tun
           hostPath:
             path: /dev/net/tun

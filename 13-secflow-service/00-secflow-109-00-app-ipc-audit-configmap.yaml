@@ -5,6 +5,10 @@ metadata:
   namespace: secflow-ns
 data:
   config.yaml: |
+    # Single-PVC layout inside secflow-app-ipc-audit-data-nfs-pvc:
+    # - PVC root -> /var/lib/secflow-app-ipc-audit
+    # - PVC subdir files/ -> /workspace/files
+    # The files/ subtree must contain the OpenHarmony source tree, hdc, and qcow2 cache.
     title: "SecFlow IPC Audit Service"
     api_prefix: "/api/app/ipc-audit"
     database_url: "sqlite:////var/lib/secflow-app-ipc-audit/ipc-audit.db"
@@ -45,7 +49,7 @@ data:
 
     workspaces:
       - workspace_id: "shared-files-root"
-        display_name: "Shared Files Root"
+        display_name: "IPC Audit Files Root"
         repo_root: "/workspace/files"
         entries_file: ".audit/ipc_entries.txt"
         bundle_scan_roots:

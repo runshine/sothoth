@@ -9,25 +9,7 @@ ARG PIP_TRUSTED_HOST=repo.huaweicloud.com
 ARG NPM_REGISTRY_URL=https://repo.huaweicloud.com/repository/npm/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    IPC_AUDIT_DATABASE_URL=sqlite:////var/lib/secflow-ipc-audit/ipc-audit.db \
-    IPC_AUDIT_STATE_ROOT=/var/lib/secflow-ipc-audit \
-    IPC_AUDIT_EXECUTION_MODE=codex_cli \
-    IPC_AUDIT_DEFAULT_WORKSPACE_ID=oh61-main \
-    IPC_AUDIT_CODEX_BIN=/usr/local/bin/codex \
-    IPC_AUDIT_OPENCODE_BIN=/usr/local/bin/opencode \
-    HDC_BIN=/workspace/openharmony_6_1/vendor/edu/docker/src/hdc \
-    LD_LIBRARY_PATH=/workspace/openharmony_6_1/vendor/edu/docker/src \
-    OHEMU_HELPER_BIN=/usr/local/bin/ipc-audit-qemu \
-    OHEMU_WORKSPACE_ROOT=/workspace/openharmony_6_1 \
-    OHEMU_QCOW2_PREPARED_ROOT=/workspace/openharmony_6_1/vendor/edu/docker/volumes/qcow2_cache \
-    OHEMU_RUNTIME_ROOT=/var/lib/secflow-ipc-audit/ohemu \
-    OHEMU_ARCH=arm64 \
-    OHEMU_NETWORK_MODE=bridge \
-    OHEMU_HDC_BIND=127.0.0.1 \
-    OHEMU_HDC_BASE_PORT=55555 \
-    OHEMU_WAIT_FOR_HDC_READY=1 \
-    OHEMU_HDC_READY_TIMEOUT=180
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
@@ -76,11 +58,16 @@ COPY config.example.yaml /app/config.example.yaml
 COPY scripts/ipc-audit-qemu.sh /usr/local/bin/ipc-audit-qemu
 RUN chmod +x /usr/local/bin/ipc-audit-qemu
 
-RUN mkdir -p /var/lib/secflow-ipc-audit /workspace/openharmony_6_1 /root/.codex /root/.config/opencode /root/.local/share/opencode
+RUN mkdir -p \
+    /var/lib/secflow-ipc-audit \
+    /var/lib/secflow-app-ipc-audit \
+    /workspace/openharmony_6_1 \
+    /workspace/files \
+    /root/.codex \
+    /root/.config/opencode \
+    /root/.local/share/opencode
 
 EXPOSE 8080
-
-VOLUME ["/var/lib/secflow-ipc-audit", "/workspace/openharmony_6_1"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python3 -c "from urllib.request import urlopen; urlopen('http://127.0.0.1:8080/api/app/ipc-audit/health', timeout=5)" || exit 1
