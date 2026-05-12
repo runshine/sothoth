@@ -127,6 +127,25 @@ class CatalogRefreshJobResponse(BaseModel):
     message: str | None = None
 
 
+class ProviderSummaryResponse(BaseModel):
+    provider_key: str
+    display_name: str
+    provider_type: str
+    enabled: bool
+    is_default: bool
+    api_base: str
+    model: str
+    updated_at: str | None = None
+    mapped_env_keys: list[str] = Field(default_factory=list)
+    mapped_file_paths: list[str] = Field(default_factory=list)
+
+
+class ProviderListResponse(BaseModel):
+    total: int
+    default_provider_key: str | None = None
+    items: list[ProviderSummaryResponse]
+
+
 class TaskCreateRequest(BaseModel):
     project_id: str | None = None
     title: str
@@ -135,6 +154,7 @@ class TaskCreateRequest(BaseModel):
     input_ref: InputRef
     executor_mode: ExecutorMode | None = None
     model: str | None = None
+    provider_keys: list[str] = Field(default_factory=list)
     notes: str | None = None
     idempotency_key: str | None = None
 

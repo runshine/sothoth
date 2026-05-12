@@ -66,6 +66,7 @@ class StageContext:
     artifacts_dir: Path
     scratch_dir: Path
     effective_config: dict[str, Any]
+    provider_runtime: Any | None = None
 
     def stage_session_dir(self) -> Path:
         return self.runtime_root / self.stage_name
@@ -132,6 +133,14 @@ def resolve_executor_model(effective_config: dict[str, Any]) -> str | None:
     return candidate or None
 
 
+def resolve_stage_executor_model(context: StageContext) -> str | None:
+    runtime = context.provider_runtime
+    runtime_model = str(getattr(runtime, "effective_model", "") or "").strip() if runtime is not None else ""
+    if runtime_model:
+        return runtime_model
+    return resolve_executor_model(context.effective_config)
+
+
 def build_codex_exec_command(
     prompt: str,
     *,
@@ -184,25 +193,52 @@ def build_opencode_exec_command(
     return cmd
 
 
+def build_process_env(context: StageContext) -> dict[str, str]:
+    process_env, _, _ = build_process_env_and_summary(context)
+    return process_env
+
+
+def build_process_env_and_summary(context: StageContext) -> tuple[dict[str, str], str, dict[str, Any]]:
+    from app.services.provider_runtime import get_provider_runtime_service
+
+    runtime_service = get_provider_runtime_service()
+    materialized = runtime_service.materialize_runtime(context.runtime_root, context.provider_runtime)
+    process_env = runtime_service.build_process_env(context.provider_runtime, materialized)
+    runtime = context.provider_runtime
+    provider_keys = runtime.provider_keys if runtime is not None else []
+    metadata = {
+        "provider_keys": provider_keys,
+        "mapped_env_keys": materialized.mapped_env_keys,
+        "mapped_file_paths": materialized.mapped_file_paths,
+        "effective_model": runtime.effective_model if runtime is not None else None,
+    }
+    summary = "\n".join(
+        [
+            f"Provider keys: {provider_keys if provider_keys else '[]'}",
+            f"Mapped env keys: {materialized.mapped_env_keys if materialized.mapped_env_keys else '[]'}",
+            f"Mapped file paths: {materialized.mapped_file_paths if materialized.mapped_file_paths else '[]'}",
+            f"HOME: {materialized.home_dir}",
+            f"XDG_CONFIG_HOME: {materialized.xdg_config_home}",
+            f"XDG_DATA_HOME: {materialized.xdg_data_home}",
+            f"XDG_CACHE_HOME: {materialized.xdg_cache_home}",
+            f"XDG_STATE_HOME: {materialized.xdg_state_home}",
+        ]
+    )
+    return process_env, summary, metadata
+
+
 def build_opencode_process_env(context: StageContext) -> dict[str, str]:
-    env = os.environ.copy()
-    opencode_root = context.stage_session_dir() / "opencode-env"
-    data_home = opencode_root / "data"
-    cache_home = opencode_root / "cache"
-    state_home = opencode_root / "state"
-    for path in (data_home, cache_home, state_home):
-        path.mkdir(parents=True, exist_ok=True)
-    # Keep XDG_CONFIG_HOME untouched so deployment-time file_bindings under
-    # /root/.config/opencode remain active, while isolating per-process DB/logs.
-    env["XDG_DATA_HOME"] = str(data_home)
-    env["XDG_CACHE_HOME"] = str(cache_home)
-    env["XDG_STATE_HOME"] = str(state_home)
-    return env
+    return build_process_env(context)
 
 
 def opencode_env_summary(env: dict[str, str]) -> str:
-    keys = ("XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME")
+    keys = ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME")
     return "\n".join(f"{key}: {env.get(key, '')}" for key in keys)
+
+
+def provider_runtime_summary(context: StageContext) -> str:
+    _, summary, _ = build_process_env_and_summary(context)
+    return summary
 
 
 def extract_opencode_session_id(events_path: Path) -> str | None:
@@ -286,7 +322,7 @@ def run_logged_command(
     timeout_seconds: int,
     mirror_output_paths: list[Path] | None = None,
     append: bool = False,
-    env: dict[str, str] | None = None,
+    process_env: dict[str, str] | None = None,
 ) -> LoggedCommandResult:
     cfg: ExecutionConfig = get_config().execution
     heartbeat_interval = max(float(cfg.heartbeat_interval_seconds), 1.0)
@@ -314,7 +350,7 @@ def run_logged_command(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        env=env,
+        env=process_env,
     )
     selector = selectors.DefaultSelector()
     if process.stdout is not None:

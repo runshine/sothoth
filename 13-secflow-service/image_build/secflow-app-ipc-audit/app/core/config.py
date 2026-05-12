@@ -55,6 +55,15 @@ class ExecutionConfig(BaseModel):
     mock_stage_delay_seconds: float = 0.0
 
 
+class ProviderSourceConfig(BaseModel):
+    enabled: bool = True
+    backend: Literal["configcenter", "platform_agent"] = "configcenter"
+    base_url: str = "http://secflow-platform-configcenter"
+    api_prefix: str = "/api/configcenter/service/llm"
+    timeout_seconds: int = 15
+    machine_token: str | None = None
+
+
 class ServiceConfig(BaseModel):
     title: str = "SecFlow IPC Audit Service"
     api_prefix: str = "/api/app/ipc-audit"
@@ -63,6 +72,7 @@ class ServiceConfig(BaseModel):
     default_workspace_id: str | None = None
     app: AppConfig = Field(default_factory=AppConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    provider_source: ProviderSourceConfig = Field(default_factory=ProviderSourceConfig)
     workspaces: list[WorkspaceConfig] = Field(default_factory=list)
 
 
@@ -119,6 +129,7 @@ def _as_bool(value: object) -> bool:
 def _merge_env_overrides(payload: dict[str, object]) -> dict[str, object]:
     app_payload = dict(payload.get("app") or {})
     execution_payload = dict(payload.get("execution") or {})
+    provider_source_payload = dict(payload.get("provider_source") or {})
     payload["database_url"] = os.environ.get("IPC_AUDIT_DATABASE_URL", payload.get("database_url"))
     payload["state_root"] = os.environ.get("IPC_AUDIT_STATE_ROOT", payload.get("state_root"))
     payload["default_workspace_id"] = os.environ.get(
@@ -242,8 +253,37 @@ def _merge_env_overrides(payload: dict[str, object]) -> dict[str, object]:
             execution_payload.get("mock_stage_delay_seconds", 0.0),
         )
     )
+    provider_source_payload["enabled"] = _as_bool(
+        os.environ.get(
+            "IPC_AUDIT_PROVIDER_ENABLED",
+            provider_source_payload.get("enabled", True),
+        )
+    )
+    provider_source_payload["backend"] = os.environ.get(
+        "IPC_AUDIT_PROVIDER_BACKEND",
+        provider_source_payload.get("backend", "configcenter"),
+    )
+    provider_source_payload["base_url"] = os.environ.get(
+        "IPC_AUDIT_PROVIDER_BASE_URL",
+        provider_source_payload.get("base_url", "http://secflow-platform-configcenter"),
+    )
+    provider_source_payload["api_prefix"] = os.environ.get(
+        "IPC_AUDIT_PROVIDER_API_PREFIX",
+        provider_source_payload.get("api_prefix", "/api/configcenter/service/llm"),
+    )
+    provider_source_payload["timeout_seconds"] = int(
+        os.environ.get(
+            "IPC_AUDIT_PROVIDER_TIMEOUT_SECONDS",
+            provider_source_payload.get("timeout_seconds", 15),
+        )
+    )
+    provider_source_payload["machine_token"] = os.environ.get(
+        "IPC_AUDIT_PROVIDER_MACHINE_TOKEN",
+        provider_source_payload.get("machine_token"),
+    )
     payload["app"] = app_payload
     payload["execution"] = execution_payload
+    payload["provider_source"] = provider_source_payload
     return payload
 
 

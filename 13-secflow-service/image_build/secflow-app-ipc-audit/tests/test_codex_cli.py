@@ -10,8 +10,26 @@ from app.core.auth import Subject
 from app.core.config import load_config
 from app.db.database import init_database
 from app.schemas import InputRef, TaskCreateRequest
+from app.services.provider_client import ProviderNotFoundError
 from app.services.execution_service import get_execution_service
 from app.services.task_service import get_task_service
+
+
+class FakeProviderClient:
+    def __init__(self, details: dict[str, dict]) -> None:
+        self.details = details
+
+    def list_providers(self) -> dict:
+        return {
+            "total": len(self.details),
+            "default_provider_key": next(iter(self.details.keys()), None),
+            "items": list(self.details.values()),
+        }
+
+    def get_provider_detail(self, provider_key: str) -> dict:
+        if provider_key not in self.details:
+            raise ProviderNotFoundError(f"provider not found: {provider_key}")
+        return self.details[provider_key]
 
 
 class CodexCliModeTest(unittest.TestCase):
@@ -59,6 +77,37 @@ class CodexCliModeTest(unittest.TestCase):
         load_config()
         init_database()
         self.subject = Subject(username="tester")
+        self.provider_details = {
+            "codex-prod": {
+                "provider_key": "codex-prod",
+                "display_name": "Codex Prod",
+                "provider_type": "openai",
+                "enabled": True,
+                "is_default": True,
+                "api_base": "https://api.openai.com/v1",
+                "model": "gpt-5-codex-create",
+                "updated_at": "2026-05-12T00:00:00Z",
+                "api_key": "top-secret",
+                "env_bindings": {
+                    "OPENAI_API_KEY": "sk-create-secret",
+                },
+                "file_bindings": [
+                    {
+                        "name": "auth.json",
+                        "path": "/root/.codex/auth.json",
+                        "content": "{\"token\":\"create-secret\"}",
+                        "enabled": True,
+                    },
+                    {
+                        "name": "opencode.json",
+                        "path": "/root/.config/opencode/opencode.json",
+                        "content": "{\"provider\":\"create-secret\"}",
+                        "enabled": True,
+                    },
+                ],
+            }
+        }
+        self._install_provider_client()
 
     def tearDown(self) -> None:
         for key in (
@@ -71,6 +120,11 @@ class CodexCliModeTest(unittest.TestCase):
             "IPC_AUDIT_POC_ENABLED",
             "IPC_AUDIT_POC_RUNTIME_AVAILABLE",
             "IPC_AUDIT_WORKSPACES_JSON",
+            "FAKE_CODEX_EXPECT_HOME_PREFIX",
+            "FAKE_CODEX_EXPECT_XDG_CONFIG_PREFIX",
+            "FAKE_CODEX_EXPECT_OPENAI_API_KEY",
+            "FAKE_CODEX_EXPECT_AUTH_TOKEN",
+            "FAKE_CODEX_EXPECT_OPENCODE_PROVIDER",
         ):
             os.environ.pop(key, None)
         self._reset_singletons()
@@ -165,12 +219,60 @@ class CodexCliModeTest(unittest.TestCase):
         self.assertTrue((attempt_root / "runtime" / "poc" / "outputs").exists())
         self.assertFalse((self.repo_root / ".audit" / "secflow-app-ipc-audit").exists())
 
+    def test_codex_cli_refetches_provider_runtime_env_and_model(self) -> None:
+        self.provider_details["codex-prod"]["model"] = "gpt-5-codex-create"
+        self.provider_details["codex-prod"]["env_bindings"]["OPENAI_API_KEY"] = "sk-create-secret"
+        self.provider_details["codex-prod"]["file_bindings"][0]["content"] = "{\"token\":\"create-secret\"}"
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="provider-bound-codex",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_only",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+                executor_mode="codex_cli",
+                provider_keys=["codex-prod"],
+            ),
+            self.subject,
+        )
+
+        self.provider_details["codex-prod"]["model"] = "gpt-5-codex-runtime"
+        self.provider_details["codex-prod"]["env_bindings"]["OPENAI_API_KEY"] = "sk-runtime-secret"
+        self.provider_details["codex-prod"]["file_bindings"][0]["content"] = "{\"token\":\"runtime-secret\"}"
+        self.provider_details["codex-prod"]["file_bindings"][1]["content"] = "{\"provider\":\"runtime-secret\"}"
+        self._set_env("FAKE_CODEX_EXPECT_HOME_PREFIX", str(self.state_root))
+        self._set_env("FAKE_CODEX_EXPECT_XDG_CONFIG_PREFIX", str(self.state_root))
+        self._set_env("FAKE_CODEX_EXPECT_OPENAI_API_KEY", "sk-runtime-secret")
+        self._set_env("FAKE_CODEX_EXPECT_AUTH_TOKEN", "runtime-secret")
+        self._set_env("FAKE_CODEX_EXPECT_OPENCODE_PROVIDER", "runtime-secret")
+
+        attempt_id = get_task_service().claim_next_attempt("tester-worker")
+        self.assertIsNotNone(attempt_id)
+        get_execution_service().run_attempt(str(attempt_id))
+
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+        self.assertEqual(detail.status, "succeeded")
+        self.assertEqual(attempt.status, "succeeded")
+
+        audit_log = get_task_service().get_stage_log(task.task_id, str(detail.latest_attempt_id), "audit", lines=260, cursor=None)
+        self.assertIn("-m gpt-5-codex-runtime", audit_log.content)
+        self.assertIn("Provider keys: ['codex-prod']", audit_log.content)
+        self.assertNotIn("sk-runtime-secret", audit_log.content)
+        self.assertNotIn("runtime-secret", audit_log.content)
+
+        manifest_path = self.state_root / "tasks" / task.task_id / "attempts" / str(detail.latest_attempt_id) / "runtime" / "manifest.json"
+        manifest = manifest_path.read_text(encoding="utf-8")
+        self.assertIn("gpt-5-codex-runtime", manifest)
+        self.assertNotIn("sk-runtime-secret", manifest)
+        self.assertNotIn("runtime-secret", manifest)
+
     def _write_fake_codex(self) -> None:
         script = "\n".join(
             [
                 "#!/usr/bin/env python3",
                 "from __future__ import annotations",
                 "import json",
+                "import os",
                 "import sys",
                 "from pathlib import Path",
                 "",
@@ -181,6 +283,27 @@ class CodexCliModeTest(unittest.TestCase):
                 "    if value == '-o' and index + 1 < len(args):",
                 "        last_message_path = Path(args[index + 1])",
                 "prompt = args[-1]",
+                "home = os.environ.get('HOME', '')",
+                "expected_home_prefix = os.environ.get('FAKE_CODEX_EXPECT_HOME_PREFIX', '')",
+                "if expected_home_prefix and not home.startswith(expected_home_prefix):",
+                "    raise SystemExit(f'unexpected HOME: {home}')",
+                "xdg_config_home = os.environ.get('XDG_CONFIG_HOME', '')",
+                "expected_xdg_prefix = os.environ.get('FAKE_CODEX_EXPECT_XDG_CONFIG_PREFIX', '')",
+                "if expected_xdg_prefix and not xdg_config_home.startswith(expected_xdg_prefix):",
+                "    raise SystemExit(f'unexpected XDG_CONFIG_HOME: {xdg_config_home}')",
+                "expected_openai_key = os.environ.get('FAKE_CODEX_EXPECT_OPENAI_API_KEY', '')",
+                "if expected_openai_key and os.environ.get('OPENAI_API_KEY') != expected_openai_key:",
+                "    raise SystemExit('unexpected OPENAI_API_KEY')",
+                "expected_auth_token = os.environ.get('FAKE_CODEX_EXPECT_AUTH_TOKEN', '')",
+                "if expected_auth_token:",
+                "    auth_path = Path(home) / '.codex' / 'auth.json'",
+                "    if expected_auth_token not in auth_path.read_text(encoding='utf-8'):",
+                "        raise SystemExit(f'auth.json missing expected token: {auth_path}')",
+                "expected_opencode_provider = os.environ.get('FAKE_CODEX_EXPECT_OPENCODE_PROVIDER', '')",
+                "if expected_opencode_provider:",
+                "    opencode_path = Path(xdg_config_home) / 'opencode' / 'opencode.json'",
+                "    if expected_opencode_provider not in opencode_path.read_text(encoding='utf-8'):",
+                "        raise SystemExit(f'opencode.json missing expected provider: {opencode_path}')",
                 "",
                 "def extract(prefix: str) -> Path:",
                 "    for line in prompt.splitlines():",
@@ -224,6 +347,11 @@ class CodexCliModeTest(unittest.TestCase):
     def _set_env(key: str, value: str) -> None:
         os.environ[key] = value
 
+    def _install_provider_client(self) -> None:
+        import app.services.provider_client as provider_client_module
+
+        provider_client_module._provider_client = FakeProviderClient(self.provider_details)
+
     @staticmethod
     def _reset_singletons() -> None:
         import app.core.config as config_module
@@ -232,6 +360,8 @@ class CodexCliModeTest(unittest.TestCase):
         import app.services.catalog_service as catalog_module
         import app.services.event_service as event_module
         import app.services.execution_service as execution_module
+        import app.services.provider_client as provider_client_module
+        import app.services.provider_runtime as provider_runtime_module
         import app.services.task_service as task_module
         import app.services.workspace_service as workspace_module
         import app.workers.scheduler as scheduler_module
@@ -242,6 +372,8 @@ class CodexCliModeTest(unittest.TestCase):
         catalog_module._catalog_service = None
         event_module._event_service = None
         execution_module._execution_service = None
+        provider_client_module._provider_client = None
+        provider_runtime_module._provider_runtime_service = None
         task_module._task_service = None
         workspace_module._workspace_service = None
         scheduler_module._scheduler_service = None

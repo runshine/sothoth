@@ -31,6 +31,8 @@ from app.schemas import (
 from app.services.artifact_service import get_artifact_service
 from app.services.catalog_service import get_catalog_service
 from app.services.event_service import get_event_service
+from app.services.provider_client import ProviderClientError
+from app.services.provider_runtime import get_provider_runtime_service
 from app.services.workspace_service import get_workspace_service
 
 ACTIVE_TASK_STATUSES = {"queued", "running", "cancel_requested"}
@@ -64,6 +66,16 @@ class TaskService:
         input_ref = normalized.normalized_input_ref
         target_key = input_ref.project_path or input_ref.report_path or ""
         now = utc_now_z()
+        execution_cfg = get_config().execution
+        executor_mode = str(payload.executor_mode or execution_cfg.mode)
+        explicit_task_model = str(payload.model or "").strip() or None
+        try:
+            runtime_provider = get_provider_runtime_service().resolve_runtime(
+                payload.provider_keys,
+                explicit_task_model=explicit_task_model,
+            )
+        except ProviderClientError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
         with get_database().connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if payload.idempotency_key:
@@ -91,13 +103,15 @@ class TaskService:
 
             task_id = new_task_id()
             attempt_id = new_attempt_id()
-            execution_cfg = get_config().execution
-            executor_mode = str(payload.executor_mode or execution_cfg.mode)
-            selected_model = str(payload.model or "").strip() or None
+            selected_model = runtime_provider.effective_model
             effective_config = {
                 "execution_mode": executor_mode,
                 "executor_mode": executor_mode,
                 "model": selected_model,
+                "task_model": explicit_task_model,
+                "provider_keys": runtime_provider.provider_keys,
+                "provider_snapshots": runtime_provider.provider_snapshots,
+                "provider_source_backend": get_config().provider_source.backend,
                 "audit_skill": execution_cfg.default_audit_skill,
                 "poc_skill": execution_cfg.default_poc_skill,
                 "audit_sandbox_mode": execution_cfg.audit_sandbox_mode,

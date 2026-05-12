@@ -97,11 +97,15 @@ class CatalogRefreshAsyncTest(unittest.TestCase):
         import app.core.config as config_module
         import app.db.database as database_module
         import app.services.catalog_service as catalog_module
+        import app.services.provider_client as provider_client_module
+        import app.services.provider_runtime as provider_runtime_module
         import app.services.workspace_service as workspace_module
 
         config_module._config = None
         database_module._database = None
         catalog_module._catalog_service = None
+        provider_client_module._provider_client = None
+        provider_runtime_module._provider_runtime_service = None
         workspace_module._workspace_service = None
 
 

@@ -165,6 +165,8 @@ class SchedulerParallelismTest(unittest.TestCase):
         import app.services.catalog_service as catalog_module
         import app.services.event_service as event_module
         import app.services.execution_service as execution_module
+        import app.services.provider_client as provider_client_module
+        import app.services.provider_runtime as provider_runtime_module
         import app.services.runtime_config_service as runtime_config_module
         import app.services.task_service as task_module
         import app.services.workspace_service as workspace_module
@@ -176,6 +178,8 @@ class SchedulerParallelismTest(unittest.TestCase):
         catalog_module._catalog_service = None
         event_module._event_service = None
         execution_module._execution_service = None
+        provider_client_module._provider_client = None
+        provider_runtime_module._provider_runtime_service = None
         runtime_config_module._runtime_config_service = None
         task_module._task_service = None
         workspace_module._workspace_service = None

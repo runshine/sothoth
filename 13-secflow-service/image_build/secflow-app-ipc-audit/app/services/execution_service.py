@@ -12,6 +12,8 @@ from app.core.time_utils import utc_now_z
 from app.db.database import get_database
 from app.services.artifact_service import get_artifact_service
 from app.services.event_service import get_event_service
+from app.services.provider_client import ProviderClientError
+from app.services.provider_runtime import get_provider_runtime_service
 from app.services.workspace_service import get_workspace_service
 from app.workers.runner import StageArtifact, StageContext, StageExecutionResult, StageHooks, write_json_file
 from app.workers.stage_audit import run_audit_stage
@@ -24,6 +26,7 @@ class ExecutionService:
     def run_attempt(self, attempt_id: str) -> None:
         context = self._load_context(attempt_id)
         try:
+            self._attach_provider_runtime(context)
             audit_report_path: Path | None = None
             start_stage = str(context["effective_config"].get("start_stage") or "audit")
 
@@ -153,7 +156,26 @@ class ExecutionService:
             artifacts_dir=artifact_service.artifacts_dir(task_id, attempt_id),
             scratch_dir=artifact_service.scratch_dir(task_id, attempt_id),
             effective_config=dict(context["effective_config"]),
+            provider_runtime=context.get("provider_runtime"),
         )
+
+    def _attach_provider_runtime(self, context: dict[str, object]) -> None:
+        effective_config = context["effective_config"] if isinstance(context.get("effective_config"), dict) else {}
+        explicit_task_model = str(effective_config.get("task_model") or "").strip() or None
+        fallback_model = str(effective_config.get("model") or "").strip() or None
+        try:
+            resolved = get_provider_runtime_service().resolve_runtime(
+                effective_config.get("provider_keys") if isinstance(effective_config.get("provider_keys"), list) else [],
+                explicit_task_model=explicit_task_model,
+                fallback_model=fallback_model,
+            )
+        except ProviderClientError as exc:
+            provider_keys = effective_config.get("provider_keys") if isinstance(effective_config.get("provider_keys"), list) else []
+            raise StageFailedError(
+                "provider",
+                f"provider resolution failed for {provider_keys or '[]'}: {exc}",
+            ) from exc
+        context["provider_runtime"] = resolved
 
     def _persist_stage_result(self, context: dict[str, object], result: StageExecutionResult) -> None:
         task_id = str(context["task_id"])
@@ -636,6 +658,14 @@ class ExecutionService:
                 "mode": get_config().execution.mode,
                 "repo_root": str(context["repo_root"]),
                 "attempt_root": str(attempt_root),
+                "provider_keys": list(getattr(context.get("provider_runtime"), "provider_keys", []) or []),
+                "mapped_env_keys": list(getattr(context.get("provider_runtime"), "merged_env", {}).keys()),
+                "mapped_file_paths": [
+                    str(item.get("path") or "").strip()
+                    for item in getattr(context.get("provider_runtime"), "merged_files", []) or []
+                    if isinstance(item, dict) and str(item.get("path") or "").strip()
+                ],
+                "effective_model": getattr(context.get("provider_runtime"), "effective_model", None),
             },
             "stages": [dict(row) for row in stage_rows],
             "artifacts": [dict(row) for row in artifact_rows],
