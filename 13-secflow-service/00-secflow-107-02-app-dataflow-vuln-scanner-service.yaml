@@ -6,7 +6,8 @@ metadata:
 spec:
   type: ClusterIP
   selector:
-    name: "secflow-app-dataflow-vuln-scanner"
+    app: secflow-app-dataflow-vuln-scanner
+    role: manager
   ports:
     - port: 80
       targetPort: 8080

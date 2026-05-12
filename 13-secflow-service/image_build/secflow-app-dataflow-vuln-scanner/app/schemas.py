@@ -324,6 +324,8 @@ class HealthResponse(BaseModel):
     pod_id: str
     database: str
     scheduler: str
+    scheduler_role: str = "standalone"
+    worker_enabled: str = "true"
 
 
 class RunSummaryResponse(BaseModel):

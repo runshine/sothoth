@@ -1,21 +1,24 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: secflow-app-dataflow-vuln-scanner
+  name: secflow-app-dataflow-vuln-scanner-manager
   namespace: secflow-ns
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
-      name: secflow-app-dataflow-vuln-scanner
+      app: secflow-app-dataflow-vuln-scanner
+      role: manager
   template:
     metadata:
       labels:
-        name: secflow-app-dataflow-vuln-scanner
+        app: secflow-app-dataflow-vuln-scanner
+        role: manager
+        name: secflow-app-dataflow-vuln-scanner-manager
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
-        - name: secflow-app-dataflow-vuln-scanner
+        - name: secflow-app-dataflow-vuln-scanner-manager
           image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest
           imagePullPolicy: Always
           env:
@@ -23,6 +26,94 @@ spec:
               value: Asia/Shanghai
             - name: CONFIG_PATH
               value: /app/config.yaml
+            - name: SECFLOW_DATAFLOW_ROLE
+              value: manager
+            - name: POD_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SECFLOW_DATAFLOW_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: secflow-app-dataflow-vuln-scanner-secret
+                  key: db-password
+            - name: SECFLOW_DATAFLOW_SERVICE_MACHINE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: secflow-app-dataflow-vuln-scanner-secret
+                  key: service-machine-token
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: secflow-app-dataflow-vuln-scanner-config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+            - name: secflow-platform-fileserver-data-nfs-pvc
+              mountPath: /data
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "1"
+          livenessProbe:
+            httpGet:
+              path: /api/dataflow-vuln-scanner/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /api/dataflow-vuln-scanner/ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+      volumes:
+        - name: secflow-app-dataflow-vuln-scanner-config
+          configMap:
+            name: secflow-app-dataflow-vuln-scanner-config
+            items:
+              - key: config.yaml
+                path: config.yaml
+        - name: secflow-platform-fileserver-data-nfs-pvc
+          persistentVolumeClaim:
+            claimName: secflow-platform-fileserver-data-nfs-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-dataflow-vuln-scanner-worker
+  namespace: secflow-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secflow-app-dataflow-vuln-scanner
+      role: worker
+  template:
+    metadata:
+      labels:
+        app: secflow-app-dataflow-vuln-scanner
+        role: worker
+        name: secflow-app-dataflow-vuln-scanner-worker
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: secflow-app-dataflow-vuln-scanner-worker
+          image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest
+          imagePullPolicy: Always
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: CONFIG_PATH
+              value: /app/config.yaml
+            - name: SECFLOW_DATAFLOW_ROLE
+              value: worker
             - name: POD_ID
               valueFrom:
                 fieldRef:
@@ -64,8 +155,8 @@ spec:
             httpGet:
               path: /api/dataflow-vuln-scanner/ready
               port: 8080
-            initialDelaySeconds: 15
-            periodSeconds: 15
+            initialDelaySeconds: 20
+            periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 6
       volumes:

@@ -22,6 +22,8 @@
 
 {rework_priority_queue}
 
+## Summary / Ledger handoff
+
 {summary_handoff_queue}
 
 {failed_result_reasons}

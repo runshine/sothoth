@@ -1461,6 +1461,11 @@ class WorkerExecutor:
                 review_state=review_state,
                 failed_files=failed_files,
             ),
+            "missed_hunt_variant_seeds": self._build_missed_hunt_variant_seeds(
+                ctx=ctx,
+                review_state=review_state,
+                failed_files=failed_files,
+            ),
             "coverage_hypothesis_queue": self._build_coverage_hypothesis_queue(
                 worker_issue_entries=worker_issue_entries,
                 coverage_targets=coverage_targets,
@@ -1510,10 +1515,13 @@ class WorkerExecutor:
         advisor_tokens: tuple[str, ...],
         plan_kind: str,
     ) -> str:
+        # Rework runs in one long-lived Worker session, so the model already
+        # has earlier-cycle history. Keep only the latest matching advisor
+        # record here to avoid making every rework stage re-ingest old reviews.
         records = [
             record for record in reversed(review_state.global_review_history)
             if self._record_matches_advisor(record, advisor_tokens)
-        ][:2]
+        ][:1]
         if not records:
             if plan_kind == "completeness":
                 return "\n".join([
@@ -1538,11 +1546,11 @@ class WorkerExecutor:
                 lines.append(f"- scores: {score_text}")
             feedback = str(getattr(record, "feedback", "") or "").strip()
             if feedback:
-                lines.append(f"- feedback: {self._clip_prompt_section(feedback, max_chars=1600)}")
+                lines.append(f"- feedback: {self._clip_prompt_section(feedback, max_chars=900)}")
             issues = list(getattr(record, "issues", []) or [])
             if issues:
                 lines.append("- advisor issues -> 本轮漏洞动作:")
-                for issue in issues[:8]:
+                for issue in issues[:5]:
                     if not isinstance(issue, dict):
                         continue
                     issue_id = ReviewState.prompt_safe_issue_id(
@@ -1570,7 +1578,7 @@ class WorkerExecutor:
                         )
                     lines.append(
                         f"  - `{issue_id}`: target={target}; blocking_type={blocking_type or 'unspecified'}; "
-                        f"required_action={action[:320] or '(无)'}; rework_action={model_action}"
+                        f"required_action={action[:220] or '(无)'}; rework_action={model_action}"
                     )
             else:
                 lines.append("- 本 advisor 未返回结构化 issue；只把 feedback 中的具体路径/分数短板作为本轮假设来源。")
@@ -1598,10 +1606,111 @@ class WorkerExecutor:
                 continue
             reason = (item.reason or "").strip()
             lines.append(
-                f"- `{item.filename}`: review_reason={reason[:520] or '(无原因)'}; "
+                f"- `{item.filename}`: review_reason={reason[:360] or '(无原因)'}; "
                 "required_action=重读源码证伪，真则补强，假则撤回或标记 false_positive。"
             )
         return "\n".join(lines)
+
+    def _build_missed_hunt_variant_seeds(
+        self,
+        *,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        failed_files: list[str],
+    ) -> str:
+        results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
+        current_files = ctx.pre_cycle_result_files or self._list_result_files(results_dir)
+        protected_files = list(ctx.protected_result_files or [])
+        failed_set = set(failed_files or [])
+        ordered_files = list(dict.fromkeys([*protected_files, *current_files]))
+
+        seeds: list[dict[str, str]] = []
+        for name in ordered_files:
+            if name in failed_set or not is_result_report_filename(name):
+                continue
+            path = os.path.join(results_dir, name)
+            if not os.path.isfile(path):
+                continue
+            try:
+                content = read_file(path)
+            except Exception:
+                continue
+            lifecycle = infer_result_lifecycle_from_text(content, name)
+            if not bool(lifecycle.get("active", True)):
+                continue
+            seeds.append(self._summarize_result_variant_seed(name, content))
+            if len(seeds) >= 8:
+                break
+
+        lines = [
+            "- 用已有有效 result 派生 sibling-path、symmetry-break、guard-bypass、state/config、error-path 变体。",
+            "- 不要重复报告已有漏洞；只有 sink、触发条件、保护缺口或攻击面有实质差异时才新增 result。",
+        ]
+        if seeds:
+            lines.append("### Active result variant seeds")
+            for seed in seeds:
+                parts = [
+                    f"`{seed['filename']}`",
+                    f"title={seed['title']}",
+                    f"severity={seed['severity']}",
+                    f"category={seed['category']}",
+                    f"subject={seed['subject']}",
+                    f"sink={seed['sink']}",
+                ]
+                lines.append("- " + "; ".join(parts))
+        else:
+            lines.append("- 当前没有可用的 active result 变体种子；优先从 advisor feedback 生成候选。")
+
+        if failed_files:
+            lines.extend([
+                "### Failed-result adjacency",
+                "- fp_repair 若证伪了 failed result，不要停在撤回；继续检查相邻真实风险：同一函数的兄弟分支、同一 sink 的其他输入源、同一 guard 的边界绕过。",
+                "- failed result 本身不得原样升级为新漏洞；只有发现独立真实路径才新增更高编号 result。",
+            ])
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _summarize_result_variant_seed(filename: str, content: str) -> dict[str, str]:
+        return {
+            "filename": filename,
+            "title": WorkerExecutor._extract_markdown_title(content)[:140] or "(untitled)",
+            "severity": WorkerExecutor._extract_result_meta_field(content, "severity")[:40] or "unknown",
+            "category": WorkerExecutor._extract_result_meta_field(content, "category")[:80] or "unknown",
+            "subject": (
+                WorkerExecutor._extract_result_meta_field(content, "subject.name")
+                or WorkerExecutor._extract_result_meta_field(content, "subject.locator")
+                or WorkerExecutor._extract_result_meta_field(content, "subject")
+            )[:120] or "unknown",
+            "sink": (
+                WorkerExecutor._extract_result_meta_field(content, "sink/危险操作")
+                or WorkerExecutor._extract_result_meta_field(content, "sink")
+                or WorkerExecutor._extract_result_meta_field(content, "危险操作")
+            )[:120] or "unknown",
+        }
+
+    @staticmethod
+    def _extract_markdown_title(content: str) -> str:
+        for line in (content or "").splitlines()[:20]:
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                return stripped.lstrip("#").strip()
+        return ""
+
+    @staticmethod
+    def _extract_result_meta_field(content: str, field_name: str) -> str:
+        head = "\n".join((content or "").splitlines()[:120])
+        escaped = re.escape(field_name)
+        patterns = [
+            rf"(?im)^\s*[-*]?\s*(?:\*\*)?{escaped}(?:\*\*)?\s*[:：]\s*(.+?)\s*$",
+            rf"(?im)^\s*[-*]?\s*{escaped}\s*=\s*(.+?)\s*$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, head)
+            if match:
+                value = match.group(1).strip()
+                return value.strip("`* ")
+        return ""
 
     def _build_coverage_hypothesis_queue(
         self,
@@ -1617,15 +1726,15 @@ class WorkerExecutor:
             lines.append("### Worker-actionable issue hypotheses")
             lines.extend(
                 self._format_issue_entry_for_prompt(item)
-                for item in worker_issue_entries[:10]
+                for item in worker_issue_entries[:6]
             )
-            if len(worker_issue_entries) > 10:
-                lines.append(f"- ... 另有 {len(worker_issue_entries) - 10} 个 worker issue，低收益项本轮可不处理。")
+            if len(worker_issue_entries) > 6:
+                lines.append(f"- ... 另有 {len(worker_issue_entries) - 6} 个 worker issue，低收益项本轮可不处理。")
         if coverage_targets:
             lines.append("### High-yield coverage hypotheses")
-            lines.extend(self._format_coverage_target_for_prompt(item) for item in coverage_targets[:16])
-            if len(coverage_targets) > 16:
-                lines.append(f"- ... 另有 {len(coverage_targets) - 16} 个 coverage target，详见 coverage ledger。")
+            lines.extend(self._format_coverage_target_for_prompt(item) for item in coverage_targets[:8])
+            if len(coverage_targets) > 8:
+                lines.append(f"- ... 另有 {len(coverage_targets) - 8} 个 coverage target，详见 coverage ledger。")
         if not worker_issue_entries and not coverage_targets:
             lines.append("- 当前没有高收益 coverage/issue 假设；本轮漏报补扫应主要依据 advisor feedback。")
         return "\n".join(lines)
@@ -1638,7 +1747,7 @@ class WorkerExecutor:
     ) -> int:
         if summary_repair_only:
             return {"fast": 4, "balanced": 8, "audit": 12}.get(profile_name, 8)
-        return {"fast": 5, "balanced": 12, "audit": 24}.get(profile_name, 12)
+        return {"fast": 4, "balanced": 8, "audit": 10}.get(profile_name, 8)
 
     @staticmethod
     def _issue_owner(item: dict[str, Any]) -> str:
@@ -1773,7 +1882,7 @@ class WorkerExecutor:
             if os.path.isfile(path):
                 required.append(path)
 
-        for item in [*worker_issue_entries[:8], *summary_handoff_entries[:4]]:
+        for item in [*worker_issue_entries[:5], *summary_handoff_entries[:3]]:
             issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
             for value in (
                 issue.get("target"),
@@ -1782,7 +1891,7 @@ class WorkerExecutor:
             ):
                 required.extend(self._resolve_rework_read_paths(ctx, str(value or "").strip()))
 
-        for item in coverage_targets[:8]:
+        for item in coverage_targets[:5]:
             source_file = str(item.get("source_file") or "").strip()
             if source_file and os.path.isfile(source_file):
                 required.append(source_file)
@@ -1793,9 +1902,9 @@ class WorkerExecutor:
                 unique.append(path)
 
         lines = ["## 本轮必须读取的增量文件"]
-        lines.extend(f"- `{path}`" for path in unique[:24])
-        if len(unique) > 24:
-            lines.append(f"- ... 另有 {len(unique) - 24} 个相关文件，按目标队列需要再读取。")
+        lines.extend(f"- `{path}`" for path in unique[:16])
+        if len(unique) > 16:
+            lines.append(f"- ... 另有 {len(unique) - 16} 个相关文件，按目标队列需要再读取。")
         lines.append("- 不要重新通读所有历史 result/supporting_docs；只按本轮目标队列追加读取。")
         return "\n".join(lines)
 
@@ -1834,7 +1943,7 @@ class WorkerExecutor:
         issue_id = ReviewState.prompt_safe_issue_id(
             issue.get("id") or issue.get("issue_id") or item.get("signature") or ""
         )
-        target = str(issue.get("target") or "(未指定 target)")
+        target = str(issue.get("target") or "(未指定 target)")[:180]
         owner = str(issue.get("actionable_by") or item.get("actionable_by") or "worker")
         blocking_type = ReviewState.prompt_safe_blocking_type(
             item.get("blocking_type") or issue.get("blocking_type") or ""
@@ -1850,17 +1959,18 @@ class WorkerExecutor:
             f"actionable_by={owner}; blocking_type={blocking_type or 'unspecified'}"
         )
         if action:
-            line += f"; action={action[:260]}"
+            line += f"; action={action[:180]}"
         acceptance = str(item.get("acceptance_criteria") or issue.get("acceptance_criteria") or "").strip()
         if acceptance:
-            line += f"; acceptance={acceptance[:220]}"
+            line += f"; acceptance={acceptance[:160]}"
         return line
 
     @staticmethod
     def _format_coverage_target_for_prompt(item: dict[str, Any]) -> str:
+        value = str(item.get("value") or "")[:180]
         return (
             f"- `{item.get('id')}`: kind={item.get('label') or item.get('kind')}; "
-            f"value=`{item.get('value')}`; risk={item.get('risk') or 'medium'}; "
+            f"value=`{value}`; risk={item.get('risk') or 'medium'}; "
             "status=open"
         )
 
@@ -1884,12 +1994,12 @@ class WorkerExecutor:
             lines.extend(["", "### P0 failed results"])
             for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files):
                 if item.filename in failed_files:
-                    lines.append(f"- `{item.filename}`: {item.reason.strip()[:360]}")
+                    lines.append(f"- `{item.filename}`: {item.reason.strip()[:260]}")
         if worker_issue_entries:
             lines.extend(["", "### P1 worker active issues"])
-            lines.extend(self._format_issue_entry_for_prompt(item) for item in worker_issue_entries[:12])
-            if len(worker_issue_entries) > 12:
-                lines.append(f"- ... 另有 {len(worker_issue_entries) - 12} 个 worker issue，详见 `_meta/issue_ledger.json`")
+            lines.extend(self._format_issue_entry_for_prompt(item) for item in worker_issue_entries[:8])
+            if len(worker_issue_entries) > 8:
+                lines.append(f"- ... 另有 {len(worker_issue_entries) - 8} 个 worker issue，详见 `_meta/issue_ledger.json`")
         if coverage_targets:
             lines.extend(["", "### P2 coverage targets"])
             lines.extend(self._format_coverage_target_for_prompt(item) for item in coverage_targets)
@@ -1899,13 +2009,12 @@ class WorkerExecutor:
 
     def _build_summary_handoff_queue(self, summary_handoff_entries: list[dict[str, Any]]) -> str:
         lines = [
-            "## Summary / Ledger handoff（非 Worker 强制闭环）",
             "- 下列问题主要由后续 summary 阶段统一整理、同步或说明；Worker 只需补足必要证据，不要手工改 `_meta/`。",
         ]
         if summary_handoff_entries:
-            lines.extend(self._format_issue_entry_for_prompt(item) for item in summary_handoff_entries[:8])
-            if len(summary_handoff_entries) > 8:
-                lines.append(f"- ... 另有 {len(summary_handoff_entries) - 8} 个 summary/ledger issue，详见 `_meta/issue_ledger.json`")
+            lines.extend(self._format_issue_entry_for_prompt(item) for item in summary_handoff_entries[:6])
+            if len(summary_handoff_entries) > 6:
+                lines.append(f"- ... 另有 {len(summary_handoff_entries) - 6} 个 summary/ledger issue，详见 `_meta/issue_ledger.json`")
         else:
             lines.append("- 当前没有单独的 summary/ledger handoff issue。")
         return "\n".join(lines)
@@ -1964,12 +2073,12 @@ class WorkerExecutor:
             reason = ""
             for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files):
                 if item.filename == name:
-                    reason = item.reason[:120]
+                    reason = item.reason[:80]
                     break
             issue_lines.append(
                 f"| failed_result:{name} | {name} |  | 修复/撤回/补证：{reason} |  |  |"
             )
-        for item in (worker_issue_entries or [])[:12]:
+        for item in (worker_issue_entries or [])[:8]:
             issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
             issue_id = str(issue.get("id") or issue.get("issue_id") or item.get("signature") or "").strip()
             target = ""
@@ -1978,7 +2087,7 @@ class WorkerExecutor:
             if issue_id:
                 safe_issue_id = ReviewState.prompt_safe_issue_id(issue_id)
                 issue_lines.append(f"| {safe_issue_id} | {target} |  |  |  |  |")
-        for item in (coverage_targets or [])[:12]:
+        for item in (coverage_targets or [])[:8]:
             obligation_id = str(item.get("id") or "").strip()
             target = str(item.get("value") or item.get("target") or "").strip()
             if obligation_id:

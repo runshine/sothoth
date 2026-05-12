@@ -1,22 +1,22 @@
 [submodule "04-static-binary-service/image_build/static-binary-manager-frontend"]
 	path = 04-static-binary-service/image_build/static-binary-manager-frontend
-	url = https://github.com/runshine/static-binary-manager-frontend.git
+	url = git@github.com:runshine/static-binary-manager-frontend.git
 [submodule "10-vscode-web-manager-service/image_build/vscode-web-manager-frontend"]
 	path = 10-vscode-web-manager-service/image_build/vscode-web-manager-frontend
-	url = https://github.com/runshine/vscode-web-manager-frontend.git
+	url = git@github.com:runshine/vscode-web-manager-frontend.git
 [submodule "07-agent-service-manager-service/image_build/agent-service-manager-frontend"]
 	path = 07-agent-service-manager-service/image_build/agent-service-manager-frontend
-	url = https://github.com/runshine/agent-service-manager-frontend.git
+	url = git@github.com:runshine/agent-service-manager-frontend.git
 [submodule "13-secflow-service/image_build/secflow-frontend"]
 	path = 13-secflow-service/image_build/secflow-frontend
-	url = https://github.com/runshine/SecFlowFrontend.git
+	url = git@github.com:runshine/SecFlowFrontend.git
 	branch = local
 [submodule "13-secflow-service/image_build/secflow-app-system-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-system-analyse
-	url = https://github.com/ict-bin/system_analyse
+	url = git@github.com:ict-bin/system_analyse.git
 [submodule "13-secflow-service/image_build/secflow-app-entry-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-entry-analyse
-	url = https://github.com/ict-bin/entry_analyse
+	url = git@github.com:ict-bin/entry_analyse.git
 [submodule "13-secflow-service/image_build/secflow-app-dataflow-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-dataflow-analyse
-	url = https://github.com/ict-bin/data_flow_analyse
+	url = git@github.com:ict-bin/data_flow_analyse.git

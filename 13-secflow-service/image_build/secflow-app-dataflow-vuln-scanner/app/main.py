@@ -33,17 +33,21 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("starting secflow dataflow vuln scanner service...")
     load_config()
+    role = get_scheduler_service().role
+    logger.info("secflow dataflow vuln scanner role=%s", role)
     sync_providers_to_pi()
     init_database()
     with get_engine().connect() as conn:
         conn.exec_driver_sql("SELECT 1")
     await get_auth_service().startup_validate()
     get_project_service().startup_validate()
-    await get_registry_service().start()
+    if role != "worker":
+        await get_registry_service().start()
     await get_scheduler_service().start()
     yield
     await get_scheduler_service().stop()
-    await get_registry_service().stop()
+    if role != "worker":
+        await get_registry_service().stop()
 
 
 def create_app() -> FastAPI:
