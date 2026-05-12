@@ -183,6 +183,50 @@ class TaskItemAdvancedResponse(BaseModel):
     ida_files: list[AdvancedFile] = Field(default_factory=list)
 
 
+class B2SArtifact(BaseModel):
+    id: str
+    name: str
+    path: str
+    relative_path: str
+    kind: str
+    size: int = 0
+    stage: Optional[str] = None
+    stage_order: Optional[int] = None
+    section: Optional[str] = None
+    section_order: Optional[int] = None
+    round: Optional[str] = None
+    round_order: Optional[int] = None
+    agent: Optional[str] = None
+    role: Optional[str] = None
+    batch_no: Optional[int] = None
+    attempt_no: Optional[int] = None
+    content_url: str
+
+
+class TaskItemArtifactsResponse(BaseModel):
+    task_id: str
+    item_id: str
+    output_dir: str
+    work_dir: Optional[str] = None
+    artifacts: list[B2SArtifact] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+
+
+class B2SArtifactContentResponse(BaseModel):
+    artifact_id: str
+    name: str
+    path: str
+    kind: str
+    mime_type: str = "text/plain"
+    encoding: str = "utf-8"
+    size: int = 0
+    offset: int = 0
+    limit: int = 0
+    content: str = ""
+    truncated: bool = False
+    next_offset: Optional[int] = None
+
+
 class TaskListResponse(BaseModel):
     total: int
     items: list[TaskResponse]

@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
-from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsDimension, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsMeta, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, ReviewAnalyticsTrendInsight, ReviewAnalyticsTrendPoint, ReviewAnalyticsTrendSeries, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemResponse, TaskResponse
+from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SArtifact, B2SArtifactContentResponse, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsDimension, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsMeta, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, ReviewAnalyticsTrendInsight, ReviewAnalyticsTrendPoint, ReviewAnalyticsTrendSeries, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemArtifactsResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
@@ -1235,6 +1235,108 @@ def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) ->
         work_dir=str(work_dir) if work_dir else None,
         runs=runs,
         ida_files=ida_files,
+    )
+
+
+def _artifact_id(path: str) -> str:
+    return hashlib.sha256(path.encode("utf-8")).hexdigest()[:24]
+
+
+def _artifact_mime_type(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return "application/json"
+    if suffix == ".jsonl":
+        return "application/x-jsonlines"
+    if suffix in {".c", ".h"}:
+        return "text/x-c"
+    if suffix == ".md":
+        return "text/markdown"
+    return "text/plain"
+
+
+def _iter_advanced_files(advanced: TaskItemAdvancedResponse) -> list[AdvancedFile]:
+    files: list[AdvancedFile] = []
+    files.extend(advanced.ida_files)
+    for run in advanced.runs:
+        files.extend(run.files)
+        files.extend(run.agent_sessions)
+        for batch in run.batches:
+            for file in [batch.disasm, batch.source]:
+                if file:
+                    files.append(file)
+            files.extend(batch.review_snapshots)
+            files.extend(batch.reviews)
+    return files
+
+
+def build_task_item_artifacts(item: B2STaskItem) -> TaskItemArtifactsResponse:
+    advanced = build_task_item_advanced(item, include_content=False)
+    base = Path(advanced.output_dir).resolve()
+    artifacts: list[B2SArtifact] = []
+    for file in _iter_advanced_files(advanced):
+        try:
+            relative_path = str(Path(file.path).resolve().relative_to(base))
+        except Exception:
+            relative_path = file.name
+        artifact_id = _artifact_id(file.path)
+        content_url = f"/api/app/binary-to-source/projects/{item.project_id}/tasks/{item.task_id}/items/{item.id}/artifacts/{artifact_id}/content"
+        artifacts.append(B2SArtifact(
+            id=artifact_id, name=file.name, path=file.path, relative_path=relative_path, kind=file.kind, size=file.size,
+            stage=file.stage, stage_order=file.stage_order, section=file.section, section_order=file.section_order,
+            round=file.round, round_order=file.round_order, agent=file.agent, role=file.role, batch_no=file.batch_no,
+            attempt_no=file.attempt_no, content_url=content_url,
+        ))
+    return TaskItemArtifactsResponse(
+        task_id=item.task_id,
+        item_id=item.id,
+        output_dir=advanced.output_dir,
+        work_dir=advanced.work_dir,
+        artifacts=sorted(artifacts, key=lambda file: ((file.stage_order or 0), (file.section_order or 0), (file.round_order or 0), file.relative_path)),
+        counts={
+            "artifacts": len(artifacts),
+            "batches": sum(len(run.batches) for run in advanced.runs),
+            "reviews": sum(len(batch.reviews) + len(batch.review_snapshots) for run in advanced.runs for batch in run.batches),
+            "sessions": sum(len(run.agent_sessions) for run in advanced.runs),
+            "ida_files": len(advanced.ida_files),
+        },
+    )
+
+
+def build_task_item_artifact_content(item: B2STaskItem, artifact_id: str, offset: int = 0, limit: int = ADVANCED_MAX_BYTES) -> B2SArtifactContentResponse:
+    advanced = build_task_item_advanced(item, include_content=False)
+    file = next((candidate for candidate in _iter_advanced_files(advanced) if _artifact_id(candidate.path) == artifact_id), None)
+    if not file:
+        raise NotFoundError("产物文件不存在")
+    path = Path(file.path).resolve()
+    base = Path(advanced.output_dir).resolve()
+    try:
+        path.relative_to(base)
+    except Exception as exc:
+        raise ValidationError("产物路径越界") from exc
+    if not path.is_file():
+        raise NotFoundError("产物文件不存在")
+    safe_offset = max(0, int(offset or 0))
+    safe_limit = max(1, min(int(limit or ADVANCED_MAX_BYTES), ADVANCED_MAX_BYTES))
+    size = path.stat().st_size
+    with path.open("rb") as fp:
+        fp.seek(safe_offset)
+        raw = fp.read(safe_limit + 1)
+    truncated = len(raw) > safe_limit
+    content = raw[:safe_limit].decode("utf-8", errors="replace")
+    next_offset = safe_offset + safe_limit if truncated or safe_offset + len(raw[:safe_limit]) < size else None
+    return B2SArtifactContentResponse(
+        artifact_id=artifact_id,
+        name=file.name,
+        path=str(path),
+        kind=file.kind,
+        mime_type=_artifact_mime_type(path),
+        size=size,
+        offset=safe_offset,
+        limit=safe_limit,
+        content=content,
+        truncated=bool(next_offset),
+        next_offset=next_offset,
     )
 
 
