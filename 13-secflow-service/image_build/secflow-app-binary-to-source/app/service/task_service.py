@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 from pathlib import Path
 from uuid import uuid4
@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
 from app.model import B2STask, B2STaskItem
-from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemResponse, TaskResponse
+from app.schemas import AdvancedBatch, AdvancedFile, AdvancedRun, B2SOverallProgress, ReviewAnalyticsAttempt, ReviewAnalyticsDimension, ReviewAnalyticsFunction, ReviewAnalyticsFunctionAttempt, ReviewAnalyticsIssue, ReviewAnalyticsMeta, ReviewAnalyticsRadar, ReviewAnalyticsResponse, ReviewAnalyticsSummary, ReviewAnalyticsTrendInsight, ReviewAnalyticsTrendPoint, ReviewAnalyticsTrendSeries, TaskCreate, TaskDetailResponse, TaskItemAdvancedResponse, TaskItemResponse, TaskResponse
 from app.service.llm_provider import resolve_job_model
 from app.service.pi_re_agent import get_pi_client
 from app.service.security import app_task_item_root, app_task_root, ensure_path_in_project, project_root, safe_input_dir, safe_output_dir, validate_task_id
@@ -886,6 +886,191 @@ def _collect_advanced_files(paths: list[Path], base: Path, include_content: bool
     return files
 
 
+ISSUE_LABELS = {"Length Logic": "长度校验逻辑反转", "Return Code": "accepted 返回值错误", "Extra Check": "多余校验条件", "Semantic": "语义问题", "Validation": "输入校验", "Return": "返回语义", "Call": "调用关系", "Type": "类型结构"}
+ISSUE_DETAILS = {
+    "Length Logic": "序列号长度判断方向错误，导致有效输入路径被错误处理。",
+    "Return Code": "accepted 分支返回值与原始二进制语义不一致。",
+    "Extra Check": "输出中出现原始逻辑不存在的 hex_len == 0 校验。",
+    "Semantic": "还原代码与原始二进制语义存在偏差。",
+}
+CATEGORY_LABELS = {"Validation": "输入校验", "Return": "返回语义", "Call": "调用关系", "Type": "类型结构", "Semantic": "语义一致性"}
+SEVERITY_LABELS = {"blocking": "阻断", "major": "重要", "warning": "警告"}
+STATUS_LABELS = {"resolved": "已解决", "remaining": "未解决"}
+RISK_LABELS = {"low": "低", "low-medium": "低-中", "medium": "中", "high": "高", "unknown": "未知"}
+
+QUALITY_DIMENSION_GROUPS = [
+    {
+        "key": "logic_accuracy",
+        "label": "代码逻辑准确性",
+        "color_hint": "logic",
+        "description": "控制流、返回值和关键条件高度匹配原始程序",
+        "formula": "0.15*completeness + 0.25*control_flow + 0.20*return_semantics + 0.25*input_validation + 0.15*call_fidelity",
+        "terms": [("completeness", 0.15), ("control_flow", 0.25), ("return_semantics", 0.2), ("input_validation", 0.25), ("call_fidelity", 0.15)],
+    },
+    {
+        "key": "data_structure_accuracy",
+        "label": "数据结构准确性",
+        "color_hint": "structure",
+        "description": "类型、结构体和参数含义还原合理",
+        "formula": "0.55*type_struct_fidelity + 0.25*call_fidelity + 0.20*completeness",
+        "terms": [("type_struct_fidelity", 0.55), ("call_fidelity", 0.25), ("completeness", 0.2)],
+    },
+    {
+        "key": "readability",
+        "label": "可读性",
+        "color_hint": "readability",
+        "description": "命名、代码结构和表达便于人工审查",
+        "formula": "0.45*completeness + 0.35*type_struct_fidelity + 0.20*call_fidelity",
+        "terms": [("completeness", 0.45), ("type_struct_fidelity", 0.35), ("call_fidelity", 0.2)],
+    },
+]
+
+
+def _quality_level(score: int) -> tuple[str, str]:
+    if score >= 90:
+        return "excellent", "优秀"
+    if score >= 80:
+        return "good", "良好"
+    if score >= 70:
+        return "usable", "可用"
+    return "needs_work", "待优化"
+
+
+def _verdict_label(verdict: str) -> str:
+    verdict = (verdict or "UNKNOWN").upper()
+    return "通过" if verdict == "PASS" else "失败" if verdict == "FAIL" else "未知"
+
+
+def _dimension_score(radar: ReviewAnalyticsRadar, terms: list[tuple[str, float]]) -> int:
+    total_weight = sum(weight for _, weight in terms)
+    weighted = sum(float(getattr(radar, key, 0) or 0) * weight for key, weight in terms)
+    return round(weighted / total_weight) if total_weight else 0
+
+
+def _build_review_dimensions(radar: list[ReviewAnalyticsRadar]) -> list[ReviewAnalyticsDimension]:
+    if not radar:
+        return []
+    dimensions: list[ReviewAnalyticsDimension] = []
+    final_radar = radar[-1]
+    for group in QUALITY_DIMENSION_GROUPS:
+        points = [ReviewAnalyticsTrendPoint(attempt_no=round_.attempt_no, label=f"第{round_.attempt_no}轮", score=_dimension_score(round_, group["terms"])) for round_ in radar]
+        initial_score = points[0].score if points else 0
+        final_score = points[-1].score if points else 0
+        delta = max(0, final_score - initial_score)
+        delta_percent = round(delta / initial_score * 100) if initial_score > 0 else 0
+        level, level_label = _quality_level(final_score)
+        components = {key: int(getattr(final_radar, key, 0) or 0) for key, _ in group["terms"]}
+        dimensions.append(ReviewAnalyticsDimension(
+            key=group["key"], label=group["label"], score=final_score, initial_score=initial_score,
+            delta=delta, delta_percent=delta_percent, level=level, level_label=level_label,
+            description=group["description"], formula=group["formula"], color_hint=group["color_hint"],
+            points=points, components=components,
+        ))
+    return dimensions
+
+
+def _quality_scores_from_dimensions(dimensions: list[ReviewAnalyticsDimension], fallback_initial: int = 0, fallback_final: int = 0) -> tuple[int, int, int, int, str, str]:
+    if dimensions:
+        initial = round(sum(item.initial_score for item in dimensions) / len(dimensions))
+        final = round(sum(item.score for item in dimensions) / len(dimensions))
+    else:
+        initial, final = fallback_initial, fallback_final
+    delta = max(0, final - initial)
+    delta_percent = round(delta / initial * 100) if initial > 0 else 0
+    level, label = _quality_level(final)
+    return initial, final, delta, delta_percent, level, label
+
+
+def _build_review_trend_insight(attempts: list[ReviewAnalyticsAttempt], dimensions: list[ReviewAnalyticsDimension] | None = None) -> ReviewAnalyticsTrendInsight:
+    if not attempts:
+        return ReviewAnalyticsTrendInsight()
+    first = attempts[0]
+    final = attempts[-1]
+    if dimensions:
+        first_score, final_score, delta, _, _, _ = _quality_scores_from_dimensions(dimensions, int(first.semantic_score or first.confidence or 0), int(final.semantic_score or final.confidence or 0))
+    else:
+        first_score = int(first.quality_score or first.semantic_score or first.confidence or 0)
+        final_score = int(final.quality_score or final.semantic_score or final.confidence or 0)
+        delta = final_score - first_score
+    series = [ReviewAnalyticsTrendSeries(key=item.key, label=item.label, color_hint=item.color_hint, points=item.points) for item in dimensions or []]
+    if len(attempts) < 2:
+        title = "等待下一轮评审"
+        conclusion = "当前仅有 1 轮评审数据，建议结合后续轮次观察质量变化。"
+        tone = "neutral"
+    elif delta >= 20:
+        title = "质量显著提升"
+        conclusion = f"经过 {len(attempts)} 轮评审修复，语义质量从 {first_score} 提升至 {final_score}，累计提升 {delta} 分。"
+        tone = "positive"
+    elif delta >= 8:
+        title = "质量稳步提升"
+        conclusion = f"经过 {len(attempts)} 轮评审修复，语义质量提升 {delta} 分，整体趋势向好。"
+        tone = "positive"
+    elif delta >= 0:
+        title = "质量基本稳定"
+        conclusion = f"{len(attempts)} 轮评审后质量保持稳定，最终语义质量为 {final_score}。"
+        tone = "neutral"
+    else:
+        title = "质量出现回落"
+        conclusion = f"最近轮次语义质量较初始下降 {abs(delta)} 分，建议优先复核新引入的问题。"
+        tone = "warning"
+    return ReviewAnalyticsTrendInsight(title=title, conclusion=conclusion, tone=tone, primary_metric="质量分", first_score=first_score, final_score=final_score, delta=delta, series=series)
+
+
+def _finalize_review_analytics(task_id: str, item_id: str, attempts: list[ReviewAnalyticsAttempt], issues: list[ReviewAnalyticsIssue], matrix: list[ReviewAnalyticsFunction], radar: list[ReviewAnalyticsRadar], *, final_verdict: str, final_confidence: int, closure: float, residual: str, mock: bool) -> ReviewAnalyticsResponse:
+    for issue in issues:
+        issue.display_label = issue.display_label or ISSUE_LABELS.get(issue.label, issue.label)
+        issue.description = issue.description or ISSUE_DETAILS.get(issue.label, f"{issue.category} · {issue.severity}")
+        issue.category_label = issue.category_label or CATEGORY_LABELS.get(issue.category, issue.category)
+        issue.severity_label = issue.severity_label or SEVERITY_LABELS.get(issue.severity, issue.severity)
+        issue.status_label = issue.status_label or STATUS_LABELS.get(issue.status, issue.status)
+
+    dimensions = _build_review_dimensions(radar)
+    fallback_initial = attempts[0].semantic_score if attempts else 0
+    fallback_final = attempts[-1].semantic_score if attempts else final_confidence
+    initial_quality, final_quality, quality_delta, quality_delta_percent, _, final_quality_label = _quality_scores_from_dimensions(dimensions, fallback_initial, fallback_final)
+
+    for attempt in attempts:
+        discovered = sum(1 for issue in issues if issue.introduced_attempt == attempt.attempt_no)
+        resolved_at = sum(1 for issue in issues if issue.resolved_attempt == attempt.attempt_no)
+        open_after = sum(1 for issue in issues if issue.introduced_attempt <= attempt.attempt_no and (not issue.resolved_attempt or issue.resolved_attempt > attempt.attempt_no))
+        round_radar = next((item for item in radar if item.attempt_no == attempt.attempt_no), None)
+        round_dimensions = _build_review_dimensions([round_radar]) if round_radar else []
+        round_quality = round(sum(item.score for item in round_dimensions) / len(round_dimensions)) if round_dimensions else (attempt.semantic_score or attempt.confidence or 0)
+        attempt.label = attempt.label or f"第 {attempt.attempt_no} 轮"
+        attempt.verdict_label = attempt.verdict_label or _verdict_label(attempt.verdict)
+        attempt.quality_score = round_quality
+        attempt.issues_discovered = discovered
+        attempt.issues_resolved = resolved_at
+        attempt.issues_open_after_attempt = open_after
+        attempt.status_label = attempt.status_label or ("最终轮" if attempt is attempts[-1] else "已通过" if attempt.verdict == "PASS" else "需修复")
+
+    resolved_count = sum(1 for issue in issues if issue.status == "resolved")
+    remaining_count = sum(1 for issue in issues if issue.status != "resolved")
+    trend = _build_review_trend_insight(attempts, dimensions)
+    generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return ReviewAnalyticsResponse(
+        task_id=task_id,
+        item_id=item_id,
+        status="ready",
+        meta=ReviewAnalyticsMeta(generated_at=generated_at, mock=mock),
+        summary=ReviewAnalyticsSummary(
+            attempts=len(attempts), attempt_count=len(attempts), final_verdict=final_verdict,
+            final_verdict_label=_verdict_label(final_verdict), final_confidence=final_confidence,
+            final_quality_score=final_quality, final_quality_label=final_quality_label,
+            initial_quality_score=initial_quality, quality_delta=quality_delta, quality_delta_percent=quality_delta_percent,
+            issue_total=len(issues), issue_resolved=resolved_count, issue_remaining=remaining_count,
+            issue_closure_rate=closure, residual_risk=residual, residual_risk_label=RISK_LABELS.get(residual, residual), mock=mock,
+        ),
+        attempts=attempts,
+        issues=issues,
+        dimensions=dimensions,
+        trend=trend,
+        function_matrix=matrix,
+        radar=radar,
+        trend_insight=trend,
+    )
+
+
 def _mock_review_analytics(task_id: str, item_id: str) -> ReviewAnalyticsResponse:
     attempts = [
         ReviewAnalyticsAttempt(attempt_no=1, verdict="FAIL", total_functions=10, verified_functions=8, blocking_issues=3, semantic_score=68, confidence=64),
@@ -902,7 +1087,7 @@ def _mock_review_analytics(task_id: str, item_id: str) -> ReviewAnalyticsRespons
         ReviewAnalyticsRadar(attempt_no=1, completeness=100, control_flow=70, return_semantics=55, input_validation=45, call_fidelity=94, type_struct_fidelity=88),
         ReviewAnalyticsRadar(attempt_no=2, completeness=100, control_flow=95, return_semantics=96, input_validation=96, call_fidelity=95, type_struct_fidelity=95),
     ]
-    return ReviewAnalyticsResponse(task_id=task_id, item_id=item_id, summary=ReviewAnalyticsSummary(attempts=2, final_verdict="PASS", final_confidence=89, issue_closure_rate=1.0, residual_risk="low-medium", mock=True), attempts=attempts, issues=issues, function_matrix=matrix, radar=radar)
+    return _finalize_review_analytics(task_id, item_id, attempts, issues, matrix, radar, final_verdict="PASS", final_confidence=89, closure=1.0, residual="low-medium", mock=True)
 
 
 def _parse_review_file(file: AdvancedFile) -> dict:
@@ -983,7 +1168,7 @@ def build_task_item_review_analytics(item: B2STaskItem, mock: bool = False) -> R
     closure = resolved / len(issues) if issues else (1.0 if final["verdict"] == "PASS" else 0.0)
     confidence = max(0, min(100, round(final["score"] * 0.42 + closure * 38 + (14 if final["verdict"] == "PASS" else 0) + min(len(parsed), 3) * 2)))
     residual = "high" if final["verdict"] != "PASS" or final["issues"] else ("low" if confidence >= 92 else "low-medium" if confidence >= 82 else "medium")
-    return ReviewAnalyticsResponse(task_id=item.task_id, item_id=item.id, summary=ReviewAnalyticsSummary(attempts=len(parsed), final_verdict=final["verdict"], final_confidence=confidence, issue_closure_rate=closure, residual_risk=residual, mock=False), attempts=attempts, issues=issues, function_matrix=matrix, radar=radar)
+    return _finalize_review_analytics(item.task_id, item.id, attempts, issues, matrix, radar, final_verdict=final["verdict"], final_confidence=confidence, closure=closure, residual=residual, mock=False)
 
 
 def build_task_item_advanced(item: B2STaskItem, include_content: bool = True) -> TaskItemAdvancedResponse:
