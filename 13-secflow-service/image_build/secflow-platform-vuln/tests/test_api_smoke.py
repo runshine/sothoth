@@ -166,6 +166,7 @@ def test_public_authenticated_submission_creates_case(client: TestClient):
     assert response.status_code == 200
     payload = response.json()
     assert re.match(r"^case-\d{8}-\d{6}-[0-9a-f]{10}$", payload["id"])
+    assert re.match(r"^vuln-\d{8}-\d{6}-[0-9a-f]{10}$", payload["global_vuln_id"])
     assert payload["created_by_type"] == "human"
     assert payload["created_by"] == "tester"
     assert payload["project_id"] == "demo-project"
@@ -173,6 +174,7 @@ def test_public_authenticated_submission_creates_case(client: TestClient):
 
     detail = client.get(f"/api/vuln/cases/{payload['id']}")
     assert detail.status_code == 200
+    assert detail.json()["global_vuln_id"] == payload["global_vuln_id"]
     assert detail.json()["created_by_type"] == "human"
     assert detail.json()["reporter"]["name"] == "public-ci"
     assert detail.json()["subject"]["locator"] == "/auth/login"
@@ -340,6 +342,8 @@ def test_create_case_and_timeline(client: TestClient):
 
     detail = client.get(f"/api/vuln/cases/{case_id}")
     assert detail.status_code == 200
+    assert re.match(r"^vuln-\d{8}-\d{6}-[0-9a-f]{10}$", detail.json()["global_vuln_id"])
+    assert detail.json()["source_report_ids"] == [payload["report_id"]]
     assert detail.json()["current_stage"] == "receive"
     assert detail.json()["reporter"]["name"] == "manual-reviewer"
     assert detail.json()["subject"]["locator"] == "/login"
@@ -348,6 +352,50 @@ def test_create_case_and_timeline(client: TestClient):
     timeline = client.get(f"/api/vuln/cases/{case_id}/timeline")
     assert timeline.status_code == 200
     assert timeline.json()["total"] >= 2
+
+
+def test_duplicate_report_id_returns_existing_case(client: TestClient):
+    payload = make_suspicion_payload(
+        title="Original suspicion",
+        report_id="dup-report-001",
+        reporter={"name": "plugin-a", "version": "1.0.0", "type": "plugin"},
+    )
+    first = client.post("/api/vuln/cases", json=payload)
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Duplicate suspicion should reuse case",
+            report_id="dup-report-001",
+            reporter={"name": "plugin-b", "version": "2.0.0", "type": "plugin"},
+        ),
+    )
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["global_vuln_id"] == first.json()["global_vuln_id"]
+
+
+def test_get_case_by_global_vuln_id(client: TestClient):
+    create_resp = client.post(
+        "/api/vuln/cases",
+        json=make_suspicion_payload(
+            title="Lookup by global vuln id",
+            report_id="lookup-report-001",
+        ),
+    )
+    assert create_resp.status_code == 200
+    global_vuln_id = create_resp.json()["global_vuln_id"]
+
+    detail_resp = client.get(f"/api/vuln/cases/{global_vuln_id}")
+    assert detail_resp.status_code == 200
+    assert detail_resp.json()["report_id"] == "lookup-report-001"
+    assert detail_resp.json()["global_vuln_id"] == global_vuln_id
+
+    list_resp = client.get("/api/vuln/cases", params={"global_vuln_id": global_vuln_id})
+    assert list_resp.status_code == 200
+    assert list_resp.json()["total"] == 1
+    assert list_resp.json()["items"][0]["global_vuln_id"] == global_vuln_id
 
 
 def test_update_case_intake_partial_fields(client: TestClient):

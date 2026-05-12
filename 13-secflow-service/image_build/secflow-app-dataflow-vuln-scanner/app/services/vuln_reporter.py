@@ -62,6 +62,18 @@ def _frontmatter_value(text: str, key: str) -> str:
     return ""
 
 
+def _format_report_timestamp(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        if hasattr(value, "strftime"):
+            try:
+                return value.strftime("%Y%m%d-%H%M%S")
+            except Exception:
+                continue
+    return now_local().strftime("%Y%m%d-%H%M%S")
+
+
 def _normalize_severity(value: Any) -> str:
     text = str(value or "").strip().lower()
     if text in {"critical", "high", "medium", "low"}:
@@ -163,6 +175,34 @@ def get_task_vuln_report_status(db: Session, trigger: TriggerTask, execution_id:
 
 
 class VulnReportService:
+    @staticmethod
+    def _build_report_id(
+        *,
+        trigger: TriggerTask,
+        execution: WorkflowExecution,
+        run_index: RunIndex,
+        result: RunIndexResult,
+        sequence_no: int,
+        sequence_width: int,
+    ) -> str:
+        timestamp = _format_report_timestamp(
+            run_index.started_at,
+            execution.started_at,
+            trigger.started_at,
+            run_index.created_at,
+            execution.created_at,
+            trigger.created_at,
+        )
+        unique_key = "|".join([
+            str(trigger.project_id or ""),
+            str(trigger.id or ""),
+            str(execution.id or ""),
+            str(run_index.id or ""),
+            str(result.filename or ""),
+        ])
+        suffix = hashlib.sha1(unique_key.encode("utf-8")).hexdigest()[:6].upper()
+        return f"DFVS-{timestamp}-{int(sequence_no):0{sequence_width}d}-{suffix}"
+
     def _result_rows(self, db: Session, run_index: RunIndex, result_files: list[str] | None = None) -> list[RunIndexResult]:
         selected = {str(item or "").strip() for item in (result_files or []) if str(item or "").strip()}
         rows = (
@@ -210,6 +250,8 @@ class VulnReportService:
         execution: WorkflowExecution,
         run_index: RunIndex,
         result: RunIndexResult,
+        sequence_no: int,
+        sequence_width: int,
     ) -> dict[str, Any]:
         raw_payload = _load_externalized_json_payload(run_index.run_root_path, result.raw_json or {})
         raw = raw_payload if isinstance(raw_payload, dict) else {}
@@ -244,7 +286,16 @@ class VulnReportService:
             "evolution_source_execution_id": _task_metadata(trigger).get("derivation", {}).get("evolution_source_execution_id"),
             "reported_severity": severity,
         }
-        report_id = f"dfvs:{trigger.id}:{execution.id}:{result.filename}"
+        legacy_report_id = f"dfvs:{trigger.id}:{execution.id}:{result.filename}"
+        report_id = self._build_report_id(
+            trigger=trigger,
+            execution=execution,
+            run_index=run_index,
+            result=result,
+            sequence_no=sequence_no,
+            sequence_width=sequence_width,
+        )
+        source["finding_id"] = report_id
         subject_locator = str(raw.get("subject_locator") or raw.get("locator") or result_path or result.filename)
         return {
             "project_id": trigger.project_id,
@@ -258,7 +309,10 @@ class VulnReportService:
             "category": str(raw.get("category") or _frontmatter_value(content, "category") or "dataflow").strip() or None,
             "rule_id": str(raw.get("rule_id") or _frontmatter_value(content, "rule_id") or "").strip() or None,
             "rule_name": str(raw.get("rule_name") or _frontmatter_value(content, "rule_name") or "").strip() or None,
-            "fingerprint": str(raw.get("fingerprint") or hashlib.sha256(f"{report_id}:{title}".encode("utf-8")).hexdigest()).strip(),
+            "fingerprint": str(
+                raw.get("fingerprint")
+                or hashlib.sha256(f"{legacy_report_id}:{title}".encode("utf-8")).hexdigest()
+            ).strip(),
             "reporter": {
                 "name": SERVICE_NAME,
                 "type": "service",
@@ -291,6 +345,7 @@ class VulnReportService:
                     "review_verdict": result.verdict,
                     "review_cycle": result.review_cycle,
                     "lifecycle_status": result.lifecycle_status,
+                    "finding_id": report_id,
                     "linked_task_purpose": str(trigger.task_purpose or "normal"),
                 },
             },
@@ -321,9 +376,23 @@ class VulnReportService:
         rows = self._result_rows(db, run_index, result_files)
         if not rows:
             return {"status": "empty", "enabled": True, "total": 0}
+        all_rows = self._result_rows(db, run_index, None)
+        ordered_filenames = [str(item.filename or "").strip() for item in all_rows if str(item.filename or "").strip()]
+        sequence_width = max(3, len(str(max(len(ordered_filenames), 1))))
+        sequence_map = {
+            filename: index
+            for index, filename in enumerate(ordered_filenames, start=1)
+        }
 
         for result in rows:
-            payload = self._payload_for_result(trigger=trigger, execution=execution, run_index=run_index, result=result)
+            payload = self._payload_for_result(
+                trigger=trigger,
+                execution=execution,
+                run_index=run_index,
+                result=result,
+                sequence_no=sequence_map.get(str(result.filename or "").strip(), 1),
+                sequence_width=sequence_width,
+            )
             payload_hash = _json_hash(payload)
             record = (
                 db.query(VulnReportSubmission)

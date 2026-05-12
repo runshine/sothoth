@@ -10,6 +10,7 @@ from app.config import get_config
 from app.models.database import ActionExecution, Case, CaseEvent, ManualTask, Result, ServiceCapability, ServiceRegistry, StageHistory, WorkflowDefinition, WorkflowRun
 from app.schemas import ActionCallbackRequest, CaseCreateRequest, ManualTaskCreateRequest, RoutedActionDispatchRequest
 from app.services.service_registry import reconcile_service_statuses
+from app.utils.case_identity import generate_global_vuln_id
 
 
 MAIN_STAGE_RECEIVE = "receive"
@@ -115,6 +116,31 @@ def generate_case_id() -> str:
     return f"case-{ts}-{uuid4().hex[:10]}"
 
 
+def _build_source_ref(source_meta: dict, *, now_iso: str | None = None) -> dict:
+    reporter = source_meta.get("reporter") if isinstance(source_meta.get("reporter"), dict) else {}
+    timestamp = now_iso or datetime.utcnow().isoformat()
+    return {
+        "reporter_name": str(reporter.get("name") or "").strip() or None,
+        "reporter_type": str(reporter.get("type") or "").strip() or None,
+        "reporter_vendor": str(reporter.get("vendor") or "").strip() or None,
+        "report_id": str(source_meta.get("report_id") or "").strip() or None,
+        "reported_at": source_meta.get("reported_at"),
+        "first_seen_at": timestamp,
+        "last_seen_at": timestamp,
+    }
+
+
+def _load_source_refs(source_meta: dict) -> list[dict]:
+    refs = source_meta.get("source_refs")
+    normalized = [dict(item) for item in refs] if isinstance(refs, list) else []
+    if normalized:
+        return normalized
+    fallback = _build_source_ref(source_meta)
+    if fallback.get("report_id") or fallback.get("reporter_name"):
+        return [fallback]
+    return []
+
+
 def build_case_fileserver_root(case_id: str) -> dict[str, str | None]:
     root_path = f"/{SPECIAL_FILESERVER_SUBPROJECT_NAME}/{case_id}"
     return {
@@ -152,22 +178,27 @@ def create_case_with_runtime(db: Session, request: CaseCreateRequest, *, initial
     workflow = ensure_default_workflow(db)
     source_meta, target_meta, display_meta = request.build_storage_payloads()
     report_id = str(source_meta.get("report_id") or "").strip()
-    fingerprint = str(source_meta.get("fingerprint") or "").strip()
-    if report_id or fingerprint:
+    now_iso = datetime.utcnow().isoformat()
+    source_ref = _build_source_ref(source_meta, now_iso=now_iso)
+    if report_id:
         for existing in db.query(Case).filter(Case.project_id == request.project_id).all():
             try:
                 existing_source = json.loads(existing.source_meta_json or "{}")
             except Exception:
                 existing_source = {}
-            if report_id and str(existing_source.get("report_id") or "").strip() == report_id:
-                return existing
-            if fingerprint and str(existing_source.get("fingerprint") or "").strip() == fingerprint:
+            existing_report_id = str(existing_source.get("report_id") or "").strip()
+            existing_refs = _load_source_refs(existing_source)
+            if existing_report_id == report_id or any(str(item.get("report_id") or "").strip() == report_id for item in existing_refs):
                 return existing
     case_id = generate_case_id()
+    global_vuln_id = generate_global_vuln_id()
+    source_meta["global_vuln_id"] = global_vuln_id
+    source_meta["source_refs"] = [source_ref]
     fileserver_root = build_case_fileserver_root(case_id)
     display_meta["fileserver_root"] = fileserver_root
     case = Case(
         id=case_id,
+        global_vuln_id=global_vuln_id,
         project_id=request.project_id,
         title=request.title,
         summary=request.summary,

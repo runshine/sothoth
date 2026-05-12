@@ -3,10 +3,11 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 from app.config import get_config
+from app.utils.case_identity import generate_global_vuln_id
 
 
 class Base(DeclarativeBase):
@@ -21,6 +22,7 @@ class Case(Base):
     __tablename__ = "secflow_vuln_case"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    global_vuln_id: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True, nullable=True)
     project_id: Mapped[str] = mapped_column(String(64), index=True)
     title: Mapped[str] = mapped_column(String(255))
     summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -242,7 +244,40 @@ def get_session_factory():
 
 
 def init_database() -> None:
-    Base.metadata.create_all(bind=get_engine())
+    engine = get_engine()
+    Base.metadata.create_all(bind=engine)
+    run_auto_migrations()
+
+
+def run_auto_migrations() -> None:
+    engine = get_engine()
+    inspector = inspect(engine)
+    table_names = set(inspector.get_table_names())
+    if Case.__tablename__ not in table_names:
+        return
+
+    case_columns = {column["name"] for column in inspector.get_columns(Case.__tablename__)}
+    with engine.begin() as connection:
+        if "global_vuln_id" not in case_columns:
+            connection.execute(text(f"ALTER TABLE {Case.__tablename__} ADD COLUMN global_vuln_id VARCHAR(64)"))
+
+    inspector = inspect(engine)
+    case_indexes = {index["name"] for index in inspector.get_indexes(Case.__tablename__)}
+    unique_indexes = {constraint["name"] for constraint in inspector.get_unique_constraints(Case.__tablename__) if constraint.get("name")}
+    if "ix_secflow_vuln_case_global_vuln_id" not in case_indexes and "ix_secflow_vuln_case_global_vuln_id" not in unique_indexes:
+        with engine.begin() as connection:
+            connection.execute(text("CREATE UNIQUE INDEX ix_secflow_vuln_case_global_vuln_id ON secflow_vuln_case (global_vuln_id)"))
+
+    session = get_session_factory()()
+    try:
+        pending = session.query(Case).filter((Case.global_vuln_id.is_(None)) | (Case.global_vuln_id == "")).all()
+        if not pending:
+            return
+        for case in pending:
+            case.global_vuln_id = generate_global_vuln_id()
+        session.commit()
+    finally:
+        session.close()
 
 
 def get_db():

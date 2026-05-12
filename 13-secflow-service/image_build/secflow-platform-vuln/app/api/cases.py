@@ -62,6 +62,36 @@ from app.services.lifecycle_engine import (
 router = APIRouter(prefix="/api/vuln/cases", tags=["cases"])
 
 
+def _source_refs(source_meta: dict) -> list[dict]:
+    refs = source_meta.get("source_refs")
+    if isinstance(refs, list):
+        return [dict(item) for item in refs if isinstance(item, dict)]
+    report_id = str(source_meta.get("report_id") or "").strip()
+    reporter = source_meta.get("reporter") if isinstance(source_meta.get("reporter"), dict) else {}
+    if not report_id and not reporter:
+        return []
+    return [{
+        "reporter_name": str(reporter.get("name") or "").strip() or None,
+        "reporter_type": str(reporter.get("type") or "").strip() or None,
+        "reporter_vendor": str(reporter.get("vendor") or "").strip() or None,
+        "report_id": report_id or None,
+        "reported_at": source_meta.get("reported_at"),
+    }]
+
+
+def _finding_id(source_meta: dict, metadata: dict, source_task: dict) -> str | None:
+    for candidate in (
+        source_meta.get("finding_id"),
+        source_meta.get("report_id"),
+        source_task.get("finding_id") if isinstance(source_task, dict) else None,
+        (metadata.get("dataflow_vuln_scanner") or {}).get("finding_id") if isinstance(metadata.get("dataflow_vuln_scanner"), dict) else None,
+    ):
+        value = str(candidate or "").strip()
+        if value:
+            return value
+    return None
+
+
 def _case_payload(item: Case) -> dict:
     source_meta = json.loads(item.source_meta_json or "{}")
     subject = json.loads(item.target_meta_json or "{}")
@@ -69,15 +99,19 @@ def _case_payload(item: Case) -> dict:
     lifecycle = get_lifecycle_state(item)
     metadata = display_meta.get("metadata") or {}
     source_task = metadata.get("source") if isinstance(metadata.get("source"), dict) else {}
+    finding_id = _finding_id(source_meta, metadata, source_task)
+    source_refs = _source_refs(source_meta)
     fileserver_root = display_meta.get("fileserver_root") or {}
     return {
         "id": item.id,
+        "global_vuln_id": item.global_vuln_id or source_meta.get("global_vuln_id"),
         "project_id": item.project_id,
         "title": item.title,
         "summary": item.summary,
         "severity": item.severity,
         "cvss_score": source_meta.get("cvss_score", 0.0),
         "confidence": item.confidence,
+        "finding_id": finding_id,
         "report_id": source_meta.get("report_id"),
         "state": source_meta.get("state", "suspected"),
         "category": source_meta.get("category"),
@@ -85,6 +119,8 @@ def _case_payload(item: Case) -> dict:
         "rule_name": source_meta.get("rule_name"),
         "fingerprint": source_meta.get("fingerprint"),
         "reported_at": source_meta.get("reported_at"),
+        "source_refs": source_refs,
+        "source_report_ids": [str(item.get("report_id") or "").strip() for item in source_refs if str(item.get("report_id") or "").strip()],
         "reporter": source_meta.get("reporter") or {},
         "subject": subject,
         "evidence": display_meta.get("evidence") or {},
@@ -97,6 +133,7 @@ def _case_payload(item: Case) -> dict:
             "execution_id": source_task.get("execution_id"),
             "run_id": source_task.get("run_id"),
             "run_name": source_task.get("run_name"),
+            "finding_id": source_task.get("finding_id"),
             "result_file": source_task.get("result_file"),
             "result_path": source_task.get("result_path"),
             "project_id": source_task.get("project_id"),
@@ -125,7 +162,14 @@ def _case_payload(item: Case) -> dict:
         "created_by": item.created_by,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
-    }
+}
+
+
+def _get_case_by_id_or_global_vuln_id(db: Session, case_id: str) -> Case | None:
+    item = db.query(Case).filter(Case.id == case_id).first()
+    if item is not None:
+        return item
+    return db.query(Case).filter(Case.global_vuln_id == case_id).first()
 
 
 def _manual_task_payload(item: ManualTask) -> dict:
@@ -262,6 +306,7 @@ async def create_draft_case(
 @router.get("")
 async def list_cases(
     project_id: str | None = Query(None),
+    global_vuln_id: str | None = Query(None),
     current_stage: str | None = Query(None),
     source_service_name: str | None = Query(None),
     source_task_id: str | None = Query(None),
@@ -278,6 +323,8 @@ async def list_cases(
     query = db.query(Case)
     if project_id:
         query = query.filter(Case.project_id == project_id)
+    if global_vuln_id:
+        query = query.filter(Case.global_vuln_id == global_vuln_id)
     if current_stage:
         query = query.filter(Case.current_stage == current_stage)
     items = query.order_by(Case.updated_at.desc()).all()
@@ -320,7 +367,7 @@ async def list_cases(
 
 @router.get("/{case_id}")
 async def get_case(case_id: str, user_and_token: tuple[dict, str] = Depends(get_current_subject), db: Session = Depends(get_db)):
-    item = db.query(Case).filter(Case.id == case_id).first()
+    item = _get_case_by_id_or_global_vuln_id(db, case_id)
     if item is None:
         raise HTTPException(status_code=404, detail="case not found")
     _, token = user_and_token
@@ -386,7 +433,7 @@ async def update_case(
     user_and_token: tuple[dict, str] = Depends(get_current_subject),
     db: Session = Depends(get_db),
 ):
-    item = db.query(Case).filter(Case.id == case_id).first()
+    item = _get_case_by_id_or_global_vuln_id(db, case_id)
     if item is None:
         raise HTTPException(status_code=404, detail="case not found")
 
@@ -505,7 +552,7 @@ async def delete_case(
     user_and_token: tuple[dict, str] = Depends(get_current_subject),
     db: Session = Depends(get_db),
 ):
-    item = db.query(Case).filter(Case.id == case_id).first()
+    item = _get_case_by_id_or_global_vuln_id(db, case_id)
     if item is None:
         raise HTTPException(status_code=404, detail="case not found")
 
@@ -530,7 +577,7 @@ async def delete_case(
 
 @router.get("/{case_id}/timeline")
 async def get_case_timeline(case_id: str, user_and_token: tuple[dict, str] = Depends(get_current_subject), db: Session = Depends(get_db)):
-    case = db.query(Case).filter(Case.id == case_id).first()
+    case = _get_case_by_id_or_global_vuln_id(db, case_id)
     if case is None:
         raise HTTPException(status_code=404, detail="case not found")
     _, token = user_and_token

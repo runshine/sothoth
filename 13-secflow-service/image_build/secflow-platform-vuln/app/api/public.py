@@ -199,9 +199,10 @@ async def submit_authenticated_submission(
         ),
     )
     source_meta = json.loads(item.source_meta_json or "{}")
-    duplicate = bool(request.report_id and source_meta.get("report_id") == request.report_id and item.created_by != created_by)
+    duplicate = bool(request.report_id and str(source_meta.get("report_id") or "").strip() == str(request.report_id or "").strip())
     return {
         "id": item.id,
+        "global_vuln_id": item.global_vuln_id or source_meta.get("global_vuln_id"),
         "project_id": item.project_id,
         "duplicate": duplicate,
         "files_root_path": build_case_fileserver_root(item.id)["root_path"],
