@@ -135,6 +135,22 @@ class TaskManagerTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
 
+    def _finish_continue_prepare(self, db, task, target_stage: str) -> None:
+        asyncio.run(self.manager._prepare_continue_task(db, task, target_stage))
+        task.status = "pending"
+        task.current_stage = target_stage
+        task.execution_mode = "task_retry"
+        task.target_stage_name = target_stage
+        task.pending_action = None
+
+    def _finish_retry_prepare(self, db, task) -> None:
+        stage_sequence = asyncio.run(self.manager._prepare_retry_task(db, task))
+        task.status = "pending"
+        task.current_stage = stage_sequence[0]
+        task.execution_mode = None
+        task.target_stage_name = None
+        task.pending_action = None
+
     def test_task_summary_is_written_to_task_workspace_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = BinarySecurityTask(
@@ -1030,6 +1046,9 @@ class TaskManagerTests(unittest.TestCase):
         target_stage = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
 
         self.assertEqual("entry_analysis", target_stage)
+        self.assertEqual("continue_preparing", task.status)
+        self.assertEqual("continue", task.pending_action)
+        self._finish_continue_prepare(db, task, target_stage)
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.finished_at)
@@ -1075,7 +1094,8 @@ class TaskManagerTests(unittest.TestCase):
 
             self.manager._delete_downstream_refs = fake_delete_downstream_refs
 
-            asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
+            target_stage = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
+            self._finish_continue_prepare(db, task, target_stage)
 
             self.assertEqual([], db.archive_jobs)
 
@@ -1253,7 +1273,8 @@ class TaskManagerTests(unittest.TestCase):
 
             self.manager._delete_downstream_refs = fake_delete_downstream_refs
 
-            asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
+            target_stage = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
+            self._finish_continue_prepare(db, task, target_stage)
 
             self.assertTrue(system_output.exists())
             self.assertFalse(entry_output.exists())
@@ -1316,6 +1337,7 @@ class TaskManagerTests(unittest.TestCase):
             target_stage = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
 
             self.assertEqual("system_analysis", target_stage)
+            self._finish_continue_prepare(db, task, target_stage)
             self.assertEqual(
                 [
                     {"service": "system_analyse", "task_id": "sat_1", "project_id": "p1", "stage_name": "system_analysis"},
@@ -1391,6 +1413,9 @@ class TaskManagerTests(unittest.TestCase):
             db = _ModelAwareDb(tasks=[task], archive_jobs=archive_jobs)
 
             self.manager.retry_task(db, project_id="p1", task_id="t1")
+            self.assertEqual("retry_preparing", task.status)
+            self.assertEqual("retry", task.pending_action)
+            self._finish_retry_prepare(db, task)
 
             self.assertEqual("pending", task.status)
             self.assertEqual([], db.archive_jobs)
@@ -1420,6 +1445,7 @@ class TaskManagerTests(unittest.TestCase):
             db = _ModelAwareDb(tasks=[task])
 
             self.manager.retry_task(db, project_id="p1", task_id="t1")
+            self._finish_retry_prepare(db, task)
 
             self.assertFalse(system_output.exists())
             self.assertFalse(entry_output.exists())
@@ -1532,14 +1558,12 @@ class TaskManagerTests(unittest.TestCase):
             )
 
         original_cleanup = self.manager._cleanup_downstream_refs
-        original_run_sync = self.manager._run_sync
         self.manager._cleanup_downstream_refs = fake_cleanup
-        self.manager._run_sync = lambda coro: asyncio.run(coro)
         try:
             self.manager.retry_task(db, project_id="p1", task_id="task1")
+            self._finish_retry_prepare(db, task)
         finally:
             self.manager._cleanup_downstream_refs = original_cleanup
-            self.manager._run_sync = original_run_sync
 
         self.assertEqual(1, len(calls))
         self.assertEqual("task1", calls[0]["task_id"])
@@ -1586,6 +1610,7 @@ class TaskManagerTests(unittest.TestCase):
             stage = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="task1"))
 
             self.assertEqual("system_analysis", stage)
+            self._finish_continue_prepare(db, task, stage)
             self.assertEqual("task_retry", task.execution_mode)
             self.assertEqual("system_analysis", task.target_stage_name)
             self.assertEqual(1, len(db.stage_items))

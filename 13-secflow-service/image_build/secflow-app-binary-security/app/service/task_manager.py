@@ -412,6 +412,10 @@ def _normalize_module_risk_levels(values: list[str] | None) -> list[str]:
 STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancelled"}
 STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading", "ready_to_start"}
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
+TASK_STATUS_CONTINUE_PREPARING = "continue_preparing"
+TASK_STATUS_RETRY_PREPARING = "retry_preparing"
+TASK_PREPARING_STATUSES = {TASK_STATUS_CONTINUE_PREPARING, TASK_STATUS_RETRY_PREPARING}
+TASK_PENDING_ACTIONS = {"continue", "retry"}
 MODULE_SELECTION_MODE_AUTO = "auto"
 MODULE_SELECTION_MODE_MANUAL_CONFIRM = "manual_confirm"
 ALLOWED_MODULE_RISK_LEVELS = ("高", "中", "低")
@@ -500,8 +504,11 @@ class TaskManager:
         self._loop_task: Optional[asyncio.Task] = None
         self._archive_loop_task: Optional[asyncio.Task] = None
         self._downstream_reconcile_task: Optional[asyncio.Task] = None
+        self._action_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
+        self._action_workers: dict[str, asyncio.Task] = {}
         self._worker_lock = asyncio.Lock()
+        self._action_worker_lock = asyncio.Lock()
 
     async def start(self) -> None:
         if self._running:
@@ -509,6 +516,10 @@ class TaskManager:
         self._running = True
         self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
         self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
+        self._action_loop_task = asyncio.create_task(
+            self._blocking_action_dispatch_loop(),
+            name="binary-security-blocking-action-dispatcher",
+        )
         self._downstream_reconcile_task = asyncio.create_task(
             self._downstream_reconcile_loop(),
             name="binary-security-downstream-reconcile",
@@ -528,6 +539,12 @@ class TaskManager:
                 await self._archive_loop_task
             except asyncio.CancelledError:
                 pass
+        if self._action_loop_task:
+            self._action_loop_task.cancel()
+            try:
+                await self._action_loop_task
+            except asyncio.CancelledError:
+                pass
         if self._downstream_reconcile_task:
             self._downstream_reconcile_task.cancel()
             try:
@@ -539,6 +556,11 @@ class TaskManager:
             task.cancel()
         if active:
             await asyncio.gather(*active, return_exceptions=True)
+        action_active = list(self._action_workers.values())
+        for task in action_active:
+            task.cancel()
+        if action_active:
+            await asyncio.gather(*action_active, return_exceptions=True)
 
     def prepare_task_id(self, db: Session, project_id: str) -> str:
         for _ in range(10):
@@ -779,6 +801,7 @@ class TaskManager:
                 BinarySecurityTask.name,
                 BinarySecurityTask.status,
                 BinarySecurityTask.current_stage,
+                BinarySecurityTask.pending_action,
                 BinarySecurityTask.firmware_path,
                 BinarySecurityTask.policy_json,
                 BinarySecurityTask.metrics_json,
@@ -1156,9 +1179,19 @@ class TaskManager:
             raise ValidationError(reason or "当前任务不可继续")
         if not target_stage:
             raise ValidationError("当前任务未找到可继续的阶段")
-        self._invalidate_task_execution(task)
-        db.flush()
+        self._accept_blocking_action(
+            db,
+            task,
+            action="continue",
+            preparing_status=TASK_STATUS_CONTINUE_PREPARING,
+            target_stage=target_stage,
+            message=f"继续任务已受理，后台正在准备从阶段 {target_stage} 继续",
+            event_type="task_continue_accepted",
+            event_payload={"target_stage": target_stage},
+        )
+        return target_stage
 
+    async def _prepare_continue_task(self, db: Session, task: BinarySecurityTask, target_stage: str) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
         stage_runs = {
             row.stage_name: row
@@ -1168,55 +1201,49 @@ class TaskManager:
         }
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
+        self._invalidate_task_execution(task)
+        db.flush()
+        affected_items = self._stage_items_for_stages(db, task.id, affected_stages)
+        downstream_refs = self._collect_downstream_refs(task, affected_items)
+        if downstream_refs:
+            await self._delete_downstream_refs(db, task, downstream_refs, self._service_token())
+        db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.stage_name.in_(affected_stages),
+        ).delete(synchronize_session=False)
         self._clear_stage_outputs_from(task, target_stage, mark_stale=False)
         self._delete_archive_children_for_stages(db, task, affected_stages)
         for stage_name in affected_stages:
             stage_run = stage_runs.get(stage_name)
             if stage_run:
                 self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
-
-        task.status = "pending"
-        task.current_stage = target_stage
-        task.execution_mode = "task_retry"
-        task.target_stage_name = target_stage
-        task.last_error = None
-        self._invalidate_task_execution(task)
-        task.finished_at = None
-        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
-        self._record_event(
-            db,
-            task,
-            "task_continue_requested",
-            f"手动继续任务，将从阶段 {target_stage} 开始推进，并尽量复用旧下游任务",
-            stage_name=target_stage,
-            payload={
-                "target_stage": target_stage,
-                "cleared_stages": affected_stages,
-                "retry_semantics": "continue_with_existing_downstream",
-            },
-        )
-        db.commit()
-        return target_stage
+        return affected_stages
 
     def retry_task(self, db: Session, *, project_id: str, task_id: str) -> None:
         task = self._task_or_404(db, project_id, task_id)
         supported, reason, stage_name = self._task_retry_support(db, task)
         if not supported or not stage_name:
             raise ValidationError(reason or "当前任务不支持安全重试")
+        first_stage = self._stage_sequence_for_task(task)[0]
+        self._accept_blocking_action(
+            db,
+            task,
+            action="retry",
+            preparing_status=TASK_STATUS_RETRY_PREPARING,
+            target_stage=first_stage,
+            message=f"清空并从头开始已受理，后台正在准备从阶段 {first_stage} 重新排队",
+            event_type="task_retry_accepted",
+            event_payload={"target_stage": first_stage},
+        )
+
+    async def _prepare_retry_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
         first_stage = stage_sequence[0]
         self._invalidate_task_execution(task)
         all_items = self._stage_items_for_stages(db, task.id, stage_sequence)
         downstream_refs = self._collect_downstream_refs(task, all_items)
         if downstream_refs:
-            self._run_sync(self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token()))
-        task.status = "pending"
-        task.current_stage = first_stage
-        task.execution_mode = None
-        task.target_stage_name = None
-        task.last_error = None
-        self._invalidate_task_execution(task)
-        task.finished_at = None
+            await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
         self._clear_stage_outputs_from(task, first_stage, mark_stale=False)
         db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task.id,
@@ -1230,16 +1257,7 @@ class TaskManager:
             ).first()
             if stage_run:
                 self._reset_stage_run_for_retry(task, stage_run, increment_retry=True)
-        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
-        self._record_event(
-            db,
-            task,
-            "task_retried",
-            f"任务已清空全部阶段和下游任务，将从第一阶段 {first_stage} 重新开始",
-            stage_name=first_stage,
-            payload={"target_stage": first_stage, "cleared_stages": stage_sequence, "retry_semantics": "full_restart"},
-        )
-        db.commit()
+        return stage_sequence
 
     def retry_stage(self, db: Session, *, project_id: str, task_id: str, stage_name: str) -> None:
         task = self._task_or_404(db, project_id, task_id)
@@ -1841,6 +1859,56 @@ class TaskManager:
         db.commit()
         return BinarySecurityServiceConfigResponse(config=payload)
 
+    def _accept_blocking_action(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        action: str,
+        preparing_status: str,
+        target_stage: str | None,
+        message: str,
+        event_type: str,
+        event_payload: dict[str, Any] | None = None,
+    ) -> None:
+        if action not in TASK_PENDING_ACTIONS:
+            raise ValidationError(f"不支持的任务阻塞动作: {action}")
+        self._invalidate_task_execution(task)
+        task.status = preparing_status
+        task.pending_action = action
+        task.current_stage = target_stage or task.current_stage
+        task.last_error = None
+        task.finished_at = None
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=preparing_status)
+        self._record_event(
+            db,
+            task,
+            event_type,
+            message,
+            stage_name=target_stage,
+            payload={"action": action, "target_stage": target_stage, **(event_payload or {})},
+        )
+        db.commit()
+
+    async def _blocking_action_dispatch_loop(self) -> None:
+        session_factory = get_session_factory()
+        while self._running:
+            db = session_factory()
+            try:
+                claimed_ids = self._claim_preparing_tasks(db)
+                if claimed_ids:
+                    async with self._action_worker_lock:
+                        for task_id in claimed_ids:
+                            if task_id in self._action_workers and not self._action_workers[task_id].done():
+                                continue
+                            self._action_workers[task_id] = asyncio.create_task(
+                                self._run_preparing_action(task_id),
+                                name=f"binary-security-action-{task_id}",
+                            )
+            finally:
+                db.close()
+            await asyncio.sleep(self.cfg.scheduler.poll_interval_seconds)
+
     async def _dispatch_loop(self) -> None:
         session_factory = get_session_factory()
         while self._running:
@@ -1856,6 +1924,148 @@ class TaskManager:
             finally:
                 db.close()
             await asyncio.sleep(self.cfg.scheduler.poll_interval_seconds)
+
+    def _claim_preparing_tasks(self, db: Session) -> list[str]:
+        candidates = (
+            db.query(BinarySecurityTask.id)
+            .filter(
+                BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
+                BinarySecurityTask.dispatcher_instance_id.is_(None),
+            )
+            .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
+            .limit(max(1, int(self.cfg.scheduler.task_concurrency or 2)))
+            .all()
+        )
+        claimed: list[str] = []
+        started_at = _now()
+        for row in candidates:
+            task_id = row[0]
+            updated = (
+                db.query(BinarySecurityTask)
+                .filter(
+                    BinarySecurityTask.id == task_id,
+                    BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
+                    BinarySecurityTask.dispatcher_instance_id.is_(None),
+                )
+                .update(
+                    {
+                        BinarySecurityTask.dispatcher_instance_id: self.instance_id,
+                        BinarySecurityTask.dispatch_started_at: started_at,
+                        BinarySecurityTask.updated_at: started_at,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated:
+                claimed.append(task_id)
+        if claimed:
+            db.commit()
+        return claimed
+
+    async def _run_preparing_action(self, task_id: str) -> None:
+        session_factory = get_session_factory()
+        db = session_factory()
+        try:
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            if (
+                task is None
+                or task.status not in TASK_PREPARING_STATUSES
+                or task.dispatcher_instance_id != self.instance_id
+            ):
+                return
+            action = str(task.pending_action or "").strip()
+            if action not in TASK_PENDING_ACTIONS:
+                raise ValidationError("任务 preparing 状态缺少有效 pending_action")
+            target_stage = str(task.current_stage or "").strip() or None
+            started_event = "task_continue_prepare_started" if action == "continue" else "task_retry_prepare_started"
+            finished_event = "task_continue_prepare_finished" if action == "continue" else "task_retry_prepare_finished"
+            failed_event = "task_continue_prepare_failed" if action == "continue" else "task_retry_prepare_failed"
+            requeued_event = "task_continue_requested" if action == "continue" else "task_retried"
+
+            self._record_event(
+                db,
+                task,
+                started_event,
+                "后台准备已开始，正在清理旧阶段结果并重建可继续执行状态",
+                stage_name=target_stage,
+                payload={"action": action, "target_stage": target_stage},
+            )
+            db.commit()
+
+            if action == "continue":
+                if not target_stage:
+                    raise ValidationError("继续任务缺少目标阶段")
+                affected_stages = await self._prepare_continue_task(db, task, target_stage)
+                task.execution_mode = "task_retry"
+                task.target_stage_name = target_stage
+                requeued_message = f"任务已完成继续准备，将从阶段 {target_stage} 重新排队"
+                retry_semantics = "continue_with_existing_downstream"
+            else:
+                stage_sequence = await self._prepare_retry_task(db, task)
+                target_stage = stage_sequence[0] if stage_sequence else None
+                affected_stages = stage_sequence
+                task.execution_mode = None
+                task.target_stage_name = None
+                requeued_message = f"任务已完成清理，将从第一阶段 {target_stage} 重新排队"
+                retry_semantics = "full_restart"
+
+            task.status = "pending"
+            task.pending_action = None
+            task.current_stage = target_stage
+            task.last_error = None
+            task.finished_at = None
+            self._invalidate_task_execution(task)
+            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
+            self._record_event(
+                db,
+                task,
+                finished_event,
+                "后台准备完成，任务已恢复为待调度状态",
+                stage_name=target_stage,
+                payload={"action": action, "target_stage": target_stage, "cleared_stages": affected_stages},
+            )
+            self._record_event(
+                db,
+                task,
+                requeued_event,
+                requeued_message,
+                stage_name=target_stage,
+                payload={
+                    "target_stage": target_stage,
+                    "cleared_stages": affected_stages,
+                    "retry_semantics": retry_semantics,
+                    "accepted_async": True,
+                },
+            )
+            db.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            db.rollback()
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            if task is not None:
+                action = str(task.pending_action or "").strip()
+                target_stage = str(task.current_stage or "").strip() or None
+                task.status = "failed"
+                task.pending_action = None
+                task.last_error = str(exc)
+                task.finished_at = _now()
+                self._invalidate_task_execution(task)
+                self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="failed")
+                self._record_event(
+                    db,
+                    task,
+                    "task_continue_prepare_failed" if action == "continue" else "task_retry_prepare_failed",
+                    f"后台准备失败: {exc}",
+                    level="error",
+                    stage_name=target_stage,
+                    payload={"action": action or None, "target_stage": target_stage, "error": str(exc)},
+                )
+                db.commit()
+        finally:
+            async with self._action_worker_lock:
+                self._action_workers.pop(task_id, None)
+            db.close()
 
     async def _archive_dispatch_loop(self) -> None:
         while self._running:
@@ -2576,7 +2786,7 @@ class TaskManager:
         running_count = int(
             db.query(func.count(BinarySecurityTask.id))
             .filter(
-                BinarySecurityTask.status.in_(["dispatching", "running"]),
+                BinarySecurityTask.status.in_(["dispatching", "running", TASK_STATUS_CONTINUE_PREPARING, TASK_STATUS_RETRY_PREPARING]),
             )
             .scalar()
             or 0
@@ -3225,6 +3435,8 @@ class TaskManager:
             "pending",
             "dispatching",
             "running",
+            TASK_STATUS_CONTINUE_PREPARING,
+            TASK_STATUS_RETRY_PREPARING,
             "pending_upload",
             "uploading",
             "ready_to_start",
@@ -3343,6 +3555,7 @@ class TaskManager:
             name=task.name,
             status=task.status,
             current_stage=task.current_stage,
+            pending_action=task.pending_action,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
             is_queued=task.status == "pending",
@@ -4237,8 +4450,10 @@ class TaskManager:
     def _task_retry_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, "当前任务尚未完成输入准备，不能重试", None
-        if task.status in {"pending", "dispatching", "running"}:
+        if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
             return False, f"当前任务正在执行或排队中，不能重试: {task.status}", None
+        if str(task.pending_action or "").strip():
+            return False, f"当前任务已有待处理操作: {task.pending_action}", None
         stage_sequence = self._stage_sequence_for_task(task)
         if not stage_sequence:
             return False, "当前任务没有可执行阶段", None
@@ -4247,8 +4462,10 @@ class TaskManager:
     def _task_continue_support(self, db: Session, task: BinarySecurityTask) -> tuple[bool, str | None, str | None]:
         if task.status in {"pending_upload", "uploading", "ready_to_start"}:
             return False, f"当前任务状态不允许继续: {task.status}", None
-        if task.status in {"pending", "dispatching", "running"}:
+        if task.status in {"pending", "dispatching", "running"} | TASK_PREPARING_STATUSES:
             return False, f"当前任务正在执行或排队中，不能手动继续: {task.status}", None
+        if str(task.pending_action or "").strip():
+            return False, f"当前任务已有待处理操作: {task.pending_action}", None
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
             return False, "当前任务等待模块确认，请先确认模块后继续", None
 

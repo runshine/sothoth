@@ -233,7 +233,13 @@ def retry_task(
     db: Session = Depends(get_db),
 ):
     get_task_manager().retry_task(db, project_id=project_id, task_id=task_id)
-    return BinarySecurityActionResponse(task_id=task_id, message="任务已从第一阶段重新排队")
+    return BinarySecurityActionResponse(
+        task_id=task_id,
+        status="retry_preparing",
+        accepted=True,
+        action="retry",
+        message="任务已受理，后台正在清空并准备从第一阶段重新排队",
+    )
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/continue", response_model=BinarySecurityActionResponse)
@@ -244,7 +250,13 @@ async def continue_task(
     db: Session = Depends(get_db),
 ):
     target_stage = await get_task_manager().continue_task(db, project_id=project_id, task_id=task_id)
-    return BinarySecurityActionResponse(task_id=task_id, message=f"任务已重新排队，将从阶段 {target_stage} 继续")
+    return BinarySecurityActionResponse(
+        task_id=task_id,
+        status="continue_preparing",
+        accepted=True,
+        action="continue",
+        message=f"任务已受理，后台正在准备从阶段 {target_stage} 继续",
+    )
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/retry", response_model=BinarySecurityActionResponse)

@@ -77,6 +77,7 @@ class BinarySecurityTask(Base, JsonMixin):
     stage_summary_json = Column(Text, nullable=True)
     execution_mode = Column(String(32), nullable=True, index=True)
     target_stage_name = Column(String(64), nullable=True, index=True)
+    pending_action = Column(String(32), nullable=True, index=True)
     last_error = Column(Text, nullable=True)
     dispatcher_instance_id = Column(String(128), nullable=True, index=True)
     dispatch_started_at = Column(DateTime, nullable=True, index=True)
@@ -399,6 +400,10 @@ def _ensure_compat_columns(engine) -> None:
         if "target_stage_name" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN target_stage_name VARCHAR(64) NULL"
+            )
+        if "pending_action" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN pending_action VARCHAR(32) NULL"
             )
         with engine.begin() as conn:
             for statement in statements:

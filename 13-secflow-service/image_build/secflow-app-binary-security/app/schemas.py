@@ -84,6 +84,7 @@ class BinarySecurityTaskResponse(BaseModel):
     name: str
     status: str
     current_stage: Optional[str] = None
+    pending_action: Optional[str] = None
     firmware_path: str
     stage_sequence: list[str] = Field(default_factory=list)
     is_queued: bool = False
@@ -300,6 +301,8 @@ class BinarySecurityActionResponse(BaseModel):
     status: str = "ok"
     task_id: str
     message: str
+    accepted: bool = False
+    action: Optional[str] = None
     cancelled_downstream_count: int = 0
     deleted_downstream_count: int = 0
     cleanup_status: Optional[str] = None
