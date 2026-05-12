@@ -20,6 +20,14 @@ data:
       port: 8080
       debug: false
 
+    provider_source:
+      enabled: true
+      backend: "configcenter"
+      base_url: "http://secflow-platform-configcenter"
+      api_prefix: "/api/configcenter/service/llm"
+      timeout_seconds: 15
+      machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+
     execution:
       mode: "opencode_cli"
       max_parallel_tasks: 1
