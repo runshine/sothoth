@@ -77,6 +77,8 @@ def test_payload_uses_readable_finding_id_and_legacy_fingerprint(tmp_path):
     assert re.fullmatch(r"DFVS-20260512-101114-001-[0-9A-F]{6}", payload["report_id"])
     assert payload["metadata"]["source"]["finding_id"] == payload["report_id"]
     assert payload["metadata"]["dataflow_vuln_scanner"]["finding_id"] == payload["report_id"]
+    assert payload["reporter"]["version"] == "1.0.0"
+    assert payload["evidence"]["references"] == [{"path": str(result_path), "kind": "report"}]
     assert payload["fingerprint"] == hashlib.sha256(
         "dfvs:task-1:exec-1:result_001.md:Demo finding".encode("utf-8")
     ).hexdigest()

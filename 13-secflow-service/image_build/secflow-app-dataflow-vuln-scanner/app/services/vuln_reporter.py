@@ -25,6 +25,7 @@ from app.time_utils import now_local
 
 SERVICE_NAME = "secflow-app-dataflow-vuln-scanner"
 SERVICE_ID = "secflow-app-dataflow-vuln-scanner"
+SERVICE_VERSION = "1.0.0"
 
 
 def _new_id(prefix: str) -> str:
@@ -315,6 +316,7 @@ class VulnReportService:
             ).strip(),
             "reporter": {
                 "name": SERVICE_NAME,
+                "version": SERVICE_VERSION,
                 "type": "service",
                 "instance_id": execution.owner_pod_id or get_config().scheduler.pod_id,
             },
@@ -326,7 +328,7 @@ class VulnReportService:
             "evidence": {
                 "summary": summary[:2000] if summary else title,
                 "reproduction_hint": str(raw.get("reproduction_hint") or _frontmatter_value(content, "reproduction_hint") or ""),
-                "references": [result_path] if result_path else [],
+                "references": ([{"path": result_path, "kind": "report"}] if result_path else []),
             },
             "artifacts": [
                 {
