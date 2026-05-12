@@ -215,6 +215,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/app/binary-evolution
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-binary-evolution-center
+            port:
+              number: 80
+
       - path: /api/dataflow-vuln-scanner
         pathType: Prefix
         backend:
