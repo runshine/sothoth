@@ -191,6 +191,14 @@ spec:
             port:
               number: 80
 
+      - path: /api/app/ipc-audit
+        pathType: Prefix
+        backend:
+          service:
+            name: secflow-app-ipc-audit
+            port:
+              number: 80
+
       - path: /api/app/binary-to-source
         pathType: Prefix
         backend:

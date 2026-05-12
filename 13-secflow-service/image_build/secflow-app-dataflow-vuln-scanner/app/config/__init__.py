@@ -82,6 +82,18 @@ class ConfigCenterServiceConfig(BaseModel):
     timeout: int = 30
 
 
+class VulnEngineServiceConfig(BaseModel):
+    enabled: bool = True
+    base_url: str = "http://secflow-platform-vuln"
+    submit_path: str = "/api/vuln/public/intake/submissions"
+    timeout: int = 30
+    service_machine_token: Optional[str] = None
+
+    @property
+    def submit_url(self) -> str:
+        return f"{self.base_url.rstrip('/')}{self.submit_path}"
+
+
 class RunsConfig(BaseModel):
     enabled: bool = True
 
@@ -153,6 +165,7 @@ class Config(BaseModel):
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     fileserver_service: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
     configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
+    vuln_engine_service: VulnEngineServiceConfig = Field(default_factory=VulnEngineServiceConfig)
     runs: RunsConfig = Field(default_factory=RunsConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)

@@ -187,11 +187,14 @@ async def submit_authenticated_submission(
     subject, token = user_and_token
     await ensure_project_access(request.project_id, token)
     creator = subject.get("username") or str(subject.get("id"))
+    reporter_type = getattr(request.reporter, "type", None)
+    created_by_type = "service" if reporter_type == "service" else "human"
+    created_by = request.reporter.name if created_by_type == "service" else creator
     item = create_case_with_runtime(
         db,
         request.to_case_create_request(
-            created_by_type="human",
-            created_by=creator,
+            created_by_type=created_by_type,
+            created_by=created_by,
             anonymous_submission=False,
         ),
     )

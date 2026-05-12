@@ -63,6 +63,7 @@ from app.services.pi_vuln_adapter import (
     build_core_tasks,
     write_final_task_manifest,
 )
+from app.services.vuln_reporter import get_task_vuln_report_status, get_vuln_report_service
 from app.services.workflow_service import get_workflow_service
 from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
 
@@ -421,6 +422,14 @@ class ExecutionService:
             run_path=run_locator["run_path"],
             run=run_summary,
             latest_run=run_summary,
+            auto_report_vulnerabilities=bool(
+                self._trigger_task_metadata(trigger).get("auto_report_vulnerabilities", True)
+            ),
+            vuln_report_status=get_task_vuln_report_status(
+                db,
+                trigger,
+                latest_execution.id if latest_execution else None,
+            ),
         )
 
     def _scan_task_detail(self, db: Session, trigger: TriggerTask) -> ScanTaskDetailResponse:
@@ -2058,6 +2067,7 @@ class ExecutionService:
             "parent_stage_name": payload.parent_stage_name,
             "parent_stage_item_id": payload.parent_stage_item_id,
             "parent_stage_item_key": payload.parent_stage_item_key,
+            "auto_report_vulnerabilities": bool(payload.auto_report_vulnerabilities),
         }
         if payload.data_flow and payload.source_dir:
             scan_options = dict(payload.scan_options or {})
@@ -3248,6 +3258,27 @@ class ExecutionService:
             db.commit()
             get_run_index_service().sync_execution_run(db, execution)
             db.commit()
+            report_status = {}
+            if terminal_status == "succeeded":
+                try:
+                    run_index = get_run_index_service().get_run_index_by_execution(db, execution)
+                    report_status = get_vuln_report_service().report_execution_results(
+                        db,
+                        trigger=trigger,
+                        execution=execution,
+                        run_index=run_index,
+                    )
+                except Exception as exc:
+                    db.rollback()
+                    report_status = {"status": "failed", "enabled": True, "error": str(exc)}
+                self.record_event(
+                    db,
+                    execution_id=execution.id,
+                    event_type="vuln_report_finished",
+                    message=f"vulnerability suspicion auto-report {report_status.get('status', 'unknown')}",
+                    level="warning" if report_status.get("status") in {"failed", "partial_failed"} else "info",
+                    payload_json=report_status,
+                )
             event_type = "execution_finished"
             if terminal_status == "cancelled":
                 event_type = "execution_cancelled"
@@ -3266,6 +3297,7 @@ class ExecutionService:
                     "run_dir": abs_path(run_dir),
                     "output_manifest_path": execution.output_manifest_path,
                     "output_task_count": execution.output_task_count,
+                    "vuln_report_status": report_status,
                 },
             )
         finally:

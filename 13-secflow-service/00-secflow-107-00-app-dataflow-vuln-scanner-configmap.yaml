@@ -50,6 +50,12 @@ data:
       base_url: "http://secflow-platform-configcenter/api/configcenter"
       timeout: 30
 
+    vuln_engine_service:
+      enabled: true
+      base_url: "http://secflow-platform-vuln"
+      submit_path: "/api/vuln/public/intake/submissions"
+      timeout: 30
+
     runs:
       enabled: true
 

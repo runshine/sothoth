@@ -126,6 +126,7 @@ class ScanTaskCreateRequest(BaseModel):
     parent_stage_name: Optional[str] = None
     parent_stage_item_id: Optional[str] = None
     parent_stage_item_key: Optional[str] = None
+    auto_report_vulnerabilities: bool = True
 
     @model_validator(mode="after")
     def validate_task_input(self) -> "ScanTaskCreateRequest":
@@ -173,6 +174,8 @@ class ScanTaskResponse(BaseModel):
     run_path: Optional[str] = None
     run: Dict[str, Any] = Field(default_factory=dict)
     latest_run: Dict[str, Any] = Field(default_factory=dict)
+    auto_report_vulnerabilities: bool = True
+    vuln_report_status: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ScanTaskAttemptResponse(BaseModel):
