@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
 from app.pi_vuln_core.config.models import AtomicWorkflowDef
+from app.pi_vuln_core.engine.checkpoint import load_step_checkpoint
 from app.pi_vuln_core.engine.models import WorkflowContext
 from app.pi_vuln_core.engine.worker import WorkerExecutor
 from app.pi_vuln_core.review.state import ReviewState
 from app.pi_vuln_core.utils.template import TemplateRenderError, render_string
+from app.pi_vuln_core.agents.models import AgentResponse
 
 
 def _workflow_with_worker_prompt(
@@ -195,7 +199,8 @@ def test_summary_or_ledger_issue_enters_rework_prompt(tmp_path: Path) -> None:
 
     assert "第 2 轮评审返工" in prompt
     assert "summary 漏洞汇总表没有同步 supporting docs" in prompt
-    assert "本轮只修复 `summary.md`" in prompt
+    assert "本轮主要为 summary/ledger handoff" in prompt
+    assert "只补充后续 summary 阶段需要的 `supporting_docs/` 证据" in prompt
     assert "不要新增、删除、重写或重新编号 `results/result_NNN.md`" in prompt
 
 
@@ -257,6 +262,235 @@ def test_configured_rework_prompt_template_is_used(tmp_path: Path) -> None:
     assert "result_001.md" in prompt
     assert "needs stronger source evidence" in prompt
     assert "Coverage obligation ledger" in prompt
+
+
+def test_default_rework_prompt_is_incremental_for_shared_worker_session(tmp_path: Path) -> None:
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# scan task\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    results_dir = work_dir / "results"
+    meta_dir = work_dir / "_meta"
+    results_dir.mkdir(parents=True)
+    meta_dir.mkdir(parents=True)
+    (results_dir / "result_001.md").write_text("# passed\n", encoding="utf-8")
+    (results_dir / "result_002.md").write_text("# failed\n", encoding="utf-8")
+    (meta_dir / "coverage_ledger.json").write_text(
+        json.dumps(
+            {
+                "coverage_obligations": {
+                    "open_entries": [
+                        {
+                            "id": "USED:danger_len",
+                            "kind": "used",
+                            "label": "USED",
+                            "value": "danger_len@L42",
+                            "risk": "high",
+                            "status": "open",
+                        }
+                    ]
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    wf = _workflow_with_worker_prompt(
+        Path("prompts/vuln_scan/worker_user.md"),
+        Path("prompts/vuln_scan/summary.md"),
+        rework_prompt=Path("prompts/vuln_scan/worker_rework.md"),
+    )
+    ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file=str(task_file),
+        working_dir=str(work_dir),
+        cycle=2,
+        review_mode="discovery",
+    )
+    state = ReviewState()
+    state.mark_result_passed("result_001.md", 1)
+    state.mark_result_failed("result_002.md", 1, "source check contradicts report")
+    state.record_global_review_result(
+        cycle=1,
+        passed=False,
+        feedback="mixed worker and summary issues",
+        scores={"used_coverage": 0.5},
+        issues=[
+            {
+                "id": "worker-used-gap",
+                "category": "coverage_gap",
+                "target": "danger_len",
+                "required_action": "补齐 USED sink 证据",
+                "actionable_by": "worker",
+            },
+            {
+                "id": "summary-table-sync",
+                "category": "report_completeness",
+                "target": "summary.md",
+                "required_action": "同步 summary 表格",
+                "actionable_by": "summary",
+            },
+        ],
+    )
+
+    prompt = WorkerExecutor(agent_registry=None, recorder=None)._build_user_prompt(  # type: ignore[arg-type]
+        wf,
+        ctx,
+        state,
+    )
+
+    assert "Worker 的所有 cycle 共用同一个 session" in prompt
+    assert "本轮增量目标队列" in prompt
+    assert "### P0 failed results" in prompt
+    assert "### P1 worker active issues" in prompt
+    assert "### P2 coverage targets" in prompt
+    assert "Summary / Ledger handoff" in prompt
+    assert "summary-table-sync" in prompt
+    assert "不要求本轮关闭全部 open obligations" in prompt
+    assert "只处理失败 result" not in prompt
+    assert "不要重新通读所有历史 result/supporting_docs" in prompt
+
+
+def test_staged_rework_sequence_uses_one_worker_session_and_checkpoints(tmp_path: Path) -> None:
+    class FakeWorkerAgent:
+        def __init__(self) -> None:
+            self.messages: list[dict[str, str]] = []
+
+        async def multi_turn_execute(
+            self,
+            *,
+            system_prompt: str,
+            user_prompt: str,
+            working_dir: str,
+            max_turns: int,
+            session_id: str,
+        ) -> AgentResponse:
+            self.messages.append({
+                "kind": "multi_turn",
+                "session_id": session_id,
+                "message": user_prompt,
+                "system_prompt": system_prompt,
+            })
+            return AgentResponse(
+                content="triage ok",
+                conversation_id=session_id,
+                turn_count=len(self.messages),
+                finished=True,
+            )
+
+        async def send_message(
+            self,
+            *,
+            message: str,
+            session_id: str,
+            working_dir: str,
+        ) -> AgentResponse:
+            self.messages.append({
+                "kind": "send_message",
+                "session_id": session_id,
+                "message": message,
+                "system_prompt": "",
+            })
+            return AgentResponse(
+                content="stage ok",
+                conversation_id=session_id,
+                turn_count=len(self.messages),
+                finished=True,
+            )
+
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# scan task\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    results_dir = work_dir / "results"
+    results_dir.mkdir(parents=True)
+    (results_dir / "result_001.md").write_text("# failed\n", encoding="utf-8")
+    wf = _workflow_with_worker_prompt(
+        Path("prompts/vuln_scan/worker_user.md"),
+        Path("prompts/vuln_scan/summary.md"),
+        rework_prompt=Path("prompts/vuln_scan/worker_rework.md"),
+    )
+    ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file=str(task_file),
+        working_dir=str(work_dir),
+        cycle=2,
+        review_mode="discovery",
+        worker_session_id="worker-session-1",
+        worker_session_cycle=2,
+    )
+    state = ReviewState()
+    state.mark_result_failed("result_001.md", 1, "source evidence contradicts report")
+    state.record_global_review_result(
+        cycle=1,
+        passed=False,
+        feedback="EXPORT followthrough gap",
+        scores={"export_followthrough": 0.5},
+        advisor_id="global_completeness",
+        issues=[
+            {
+                "id": "cmp-export-gap",
+                "category": "export_followthrough",
+                "target": "EXPORT_L42",
+                "required_action": "跟入 EXPORT_L42 到 sink",
+                "actionable_by": "worker",
+            }
+        ],
+    )
+    state.record_global_review_result(
+        cycle=1,
+        passed=False,
+        feedback="boundary bypass not checked",
+        scores={"code_evidence_depth": 0.4},
+        advisor_id="global_depth",
+        issues=[
+            {
+                "id": "dpt-boundary",
+                "category": "scan_depth",
+                "target": "len check",
+                "required_action": "检查 len=0/1/0xffff 绕过",
+                "actionable_by": "worker",
+            }
+        ],
+    )
+
+    agent = FakeWorkerAgent()
+    response = asyncio.run(
+        WorkerExecutor(agent_registry=None, recorder=None)._execute_rework_sequence(  # type: ignore[arg-type]
+            wf_def=wf,
+            ctx=ctx,
+            review_state=state,
+            agent=agent,
+            session_id="worker-session-1",
+            system_prompt="system",
+        )
+    )
+
+    assert response.metadata["rework_sequence"] is True
+    assert response.metadata["skip_reflection_after_worker"] is True
+    assert len(agent.messages) == 4
+    assert {item["session_id"] for item in agent.messages} == {"worker-session-1"}
+    assert agent.messages[0]["kind"] == "multi_turn"
+    assert all(item["kind"] == "send_message" for item in agent.messages[1:])
+    assert "全面性评审 -> 漏报补扫信号" in agent.messages[0]["message"]
+    assert "误报压制与失败结果修复" in agent.messages[1]["message"]
+    assert "评审驱动的漏报补扫与深挖" in agent.messages[2]["message"]
+    assert "Rework Handoff" in agent.messages[3]["message"]
+
+    for step_key in (
+        "worker::rework_triage",
+        "worker::rework_fp_repair",
+        "worker::rework_missed_hunt",
+        "worker::rework_handoff",
+    ):
+        checkpoint = load_step_checkpoint(
+            work_dir,
+            cycle=2,
+            phase="worker",
+            step_key=step_key,
+        )
+        assert checkpoint is not None
+        assert checkpoint["status"] == "completed"
 
 
 def test_repeated_analysis_issue_adds_residual_protocol_to_closure_prompt(tmp_path: Path) -> None:

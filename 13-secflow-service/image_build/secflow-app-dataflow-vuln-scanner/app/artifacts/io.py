@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -36,11 +38,24 @@ def read_json(path: str | Path) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _atomic_write_text(path: Path, content: str) -> Path:
+    ensure_dir(path.parent)
+    tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def write_json(path: str | Path, payload: Any) -> Path:
     target = Path(path)
-    ensure_dir(target.parent)
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return target
+    return _atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def write_text(path: str | Path, content: str) -> Path:

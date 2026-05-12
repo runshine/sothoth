@@ -30,6 +30,8 @@ from app.models.database import (
 )
 from app.services.run_inspector import (
     _session_runtime_metadata,
+    collect_new_results_by_cycle,
+    derive_profile_gate_summary,
     inspect_cycle_detail,
     inspect_file,
     inspect_files,
@@ -38,6 +40,7 @@ from app.services.run_inspector import (
     inspect_run_summary,
     inspect_session_file,
     inspect_sessions,
+    load_active_issue_records_from_ledger,
 )
 from app.time_utils import UTC_PLUS_8, ensure_local, isoformat_local, now_local
 
@@ -53,6 +56,13 @@ def _new_id(prefix: str) -> str:
 def _safe_path_component(value: Any) -> str:
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
     return text[:160] or "unknown"
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -174,6 +184,7 @@ def _raw_summary_db_view(payload: dict[str, Any]) -> dict[str, Any]:
     cli_payload = payload.get("dataflow_cli") if isinstance(payload.get("dataflow_cli"), dict) else {}
     current_step = payload.get("current_step") if isinstance(payload.get("current_step"), dict) else {}
     step_history = payload.get("step_history") if isinstance(payload.get("step_history"), list) else []
+    cycle_timing = payload.get("cycle_timing") if isinstance(payload.get("cycle_timing"), dict) else {}
     return {
         "start_time": str(payload.get("start_time") or ""),
         "command": list(payload.get("command") or []) if isinstance(payload.get("command"), list) else [],
@@ -184,8 +195,16 @@ def _raw_summary_db_view(payload: dict[str, Any]) -> dict[str, Any]:
             "phase": current_step.get("phase"),
             "step_key": current_step.get("step_key"),
             "status": current_step.get("status"),
+            "started_at": current_step.get("started_at"),
+            "started_epoch": current_step.get("started_epoch"),
+            "finished_at": current_step.get("finished_at"),
+            "finished_epoch": current_step.get("finished_epoch"),
+            "duration_seconds": current_step.get("duration_seconds"),
+            "duration_ms": current_step.get("duration_ms"),
+            "elapsed_seconds": current_step.get("elapsed_seconds"),
         },
         "step_history_count": len(step_history),
+        "cycle_timing": cycle_timing,
         "summary_markdown_length": len(str(payload.get("summary_markdown") or "")),
         "task_markdown_length": len(str(payload.get("task_markdown") or "")),
     }
@@ -470,6 +489,19 @@ def _run_index_is_active(record: RunIndex) -> bool:
     return str(record.status or "").strip().lower() in _ACTIVE_RUN_INDEX_STATUSES
 
 
+def _new_results_by_cycle_for_index(run_index: RunIndex) -> dict[int, list[dict[str, Any]]]:
+    atomic_work_path = str(run_index.atomic_work_path or "").strip()
+    if not atomic_work_path:
+        return {}
+    try:
+        atomic = Path(atomic_work_path)
+    except Exception:
+        return {}
+    if not atomic.is_dir():
+        return {}
+    return collect_new_results_by_cycle(atomic)
+
+
 def _project_files_root(project_id: str) -> Path:
     config = get_config()
     return Path(config.fileserver_service.data_mount_path) / config.fileserver_service.project_files_dirname / str(project_id or "").strip()
@@ -616,6 +648,7 @@ class RunIndexService:
                             "cycle": cycle_no,
                             "outcome": str(cycle.get("outcome") or ""),
                             "result_total": int(cycle.get("result_total") or 0),
+                            "new_result_count": _safe_int(cycle.get("new_result_count")),
                             "issue_count": len(list(cycle.get("issues") or [])),
                         },
                     ),
@@ -913,6 +946,7 @@ class RunIndexService:
             "task_markdown": _task_markdown_for_run(run_root),
             "current_step": dict(detail.get("current_step") or {}),
             "step_history": list(detail.get("step_history") or []),
+            "cycle_timing": dict(detail.get("cycle_timing") or {}),
         }
         command_payload = _run_command_payload(
             db,
@@ -1174,9 +1208,30 @@ class RunIndexService:
             .all()
         )
         rows: list[dict[str, Any]] = []
+        derived_new_results_by_cycle: dict[int, list[dict[str, Any]]] | None = None
         for item in cycles:
             metrics = _load_externalized_mapping_payload(run_index.run_root_path, item.metrics_json)
             issues = _load_externalized_list_payload(run_index.run_root_path, item.issues_json)
+            raw_cycle = _load_externalized_json_payload(run_index.run_root_path, item.raw_json) or {}
+            new_results = raw_cycle.get("new_results") if isinstance(raw_cycle.get("new_results"), list) else None
+            if new_results is None:
+                if derived_new_results_by_cycle is None:
+                    derived_new_results_by_cycle = _new_results_by_cycle_for_index(run_index)
+                new_results = derived_new_results_by_cycle.get(item.cycle, [])
+            raw_global_review = raw_cycle.get("global_review") if isinstance(raw_cycle.get("global_review"), dict) else {}
+            if not raw_global_review:
+                raw_global_review = {
+                    "passed": item.global_passed,
+                    "feedback_preview": metrics.get("global_feedback_preview", ""),
+                    "issues": issues,
+                    "total_advisor_count": raw_cycle.get("global_advisor_total", 0),
+                    "passed_advisor_count": raw_cycle.get("global_advisor_passed", 0),
+                    "failed_advisor_id": item.failed_advisor_id,
+                    "failed_role_name": item.failed_role_name,
+                }
+            metrics_with_issues = dict(metrics)
+            metrics_with_issues["issues"] = issues
+            profile_gate = derive_profile_gate_summary(raw_global_review, metrics_with_issues)
             rows.append(
                 {
                     "cycle": item.cycle,
@@ -1184,6 +1239,11 @@ class RunIndexService:
                     "outcome": item.outcome,
                     "workflow_mode": item.workflow_mode,
                     "global_passed": item.global_passed,
+                    "global_feedback_preview": str(raw_global_review.get("feedback_preview") or metrics.get("global_feedback_preview") or ""),
+                    "global_advisor_total": int(profile_gate.get("total_advisor_count") or 0),
+                    "global_advisor_passed": int(profile_gate.get("passed_advisor_count") or 0),
+                    "global_aggregate_status": str(raw_global_review.get("aggregate_status") or ""),
+                    "profile_gate": profile_gate,
                     "failed_advisor_id": item.failed_advisor_id,
                     "failed_role_name": item.failed_role_name,
                     "result_total": item.result_total,
@@ -1201,6 +1261,8 @@ class RunIndexService:
                     "summary_size": metrics.get("summary_size", 0),
                     "plateau_status": _load_externalized_mapping_payload(run_index.run_root_path, item.plateau_status_json),
                     "issues": issues,
+                    "new_result_count": _safe_int(raw_cycle.get("new_result_count"), len(new_results)),
+                    "new_results": new_results,
                 }
             )
         return rows
@@ -1374,6 +1436,12 @@ class RunIndexService:
                 db.commit()
                 command = cli_payload.get("command") if isinstance(cli_payload.get("command"), list) else []
                 command_display = str(cli_payload.get("command_display") or "")
+        latest_issues = _load_externalized_list_payload(run_index.run_root_path, run_index.latest_issues_json)
+        if run_index.atomic_work_path and not _run_index_is_active(run_index):
+            active_issues = load_active_issue_records_from_ledger(run_index.atomic_work_path)
+            if active_issues is not None:
+                latest_issues = active_issues
+
         payload.update(
             {
                 "config": _load_externalized_mapping_payload(run_index.run_root_path, run_index.config_json),
@@ -1382,7 +1450,7 @@ class RunIndexService:
                 "results": self._result_payloads(db, run_index),
                 "removed_results": self._removed_result_payloads(db, run_index),
                 "manifests": _load_externalized_mapping_payload(run_index.run_root_path, run_index.manifests_json),
-                "latest_issues": _load_externalized_list_payload(run_index.run_root_path, run_index.latest_issues_json),
+                "latest_issues": latest_issues,
                 "atomic_work_path": run_index.atomic_work_path or "",
                 "files": self._list_run_files_rows(db, run_index, limit=20000),
                 "sessions": self._list_run_sessions_rows(db, run_index),
@@ -1391,6 +1459,7 @@ class RunIndexService:
                 "command_display": command_display,
                 "current_step": dict(raw_summary.get("current_step") or {}),
                 "step_history": list(raw_summary.get("step_history") or []),
+                "cycle_timing": dict(raw_summary.get("cycle_timing") or {}),
                 "raw": raw_summary,
             }
         )
@@ -1417,6 +1486,26 @@ class RunIndexService:
             .order_by(RunIndexResultReview.result_file.asc(), RunIndexResultReview.advisor_id.asc())
             .all()
         )
+        metrics = _load_externalized_mapping_payload(run_index.run_root_path, cycle_row.metrics_json)
+        issues = _load_externalized_list_payload(run_index.run_root_path, cycle_row.issues_json)
+        raw_cycle = _load_externalized_json_payload(run_index.run_root_path, cycle_row.raw_json) or {}
+        new_results = raw_cycle.get("new_results") if isinstance(raw_cycle.get("new_results"), list) else None
+        if new_results is None:
+            new_results = _new_results_by_cycle_for_index(run_index).get(cycle, [])
+        raw_global_review = raw_cycle.get("global_review") if isinstance(raw_cycle.get("global_review"), dict) else {}
+        if not raw_global_review:
+            raw_global_review = {
+                "passed": cycle_row.global_passed,
+                "feedback_preview": metrics.get("global_feedback_preview", ""),
+                "issues": issues,
+                "total_advisor_count": raw_cycle.get("global_advisor_total", len(global_reviews)),
+                "passed_advisor_count": raw_cycle.get("global_advisor_passed", len([item for item in global_reviews if item.passed])),
+                "failed_advisor_id": cycle_row.failed_advisor_id,
+                "failed_role_name": cycle_row.failed_role_name,
+            }
+        metrics_with_issues = dict(metrics)
+        metrics_with_issues["issues"] = issues
+        profile_gate = derive_profile_gate_summary(raw_global_review, metrics_with_issues)
         return {
             "cycle": cycle,
             "global_reviews": [
@@ -1455,7 +1544,11 @@ class RunIndexService:
                 for item in result_reviews
             ],
             "summary_snapshot": cycle_row.summary_snapshot_text or "",
-            "metrics": _load_externalized_mapping_payload(run_index.run_root_path, cycle_row.metrics_json),
+            "metrics": metrics,
+            "global_review_summary": raw_global_review,
+            "profile_gate": profile_gate,
+            "new_result_count": _safe_int(raw_cycle.get("new_result_count"), len(new_results)),
+            "new_results": new_results,
         }
 
     def get_run_file(self, db: Session, run_index: RunIndex, path: str) -> dict[str, Any]:

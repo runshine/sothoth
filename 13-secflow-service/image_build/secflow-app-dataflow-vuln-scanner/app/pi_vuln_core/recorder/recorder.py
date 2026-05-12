@@ -28,6 +28,56 @@ def _now_iso() -> str:
     return isoformat_local(now_local()) or ""
 
 
+def _is_profile_gate_issue(issue: dict[str, Any]) -> bool:
+    issue_id = str(issue.get("id") or "").strip().upper()
+    category = str(issue.get("category") or "").strip().lower()
+    blocking_type = str(issue.get("blocking_type") or "").strip().lower()
+    return (
+        issue_id.startswith("PROFILE-")
+        or category == "coverage_gate"
+        or blocking_type
+        in {
+            "coverage_obligation_open",
+            "summary_only_evidence",
+            "coverage_ledger_under_extracted",
+            "metadata_sync",
+        }
+    )
+
+
+def _profile_gate_summary(
+    *,
+    global_passed: bool,
+    global_feedback: str,
+    advisor_results: list[dict],
+    issues: list[dict],
+) -> dict[str, Any]:
+    total_advisors = len(advisor_results)
+    passed_advisors = len([item for item in advisor_results if item.get("passed", False)])
+    advisors_all_passed = total_advisors > 0 and passed_advisors == total_advisors
+    profile_issues = [dict(item) for item in issues if _is_profile_gate_issue(item)]
+    feedback = str(global_feedback or "")
+    feedback_mentions_gate = (
+        "框架范围验收硬门槛未通过" in feedback
+        or "[profile_min_discovery_cycles]" in feedback
+        or "PROFILE-" in feedback
+        or "coverage gate" in feedback.lower()
+    )
+    failed = (not global_passed) and (bool(profile_issues) or (advisors_all_passed and feedback_mentions_gate))
+    status = "failed" if failed else "passed" if global_passed else "not_applicable"
+    return {
+        "status": status,
+        "failed": failed,
+        "passed": global_passed and not failed,
+        "advisor_all_passed": advisors_all_passed,
+        "passed_advisor_count": passed_advisors,
+        "total_advisor_count": total_advisors,
+        "feedback_preview": feedback[:500],
+        "issue_count": len(profile_issues),
+        "issues": profile_issues,
+    }
+
+
 class ExecutionRecorder:
     """
     执行记录器
@@ -353,7 +403,20 @@ class ExecutionRecorder:
         写入: _meta/review_summaries/cycle_{N}.json
         """
         advisor_results = list(global_advisor_results or [])
+        effective_issues = [dict(item) for item in (issues or [])]
         failed_advisor = next((item for item in advisor_results if not item.get("passed", True)), None)
+        profile_gate = _profile_gate_summary(
+            global_passed=global_passed,
+            global_feedback=global_feedback,
+            advisor_results=advisor_results,
+            issues=effective_issues,
+        )
+        aggregate_status = (
+            "passed" if global_passed
+            else "profile_gate_failed" if profile_gate.get("failed")
+            else "advisor_failed" if failed_advisor
+            else "global_failed"
+        )
         record = {
             "cycle": cycle,
             "timestamp": _now_iso(),
@@ -361,12 +424,14 @@ class ExecutionRecorder:
             "global_review": {
                 "passed": global_passed,
                 "feedback_preview": global_feedback[:500] if global_feedback else "",
-                "issues": issues or [],
+                "issues": effective_issues,
                 "advisor_results": advisor_results,
                 "total_advisor_count": len(advisor_results),
                 "passed_advisor_count": len([item for item in advisor_results if item.get("passed", False)]),
                 "failed_advisor_id": str(failed_advisor.get("advisor_id") or "") if failed_advisor else "",
                 "failed_role_name": str(failed_advisor.get("role_name") or "") if failed_advisor else "",
+                "aggregate_status": aggregate_status,
+                "profile_gate": profile_gate,
             },
             "result_review": {
                 "total": total_results,

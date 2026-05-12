@@ -11,7 +11,7 @@ import asyncio
 import hashlib
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
 from app.pi_vuln_core.config.models import AtomicWorkflowDef, GlobalConfig
@@ -150,6 +150,7 @@ class AtomicWorkflowEngine:
         worker_session_id: str | None = None,
         advisor_sessions: dict[str, str] | None = None,
         resume_state: str | None = None,
+        resume_cursor: dict | None = None,
     ) -> AtomicWorkflowResult:
         if total_cycle_limit <= start_cycle:
             raise ValueError(
@@ -182,6 +183,7 @@ class AtomicWorkflowEngine:
             total_cycle_limit=total_cycle_limit,
             worker_session_id=worker_session_id,
             resume_state=resume_state or "",
+            resume_cursor=resume_cursor or {},
         )
 
         try:
@@ -191,6 +193,7 @@ class AtomicWorkflowEngine:
                 start_cycle=start_cycle,
                 total_cycle_limit=total_cycle_limit,
                 resume_from_state=resume_state,
+                resume_cursor=resume_cursor,
             )
             if cycle_result is not None:
                 result = cycle_result
@@ -446,6 +449,7 @@ class AtomicWorkflowEngine:
         start_cycle: int,
         total_cycle_limit: int,
         resume_from_state: str | None = None,
+        resume_cursor: dict | None = None,
     ) -> AtomicWorkflowResult | None:
         work_dir = ctx.working_dir
         cycle_metrics_history: list[dict] = []
@@ -468,15 +472,33 @@ class AtomicWorkflowEngine:
         normalized_resume_state = (resume_from_state or "").strip()
         if normalized_resume_state not in phase_order:
             normalized_resume_state = AtomicWorkflowState.WORKER.value
+        cursor_cycle = 0
+        cursor_phase = ""
+        if isinstance(resume_cursor, dict):
+            try:
+                cursor_cycle = int(resume_cursor.get("cycle") or 0)
+            except (TypeError, ValueError):
+                cursor_cycle = 0
+            cursor_phase = str(resume_cursor.get("phase") or "").strip()
+            if cursor_phase not in phase_order:
+                cursor_phase = ""
 
         for cycle in range(start_cycle + 1, total_cycle_limit + 1):
             ctx.cycle = cycle
             review_state.workflow_mode = ctx.review_mode
             vlog.cycle_start(cycle, total_cycle_limit)
 
+            active_resume_cursor = (
+                resume_cursor
+                if cursor_cycle == cycle and cursor_phase
+                else None
+            )
             cycle_resume_state = (
-                normalized_resume_state
-                if cycle == start_cycle + 1 else AtomicWorkflowState.WORKER.value
+                cursor_phase
+                if active_resume_cursor is not None
+                else normalized_resume_state
+                if cycle == start_cycle + 1
+                else AtomicWorkflowState.WORKER.value
             )
             resume_index = phase_order.get(cycle_resume_state, 0)
             skip_worker = resume_index > phase_order[AtomicWorkflowState.WORKER.value]
@@ -510,7 +532,12 @@ class AtomicWorkflowEngine:
                     detail=f"cycle={cycle},mode={ctx.review_mode}",
                 )
                 try:
-                    worker_response = await self.worker_exec.execute_worker(self.wf, ctx, review_state)
+                    worker_response = await self.worker_exec.execute_worker(
+                        self.wf,
+                        ctx,
+                        review_state,
+                        resume_cursor=active_resume_cursor,
+                    )
                 except WorkerStageError as exc:
                     return await self._fail_worker_stage(
                         ctx=ctx,
@@ -544,7 +571,12 @@ class AtomicWorkflowEngine:
                 for i, r in enumerate(self.wf.roles.worker.prompts.reflection):
                     vlog.reflection_start(i + 1, r.id)
                 try:
-                    await self.worker_exec.execute_reflection(self.wf, ctx, review_state)
+                    await self.worker_exec.execute_reflection(
+                        self.wf,
+                        ctx,
+                        review_state,
+                        resume_cursor=active_resume_cursor,
+                    )
                 except WorkerStageError as exc:
                     return await self._fail_worker_stage(
                         ctx=ctx,
@@ -582,6 +614,7 @@ class AtomicWorkflowEngine:
                         self.wf,
                         ctx,
                         review_state,
+                        resume_cursor=active_resume_cursor,
                     )
                 except WorkerStageError as exc:
                     return await self._fail_worker_stage(
@@ -687,6 +720,7 @@ class AtomicWorkflowEngine:
                     review_state=review_state,
                     advisor_sessions=ctx.advisor_sessions,
                     engine_config=self.wf.engine,
+                    resume_cursor=active_resume_cursor,
                 )
             else:
                 existing_global_records = review_state.get_global_review_records(cycle)
@@ -711,6 +745,7 @@ class AtomicWorkflowEngine:
                         review_state=review_state,
                         advisor_sessions=ctx.advisor_sessions,
                         engine_config=self.wf.engine,
+                        resume_cursor=active_resume_cursor,
                     )
 
             global_cycle_records = review_state.get_global_review_records(cycle)
@@ -759,6 +794,7 @@ class AtomicWorkflowEngine:
                     parallel=self.global_cfg.parallel_result_review,
                     concurrency_limit=self.global_cfg.parallel_result_review_limit,
                     advisor_sessions=ctx.advisor_sessions,
+                    resume_cursor=active_resume_cursor,
                 )
             except ResultReviewFrameworkError as exc:
                 error = f"结果评审框架错误：{exc}"
@@ -853,6 +889,9 @@ class AtomicWorkflowEngine:
                 plateau_status=plateau_status,
             )
             self._write_issue_ledger(work_dir=work_dir, review_state=review_state)
+            summary_issues = review_state.get_current_issue_records()
+            if not summary_issues:
+                summary_issues = review_state.get_recent_issues(last_n=1)
 
             await self.recorder.record_review_cycle_summary(
                 work_dir=work_dir,
@@ -863,7 +902,7 @@ class AtomicWorkflowEngine:
                 passed_results=passed_files,
                 failed_results=failed_dicts,
                 workflow_mode=ctx.review_mode,
-                issues=review_state.get_recent_issues(last_n=1),
+                issues=summary_issues,
                 plateau_status=plateau_status,
                 global_advisor_results=global_advisor_results,
             )
@@ -1012,7 +1051,9 @@ class AtomicWorkflowEngine:
             except OSError:
                 summary_size = 0
 
-        recent_issues = review_state.get_recent_issues(last_n=1)
+        current_issues = review_state.get_current_issue_records()
+        if not current_issues:
+            current_issues = review_state.get_recent_issues(last_n=1)
         current_failed_files = [item.filename for item in failed_items]
         unreviewed_new_results = [
             name for name in all_results
@@ -1033,8 +1074,11 @@ class AtomicWorkflowEngine:
             "scores": dict(review_state.last_global_scores or {}),
             "global_scores": dict(review_state.last_global_scores or {}),
             "global_failure_scope": self._classify_global_failure_scope(review_state),
-            "issue_count": len(recent_issues),
-            "issue_ids": [item.get("detail", "")[:80] for item in recent_issues],
+            "issue_count": len(current_issues),
+            "issue_ids": [
+                str(item.get("id") or item.get("detail") or item.get("required_action") or "")[:80]
+                for item in current_issues
+            ],
             "total_results": len(all_results),
             "passed_result_count": len(passed_files),
             "failed_result_count": failed_count,
@@ -1055,7 +1099,9 @@ class AtomicWorkflowEngine:
 
     @staticmethod
     def _classify_global_failure_scope(review_state: ReviewState) -> str:
-        issues = review_state.get_recent_issues(last_n=1)
+        issues = review_state.get_current_issue_records()
+        if not issues:
+            issues = review_state.get_recent_issues(last_n=1)
         if not issues:
             scores = review_state.last_global_scores or {}
             if scores and all(

@@ -388,6 +388,7 @@ class RunDetailResponse(RunSummaryResponse):
     command_display: str = ""
     current_step: Dict[str, Any] = Field(default_factory=dict)
     step_history: List[Dict[str, Any]] = Field(default_factory=list)
+    cycle_timing: Dict[str, Any] = Field(default_factory=dict)
     raw: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -395,8 +396,12 @@ class RunCycleResponse(BaseModel):
     cycle: int
     global_reviews: List[Dict[str, Any]] = Field(default_factory=list)
     result_reviews: List[Dict[str, Any]] = Field(default_factory=list)
+    new_result_count: int = 0
+    new_results: List[Dict[str, Any]] = Field(default_factory=list)
     summary_snapshot: str = ""
     metrics: Dict[str, Any] = Field(default_factory=dict)
+    global_review_summary: Dict[str, Any] = Field(default_factory=dict)
+    profile_gate: Dict[str, Any] = Field(default_factory=dict)
 
 
 class RunFileContentResponse(BaseModel):

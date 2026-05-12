@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import os
 import posixpath
 import re
@@ -56,7 +57,11 @@ from app.schemas import (
 )
 from app.services.fileserver_client import get_fileserver_client
 from app.services.llm_provider_sync import sync_providers_to_pi
-from app.services.run_index_service import _load_externalized_json_payload, get_run_index_service
+from app.services.run_index_service import (
+    _load_externalized_json_payload,
+    _load_externalized_mapping_payload,
+    get_run_index_service,
+)
 from app.services.pi_vuln_adapter import (
     DbExecutionObserver,
     DbExecutionRecorder,
@@ -66,6 +71,9 @@ from app.services.pi_vuln_adapter import (
 from app.services.vuln_reporter import get_task_vuln_report_status, get_vuln_report_service
 from app.services.workflow_service import get_workflow_service
 from app.time_utils import UTC_PLUS_8, isoformat_local, now_local
+
+
+logger = logging.getLogger("dataflow_vuln.execution")
 
 
 def _new_id(prefix: str) -> str:
@@ -326,7 +334,10 @@ class ExecutionService:
                         .first()
                     )
                 if lightweight_run_index is not None:
-                    config_json = dict(lightweight_run_index.config_json or {})
+                    config_json = _load_externalized_mapping_payload(
+                        lightweight_run_index.run_root_path,
+                        lightweight_run_index.config_json,
+                    )
                     review_profile = str(config_json.get("review_profile") or "")
                     for workflow in ((config_json.get("workflows") or {}).get("atomic") or []):
                         if not isinstance(workflow, dict):
@@ -615,6 +626,35 @@ class ExecutionService:
         if return_code is not None:
             payload["return_code"] = return_code
         write_json(Path(execution.workspace_root) / "run" / "_meta" / "process.json", payload)
+
+    def _try_write_cli_process_file(
+        self,
+        *,
+        execution: WorkflowExecution,
+        trigger: TriggerTask,
+        cmd: list[str],
+        process: subprocess.Popen,
+        status_text: str,
+        return_code: int | None = None,
+    ) -> bool:
+        try:
+            self._write_cli_process_file(
+                execution=execution,
+                trigger=trigger,
+                cmd=cmd,
+                process=process,
+                status_text=status_text,
+                return_code=return_code,
+            )
+            return True
+        except OSError as exc:
+            logger.warning(
+                "run process metadata write failed; child process will continue: execution_id=%s status=%s error=%s",
+                execution.id,
+                status_text,
+                exc,
+            )
+            return False
 
     def _resume_command_payload_from_plan(self, *, plan: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
         argv, _ = self._build_dataflow_cli_argv(
@@ -2484,6 +2524,15 @@ class ExecutionService:
                 checkpoint_phase=plan.checkpoint_phase,
                 checkpoint_step_key=plan.checkpoint_step_key,
                 checkpoint_status=plan.checkpoint_status,
+                resume_cursor=plan.resume_cursor,
+                resume_start_cycle=plan.resume_start_cycle,
+                resume_target_node={
+                    "cycle": int((plan.resume_cursor or {}).get("cycle") or 0),
+                    "phase": plan.resume_target_phase,
+                    "step_key": plan.resume_target_step_key,
+                    "node_kind": str((plan.resume_cursor or {}).get("node_kind") or ""),
+                } if plan.resume_target_phase else None,
+                node_resume_policy=plan.node_resume_policy,
                 model_display=launcher._format_model_display(display_model),  # type: ignore[attr-defined]
                 thinking=display_thinking,
                 task_file=plan.task_file,
@@ -2495,7 +2544,16 @@ class ExecutionService:
                 "current_status": plan.current_status,
                 "completed_cycles": plan.completed_cycles,
                 "extra_cycles": payload.extra_cycles,
-                "resume_total_cycle_limit": plan.completed_cycles + payload.extra_cycles,
+                "resume_start_cycle": plan.resume_start_cycle,
+                "resume_total_cycle_limit": max(plan.completed_cycles, plan.resume_start_cycle) + payload.extra_cycles,
+                "resume_cursor": plan.resume_cursor,
+                "resume_target_node": {
+                    "cycle": int((plan.resume_cursor or {}).get("cycle") or 0),
+                    "phase": plan.resume_target_phase,
+                    "step_key": plan.resume_target_step_key,
+                    "node_kind": str((plan.resume_cursor or {}).get("node_kind") or ""),
+                } if plan.resume_target_phase else None,
+                "node_resume_policy": plan.node_resume_policy,
             }
         except HTTPException:
             raise
@@ -3071,7 +3129,7 @@ class ExecutionService:
         execution.process_finished_at = None
         db.add(execution)
         db.commit()
-        self._write_cli_process_file(
+        self._try_write_cli_process_file(
             execution=execution,
             trigger=trigger,
             cmd=cmd,
@@ -3093,7 +3151,7 @@ class ExecutionService:
         try:
             while process.poll() is None:
                 time.sleep(max(1, int(get_config().service.execution_cancel_check_interval_seconds)))
-                self._write_cli_process_file(
+                self._try_write_cli_process_file(
                     execution=execution,
                     trigger=trigger,
                     cmd=cmd,
@@ -3106,7 +3164,7 @@ class ExecutionService:
                     execution.process_status = "delete_requested" if execution.status == "delete_requested" or trigger.status == "delete_requested" else "stop_requested"
                     db.add(execution)
                     db.commit()
-                    self._write_cli_process_file(
+                    self._try_write_cli_process_file(
                         execution=execution,
                         trigger=trigger,
                         cmd=cmd,
@@ -3136,7 +3194,7 @@ class ExecutionService:
                 execution.process_finished_at = now_local()
                 db.add(execution)
                 db.commit()
-                self._write_cli_process_file(
+                self._try_write_cli_process_file(
                     execution=execution,
                     trigger=trigger,
                     cmd=cmd,

@@ -12,13 +12,18 @@ from __future__ import annotations
 import inspect
 import hashlib
 import os
+import re
 from pathlib import Path
 from typing import Any, Optional
 
 from app.pi_vuln_core.agents.models import AgentResponse
 from app.pi_vuln_core.agents.registry import AgentRuntimeRegistry
 from app.pi_vuln_core.config.models import AtomicWorkflowDef
-from app.pi_vuln_core.engine.checkpoint import record_step_checkpoint
+from app.pi_vuln_core.engine.checkpoint import (
+    is_terminal_checkpoint,
+    load_step_checkpoint,
+    record_step_checkpoint,
+)
 from app.pi_vuln_core.engine.models import WorkflowContext
 from app.pi_vuln_core.recorder.recorder import ExecutionRecorder
 from app.pi_vuln_core.review.previous_limitations import (
@@ -61,6 +66,29 @@ class WorkerStageError(RuntimeError):
 class WorkerExecutor:
     """Worker 执行器"""
 
+    REWORK_STAGE_DEFS = (
+        {
+            "id": "triage",
+            "step_key": "worker::rework_triage",
+            "prompt_filename": "worker_rework_triage.md",
+        },
+        {
+            "id": "false_positive_repair",
+            "step_key": "worker::rework_fp_repair",
+            "prompt_filename": "worker_rework_fp_repair.md",
+        },
+        {
+            "id": "missed_vuln_hunting",
+            "step_key": "worker::rework_missed_hunt",
+            "prompt_filename": "worker_rework_missed_hunt.md",
+        },
+        {
+            "id": "closure_handoff",
+            "step_key": "worker::rework_handoff",
+            "prompt_filename": "worker_rework_handoff.md",
+        },
+    )
+
     def __init__(
         self,
         agent_registry: AgentRuntimeRegistry,
@@ -74,6 +102,7 @@ class WorkerExecutor:
         wf_def: AtomicWorkflowDef,
         ctx: WorkflowContext,
         review_state: ReviewState,
+        resume_cursor: dict[str, Any] | None = None,
     ) -> AgentResponse:
         """
         Worker 阶段 (R6c)
@@ -95,6 +124,90 @@ class WorkerExecutor:
             review_state,
             current_result_files=current_result_files,
         )
+
+        if uses_rework_prompt and self._has_staged_rework_prompts(wf_def):
+            legacy_checkpoint = load_step_checkpoint(
+                ctx.working_dir,
+                cycle=ctx.cycle,
+                phase="worker",
+                step_key="worker::rework",
+            )
+            if self._can_skip_worker_node(legacy_checkpoint, "rework"):
+                logger.info(
+                    "resume_skip_legacy_worker_rework_node",
+                    workflow_id=ctx.workflow_id,
+                    task_id=ctx.task_id,
+                    cycle=ctx.cycle,
+                    checkpoint_status=legacy_checkpoint.get("status"),
+                )
+                metadata = {
+                    "worker_prompt_kind": "rework",
+                    "skip_reflection_after_worker": True,
+                    "resume_skipped": True,
+                    "resume_cursor": resume_cursor or {},
+                    "resume_checkpoint": legacy_checkpoint,
+                }
+                if str(legacy_checkpoint.get("status") or "") == "partial_salvaged":
+                    metadata["partial_salvaged"] = True
+                return AgentResponse(
+                    content="",
+                    conversation_id=session_id,
+                    turn_count=0,
+                    finished=True,
+                    metadata=metadata,
+                )
+
+            system_prompt = self._build_worker_system_prompt(
+                worker_cfg.prompts.work.system_prompt_file,
+                ctx,
+            )
+            try:
+                return await self._execute_rework_sequence(
+                    wf_def=wf_def,
+                    ctx=ctx,
+                    review_state=review_state,
+                    agent=agent,
+                    session_id=session_id,
+                    system_prompt=system_prompt,
+                    resume_cursor=resume_cursor,
+                )
+            except TemplateRenderError as exc:
+                raise WorkerStageError("worker", f"Rework prompt 渲染失败：{exc}") from exc
+
+        worker_prompt_kind = "rework" if uses_rework_prompt else "initial"
+        worker_step_key = "worker::rework" if uses_rework_prompt else "worker::work"
+
+        existing_checkpoint = load_step_checkpoint(
+            ctx.working_dir,
+            cycle=ctx.cycle,
+            phase="worker",
+            step_key=worker_step_key,
+        )
+        if self._can_skip_worker_node(existing_checkpoint, worker_prompt_kind):
+            logger.info(
+                "resume_skip_worker_node",
+                workflow_id=ctx.workflow_id,
+                task_id=ctx.task_id,
+                cycle=ctx.cycle,
+                step_key=worker_step_key,
+                checkpoint_status=existing_checkpoint.get("status"),
+            )
+            metadata = {
+                "worker_prompt_kind": worker_prompt_kind,
+                "skip_reflection_after_worker": uses_rework_prompt,
+                "resume_skipped": True,
+                "resume_cursor": resume_cursor or {},
+                "resume_checkpoint": existing_checkpoint,
+            }
+            if str(existing_checkpoint.get("status") or "") == "partial_salvaged":
+                metadata["partial_salvaged"] = True
+            return AgentResponse(
+                content="",
+                conversation_id=session_id,
+                turn_count=0,
+                finished=True,
+                metadata=metadata,
+            )
 
         # 构建 prompt
         system_prompt = self._build_worker_system_prompt(
@@ -120,10 +233,11 @@ class WorkerExecutor:
             ctx.working_dir,
             cycle=ctx.cycle,
             phase="worker",
-            step_key="worker",
+            step_key=worker_step_key,
             status="started",
             agent_id=worker_cfg.agent_id,
             session_id=session_id,
+            extra={"prompt_kind": worker_prompt_kind},
         )
 
         # 多轮执行
@@ -155,12 +269,12 @@ class WorkerExecutor:
                     ctx.working_dir,
                     cycle=ctx.cycle,
                     phase="worker",
-                    step_key="worker",
+                    step_key=worker_step_key,
                     status="partial_salvaged",
                     agent_id=worker_cfg.agent_id,
                     session_id=session_id,
                     detail=error,
-                    extra={"turn_count": response.turn_count},
+                    extra={"turn_count": response.turn_count, "prompt_kind": worker_prompt_kind},
                 )
                 logger.warning(
                     "worker_turn_limit_partial_salvaged",
@@ -193,12 +307,12 @@ class WorkerExecutor:
                 ctx.working_dir,
                 cycle=ctx.cycle,
                 phase="worker",
-                step_key="worker",
+                step_key=worker_step_key,
                 status="failed",
                 agent_id=worker_cfg.agent_id,
                 session_id=session_id,
                 detail=error,
-                extra={"turn_count": response.turn_count},
+                extra={"turn_count": response.turn_count, "prompt_kind": worker_prompt_kind},
             )
             logger.error(
                 "worker_execute_error",
@@ -213,7 +327,7 @@ class WorkerExecutor:
             ctx.working_dir,
             cycle=ctx.cycle,
             phase="worker",
-            step_key="worker",
+            step_key=worker_step_key,
             status="completed",
             agent_id=worker_cfg.agent_id,
             session_id=session_id,
@@ -230,6 +344,336 @@ class WorkerExecutor:
                      turns=response.turn_count,
                      internal_turns=response.metadata.get("internal_turn_count"),
                      finished=response.finished)
+        return response
+
+    @staticmethod
+    def _can_skip_worker_node(
+        checkpoint: dict[str, Any] | None,
+        worker_prompt_kind: str,
+    ) -> bool:
+        if not is_terminal_checkpoint(checkpoint):
+            return False
+        step_key = str((checkpoint or {}).get("step_key") or "").strip()
+        if step_key != "worker":
+            return True
+        extra = checkpoint.get("extra") if isinstance(checkpoint.get("extra"), dict) else {}
+        recorded_kind = str(
+            extra.get("prompt_kind")
+            or extra.get("worker_prompt_kind")
+            or ""
+        ).strip().lower()
+        # Legacy worker checkpoints may not have a prompt kind. Treat them as
+        # compatible so old histories keep their previous resume behavior.
+        return not recorded_kind or recorded_kind == worker_prompt_kind
+
+    @classmethod
+    def _staged_rework_prompt_files(cls, wf_def: AtomicWorkflowDef) -> list[dict[str, str]]:
+        rework_prompt_file = getattr(
+            wf_def.roles.worker.prompts.work,
+            "rework_prompt_file",
+            None,
+        )
+        if not rework_prompt_file:
+            return []
+        base_path = Path(rework_prompt_file)
+        stages: list[dict[str, str]] = []
+        for item in cls.REWORK_STAGE_DEFS:
+            prompt_file = str(base_path.with_name(str(item["prompt_filename"])))
+            if not os.path.isfile(prompt_file):
+                return []
+            stages.append({
+                "id": str(item["id"]),
+                "step_key": str(item["step_key"]),
+                "prompt_file": prompt_file,
+            })
+        return stages
+
+    @classmethod
+    def _has_staged_rework_prompts(cls, wf_def: AtomicWorkflowDef) -> bool:
+        return bool(cls._staged_rework_prompt_files(wf_def))
+
+    async def _execute_rework_sequence(
+        self,
+        *,
+        wf_def: AtomicWorkflowDef,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        agent,
+        session_id: str,
+        system_prompt: str,
+        resume_cursor: dict[str, Any] | None = None,
+    ) -> AgentResponse:
+        self._prepare_rework_context(ctx, review_state)
+        worker_cfg = wf_def.roles.worker
+        stages = self._staged_rework_prompt_files(wf_def)
+        max_turns = self._effective_worker_max_turns(wf_def, ctx)
+        responses: list[AgentResponse] = []
+        skipped: list[str] = []
+        partial_salvaged = False
+
+        logger.info(
+            "worker_rework_sequence_start",
+            workflow_id=ctx.workflow_id,
+            task_id=ctx.task_id,
+            cycle=ctx.cycle,
+            session_id=session_id,
+            stages=[item["id"] for item in stages],
+        )
+
+        for index, stage in enumerate(stages):
+            step_key = stage["step_key"]
+            existing_checkpoint = load_step_checkpoint(
+                ctx.working_dir,
+                cycle=ctx.cycle,
+                phase="worker",
+                step_key=step_key,
+            )
+            if self._can_skip_worker_node(existing_checkpoint, "rework"):
+                skipped.append(stage["id"])
+                logger.info(
+                    "resume_skip_worker_rework_subnode",
+                    workflow_id=ctx.workflow_id,
+                    task_id=ctx.task_id,
+                    cycle=ctx.cycle,
+                    step_key=step_key,
+                    checkpoint_status=existing_checkpoint.get("status"),
+                )
+                if str(existing_checkpoint.get("status") or "") == "partial_salvaged":
+                    partial_salvaged = True
+                continue
+
+            prompt = self._build_rework_stage_prompt(
+                ctx=ctx,
+                review_state=review_state,
+                prompt_file=stage["prompt_file"],
+            )
+            response = await self._execute_rework_subnode(
+                ctx=ctx,
+                agent=agent,
+                agent_id=worker_cfg.agent_id,
+                session_id=session_id,
+                stage_id=stage["id"],
+                step_key=step_key,
+                prompt=prompt,
+                system_prompt=system_prompt if index == 0 else "",
+                max_turns=max_turns,
+            )
+            partial_salvaged = partial_salvaged or bool(
+                (response.metadata or {}).get("partial_salvaged")
+            )
+            responses.append(response)
+
+        total_turns = max((int(response.turn_count or 0) for response in responses), default=0)
+        if responses:
+            final_response = responses[-1]
+            content = final_response.content
+            token_usage = dict(final_response.token_usage or {})
+            raw_response = final_response.raw_response
+            tool_outputs = [
+                output
+                for response in responses
+                for output in (response.tool_outputs or [])
+            ]
+            files_created = [
+                path
+                for response in responses
+                for path in (response.files_created or [])
+            ]
+            files_modified = [
+                path
+                for response in responses
+                for path in (response.files_modified or [])
+            ]
+        else:
+            content = ""
+            token_usage = {}
+            raw_response = None
+            tool_outputs = []
+            files_created = []
+            files_modified = []
+
+        metadata = {
+            "worker_prompt_kind": "rework",
+            "skip_reflection_after_worker": True,
+            "rework_sequence": True,
+            "rework_stages": [item["id"] for item in stages],
+            "rework_skipped_stages": skipped,
+            "resume_cursor": resume_cursor or {},
+        }
+        if partial_salvaged:
+            metadata["partial_salvaged"] = True
+
+        logger.info(
+            "worker_rework_sequence_done",
+            workflow_id=ctx.workflow_id,
+            task_id=ctx.task_id,
+            cycle=ctx.cycle,
+            turns=total_turns,
+            skipped=skipped,
+            partial_salvaged=partial_salvaged,
+        )
+        return AgentResponse(
+            content=content,
+            tool_outputs=tool_outputs,
+            files_created=files_created,
+            files_modified=files_modified,
+            conversation_id=session_id,
+            turn_count=total_turns,
+            finished=True,
+            token_usage=token_usage,
+            raw_response=raw_response,
+            metadata=metadata,
+        )
+
+    def _build_rework_stage_prompt(
+        self,
+        *,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        prompt_file: str,
+    ) -> str:
+        sections = self._build_rework_prompt_sections(ctx, review_state)
+        return render_string(read_file(prompt_file), strict=True, **sections)
+
+    async def _execute_rework_subnode(
+        self,
+        *,
+        ctx: WorkflowContext,
+        agent,
+        agent_id: str,
+        session_id: str,
+        stage_id: str,
+        step_key: str,
+        prompt: str,
+        system_prompt: str,
+        max_turns: int,
+    ) -> AgentResponse:
+        logger.info(
+            "worker_rework_subnode_start",
+            workflow_id=ctx.workflow_id,
+            task_id=ctx.task_id,
+            cycle=ctx.cycle,
+            stage_id=stage_id,
+            step_key=step_key,
+            session_id=session_id,
+        )
+        record_step_checkpoint(
+            ctx.working_dir,
+            cycle=ctx.cycle,
+            phase="worker",
+            step_key=step_key,
+            status="started",
+            agent_id=agent_id,
+            session_id=session_id,
+            extra={"prompt_kind": "rework", "rework_stage": stage_id},
+        )
+
+        pre_worker_digest = self._worker_editable_artifact_digest(ctx)
+        if system_prompt:
+            response = await agent.multi_turn_execute(
+                system_prompt=system_prompt,
+                user_prompt=prompt,
+                working_dir=ctx.working_dir,
+                max_turns=max_turns,
+                session_id=session_id,
+            )
+        else:
+            response = await agent.send_message(
+                message=prompt,
+                session_id=session_id,
+                working_dir=ctx.working_dir,
+            )
+        response.metadata = dict(response.metadata or {})
+        response.metadata.update({
+            "worker_prompt_kind": "rework",
+            "rework_stage": stage_id,
+            "skip_reflection_after_worker": True,
+        })
+
+        self._relocate_misplaced_outputs(ctx, response.turn_count)
+
+        if not response.success or not response.finished:
+            error = response.error or f"Worker rework subnode {stage_id} 未完成"
+            if self._can_salvage_worker_turn_limit(
+                ctx=ctx,
+                response=response,
+                pre_worker_digest=pre_worker_digest,
+            ):
+                record_step_checkpoint(
+                    ctx.working_dir,
+                    cycle=ctx.cycle,
+                    phase="worker",
+                    step_key=step_key,
+                    status="partial_salvaged",
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    detail=error,
+                    extra={
+                        "turn_count": response.turn_count,
+                        "prompt_kind": "rework",
+                        "rework_stage": stage_id,
+                    },
+                )
+                metadata = dict(response.metadata or {})
+                metadata.update({
+                    "partial_salvaged": True,
+                    "salvage_reason": "runtime_turn_limit_with_artifact_changes",
+                    "original_error": error,
+                    "original_error_code": response.error_code,
+                })
+                response.metadata = metadata
+                return response
+            record_step_checkpoint(
+                ctx.working_dir,
+                cycle=ctx.cycle,
+                phase="worker",
+                step_key=step_key,
+                status="failed",
+                agent_id=agent_id,
+                session_id=session_id,
+                detail=error,
+                extra={
+                    "turn_count": response.turn_count,
+                    "prompt_kind": "rework",
+                    "rework_stage": stage_id,
+                },
+            )
+            logger.error(
+                "worker_rework_subnode_error",
+                workflow_id=ctx.workflow_id,
+                task_id=ctx.task_id,
+                cycle=ctx.cycle,
+                stage_id=stage_id,
+                error=error,
+                turns=response.turn_count,
+                finished=response.finished,
+            )
+            raise WorkerStageError("worker", error, response)
+
+        record_step_checkpoint(
+            ctx.working_dir,
+            cycle=ctx.cycle,
+            phase="worker",
+            step_key=step_key,
+            status="completed",
+            agent_id=agent_id,
+            session_id=session_id,
+            extra={
+                "turn_count": response.turn_count,
+                "prompt_kind": "rework",
+                "rework_stage": stage_id,
+                "internal_turn_count": response.metadata.get("internal_turn_count"),
+                "event_total_count": response.metadata.get("event_total_count"),
+            },
+        )
+        logger.info(
+            "worker_rework_subnode_done",
+            workflow_id=ctx.workflow_id,
+            task_id=ctx.task_id,
+            cycle=ctx.cycle,
+            stage_id=stage_id,
+            turns=response.turn_count,
+        )
         return response
 
     def _can_salvage_worker_turn_limit(
@@ -884,6 +1328,7 @@ class WorkerExecutor:
             and summary_or_ledger_rework
         )
         result_repair_only = bool(failed_files)
+        policy = get_review_profile_policy(ctx.review_profile)
         repeated_issue_summary = review_state.format_issue_ledger_summary(
             min_consecutive=2,
             max_items=5,
@@ -915,8 +1360,17 @@ class WorkerExecutor:
                 open_backlog,
             ])
 
+        active_entries = review_state.get_active_issue_entries(include_framework=False)
+        worker_issue_entries, summary_handoff_entries = self._split_rework_issue_entries(active_entries)
+        coverage_targets = self._select_rework_coverage_targets(
+            ctx=ctx,
+            max_items=self._rework_coverage_target_limit(
+                policy.name,
+                summary_repair_only=summary_repair_only,
+            ),
+        )
+
         if summary_repair_only:
-            policy = get_review_profile_policy(ctx.review_profile)
             summary_repair_limits = {"fast": 6, "balanced": 12, "strict": 20, "audit": 32}
             coverage_max_open = summary_repair_limits.get(policy.name, 12)
         else:
@@ -959,6 +1413,9 @@ class WorkerExecutor:
             ctx=ctx,
             review_state=review_state,
             issue_closure_file=issue_closure_file,
+            failed_files=failed_files,
+            worker_issue_entries=worker_issue_entries,
+            coverage_targets=coverage_targets,
         )
         return {
             "cycle": str(ctx.cycle),
@@ -970,7 +1427,15 @@ class WorkerExecutor:
             "previous_limitations_file": previous_limitations_file,
             "results_dir": results_dir,
             "supporting_docs_dir": supporting_docs_dir,
+            "rework_session_context": self._build_rework_session_context(ctx, review_state),
             "rework_recovery_context": self._build_rework_recovery_context(ctx, review_state),
+            "required_read_files": self._build_rework_required_read_files(
+                ctx=ctx,
+                failed_files=failed_files,
+                worker_issue_entries=worker_issue_entries,
+                summary_handoff_entries=summary_handoff_entries,
+                coverage_targets=coverage_targets,
+            ),
             "review_delta_text": self._build_review_delta_text(
                 ctx=ctx,
                 review_state=review_state,
@@ -981,15 +1446,44 @@ class WorkerExecutor:
             "repeated_issue_summary": repeated_issue_summary_text,
             "active_issue_backlog": active_issue_backlog,
             "coverage_context": coverage_context,
+            "completeness_rework_plan": self._build_advisor_driven_rework_plan(
+                review_state=review_state,
+                advisor_tokens=("global_completeness", "completeness", "全面"),
+                plan_kind="completeness",
+            ),
+            "depth_rework_plan": self._build_advisor_driven_rework_plan(
+                review_state=review_state,
+                advisor_tokens=("global_depth", "depth", "深入"),
+                plan_kind="depth",
+            ),
+            "result_repair_plan": self._build_result_repair_plan(
+                ctx=ctx,
+                review_state=review_state,
+                failed_files=failed_files,
+            ),
+            "coverage_hypothesis_queue": self._build_coverage_hypothesis_queue(
+                worker_issue_entries=worker_issue_entries,
+                coverage_targets=coverage_targets,
+            ),
+            "rework_priority_queue": self._build_rework_priority_queue(
+                ctx=ctx,
+                review_state=review_state,
+                failed_files=failed_files,
+                worker_issue_entries=worker_issue_entries,
+                coverage_targets=coverage_targets,
+            ),
+            "summary_handoff_queue": self._build_summary_handoff_queue(summary_handoff_entries),
             "failed_result_reasons": failed_result_reasons,
             "output_contract_text": self._build_worker_output_contract_text(ctx),
-            "result_report_template": self._result_report_template(),
+            "result_report_template": self._result_report_template(compact=True),
             "issue_closure_file": issue_closure_file,
             "issue_closure_template": issue_closure_template,
             "rework_scope_policy": self._build_rework_scope_policy(
                 summary_repair_only=summary_repair_only,
                 result_repair_only=result_repair_only,
                 is_closure=is_closure,
+                worker_issue_count=len(worker_issue_entries),
+                coverage_target_count=len(coverage_targets),
             ),
             "numbering_rules": numbering_rules,
             "convergence_requirements": convergence_requirements,
@@ -999,35 +1493,460 @@ class WorkerExecutor:
         }
 
     @staticmethod
+    def _record_matches_advisor(
+        record: Any,
+        advisor_tokens: tuple[str, ...],
+    ) -> bool:
+        haystack = " ".join([
+            str(getattr(record, "advisor_id", "") or ""),
+            str(getattr(record, "role_name", "") or ""),
+        ]).strip().lower()
+        return any(str(token).lower() in haystack for token in advisor_tokens)
+
+    def _build_advisor_driven_rework_plan(
+        self,
+        *,
+        review_state: ReviewState,
+        advisor_tokens: tuple[str, ...],
+        plan_kind: str,
+    ) -> str:
+        records = [
+            record for record in reversed(review_state.global_review_history)
+            if self._record_matches_advisor(record, advisor_tokens)
+        ][:2]
+        if not records:
+            if plan_kind == "completeness":
+                return "\n".join([
+                    "- 当前没有可识别的全面性评审记录。",
+                    "- 若本轮仍有 active worker issue 或 high/STAR coverage target，请只把它们当作高收益漏洞假设来源。",
+                ])
+            return "\n".join([
+                "- 当前没有可识别的深入性评审记录。",
+                "- 若本轮已有弱证据 result，请优先做校验绕过、边界值和攻击前提复核。",
+            ])
+
+        lines: list[str] = []
+        for record in records:
+            advisor_id = str(getattr(record, "advisor_id", "") or "global_review")
+            role_name = str(getattr(record, "role_name", "") or advisor_id)
+            status = "PASS" if bool(getattr(record, "passed", False)) else "FAIL"
+            cycle = int(getattr(record, "cycle", 0) or 0)
+            lines.append(f"### Cycle {cycle} - {advisor_id} / {role_name} ({status})")
+            scores = getattr(record, "scores", {}) or {}
+            if scores:
+                score_text = ", ".join(f"{key}={float(value):.2f}" for key, value in scores.items())
+                lines.append(f"- scores: {score_text}")
+            feedback = str(getattr(record, "feedback", "") or "").strip()
+            if feedback:
+                lines.append(f"- feedback: {self._clip_prompt_section(feedback, max_chars=1600)}")
+            issues = list(getattr(record, "issues", []) or [])
+            if issues:
+                lines.append("- advisor issues -> 本轮漏洞动作:")
+                for issue in issues[:8]:
+                    if not isinstance(issue, dict):
+                        continue
+                    issue_id = ReviewState.prompt_safe_issue_id(
+                        issue.get("id") or issue.get("issue_id") or ""
+                    ) or "(no-id)"
+                    target = str(issue.get("target") or issue.get("path") or "(未指定 target)")
+                    action = str(
+                        issue.get("required_action")
+                        or issue.get("detail")
+                        or issue.get("description")
+                        or ""
+                    ).strip()
+                    blocking_type = ReviewState.prompt_safe_blocking_type(
+                        issue.get("blocking_type") or issue.get("category") or ""
+                    )
+                    if plan_kind == "completeness":
+                        model_action = (
+                            "将该反馈转成漏报补扫假设：跟入 target 的 INPUT/EXPORT/USED/CLEANED/STAR "
+                            "路径，确认真实漏洞则新增 result，证伪则写 source_closed supporting_doc。"
+                        )
+                    else:
+                        model_action = (
+                            "将该反馈转成深挖/证伪问题：复核边界值、校验绕过、变体路径、攻击前提和 "
+                            "严重度/置信度，确认则补强或新增 result，证伪则记录 false-positive/residual。"
+                        )
+                    lines.append(
+                        f"  - `{issue_id}`: target={target}; blocking_type={blocking_type or 'unspecified'}; "
+                        f"required_action={action[:320] or '(无)'}; rework_action={model_action}"
+                    )
+            else:
+                lines.append("- 本 advisor 未返回结构化 issue；只把 feedback 中的具体路径/分数短板作为本轮假设来源。")
+        return "\n".join(lines)
+
+    def _build_result_repair_plan(
+        self,
+        *,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        failed_files: list[str],
+    ) -> str:
+        if not failed_files:
+            return "\n".join([
+                "- 当前没有 failed result；误报修复节点应快速确认无需修改结果文件。",
+                "- 不要为了填充本节点而新增弱 result；把 token 留给漏报补扫节点。",
+            ])
+
+        lines = [
+            "- failed result 必须逐个处理，不能原样保留弱报告。",
+            "- 处理结果只能是：补证确认 / 严重度或前提修正 / 拆分为新真实漏洞 / false_positive 或 withdrawn。",
+        ]
+        for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files):
+            if item.filename not in failed_files:
+                continue
+            reason = (item.reason or "").strip()
+            lines.append(
+                f"- `{item.filename}`: review_reason={reason[:520] or '(无原因)'}; "
+                "required_action=重读源码证伪，真则补强，假则撤回或标记 false_positive。"
+            )
+        return "\n".join(lines)
+
+    def _build_coverage_hypothesis_queue(
+        self,
+        *,
+        worker_issue_entries: list[dict[str, Any]],
+        coverage_targets: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            "- coverage/issue ledger 只作为漏洞假设来源，不是机械填表目标。",
+            "- 优先处理 STAR、high-risk EXPORT/USED、advisor 明确点名、靠近危险 sink 的路径。",
+        ]
+        if worker_issue_entries:
+            lines.append("### Worker-actionable issue hypotheses")
+            lines.extend(
+                self._format_issue_entry_for_prompt(item)
+                for item in worker_issue_entries[:10]
+            )
+            if len(worker_issue_entries) > 10:
+                lines.append(f"- ... 另有 {len(worker_issue_entries) - 10} 个 worker issue，低收益项本轮可不处理。")
+        if coverage_targets:
+            lines.append("### High-yield coverage hypotheses")
+            lines.extend(self._format_coverage_target_for_prompt(item) for item in coverage_targets[:16])
+            if len(coverage_targets) > 16:
+                lines.append(f"- ... 另有 {len(coverage_targets) - 16} 个 coverage target，详见 coverage ledger。")
+        if not worker_issue_entries and not coverage_targets:
+            lines.append("- 当前没有高收益 coverage/issue 假设；本轮漏报补扫应主要依据 advisor feedback。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _rework_coverage_target_limit(
+        profile_name: str,
+        *,
+        summary_repair_only: bool = False,
+    ) -> int:
+        if summary_repair_only:
+            return {"fast": 4, "balanced": 8, "audit": 12}.get(profile_name, 8)
+        return {"fast": 5, "balanced": 12, "audit": 24}.get(profile_name, 12)
+
+    @staticmethod
+    def _issue_owner(item: dict[str, Any]) -> str:
+        issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
+        return str(
+            issue.get("actionable_by")
+            or issue.get("owner")
+            or item.get("actionable_by")
+            or item.get("owner")
+            or ""
+        ).strip().lower()
+
+    @staticmethod
+    def _issue_category(item: dict[str, Any]) -> str:
+        issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
+        return str(issue.get("category") or item.get("blocking_type") or "").strip().lower()
+
+    @classmethod
+    def _split_rework_issue_entries(
+        cls,
+        entries: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        summary_owners = {"summary", "report", "ledger"}
+        summary_categories = {
+            "report_completeness",
+            "limitations_honesty",
+            "summary",
+            "ledger",
+            "metadata",
+            "metadata_sync",
+        }
+        worker_entries: list[dict[str, Any]] = []
+        summary_entries: list[dict[str, Any]] = []
+        for item in entries:
+            owner = cls._issue_owner(item)
+            category = cls._issue_category(item)
+            if owner in summary_owners or (not owner and category in summary_categories):
+                summary_entries.append(item)
+                continue
+            if owner == "framework":
+                continue
+            worker_entries.append(item)
+        return worker_entries, summary_entries
+
+    def _select_rework_coverage_targets(
+        self,
+        *,
+        ctx: WorkflowContext,
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        ledger_file = coverage_ledger_path(ctx.working_dir)
+        if not ledger_file.is_file() or max_items <= 0:
+            return []
+        try:
+            ledger = read_json(ledger_file)
+        except Exception:
+            return []
+        obligations = ledger.get("coverage_obligations") if isinstance(ledger, dict) else {}
+        open_entries = obligations.get("open_entries") if isinstance(obligations, dict) else []
+        if not isinstance(open_entries, list):
+            return []
+
+        risk_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        kind_rank = {"star": 0, "export": 1, "used": 2, "cleaned": 3, "input": 4}
+
+        def _sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
+            risk = str(item.get("risk") or "medium").strip().lower()
+            kind = str(item.get("kind") or "").strip().lower()
+            return (
+                risk_rank.get(risk, 2),
+                kind_rank.get(kind, 9),
+                str(item.get("id") or item.get("value") or ""),
+            )
+
+        candidates = [item for item in open_entries if isinstance(item, dict)]
+        candidates.sort(key=_sort_key)
+        return candidates[:max_items]
+
+    def _build_rework_session_context(
+        self,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+    ) -> str:
+        summary_path = ctx.summary_file or os.path.join(ctx.working_dir, "summary.md")
+        results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
+        supporting_docs_dir = self._supporting_docs_dir(ctx.working_dir)
+        previous_limitations_file = os.path.join(ctx.working_dir, "previous_limitations.md")
+        issue_ledger_file = os.path.join(ctx.working_dir, "_meta", "issue_ledger.json")
+        coverage_file = coverage_ledger_path(ctx.working_dir)
+        lines = [
+            "## 共享 session 增量上下文",
+            "- Worker 所有 cycle 共用同一个 session；你已经拥有前序 work / reflection / summary 对话历史。",
+            "- 本 prompt 只补充本轮新增评审差异与目标队列；如果历史上下文与本 prompt 冲突，以本 prompt 为准。",
+            f"- 当前轮次：{ctx.cycle}",
+            f"- 工作模式：{ctx.review_mode or review_state.workflow_mode}",
+            f"- 任务文件: `{ctx.task_file}`",
+            f"- 工作目录: `{ctx.working_dir}`",
+            f"- summary: `{summary_path}`（后续 summary 阶段统一改写）",
+            f"- results_dir: `{results_dir}`",
+            f"- supporting_docs_dir: `{supporting_docs_dir}`",
+            f"- previous_limitations: `{previous_limitations_file}`",
+            f"- issue ledger: `{issue_ledger_file}`",
+            f"- coverage ledger: `{coverage_file}`",
+        ]
+        if ctx.review_mode == "closure" or review_state.workflow_mode == "closure":
+            lines.append("- 当前已经进入 **closure（收敛）模式**。")
+            reason = str(getattr(review_state, "closure_reason", "") or getattr(ctx, "plateau_reason", "") or "").strip()
+            if reason:
+                lines.append(f"- closure 触发原因：{reason[:500]}")
+        return "\n".join(lines)
+
+    def _build_rework_required_read_files(
+        self,
+        *,
+        ctx: WorkflowContext,
+        failed_files: list[str],
+        worker_issue_entries: list[dict[str, Any]],
+        summary_handoff_entries: list[dict[str, Any]],
+        coverage_targets: list[dict[str, Any]],
+    ) -> str:
+        results_dir = ctx.results_dir or os.path.join(ctx.working_dir, "results")
+        issue_ledger_file = os.path.join(ctx.working_dir, "_meta", "issue_ledger.json")
+        coverage_file = str(coverage_ledger_path(ctx.working_dir))
+        required: list[str] = [ctx.task_file]
+
+        for path in (coverage_file, issue_ledger_file):
+            if os.path.isfile(path):
+                required.append(path)
+
+        for name in failed_files:
+            path = os.path.join(results_dir, name)
+            if os.path.isfile(path):
+                required.append(path)
+
+        for item in [*worker_issue_entries[:8], *summary_handoff_entries[:4]]:
+            issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
+            for value in (
+                issue.get("target"),
+                issue.get("evidence"),
+                issue.get("source_file"),
+            ):
+                required.extend(self._resolve_rework_read_paths(ctx, str(value or "").strip()))
+
+        for item in coverage_targets[:8]:
+            source_file = str(item.get("source_file") or "").strip()
+            if source_file and os.path.isfile(source_file):
+                required.append(source_file)
+
+        unique: list[str] = []
+        for path in required:
+            if path and path not in unique:
+                unique.append(path)
+
+        lines = ["## 本轮必须读取的增量文件"]
+        lines.extend(f"- `{path}`" for path in unique[:24])
+        if len(unique) > 24:
+            lines.append(f"- ... 另有 {len(unique) - 24} 个相关文件，按目标队列需要再读取。")
+        lines.append("- 不要重新通读所有历史 result/supporting_docs；只按本轮目标队列追加读取。")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _resolve_rework_read_paths(ctx: WorkflowContext, text: str) -> list[str]:
+        if not text:
+            return []
+        matches = re.findall(r"[\w./:-]+\.md", text)
+        if text.endswith(".md") and text not in matches:
+            matches.append(text)
+        candidates: list[str] = []
+        for raw in matches:
+            value = raw.strip("`'\"，,;:()[]{}")
+            if not value:
+                continue
+            path_candidates = [value]
+            if not os.path.isabs(value):
+                path_candidates.extend([
+                    os.path.join(ctx.working_dir, value),
+                    os.path.join(ctx.working_dir, "results", value),
+                    os.path.join(ctx.working_dir, "supporting_docs", value),
+                ])
+            for candidate in path_candidates:
+                if os.path.isfile(candidate):
+                    candidates.append(candidate)
+                    break
+        unique: list[str] = []
+        for path in candidates:
+            if path not in unique:
+                unique.append(path)
+        return unique
+
+    @staticmethod
+    def _format_issue_entry_for_prompt(item: dict[str, Any]) -> str:
+        issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
+        issue_id = ReviewState.prompt_safe_issue_id(
+            issue.get("id") or issue.get("issue_id") or item.get("signature") or ""
+        )
+        target = str(issue.get("target") or "(未指定 target)")
+        owner = str(issue.get("actionable_by") or item.get("actionable_by") or "worker")
+        blocking_type = ReviewState.prompt_safe_blocking_type(
+            item.get("blocking_type") or issue.get("blocking_type") or ""
+        )
+        action = str(
+            issue.get("required_action")
+            or issue.get("detail")
+            or item.get("semantic_key")
+            or ""
+        ).strip()
+        line = (
+            f"- `{issue_id or item.get('signature')}`: target={target}; "
+            f"actionable_by={owner}; blocking_type={blocking_type or 'unspecified'}"
+        )
+        if action:
+            line += f"; action={action[:260]}"
+        acceptance = str(item.get("acceptance_criteria") or issue.get("acceptance_criteria") or "").strip()
+        if acceptance:
+            line += f"; acceptance={acceptance[:220]}"
+        return line
+
+    @staticmethod
+    def _format_coverage_target_for_prompt(item: dict[str, Any]) -> str:
+        return (
+            f"- `{item.get('id')}`: kind={item.get('label') or item.get('kind')}; "
+            f"value=`{item.get('value')}`; risk={item.get('risk') or 'medium'}; "
+            "status=open"
+        )
+
+    def _build_rework_priority_queue(
+        self,
+        *,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        failed_files: list[str],
+        worker_issue_entries: list[dict[str, Any]],
+        coverage_targets: list[dict[str, Any]],
+    ) -> str:
+        lines = [
+            "## 本轮增量目标队列（按优先级执行）",
+            "- P0：未通过 result 的最小必要修复、补证、撤回或转 supporting_docs。",
+            "- P1：worker 可执行 active issues。",
+            "- P2：与本轮问题直接相关或高风险/STAR 的 open coverage obligations。",
+            "- 不在下列队列中的大量 open obligations 不要求本轮全部处理，避免把返工变成全量重扫。",
+        ]
+        if failed_files:
+            lines.extend(["", "### P0 failed results"])
+            for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files):
+                if item.filename in failed_files:
+                    lines.append(f"- `{item.filename}`: {item.reason.strip()[:360]}")
+        if worker_issue_entries:
+            lines.extend(["", "### P1 worker active issues"])
+            lines.extend(self._format_issue_entry_for_prompt(item) for item in worker_issue_entries[:12])
+            if len(worker_issue_entries) > 12:
+                lines.append(f"- ... 另有 {len(worker_issue_entries) - 12} 个 worker issue，详见 `_meta/issue_ledger.json`")
+        if coverage_targets:
+            lines.extend(["", "### P2 coverage targets"])
+            lines.extend(self._format_coverage_target_for_prompt(item) for item in coverage_targets)
+        if not failed_files and not worker_issue_entries and not coverage_targets:
+            lines.extend(["", "- 当前没有强制 Worker 返工目标；若只是 summary/ledger 同步问题，请只补充 summary 阶段需要的 supporting_docs 证据。"])
+        return "\n".join(lines)
+
+    def _build_summary_handoff_queue(self, summary_handoff_entries: list[dict[str, Any]]) -> str:
+        lines = [
+            "## Summary / Ledger handoff（非 Worker 强制闭环）",
+            "- 下列问题主要由后续 summary 阶段统一整理、同步或说明；Worker 只需补足必要证据，不要手工改 `_meta/`。",
+        ]
+        if summary_handoff_entries:
+            lines.extend(self._format_issue_entry_for_prompt(item) for item in summary_handoff_entries[:8])
+            if len(summary_handoff_entries) > 8:
+                lines.append(f"- ... 另有 {len(summary_handoff_entries) - 8} 个 summary/ledger issue，详见 `_meta/issue_ledger.json`")
+        else:
+            lines.append("- 当前没有单独的 summary/ledger handoff issue。")
+        return "\n".join(lines)
+
+    @staticmethod
     def _build_rework_scope_policy(
         *,
         summary_repair_only: bool,
         result_repair_only: bool,
         is_closure: bool,
+        worker_issue_count: int = 0,
+        coverage_target_count: int = 0,
     ) -> str:
         lines = [
             "## 返工范围硬约束",
-            "- 返工不是重新漏洞挖掘，而是基于 data-flow obligation、failed result 与 active issue 的定向闭环。",
-            "- 本轮新增探索必须至少命中以下一项：active issue、coverage ledger open obligation、failed result 补证/撤回、previous limitations residual 验证。",
+            "- 返工不是重新漏洞挖掘，而是基于本轮增量目标队列做定向闭环。",
+            "- 本轮新增探索必须至少命中以下一项：P0 failed result、P1 worker issue、P2 coverage target 或明确源码证据缺口。",
             "- 脱离 INPUT / EXPORT / USED / CLEANED / ★ 主轴的全源码发散不得写入正式结果。",
+            "- 如果历史 session 中的旧目标与本轮队列冲突，以本轮队列为准。",
         ]
         if summary_repair_only:
             lines.extend([
-                "- 本轮只修复 `summary.md`、`previous_limitations.md`、`supporting_docs/` 与覆盖/issue 映射说明。",
-                "- 禁止新增、删除、重写、重新编号 results/result_NNN.md。",
+                "- 本轮主要为 summary/ledger handoff：只补充后续 summary 阶段需要的 supporting_docs 证据。",
+                "- 禁止新增、删除、重写、重新编号 `results/result_NNN.md`；不要手工编辑 `_meta/` 下框架生成文件。",
             ])
         elif result_repair_only:
             lines.extend([
-                "- 当前为结果修复：只处理失败 result 及其直接相关源码路径。",
-                "- 新增 result 只能用于拆分独立真实漏洞或补充已证实的更高编号修正报告。",
+                "- 当前包含失败 result：先完成 P0 修复/撤回/补证，再处理 P1/P2 队列中列出的目标。",
+                "- 不要因为 ledger 中还有大量 open obligations 而全量扩张攻击面。",
+                "- 新增 result 只能用于拆分独立真实漏洞，或补充已证实的更高编号修正报告。",
             ])
         elif is_closure:
             lines.extend([
-                "- 当前为 closure：优先关闭 active issue backlog 与 high/STAR open obligations。",
+                "- 当前为 closure：优先关闭 P1 active issues 与 P2 high/STAR coverage targets。",
                 "- 若源码/外部依赖缺失，写 accepted_residual/external_blocked 与人工验收条件，不要反复写继续分析。",
             ])
         else:
             lines.append("- discovery 返工只围绕评审反馈定向扩展，不重新全量重扫。")
+        lines.append(
+            f"- 本轮队列规模：worker issues={worker_issue_count}, coverage targets={coverage_target_count}。"
+        )
         return "\n".join(lines)
 
     @staticmethod
@@ -1036,24 +1955,40 @@ class WorkerExecutor:
         ctx: WorkflowContext,
         review_state: ReviewState,
         issue_closure_file: str,
+        failed_files: list[str] | None = None,
+        worker_issue_entries: list[dict[str, Any]] | None = None,
+        coverage_targets: list[dict[str, Any]] | None = None,
     ) -> str:
-        open_backlog = review_state.get_active_issue_entries()
         issue_lines = []
-        for item in open_backlog[:20]:
-            issue_id = str(getattr(item, "issue_id", "") or getattr(item, "id", "") or "").strip()
+        for name in failed_files or []:
+            reason = ""
+            for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files):
+                if item.filename == name:
+                    reason = item.reason[:120]
+                    break
+            issue_lines.append(
+                f"| failed_result:{name} | {name} |  | 修复/撤回/补证：{reason} |  |  |"
+            )
+        for item in (worker_issue_entries or [])[:12]:
+            issue = item.get("issue") if isinstance(item.get("issue"), dict) else {}
+            issue_id = str(issue.get("id") or issue.get("issue_id") or item.get("signature") or "").strip()
             target = ""
-            issue = getattr(item, "issue", None)
-            if isinstance(issue, dict):
-                issue_id = issue_id or str(issue.get("id") or "").strip()
+            if issue:
                 target = str(issue.get("target") or "").strip()
             if issue_id:
                 safe_issue_id = ReviewState.prompt_safe_issue_id(issue_id)
                 issue_lines.append(f"| {safe_issue_id} | {target} |  |  |  |  |")
+        for item in (coverage_targets or [])[:12]:
+            obligation_id = str(item.get("id") or "").strip()
+            target = str(item.get("value") or item.get("target") or "").strip()
+            if obligation_id:
+                issue_lines.append(f"| {obligation_id} | {target} |  |  |  |  |")
         if not issue_lines:
             issue_lines.append("| <issue_id 或 obligation_id> | <目标> | <source_closed/promoted_to_result/accepted_residual/unused/not_applicable/external_blocked> | <本轮动作> | <results/... 或 supporting_docs/...> | <剩余限制> |")
         return "\n".join([
             "## issue closure 记录要求",
             f"本轮必须创建或更新：`{issue_closure_file}`",
+            "只需要覆盖本轮 P0/P1/P2 目标队列，不要求覆盖全部 open obligations。",
             "",
             "建议内容模板：",
             "",
@@ -1080,14 +2015,18 @@ class WorkerExecutor:
         lines = ["## 收敛要求"]
         if summary_repair_only:
             lines.append("- 当前已经进入 **closure（收敛）模式**。")
-            lines.append("- 本轮只修复 `summary.md`、`previous_limitations.md`、`supporting_docs/` 与 summary 阶段可影响的结果映射/覆盖账本一致性。")
+            lines.append("- 本轮只补充后续 summary 阶段需要的 `supporting_docs/` 证据与 handoff 说明。")
             lines.append("- 不要新增、删除、重写或重新编号 `results/result_NNN.md`；结果评审已经通过。")
             lines.append("- 不要手工编辑 `_meta/` 下的框架生成文件；只修正正式文档，让框架在 summary 后重新同步 manifest/ledger。")
         elif result_repair_only:
-            lines.append("- 本轮只聚焦**修复/删除未通过结果**，不要继续扩张攻击面。")
+            lines.append("- 本轮重点是**修复/删除未通过结果**：先逐个证伪 failed result，再决定补证、修正、撤回或保留。")
+            lines.append("- 当前只聚焦**修复/删除未通过结果**，不要把结果修复轮扩张成全量攻击面重扫。")
+            lines.append("- 本轮先完成 P0 未通过结果的修复/撤回/补证，再处理 P1/P2 队列中明确列出的目标。")
+            lines.append("- 不要继续扩张攻击面；只有失败结果证伪过程中发现的独立真实漏洞才允许新增报告。")
+            lines.append("- 不要继续扩张到队列之外的攻击面；未列出的 open obligations 留给后续轮次或 summary handoff。")
         elif is_closure:
             lines.append("- 当前已经进入 **closure（收敛）模式**。")
-            lines.append("- 优先关闭近期全局评审反馈指出的问题，不要继续扩张攻击面。")
+            lines.append("- 优先关闭本轮 P1/P2 队列，不要继续扩张攻击面。")
             lines.append("- 若没有新增结果，必须在 `supporting_docs/` 记录本轮深挖证据，供后续 summary 阶段统一整理。")
             if repeated_issue_summary:
                 residual_path = os.path.join(
@@ -1109,16 +2048,19 @@ class WorkerExecutor:
         lines = [
             f"# 第 {sections['cycle']} 轮评审返工",
             "",
-            sections["rework_recovery_context"],
+            sections.get("rework_session_context") or sections["rework_recovery_context"],
+            "",
+            sections.get("required_read_files", ""),
             "",
             sections["review_delta_text"],
         ]
         for key in (
             "global_review_feedback",
             "repeated_issue_summary",
-            "active_issue_backlog",
-            "coverage_context",
+            "rework_priority_queue",
+            "summary_handoff_queue",
             "failed_result_reasons",
+            "rework_scope_policy",
         ):
             if sections.get(key):
                 lines.extend(["", str(sections[key])])
@@ -1846,6 +2788,7 @@ class WorkerExecutor:
         wf_def: AtomicWorkflowDef,
         ctx: WorkflowContext,
         review_state: ReviewState | None = None,
+        resume_cursor: dict[str, Any] | None = None,
     ) -> None:
         """
         自我反思阶段 (R6d)
@@ -1895,6 +2838,25 @@ class WorkerExecutor:
             for reflect_cfg in reflection_prompts
         ]
         for i, (pass_index, reflect_cfg) in enumerate(expanded_prompts):
+            step_key = f"reflect::{reflect_cfg.id}::pass_{pass_index:02d}"
+            existing_checkpoint = load_step_checkpoint(
+                ctx.working_dir,
+                cycle=ctx.cycle,
+                phase="reflect",
+                step_key=step_key,
+            )
+            if is_terminal_checkpoint(existing_checkpoint):
+                logger.info(
+                    "resume_skip_reflection_node",
+                    round=i + 1,
+                    pass_index=pass_index,
+                    prompt_id=reflect_cfg.id,
+                    cycle=ctx.cycle,
+                    step_key=step_key,
+                    checkpoint_status=existing_checkpoint.get("status"),
+                    resume_cursor=resume_cursor or {},
+                )
+                continue
             prompt = read_file(reflect_cfg.prompt_file)
             try:
                 prompt = render_string(
@@ -1928,7 +2890,7 @@ class WorkerExecutor:
                 ctx.working_dir,
                 cycle=ctx.cycle,
                 phase="reflect",
-                step_key=f"reflect::{reflect_cfg.id}::pass_{pass_index:02d}",
+                step_key=step_key,
                 status="started",
                 agent_id=worker_cfg.agent_id,
                 session_id=ctx.worker_session_id or "",
@@ -1964,7 +2926,7 @@ class WorkerExecutor:
                     ctx.working_dir,
                     cycle=ctx.cycle,
                     phase="reflect",
-                    step_key=f"reflect::{reflect_cfg.id}::pass_{pass_index:02d}",
+                    step_key=step_key,
                     status="soft_failed",
                     agent_id=worker_cfg.agent_id,
                     session_id=ctx.worker_session_id or "",
@@ -2005,7 +2967,7 @@ class WorkerExecutor:
                 ctx.working_dir,
                 cycle=ctx.cycle,
                 phase="reflect",
-                step_key=f"reflect::{reflect_cfg.id}::pass_{pass_index:02d}",
+                step_key=step_key,
                 status="completed",
                 agent_id=worker_cfg.agent_id,
                 session_id=ctx.worker_session_id or "",
@@ -2019,6 +2981,7 @@ class WorkerExecutor:
         wf_def: AtomicWorkflowDef,
         ctx: WorkflowContext,
         review_state: ReviewState | None = None,
+        resume_cursor: dict[str, Any] | None = None,
     ) -> tuple[str, str]:
         """
         总结阶段 (R6e)
@@ -2047,6 +3010,29 @@ class WorkerExecutor:
 
         ctx.summary_file = summary_path
         ctx.results_dir = results_dir
+
+        existing_checkpoint = load_step_checkpoint(
+            ctx.working_dir,
+            cycle=ctx.cycle,
+            phase="summary",
+            step_key="summary",
+        )
+        if (
+            is_terminal_checkpoint(existing_checkpoint)
+            and os.path.isfile(summary_path)
+            and os.path.isdir(results_dir)
+        ):
+            logger.info(
+                "resume_skip_summary_node",
+                workflow_id=ctx.workflow_id,
+                task_id=ctx.task_id,
+                cycle=ctx.cycle,
+                checkpoint_status=existing_checkpoint.get("status"),
+                summary_path=summary_path,
+                results_dir=results_dir,
+                resume_cursor=resume_cursor or {},
+            )
+            return summary_path, results_dir
 
         prompt = read_file(summary_cfg.prompt_file)
         summary_state = review_state or ReviewState()

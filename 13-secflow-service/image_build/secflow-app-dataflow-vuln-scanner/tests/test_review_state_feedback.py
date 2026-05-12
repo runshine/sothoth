@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from app.pi_vuln_core.engine.atomic import AtomicWorkflowEngine
+from app.pi_vuln_core.review.global_review import GlobalReviewExecutor
 from app.pi_vuln_core.review.models import parse_review_response
 from app.pi_vuln_core.review.state import GlobalReviewRecord, ReviewState
 
@@ -204,6 +205,111 @@ def test_issue_ledger_fingerprints_repeated_semantic_issues() -> None:
     assert second["repeated_signatures"]
     snapshot = state.get_issue_ledger_snapshot()
     assert snapshot["entries"][0]["seen_count"] == 2
+
+
+def test_current_issue_records_follow_active_ledger_not_stale_history() -> None:
+    state = ReviewState()
+    stale_issue = {
+        "id": "CMP-old",
+        "category": "coverage_gap",
+        "target": "result_001.md",
+        "required_action": "旧 advisor 问题",
+        "actionable_by": "worker",
+    }
+    active_profile_issue = {
+        "id": "PROFILE-balanced-coverage-open-required",
+        "category": "coverage_gate",
+        "target": "_meta/coverage_ledger.json",
+        "required_action": "关闭当前 open obligations",
+        "actionable_by": "worker",
+        "blocking_type": "coverage_obligation_open",
+    }
+
+    state.global_review_history.append(
+        GlobalReviewRecord(
+            cycle=1,
+            advisor_id="global_completeness",
+            passed=False,
+            feedback="old failure",
+            issues=[stale_issue],
+        )
+    )
+    state.record_global_review_result(
+        cycle=1,
+        passed=False,
+        feedback="old failure",
+        issues=[stale_issue],
+    )
+    state.record_global_review_result(
+        cycle=2,
+        passed=False,
+        feedback="profile gate failed",
+        issues=[active_profile_issue],
+    )
+
+    current = state.get_current_issue_records()
+    assert [item["id"] for item in current] == ["PROFILE-balanced-coverage-open-required"]
+    assert current[0]["seen_count"] == 1
+    assert current[0]["blocking_type"] == "coverage_obligation_open"
+
+
+def test_review_feedback_snapshot_uses_active_issues_and_clears_after_pass(tmp_path) -> None:
+    state = ReviewState()
+    executor = GlobalReviewExecutor({}, object())
+    stale_issue = {
+        "id": "CMP-old",
+        "category": "coverage_gap",
+        "target": "result_001.md",
+        "required_action": "旧 advisor 问题",
+        "actionable_by": "worker",
+    }
+    active_profile_issue = {
+        "id": "PROFILE-balanced-summary-only-evidence",
+        "category": "coverage_gate",
+        "target": "_meta/coverage_ledger.json",
+        "required_action": "补充 supporting_docs 证据",
+        "actionable_by": "worker",
+        "blocking_type": "summary_only_evidence",
+    }
+
+    state.global_review_history.append(
+        GlobalReviewRecord(
+            cycle=1,
+            advisor_id="global_completeness",
+            passed=False,
+            feedback="old failure",
+            issues=[stale_issue],
+        )
+    )
+    state.record_global_review_result(
+        cycle=1,
+        passed=False,
+        feedback="old failure",
+        issues=[stale_issue],
+    )
+    state.record_global_review_result(
+        cycle=2,
+        passed=False,
+        feedback="profile gate failed",
+        issues=[active_profile_issue],
+    )
+
+    executor._write_review_feedback_snapshot(str(tmp_path), 2, state)
+    snapshot = json.loads((tmp_path / "_meta" / "review_feedback" / "cycle_002.json").read_text(encoding="utf-8"))
+    assert snapshot["issue_count"] == 1
+    assert [item["id"] for item in snapshot["issues"]] == ["PROFILE-balanced-summary-only-evidence"]
+    assert snapshot["issue_ledger_status"]["active_issue_count"] == 1
+
+    state.record_global_review_result(
+        cycle=3,
+        passed=True,
+        feedback="全局评审通过",
+        issues=[],
+    )
+    executor._write_review_feedback_snapshot(str(tmp_path), 3, state)
+    cleared = json.loads((tmp_path / "_meta" / "review_feedback" / "cycle_003.json").read_text(encoding="utf-8"))
+    assert cleared["issue_count"] == 0
+    assert cleared["issues"] == []
 
 
 def test_worker_actionable_issue_takes_precedence_over_summary_category() -> None:

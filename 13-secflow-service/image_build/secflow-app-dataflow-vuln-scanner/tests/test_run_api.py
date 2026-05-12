@@ -24,6 +24,7 @@ from app.models.database import (
 )
 from app.services.execution_service import get_execution_service
 from app.services.run_index_service import get_run_index_service
+from app.services.run_inspector import inspect_cycle_detail, inspect_run_detail
 from app.services.scheduler import get_scheduler_service
 
 
@@ -184,6 +185,153 @@ def _create_run_workspace(run_root: Path) -> None:
     _write(call / "stdout.txt", "stdout")
 
 
+def _add_new_result_cycle_fixture(run_root: Path) -> None:
+    atomic = run_root / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
+    _write_json(atomic / "_meta" / "workflow_result.json", {
+        "status": "completed",
+        "timestamp": "2026-04-28T01:22:03Z",
+        "detail": {"cycles_used": 3},
+    })
+    _write_json(atomic / "_meta" / "review_summaries" / "cycle_001.json", {
+        "cycle": 1,
+        "timestamp": "2026-04-28T01:12:03Z",
+        "workflow_mode": "discovery",
+        "global_review": {"passed": False, "advisor_results": []},
+        "result_review": {
+            "total": 2,
+            "passed_count": 2,
+            "failed_count": 0,
+            "passed_files": ["result_001.md", "result_003.md"],
+            "failed_files": [],
+        },
+        "outcome": "global_failed",
+    })
+    _write_json(atomic / "_meta" / "review_summaries" / "cycle_002.json", {
+        "cycle": 2,
+        "timestamp": "2026-04-28T01:17:03Z",
+        "workflow_mode": "discovery",
+        "global_review": {"passed": False, "advisor_results": []},
+        "result_review": {
+            "total": 3,
+            "passed_count": 3,
+            "failed_count": 0,
+            "passed_files": ["result_001.md", "result_002.md", "result_003.md"],
+            "failed_files": [],
+        },
+        "outcome": "global_failed",
+    })
+    _write_json(atomic / "_meta" / "review_summaries" / "cycle_003.json", {
+        "cycle": 3,
+        "timestamp": "2026-04-28T01:22:03Z",
+        "workflow_mode": "closure",
+        "global_review": {"passed": True, "advisor_results": []},
+        "result_review": {
+            "total": 2,
+            "passed_count": 2,
+            "failed_count": 0,
+            "passed_files": ["result_001.md", "result_002.md"],
+            "failed_files": [],
+        },
+        "outcome": "all_passed",
+    })
+    for cycle in (2, 3):
+        _write_json(atomic / "_meta" / "cycle_metrics" / f"cycle_{cycle:03d}.json", {
+            "cycle": cycle,
+            "scores": {"input_coverage": 0.95},
+            "global_failure_scope": "",
+            "issue_count": 0,
+            "issue_ids": [],
+            "summary_size": 42,
+            "historical_removed_result_count": 1 if cycle >= 3 else 0,
+        })
+    _write_json(atomic / "_meta" / "results_manifest.json", {
+        "total_result_files": 3,
+        "active_result_count": 2,
+        "inactive_result_count": 1,
+        "taskable_result_count": 2,
+        "supplemental_result_count": 0,
+        "excluded_results": [],
+        "entries": [
+            {
+                "filename": "result_001.md",
+                "role": "finding",
+                "lifecycle_status": "candidate",
+                "active": True,
+                "taskable": True,
+                "delivery_bucket": "results",
+                "vulnerability_headings": ["VULN-001"],
+            },
+            {
+                "filename": "result_002.md",
+                "role": "finding",
+                "lifecycle_status": "candidate",
+                "active": True,
+                "taskable": True,
+                "delivery_bucket": "results",
+                "vulnerability_headings": ["VULN-002"],
+            },
+            {
+                "filename": "result_003.md",
+                "role": "finding",
+                "lifecycle_status": "inactive",
+                "active": False,
+                "taskable": False,
+                "delivery_bucket": "removed_results",
+                "vulnerability_headings": ["VULN-003"],
+            },
+        ],
+    })
+    _write_json(atomic / "_meta" / "result_relations_manifest.json", {
+        "all_results": ["result_001.md", "result_002.md", "result_003.md"],
+        "taskable_results": ["result_001.md", "result_002.md"],
+        "supplemental_results": [],
+        "inactive_results": ["result_003.md"],
+        "relationships": [],
+    })
+    _write(atomic / "results" / "result_002.md", "# Second confirmed issue\nbody")
+    _write(atomic / "removed_results" / "cycle_003" / "result_003.md", "# Removed issue\nbody")
+    _write_json(atomic / "removed_results" / "cycle_003" / "result_003.json", {
+        "original_filename": "result_003.md",
+        "removed_in_cycle": 3,
+        "lifecycle_status": "inactive",
+        "reason": "merged into stronger result",
+        "signals": [],
+    })
+    _write_json(atomic / "reviews" / "results" / "result_001" / "cycle_002" / "result_fp_check.json", {
+        "result_file": "result_001.md",
+        "advisor_instance_id": "result_fp_check",
+        "cycle": 2,
+        "passed": True,
+        "verdict": "CONFIRMED",
+        "confidence": 0.91,
+        "feedback": "still valid",
+        "schema_valid": True,
+        "repair_attempts": 0,
+    })
+    _write_json(atomic / "reviews" / "results" / "result_002" / "cycle_002" / "result_fp_check.json", {
+        "result_file": "result_002.md",
+        "advisor_instance_id": "result_fp_check",
+        "cycle": 2,
+        "passed": True,
+        "verdict": "CONFIRMED",
+        "confidence": 0.88,
+        "feedback": "ok",
+        "schema_valid": True,
+        "repair_attempts": 0,
+    })
+    _write_json(atomic / "reviews" / "results" / "result_003" / "cycle_001" / "result_fp_check.json", {
+        "result_file": "result_003.md",
+        "advisor_instance_id": "result_fp_check",
+        "cycle": 1,
+        "passed": True,
+        "verdict": "CONFIRMED",
+        "confidence": 0.82,
+        "feedback": "ok",
+        "schema_valid": True,
+        "repair_attempts": 0,
+    })
+
+
 def _create_execution_bound_run(client: TestClient, run_root: Path, *, title: str = "scan demo package") -> dict:
     _create_run_workspace(run_root)
     profile_response = client.post("/api/dataflow-vuln-scanner/profiles", json=_profile_payload())
@@ -336,6 +484,81 @@ def test_runs_list_uses_execution_bound_runs_and_ignores_unbound_directories(ser
     assert detail_payload["config"]["review_profile"] == "audit"
 
 
+def test_run_detail_groups_new_results_by_first_review_cycle(tmp_path):
+    run_root = tmp_path / "new_results_by_cycle_20260512_010203"
+    _create_run_workspace(run_root)
+    _add_new_result_cycle_fixture(run_root)
+
+    detail = inspect_run_detail(run_root)
+    cycles = {item["cycle"]: item for item in detail["cycles"]}
+
+    assert cycles[1]["new_result_count"] == 2
+    assert [item["filename"] for item in cycles[1]["new_results"]] == ["result_001.md", "result_003.md"]
+    assert cycles[2]["new_result_count"] == 1
+    assert [item["filename"] for item in cycles[2]["new_results"]] == ["result_002.md"]
+    assert cycles[3]["new_result_count"] == 0
+
+    result_001 = next(item for item in cycles[1]["new_results"] if item["filename"] == "result_001.md")
+    assert result_001["first_seen_cycle"] == 1
+    assert result_001["current_review_cycle"] == 2
+    assert result_001["current_verdict"] == "CONFIRMED"
+
+    result_003 = next(item for item in cycles[1]["new_results"] if item["filename"] == "result_003.md")
+    assert result_003["removed"] is True
+    assert result_003["removed_cycle"] == 3
+    assert result_003["path"] == "removed_results/cycle_003/result_003.md"
+    assert result_003["active"] is False
+    assert result_003["taskable"] is False
+
+    cycle_detail = inspect_cycle_detail(run_root, 1)
+    assert cycle_detail["new_result_count"] == 2
+    assert [item["filename"] for item in cycle_detail["new_results"]] == ["result_001.md", "result_003.md"]
+
+
+def test_run_api_exposes_new_results_and_derives_legacy_cycle_cache(service_config_path, monkeypatch):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_new_results_20260512_010203"
+    bound = _create_execution_bound_run(client, run_root, title="new results scan")
+    _add_new_result_cycle_fixture(run_root)
+
+    with get_db_session() as db:
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        assert execution is not None
+        run_index = get_run_index_service().sync_execution_run(db, execution)
+        db.commit()
+        assert run_index is not None
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert detail.status_code == 200
+    detail_payload = detail.json()
+    cycle_1 = next(item for item in detail_payload["cycles"] if item["cycle"] == 1)
+    assert cycle_1["new_result_count"] == 2
+    assert [item["filename"] for item in cycle_1["new_results"]] == ["result_001.md", "result_003.md"]
+
+    with get_db_session() as db:
+        cycle_row = (
+            db.query(RunIndexCycle)
+            .filter(RunIndexCycle.run_index_id == bound["run_id"], RunIndexCycle.cycle == 1)
+            .first()
+        )
+        assert cycle_row is not None
+        raw_file = Path(bound["run_root"]) / cycle_row.raw_json["raw_file"]
+        raw_payload = json.loads(raw_file.read_text(encoding="utf-8"))
+        raw_payload.pop("new_result_count", None)
+        raw_payload.pop("new_results", None)
+        _write_json(raw_file, raw_payload)
+
+    import app.services.run_index_service as run_index_service_module
+
+    monkeypatch.setattr(run_index_service_module, "_source_mtime_is_current", lambda *args, **kwargs: True)
+    legacy_cycle = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/cycles/1")
+    assert legacy_cycle.status_code == 200
+    legacy_payload = legacy_cycle.json()
+    assert legacy_payload["new_result_count"] == 2
+    assert [item["filename"] for item in legacy_payload["new_results"]] == ["result_001.md", "result_003.md"]
+
+
 def test_run_resolve_only_returns_execution_bound_records(service_config_path):
     runs_root = _project_runs_root()
     unbound_run = runs_root / "unbound_resolve_20260508_010203"
@@ -400,6 +623,146 @@ def test_run_reparses_when_atomic_work_path_was_stale(service_config_path):
     assert payload["atomic_work_path"].endswith("vuln_scan_initial_001")
     assert payload["cycles"]
     assert payload["results"]
+
+
+def test_run_cycle_marks_profile_gate_failure_separately(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_profile_gate_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+    atomic = run_root / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
+    feedback = (
+        "[框架范围验收硬门槛未通过]\n"
+        "- SCOPE-coverage-open-required: 本轮验收不允许 2 个 obligations 仍为 open。"
+    )
+    profile_issue = {
+        "id": "PROFILE-audit-coverage-open-required",
+        "category": "coverage_gate",
+        "target": "_meta/coverage_ledger.json",
+        "required_action": "关闭本轮必须闭环的 open obligations",
+        "blocking_type": "coverage_obligation_open",
+    }
+
+    time.sleep(0.02)
+    _write_json(atomic / "_meta" / "review_summaries" / "cycle_001.json", {
+        "cycle": 1,
+        "timestamp": "2026-04-28T01:12:03Z",
+        "workflow_mode": "closure",
+        "global_review": {
+            "passed": False,
+            "feedback_preview": feedback,
+            "issues": [profile_issue],
+            "advisor_results": [
+                {"advisor_id": "global_completeness", "passed": True},
+                {"advisor_id": "global_depth", "passed": True},
+            ],
+            "total_advisor_count": 2,
+            "passed_advisor_count": 2,
+            "failed_advisor_id": "",
+            "failed_role_name": "",
+        },
+        "result_review": {
+            "total": 1,
+            "passed_count": 1,
+            "failed_count": 0,
+            "passed_files": ["result_001.md"],
+            "failed_files": [],
+        },
+        "outcome": "global_failed",
+    })
+    _write_json(atomic / "_meta" / "cycle_metrics" / "cycle_001.json", {
+        "cycle": 1,
+        "scores": {"input_coverage": 0.95},
+        "global_failure_scope": "analysis",
+        "global_feedback_preview": feedback,
+        "issue_count": 1,
+        "issue_ids": [profile_issue["id"]],
+        "summary_size": 42,
+        "historical_removed_result_count": 0,
+    })
+    _write_json(atomic / "_meta" / "review_feedback" / "cycle_001.json", {
+        "cycle": 1,
+        "issues": [profile_issue],
+        "last_global_feedback": feedback,
+    })
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert detail.status_code == 200
+    cycle = detail.json()["cycles"][0]
+    assert cycle["outcome"] == "global_failed"
+    assert cycle["profile_gate"]["failed"] is True
+    assert cycle["profile_gate"]["advisor_all_passed"] is True
+    assert cycle["global_advisor_total"] == 2
+    assert cycle["global_advisor_passed"] == 2
+
+    cycle_detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}/cycles/1")
+    assert cycle_detail.status_code == 200
+    assert cycle_detail.json()["profile_gate"]["failed"] is True
+
+
+def test_run_detail_latest_issues_prefers_active_issue_ledger(tmp_path):
+    run_root = tmp_path / "ledger_latest_issues_20260512_010203"
+    _create_run_workspace(run_root)
+    atomic = run_root / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
+    stale_issue = {
+        "id": "CMP-old",
+        "category": "coverage_gap",
+        "target": "result_001.md",
+        "required_action": "旧 advisor 问题",
+        "actionable_by": "worker",
+    }
+    active_issue = {
+        "id": "PROFILE-balanced-coverage-open-required",
+        "category": "coverage_gate",
+        "target": "_meta/coverage_ledger.json",
+        "required_action": "关闭当前 open obligations",
+        "actionable_by": "worker",
+        "blocking_type": "coverage_obligation_open",
+    }
+    _write_json(atomic / "_meta" / "review_feedback" / "cycle_001.json", {
+        "cycle": 1,
+        "issue_count": 1,
+        "issues": [stale_issue],
+    })
+    _write_json(atomic / "_meta" / "issue_ledger.json", {
+        "schema_version": 1,
+        "last_status": {"active_issue_count": 1},
+        "entries": [
+            {
+                "signature": "issue:profile",
+                "semantic_key": "worker|coverage_gate|ledger|关闭当前 open obligations",
+                "first_seen_cycle": 1,
+                "last_seen_cycle": 2,
+                "seen_count": 2,
+                "consecutive_count": 2,
+                "issue_ids": [active_issue["id"]],
+                "advisor_ids": [],
+                "actionable_by": "worker",
+                "blocking_type": "coverage_obligation_open",
+                "acceptance_criteria": "ledger 中不再有 blocking open obligations",
+                "active": True,
+                "resolved": False,
+                "issue": active_issue,
+            },
+            {
+                "signature": "issue:old",
+                "semantic_key": "worker|coverage_gap|result_001.md|旧 advisor 问题",
+                "first_seen_cycle": 1,
+                "last_seen_cycle": 1,
+                "seen_count": 1,
+                "consecutive_count": 0,
+                "issue_ids": [stale_issue["id"]],
+                "active": False,
+                "resolved": False,
+                "issue": stale_issue,
+            },
+        ],
+    })
+
+    detail = inspect_run_detail(run_root)
+    assert [item["id"] for item in detail["latest_issues"]] == ["PROFILE-balanced-coverage-open-required"]
+    assert detail["latest_issues"][0]["seen_count"] == 2
+    assert detail["latest_issues"][0]["blocking_type"] == "coverage_obligation_open"
 
 
 def test_run_retry_queue_cancel_and_delete(service_config_path, monkeypatch):
