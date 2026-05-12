@@ -21,7 +21,7 @@ data:
       debug: false
 
     execution:
-      mode: "mock"
+      mode: "opencode_cli"
       max_parallel_tasks: 1
       scheduler_tick_interval_seconds: 1
       heartbeat_interval_seconds: 5
