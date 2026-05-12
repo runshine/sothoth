@@ -12,9 +12,11 @@ from app.workers.runner import (
     StageHooks,
     build_codex_exec_command,
     build_opencode_exec_command,
+    build_opencode_process_env,
     command_line_string,
     copy_file,
     extract_opencode_session_id,
+    opencode_env_summary,
     opencode_last_event_is_error,
     project_label,
     resolve_executor_mode,
@@ -316,6 +318,7 @@ def _run_opencode_stage(
     executor_model: str | None,
 ) -> StageExecutionResult:
     output_path = _attempt_output_path(context)
+    opencode_env = build_opencode_process_env(context)
     cmd = build_opencode_exec_command(
         prompt,
         repo_root=context.repo_root,
@@ -331,6 +334,8 @@ def _run_opencode_stage(
             f"Executor mode: opencode_cli",
             f"Model: {executor_model or '(default)'}",
             f"Output report path: {output_path}",
+            "=== opencode environment ===",
+            opencode_env_summary(opencode_env),
             "=== command ===",
             command_line_string(cmd),
             "=== prompt ===",
@@ -347,6 +352,7 @@ def _run_opencode_stage(
         hooks=hooks,
         timeout_seconds=int(get_config().execution.task_timeout_seconds),
         mirror_output_paths=[events_path],
+        env=opencode_env,
     )
     retry_count = 0
     total_duration = result.duration_seconds
@@ -389,6 +395,8 @@ def _run_opencode_stage(
                 f"Retry reason: {retry_reason}",
                 f"Previous return code: {previous_return_code}",
                 f"Output report path: {output_path}",
+                "=== opencode environment ===",
+                opencode_env_summary(opencode_env),
                 "=== command ===",
                 command_line_string(retry_cmd),
                 "=== retry prompt ===",
@@ -406,6 +414,7 @@ def _run_opencode_stage(
             timeout_seconds=int(get_config().execution.task_timeout_seconds),
             mirror_output_paths=[events_path],
             append=True,
+            env=opencode_env,
         )
         total_duration += result.duration_seconds
     session_files = [prompt_path]

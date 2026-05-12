@@ -104,6 +104,8 @@ class BinarySecurityTaskResponse(BaseModel):
     failed_firmware_count: int = 0
     task_retry_supported: bool = False
     task_retry_reason: Optional[str] = None
+    task_continue_supported: bool = False
+    task_continue_reason: Optional[str] = None
     stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
 
 

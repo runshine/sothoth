@@ -13,7 +13,19 @@ class DataflowAnalyseClient(JsonHttpClient):
         cfg = get_config().services.dataflow_analyse
         super().__init__(base_url=cfg.base_url, timeout=cfg.timeout)
 
-    async def create_task(self, project_id: str, task_name: str, input_path: str, prompt_content: str, origin: dict[str, Any] | None = None) -> dict:
+    async def create_task(
+        self,
+        project_id: str,
+        task_name: str,
+        input_path: str,
+        prompt_content: str,
+        origin: dict[str, Any] | None = None,
+        *,
+        source_file: str | None = None,
+        function_name: str | None = None,
+        line_hint: str | None = None,
+        taint_params: list[str] | None = None,
+    ) -> dict:
         return await self.post(
             "/tasks",
             json_body={
@@ -22,6 +34,10 @@ class DataflowAnalyseClient(JsonHttpClient):
                 "input_path": input_path,
                 "task_description": "由 binary security 编排器触发的数据流分析任务",
                 "prompt_content": prompt_content,
+                "source_file": source_file,
+                "function_name": function_name,
+                "line_hint": line_hint,
+                "taint_params": taint_params or [],
                 **(origin or {}),
             },
         )

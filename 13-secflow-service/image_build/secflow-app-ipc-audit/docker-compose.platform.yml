@@ -8,7 +8,12 @@ services:
     container_name: secflow-app-ipc-audit
     restart: unless-stopped
     ports:
-      - "${IPC_AUDIT_PORT:-8080}:8080"
+      - "${IPC_AUDIT_PORT:-18080}:8080"
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
     environment:
       IPC_AUDIT_DATABASE_URL: "sqlite:////var/lib/secflow-ipc-audit/ipc-audit.db"
       IPC_AUDIT_STATE_ROOT: "/var/lib/secflow-ipc-audit"
@@ -19,6 +24,16 @@ services:
       IPC_AUDIT_OPENCODE_BIN: "/usr/local/bin/opencode"
       HDC_BIN: "/workspace/openharmony_6_1/vendor/edu/docker/src/hdc"
       LD_LIBRARY_PATH: "/workspace/openharmony_6_1/vendor/edu/docker/src"
+      OHEMU_HELPER_BIN: "/usr/local/bin/ipc-audit-qemu"
+      OHEMU_WORKSPACE_ROOT: "/workspace/openharmony_6_1"
+      OHEMU_QCOW2_PREPARED_ROOT: "/workspace/openharmony_6_1/vendor/edu/docker/volumes/qcow2_cache"
+      OHEMU_RUNTIME_ROOT: "/var/lib/secflow-ipc-audit/ohemu"
+      OHEMU_ARCH: "${OHEMU_ARCH:-arm64}"
+      OHEMU_NETWORK_MODE: "${OHEMU_NETWORK_MODE:-bridge}"
+      OHEMU_HDC_BIND: "127.0.0.1"
+      OHEMU_HDC_BASE_PORT: "${OHEMU_HDC_BASE_PORT:-55555}"
+      OHEMU_WAIT_FOR_HDC_READY: "${OHEMU_WAIT_FOR_HDC_READY:-1}"
+      OHEMU_HDC_READY_TIMEOUT: "${OHEMU_HDC_READY_TIMEOUT:-180}"
       IPC_AUDIT_POC_ENABLED: "${IPC_AUDIT_POC_ENABLED:-true}"
       IPC_AUDIT_POC_RUNTIME_AVAILABLE: "${IPC_AUDIT_POC_RUNTIME_AVAILABLE:-true}"
       IPC_AUDIT_WORKSPACES_JSON: >-

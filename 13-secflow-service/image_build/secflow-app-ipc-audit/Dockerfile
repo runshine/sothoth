@@ -17,7 +17,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     IPC_AUDIT_CODEX_BIN=/usr/local/bin/codex \
     IPC_AUDIT_OPENCODE_BIN=/usr/local/bin/opencode \
     HDC_BIN=/workspace/openharmony_6_1/vendor/edu/docker/src/hdc \
-    LD_LIBRARY_PATH=/workspace/openharmony_6_1/vendor/edu/docker/src
+    LD_LIBRARY_PATH=/workspace/openharmony_6_1/vendor/edu/docker/src \
+    OHEMU_HELPER_BIN=/usr/local/bin/ipc-audit-qemu \
+    OHEMU_WORKSPACE_ROOT=/workspace/openharmony_6_1 \
+    OHEMU_QCOW2_PREPARED_ROOT=/workspace/openharmony_6_1/vendor/edu/docker/volumes/qcow2_cache \
+    OHEMU_RUNTIME_ROOT=/var/lib/secflow-ipc-audit/ohemu \
+    OHEMU_ARCH=arm64 \
+    OHEMU_NETWORK_MODE=bridge \
+    OHEMU_HDC_BIND=127.0.0.1 \
+    OHEMU_HDC_BASE_PORT=55555 \
+    OHEMU_WAIT_FOR_HDC_READY=1 \
+    OHEMU_HDC_READY_TIMEOUT=180
 
 WORKDIR /app
 
@@ -46,8 +56,10 @@ RUN set -eux; \
      "deb ${DEBIAN_SECURITY_MIRROR} bookworm-security main" \
      > /etc/apt/sources.list; \
  fi
+# Debian/Ubuntu package qemu-system-arm provides the qemu-system-aarch64 binary.
+# There is no qemu-system-arm64 package in the Bookworm/Ubuntu apt metadata used here.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bash ca-certificates curl git ripgrep tini libatomic1 libstdc++6 libgcc-s1 \
+ && apt-get install -y --no-install-recommends bash ca-certificates curl git ripgrep tini libatomic1 libstdc++6 libgcc-s1 libusb-1.0-0 procps util-linux iproute2 bridge-utils dnsmasq qemu-system-arm qemu-system-x86 qemu-utils socat \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
@@ -61,6 +73,8 @@ RUN npm config set registry "${NPM_REGISTRY_URL}" \
 
 COPY app /app/app
 COPY config.example.yaml /app/config.example.yaml
+COPY scripts/ipc-audit-qemu.sh /usr/local/bin/ipc-audit-qemu
+RUN chmod +x /usr/local/bin/ipc-audit-qemu
 
 RUN mkdir -p /var/lib/secflow-ipc-audit /workspace/openharmony_6_1 /root/.codex /root/.config/opencode /root/.local/share/opencode
 
