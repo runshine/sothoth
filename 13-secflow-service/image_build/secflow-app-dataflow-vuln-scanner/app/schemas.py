@@ -291,6 +291,21 @@ class RunRetryRequest(BaseModel):
     clean_workspace: bool = False
 
 
+class RunVulnReportRequest(BaseModel):
+    result_files: List[str] = Field(default_factory=list)
+
+
+class RunVulnReportResponse(BaseModel):
+    status: str
+    enabled: bool = True
+    total: int = 0
+    reported: int = 0
+    failed: int = 0
+    pending: int = 0
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    error: Optional[str] = None
+
+
 class RunMutationResponse(BaseModel):
     success: bool = True
     run_id: str

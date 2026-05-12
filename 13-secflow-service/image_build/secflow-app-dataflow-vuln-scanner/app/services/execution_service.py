@@ -2307,6 +2307,41 @@ class ExecutionService:
         db.refresh(run_index)
         return self._enrich_run_payload(db, run_index, payload)
 
+    def report_run_vulnerabilities(
+        self,
+        db: Session,
+        run_index_id: str,
+        principal: dict,
+        result_files: list[str],
+    ) -> dict[str, Any]:
+        run_index = self._run_index_or_404(db, run_index_id, principal)
+        trigger, execution = self._linked_run_index_runtime(db, run_index)
+        if trigger is None or execution is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="run is not linked to a managed scan task")
+        selected = [str(item or "").strip() for item in result_files if str(item or "").strip()]
+        if not selected:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="result_files must not be empty")
+        try:
+            report_status = get_vuln_report_service().report_run_results(
+                db,
+                trigger=trigger,
+                execution=execution,
+                run_index=run_index,
+                result_files=selected,
+            )
+        except Exception as exc:
+            db.rollback()
+            report_status = {"status": "failed", "enabled": True, "error": str(exc), "items": []}
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="vuln_report_manual",
+            message=f"manual vulnerability suspicion report {report_status.get('status', 'unknown')}",
+            level="warning" if report_status.get("status") in {"failed", "partial_failed"} else "info",
+            payload_json={**report_status, "result_files": selected},
+        )
+        return report_status
+
     def get_run_cycle(self, db: Session, run_index_id: str, cycle: int, principal: dict) -> dict[str, Any]:
         run_index = self._run_index_or_404(db, run_index_id, principal)
         return get_run_index_service().get_run_cycle(db, run_index, cycle)

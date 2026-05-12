@@ -163,7 +163,8 @@ def get_task_vuln_report_status(db: Session, trigger: TriggerTask, execution_id:
 
 
 class VulnReportService:
-    def _result_rows(self, db: Session, run_index: RunIndex) -> list[RunIndexResult]:
+    def _result_rows(self, db: Session, run_index: RunIndex, result_files: list[str] | None = None) -> list[RunIndexResult]:
+        selected = {str(item or "").strip() for item in (result_files or []) if str(item or "").strip()}
         rows = (
             db.query(RunIndexResult)
             .filter(
@@ -174,11 +175,21 @@ class VulnReportService:
             .order_by(RunIndexResult.filename.asc())
             .all()
         )
+        if selected:
+            rows = [
+                row for row in rows
+                if row.filename in selected or str(row.path or "") in selected
+            ]
         if rows:
             return rows
         results_dir = Path(run_index.run_root_path) / "results"
         summary_file = Path(run_index.run_root_path) / "summary.md"
         filenames = list_final_result_report_files(results_dir, summary_file if summary_file.exists() else None)
+        if selected:
+            filenames = [
+                name for name in filenames
+                if name in selected or f"results/{name}" in selected or str(results_dir / name) in selected
+            ]
         return [
             RunIndexResult(
                 id="",
@@ -284,6 +295,8 @@ class VulnReportService:
         trigger: TriggerTask,
         execution: WorkflowExecution,
         run_index: RunIndex | None,
+        result_files: list[str] | None = None,
+        force_submit: bool = False,
     ) -> dict[str, Any]:
         if not _auto_report_enabled(trigger):
             return {"status": "disabled", "enabled": False}
@@ -297,7 +310,7 @@ class VulnReportService:
         if run_index is None:
             return {"status": "failed", "enabled": True, "error": "run index missing"}
 
-        rows = self._result_rows(db, run_index)
+        rows = self._result_rows(db, run_index, result_files)
         if not rows:
             return {"status": "empty", "enabled": True, "total": 0}
 
@@ -313,7 +326,7 @@ class VulnReportService:
                 )
                 .first()
             )
-            if record and record.status == "reported" and record.payload_hash == payload_hash:
+            if record and record.status == "reported" and record.payload_hash == payload_hash and not force_submit:
                 continue
             if record is None:
                 record = VulnReportSubmission(
@@ -364,6 +377,24 @@ class VulnReportService:
             db.add(record)
             db.commit()
         return get_task_vuln_report_status(db, trigger, execution.id)
+
+    def report_run_results(
+        self,
+        db: Session,
+        *,
+        trigger: TriggerTask,
+        execution: WorkflowExecution,
+        run_index: RunIndex,
+        result_files: list[str],
+    ) -> dict[str, Any]:
+        return self.report_execution_results(
+            db,
+            trigger=trigger,
+            execution=execution,
+            run_index=run_index,
+            result_files=result_files,
+            force_submit=True,
+        )
 
 
 _service: VulnReportService | None = None

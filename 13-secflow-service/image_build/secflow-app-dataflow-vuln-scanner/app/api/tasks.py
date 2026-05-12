@@ -20,6 +20,8 @@ from app.schemas import (
     RunRetryRequest,
     RunSessionResponse,
     RunSummaryResponse,
+    RunVulnReportRequest,
+    RunVulnReportResponse,
     ScanTaskCreateRequest,
     ScanTaskDetailResponse,
     ScanTaskPriorityUpdateRequest,
@@ -172,6 +174,17 @@ async def resolve_run_by_task(
 async def get_run(run_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
     principal, _ = subject
     return get_execution_service().get_run(db, run_id, principal)
+
+
+@router.post("/runs/{run_id}/report-vulnerabilities", response_model=RunVulnReportResponse)
+async def report_run_vulnerabilities(
+    run_id: str,
+    payload: RunVulnReportRequest,
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    return get_execution_service().report_run_vulnerabilities(db, run_id, principal, payload.result_files)
 
 
 @router.get("/runs/{run_id}/cycles/{cycle}", response_model=RunCycleResponse)
