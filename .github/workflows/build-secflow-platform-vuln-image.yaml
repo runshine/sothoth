@@ -44,9 +44,7 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-platform-vuln/Dockerfile \
-            # --tag runshine0819/secflow-platform-vuln:amd64-latest \
             --tag ghcr.io/runshine/secflow-platform-vuln:amd64-latest \
-            # --tag runshine0819/secflow-platform-vuln:amd64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-platform-vuln:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-platform-vuln/
       - name: Push amd64 image
@@ -82,9 +80,7 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-platform-vuln/Dockerfile \
-            # --tag runshine0819/secflow-platform-vuln:arm64-latest \
             --tag ghcr.io/runshine/secflow-platform-vuln:arm64-latest \
-            # --tag runshine0819/secflow-platform-vuln:arm64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-platform-vuln:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-platform-vuln/
       - name: Push arm64 image
