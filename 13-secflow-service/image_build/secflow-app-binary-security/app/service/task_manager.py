@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import json
 import os
@@ -4601,7 +4602,11 @@ class TaskManager:
             folder = SERVICE_OUTPUT_FOLDERS.get(downstream_service, downstream_service.replace("_", "-"))
             target = output_root / folder
             if target.exists():
-                shutil.rmtree(target, ignore_errors=True)
+                try:
+                    shutil.rmtree(target, ignore_errors=True)
+                except OSError as exc:
+                    if exc.errno != errno.ESTALE:
+                        raise
 
     def _clear_single_stage_outputs(self, task: BinarySecurityTask, stage_name: str) -> None:
         summary = dict(task.summary or {})
