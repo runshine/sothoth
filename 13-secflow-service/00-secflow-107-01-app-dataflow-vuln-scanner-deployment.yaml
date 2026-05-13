@@ -60,11 +60,11 @@ spec:
               mountPath: /data
           resources:
             requests:
-              memory: "1Gi"
-              cpu: "500m"
+              memory: "16Gi"
+              cpu: "4"
             limits:
-              memory: "2Gi"
-              cpu: "1"
+              memory: "16Gi"
+              cpu: "4"
           livenessProbe:
             httpGet:
               path: /api/dataflow-vuln-scanner/health
@@ -155,7 +155,7 @@ spec:
               mountPath: /data
           resources:
             requests:
-              memory: "11Gi"
+              memory: "16Gi"
               cpu: "4"
             limits:
               memory: "16Gi"
