@@ -3,7 +3,7 @@ kind: Deployment
 metadata:
   name: secflow-app-binary-security-worker
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       name: secflow-app-binary-security

@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-binary-security-worker
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       name: secflow-app-binary-security
