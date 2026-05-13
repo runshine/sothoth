@@ -1062,6 +1062,15 @@ class RunIndexService:
                 db.add(record)
                 db.flush()
         except IntegrityError:
+            # Another manager/worker may have indexed this run concurrently while
+            # the current session was preparing a new RunIndex object.  Expunge
+            # the failed pending object before querying, otherwise SQLAlchemy can
+            # return the same not-inserted instance from the identity map and the
+            # final flush will try the duplicate INSERT again.
+            try:
+                db.expunge(record)
+            except Exception:
+                pass
             with db.no_autoflush:
                 existing = _find_run_by_source(
                     db,
@@ -1071,11 +1080,6 @@ class RunIndexService:
                 )
             if existing is None:
                 raise
-            if existing is not record:
-                try:
-                    db.expunge(record)
-                except Exception:
-                    pass
             record = existing
             apply_payload(record)
             db.add(record)
