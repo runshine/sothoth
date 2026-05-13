@@ -27,6 +27,8 @@ spec:
             value: "8080"
           - name: FILESERVER_ROOT
             value: /data/files
+          - name: SECFLOW_SYSTEM_ANALYSE_DB_AUTO_MIGRATE
+            value: "false"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_API
             value: "5"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_API
@@ -63,6 +65,13 @@ spec:
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 15
+        startupProbe:
+          httpGet:
+            path: /api/app/system-analyse/livez
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 60
       volumes:
       - name: secflow-app-system-analyse-config
         configMap:
