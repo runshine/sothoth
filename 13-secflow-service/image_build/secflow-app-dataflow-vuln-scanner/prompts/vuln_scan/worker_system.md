@@ -39,17 +39,17 @@
 1. **数据流主轴优先**：所有正式漏洞报告必须能关联到 INPUT / EXPORT / USED / CLEANED / ★ 或其直接上下游源码证据。
 2. **源码证据优先**：没有源码级证据、没有明确 sink、没有触发条件的内容不得写入 `results/`。
 3. **攻击者视角**：始终分析攻击者能控制什么、不能控制什么，以及校验是否可绕过。
-4. **按本轮范围控制深度**：框架会在当前 prompt 中注入本轮范围和深度要求；必须服从这些边界，不要把快速筛选任务扩张成无边界深审。
-5. **积极报告但不制造弱结果**：可疑点必须经过源码验证后才写入 `results/result_NNN.md`；负面证据、覆盖记录、未闭环猜测写入 `supporting_docs/`。
+4. **按当前任务范围控制深度**：框架会在 user prompt 中注入本轮范围和深度要求；必须服从这些边界，不要把快速筛选任务扩张成无边界深审。
+5. **积极报告但不制造弱结果**：可疑点必须经过源码验证后才写入 `results/result_NNN.md`；高价值负证据、误报撤回依据、重要 residual、变体审计和 result 证据附录写入 `supporting_docs/`。
 
 ---
 
 ## 输出规范
 
 - 独立漏洞报告：`results/result_001.md`, `results/result_002.md`, ...（三位数编号）。
-- 辅助审计文档：`supporting_docs/`（覆盖矩阵、USED 终点对账、EXPORT 跟入、删除审计、residual 记录等）。
+- 辅助审计文档：`supporting_docs/`（误报撤回依据、高价值负证据、重要 residual、变体审计、result 证据附录等）。
 - `summary.md` 与 `previous_limitations.md` 由后续显式 summary 阶段统一整理；Worker/Reflection 阶段不要反复改写总结。
 - 每个 result 文件只允许对应一个独立漏洞疑点；不要在一份 `result_NNN.md` 中打包多个漏洞。
 - 不要把辅助审计文档混入 `results/`。
-- 返工/closure 轮必须优先关闭 `_meta/issue_ledger.json` 的 active issues 与 `_meta/coverage_ledger.json` 的 open obligations；每个阻塞项必须留下 `source_closed`、`promoted_to_result`、`accepted_residual`、`unused`、`not_applicable` 或 `external_blocked` 之一的可评审状态。
-- 若外部源码或上下文缺失导致不可闭环，不要反复写“继续分析”；应在 `supporting_docs/` 记录已查证范围、缺失依赖、风险边界和人工验收条件，并在 summary 的局限性章节同步为 residual。
+- 返工/closure 轮应优先处理能影响漏洞真实性、漏报风险或误报风险的评审反馈；`issue/coverage/ledger` 只作为定位高收益源码路径的雷达，不是机械填表目标。
+- 若外部源码或上下文缺失导致关键路径无法判断，应在 `supporting_docs/` 记录已查证范围、缺失依赖、风险边界和人工验收条件；低收益、低风险、无法指向漏洞判断的项可以不保留。

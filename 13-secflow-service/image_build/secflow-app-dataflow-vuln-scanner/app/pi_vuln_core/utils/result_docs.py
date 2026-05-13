@@ -1058,7 +1058,7 @@ def format_coverage_obligation_summary(
     *,
     max_open: int = 20,
 ) -> str:
-    """Compact human-readable obligation summary for Worker/Advisor prompts."""
+    """Compact human-readable coverage radar for Worker/Advisor prompts."""
     if not coverage_ledger:
         return "(coverage ledger not available)"
     obligations = coverage_ledger.get("coverage_obligations") or {}
@@ -1068,7 +1068,8 @@ def format_coverage_obligation_summary(
     by_kind = obligations.get("by_kind") or {}
     quality = obligations.get("quality") or {}
     lines = [
-        "## Coverage Obligation Ledger",
+        "### Coverage radar snapshot",
+        "- 用途：辅助定位高收益漏洞路径；不要把它当成必须逐项关闭的任务清单。",
         (
             f"- total={int(obligations.get('total') or 0)}, "
             f"documented={int(obligations.get('documented') or 0)}, "
@@ -1095,9 +1096,12 @@ def format_coverage_obligation_summary(
 
     open_entries = obligations.get("open_entries") or []
     if open_entries:
+        limit = max(0, min(int(max_open or 0), 12))
+        high_yield_entries = _select_high_yield_coverage_entries(open_entries, limit=limit)
         lines.append("")
-        lines.append(f"### Open obligations (first {max_open})")
-        for item in open_entries[:max_open]:
+        lines.append(f"### High-yield open signals (top {len(high_yield_entries)})")
+        lines.append("- 优先审计这些靠近 sink、风险较高或类型更关键的信号；其余 open 项只在源码证据指向漏洞时再读取 ledger 跟入。")
+        for item in high_yield_entries:
             if not isinstance(item, dict):
                 continue
             lines.append(
@@ -1106,6 +1110,62 @@ def format_coverage_obligation_summary(
                 f", risk={item.get('risk') or 'medium'}"
             )
     return "\n".join(lines)
+
+
+def _select_high_yield_coverage_entries(
+    open_entries: object,
+    *,
+    limit: int,
+) -> list[dict[str, object]]:
+    if limit <= 0 or not isinstance(open_entries, list):
+        return []
+    indexed_entries: list[tuple[int, dict[str, object]]] = [
+        (index, item)
+        for index, item in enumerate(open_entries)
+        if isinstance(item, dict)
+    ]
+    indexed_entries.sort(key=lambda pair: _coverage_radar_sort_key(pair[1], pair[0]))
+    return [item for _, item in indexed_entries[:limit]]
+
+
+def _coverage_radar_sort_key(item: dict[str, object], index: int) -> tuple[int, int, int, int]:
+    risk_rank = {
+        "critical": 0,
+        "high": 1,
+        "medium": 2,
+        "low": 3,
+        "info": 4,
+    }
+    kind_rank = {
+        "star": 0,
+        "used": 1,
+        "export": 1,
+        "cleaned": 2,
+        "input": 3,
+    }
+    risk = str(item.get("risk") or "medium").lower()
+    kind = str(item.get("kind") or "").lower()
+    if not kind:
+        identifier = str(item.get("id") or "").split(":", 1)[0].lower()
+        kind = identifier
+    value = " ".join(
+        str(item.get(field) or "").lower()
+        for field in ("id", "label", "value")
+    )
+    sink_rank = 0 if any(
+        token in value
+        for token in (
+            "alloc", "copy", "cpy", "free", "index", "len", "length",
+            "loop", "mbuf", "mem", "offset", "packet", "parse", "ptr",
+            "read", "recv", "send", "size", "socket", "write",
+        )
+    ) else 1
+    return (
+        risk_rank.get(risk, risk_rank["medium"]),
+        kind_rank.get(kind, 4),
+        sink_rank,
+        index,
+    )
 
 
 def _coverage_obligation_id(kind: str, value: str, index: int) -> str:

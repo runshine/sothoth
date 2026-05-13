@@ -879,23 +879,13 @@ class WorkerExecutor:
         system_prompt_file: str,
         ctx: WorkflowContext,
     ) -> str:
-        """Build the effective Worker system prompt with run-scope guidance.
+        """Build the stable Worker system prompt.
 
-        The prompt file intentionally contains only the stable role/contract.
-        Profile-specific hunting depth is injected here so each run receives the
-        right bounded instructions without fragmenting the base system prompt.
-        Audit adds an optional appendix with a fuller vuln checklist, while
-        fast/balanced stay on the lean base contract.
+        Run-scoped guidance belongs in the user prompt so the system prompt stays
+        close to its role boundary: identity, durable constraints, and safety
+        invariants.
         """
-        base = read_file(system_prompt_file).rstrip()
-        dynamic_sections = [
-            self._format_profile_worker_scope(ctx),
-            self._load_profile_worker_appendix(system_prompt_file, ctx),
-            self._result_report_template(compact=True),
-        ]
-        return base + "\n\n" + "\n\n".join(
-            section for section in dynamic_sections if section.strip()
-        ).rstrip() + "\n"
+        return read_file(system_prompt_file).rstrip() + "\n"
 
     @staticmethod
     def _load_profile_worker_appendix(
@@ -916,7 +906,7 @@ class WorkerExecutor:
             return "\n".join([
                 "## result_NNN.md 强制结构摘要",
                 "- 每个 result 只描述一个独立漏洞疑点；无源码证据不得写入 results/。",
-                "- 必须包含：疑点元信息、数据流绑定、受控输入、源码证据、触发条件、校验/绕过分析、影响、修复建议、关联 obligation/issue。",
+                "- 必须包含：疑点元信息、数据流绑定、受控输入、源码证据、触发条件、校验/绕过分析、影响、修复建议、相关数据流/评审线索。",
                 "- 若为补充/修正报告，文件开头必须写 `- **原始报告**: result_NNN.md` 与 `- **本报告性质**: 补充分析/修正`。",
             ])
         return "\n".join([
@@ -983,37 +973,6 @@ class WorkerExecutor:
             "```",
         ])
 
-    @staticmethod
-    def _format_profile_worker_scope(ctx: WorkflowContext) -> str:
-        policy = get_review_profile_policy(ctx.review_profile)
-        common = [
-            "## 本轮 Worker 初始挖掘范围",
-            "- 本任务是 data-flow driven vulnerability hunting，不是无边界全源码审计。",
-            "- 所有正式漏洞报告、补扫记录和返工动作都必须能回链到数据流文件中的 INPUT / EXPORT / USED / CLEANED / ★，或其直接上下游源码证据。",
-        ]
-        if policy.name == "fast":
-            lanes = [
-                "只审计主 INPUT、★ 关键发现、最直接的高风险 USED/EXPORT。",
-                "漏洞模式裁剪为显性内存安全、整数安全、输入校验缺失和明显 DoS。",
-                "不要求低风险 EXPORT 穷尽；未覆盖项在 supporting_docs/ 中记录 residual 即可。",
-                "不要为满足产物数量创建低置信 result。",
-            ]
-        elif policy.name == "balanced":
-            lanes = [
-                "优先闭环所有 INPUT、★、critical/high 风险 EXPORT/USED/CLEANED。",
-                "漏洞模式覆盖 memory_safety、integer_safety、input_validation；对路径相关的 logic_state/resource_lifetime 做定向扫描。",
-                "EXPORT 跟入到 sink 或可信边界；源码缺失时记录 accepted_residual/external_blocked，不无限追外部依赖。",
-                "低风险、与数据流主轴弱相关的全源码探索不得阻塞本轮。",
-            ]
-        else:
-            lanes = [
-                "需要尽量闭环全部 INPUT/EXPORT/USED/CLEANED/★ obligations。",
-                "漏洞模式完整覆盖 memory_safety、integer_safety、input_validation、logic_state、resource_lifetime、concurrency_timing、resource_exhaustion、information_disclosure。",
-                "对关键校验做边界值、符号混用、整数截断/溢出、TOCTOU、错误处理分支和对称路径分析。",
-                "无法闭环的外部源码/上下文必须写 accepted_residual/external_blocked，并给出人工验收条件。",
-            ]
-        return "\n".join(common + [f"- {item}" for item in lanes])
-
     def _build_user_prompt(
         self,
         wf_def: AtomicWorkflowDef,
@@ -1053,6 +1012,7 @@ class WorkerExecutor:
                 ctx=ctx,
                 review_state=review_state,
                 current_result_files=current_result_files,
+                system_prompt_file=wf_def.roles.worker.prompts.work.system_prompt_file,
             ),
             result_report_template=self._result_report_template(),
         )
@@ -1230,6 +1190,7 @@ class WorkerExecutor:
         ctx: WorkflowContext,
         review_state: ReviewState,
         current_result_files: list[str],
+        system_prompt_file: str | None = None,
     ) -> str:
         previous_limitations_file = os.path.join(ctx.working_dir, "previous_limitations.md")
         lines = [
@@ -1245,6 +1206,13 @@ class WorkerExecutor:
             "",
             self._format_profile_execution_context(ctx),
         ]
+        audit_appendix = (
+            self._load_profile_worker_appendix(system_prompt_file, ctx)
+            if system_prompt_file else
+            ""
+        )
+        if audit_appendix:
+            lines.extend(["", audit_appendix])
         coverage_context = self._format_coverage_obligation_context(ctx)
         if coverage_context:
             lines.extend(["", coverage_context])
@@ -2393,14 +2361,17 @@ class WorkerExecutor:
         ledger_file = coverage_ledger_path(ctx.working_dir)
         if not ledger_file.is_file():
             return (
-                "## Coverage obligation ledger\n"
+                "## Coverage / issue radar\n"
                 f"- 尚未生成 `{ledger_file}`；本轮 summary 后框架会根据 task/data-flow 与正式产物同步。"
             )
         try:
             ledger = read_json(ledger_file)
         except Exception as exc:
-            return f"## Coverage obligation ledger\n- 读取 `{ledger_file}` 失败：{exc}"
-        return format_coverage_obligation_summary(ledger, max_open=max_open)
+            return f"## Coverage / issue radar\n- 读取 `{ledger_file}` 失败：{exc}"
+        return "\n".join([
+            f"## Coverage / issue radar\n- 读取 `{ledger_file}` 作为高收益漏洞路径雷达；不要求机械关闭全部 open 项。",
+            format_coverage_obligation_summary(ledger, max_open=max_open),
+        ])
 
     @staticmethod
     def _extract_result_number(name: str) -> int | None:

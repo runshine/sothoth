@@ -1542,9 +1542,9 @@ class GlobalReviewExecutor:
                 "- discovery 模式：可以做全量覆盖/深度审计，但 issue 必须指向具体 obligation、函数或文件，并给出可验证 acceptance_criteria。"
             )
         return "\n".join([
-            "- closure 模式：本轮不是重新发散漏洞挖掘，而是验证 active issue backlog 与 coverage ledger 的 closure。",
-            "- 优先检查 `_meta/coverage_ledger.json` 的 `coverage_obligations.open_entries` 和 `_meta/issue_ledger.json` 的 active entries。",
-            "- 若 open obligation 已在 summary/supporting_docs/results 中以 source_closed、promoted_to_result、accepted_residual、unused、not_applicable 或 external_blocked 自洽处理，应判定该项关闭。",
+            "- closure 模式：本轮不是重新发散漏洞挖掘，而是验证仍影响漏洞真实性、漏报风险或误报风险的 active issues / coverage signals。",
+            "- 优先检查 `_meta/coverage_ledger.json` 中高风险、靠近 sink、被评审点名的 open signals，以及 `_meta/issue_ledger.json` 的 active entries。",
+            "- 若高价值 signal 已在 summary/supporting_docs/results 中以 source_closed、promoted_to_result、accepted_residual、unused、not_applicable 或 external_blocked 自洽处理，应判定该项关闭。",
             "- 只有发现具体、可验证、且会影响最终结论的高严重遗漏时才新增 issue；不要用笼统的“继续深入/仍不够全面”阻断。",
         ])
 
@@ -1552,13 +1552,13 @@ class GlobalReviewExecutor:
     def _format_coverage_obligation_context(coverage_ledger_file: Path) -> str:
         if not coverage_ledger_file.is_file():
             return (
-                "## Coverage obligation ledger\n"
+                "## Coverage / issue radar\n"
                 f"- `{coverage_ledger_file}` 尚不存在；若本轮 summary 已生成但账本缺失，应标记 framework/metadata_sync。"
             )
         try:
             ledger = read_json(coverage_ledger_file)
         except Exception as exc:
-            return f"## Coverage obligation ledger\n- 读取 `{coverage_ledger_file}` 失败：{exc}"
+            return f"## Coverage / issue radar\n- 读取 `{coverage_ledger_file}` 失败：{exc}"
         return format_coverage_obligation_summary(ledger, max_open=12)
 
     def _write_review_feedback_snapshot(

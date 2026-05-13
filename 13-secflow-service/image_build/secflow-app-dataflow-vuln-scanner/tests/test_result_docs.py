@@ -299,6 +299,8 @@ def test_coverage_ledger_builds_task_obligation_closure_list(tmp_path: Path) -> 
     summary = format_coverage_obligation_summary(ledger, max_open=20)
     assert "total=5" in summary
     assert "INPUT-2" in summary
+    assert "High-yield open signals" in summary
+    assert "Open obligations (first" not in summary
 
 
 def test_coverage_ledger_extracts_obligations_from_referenced_data_flow_file(tmp_path: Path) -> None:
@@ -361,6 +363,7 @@ def test_coverage_ledger_extracts_obligations_from_referenced_data_flow_file(tmp
     summary = format_coverage_obligation_summary(ledger, max_open=20)
     assert "declared_extraction_ratio" in summary
     assert "RAW_U32@L130" in summary
+    assert "High-yield open signals" in summary
 
 
 @pytest.mark.asyncio

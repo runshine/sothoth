@@ -72,7 +72,7 @@ def test_jinja_prompt_rendering_uses_framework_error_type() -> None:
         render_string("Task: {{ missing_var }}", strict=True)
 
 
-def test_worker_system_prompt_appends_audit_appendix_only_for_audit() -> None:
+def test_worker_system_prompt_stays_stable_without_run_scoped_appendix() -> None:
     executor = WorkerExecutor(agent_registry=None, recorder=None)  # type: ignore[arg-type]
     audit_ctx = WorkflowContext(
         workflow_id="wf",
@@ -98,30 +98,66 @@ def test_worker_system_prompt_appends_audit_appendix_only_for_audit() -> None:
         balanced_ctx,
     )
 
-    assert "## 本轮扩展方法学" in audit_prompt
-    assert "## 漏洞模式补充检查清单" in audit_prompt
-    assert "仅 audit" not in audit_prompt
-    assert " audit " not in audit_prompt.lower()
+    assert "## 本轮扩展方法学" not in audit_prompt
+    assert "## 漏洞模式补充检查清单" not in audit_prompt
+    assert "## result_NNN.md 强制结构摘要" not in audit_prompt
     assert "## 本轮扩展方法学" not in balanced_prompt
 
 
-def test_worker_system_prompt_audit_appendix_is_optional_for_custom_prompt(tmp_path: Path) -> None:
-    custom_system = tmp_path / "worker_system.md"
-    custom_system.write_text("custom system\n", encoding="utf-8")
+def test_worker_user_prompt_receives_audit_appendix_as_runtime_context(tmp_path: Path) -> None:
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# scan task\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    wf = _workflow_with_worker_prompt(
+        Path("prompts/vuln_scan/worker_user.md"),
+        Path("prompts/vuln_scan/summary.md"),
+    )
     ctx = WorkflowContext(
         workflow_id="wf",
         task_id="task",
-        task_file="task.md",
-        working_dir=str(tmp_path / "work"),
+        task_file=str(task_file),
+        working_dir=str(work_dir),
         review_profile="audit",
     )
 
-    prompt = WorkerExecutor(agent_registry=None, recorder=None)._build_worker_system_prompt(  # type: ignore[arg-type]
-        str(custom_system),
+    prompt = WorkerExecutor(agent_registry=None, recorder=None)._build_user_prompt(  # type: ignore[arg-type]
+        wf,
         ctx,
+        ReviewState(),
     )
 
-    assert prompt.startswith("custom system")
+    assert "## 本轮扩展方法学" in prompt
+    assert "## 漏洞模式补充检查清单" in prompt
+
+
+def test_worker_user_prompt_skips_audit_appendix_for_custom_system_prompt(tmp_path: Path) -> None:
+    custom_system = tmp_path / "worker_system.md"
+    custom_system.write_text("custom system\n", encoding="utf-8")
+    worker_prompt = tmp_path / "worker_user.md"
+    worker_prompt.write_text("{worker_runtime_context}\n{result_report_template}\n", encoding="utf-8")
+    summary_prompt = tmp_path / "summary.md"
+    summary_prompt.write_text("summary\n", encoding="utf-8")
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# scan task\n", encoding="utf-8")
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    wf = _workflow_with_worker_prompt(worker_prompt, summary_prompt)
+    wf.roles.worker.prompts.work.system_prompt_file = str(custom_system)
+    ctx = WorkflowContext(
+        workflow_id="wf",
+        task_id="task",
+        task_file=str(task_file),
+        working_dir=str(work_dir),
+        review_profile="audit",
+    )
+
+    prompt = WorkerExecutor(agent_registry=None, recorder=None)._build_user_prompt(  # type: ignore[arg-type]
+        wf,
+        ctx,
+        ReviewState(),
+    )
+
     assert "## 本轮扩展方法学" not in prompt
 
 
@@ -261,7 +297,7 @@ def test_configured_rework_prompt_template_is_used(tmp_path: Path) -> None:
     assert "worker-gap" in prompt
     assert "result_001.md" in prompt
     assert "needs stronger source evidence" in prompt
-    assert "Coverage obligation ledger" in prompt
+    assert "Coverage / issue radar" in prompt
 
 
 def test_default_rework_prompt_is_incremental_for_shared_worker_session(tmp_path: Path) -> None:
