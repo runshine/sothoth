@@ -325,7 +325,7 @@ class OpenCodeCliModeTest(unittest.TestCase):
         self._set_env("FAKE_OPENCODE_EXPECT_XDG_PREFIX", str(self.state_root))
         self._set_env("FAKE_OPENCODE_EXPECT_XDG_CONFIG_PREFIX", str(self.state_root))
         self._set_env("FAKE_OPENCODE_EXPECT_OPENAI_API_KEY", "sk-runtime-secret")
-        self._set_env("FAKE_OPENCODE_EXPECT_OPENCODE_PROVIDER", "runtime-secret")
+        self._set_env("FAKE_OPENCODE_EXPECT_OPENCODE_PROVIDER", "openai")
 
         attempt_id = get_task_service().claim_next_attempt("tester-worker")
         self.assertIsNotNone(attempt_id)
@@ -341,6 +341,49 @@ class OpenCodeCliModeTest(unittest.TestCase):
         self.assertIn("Provider keys: ['opencode-prod']", audit_log.content)
         self.assertNotIn("sk-runtime-secret", audit_log.content)
         self.assertNotIn("runtime-secret", audit_log.content)
+
+    def test_opencode_cli_generates_missing_opencode_config_from_provider_fields(self) -> None:
+        self.provider_details["opencode-prod"]["api_base"] = "https://generated-opencode.example.test/v1"
+        self.provider_details["opencode-prod"]["api_key"] = "sk-generated-opencode"
+        self.provider_details["opencode-prod"]["model"] = "openai/gpt-5-generated"
+        self.provider_details["opencode-prod"]["env_bindings"] = {}
+        self.provider_details["opencode-prod"]["file_bindings"] = [
+            {
+                "name": "auth.json",
+                "path": "/root/.codex/auth.json",
+                "content": "{\"token\":\"other-executor-only\"}",
+                "enabled": True,
+            }
+        ]
+        self._set_env("FAKE_OPENCODE_EXPECT_OPENAI_API_KEY", "sk-generated-opencode")
+        self._set_env("FAKE_OPENCODE_EXPECT_OPENCODE_PROVIDER", "openai")
+
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="generated-opencode-provider",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_only",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+                executor_mode="opencode_cli",
+                provider_keys=["opencode-prod"],
+            ),
+            self.subject,
+        )
+        attempt_id = get_task_service().claim_next_attempt("tester-worker")
+        self.assertIsNotNone(attempt_id)
+        get_execution_service().run_attempt(str(attempt_id))
+
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+        self.assertEqual(detail.status, "succeeded")
+        self.assertEqual(attempt.status, "succeeded")
+
+        provider_root = self.state_root / "tasks" / task.task_id / "attempts" / str(detail.latest_attempt_id) / "runtime" / "provider"
+        config_text = (provider_root / "xdg-config" / "opencode" / "opencode.json").read_text(encoding="utf-8")
+        self.assertIn('"openai"', config_text)
+        self.assertIn('"https://generated-opencode.example.test/v1"', config_text)
+        self.assertIn('"sk-generated-opencode"', config_text)
+        self.assertIn('"model": "openai/gpt-5-generated"', config_text)
 
     def _write_fake_opencode(self) -> None:
         script = "\n".join(

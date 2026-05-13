@@ -135,6 +135,9 @@ def resolve_executor_model(effective_config: dict[str, Any]) -> str | None:
 
 def resolve_stage_executor_model(context: StageContext) -> str | None:
     runtime = context.provider_runtime
+    runtime_model = str(getattr(runtime, "executor_model", "") or "").strip() if runtime is not None else ""
+    if runtime_model:
+        return runtime_model
     runtime_model = str(getattr(runtime, "effective_model", "") or "").strip() if runtime is not None else ""
     if runtime_model:
         return runtime_model
@@ -211,12 +214,15 @@ def build_process_env_and_summary(context: StageContext) -> tuple[dict[str, str]
         "mapped_env_keys": materialized.mapped_env_keys,
         "mapped_file_paths": materialized.mapped_file_paths,
         "effective_model": runtime.effective_model if runtime is not None else None,
+        "executor_model": getattr(runtime, "executor_model", None) if runtime is not None else None,
     }
     summary = "\n".join(
         [
             f"Provider keys: {provider_keys if provider_keys else '[]'}",
             f"Mapped env keys: {materialized.mapped_env_keys if materialized.mapped_env_keys else '[]'}",
             f"Mapped file paths: {materialized.mapped_file_paths if materialized.mapped_file_paths else '[]'}",
+            f"Effective model: {runtime.effective_model if runtime is not None and runtime.effective_model else '(default)'}",
+            f"Executor model: {getattr(runtime, 'executor_model', None) or '(default)'}",
             f"HOME: {materialized.home_dir}",
             f"XDG_CONFIG_HOME: {materialized.xdg_config_home}",
             f"XDG_DATA_HOME: {materialized.xdg_data_home}",

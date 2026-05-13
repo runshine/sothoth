@@ -72,6 +72,7 @@ class TaskService:
         try:
             runtime_provider = get_provider_runtime_service().resolve_runtime(
                 payload.provider_keys,
+                executor_mode=executor_mode,
                 explicit_task_model=explicit_task_model,
             )
         except ProviderClientError as exc:

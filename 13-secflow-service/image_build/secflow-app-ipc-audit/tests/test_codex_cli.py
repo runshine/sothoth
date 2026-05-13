@@ -266,6 +266,50 @@ class CodexCliModeTest(unittest.TestCase):
         self.assertNotIn("sk-runtime-secret", manifest)
         self.assertNotIn("runtime-secret", manifest)
 
+    def test_codex_cli_generates_missing_codex_files_from_provider_fields(self) -> None:
+        self.provider_details["codex-prod"]["api_base"] = "https://generated-codex.example.test/v1"
+        self.provider_details["codex-prod"]["api_key"] = "sk-generated-codex"
+        self.provider_details["codex-prod"]["model"] = "gpt-5-codex-generated"
+        self.provider_details["codex-prod"]["env_bindings"] = {}
+        self.provider_details["codex-prod"]["file_bindings"] = [
+            {
+                "name": "opencode.json",
+                "path": "/root/.config/opencode/opencode.json",
+                "content": "{\"provider\":\"still-available-for-other-executors\"}",
+                "enabled": True,
+            }
+        ]
+        self._set_env("FAKE_CODEX_EXPECT_OPENAI_API_KEY", "sk-generated-codex")
+        self._set_env("FAKE_CODEX_EXPECT_AUTH_TOKEN", "sk-generated-codex")
+
+        task = get_task_service().create_task(
+            TaskCreateRequest(
+                title="generated-codex-provider",
+                workspace_id="oh61-main",
+                pipeline_mode="audit_only",
+                input_ref=InputRef(kind="custom_project", project_path="foundation/demo/service"),
+                executor_mode="codex_cli",
+                provider_keys=["codex-prod"],
+            ),
+            self.subject,
+        )
+        attempt_id = get_task_service().claim_next_attempt("tester-worker")
+        self.assertIsNotNone(attempt_id)
+        get_execution_service().run_attempt(str(attempt_id))
+
+        detail = get_task_service().get_task(task.task_id)
+        attempt = get_task_service().get_attempt(task.task_id, str(detail.latest_attempt_id))
+        self.assertEqual(detail.status, "succeeded")
+        self.assertEqual(attempt.status, "succeeded")
+
+        provider_root = self.state_root / "tasks" / task.task_id / "attempts" / str(detail.latest_attempt_id) / "runtime" / "provider"
+        auth_text = (provider_root / "home" / ".codex" / "auth.json").read_text(encoding="utf-8")
+        config_text = (provider_root / "home" / ".codex" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn("sk-generated-codex", auth_text)
+        self.assertIn('model = "gpt-5-codex-generated"', config_text)
+        self.assertIn('base_url = "https://generated-codex.example.test/v1"', config_text)
+        self.assertIn('env_key = "OPENAI_API_KEY"', config_text)
+
     def _write_fake_codex(self) -> None:
         script = "\n".join(
             [

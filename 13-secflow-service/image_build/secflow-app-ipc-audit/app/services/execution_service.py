@@ -166,6 +166,7 @@ class ExecutionService:
         try:
             resolved = get_provider_runtime_service().resolve_runtime(
                 effective_config.get("provider_keys") if isinstance(effective_config.get("provider_keys"), list) else [],
+                executor_mode=str(effective_config.get("executor_mode") or effective_config.get("execution_mode") or "").strip() or None,
                 explicit_task_model=explicit_task_model,
                 fallback_model=fallback_model,
             )
@@ -666,6 +667,7 @@ class ExecutionService:
                     if isinstance(item, dict) and str(item.get("path") or "").strip()
                 ],
                 "effective_model": getattr(context.get("provider_runtime"), "effective_model", None),
+                "executor_model": getattr(context.get("provider_runtime"), "executor_model", None),
             },
             "stages": [dict(row) for row in stage_rows],
             "artifacts": [dict(row) for row in artifact_rows],
