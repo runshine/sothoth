@@ -50,6 +50,10 @@ spec:
               value: api
             - name: UNPACKER_AGENT_DIR
               value: /app/app/agent
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: GUNICORN_THREADS
               value: "512"
             - name: POD_IP
@@ -165,6 +169,10 @@ spec:
               value: dispatcher,worker
             - name: UNPACKER_AGENT_DIR
               value: /app/app/agent
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: GUNICORN_THREADS
               value: "512"
             - name: POD_IP
@@ -280,6 +288,10 @@ spec:
               value: cleanup-worker
             - name: UNPACKER_AGENT_DIR
               value: /app/app/agent
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: GUNICORN_THREADS
               value: "512"
             - name: POD_IP
