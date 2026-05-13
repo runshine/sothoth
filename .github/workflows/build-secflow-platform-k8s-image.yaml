@@ -45,9 +45,7 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-platform-k8s/Dockerfile \
-            # --tag runshine0819/secflow-platform-k8s:amd64-latest \
             --tag ghcr.io/runshine/secflow-platform-k8s:amd64-latest \
-            # --tag runshine0819/secflow-platform-k8s:amd64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-platform-k8s:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-platform-k8s/
 
@@ -86,9 +84,7 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-platform-k8s/Dockerfile \
-            # --tag runshine0819/secflow-platform-k8s:arm64-latest \
             --tag ghcr.io/runshine/secflow-platform-k8s:arm64-latest \
-            # --tag runshine0819/secflow-platform-k8s:arm64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-platform-k8s:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-platform-k8s/
 

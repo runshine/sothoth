@@ -45,9 +45,7 @@ jobs:
         run: |
           docker build \
             --file 02-vpn-access-service/image_build/vpn-monitor/Dockerfile \
-            # --tag runshine0819/vpn-monitor:amd64-latest \
             --tag ghcr.io/runshine/vpn-monitor:amd64-latest \
-            # --tag runshine0819/vpn-monitor:amd64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/vpn-monitor:amd64-${{ needs.prepare.outputs.date_tag }} \
             02-vpn-access-service/image_build/vpn-monitor
 
@@ -86,9 +84,7 @@ jobs:
         run: |
           docker build \
             --file 02-vpn-access-service/image_build/vpn-monitor/Dockerfile \
-            # --tag runshine0819/vpn-monitor:arm64-latest \
             --tag ghcr.io/runshine/vpn-monitor:arm64-latest \
-            # --tag runshine0819/vpn-monitor:arm64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/vpn-monitor:arm64-${{ needs.prepare.outputs.date_tag }} \
             02-vpn-access-service/image_build/vpn-monitor
 

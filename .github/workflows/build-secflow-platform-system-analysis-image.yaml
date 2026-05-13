@@ -46,9 +46,7 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-platform-system-analysis/Dockerfile \
-            # --tag runshine0819/secflow-platform-system-analysis:amd64-latest \
             --tag ghcr.io/runshine/secflow-platform-system-analysis:amd64-latest \
-            # --tag runshine0819/secflow-platform-system-analysis:amd64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-platform-system-analysis:amd64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-platform-system-analysis/
 
@@ -88,9 +86,7 @@ jobs:
         run: |
           docker build \
             --file 13-secflow-service/image_build/secflow-platform-system-analysis/Dockerfile \
-            # --tag runshine0819/secflow-platform-system-analysis:arm64-latest \
             --tag ghcr.io/runshine/secflow-platform-system-analysis:arm64-latest \
-            # --tag runshine0819/secflow-platform-system-analysis:arm64-${{ needs.prepare.outputs.date_tag }} \
             --tag ghcr.io/runshine/secflow-platform-system-analysis:arm64-${{ needs.prepare.outputs.date_tag }} \
             13-secflow-service/image_build/secflow-platform-system-analysis/
 
