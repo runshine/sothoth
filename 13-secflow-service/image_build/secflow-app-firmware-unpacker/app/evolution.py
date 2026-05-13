@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +24,8 @@ DEFAULT_EVOLUTION_TARGET_AGENT = "codex"
 DEFAULT_EVOLUTION_OPTIMIZER = "codex"
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_TUNER_CONFIG_DIR = "agent_tuner"
+_CODEX_HOME_COMPAT_PATCHED = False
 
 
 def _slugify(value: str) -> str:
@@ -133,30 +138,98 @@ def resolve_family_tuned_agent(target_node: str, family_id: str, *, root: Path |
     return record
 
 
+def _git_output(args: list[str], *, cwd: Path) -> str | None:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    value = (completed.stdout or "").strip()
+    return value or None
+
+
+def _repo_clone_source() -> tuple[Path, str, str | None]:
+    git_root_raw = _git_output(["rev-parse", "--show-toplevel"], cwd=_REPO_ROOT)
+    branch = _git_output(["branch", "--show-current"], cwd=_REPO_ROOT) or "main"
+    if not git_root_raw:
+        return _REPO_ROOT, branch, None
+    git_root = Path(git_root_raw).expanduser().resolve()
+    try:
+        workdir_subpath = str(_REPO_ROOT.relative_to(git_root))
+    except ValueError:
+        workdir_subpath = None
+    return git_root, branch, workdir_subpath
+
+
+def _prompt_surface_paths(workdir_subpath: str | None) -> list[str]:
+    relative_path = Path("app/agent/prompt/unpack-firmware.md")
+    if not workdir_subpath:
+        return [str(relative_path)]
+    return [str(Path(workdir_subpath) / relative_path)]
+
+
+def _evolution_executable_path() -> str:
+    resolved = shutil.which(DEFAULT_EVOLUTION_TARGET_AGENT)
+    return resolved or ""
+
+
+def apply_agentflow_evolution_compat_patches() -> None:
+    global _CODEX_HOME_COMPAT_PATCHED
+    if _CODEX_HOME_COMPAT_PATCHED:
+        return
+
+    from agentflow.agents.codex import CodexAdapter
+
+    original_prepare = CodexAdapter.prepare
+
+    def _patched_prepare(self, node, prompt, paths):
+        prepared = original_prepare(self, node, prompt, paths)
+        host_home = str(os.environ.get("HOME") or "").strip()
+        host_codex_home = str(os.environ.get("CODEX_HOME") or "").strip()
+        if not host_codex_home and host_home:
+            host_codex_home = str((Path(host_home) / ".codex").resolve())
+        codex_home = str(prepared.env.get("CODEX_HOME") or "").strip()
+        prepared_home = str(prepared.env.get("HOME") or "").strip()
+        if host_home and codex_home and prepared_home == codex_home:
+            prepared.env["HOME"] = host_home
+        if host_codex_home and codex_home and host_codex_home != codex_home:
+            prepared.env["CODEX_HOME"] = host_codex_home
+        return prepared
+
+    CodexAdapter.prepare = _patched_prepare
+    _CODEX_HOME_COMPAT_PATCHED = True
+
+
 def ensure_tuner_profile(workspace: Path, *, profile: str, alias: str) -> Path:
-    tuner_dir = workspace / ".agentflow" / "tuners"
+    apply_agentflow_evolution_compat_patches()
+    tuner_dir = workspace / _TUNER_CONFIG_DIR
     tuner_dir.mkdir(parents=True, exist_ok=True)
     path = tuner_dir / f"{profile}.yaml"
     if path.exists():
         return path
+    repo_root, default_branch, workdir_subpath = _repo_clone_source()
     payload = {
         "name": alias,
         "base_agent": DEFAULT_EVOLUTION_TARGET_AGENT,
-        "repo_url": str(_REPO_ROOT),
-        "default_branch": "main",
-        "workdir_subpath": ".",
+        "repo_url": str(repo_root),
+        "default_branch": default_branch,
+        "workdir_subpath": workdir_subpath,
         "build_command": "python -m compileall app",
         "test_command": "pytest -q tests/test_agentflow_migration.py tests/test_task_manager.py tests/test_task_result_api.py",
         "smoke_command": "python -c \"print('agentflow evolution smoke ok')\"",
-        "executable_path": "",
+        "executable_path": _evolution_executable_path(),
         "evolution_prompt": (
             "Improve the generic firmware unpack executor conservatively. "
             "Preserve the output protocol, stop after summary creation, and do not change reviewer semantics."
         ),
         "tunable_surfaces": [
             {
-                "path": "app/agent/prompt/unpack-firmware.md",
-                "kind": "prompt",
+                "name": "generic executor prompt",
+                "paths": _prompt_surface_paths(workdir_subpath),
                 "notes": "Primary generic executor prompt surface.",
             }
         ],

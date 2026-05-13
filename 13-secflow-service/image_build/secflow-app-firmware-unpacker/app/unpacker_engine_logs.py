@@ -13,7 +13,6 @@ from typing import Any
 
 from app.logging_utils import log_event
 from app.unpacker_engine_config import LOG_OUTPUT_DIR
-from app.unpacker_engine_session import get_session_dir
 
 
 _STREAM_LOG_STATE: dict[str, dict[str, Any]] = {}
@@ -28,7 +27,7 @@ def get_log_dir(output_path: str) -> Path:
     else:
         log_dir = LOG_OUTPUT_DIR / output_dir.name
     log_dir.mkdir(parents=True, exist_ok=True)
-    get_session_dir(log_dir)
+    (log_dir / "sessions").mkdir(parents=True, exist_ok=True)
     return log_dir
 
 

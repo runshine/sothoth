@@ -52,7 +52,6 @@ from pydantic import BaseModel, Field
 class AgentFlowConfig(BaseModel):
     """AgentFlow engine configuration."""
 
-    enabled: bool = True
     profile: str = "production"
     runs_dir: str = "/data/files/.agentflow/runs"
     max_concurrent_runs: int = 2
@@ -111,7 +110,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _apply_env_overrides(cfg: Config) -> Config:
-    cfg.agentflow.enabled = True
     cfg.agentflow.profile = os.environ.get("AGENTFLOW_PROFILE", cfg.agentflow.profile)
     cfg.agentflow.runs_dir = os.environ.get("AGENTFLOW_RUNS_DIR", cfg.agentflow.runs_dir)
     cfg.agentflow.max_concurrent_runs = _env_int(

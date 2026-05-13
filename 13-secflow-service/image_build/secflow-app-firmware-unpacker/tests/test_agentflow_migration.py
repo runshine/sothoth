@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from app.cli import _token_summary, build_firmware_unpack_pipeline, run_unpack_agentflow
 from app.cli import reload_config
+from app.evolution import apply_agentflow_evolution_compat_patches, ensure_tuner_profile
 
 
 def _status(value):
@@ -171,10 +172,8 @@ class AgentFlowConfigTests(unittest.TestCase):
             config_path.write_text("app:\n  port: 9999\n", encoding="utf-8")
             with patch.dict(os.environ, {"CONFIG_PATH": str(config_path)}, clear=False):
                 cfg = reload_config(str(config_path))
-            self.assertTrue(cfg.agentflow.enabled)
             self.assertEqual(
                 {
-                    "enabled",
                     "profile",
                     "runs_dir",
                     "max_concurrent_runs",
@@ -195,7 +194,7 @@ class AgentFlowConfigTests(unittest.TestCase):
     def test_env_overrides_agentflow_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yaml"
-            config_path.write_text("agentflow:\n  enabled: false\n", encoding="utf-8")
+            config_path.write_text("agentflow:\n  profile: test\n", encoding="utf-8")
             env = {
                 "AGENTFLOW_RUNS_DIR": "/tmp/agentflow-runs",
                 "AGENTFLOW_MAX_CONCURRENT_RUNS": "7",
@@ -207,7 +206,6 @@ class AgentFlowConfigTests(unittest.TestCase):
             }
             with patch.dict(os.environ, env, clear=False):
                 cfg = reload_config(str(config_path))
-            self.assertTrue(cfg.agentflow.enabled)
             self.assertEqual("/tmp/agentflow-runs", cfg.agentflow.runs_dir)
             self.assertEqual(7, cfg.agentflow.max_concurrent_runs)
             self.assertEqual("staging", cfg.agentflow.profile)
@@ -215,6 +213,72 @@ class AgentFlowConfigTests(unittest.TestCase):
             self.assertEqual("pi", cfg.agentflow.graph_optimizer)
             self.assertEqual(2, cfg.agentflow.graph_optimization_rounds)
             self.assertEqual("/tmp/evolution", cfg.agentflow.evolution_archive_dir)
+
+    def test_ensure_tuner_profile_uses_agent_tuner_schema_expected_by_current_agentflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            with patch("app.evolution._repo_clone_source", return_value=(Path("/tmp/repo-root"), "agentflow", "service/unpacker")), patch(
+                "app.evolution._evolution_executable_path", return_value="/usr/bin/codex"
+            ):
+                path = ensure_tuner_profile(
+                    workspace,
+                    profile="generic-executor--family-1",
+                    alias="generic-executor--family-1-tuned",
+                )
+
+            self.assertEqual(workspace / "agent_tuner" / "generic-executor--family-1.yaml", path)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual("/tmp/repo-root", payload["repo_url"])
+            self.assertEqual("agentflow", payload["default_branch"])
+            self.assertEqual("service/unpacker", payload["workdir_subpath"])
+            self.assertEqual("/usr/bin/codex", payload["executable_path"])
+            self.assertEqual(
+                [
+                    {
+                        "name": "generic executor prompt",
+                        "paths": ["service/unpacker/app/agent/prompt/unpack-firmware.md"],
+                        "notes": "Primary generic executor prompt surface.",
+                    }
+                ],
+                payload["tunable_surfaces"],
+            )
+
+    def test_agentflow_codex_compat_patch_preserves_host_home(self):
+        class _Prepared:
+            def __init__(self):
+                self.env = {"CODEX_HOME": "/tmp/codex-home", "HOME": "/tmp/codex-home"}
+
+        with patch("app.evolution._CODEX_HOME_COMPAT_PATCHED", False), patch(
+            "agentflow.agents.codex.CodexAdapter.prepare", return_value=_Prepared()
+        ) as original_prepare:
+            apply_agentflow_evolution_compat_patches()
+            from agentflow.agents.codex import CodexAdapter
+
+            adapter = CodexAdapter()
+            with patch.dict(os.environ, {"HOME": "/home/tester", "CODEX_HOME": "/home/tester/.codex"}, clear=False):
+                prepared = adapter.prepare(object(), "prompt", object())
+
+        original_prepare.assert_called_once()
+        self.assertEqual("/home/tester/.codex", prepared.env["CODEX_HOME"])
+        self.assertEqual("/home/tester", prepared.env["HOME"])
+
+    def test_agentflow_codex_compat_patch_defaults_codex_home_to_home_dot_codex(self):
+        class _Prepared:
+            def __init__(self):
+                self.env = {"CODEX_HOME": "/tmp/codex-home", "HOME": "/tmp/codex-home"}
+
+        with patch("app.evolution._CODEX_HOME_COMPAT_PATCHED", False), patch(
+            "agentflow.agents.codex.CodexAdapter.prepare", return_value=_Prepared()
+        ):
+            apply_agentflow_evolution_compat_patches()
+            from agentflow.agents.codex import CodexAdapter
+
+            adapter = CodexAdapter()
+            with patch.dict(os.environ, {"HOME": "/home/tester"}, clear=True):
+                prepared = adapter.prepare(object(), "prompt", object())
+
+        self.assertEqual("/home/tester/.codex", prepared.env["CODEX_HOME"])
+        self.assertEqual("/home/tester", prepared.env["HOME"])
 
 
 class AgentFlowPipelineTests(unittest.TestCase):

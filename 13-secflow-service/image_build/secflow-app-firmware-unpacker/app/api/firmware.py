@@ -48,8 +48,7 @@ from app.services.task_events import list_task_events
 from app.services.task_manager import cancel_task, delete_tasks, request_task_result_cache_refresh, retry_task, submit_unpack_task
 from app.services.worker import get_cluster_snapshot, get_worker_id
 from app.skill_store import list_skills
-from app.unpacker_engine_config import get_max_retries
-from app.unpacker_engine import TOOLS_DIR
+from app.unpacker_engine_config import TOOLS_DIR, get_max_retries
 from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, list_round_dirs as _list_round_dirs, read_text_tail
 
 

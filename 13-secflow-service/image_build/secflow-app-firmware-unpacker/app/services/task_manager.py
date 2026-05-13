@@ -518,11 +518,11 @@ def _parse_llm_binding_snapshot(snapshot_raw: str | None) -> dict | None:
 
 def _build_llm_binding_snapshot(db) -> dict:
     from app.services.configcenter import get_configcenter_client
-    from app.unpacker_engine import (
+    from app.unpacker_engine_config import (
         ROLE_CONFIG_FILE_KEYS,
         ROLE_MODEL_CONFIG_KEYS,
-        _build_settings_json,
-        _resolve_provider_selector,
+        build_settings_json,
+        resolve_provider_selector,
     )
 
     from app.model import get_config_value
@@ -537,7 +537,7 @@ def _build_llm_binding_snapshot(db) -> dict:
 
         config_file = client.get_llm_config_file(config_file_key)
         configured_model = str(get_config_value(db, ROLE_MODEL_CONFIG_KEYS.get(role, ""), default="") or "").strip()
-        selected_provider_key, resolved_model, model_selector = _resolve_provider_selector(
+        selected_provider_key, resolved_model, model_selector = resolve_provider_selector(
             config_file_key,
             str(config_file.get("default_model") or "").strip(),
             configured_model or None,
@@ -549,7 +549,7 @@ def _build_llm_binding_snapshot(db) -> dict:
             "model": resolved_model,
             "model_selector": model_selector,
             "models_json": config_file.get("models_json"),
-            "settings_json": _build_settings_json(selected_provider_key, "auto"),
+            "settings_json": build_settings_json(selected_provider_key, "auto"),
             "frozen_at": frozen_at,
             "updated_at": str(config_file.get("updated_at") or "").strip() or None,
         }

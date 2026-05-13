@@ -1,5 +1,4 @@
 agentflow:
-  enabled: true
   profile: "production"
   runs_dir: "/data/files/.agentflow/runs"
   max_concurrent_runs: 2
