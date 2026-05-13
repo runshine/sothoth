@@ -9,9 +9,11 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from math import floor
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -197,6 +199,70 @@ def _dispatch_interval_seconds() -> int:
 
 def _claim_batch_size() -> int:
     return max(1, int(get_config().worker.claim_batch_size))
+
+
+def _transient_db_retry_attempts() -> int:
+    return max(1, int(get_config().worker.transient_db_retry_attempts))
+
+
+def _transient_db_retry_backoff_seconds() -> float:
+    return max(0.05, int(get_config().worker.transient_db_retry_backoff_ms) / 1000.0)
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    orig = getattr(exc, "orig", exc)
+    code = None
+    with suppress(Exception):
+        args = getattr(orig, "args", None) or ()
+        if args:
+            code = int(args[0])
+    message = str(orig or exc).lower()
+    if code in {1205, 1213, 1412, 1614, 3572}:
+        return True
+    markers = (
+        "please retry transaction",
+        "lock wait timeout exceeded",
+        "deadlock found",
+        "deadlock detected",
+        "serialization failure",
+        "could not serialize access",
+        "database is locked",
+        "database schema has changed",
+        "try restarting transaction",
+    )
+    return any(marker in message for marker in markers)
+
+
+def _run_db_retry(
+    operation_name: str,
+    func: Callable[[], Any],
+    *,
+    context: Optional[dict[str, Any]] = None,
+) -> Any:
+    max_attempts = _transient_db_retry_attempts()
+    delay = _transient_db_retry_backoff_seconds()
+    last_exc: BaseException | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func()
+        except SQLAlchemyError as exc:
+            last_exc = exc
+            if not _is_transient_db_error(exc) or attempt >= max_attempts:
+                raise
+            sleep_seconds = min(2.0, delay * (2 ** (attempt - 1)))
+            logger.warning(
+                "transient db error during %s, retrying attempt=%s/%s delay=%.2fs context=%s error=%s",
+                operation_name,
+                attempt,
+                max_attempts,
+                sleep_seconds,
+                context or {},
+                exc,
+            )
+            time.sleep(sleep_seconds)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{operation_name} retry loop exited unexpectedly")
 
 
 def _task_lease_seconds() -> int:
@@ -897,48 +963,76 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
     owner_id = get_worker_id()
     processed = 0
     while processed < max(1, limit):
-        db = get_db_session()
-        job = None
-        now = now_local()
-        try:
-            job = (
-                db.query(WorkspaceCleanupJob)
-                .filter(
-                    (
-                        (WorkspaceCleanupJob.status == "pending")
-                        | (
-                            (WorkspaceCleanupJob.status == "running")
-                            & (
-                                (WorkspaceCleanupJob.lease_expires_at.is_(None))
-                                | (WorkspaceCleanupJob.lease_expires_at < now)
+        def _claim_cleanup_job() -> dict[str, Any] | None:
+            db = get_db_session()
+            now = now_local()
+            try:
+                query = (
+                    db.query(WorkspaceCleanupJob)
+                    .filter(
+                        (
+                            (WorkspaceCleanupJob.status == "pending")
+                            | (
+                                (WorkspaceCleanupJob.status == "running")
+                                & (
+                                    (WorkspaceCleanupJob.lease_expires_at.is_(None))
+                                    | (WorkspaceCleanupJob.lease_expires_at < now)
+                                )
                             )
                         )
                     )
+                    .order_by(WorkspaceCleanupJob.created_at.asc())
                 )
-                .order_by(WorkspaceCleanupJob.created_at.asc())
-                .first()
-            )
-            if job is None:
+                if _supports_skip_locked():
+                    query = query.with_for_update(skip_locked=True)
+                job = query.first()
+                if job is None:
+                    return None
+                job.status = "running"
+                job.owner_id = owner_id
+                job.started_at = job.started_at or now
+                job.completed_at = None
+                job.error_message = None
+                job.attempts = int(job.attempts or 0) + 1
+                job.lease_expires_at = _cleanup_job_lease_deadline(now)
+                db.commit()
+                return {
+                    "job_id": job.id,
+                    "task_id": job.task_id,
+                    "project_id": job.project_id,
+                    "reason": job.reason,
+                    "attempts": job.attempts,
+                }
+            except SQLAlchemyError:
+                db.rollback()
+                raise
+            finally:
                 db.close()
-                break
-            job.status = "running"
-            job.owner_id = owner_id
-            job.started_at = job.started_at or now
-            job.completed_at = None
-            job.error_message = None
-            job.attempts = int(job.attempts or 0) + 1
-            job.lease_expires_at = _cleanup_job_lease_deadline(now)
-            db.commit()
-            task_id = job.task_id
-            project_id = job.project_id
-            job_id = job.id
-        finally:
-            db.close()
+
+        job = _run_db_retry(
+            "claim_workspace_cleanup_job",
+            _claim_cleanup_job,
+            context={"owner_id": owner_id},
+        )
+        if job is None:
+            break
+        task_id = str(job["task_id"])
+        project_id = job.get("project_id")
+        job_id = str(job["job_id"])
+        reason = str(job.get("reason") or "")
+        logger.info(
+            "claimed workspace cleanup job job_id=%s task_id=%s reason=%s attempts=%s owner_id=%s",
+            job_id,
+            task_id,
+            reason,
+            job.get("attempts"),
+            owner_id,
+        )
 
         error_message: Optional[str] = None
         requeue_task_id: Optional[str] = None
         try:
-            if job.reason == "task_retry_reset":
+            if reason == "task_retry_reset":
                 db = get_db_session()
                 try:
                     task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
@@ -1007,28 +1101,41 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
                 "failed to process workspace job %s task %s reason=%s: %s",
                 job_id,
                 task_id,
-                job.reason,
+                reason,
                 exc,
             )
 
-        db = get_db_session()
-        try:
-            current = db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.id == job_id).first()
-            if current is None:
-                processed += 1
-                continue
-            current.owner_id = owner_id
-            current.lease_expires_at = None
-            current.completed_at = now_local()
-            if error_message:
-                current.status = "failed"
-                current.error_message = error_message
-            else:
-                current.status = "success"
-            db.commit()
-        finally:
-            db.close()
-        if job.reason == "task_retry_reset":
+        def _finalize_cleanup_job() -> bool:
+            db = get_db_session()
+            try:
+                current = db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.id == job_id).first()
+                if current is None:
+                    return False
+                current.owner_id = owner_id
+                current.lease_expires_at = None
+                current.completed_at = now_local()
+                if error_message:
+                    current.status = "failed"
+                    current.error_message = error_message
+                else:
+                    current.status = "success"
+                db.commit()
+                return True
+            except SQLAlchemyError:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
+        finalized = _run_db_retry(
+            "finalize_workspace_cleanup_job",
+            _finalize_cleanup_job,
+            context={"job_id": job_id, "task_id": task_id, "owner_id": owner_id},
+        )
+        if not finalized:
+            processed += 1
+            continue
+        if reason == "task_retry_reset":
             if error_message:
                 _fail_retry_preparing_task(task_id, error_message)
             elif requeue_task_id:
@@ -1557,112 +1664,150 @@ def recover_orphaned_tasks() -> None:
     from app.services.worker import get_worker_id
 
     now = now_local()
-    active_owner_ids: set[str] = set()
     heartbeat_cutoff = now - timedelta(seconds=max(15, int(get_config().worker.dead_threshold_seconds)))
-    db = get_db_session()
-    try:
-        active_owner_ids = {
-            str(row.worker_id)
-            for row in db.query(WorkerInstance)
-            .filter(
-                WorkerInstance.is_alive.is_(True),
-                WorkerInstance.last_heartbeat >= heartbeat_cutoff,
-            )
-            .all()
-        }
-        tasks = (
-            db.query(UnpackTask)
-            .filter(
-                UnpackTask.status.in_(
-                    [TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
+
+    def _load_recovery_snapshot() -> tuple[set[str], list[Any]]:
+        db = get_db_session()
+        try:
+            active_owner_ids = {
+                str(row.worker_id)
+                for row in db.query(WorkerInstance)
+                .filter(
+                    WorkerInstance.is_alive.is_(True),
+                    WorkerInstance.last_heartbeat >= heartbeat_cutoff,
                 )
+                .all()
+            }
+            tasks = (
+                db.query(UnpackTask)
+                .filter(
+                    UnpackTask.status.in_(
+                        [TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
+                    )
+                )
+                .all()
             )
-            .all()
-        )
-    finally:
-        db.close()
+            return active_owner_ids, tasks
+        finally:
+            db.close()
+
+    active_owner_ids, tasks = _run_db_retry(
+        "recover_orphaned_tasks_snapshot",
+        _load_recovery_snapshot,
+        context={"heartbeat_cutoff": isoformat_local(heartbeat_cutoff)},
+    )
 
     current_owner = get_worker_id()
+    action_counts: dict[str, int] = {}
 
     for task in tasks:
-        owner_id = str(task.owner_id or "").strip()
-        cancel_requested_at = task.cancel_requested_at
-        owner_missing = not owner_id or owner_id not in active_owner_ids
-        local_owned = owner_id == current_owner
-        runner_pid = getattr(task, "runner_pid", None)
-        runner_alive = _is_process_alive(runner_pid) if local_owned and runner_pid else False
-        runner_not_started = bool(
-            local_owned
-            and not runner_pid
-            and task.started_at
-            and task.started_at + timedelta(seconds=_runner_start_grace_seconds()) < now
-        )
-        cancel_timed_out = bool(
-            cancel_requested_at
-            and cancel_requested_at + timedelta(seconds=_cancel_timeout_seconds()) < now
-        )
-        progress_stale = bool(
-            task.last_progress_at
-            and task.last_progress_at + timedelta(seconds=_cancel_timeout_seconds()) < now
-        )
-        claim_stale = bool(
-            task.status == TaskStatus.CLAIMED.value
-            and task.dispatch_claimed_at
-            and task.dispatch_claimed_at + timedelta(seconds=_runner_start_grace_seconds()) < now
-        )
-        if task.status == TaskStatus.CLAIMED.value:
-            if owner_missing or claim_stale:
-                _reset_claim(task.id)
-            continue
-        if task.status == TaskStatus.CANCELLING.value and local_owned:
-            if runner_not_started:
-                _mark_task_cancelled(task.id, reason="Task runner was not started")
+        try:
+            owner_id = str(task.owner_id or "").strip()
+            cancel_requested_at = task.cancel_requested_at
+            owner_missing = not owner_id or owner_id not in active_owner_ids
+            local_owned = owner_id == current_owner
+            runner_pid = getattr(task, "runner_pid", None)
+            runner_alive = _is_process_alive(runner_pid) if local_owned and runner_pid else False
+            runner_not_started = bool(
+                local_owned
+                and not runner_pid
+                and task.started_at
+                and task.started_at + timedelta(seconds=_runner_start_grace_seconds()) < now
+            )
+            cancel_timed_out = bool(
+                cancel_requested_at
+                and cancel_requested_at + timedelta(seconds=_cancel_timeout_seconds()) < now
+            )
+            progress_stale = bool(
+                task.last_progress_at
+                and task.last_progress_at + timedelta(seconds=_cancel_timeout_seconds()) < now
+            )
+            claim_stale = bool(
+                task.status == TaskStatus.CLAIMED.value
+                and task.dispatch_claimed_at
+                and task.dispatch_claimed_at + timedelta(seconds=_runner_start_grace_seconds()) < now
+            )
+            if task.status == TaskStatus.CLAIMED.value:
+                if owner_missing or claim_stale:
+                    _reset_claim(task.id)
+                    action_counts["claim_reset"] = int(action_counts.get("claim_reset", 0)) + 1
                 continue
-            if not runner_alive:
-                _mark_task_cancelled(task.id, reason="Task runner exited while cancelling")
+            if task.status == TaskStatus.CANCELLING.value and local_owned:
+                if runner_not_started:
+                    _mark_task_cancelled(task.id, reason="Task runner was not started")
+                    action_counts["cancelled_runner_not_started"] = int(action_counts.get("cancelled_runner_not_started", 0)) + 1
+                    continue
+                if not runner_alive:
+                    _mark_task_cancelled(task.id, reason="Task runner exited while cancelling")
+                    action_counts["cancelled_runner_exited"] = int(action_counts.get("cancelled_runner_exited", 0)) + 1
+                    continue
+                if task.cancel_grace_deadline and task.cancel_grace_deadline <= now:
+                    sent = _signal_task_runner(
+                        task,
+                        signal.SIGTERM,
+                        event_type="cancel_sigterm_sent",
+                        summary="已向任务执行进程发送 SIGTERM",
+                    )
+                    if sent:
+                        _clear_cancel_grace_deadline(task.id)
+                        action_counts["cancel_sigterm_sent"] = int(action_counts.get("cancel_sigterm_sent", 0)) + 1
+                if (
+                    (task.cancel_force_deadline and task.cancel_force_deadline <= now)
+                    or cancel_timed_out
+                    or progress_stale
+                ):
+                    _signal_task_runner(
+                        task,
+                        signal.SIGKILL,
+                        event_type="cancel_sigkill_sent",
+                        summary="已向任务执行进程发送 SIGKILL",
+                    )
+                    _mark_task_cancelled(task.id, reason="Task cancelled after force kill deadline")
+                    action_counts["cancel_sigkill_sent"] = int(action_counts.get("cancel_sigkill_sent", 0)) + 1
                 continue
-            if task.cancel_grace_deadline and task.cancel_grace_deadline <= now:
-                sent = _signal_task_runner(
-                    task,
-                    signal.SIGTERM,
-                    event_type="cancel_sigterm_sent",
-                    summary="已向任务执行进程发送 SIGTERM",
-                )
-                if sent:
-                    _clear_cancel_grace_deadline(task.id)
-            if (
-                (task.cancel_force_deadline and task.cancel_force_deadline <= now)
-                or cancel_timed_out
-                or progress_stale
-            ):
-                _signal_task_runner(
-                    task,
-                    signal.SIGKILL,
-                    event_type="cancel_sigkill_sent",
-                    summary="已向任务执行进程发送 SIGKILL",
-                )
-                _mark_task_cancelled(task.id, reason="Task cancelled after force kill deadline")
-            continue
-        if task.status == TaskStatus.CANCELLING.value:
-            if owner_missing:
-                _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
-            elif cancel_timed_out or progress_stale:
-                _mark_task_cancelled(task.id, reason="Task cancelled after owner lost or timeout")
-            continue
-        if task.status == TaskStatus.RUNNING.value:
-            if owner_missing:
-                _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
-            elif local_owned and runner_not_started:
-                _finalize_orphaned_task(task.id, reason="Task runner was not started")
-            elif local_owned and not runner_alive:
-                _finalize_orphaned_task(task.id, reason="Task runner process exited unexpectedly")
-            elif local_owned and runner_alive:
-                _update_task_progress_for_owner(
-                    task.id,
-                    owner_id=owner_id,
-                    run_token=task.run_token,
-                    stage=None,
-                )
+            if task.status == TaskStatus.CANCELLING.value:
+                if owner_missing:
+                    _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
+                    action_counts["orphaned_cancelled"] = int(action_counts.get("orphaned_cancelled", 0)) + 1
+                elif cancel_timed_out or progress_stale:
+                    _mark_task_cancelled(task.id, reason="Task cancelled after owner lost or timeout")
+                    action_counts["cancel_timeout"] = int(action_counts.get("cancel_timeout", 0)) + 1
+                continue
+            if task.status == TaskStatus.RUNNING.value:
+                if owner_missing:
+                    _finalize_orphaned_task(task.id, reason="Task owner pod lost", owner_lost=True)
+                    action_counts["owner_lost"] = int(action_counts.get("owner_lost", 0)) + 1
+                elif local_owned and runner_not_started:
+                    _finalize_orphaned_task(task.id, reason="Task runner was not started")
+                    action_counts["runner_not_started"] = int(action_counts.get("runner_not_started", 0)) + 1
+                elif local_owned and not runner_alive:
+                    _finalize_orphaned_task(task.id, reason="Task runner process exited unexpectedly")
+                    action_counts["runner_exited"] = int(action_counts.get("runner_exited", 0)) + 1
+                elif local_owned and runner_alive:
+                    _update_task_progress_for_owner(
+                        task.id,
+                        owner_id=owner_id,
+                        run_token=task.run_token,
+                        stage=None,
+                    )
+                    action_counts["progress_refreshed"] = int(action_counts.get("progress_refreshed", 0)) + 1
+        except Exception as exc:
+            action_counts["errors"] = int(action_counts.get("errors", 0)) + 1
+            logger.warning(
+                "recover orphaned task warning task_id=%s status=%s owner_id=%s error=%s",
+                task.id,
+                task.status,
+                getattr(task, "owner_id", None),
+                exc,
+            )
+    if action_counts:
+        logger.info(
+            "recover orphaned tasks summary owner_id=%s active_workers=%s scanned_tasks=%s actions=%s",
+            current_owner,
+            len(active_owner_ids),
+            len(tasks),
+            action_counts,
+        )
 
 
 def _claim_task(task_id: str) -> bool:
@@ -1877,84 +2022,104 @@ def _claim_pending_tasks(limit: int) -> list[str]:
 
     fetch_limit = max(1, limit)
     owner_id = get_worker_id()
-    now = now_local()
-    claim_deadline = now + timedelta(seconds=_dispatch_interval_seconds() * 4)
     use_skip_locked = _supports_skip_locked()
-    if not use_skip_locked:
-        candidate_ids: list[str] = []
+
+    def _do_claim_pending_tasks() -> list[dict[str, object]]:
+        now = now_local()
+        claim_deadline = now + timedelta(seconds=_dispatch_interval_seconds() * 4)
+        if not use_skip_locked:
+            candidate_ids: list[str] = []
+            db = get_db_session()
+            try:
+                candidate_ids = [
+                    row.id
+                    for row in (
+                        db.query(UnpackTask.id)
+                        .filter(UnpackTask.status == TaskStatus.PENDING.value)
+                        .order_by(UnpackTask.created_at.asc(), UnpackTask.id.asc())
+                        .limit(fetch_limit)
+                        .all()
+                    )
+                ]
+            finally:
+                db.close()
+            claimed_payloads: list[dict[str, object]] = []
+            for task_id in candidate_ids:
+                if len(claimed_payloads) >= fetch_limit:
+                    break
+                if _claim_task(task_id):
+                    claimed_payloads.append(
+                        {
+                            "task_id": task_id,
+                            "project_id": None,
+                            "status": TaskStatus.CLAIMED.value,
+                            "owner_id": owner_id,
+                            "event_recorded": True,
+                        }
+                    )
+            return claimed_payloads
+
         db = get_db_session()
+        claimed_payloads: list[dict[str, object]] = []
         try:
-            candidate_ids = [
-                row.id
-                for row in (
-                    db.query(UnpackTask.id)
-                    .filter(UnpackTask.status == TaskStatus.PENDING.value)
-                    .order_by(UnpackTask.created_at.asc(), UnpackTask.id.asc())
-                    .limit(fetch_limit)
-                    .all()
+            query = (
+                db.query(UnpackTask)
+                .filter(UnpackTask.status == TaskStatus.PENDING.value)
+                .order_by(UnpackTask.created_at.asc(), UnpackTask.id.asc())
+            )
+            if use_skip_locked:
+                query = query.with_for_update(skip_locked=True)
+            candidates = query.limit(fetch_limit).all()
+            for task in candidates:
+                dispatch_token = uuid.uuid4().hex
+                task.status = TaskStatus.CLAIMED.value
+                task.owner_id = owner_id
+                task.dispatch_owner_id = owner_id
+                task.dispatch_token = dispatch_token
+                task.dispatch_claimed_at = now
+                task.dispatch_lease_expires_at = claim_deadline
+                task.current_stage = "queued"
+                task.lease_expires_at = None
+                task.cancel_requested_at = None
+                task.heartbeat_at = now
+                task.last_progress_at = now
+                task.runner_pid = None
+                task.runner_started_at = None
+                task.runner_heartbeat_at = None
+                task.run_token = None
+                task.cancel_grace_deadline = None
+                task.cancel_force_deadline = None
+                task.started_at = None
+                task.completed_at = None
+                task.error_message = None
+                task.result_status = None
+                task.result_message = None
+                claimed_payloads.append(
+                    {
+                        "task_id": task.id,
+                        "project_id": task.project_id,
+                        "status": task.status,
+                        "owner_id": owner_id,
+                    }
                 )
-            ]
+            db.commit()
+            return claimed_payloads
+        except SQLAlchemyError:
+            db.rollback()
+            raise
         finally:
             db.close()
-        claimed_ids: list[str] = []
-        for task_id in candidate_ids:
-            if len(claimed_ids) >= fetch_limit:
-                break
-            if _claim_task(task_id):
-                claimed_ids.append(task_id)
-        return claimed_ids
 
-    db = get_db_session()
-    claimed_payloads: list[dict[str, object]] = []
-    try:
-        query = (
-            db.query(UnpackTask)
-            .filter(UnpackTask.status == TaskStatus.PENDING.value)
-            .order_by(UnpackTask.created_at.asc(), UnpackTask.id.asc())
-        )
-        if use_skip_locked:
-            query = query.with_for_update(skip_locked=True)
-        candidates = query.limit(fetch_limit).all()
-        for task in candidates:
-            dispatch_token = uuid.uuid4().hex
-            task.status = TaskStatus.CLAIMED.value
-            task.owner_id = owner_id
-            task.dispatch_owner_id = owner_id
-            task.dispatch_token = dispatch_token
-            task.dispatch_claimed_at = now
-            task.dispatch_lease_expires_at = claim_deadline
-            task.current_stage = "queued"
-            task.lease_expires_at = None
-            task.cancel_requested_at = None
-            task.heartbeat_at = now
-            task.last_progress_at = now
-            task.runner_pid = None
-            task.runner_started_at = None
-            task.runner_heartbeat_at = None
-            task.run_token = None
-            task.cancel_grace_deadline = None
-            task.cancel_force_deadline = None
-            task.started_at = None
-            task.completed_at = None
-            task.error_message = None
-            task.result_status = None
-            task.result_message = None
-            claimed_payloads.append(
-                {
-                    "task_id": task.id,
-                    "project_id": task.project_id,
-                    "status": task.status,
-                    "owner_id": owner_id,
-                }
-            )
-        db.commit()
-    except SQLAlchemyError:
-        db.rollback()
-        raise
-    finally:
-        db.close()
+    started_at = time.monotonic()
+    claimed_payloads = _run_db_retry(
+        "claim_pending_tasks",
+        _do_claim_pending_tasks,
+        context={"owner_id": owner_id, "limit": fetch_limit, "skip_locked": use_skip_locked},
+    )
 
     for payload in claimed_payloads:
+        if payload.get("event_recorded"):
+            continue
         _record_task_event(
             str(payload["task_id"]),
             project_id=payload.get("project_id"),
@@ -1966,12 +2131,27 @@ def _claim_pending_tasks(limit: int) -> list[str]:
             owner_id=str(payload["owner_id"]),
             created_by="task_manager",
         )
+    duration_ms = int((time.monotonic() - started_at) * 1000)
+    if claimed_payloads:
+        logger.info(
+            "claimed pending tasks owner_id=%s requested=%s claimed=%s skip_locked=%s duration_ms=%s",
+            owner_id,
+            fetch_limit,
+            len(claimed_payloads),
+            use_skip_locked,
+            duration_ms,
+        )
     return [str(item["task_id"]) for item in claimed_payloads]
 
 
 def _schedule_pending_tasks() -> None:
     available_slots = _runtime_max_concurrent() - _active_runner_count()
     if available_slots <= 0:
+        logger.debug(
+            "task dispatch backpressure owner_active=%s runtime_max=%s",
+            _active_runner_count(),
+            _runtime_max_concurrent(),
+        )
         return
 
     fetch_limit = max(available_slots, _claim_batch_size())

@@ -65,8 +65,13 @@ def build_gunicorn_argv() -> list[str]:
     ]
 
 
-if __name__ == "__main__":
+def main() -> int:
     import gunicorn.app.wsgiapp
 
     sys.argv = build_gunicorn_argv()
     gunicorn.app.wsgiapp.run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

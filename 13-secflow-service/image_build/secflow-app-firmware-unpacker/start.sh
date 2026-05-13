@@ -17,10 +17,10 @@ echo ""
 echo "Config: ${FIRMWARE_UNPACKER_CONFIG}"
 echo "Agent Dir: ${UNPACKER_AGENT_DIR}"
 echo "Tools Dir: ${UNPACKER_TOOLS_DIR}"
-echo "Starting FastAPI service with Gunicorn ..."
+echo "Runtime Role: ${FIRMWARE_UNPACKER_RUNTIME_ROLE:-all}"
 
 mkdir -p /app/data
 mkdir -p "${UNPACKER_TOOLS_DIR}"
 
 cd /app
-exec python3 /app/app/start.py
+exec python3 /app/app/entrypoint.py
