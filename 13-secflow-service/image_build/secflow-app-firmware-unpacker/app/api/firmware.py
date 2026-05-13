@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy import or_
 from sqlalchemy.orm import load_only
 
@@ -48,6 +48,7 @@ from app.schemas import (
 )
 from app.services.pod_metrics import get_pod_resource_usage
 from app.services.configcenter import get_configcenter_client
+from app.services.observability import generate_metrics_payload, metrics_content_type
 from app.services.task_events import list_task_events
 from app.services.task_manager import (
     cancel_task,
@@ -72,6 +73,11 @@ from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, list_round_dirs
 router = APIRouter(tags=["Firmware Unpacker"])
 logger = logging.getLogger(__name__)
 MAX_LOG_RENDER_BYTES = 128 * 1024
+
+
+@router.get("/metrics", include_in_schema=False)
+async def metrics() -> Response:
+    return Response(content=generate_metrics_payload(), media_type=metrics_content_type())
 
 
 def _normalize_project_id(project_id: Optional[str]) -> Optional[str]:

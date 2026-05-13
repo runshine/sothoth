@@ -21,6 +21,14 @@ from typing import Any, Callable, Dict, Optional
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import get_config
+from app.services.observability import (
+    record_claim_result,
+    record_cleanup_job,
+    record_db_operation_result,
+    record_db_retry,
+    record_dispatch_backpressure,
+    record_orphan_recovery,
+)
 from app.time_utils import isoformat_local, now_local
 from app.unpacker_engine_config import get_max_retries_reached_action
 from app.unpacker_engine_logs import TASK_RESULT_CACHE_FILENAME, atomic_write_json, scan_output_tree
@@ -244,11 +252,15 @@ def _run_db_retry(
     last_exc: BaseException | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return func()
+            result = func()
+            record_db_operation_result(operation_name, "success")
+            return result
         except SQLAlchemyError as exc:
             last_exc = exc
             if not _is_transient_db_error(exc) or attempt >= max_attempts:
+                record_db_operation_result(operation_name, "failed")
                 raise
+            record_db_retry(operation_name)
             sleep_seconds = min(2.0, delay * (2 ** (attempt - 1)))
             logger.warning(
                 "transient db error during %s, retrying attempt=%s/%s delay=%.2fs context=%s error=%s",
@@ -261,6 +273,7 @@ def _run_db_retry(
             )
             time.sleep(sleep_seconds)
     if last_exc is not None:
+        record_db_operation_result(operation_name, "failed")
         raise last_exc
     raise RuntimeError(f"{operation_name} retry loop exited unexpectedly")
 
@@ -1031,6 +1044,7 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
 
         error_message: Optional[str] = None
         requeue_task_id: Optional[str] = None
+        started_at = time.monotonic()
         try:
             if reason == "task_retry_reset":
                 db = get_db_session()
@@ -1131,6 +1145,11 @@ def process_workspace_cleanup_jobs(limit: int = 2) -> int:
             "finalize_workspace_cleanup_job",
             _finalize_cleanup_job,
             context={"job_id": job_id, "task_id": task_id, "owner_id": owner_id},
+        )
+        record_cleanup_job(
+            reason=reason,
+            result="failed" if error_message else ("success" if finalized else "skipped"),
+            duration_seconds=time.monotonic() - started_at,
         )
         if not finalized:
             processed += 1
@@ -1699,6 +1718,7 @@ def recover_orphaned_tasks() -> None:
 
     current_owner = get_worker_id()
     action_counts: dict[str, int] = {}
+    started_at = time.monotonic()
 
     for task in tasks:
         try:
@@ -1808,6 +1828,11 @@ def recover_orphaned_tasks() -> None:
             len(tasks),
             action_counts,
         )
+    record_orphan_recovery(
+        scanned_tasks=len(tasks),
+        action_counts=action_counts,
+        duration_seconds=time.monotonic() - started_at,
+    )
 
 
 def _claim_task(task_id: str) -> bool:
@@ -2111,11 +2136,19 @@ def _claim_pending_tasks(limit: int) -> list[str]:
             db.close()
 
     started_at = time.monotonic()
-    claimed_payloads = _run_db_retry(
-        "claim_pending_tasks",
-        _do_claim_pending_tasks,
-        context={"owner_id": owner_id, "limit": fetch_limit, "skip_locked": use_skip_locked},
-    )
+    try:
+        claimed_payloads = _run_db_retry(
+            "claim_pending_tasks",
+            _do_claim_pending_tasks,
+            context={"owner_id": owner_id, "limit": fetch_limit, "skip_locked": use_skip_locked},
+        )
+    except Exception:
+        record_claim_result(
+            claimed_count=0,
+            duration_seconds=time.monotonic() - started_at,
+            result="failed",
+        )
+        raise
 
     for payload in claimed_payloads:
         if payload.get("event_recorded"):
@@ -2132,6 +2165,11 @@ def _claim_pending_tasks(limit: int) -> list[str]:
             created_by="task_manager",
         )
     duration_ms = int((time.monotonic() - started_at) * 1000)
+    record_claim_result(
+        claimed_count=len(claimed_payloads),
+        duration_seconds=duration_ms / 1000.0,
+        result="success" if claimed_payloads else "empty",
+    )
     if claimed_payloads:
         logger.info(
             "claimed pending tasks owner_id=%s requested=%s claimed=%s skip_locked=%s duration_ms=%s",
@@ -2147,6 +2185,7 @@ def _claim_pending_tasks(limit: int) -> list[str]:
 def _schedule_pending_tasks() -> None:
     available_slots = _runtime_max_concurrent() - _active_runner_count()
     if available_slots <= 0:
+        record_dispatch_backpressure()
         logger.debug(
             "task dispatch backpressure owner_active=%s runtime_max=%s",
             _active_runner_count(),
