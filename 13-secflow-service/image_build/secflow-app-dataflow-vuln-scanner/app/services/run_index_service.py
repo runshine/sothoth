@@ -1063,21 +1063,17 @@ class RunIndexService:
                 db.flush()
         except IntegrityError:
             # Another manager/worker may have indexed this run concurrently while
-            # the current session was preparing a new RunIndex object.  Expunge
-            # the failed pending object before querying, otherwise SQLAlchemy can
-            # return the same not-inserted instance from the identity map and the
-            # final flush will try the duplicate INSERT again.
-            try:
-                db.expunge(record)
-            except Exception:
-                pass
-            with db.no_autoflush:
-                existing = _find_run_by_source(
-                    db,
-                    source_type=source_type,
-                    source_key=source_key,
-                    source_hash=source_hash,
-                )
+            # the current session was preparing a new RunIndex object.  Roll the
+            # transaction back so the failed INSERT is removed from the identity
+            # map, then update the already-created row instead of surfacing a
+            # duplicate-key failure to the execution runner.
+            db.rollback()
+            existing = _find_run_by_source(
+                db,
+                source_type=source_type,
+                source_key=source_key,
+                source_hash=source_hash,
+            )
             if existing is None:
                 raise
             record = existing
