@@ -432,6 +432,7 @@ DEFAULT_CONFIGS = [
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
     ("worker_history_retention_days", "7", "int", "失活 worker 历史记录保留天数，0=不自动删除"),
     ("cleanup_job_retention_days", "7", "int", "已完成工作目录清理任务保留天数，0=不自动删除"),
+    ("task_event_retention_days", "14", "int", "任务事件历史保留天数，仅清理终态任务或孤儿任务的老事件，0=不自动删除"),
     ("task_lease_seconds", "45", "int", "已废弃：任务执行不再使用租约，仅兼容清理任务配置"),
     ("task_lease_renew_interval_seconds", "10", "int", "已废弃：任务执行不再续租，保留用于旧配置兼容"),
     ("cancel_timeout_seconds", "120", "int", "任务取消最长等待秒数"),

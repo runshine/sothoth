@@ -6,7 +6,7 @@ from pathlib import Path
 import yaml
 
 from app.config import reload_config
-from app.model import WorkerInstance, WorkspaceCleanupJob, get_db_session, init_database
+from app.model import TaskStatus, UnpackTask, UnpackTaskEvent, WorkerInstance, WorkspaceCleanupJob, get_db_session, init_database
 import app.model as model_module
 import app.services.worker as worker_module
 from app.time_utils import now_local
@@ -29,6 +29,7 @@ class WorkerMaintenanceTests(unittest.TestCase):
                     "service": {
                         "worker_history_retention_days": 7,
                         "cleanup_job_retention_days": 7,
+                        "task_event_retention_days": 14,
                     },
                     "worker": {
                         "dead_threshold_seconds": 90,
@@ -201,5 +202,84 @@ class WorkerMaintenanceTests(unittest.TestCase):
             self.assertIsNone(db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.id == "job-old-failed").first())
             self.assertIsNotNone(db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.id == "job-fresh-success").first())
             self.assertIsNotNone(db.query(WorkspaceCleanupJob).filter(WorkspaceCleanupJob.id == "job-running").first())
+        finally:
+            db.close()
+
+    def test_prune_task_event_history_deletes_only_old_terminal_or_orphan_events(self):
+        old_time = now_local() - timedelta(days=20)
+        fresh_time = now_local() - timedelta(days=1)
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTask(
+                    id="t-terminal",
+                    project_id="p1",
+                    firmware_path="/tmp/fw.bin",
+                    output_path="/tmp/out1",
+                    status=TaskStatus.SUCCESS.value,
+                )
+            )
+            db.add(
+                UnpackTask(
+                    id="t-running",
+                    project_id="p1",
+                    firmware_path="/tmp/fw.bin",
+                    output_path="/tmp/out2",
+                    status=TaskStatus.RUNNING.value,
+                )
+            )
+            db.add(
+                UnpackTaskEvent(
+                    id="event-terminal-old",
+                    task_id="t-terminal",
+                    project_id="p1",
+                    event_type="done",
+                    summary="old terminal",
+                    created_at=old_time,
+                )
+            )
+            db.add(
+                UnpackTaskEvent(
+                    id="event-terminal-fresh",
+                    task_id="t-terminal",
+                    project_id="p1",
+                    event_type="done",
+                    summary="fresh terminal",
+                    created_at=fresh_time,
+                )
+            )
+            db.add(
+                UnpackTaskEvent(
+                    id="event-running-old",
+                    task_id="t-running",
+                    project_id="p1",
+                    event_type="progress",
+                    summary="old running",
+                    created_at=old_time,
+                )
+            )
+            db.add(
+                UnpackTaskEvent(
+                    id="event-orphan-old",
+                    task_id="t-missing",
+                    project_id="p1",
+                    event_type="orphan",
+                    summary="old orphan",
+                    created_at=old_time,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        deleted = worker_module.prune_task_event_history()
+
+        self.assertEqual(2, deleted)
+        db = get_db_session()
+        try:
+            self.assertIsNone(db.query(UnpackTaskEvent).filter(UnpackTaskEvent.id == "event-terminal-old").first())
+            self.assertIsNone(db.query(UnpackTaskEvent).filter(UnpackTaskEvent.id == "event-orphan-old").first())
+            self.assertIsNotNone(db.query(UnpackTaskEvent).filter(UnpackTaskEvent.id == "event-terminal-fresh").first())
+            self.assertIsNotNone(db.query(UnpackTaskEvent).filter(UnpackTaskEvent.id == "event-running-old").first())
         finally:
             db.close()

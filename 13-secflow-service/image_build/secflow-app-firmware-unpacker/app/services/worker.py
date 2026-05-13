@@ -9,6 +9,8 @@ import threading
 from datetime import timedelta
 from typing import Optional
 
+from sqlalchemy import or_
+
 from app.config import get_config
 from app.time_utils import now_local
 
@@ -75,6 +77,18 @@ def _runtime_cleanup_job_retention_days() -> int:
     try:
         default = int(get_config().service.cleanup_job_retention_days)
         value = get_config_value(db, "cleanup_job_retention_days", default=default)
+        return max(0, int(value))
+    finally:
+        db.close()
+
+
+def _runtime_task_event_retention_days() -> int:
+    from app.model import get_config_value, get_db_session
+
+    db = get_db_session()
+    try:
+        default = int(get_config().service.task_event_retention_days)
+        value = get_config_value(db, "task_event_retention_days", default=default)
         return max(0, int(value))
     finally:
         db.close()
@@ -257,6 +271,45 @@ def prune_finished_cleanup_jobs() -> int:
     return int(deleted or 0)
 
 
+def prune_task_event_history() -> int:
+    from app.model import TERMINAL_STATUSES, TaskStatus, UnpackTask, UnpackTaskEvent, get_db_session
+
+    retention_days = _runtime_task_event_retention_days()
+    if retention_days <= 0:
+        return 0
+
+    cutoff = now_local() - timedelta(days=retention_days)
+    terminal_values = [item.value if isinstance(item, TaskStatus) else str(item) for item in TERMINAL_STATUSES]
+    db = get_db_session()
+    deleted = 0
+    try:
+        deleted = (
+            db.query(UnpackTaskEvent)
+            .filter(
+                UnpackTaskEvent.created_at.isnot(None),
+                UnpackTaskEvent.created_at < cutoff,
+                or_(
+                    ~UnpackTaskEvent.task_id.in_(db.query(UnpackTask.id)),
+                    UnpackTaskEvent.task_id.in_(
+                        db.query(UnpackTask.id).filter(UnpackTask.status.in_(terminal_values))
+                    ),
+                ),
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    finally:
+        db.close()
+    if deleted:
+        logger.info(
+            "pruned task event history: deleted=%s retention_days=%s cutoff=%s",
+            deleted,
+            retention_days,
+            cutoff.isoformat(),
+        )
+    return int(deleted or 0)
+
+
 def cleanup_finished_tasks() -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.task_manager import enqueue_workspace_cleanup
@@ -363,6 +416,7 @@ def _maintenance_loop(interval: int) -> None:
             cleanup_finished_tasks()
             prune_worker_history()
             prune_finished_cleanup_jobs()
+            prune_task_event_history()
         except Exception as exc:
             logger.warning("worker maintenance loop warning: %s", exc)
 
