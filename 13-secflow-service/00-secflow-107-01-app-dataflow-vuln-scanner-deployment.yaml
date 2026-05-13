@@ -36,6 +36,12 @@ spec:
               value: /app/config.yaml
             - name: SECFLOW_DATAFLOW_ROLE
               value: manager
+            - name: PI_MODELS_JSON
+              value: /root/.pi/agent/models.json
+            - name: PI_CODING_AGENT_DIR
+              value: /root/.pi/agent
+            - name: QT_QPA_PLATFORM
+              value: offscreen
             - name: POD_ID
               valueFrom:
                 fieldRef:
@@ -131,6 +137,12 @@ spec:
               value: /app/config.yaml
             - name: SECFLOW_DATAFLOW_ROLE
               value: worker
+            - name: PI_MODELS_JSON
+              value: /root/.pi/agent/models.json
+            - name: PI_CODING_AGENT_DIR
+              value: /root/.pi/agent
+            - name: QT_QPA_PLATFORM
+              value: offscreen
             - name: POD_ID
               valueFrom:
                 fieldRef:
