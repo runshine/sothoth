@@ -1137,6 +1137,74 @@ def test_run_status_prefers_active_run_meta_over_stale_terminal_state(service_co
     assert detail.json()["status"] == "running"
 
 
+def test_run_detail_uses_failed_task_status_when_index_is_stale_running(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_failed_task_running_index_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+    with get_db_session() as db:
+        trigger = db.get(TriggerTask, bound["task_id"])
+        execution = db.get(WorkflowExecution, bound["execution_id"])
+        run_index = db.get(RunIndex, bound["run_id"])
+        assert trigger is not None and execution is not None and run_index is not None
+        trigger.status = "failed"
+        trigger.message = "stale active runtime assumed failed"
+        execution.status = "failed"
+        execution.message = "stale active runtime assumed failed"
+        execution.process_status = "exited"
+        run_index.status = "running"
+        db.add_all([trigger, execution, run_index])
+        db.commit()
+        enriched = get_execution_service()._enrich_run_payload(db, run_index, {"status": "running"})
+
+    assert enriched["status"] == "failed"
+    assert enriched["process_state"]["display_status"] == "runtime_lost"
+
+
+def test_run_status_uses_terminal_control_status_without_finished_at(service_config_path):
+    app = create_app()
+    client = TestClient(app)
+    run_root = _project_runs_root() / "bound_stale_failed_meta_20260508_010203"
+    bound = _create_execution_bound_run(client, run_root)
+    atomic = run_root / "workspace" / "pipeline_demo_run_001" / "stage_01_vuln_scan" / "vuln_scan_initial_001"
+    time.sleep(0.02)
+    _write_json(run_root / "_meta" / "run_timestamps.json", {
+        "started_at": "2026-05-07T10:15:02",
+        "finished_at": None,
+        "status": "failed",
+        "control_message": "stale active runtime assumed failed",
+    })
+    _write_json(atomic / "_meta" / "state.json", {
+        "current_state": "running",
+        "timestamp": "2026-05-07T10:19:58Z",
+    })
+    _write_json(atomic / "_meta" / "workflow_result.json", {
+        "status": "running",
+        "timestamp": "2026-05-07T10:19:58Z",
+        "detail": {"cycles_used": 2},
+    })
+
+    detail = client.get(f"/api/dataflow-vuln-scanner/runs/{bound['run_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["status"] == "failed"
+
+
+def test_run_control_state_sets_finished_at_for_terminal_status(service_config_path):
+    run_root = _project_runs_root() / "bound_control_finished_at_20260508_010203"
+    _create_run_workspace(run_root)
+    _write_json(run_root / "_meta" / "run_timestamps.json", {
+        "started_at": "2026-05-07T10:15:02",
+        "finished_at": None,
+        "status": "running",
+    })
+
+    get_execution_service()._write_run_control_state(run_root, status_text="failed", message="stale active runtime assumed failed")
+
+    payload = json.loads((run_root / "_meta" / "run_timestamps.json").read_text(encoding="utf-8"))
+    assert payload["status"] == "failed"
+    assert payload["finished_at"]
+
+
 def test_run_status_preserves_specific_terminal_workflow_result(service_config_path):
     app = create_app()
     client = TestClient(app)

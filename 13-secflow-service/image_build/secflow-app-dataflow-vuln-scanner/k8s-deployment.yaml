@@ -116,6 +116,7 @@ spec:
         role: worker
         name: secflow-app-dataflow-vuln-scanner-worker
     spec:
+      terminationGracePeriodSeconds: 120
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname
@@ -128,6 +129,18 @@ spec:
       - name: secflow-app-dataflow-vuln-scanner-worker
         image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:20260513-9153889
         imagePullPolicy: Always
+        lifecycle:
+          preStop:
+            exec:
+              command:
+              - /bin/sh
+              - -c
+              - |
+                curl -fsS -m 55 -X POST \
+                  -H "Authorization: Bearer ${SECFLOW_DATAFLOW_SERVICE_MACHINE_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d '{"reason":"worker pod terminating","wait_seconds":45}' \
+                  http://127.0.0.1:8080/api/v1/jobs/drain || true
         env:
         - name: TZ
           value: Asia/Shanghai

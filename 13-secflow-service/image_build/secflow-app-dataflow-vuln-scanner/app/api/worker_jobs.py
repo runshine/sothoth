@@ -20,6 +20,15 @@ async def create_job(payload: dict[str, Any], _subject=Depends(get_machine_subje
     return get_scheduler_service().create_local_job(payload)
 
 
+@router.post("/drain")
+async def drain_jobs(payload: dict[str, Any] | None = None, _subject=Depends(get_machine_subject)) -> dict[str, Any]:
+    payload = payload or {}
+    return get_scheduler_service().drain_local_jobs(
+        reason=str(payload.get("reason") or "worker draining"),
+        wait_seconds=int(payload.get("wait_seconds") or 45),
+    )
+
+
 @router.get("/{job_id}")
 async def get_job(job_id: str, _subject=Depends(get_machine_subject)) -> dict[str, Any]:
     job = get_scheduler_service().get_local_job(job_id)

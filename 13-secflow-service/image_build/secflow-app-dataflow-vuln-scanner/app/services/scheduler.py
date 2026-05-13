@@ -191,7 +191,8 @@ class SchedulerService:
                     metadata_json={"service": "secflow-app-dataflow-vuln-scanner", "role": self.role},
                 )
             else:
-                self._worker_status = worker.status if worker.status in {"active", "draining"} else self._worker_status
+                if self._worker_status != "draining" and worker.status in {"active", "draining"}:
+                    self._worker_status = worker.status
                 worker.host_name = self.host_name
                 worker.capacity = self.capacity
                 worker.running_count = len(self._running_tasks)
@@ -774,6 +775,56 @@ class SchedulerService:
             return self._job_payload(execution)
         finally:
             db.close()
+
+    def drain_local_jobs(self, *, reason: str = "worker draining", wait_seconds: int = 45) -> dict[str, Any]:
+        if not self.is_http_worker_role or self.role == "manager":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="this service instance is not a dataflow worker")
+        self._worker_status = "draining"
+        try:
+            self._heartbeat_once()
+        except Exception:
+            logger.exception("failed to publish worker draining heartbeat")
+
+        db = get_db_session()
+        try:
+            jobs = (
+                db.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.owner_pod_id == self.pod_id,
+                    WorkflowExecution.status.in_(tuple(ACTIVE_JOB_STATUSES)),
+                )
+                .order_by(WorkflowExecution.created_at.asc())
+                .all()
+            )
+            job_ids = [str(item.worker_job_id or item.id) for item in jobs]
+        finally:
+            db.close()
+
+        cancelled: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for job_id in job_ids:
+            try:
+                cancelled.append(self.cancel_local_job(job_id))
+            except Exception as exc:
+                logger.exception("failed to cancel local job during drain: job_id=%s", job_id)
+                errors.append({"job_id": job_id, "error": str(exc)})
+
+        deadline = time.monotonic() + max(0, int(wait_seconds or 0))
+        while self._running_tasks and time.monotonic() < deadline:
+            time.sleep(1)
+        try:
+            self._heartbeat_once()
+        except Exception:
+            logger.exception("failed to publish worker drain completion heartbeat")
+        return {
+            "status": "draining",
+            "pod_id": self.pod_id,
+            "reason": reason,
+            "cancel_requested": len(cancelled),
+            "running_remaining": len(self._running_tasks),
+            "jobs": cancelled,
+            "errors": errors,
+        }
 
     def _local_job_query(self, db: Session, job_id: str) -> WorkflowExecution | None:
         return (

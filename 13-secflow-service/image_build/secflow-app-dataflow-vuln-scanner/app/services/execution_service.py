@@ -110,6 +110,27 @@ def _project_ids(principal: dict) -> set[str]:
 
 _ACTIVE_RUN_INDEX_STATUSES = {"pending", "queued", "running", "cancel_requested", "delete_requested"}
 _QUEUE_RUN_INDEX_STATUSES = {"pending", "queued"}
+_TERMINAL_RUN_INDEX_STATUSES = {
+    "succeeded",
+    "completed",
+    "failed",
+    "cancelled",
+    "interrupted",
+    "stopped",
+    "deleted",
+    "review_error",
+    "review_plateau",
+    "summary_incomplete",
+    "runtime_output_limit",
+    "runtime_timeout",
+    "blocked_context_window",
+    "blocked_quota",
+    "provider_rate_limited",
+    "model_contract_violation",
+    "blocked_external_source",
+    "no_workspace",
+    "error",
+}
 _RETRYABLE_RUN_INDEX_STATUSES = {
     "cancelled",
     "failed",
@@ -1116,13 +1137,17 @@ class ExecutionService:
                     payload = json.loads(timestamp_path.read_text(encoding="utf-8"))
                 except Exception:
                     payload = {}
+            current = now_local()
+            normalized_status = str(status_text or "").strip().lower()
             payload.update(
                 {
-                    "status": status_text,
+                    "status": normalized_status or status_text,
                     "control_message": message,
-                    "last_updated_at": isoformat_local(now_local()),
+                    "last_updated_at": isoformat_local(current),
                 }
             )
+            if normalized_status in _TERMINAL_RUN_INDEX_STATUSES and not payload.get("finished_at"):
+                payload["finished_at"] = isoformat_local(current)
             write_json(
                 timestamp_path,
                 payload,
@@ -3026,10 +3051,49 @@ class ExecutionService:
 
         return base
 
+    def _effective_run_payload_status(
+        self,
+        current_status: str | None,
+        *,
+        trigger: TriggerTask | None,
+        execution: WorkflowExecution | None,
+        process_state: dict[str, Any],
+    ) -> str:
+        current = str(current_status or "").strip().lower()
+        linked_statuses = [
+            str(execution.status or "").strip().lower() if execution is not None else "",
+            str(trigger.status or "").strip().lower() if trigger is not None else "",
+        ]
+        if current in _ACTIVE_RUN_INDEX_STATUSES or not current:
+            terminal_linked_statuses = [candidate for candidate in linked_statuses if candidate in _TERMINAL_RUN_INDEX_STATUSES]
+            for candidate in terminal_linked_statuses:
+                if candidate not in {"succeeded", "completed"}:
+                    return candidate
+            if (
+                not terminal_linked_statuses
+                and bool(process_state.get("stale"))
+                and process_state.get("is_running") is False
+            ):
+                # Unlinked/legacy run directories can still have a stale
+                # state.json that says "running" after the runtime process has
+                # vanished.  Surface that as interrupted so the UI does not show
+                # an impossible active process and enables retry guidance.
+                return "interrupted"
+        return current or str(current_status or "")
+
     def _enrich_run_payload(self, db: Session, run_index, payload: dict[str, Any]) -> dict[str, Any]:
         trigger, execution = self._linked_run_index_runtime(db, run_index)
         enriched = dict(payload)
-        enriched["process_state"] = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+        process_state = self._run_process_state(db, run_index, trigger=trigger, execution=execution)
+        enriched["process_state"] = process_state
+        effective_status = self._effective_run_payload_status(
+            enriched.get("status"),
+            trigger=trigger,
+            execution=execution,
+            process_state=process_state,
+        )
+        if effective_status and effective_status != str(enriched.get("status") or "").strip().lower():
+            enriched["status"] = effective_status
         retry_command = self._retry_command_display(db, run_index=run_index, trigger=trigger, execution=execution)
         enriched["retry_command_display"] = retry_command or None
         if trigger is not None:
