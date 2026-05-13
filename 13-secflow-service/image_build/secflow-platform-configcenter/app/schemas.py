@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 LlmProviderFileFormat = Literal["json", "yaml", "yml", "toml", "env", "conf", "txt", "md", "xml", "ini", "other"]
@@ -18,6 +18,8 @@ class LlmProviderFileBinding(BaseModel):
 
 
 class LlmProviderBase(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     provider_key: str
     display_name: str
     provider_type: str

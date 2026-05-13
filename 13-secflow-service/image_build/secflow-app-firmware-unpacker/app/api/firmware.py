@@ -1549,6 +1549,7 @@ def _list_tasks(
     project_id: Optional[str],
     status_filter: Optional[str],
     owner_id: Optional[str],
+    origin_mode: Optional[str],
     search: Optional[str],
     limit: int,
     offset: int,
@@ -1562,6 +1563,23 @@ def _list_tasks(
             query = query.filter(UnpackTask.status == status_filter)
         if owner_id:
             query = query.filter(UnpackTask.owner_id == owner_id)
+        normalized_origin_mode = str(origin_mode or "").strip().lower()
+        if normalized_origin_mode == "manual":
+            query = query.filter(
+                or_(
+                    UnpackTask.task_origin_type.is_(None),
+                    UnpackTask.task_origin_type == "",
+                    UnpackTask.task_origin_type == "manual",
+                )
+            )
+        elif normalized_origin_mode == "linked":
+            query = query.filter(
+                and_(
+                    UnpackTask.task_origin_type.is_not(None),
+                    UnpackTask.task_origin_type != "",
+                    UnpackTask.task_origin_type != "manual",
+                )
+            )
         if search:
             like_value = f"%{search}%"
             query = query.filter(
@@ -1871,6 +1889,7 @@ async def list_project_tasks(
     project_id: str,
     status_filter: Optional[str] = Query(default=None, alias="status"),
     owner_id: Optional[str] = Query(default=None),
+    origin_mode: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -1878,7 +1897,7 @@ async def list_project_tasks(
 ):
     _, token = subject_and_token
     await ensure_project_access(project_id, token)
-    return _list_tasks(project_id, status_filter, owner_id, search, limit, offset)
+    return _list_tasks(project_id, status_filter, owner_id, origin_mode, search, limit, offset)
 
 
 @router.get(
@@ -2155,6 +2174,7 @@ async def list_tasks_legacy(
     project_id: Optional[str] = Query(default=None),
     status_filter: Optional[str] = Query(default=None, alias="status"),
     owner_id: Optional[str] = Query(default=None),
+    origin_mode: Optional[str] = Query(default=None),
     search: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
@@ -2168,6 +2188,7 @@ async def list_tasks_legacy(
         normalized_project_id,
         status_filter,
         owner_id,
+        origin_mode,
         search,
         limit,
         offset,

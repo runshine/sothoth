@@ -4,7 +4,7 @@
 
 import json
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from sqlalchemy import (
     Column,
@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     create_engine,
+    inspect,
     text,
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -168,17 +169,38 @@ def ensure_agent_ingress_route_table():
         deleted_at DATETIME
     )
     """
-    index_sql_list = [
-        f"CREATE INDEX IF NOT EXISTS idx_{table_name}_project_agent ON {table_name} (project_id, agent_key)",
-        f"CREATE INDEX IF NOT EXISTS idx_{table_name}_project_status ON {table_name} (project_id, status)",
-        f"CREATE INDEX IF NOT EXISTS idx_{table_name}_updated_at ON {table_name} (updated_at)",
-    ]
+    expected_indexes = {
+        f"idx_{table_name}_project_agent": ["project_id", "agent_key"],
+        f"idx_{table_name}_project_status": ["project_id", "status"],
+        f"idx_{table_name}_updated_at": ["updated_at"],
+    }
 
     with engine.connect() as conn:
         conn.execute(text(create_table_sql))
-        for index_sql in index_sql_list:
-            conn.execute(text(index_sql))
         conn.commit()
+
+    _ensure_agent_ingress_route_indexes(engine, table_name, expected_indexes)
+
+
+def _ensure_agent_ingress_route_indexes(engine, table_name: str, expected_indexes: Dict[str, List[str]]):
+    """为动态路由表补齐缺失索引，避免使用不兼容的 IF NOT EXISTS 语法。"""
+    try:
+        existing_indexes = {
+            index.get("name")
+            for index in inspect(engine).get_indexes(table_name)
+            if index.get("name")
+        }
+    except Exception:
+        existing_indexes = set()
+
+    with engine.begin() as conn:
+        for index_name, columns in expected_indexes.items():
+            if index_name in existing_indexes:
+                continue
+            column_sql = ", ".join(columns)
+            conn.execute(
+                text(f"CREATE INDEX {index_name} ON {table_name} ({column_sql})")
+            )
 
 
 def _row_to_route_dict(row) -> Dict:
