@@ -1,26 +1,32 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: secflow-app-system-analyse
+  name: secflow-app-system-analyse-worker
   namespace: secflow-ns
 spec:
   replicas: 1
   selector:
     matchLabels:
-      name: secflow-app-system-analyse
+      name: secflow-app-system-analyse-worker
   template:
     metadata:
       labels:
-        name: secflow-app-system-analyse
+        name: secflow-app-system-analyse-worker
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
-      - name: secflow-app-system-analyse
+      - name: secflow-app-system-analyse-worker
         image: ghcr.io/runshine/secflow-app-system-analyse:latest
         imagePullPolicy: Always
         env:
           - name: SECFLOW_SYSTEM_ANALYSE_ROLE
-            value: api
+            value: worker
+          - name: POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: SECFLOW_SYSTEM_ANALYSE_WORKER_TASK_CONCURRENCY
+            value: "1"
           - name: TZ
             value: Asia/Shanghai
           - name: PORT
