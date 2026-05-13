@@ -26,7 +26,7 @@ spec:
             role: manager
       containers:
       - name: secflow-app-dataflow-vuln-scanner-manager
-        image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:20260513-9153889
+        image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:20260513-559a953
         imagePullPolicy: Always
         env:
         - name: TZ
@@ -127,7 +127,7 @@ spec:
             role: worker
       containers:
       - name: secflow-app-dataflow-vuln-scanner-worker
-        image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:20260513-9153889
+        image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:20260513-559a953
         imagePullPolicy: Always
         lifecycle:
           preStop:
