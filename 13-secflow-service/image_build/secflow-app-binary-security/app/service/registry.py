@@ -10,6 +10,7 @@ from typing import Optional
 import httpx
 
 from app.config import get_config
+from app.service.http_client import get_shared_async_client
 
 
 logger = logging.getLogger(__name__)
@@ -70,13 +71,13 @@ class RegistryService:
         if not self.config.enabled:
             return True
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(self._register_url(), json=self._payload())
-                if response.status_code in (200, 201):
-                    logger.info("服务注册成功: %s", json.dumps(self._payload(), ensure_ascii=False))
-                    return True
-                logger.warning("服务注册失败: %s %s", response.status_code, response.text)
-                return False
+            client = await get_shared_async_client("registry-service", timeout=10)
+            response = await client.post(self._register_url(), json=self._payload())
+            if response.status_code in (200, 201):
+                logger.info("服务注册成功: %s", json.dumps(self._payload(), ensure_ascii=False))
+                return True
+            logger.warning("服务注册失败: %s %s", response.status_code, response.text)
+            return False
         except Exception as exc:
             logger.warning("服务注册异常: %s", exc)
             return False
@@ -85,11 +86,11 @@ class RegistryService:
         if not self.config.enabled:
             return True
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(self._heartbeat_url())
-                if response.status_code == 404:
-                    return await self.register()
-                return response.status_code == 200
+            client = await get_shared_async_client("registry-service", timeout=10)
+            response = await client.post(self._heartbeat_url())
+            if response.status_code == 404:
+                return await self.register()
+            return response.status_code == 200
         except Exception as exc:
             logger.warning("心跳异常: %s", exc)
             return False
@@ -98,9 +99,9 @@ class RegistryService:
         if not self.config.enabled:
             return True
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.delete(self._unregister_url())
-                return response.status_code in (200, 404)
+            client = await get_shared_async_client("registry-service", timeout=10)
+            response = await client.delete(self._unregister_url())
+            return response.status_code in (200, 404)
         except Exception:
             return False
 

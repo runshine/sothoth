@@ -8,6 +8,7 @@ import httpx
 
 from app.config import get_config
 from app.exception import ForbiddenError, UpstreamError
+from app.service.http_client import get_shared_async_client
 
 
 class ProjectService:
@@ -16,11 +17,11 @@ class ProjectService:
 
     async def require_access(self, token: str, project_id: str) -> dict:
         try:
-            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-                resp = await client.get(
-                    f"{self.config.base_url}{self.config.get_project_path}/{project_id}",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
+            client = await get_shared_async_client("project-service", timeout=self.config.timeout)
+            resp = await client.get(
+                f"{self.config.base_url}{self.config.get_project_path}/{project_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
         except httpx.TimeoutException:
             raise UpstreamError("Project 服务请求超时")
         except httpx.ConnectError as exc:

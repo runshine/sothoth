@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, Query
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.exception import UnauthorizedError
 from app.model import get_db
+from app.runtime_health import collect_readiness
 from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityArtifactsResponse,
@@ -67,7 +69,9 @@ async def health_check():
 
 @router.get("/ready")
 async def ready_check():
-    return {"status": "ready"}
+    payload = await collect_readiness()
+    status_code = 200 if payload.get("status") == "ready" else 503
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 @router.get("/projects/{project_id}/tasks", response_model=BinarySecurityTaskListResponse)

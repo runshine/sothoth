@@ -20,7 +20,9 @@ from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
 from app.observability import observe_api_request, render_metrics
+from app.service.http_client import close_all_async_clients
 from app.service.registry import get_registry_service
+from app.service.task_queue import close_task_queue
 from app.service.task_manager import get_task_manager
 
 
@@ -122,6 +124,8 @@ async def lifespan(_: FastAPI):
             await get_task_manager().stop()
         if _registry_enabled():
             await get_registry_service().stop()
+        await close_task_queue()
+        await close_all_async_clients()
     except Exception as exc:
         logger.warning("Binary Security 服务关闭警告: %s", exc)
 

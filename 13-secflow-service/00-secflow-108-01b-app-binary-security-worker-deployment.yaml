@@ -19,6 +19,7 @@ spec:
         prometheus.io/path: /metrics
         prometheus.io/port: "8080"
     spec:
+      terminationGracePeriodSeconds: 120
       dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: secflow-app-binary-security-worker
@@ -58,6 +59,26 @@ spec:
             limits:
               memory: "1Gi"
               cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /api/app/binary-security/health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/app/binary-security/ready
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 20"]
       volumes:
         - name: secflow-app-binary-security-config
           configMap:

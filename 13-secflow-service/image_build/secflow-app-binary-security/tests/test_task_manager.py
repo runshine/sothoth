@@ -17,6 +17,8 @@ from app.model import (
     build_archive_job_dedupe_key,
     build_stage_item_identity_key,
 )
+from app.exception import ValidationError
+from app.schemas import BinarySecurityServiceConfigPayload
 from app.schemas import BinarySecurityArchiveJobResponse, BinarySecurityTaskConcurrencyUpdatePayload
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
@@ -3191,6 +3193,51 @@ class TaskManagerTests(unittest.TestCase):
             ["dir-1/file-1.txt", "dir-2/file-2.txt"],
             [entry["path"] for entry in page["files"]],
         )
+
+    def test_safe_extract_archive_rejects_excessive_file_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = TaskManager()
+            manager.cfg.storage.max_source_extract_files = 1
+            archive_path = Path(tmp) / "source.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("a.txt", "a")
+                archive.writestr("b.txt", "b")
+            with self.assertRaises(ValidationError):
+                manager._safe_extract_archive(archive_path, Path(tmp) / "out")
+
+    def test_validate_uploaded_archive_size_rejects_oversized_source_archive(self):
+        manager = TaskManager()
+        manager.cfg.storage.max_upload_file_bytes = 10
+        manager.cfg.storage.max_source_archive_bytes = 8
+        with self.assertRaises(ValidationError):
+            manager._validate_uploaded_archive_size("archive.zip", 11, source_task=True)
+
+    def test_service_config_includes_lease_timeout_default(self):
+        payload = BinarySecurityServiceConfigPayload()
+        self.assertEqual(90, payload.lease_timeout_seconds)
+
+    def test_claim_pending_tasks_reclaims_expired_lease(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+        )
+        task.dispatcher_instance_id = "other-worker"
+        task.dispatch_started_at = _now() - timedelta(minutes=10)
+        task.lease_expires_at = _now() - timedelta(seconds=1)
+        db = _FakeDb([task])
+
+        claimed = self.manager._claim_pending_tasks(db, 1)
+
+        self.assertEqual(["t1"], claimed)
+        self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+        self.assertIsNotNone(task.lease_expires_at)
 
 
 if __name__ == "__main__":
