@@ -7,6 +7,7 @@ spec:
   type: ClusterIP
   selector:
     name: secflow-app-firmware-unpacker
+    component: api
   ports:
     - port: 80
       targetPort: 8080

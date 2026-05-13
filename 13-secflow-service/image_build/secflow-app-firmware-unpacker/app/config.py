@@ -87,6 +87,12 @@ class ServiceConfig(BaseModel):
     task_retention_days: int = 7
 
 
+class RuntimeConfig(BaseModel):
+    """Process runtime role configuration."""
+
+    role: str = "all"
+
+
 class WorkerConfig(BaseModel):
     """Worker runtime configuration."""
 
@@ -167,6 +173,7 @@ class Config(BaseModel):
     project_service: ProjectServiceConfig = Field(default_factory=ProjectServiceConfig)
     configcenter_service: ConfigCenterServiceConfig = Field(default_factory=ConfigCenterServiceConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     worker: WorkerConfig = Field(default_factory=WorkerConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     app: AppConfig = Field(default_factory=AppConfig)
@@ -214,6 +221,29 @@ def load_config(config_path: Optional[str] = None) -> Config:
     _config = Config()
     _ensure_local_database_dir(_config)
     return _config
+
+
+def get_runtime_roles() -> set[str]:
+    cfg = get_config()
+    env_value = os.environ.get("FIRMWARE_UNPACKER_RUNTIME_ROLE")
+    raw_value = env_value if env_value is not None else cfg.runtime.role
+    tokens = [
+        item.strip().lower()
+        for item in str(raw_value or "all").replace("+", ",").split(",")
+        if item.strip()
+    ]
+    roles = set(tokens or ["all"])
+    if "all" in roles:
+        return {"all"}
+    return roles
+
+
+def runtime_has_role(role: str) -> bool:
+    normalized = str(role or "").strip().lower()
+    if not normalized:
+        return False
+    roles = get_runtime_roles()
+    return "all" in roles or normalized in roles
 
 
 def get_config() -> Config:

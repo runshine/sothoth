@@ -16,9 +16,13 @@ from app.time_utils import now_local
 logger = logging.getLogger(__name__)
 
 _heartbeat_thread: Optional[threading.Thread] = None
+_maintenance_thread: Optional[threading.Thread] = None
 _cleanup_thread: Optional[threading.Thread] = None
 _evolution_thread: Optional[threading.Thread] = None
-_stop_event = threading.Event()
+_heartbeat_stop_event = threading.Event()
+_maintenance_stop_event = threading.Event()
+_cleanup_stop_event = threading.Event()
+_evolution_stop_event = threading.Event()
 _active_lock = threading.Lock()
 
 
@@ -219,6 +223,10 @@ def get_cluster_snapshot() -> dict:
         all_tasks = db.query(UnpackTask).all()
         task_counts = {
             TaskStatus.PENDING.value: 0,
+            TaskStatus.CLAIMED.value: 0,
+            TaskStatus.RETRY_PREPARING.value: 0,
+            TaskStatus.ARCHIVE_PENDING.value: 0,
+            TaskStatus.ARCHIVING.value: 0,
             TaskStatus.RUNNING.value: 0,
             TaskStatus.CANCELLING.value: 0,
             TaskStatus.CANCELLED.value: 0,
@@ -242,20 +250,27 @@ def get_cluster_snapshot() -> dict:
 
 
 def _heartbeat_loop(interval: int) -> None:
-    while not _stop_event.wait(timeout=interval):
+    while not _heartbeat_stop_event.wait(timeout=interval):
         try:
             heartbeat()
             refresh_worker_active_tasks()
+        except Exception as exc:
+            logger.warning("worker heartbeat loop warning: %s", exc)
+
+
+def _maintenance_loop(interval: int) -> None:
+    while not _maintenance_stop_event.wait(timeout=interval):
+        try:
             reclaim_orphaned_tasks()
             cleanup_finished_tasks()
         except Exception as exc:
-            logger.warning("worker heartbeat loop warning: %s", exc)
+            logger.warning("worker maintenance loop warning: %s", exc)
 
 
 def _cleanup_loop(interval: int) -> None:
     from app.services.task_manager import process_workspace_cleanup_jobs
 
-    while not _stop_event.wait(timeout=interval):
+    while not _cleanup_stop_event.wait(timeout=interval):
         try:
             process_workspace_cleanup_jobs()
         except Exception as exc:
@@ -265,20 +280,20 @@ def _cleanup_loop(interval: int) -> None:
 def _evolution_loop(interval: int) -> None:
     from app.services.task_manager import process_evolution_jobs
 
-    while not _stop_event.wait(timeout=interval):
+    while not _evolution_stop_event.wait(timeout=interval):
         try:
             process_evolution_jobs()
         except Exception as exc:
             logger.warning("evolution loop warning: %s", exc)
 
 
-def start_heartbeat(interval: Optional[int] = None) -> None:
-    global _heartbeat_thread, _cleanup_thread, _evolution_thread
+def start_worker_heartbeat(interval: Optional[int] = None) -> None:
+    global _heartbeat_thread
 
     if _heartbeat_thread and _heartbeat_thread.is_alive():
         return
 
-    _stop_event.clear()
+    _heartbeat_stop_event.clear()
     loop_interval = interval or int(get_config().worker.heartbeat_interval_seconds)
     _heartbeat_thread = threading.Thread(
         target=_heartbeat_loop,
@@ -287,6 +302,55 @@ def start_heartbeat(interval: Optional[int] = None) -> None:
         daemon=True,
     )
     _heartbeat_thread.start()
+    logger.info("worker heartbeat started")
+
+
+def stop_worker_heartbeat() -> None:
+    global _heartbeat_thread
+
+    _heartbeat_stop_event.set()
+    if _heartbeat_thread and _heartbeat_thread.is_alive():
+        _heartbeat_thread.join(timeout=5)
+    _heartbeat_thread = None
+    logger.info("worker heartbeat stopped")
+
+
+def start_cluster_maintenance(interval: Optional[int] = None) -> None:
+    global _maintenance_thread
+
+    if _maintenance_thread and _maintenance_thread.is_alive():
+        return
+
+    _maintenance_stop_event.clear()
+    loop_interval = interval or int(get_config().worker.heartbeat_interval_seconds)
+    _maintenance_thread = threading.Thread(
+        target=_maintenance_loop,
+        args=(max(5, loop_interval),),
+        name="fw-worker-maintenance",
+        daemon=True,
+    )
+    _maintenance_thread.start()
+    logger.info("worker maintenance loop started")
+
+
+def stop_cluster_maintenance() -> None:
+    global _maintenance_thread
+
+    _maintenance_stop_event.set()
+    if _maintenance_thread and _maintenance_thread.is_alive():
+        _maintenance_thread.join(timeout=5)
+    _maintenance_thread = None
+    logger.info("worker maintenance loop stopped")
+
+
+def start_cleanup_loop(interval: Optional[int] = None) -> None:
+    global _cleanup_thread
+
+    if _cleanup_thread and _cleanup_thread.is_alive():
+        return
+
+    _cleanup_stop_event.clear()
+    loop_interval = interval or int(get_config().worker.heartbeat_interval_seconds)
     _cleanup_thread = threading.Thread(
         target=_cleanup_loop,
         args=(max(5, loop_interval),),
@@ -294,6 +358,27 @@ def start_heartbeat(interval: Optional[int] = None) -> None:
         daemon=True,
     )
     _cleanup_thread.start()
+    logger.info("workspace cleanup loop started")
+
+
+def stop_cleanup_loop() -> None:
+    global _cleanup_thread
+
+    _cleanup_stop_event.set()
+    if _cleanup_thread and _cleanup_thread.is_alive():
+        _cleanup_thread.join(timeout=5)
+    _cleanup_thread = None
+    logger.info("workspace cleanup loop stopped")
+
+
+def start_evolution_loop(interval: Optional[int] = None) -> None:
+    global _evolution_thread
+
+    if _evolution_thread and _evolution_thread.is_alive():
+        return
+
+    _evolution_stop_event.clear()
+    loop_interval = interval or int(get_config().worker.heartbeat_interval_seconds)
     _evolution_thread = threading.Thread(
         target=_evolution_loop,
         args=(max(5, loop_interval),),
@@ -301,15 +386,54 @@ def start_heartbeat(interval: Optional[int] = None) -> None:
         daemon=True,
     )
     _evolution_thread.start()
-    logger.info("worker heartbeat started")
+    logger.info("evolution loop started")
+
+
+def stop_evolution_loop() -> None:
+    global _evolution_thread
+
+    _evolution_stop_event.set()
+    if _evolution_thread and _evolution_thread.is_alive():
+        _evolution_thread.join(timeout=5)
+    _evolution_thread = None
+    logger.info("evolution loop stopped")
+
+
+def start_heartbeat(interval: Optional[int] = None) -> None:
+    start_worker_heartbeat(interval)
+    start_cluster_maintenance(interval)
+    start_cleanup_loop(interval)
+    start_evolution_loop(interval)
 
 
 def stop_heartbeat() -> None:
-    _stop_event.set()
+    stop_evolution_loop()
+    stop_cleanup_loop()
+    stop_cluster_maintenance()
+    stop_worker_heartbeat()
+
+
+def stop_background_loops() -> None:
+    stop_heartbeat()
+
+
+def stop_selected_loops(*, heartbeat: bool = False, maintenance: bool = False, cleanup: bool = False, evolution: bool = False) -> None:
+    if evolution:
+        stop_evolution_loop()
+    if cleanup:
+        stop_cleanup_loop()
+    if maintenance:
+        stop_cluster_maintenance()
+    if heartbeat:
+        stop_worker_heartbeat()
+
+
+def stop_all_loops() -> None:
     if _heartbeat_thread and _heartbeat_thread.is_alive():
-        _heartbeat_thread.join(timeout=5)
+        stop_worker_heartbeat()
+    if _maintenance_thread and _maintenance_thread.is_alive():
+        stop_cluster_maintenance()
     if _cleanup_thread and _cleanup_thread.is_alive():
-        _cleanup_thread.join(timeout=5)
+        stop_cleanup_loop()
     if _evolution_thread and _evolution_thread.is_alive():
-        _evolution_thread.join(timeout=5)
-    logger.info("worker heartbeat stopped")
+        stop_evolution_loop()

@@ -48,6 +48,9 @@ data:
       max_background_workers: 8
       task_retention_days: 7
 
+    runtime:
+      role: "all"
+
     worker:
       heartbeat_interval_seconds: 30
       dead_threshold_seconds: 300

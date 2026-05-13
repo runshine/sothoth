@@ -16,6 +16,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from app.config import get_config
 from app.time_utils import isoformat_local, now_local
 from app.unpacker_engine_config import get_max_retries_reached_action
@@ -38,7 +40,10 @@ PROJECT_FILES_ROOT = Path(os.environ.get("PROJECT_FILES_ROOT", "/data/files"))
 TASK_WORKSPACE_ROOT = Path("app/secflow-app-firmware-unpacker")
 STAGE_LABELS = {
     "pending": "待执行",
+    "claimed": "已认领",
     "retry_preparing": "重试准备中",
+    "archive_pending": "归档待处理",
+    "archiving": "归档中",
     "queued": "排队中",
     "preprocess": "预处理",
     "feature_extract": "特征提取",
@@ -487,7 +492,7 @@ def recover_stale_owned_tasks() -> None:
             .filter(
                 UnpackTask.owner_id == owner_id,
                 UnpackTask.status.in_(
-                    [TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
+                    [TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
                 ),
             )
             .all()
@@ -496,6 +501,9 @@ def recover_stale_owned_tasks() -> None:
         db.close()
 
     for task in tasks:
+        if task.status == TaskStatus.CLAIMED.value:
+            _reset_claim(task.id)
+            continue
         if _is_process_alive(task.runner_pid):
             continue
         reason = "owner restarted without active runner process"
@@ -624,6 +632,7 @@ def _update_task_progress_for_owner(
             return
         previous_stage = str(task.current_stage or "").strip() or None
         task.runner_heartbeat_at = now_local()
+        task.heartbeat_at = task.runner_heartbeat_at
         task.last_progress_at = now_local()
         if stage:
             task.current_stage = stage
@@ -651,11 +660,20 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
     try:
         task = db.query(UnpackTask).filter(UnpackTask.id == task_id).first()
         if task is None or task.status not in (
+            TaskStatus.CLAIMED.value,
             TaskStatus.RUNNING.value,
             TaskStatus.CANCELLING.value,
         ):
             return
-        if task.status == TaskStatus.CANCELLING.value:
+        if task.status == TaskStatus.CLAIMED.value:
+            task.status = TaskStatus.PENDING.value
+            task.current_stage = "pending"
+            task.result_status = None
+            task.result_message = None
+            task.error_message = None
+            terminal_event = None
+            terminal_summary = None
+        elif task.status == TaskStatus.CANCELLING.value:
             task.status = TaskStatus.CANCELLED.value
             task.result_status = "cancelled"
             task.result_message = f"Task cancelled: {reason}"
@@ -670,14 +688,19 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
             terminal_summary = f"任务失败：{reason}"
         previous_owner_id = task.owner_id
         task.owner_id = None
+        task.dispatch_owner_id = None
+        task.dispatch_token = None
+        task.dispatch_claimed_at = None
+        task.dispatch_lease_expires_at = None
         task.lease_expires_at = None
         task.runner_pid = None
         task.runner_started_at = None
         task.runner_heartbeat_at = None
+        task.heartbeat_at = None
         task.run_token = None
         task.cancel_grace_deadline = None
         task.cancel_force_deadline = None
-        task.completed_at = now_local()
+        task.completed_at = None if task.status == TaskStatus.PENDING.value else now_local()
         task.last_progress_at = now_local()
         db.commit()
         if owner_lost:
@@ -701,17 +724,18 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
             owner_id=previous_owner_id,
             created_by="task_manager",
         )
-        _record_task_event_from_row(
-            task,
-            event_type=terminal_event,
-            summary=terminal_summary,
-            stage_key=task.current_stage,
-            status=task.status,
-            detail={"reason": reason},
-            owner_id=previous_owner_id,
-            created_by="task_manager",
-        )
-        _write_task_result_cache(task_id)
+        if terminal_event and terminal_summary:
+            _record_task_event_from_row(
+                task,
+                event_type=terminal_event,
+                summary=terminal_summary,
+                stage_key=task.current_stage,
+                status=task.status,
+                detail={"reason": reason},
+                owner_id=previous_owner_id,
+                created_by="task_manager",
+            )
+            _write_task_result_cache(task_id)
     finally:
         db.close()
 
@@ -1244,6 +1268,10 @@ def submit_unpack_task(
                 status=TaskStatus.PENDING.value,
                 llm_binding_snapshot=json.dumps(effective_snapshot, ensure_ascii=False),
                 current_stage="pending",
+                runtime_root=prepared["run_path"] or str(_derive_run_root_from_output_path(prepared["output_path"])),
+                archive_root=str(Path(prepared["output_path"]).parent / "archive"),
+                archive_status=TaskStatus.ARCHIVE_PENDING.value,
+                heartbeat_at=now_local(),
                 last_progress_at=now_local(),
             )
         )
@@ -1285,14 +1313,19 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
         if task is None:
             return False, "任务不存在"
         trigger_runtime_cancel = False
-        if task.status == TaskStatus.PENDING.value:
+        if task.status in (TaskStatus.PENDING.value, TaskStatus.CLAIMED.value):
             task.status = TaskStatus.CANCELLED.value
             task.cancel_requested_at = now_local()
             task.result_status = "cancelled"
             task.result_message = "Task was cancelled before execution"
             task.completed_at = now_local()
+            task.dispatch_owner_id = None
+            task.dispatch_token = None
+            task.dispatch_claimed_at = None
+            task.dispatch_lease_expires_at = None
             task.cancel_grace_deadline = None
             task.cancel_force_deadline = None
+            task.heartbeat_at = None
             task.runner_pid = None
             task.runner_started_at = None
             task.runner_heartbeat_at = None
@@ -1328,7 +1361,7 @@ def cancel_task(task_id: str) -> tuple[bool, str]:
         elif task.status == TaskStatus.CANCELLED.value:
             return True, "任务已取消"
         else:
-            return False, "仅支持取消排队中或运行中的任务"
+            return False, "仅支持取消排队中、已认领或运行中的任务"
         db.commit()
         _record_task_event_from_row(
             task,
@@ -1372,9 +1405,14 @@ def retry_task(task_id: str) -> tuple[bool, Optional[str], str]:
             return False, None, "任务缺少 project_id，无法重试"
         task.status = TaskStatus.RETRY_PREPARING.value
         task.owner_id = None
+        task.dispatch_owner_id = None
+        task.dispatch_token = None
+        task.dispatch_claimed_at = None
+        task.dispatch_lease_expires_at = None
         task.current_stage = "retry_preparing"
         task.lease_expires_at = None
         task.cancel_requested_at = None
+        task.heartbeat_at = None
         task.runner_pid = None
         task.runner_started_at = None
         task.runner_heartbeat_at = None
@@ -1431,6 +1469,7 @@ def delete_tasks(task_ids: list[str]) -> tuple[int, list[str]]:
                     UnpackTask.id == task_id,
                     UnpackTask.status.notin_(
                         [
+                            TaskStatus.CLAIMED.value,
                             TaskStatus.RETRY_PREPARING.value,
                             TaskStatus.RUNNING.value,
                             TaskStatus.CANCELLING.value,
@@ -1535,7 +1574,7 @@ def recover_orphaned_tasks() -> None:
             db.query(UnpackTask)
             .filter(
                 UnpackTask.status.in_(
-                    [TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
+                    [TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]
                 )
             )
             .all()
@@ -1566,6 +1605,15 @@ def recover_orphaned_tasks() -> None:
             task.last_progress_at
             and task.last_progress_at + timedelta(seconds=_cancel_timeout_seconds()) < now
         )
+        claim_stale = bool(
+            task.status == TaskStatus.CLAIMED.value
+            and task.dispatch_claimed_at
+            and task.dispatch_claimed_at + timedelta(seconds=_runner_start_grace_seconds()) < now
+        )
+        if task.status == TaskStatus.CLAIMED.value:
+            if owner_missing or claim_stale:
+                _reset_claim(task.id)
+            continue
         if task.status == TaskStatus.CANCELLING.value and local_owned:
             if runner_not_started:
                 _mark_task_cancelled(task.id, reason="Task runner was not started")
@@ -1634,19 +1682,24 @@ def _claim_task(task_id: str) -> bool:
             )
             .update(
                 {
-                    UnpackTask.status: TaskStatus.RUNNING.value,
+                    UnpackTask.status: TaskStatus.CLAIMED.value,
                     UnpackTask.owner_id: owner_id,
+                    UnpackTask.dispatch_owner_id: owner_id,
+                    UnpackTask.dispatch_token: run_token,
+                    UnpackTask.dispatch_claimed_at: now,
+                    UnpackTask.dispatch_lease_expires_at: now + timedelta(seconds=_dispatch_interval_seconds() * 4),
                     UnpackTask.current_stage: "queued",
                     UnpackTask.lease_expires_at: None,
                     UnpackTask.cancel_requested_at: None,
+                    UnpackTask.heartbeat_at: now,
                     UnpackTask.last_progress_at: now,
                     UnpackTask.runner_pid: None,
                     UnpackTask.runner_started_at: None,
                     UnpackTask.runner_heartbeat_at: None,
-                    UnpackTask.run_token: run_token,
+                    UnpackTask.run_token: None,
                     UnpackTask.cancel_grace_deadline: None,
                     UnpackTask.cancel_force_deadline: None,
-                    UnpackTask.started_at: now,
+                    UnpackTask.started_at: None,
                     UnpackTask.completed_at: None,
                     UnpackTask.error_message: None,
                     UnpackTask.result_status: None,
@@ -1663,9 +1716,9 @@ def _claim_task(task_id: str) -> bool:
                     task,
                     event_type="task_claimed",
                     summary="任务已被当前 owner 认领",
-                    stage_key="queued",
+                    stage_key="claimed",
                     status=task.status,
-                    detail={"owner_id": owner_id, "run_token_present": True},
+                    detail={"owner_id": owner_id, "dispatch_token_present": True},
                     owner_id=owner_id,
                     created_by="task_manager",
                 )
@@ -1674,6 +1727,16 @@ def _claim_task(task_id: str) -> bool:
         return False
     finally:
         db.close()
+
+
+def _supports_skip_locked() -> bool:
+    from app.model import get_engine
+
+    try:
+        dialect = str(get_engine().dialect.name or "").strip().lower()
+    except Exception:
+        return False
+    return dialect in {"mysql", "postgresql", "postgres", "mariadb"}
 
 
 def _reset_claim(task_id: str) -> None:
@@ -1685,15 +1748,20 @@ def _reset_claim(task_id: str) -> None:
             db.query(UnpackTask)
             .filter(
                 UnpackTask.id == task_id,
-                UnpackTask.status == TaskStatus.RUNNING.value,
+                UnpackTask.status.in_([TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value]),
             )
             .update(
                 {
                     UnpackTask.status: TaskStatus.PENDING.value,
                     UnpackTask.owner_id: None,
+                    UnpackTask.dispatch_owner_id: None,
+                    UnpackTask.dispatch_token: None,
+                    UnpackTask.dispatch_claimed_at: None,
+                    UnpackTask.dispatch_lease_expires_at: None,
                     UnpackTask.current_stage: "pending",
                     UnpackTask.lease_expires_at: None,
                     UnpackTask.cancel_requested_at: None,
+                    UnpackTask.heartbeat_at: None,
                     UnpackTask.runner_pid: None,
                     UnpackTask.runner_started_at: None,
                     UnpackTask.runner_heartbeat_at: None,
@@ -1723,13 +1791,14 @@ def _launch_task_runner(task_id: str) -> None:
             .filter(
                 UnpackTask.id == task_id,
                 UnpackTask.owner_id == owner_id,
-                UnpackTask.status == TaskStatus.RUNNING.value,
+                UnpackTask.status == TaskStatus.CLAIMED.value,
             )
             .first()
         )
-        if task is None or not task.run_token:
+        if task is None or not task.dispatch_token:
             raise RuntimeError(f"任务未被当前 owner 正确认领: {task_id}")
-        run_token = task.run_token
+        dispatch_token = task.dispatch_token
+        run_token = uuid.uuid4().hex
     finally:
         db.close()
 
@@ -1762,16 +1831,21 @@ def _launch_task_runner(task_id: str) -> None:
             .filter(
                 UnpackTask.id == task_id,
                 UnpackTask.owner_id == owner_id,
-                UnpackTask.run_token == run_token,
-                UnpackTask.status == TaskStatus.RUNNING.value,
+                UnpackTask.dispatch_token == dispatch_token,
+                UnpackTask.status == TaskStatus.CLAIMED.value,
             )
             .update(
                 {
+                    UnpackTask.status: TaskStatus.RUNNING.value,
+                    UnpackTask.dispatch_lease_expires_at: None,
                     UnpackTask.runner_pid: proc.pid,
                     UnpackTask.runner_started_at: now,
                     UnpackTask.runner_heartbeat_at: now,
+                    UnpackTask.heartbeat_at: now,
                     UnpackTask.lease_expires_at: None,
                     UnpackTask.last_progress_at: now,
+                    UnpackTask.run_token: run_token,
+                    UnpackTask.started_at: now,
                 },
                 synchronize_session=False,
             )
@@ -1788,7 +1862,7 @@ def _launch_task_runner(task_id: str) -> None:
                 summary="任务独立执行进程已启动",
                 stage_key=task.current_stage,
                 status=task.status,
-                detail={"runner_pid": proc.pid, "run_token_present": True},
+                detail={"runner_pid": proc.pid, "run_token_present": True, "dispatch_token_present": True},
                 owner_id=owner_id,
                 created_by="task_manager",
             )
@@ -1797,34 +1871,114 @@ def _launch_task_runner(task_id: str) -> None:
     refresh_worker_active_tasks()
 
 
-def _schedule_pending_tasks() -> None:
+def _claim_pending_tasks(limit: int) -> list[str]:
     from app.model import TaskStatus, UnpackTask, get_db_session
+    from app.services.worker import get_worker_id
 
+    fetch_limit = max(1, limit)
+    owner_id = get_worker_id()
+    now = now_local()
+    claim_deadline = now + timedelta(seconds=_dispatch_interval_seconds() * 4)
+    use_skip_locked = _supports_skip_locked()
+    if not use_skip_locked:
+        candidate_ids: list[str] = []
+        db = get_db_session()
+        try:
+            candidate_ids = [
+                row.id
+                for row in (
+                    db.query(UnpackTask.id)
+                    .filter(UnpackTask.status == TaskStatus.PENDING.value)
+                    .order_by(UnpackTask.created_at.asc(), UnpackTask.id.asc())
+                    .limit(fetch_limit)
+                    .all()
+                )
+            ]
+        finally:
+            db.close()
+        claimed_ids: list[str] = []
+        for task_id in candidate_ids:
+            if len(claimed_ids) >= fetch_limit:
+                break
+            if _claim_task(task_id):
+                claimed_ids.append(task_id)
+        return claimed_ids
+
+    db = get_db_session()
+    claimed_payloads: list[dict[str, object]] = []
+    try:
+        query = (
+            db.query(UnpackTask)
+            .filter(UnpackTask.status == TaskStatus.PENDING.value)
+            .order_by(UnpackTask.created_at.asc(), UnpackTask.id.asc())
+        )
+        if use_skip_locked:
+            query = query.with_for_update(skip_locked=True)
+        candidates = query.limit(fetch_limit).all()
+        for task in candidates:
+            dispatch_token = uuid.uuid4().hex
+            task.status = TaskStatus.CLAIMED.value
+            task.owner_id = owner_id
+            task.dispatch_owner_id = owner_id
+            task.dispatch_token = dispatch_token
+            task.dispatch_claimed_at = now
+            task.dispatch_lease_expires_at = claim_deadline
+            task.current_stage = "queued"
+            task.lease_expires_at = None
+            task.cancel_requested_at = None
+            task.heartbeat_at = now
+            task.last_progress_at = now
+            task.runner_pid = None
+            task.runner_started_at = None
+            task.runner_heartbeat_at = None
+            task.run_token = None
+            task.cancel_grace_deadline = None
+            task.cancel_force_deadline = None
+            task.started_at = None
+            task.completed_at = None
+            task.error_message = None
+            task.result_status = None
+            task.result_message = None
+            claimed_payloads.append(
+                {
+                    "task_id": task.id,
+                    "project_id": task.project_id,
+                    "status": task.status,
+                    "owner_id": owner_id,
+                }
+            )
+        db.commit()
+    except SQLAlchemyError:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    for payload in claimed_payloads:
+        _record_task_event(
+            str(payload["task_id"]),
+            project_id=payload.get("project_id"),
+            event_type="task_claimed",
+            summary="任务已被当前 owner 认领",
+            stage_key="claimed",
+            status=str(payload["status"]),
+            detail={"owner_id": payload.get("owner_id"), "dispatch_token_present": True},
+            owner_id=str(payload["owner_id"]),
+            created_by="task_manager",
+        )
+    return [str(item["task_id"]) for item in claimed_payloads]
+
+
+def _schedule_pending_tasks() -> None:
     available_slots = _runtime_max_concurrent() - _active_runner_count()
     if available_slots <= 0:
         return
 
     fetch_limit = max(available_slots, _claim_batch_size())
-    db = get_db_session()
-    try:
-        candidate_ids = [
-            row.id
-            for row in (
-                db.query(UnpackTask.id)
-                .filter(UnpackTask.status == TaskStatus.PENDING.value)
-                .order_by(UnpackTask.created_at.asc())
-                .limit(fetch_limit)
-                .all()
-            )
-        ]
-    finally:
-        db.close()
-
-    for task_id in candidate_ids:
+    for task_id in _claim_pending_tasks(fetch_limit):
         if _runtime_max_concurrent() - _active_runner_count() <= 0:
+            _reset_claim(task_id)
             break
-        if not _claim_task(task_id):
-            continue
         try:
             _launch_task_runner(task_id)
         except Exception:
@@ -2879,13 +3033,16 @@ def shutdown() -> None:
             db.query(UnpackTask)
             .filter(
                 UnpackTask.owner_id == owner_id,
-                UnpackTask.status.in_([TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]),
+                UnpackTask.status.in_([TaskStatus.CLAIMED.value, TaskStatus.RUNNING.value, TaskStatus.CANCELLING.value]),
             )
             .all()
         )
     finally:
         db.close()
     for task in tasks:
+        if task.status == TaskStatus.CLAIMED.value:
+            _reset_claim(task.id)
+            continue
         if _is_process_alive(task.runner_pid):
             _signal_task_runner(
                 task,
