@@ -5,6 +5,11 @@ metadata:
   namespace: secflow-ns
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       name: secflow-app-dataflow-analyse
@@ -18,7 +23,7 @@ spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
       - name: secflow-app-dataflow-analyse
-        image: ghcr.io/runshine/secflow-app-dataflow-analyse:latest
+        image: ghcr.io/runshine/secflow-app-dataflow-analyse:20260513-312dc84
         imagePullPolicy: Always
         env:
           - name: TZ
@@ -41,10 +46,14 @@ spec:
             value: "true"
           - name: DFA_ENABLE_REGISTRY
             value: "false"
+          - name: DFA_LEASE_TTL_SECONDS
+            value: "90"
+          - name: DFA_HEARTBEAT_INTERVAL_SECONDS
+            value: "15"
           - name: DFA_MAX_LOCAL_RUNNING_TASKS
             value: "2"
           - name: DFA_DISPATCH_POLL_INTERVAL_SECONDS
-            value: "2"
+            value: "3"
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -56,9 +65,9 @@ spec:
         resources:
           requests:
             memory: "12Gi"
-            cpu: "8"
+            cpu: "6"
           limits:
-            memory: "12Gi"
+            memory: "16Gi"
             cpu: "8"
         startupProbe:
           httpGet:
