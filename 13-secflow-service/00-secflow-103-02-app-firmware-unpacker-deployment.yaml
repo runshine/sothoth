@@ -50,6 +50,10 @@ spec:
               value: api
             - name: UNPACKER_AGENT_DIR
               value: /app/app/agent
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -168,6 +172,10 @@ spec:
               value: dispatcher,worker
             - name: UNPACKER_AGENT_DIR
               value: /app/app/agent
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: POD_IP
               valueFrom:
                 fieldRef:
@@ -286,6 +294,10 @@ spec:
               value: cleanup-worker
             - name: UNPACKER_AGENT_DIR
               value: /app/app/agent
+            - name: WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: POD_IP
               valueFrom:
                 fieldRef:
