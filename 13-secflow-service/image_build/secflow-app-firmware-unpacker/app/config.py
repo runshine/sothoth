@@ -88,6 +88,7 @@ class ServiceConfig(BaseModel):
     worker_history_retention_days: int = 7
     cleanup_job_retention_days: int = 7
     task_event_retention_days: int = 14
+    task_event_max_per_task: int = 500
 
 
 class RuntimeConfig(BaseModel):

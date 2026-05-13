@@ -30,6 +30,7 @@ class WorkerMaintenanceTests(unittest.TestCase):
                         "worker_history_retention_days": 7,
                         "cleanup_job_retention_days": 7,
                         "task_event_retention_days": 14,
+                        "task_event_max_per_task": 3,
                     },
                     "worker": {
                         "dead_threshold_seconds": 90,
@@ -269,6 +270,60 @@ class WorkerMaintenanceTests(unittest.TestCase):
                 )
             )
             db.commit()
+        finally:
+            db.close()
+
+    def test_prune_task_event_backlog_keeps_newest_events_per_task(self):
+        base_time = now_local() - timedelta(hours=1)
+        db = get_db_session()
+        try:
+            for idx in range(5):
+                db.add(
+                    UnpackTaskEvent(
+                        id=f"event-overflow-{idx}",
+                        task_id="t-overflow",
+                        project_id="p1",
+                        event_type="progress",
+                        summary=f"event {idx}",
+                        created_at=base_time + timedelta(seconds=idx),
+                    )
+                )
+            for idx in range(2):
+                db.add(
+                    UnpackTaskEvent(
+                        id=f"event-small-{idx}",
+                        task_id="t-small",
+                        project_id="p1",
+                        event_type="progress",
+                        summary=f"small {idx}",
+                        created_at=base_time + timedelta(minutes=idx),
+                    )
+                )
+            db.commit()
+        finally:
+            db.close()
+
+        deleted = worker_module.prune_task_event_backlog()
+
+        self.assertEqual(2, deleted)
+        db = get_db_session()
+        try:
+            overflow_ids = [
+                row.id
+                for row in db.query(UnpackTaskEvent)
+                .filter(UnpackTaskEvent.task_id == "t-overflow")
+                .order_by(UnpackTaskEvent.created_at.asc(), UnpackTaskEvent.id.asc())
+                .all()
+            ]
+            small_ids = [
+                row.id
+                for row in db.query(UnpackTaskEvent)
+                .filter(UnpackTaskEvent.task_id == "t-small")
+                .order_by(UnpackTaskEvent.created_at.asc(), UnpackTaskEvent.id.asc())
+                .all()
+            ]
+            self.assertEqual(["event-overflow-2", "event-overflow-3", "event-overflow-4"], overflow_ids)
+            self.assertEqual(["event-small-0", "event-small-1"], small_ids)
         finally:
             db.close()
 
