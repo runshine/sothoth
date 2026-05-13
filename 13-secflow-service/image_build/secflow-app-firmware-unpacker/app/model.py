@@ -430,6 +430,8 @@ DEFAULT_CONFIGS = [
     ("reuse_agent_between_rounds_evolution_improver", "true", "bool", "是否复用固件解包工具进化器智能体会话：true=复用，false=每次新建"),
     ("dead_threshold", "300", "int", "Worker 心跳超时秒数"),
     ("auto_cleanup_days", "7", "int", "已完成任务自动清理天数"),
+    ("worker_history_retention_days", "7", "int", "失活 worker 历史记录保留天数，0=不自动删除"),
+    ("cleanup_job_retention_days", "7", "int", "已完成工作目录清理任务保留天数，0=不自动删除"),
     ("task_lease_seconds", "45", "int", "已废弃：任务执行不再使用租约，仅兼容清理任务配置"),
     ("task_lease_renew_interval_seconds", "10", "int", "已废弃：任务执行不再续租，保留用于旧配置兼容"),
     ("cancel_timeout_seconds", "120", "int", "任务取消最长等待秒数"),
