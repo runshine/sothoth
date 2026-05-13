@@ -39,6 +39,18 @@ TASK_STAGE_SEQUENCES = {
 }
 
 
+def normalize_parent_key(value: str | None) -> str:
+    return str(value or "").strip()
+
+
+def build_stage_item_identity_key(item_key: str | None, parent_key: str | None) -> str:
+    return f"{str(item_key or '').strip()}::{normalize_parent_key(parent_key)}"
+
+
+def build_archive_job_dedupe_key(item_id: str | None, downstream_task_id: str | None) -> str:
+    return f"{str(item_id or '').strip()}::{str(downstream_task_id or '').strip()}"
+
+
 class JsonMixin:
     def _load_json(self, raw: Optional[str], default: Any) -> Any:
         if not raw:
