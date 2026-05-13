@@ -5,6 +5,12 @@ metadata:
   namespace: secflow-ns
 spec:
   replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       name: secflow-app-entry-analyse
@@ -14,6 +20,7 @@ spec:
         name: secflow-app-entry-analyse
     spec:
       dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 30
       containers:
       - name: secflow-app-entry-analyse
         image: ghcr.io/runshine/secflow-app-entry-analyse:latest
@@ -21,10 +28,26 @@ spec:
         env:
           - name: TZ
             value: Asia/Shanghai
+          - name: EA_RUNTIME_ROLE
+            value: "api"
+          - name: EA_POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
           - name: PORT
             value: "8080"
           - name: FILESERVER_ROOT
             value: /data/files
+          - name: EA_TASK_LEASE_SECONDS
+            value: "120"
+          - name: EA_TASK_LEASE_RENEW_INTERVAL_SECONDS
+            value: "30"
+          - name: EA_TASK_CANCEL_POLL_INTERVAL_SECONDS
+            value: "3"
+          - name: EA_SCHEDULER_POLL_SECONDS
+            value: "5"
+          - name: EA_WORKER_POLL_SECONDS
+            value: "5"
           - name: WORKER_ISOLATION_MODE
             value: "none"
         ports:
@@ -51,6 +74,173 @@ spec:
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 15
+      volumes:
+      - name: secflow-app-entry-analyse-config
+        configMap:
+          name: secflow-app-entry-analyse-config
+          items:
+            - key: service.yaml
+              path: service.yaml
+      - name: secflow-platform-fileserver-data-nfs-pvc
+        persistentVolumeClaim:
+          claimName: secflow-platform-fileserver-data-nfs-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-entry-analyse-scheduler
+  namespace: secflow-ns
+spec:
+  replicas: 1
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      name: secflow-app-entry-analyse-scheduler
+  template:
+    metadata:
+      labels:
+        name: secflow-app-entry-analyse-scheduler
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  name: secflow-app-entry-analyse-scheduler
+      containers:
+      - name: secflow-app-entry-analyse-scheduler
+        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+          - name: EA_RUNTIME_ROLE
+            value: "scheduler"
+          - name: EA_POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: FILESERVER_ROOT
+            value: /data/files
+          - name: EA_TASK_LEASE_SECONDS
+            value: "120"
+          - name: EA_TASK_LEASE_RENEW_INTERVAL_SECONDS
+            value: "30"
+          - name: EA_TASK_CANCEL_POLL_INTERVAL_SECONDS
+            value: "3"
+          - name: EA_SCHEDULER_POLL_SECONDS
+            value: "5"
+          - name: EA_WORKER_POLL_SECONDS
+            value: "5"
+          - name: WORKER_ISOLATION_MODE
+            value: "none"
+        volumeMounts:
+        - name: secflow-app-entry-analyse-config
+          mountPath: /app/service.yaml
+          subPath: service.yaml
+        - name: secflow-platform-fileserver-data-nfs-pvc
+          mountPath: /data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: secflow-app-entry-analyse-config
+        configMap:
+          name: secflow-app-entry-analyse-config
+          items:
+            - key: service.yaml
+              path: service.yaml
+      - name: secflow-platform-fileserver-data-nfs-pvc
+        persistentVolumeClaim:
+          claimName: secflow-platform-fileserver-data-nfs-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-entry-analyse-worker
+  namespace: secflow-ns
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      name: secflow-app-entry-analyse-worker
+  template:
+    metadata:
+      labels:
+        name: secflow-app-entry-analyse-worker
+    spec:
+      dnsPolicy: ClusterFirstWithHostNet
+      terminationGracePeriodSeconds: 60
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            name: secflow-app-entry-analyse-worker
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  name: secflow-app-entry-analyse-worker
+      containers:
+      - name: secflow-app-entry-analyse-worker
+        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        imagePullPolicy: Always
+        env:
+          - name: TZ
+            value: Asia/Shanghai
+          - name: EA_RUNTIME_ROLE
+            value: "worker"
+          - name: EA_POD_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: FILESERVER_ROOT
+            value: /data/files
+          - name: EA_TASK_LEASE_SECONDS
+            value: "120"
+          - name: EA_TASK_LEASE_RENEW_INTERVAL_SECONDS
+            value: "30"
+          - name: EA_TASK_CANCEL_POLL_INTERVAL_SECONDS
+            value: "3"
+          - name: EA_SCHEDULER_POLL_SECONDS
+            value: "5"
+          - name: EA_WORKER_POLL_SECONDS
+            value: "5"
+          - name: WORKER_ISOLATION_MODE
+            value: "none"
+        volumeMounts:
+        - name: secflow-app-entry-analyse-config
+          mountPath: /app/service.yaml
+          subPath: service.yaml
+        - name: secflow-platform-fileserver-data-nfs-pvc
+          mountPath: /data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
       volumes:
       - name: secflow-app-entry-analyse-config
         configMap:
