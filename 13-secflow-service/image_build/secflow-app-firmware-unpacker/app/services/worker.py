@@ -6,12 +6,14 @@ import logging
 import os
 import socket
 import threading
+import time
 from datetime import timedelta
 from typing import Optional
 
 from sqlalchemy import func, or_
 
 from app.config import get_config
+from app.services.observability import record_maintenance_operation, refresh_cluster_state_metrics
 from app.time_utils import now_local
 
 
@@ -473,13 +475,67 @@ def _heartbeat_loop(interval: int) -> None:
 def _maintenance_loop(interval: int) -> None:
     while not _maintenance_stop_event.wait(timeout=interval):
         try:
+            started_at = time.monotonic()
             reclaim_orphaned_tasks()
+            record_maintenance_operation(
+                operation="reclaim_orphaned_tasks",
+                result="success",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+
+            started_at = time.monotonic()
             cleanup_finished_tasks()
+            record_maintenance_operation(
+                operation="cleanup_finished_tasks",
+                result="success",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+
+            started_at = time.monotonic()
             prune_worker_history()
+            record_maintenance_operation(
+                operation="prune_worker_history",
+                result="success",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+
+            started_at = time.monotonic()
             prune_finished_cleanup_jobs()
+            record_maintenance_operation(
+                operation="prune_finished_cleanup_jobs",
+                result="success",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+
+            started_at = time.monotonic()
             prune_task_event_history()
+            record_maintenance_operation(
+                operation="prune_task_event_history",
+                result="success",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+
+            started_at = time.monotonic()
             prune_task_event_backlog()
+            record_maintenance_operation(
+                operation="prune_task_event_backlog",
+                result="success",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
+
+            started_at = time.monotonic()
+            refresh_cluster_state_metrics()
+            record_maintenance_operation(
+                operation="refresh_cluster_state_metrics",
+                result="success",
+                duration_seconds=max(0.0, time.monotonic() - started_at),
+            )
         except Exception as exc:
+            record_maintenance_operation(
+                operation="maintenance_loop",
+                result="failed",
+                duration_seconds=0.0,
+            )
             logger.warning("worker maintenance loop warning: %s", exc)
 
 

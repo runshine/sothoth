@@ -25,6 +25,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "app"))
 from app.config import get_config, get_runtime_roles, load_config
 from app.logging_utils import configure_container_logging
 from app.runtime import start_runtime, stop_runtime
+from app.services.observability import generate_metrics_payload, metrics_content_type
 
 
 configure_container_logging("secflow-app-firmware-unpacker")
@@ -61,8 +62,17 @@ class _HealthHandler(BaseHTTPRequestHandler):
         if self.path not in {
             "/api/app/firmware-unpacker/health",
             "/api/app/firmware-unpacker/ready",
+            "/metrics",
         }:
             self.send_error(HTTPStatus.NOT_FOUND)
+            return
+
+        if self.path == "/metrics":
+            payload = generate_metrics_payload()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", metrics_content_type())
+            self.end_headers()
+            self.wfile.write(payload)
             return
 
         payload = _STATE.snapshot()
