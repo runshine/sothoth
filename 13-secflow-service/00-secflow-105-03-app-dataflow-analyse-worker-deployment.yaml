@@ -1,19 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: secflow-app-dataflow-analyse
+  name: secflow-app-dataflow-analyse-worker
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       name: secflow-app-dataflow-analyse
-      role: api
+      role: worker
   template:
     metadata:
       labels:
         name: secflow-app-dataflow-analyse
-        role: api
+        role: worker
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
@@ -32,15 +32,19 @@ spec:
           - name: DFA_AGENT_TIMEOUT_SECONDS
             value: "900"
           - name: DFA_ROLE
-            value: api
+            value: worker
           - name: DFA_ENABLE_PUBLIC_API
-            value: "true"
+            value: "false"
           - name: DFA_ENABLE_DISPATCHER
-            value: "false"
-          - name: DFA_ENABLE_EXECUTOR
-            value: "false"
-          - name: DFA_ENABLE_REGISTRY
             value: "true"
+          - name: DFA_ENABLE_EXECUTOR
+            value: "true"
+          - name: DFA_ENABLE_REGISTRY
+            value: "false"
+          - name: DFA_MAX_LOCAL_RUNNING_TASKS
+            value: "2"
+          - name: DFA_DISPATCH_POLL_INTERVAL_SECONDS
+            value: "2"
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -51,11 +55,11 @@ spec:
           mountPath: /data
         resources:
           requests:
-            memory: "4Gi"
-            cpu: "2"
+            memory: "12Gi"
+            cpu: "8"
           limits:
-            memory: "4Gi"
-            cpu: "2"
+            memory: "12Gi"
+            cpu: "8"
         startupProbe:
           httpGet:
             path: /api/app/dataflow-analyse/health
