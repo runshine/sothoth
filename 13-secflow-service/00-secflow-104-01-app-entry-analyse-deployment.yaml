@@ -21,9 +21,11 @@ spec:
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+      - name: ghcr-ict-bin-pull
       containers:
       - name: secflow-app-entry-analyse
-        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        image: ghcr.io/ict-bin/secflow-app-entry-analyse:20260513
         imagePullPolicy: Always
         env:
           - name: TZ
@@ -108,6 +110,8 @@ spec:
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+      - name: ghcr-ict-bin-pull
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
@@ -119,7 +123,7 @@ spec:
                   name: secflow-app-entry-analyse-scheduler
       containers:
       - name: secflow-app-entry-analyse-scheduler
-        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        image: ghcr.io/ict-bin/secflow-app-entry-analyse:20260513
         imagePullPolicy: Always
         env:
           - name: TZ
@@ -188,6 +192,8 @@ spec:
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       terminationGracePeriodSeconds: 60
+      imagePullSecrets:
+      - name: ghcr-ict-bin-pull
       topologySpreadConstraints:
       - maxSkew: 1
         topologyKey: kubernetes.io/hostname
@@ -206,7 +212,7 @@ spec:
                   name: secflow-app-entry-analyse-worker
       containers:
       - name: secflow-app-entry-analyse-worker
-        image: ghcr.io/runshine/secflow-app-entry-analyse:latest
+        image: ghcr.io/ict-bin/secflow-app-entry-analyse:20260513
         imagePullPolicy: Always
         env:
           - name: TZ
