@@ -9,7 +9,7 @@ import threading
 from datetime import timedelta
 from typing import Optional
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 
 from app.config import get_config
 from app.time_utils import now_local
@@ -89,6 +89,18 @@ def _runtime_task_event_retention_days() -> int:
     try:
         default = int(get_config().service.task_event_retention_days)
         value = get_config_value(db, "task_event_retention_days", default=default)
+        return max(0, int(value))
+    finally:
+        db.close()
+
+
+def _runtime_task_event_max_per_task() -> int:
+    from app.model import get_config_value, get_db_session
+
+    db = get_db_session()
+    try:
+        default = int(get_config().service.task_event_max_per_task)
+        value = get_config_value(db, "task_event_max_per_task", default=default)
         return max(0, int(value))
     finally:
         db.close()
@@ -310,6 +322,55 @@ def prune_task_event_history() -> int:
     return int(deleted or 0)
 
 
+def prune_task_event_backlog() -> int:
+    from app.model import UnpackTaskEvent, get_db_session
+
+    max_per_task = _runtime_task_event_max_per_task()
+    if max_per_task <= 0:
+        return 0
+
+    db = get_db_session()
+    deleted = 0
+    try:
+        oversized_tasks = (
+            db.query(UnpackTaskEvent.task_id, func.count(UnpackTaskEvent.id).label("event_count"))
+            .group_by(UnpackTaskEvent.task_id)
+            .having(func.count(UnpackTaskEvent.id) > max_per_task)
+            .all()
+        )
+        for task_id, event_count in oversized_tasks:
+            trim_count = max(0, int(event_count) - max_per_task)
+            if trim_count <= 0:
+                continue
+            old_event_ids = [
+                row.id
+                for row in (
+                    db.query(UnpackTaskEvent.id)
+                    .filter(UnpackTaskEvent.task_id == task_id)
+                    .order_by(UnpackTaskEvent.created_at.asc(), UnpackTaskEvent.id.asc())
+                    .limit(trim_count)
+                    .all()
+                )
+            ]
+            if not old_event_ids:
+                continue
+            deleted += int(
+                db.query(UnpackTaskEvent)
+                .filter(UnpackTaskEvent.id.in_(old_event_ids))
+                .delete(synchronize_session=False)
+            )
+        db.commit()
+    finally:
+        db.close()
+    if deleted:
+        logger.info(
+            "pruned task event backlog: deleted=%s max_per_task=%s",
+            deleted,
+            max_per_task,
+        )
+    return int(deleted or 0)
+
+
 def cleanup_finished_tasks() -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
     from app.services.task_manager import enqueue_workspace_cleanup
@@ -417,6 +478,7 @@ def _maintenance_loop(interval: int) -> None:
             prune_worker_history()
             prune_finished_cleanup_jobs()
             prune_task_event_history()
+            prune_task_event_backlog()
         except Exception as exc:
             logger.warning("worker maintenance loop warning: %s", exc)
 
