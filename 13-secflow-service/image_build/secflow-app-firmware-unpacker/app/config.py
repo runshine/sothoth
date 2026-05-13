@@ -85,6 +85,8 @@ class ServiceConfig(BaseModel):
 
     max_background_workers: int = 8
     task_retention_days: int = 7
+    worker_history_retention_days: int = 7
+    cleanup_job_retention_days: int = 7
 
 
 class RuntimeConfig(BaseModel):

@@ -56,6 +56,30 @@ def _runtime_cleanup_days() -> int:
         db.close()
 
 
+def _runtime_worker_history_retention_days() -> int:
+    from app.model import get_config_value, get_db_session
+
+    db = get_db_session()
+    try:
+        default = int(get_config().service.worker_history_retention_days)
+        value = get_config_value(db, "worker_history_retention_days", default=default)
+        return max(0, int(value))
+    finally:
+        db.close()
+
+
+def _runtime_cleanup_job_retention_days() -> int:
+    from app.model import get_config_value, get_db_session
+
+    db = get_db_session()
+    try:
+        default = int(get_config().service.cleanup_job_retention_days)
+        value = get_config_value(db, "cleanup_job_retention_days", default=default)
+        return max(0, int(value))
+    finally:
+        db.close()
+
+
 def register_worker() -> None:
     from app.model import WorkerInstance, get_db_session
 
@@ -147,7 +171,10 @@ def reclaim_orphaned_tasks() -> None:
     try:
         stale_workers = (
             db.query(WorkerInstance)
-            .filter(WorkerInstance.last_heartbeat < cutoff)
+            .filter(
+                WorkerInstance.last_heartbeat < cutoff,
+                (WorkerInstance.is_alive.is_(True) | (WorkerInstance.active_tasks > 0)),
+            )
             .all()
         )
         for worker in stale_workers:
@@ -161,6 +188,73 @@ def reclaim_orphaned_tasks() -> None:
     if stale_count:
         logger.info("marked stale workers inactive: count=%s cutoff=%s", stale_count, cutoff.isoformat())
     recover_orphaned_tasks()
+
+
+def prune_worker_history() -> int:
+    from app.model import WorkerInstance, get_db_session
+
+    retention_days = _runtime_worker_history_retention_days()
+    if retention_days <= 0:
+        return 0
+
+    cutoff = now_local() - timedelta(days=retention_days)
+    db = get_db_session()
+    deleted = 0
+    try:
+        deleted = (
+            db.query(WorkerInstance)
+            .filter(
+                WorkerInstance.is_alive.is_(False),
+                WorkerInstance.active_tasks <= 0,
+                WorkerInstance.last_heartbeat.isnot(None),
+                WorkerInstance.last_heartbeat < cutoff,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    finally:
+        db.close()
+    if deleted:
+        logger.info(
+            "pruned worker history: deleted=%s retention_days=%s cutoff=%s",
+            deleted,
+            retention_days,
+            cutoff.isoformat(),
+        )
+    return int(deleted or 0)
+
+
+def prune_finished_cleanup_jobs() -> int:
+    from app.model import WorkspaceCleanupJob, get_db_session
+
+    retention_days = _runtime_cleanup_job_retention_days()
+    if retention_days <= 0:
+        return 0
+
+    cutoff = now_local() - timedelta(days=retention_days)
+    db = get_db_session()
+    deleted = 0
+    try:
+        deleted = (
+            db.query(WorkspaceCleanupJob)
+            .filter(
+                WorkspaceCleanupJob.status.in_(["success", "failed"]),
+                WorkspaceCleanupJob.completed_at.isnot(None),
+                WorkspaceCleanupJob.completed_at < cutoff,
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+    finally:
+        db.close()
+    if deleted:
+        logger.info(
+            "pruned cleanup job history: deleted=%s retention_days=%s cutoff=%s",
+            deleted,
+            retention_days,
+            cutoff.isoformat(),
+        )
+    return int(deleted or 0)
 
 
 def cleanup_finished_tasks() -> None:
@@ -267,6 +361,8 @@ def _maintenance_loop(interval: int) -> None:
         try:
             reclaim_orphaned_tasks()
             cleanup_finished_tasks()
+            prune_worker_history()
+            prune_finished_cleanup_jobs()
         except Exception as exc:
             logger.warning("worker maintenance loop warning: %s", exc)
 
