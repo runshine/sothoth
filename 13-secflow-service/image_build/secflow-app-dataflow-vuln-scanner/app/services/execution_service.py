@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from fastapi.encoders import jsonable_encoder
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -3808,6 +3809,7 @@ class ExecutionService:
         level: str = "info",
         payload_json: dict[str, Any] | None = None,
     ) -> WorkflowExecutionEvent:
+        safe_payload = jsonable_encoder(payload_json or {})
         event = WorkflowExecutionEvent(
             id=_new_id("evt"),
             execution_id=execution_id,
@@ -3816,7 +3818,7 @@ class ExecutionService:
             round_no=round_no,
             level=level,
             message=message,
-            payload_json=payload_json or {},
+            payload_json=safe_payload,
         )
         db.add(event)
         db.commit()
