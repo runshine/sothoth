@@ -21,7 +21,10 @@ Base = declarative_base()
 
 class TaskStatus(str, enum.Enum):
     PENDING = "pending"
+    CLAIMED = "claimed"
     RETRY_PREPARING = "retry_preparing"
+    ARCHIVE_PENDING = "archive_pending"
+    ARCHIVING = "archiving"
     RUNNING = "running"
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
@@ -61,6 +64,11 @@ class UnpackTask(Base):
         index=True,
     )
     owner_id = Column(String(96), nullable=True, index=True)
+    dispatch_token = Column(String(64), nullable=True, index=True)
+    dispatch_owner_id = Column(String(96), nullable=True, index=True)
+    dispatch_claimed_at = Column(DateTime, nullable=True, index=True)
+    dispatch_lease_expires_at = Column(DateTime, nullable=True, index=True)
+    heartbeat_at = Column(DateTime, nullable=True, index=True)
     current_stage = Column(String(64), nullable=True)
     lease_expires_at = Column(DateTime, nullable=True, index=True)
     cancel_requested_at = Column(DateTime, nullable=True)
@@ -81,6 +89,12 @@ class UnpackTask(Base):
     fallback_to_llm = Column(Boolean, nullable=False, default=False)
     generated_skill_path = Column(String(512), nullable=True)
     generated_skill_status = Column(String(32), nullable=True)
+    archive_root = Column(String(512), nullable=True)
+    runtime_root = Column(String(512), nullable=True)
+    archive_status = Column(String(32), nullable=True, index=True)
+    archive_error_message = Column(Text, nullable=True)
+    archive_started_at = Column(DateTime, nullable=True)
+    archive_completed_at = Column(DateTime, nullable=True)
     promotion_success_count = Column(Integer, nullable=True)
     skill_generation_status = Column(String(32), nullable=True)
     skill_generation_error = Column(Text, nullable=True)
@@ -120,6 +134,11 @@ class UnpackTask(Base):
             "output_path": self.output_path,
             "status": self.status,
             "owner_id": self.owner_id,
+            "dispatch_token": self.dispatch_token,
+            "dispatch_owner_id": self.dispatch_owner_id,
+            "dispatch_claimed_at": isoformat_local(self.dispatch_claimed_at),
+            "dispatch_lease_expires_at": isoformat_local(self.dispatch_lease_expires_at),
+            "heartbeat_at": isoformat_local(self.heartbeat_at),
             "current_stage": self.current_stage,
             "lease_expires_at": isoformat_local(self.lease_expires_at),
             "cancel_requested_at": isoformat_local(self.cancel_requested_at),
@@ -139,6 +158,12 @@ class UnpackTask(Base):
             "fallback_to_llm": self.fallback_to_llm,
             "generated_skill_path": self.generated_skill_path,
             "generated_skill_status": self.generated_skill_status,
+            "archive_root": self.archive_root,
+            "runtime_root": self.runtime_root,
+            "archive_status": self.archive_status,
+            "archive_error_message": self.archive_error_message,
+            "archive_started_at": isoformat_local(self.archive_started_at),
+            "archive_completed_at": isoformat_local(self.archive_completed_at),
             "promotion_success_count": self.promotion_success_count,
             "skill_generation_status": self.skill_generation_status,
             "skill_generation_error": self.skill_generation_error,
@@ -508,6 +533,11 @@ def _ensure_unpack_task_columns() -> None:
         "parent_stage_item_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN parent_stage_item_id VARCHAR(64)",
         "parent_stage_item_key": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN parent_stage_item_key VARCHAR(255)",
         "owner_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN owner_id VARCHAR(96)",
+        "dispatch_token": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN dispatch_token VARCHAR(64)",
+        "dispatch_owner_id": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN dispatch_owner_id VARCHAR(96)",
+        "dispatch_claimed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN dispatch_claimed_at DATETIME",
+        "dispatch_lease_expires_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN dispatch_lease_expires_at DATETIME",
+        "heartbeat_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN heartbeat_at DATETIME",
         "current_stage": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN current_stage VARCHAR(64)",
         "lease_expires_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN lease_expires_at DATETIME",
         "cancel_requested_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN cancel_requested_at DATETIME",
@@ -524,6 +554,12 @@ def _ensure_unpack_task_columns() -> None:
         "fallback_to_llm": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN fallback_to_llm BOOLEAN DEFAULT 0",
         "generated_skill_path": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_path VARCHAR(512)",
         "generated_skill_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN generated_skill_status VARCHAR(32)",
+        "archive_root": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN archive_root VARCHAR(512)",
+        "runtime_root": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN runtime_root VARCHAR(512)",
+        "archive_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN archive_status VARCHAR(32)",
+        "archive_error_message": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN archive_error_message TEXT",
+        "archive_started_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN archive_started_at DATETIME",
+        "archive_completed_at": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN archive_completed_at DATETIME",
         "promotion_success_count": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN promotion_success_count INTEGER",
         "skill_generation_status": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_status VARCHAR(32)",
         "skill_generation_error": f"ALTER TABLE {UnpackTask.__table__.name} ADD COLUMN skill_generation_error TEXT",
@@ -556,6 +592,18 @@ def _ensure_unpack_task_columns() -> None:
     if "ix_fu_tasks_owner_created_id" not in indexes:
         index_statements.append(
             f"CREATE INDEX ix_fu_tasks_owner_created_id ON {UnpackTask.__table__.name} (owner_id, created_at, id)"
+        )
+    if "ix_fu_tasks_status_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_tasks_status_created_id ON {UnpackTask.__table__.name} (status, created_at, id)"
+        )
+    if "ix_fu_tasks_dispatch_owner_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_tasks_dispatch_owner_created_id ON {UnpackTask.__table__.name} (dispatch_owner_id, created_at, id)"
+        )
+    if "ix_fu_tasks_dispatch_status_created_id" not in indexes:
+        index_statements.append(
+            f"CREATE INDEX ix_fu_tasks_dispatch_status_created_id ON {UnpackTask.__table__.name} (status, dispatch_claimed_at, id)"
         )
     with engine.begin() as conn:
         for statement in index_statements:

@@ -74,6 +74,11 @@ class TaskResponse(BaseModel):
     output_path: str
     status: str
     owner_id: Optional[str] = None
+    dispatch_token: Optional[str] = None
+    dispatch_owner_id: Optional[str] = None
+    dispatch_claimed_at: Optional[str] = None
+    dispatch_lease_expires_at: Optional[str] = None
+    heartbeat_at: Optional[str] = None
     current_stage: Optional[str] = None
     lease_expires_at: Optional[str] = None
     cancel_requested_at: Optional[str] = None
@@ -93,6 +98,12 @@ class TaskResponse(BaseModel):
     fallback_to_llm: bool = False
     generated_skill_path: Optional[str] = None
     generated_skill_status: Optional[str] = None
+    archive_root: Optional[str] = None
+    runtime_root: Optional[str] = None
+    archive_status: Optional[str] = None
+    archive_error_message: Optional[str] = None
+    archive_started_at: Optional[str] = None
+    archive_completed_at: Optional[str] = None
     promotion_success_count: Optional[int] = None
     skill_generation_status: Optional[str] = None
     skill_generation_error: Optional[str] = None

@@ -48,6 +48,9 @@ service:
   max_background_workers: 8
   task_retention_days: 7
 
+runtime:
+  role: "all"
+
 # Worker 运行时配置
 worker:
   heartbeat_interval_seconds: 30

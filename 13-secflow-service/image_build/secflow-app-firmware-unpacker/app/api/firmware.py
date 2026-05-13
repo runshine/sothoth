@@ -328,9 +328,14 @@ def _get_task_progress(task_id: str) -> dict:
         _phase_payload("llm_cleanup", "LLM 清理", "pending"),
     ]
 
-    if task_status in {"retry_preparing", "running", "cancelling", "success", "failed", "cancelled"}:
+    if task_status in {"claimed", "retry_preparing", "running", "cancelling", "success", "failed", "cancelled"}:
         phases[0]["status"] = "running"
-        phases[0]["detail"] = "正在识别固件格式并尝试确定性预处理" if task_status != "retry_preparing" else "正在后台重置工作目录并准备重试"
+        if task_status == "retry_preparing":
+            phases[0]["detail"] = "正在后台重置工作目录并准备重试"
+        elif task_status == "claimed":
+            phases[0]["detail"] = "任务已被调度器认领，正在等待执行进程启动"
+        else:
+            phases[0]["detail"] = "正在识别固件格式并尝试确定性预处理"
 
     if stage1_path.exists():
         stage1_data = _read_json_file(stage1_path)
@@ -389,12 +394,12 @@ def _get_task_progress(task_id: str) -> dict:
                     detail,
                     _mtime_iso_text(stage3_path if stage3_path.exists() else stage2_path),
                 )
-            elif executor_logs or task_status in {"retry_preparing", "running", "success", "failed", "cancelled"}:
+            elif executor_logs or task_status in {"claimed", "retry_preparing", "running", "success", "failed", "cancelled"}:
                 phases[1] = _phase_payload(
                     "tool_match",
                     "工具匹配执行",
-                    "pending" if task_status == "retry_preparing" else "skipped",
-                    "正在等待重试准备完成" if task_status == "retry_preparing" else "未命中可复用工具，转入 LLM 解包",
+                    "pending" if task_status in {"claimed", "retry_preparing"} else "skipped",
+                    "正在等待执行进程启动" if task_status == "claimed" else ("正在等待重试准备完成" if task_status == "retry_preparing" else "未命中可复用工具，转入 LLM 解包"),
                     _mtime_iso_text(stage2_path),
                 )
 
