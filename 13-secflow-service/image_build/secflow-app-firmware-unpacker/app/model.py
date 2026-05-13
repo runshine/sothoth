@@ -453,6 +453,7 @@ DEFAULT_CONFIGS = [
 _engine = None
 _SessionFactory = None
 _OWNER_ID = None
+_WORKER_ID_MAX_LEN = 64
 
 
 def get_engine():
@@ -635,6 +636,15 @@ def generate_id() -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
+def _normalize_worker_id(raw_value: str) -> str:
+    normalized = str(raw_value or "").strip() or "unknown-worker"
+    if len(normalized) <= _WORKER_ID_MAX_LEN:
+        return normalized
+    digest = hashlib.md5(normalized.encode()).hexdigest()[:8]
+    keep = max(8, _WORKER_ID_MAX_LEN - len(digest) - 1)
+    return f"{normalized[:keep]}-{digest}"[:_WORKER_ID_MAX_LEN]
+
+
 def get_worker_id() -> str:
     global _OWNER_ID
     if _OWNER_ID is not None:
@@ -642,13 +652,13 @@ def get_worker_id() -> str:
 
     owner_id = os.environ.get("WORKER_ID")
     if owner_id:
-        _OWNER_ID = owner_id[:96]
+        _OWNER_ID = _normalize_worker_id(owner_id)
         return _OWNER_ID
 
     pod_name = (os.environ.get("HOSTNAME") or socket.gethostname()).strip() or "unknown-pod"
     pid = os.getpid()
-    unique = uuid.uuid4().hex[:8]
-    _OWNER_ID = f"{pod_name}:{pid}:{unique}"[:96]
+    digest = hashlib.md5(f"{pod_name}:{pid}".encode()).hexdigest()[:8]
+    _OWNER_ID = _normalize_worker_id(f"{pod_name}-{digest}")
     return _OWNER_ID
 
 

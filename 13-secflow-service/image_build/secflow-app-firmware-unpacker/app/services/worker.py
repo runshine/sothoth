@@ -143,6 +143,7 @@ def reclaim_orphaned_tasks() -> None:
 
     cutoff = now_local() - timedelta(seconds=_runtime_dead_threshold_seconds())
     db = get_db_session()
+    stale_count = 0
     try:
         stale_workers = (
             db.query(WorkerInstance)
@@ -152,10 +153,13 @@ def reclaim_orphaned_tasks() -> None:
         for worker in stale_workers:
             worker.is_alive = False
             worker.active_tasks = 0
+        stale_count = len(stale_workers)
         db.commit()
     finally:
         db.close()
 
+    if stale_count:
+        logger.info("marked stale workers inactive: count=%s cutoff=%s", stale_count, cutoff.isoformat())
     recover_orphaned_tasks()
 
 
@@ -272,7 +276,9 @@ def _cleanup_loop(interval: int) -> None:
 
     while not _cleanup_stop_event.wait(timeout=interval):
         try:
-            process_workspace_cleanup_jobs()
+            processed = process_workspace_cleanup_jobs()
+            if processed:
+                logger.info("workspace cleanup loop processed jobs: count=%s", processed)
         except Exception as exc:
             logger.warning("workspace cleanup loop warning: %s", exc)
 
@@ -282,7 +288,9 @@ def _evolution_loop(interval: int) -> None:
 
     while not _evolution_stop_event.wait(timeout=interval):
         try:
-            process_evolution_jobs()
+            processed = process_evolution_jobs()
+            if processed:
+                logger.info("evolution loop processed jobs: count=%s", processed)
         except Exception as exc:
             logger.warning("evolution loop warning: %s", exc)
 

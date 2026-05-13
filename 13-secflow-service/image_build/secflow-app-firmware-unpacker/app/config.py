@@ -100,6 +100,8 @@ class WorkerConfig(BaseModel):
     dead_threshold_seconds: int = 300
     claim_interval_seconds: int = 2
     claim_batch_size: int = 8
+    transient_db_retry_attempts: int = 3
+    transient_db_retry_backoff_ms: int = 200
     # Deprecated for task execution; retained for config compatibility.
     task_lease_seconds: int = 45
     task_lease_renew_interval_seconds: int = 10
