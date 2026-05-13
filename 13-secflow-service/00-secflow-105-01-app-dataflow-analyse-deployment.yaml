@@ -8,7 +8,6 @@ spec:
   selector:
     matchLabels:
       name: secflow-app-dataflow-analyse
-      role: api
   template:
     metadata:
       labels:
