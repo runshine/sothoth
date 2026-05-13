@@ -27,6 +27,11 @@ storage:
   app_root_name: "app/secflow-app-binary-security"
   fileserver_subproject_name: "__binary_security__"
   require_input_exists: true
+  min_free_disk_bytes: 1073741824
+  max_upload_file_bytes: 2147483648
+  max_source_archive_bytes: 2147483648
+  max_source_extract_bytes: 8589934592
+  max_source_extract_files: 200000
 
 scheduler:
   enabled: true
@@ -37,6 +42,15 @@ scheduler:
   downstream_sync_concurrency: 8
   downstream_action_concurrency: 8
   downstream_request_timeout_seconds: 120
+
+queue:
+  enabled: true
+  redis_url: "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
+  task_queue_key: "secflow:binary-security:tasks"
+  action_queue_key: "secflow:binary-security:actions"
+  block_timeout_seconds: 5
+  reconcile_interval_seconds: 30
+  seed_batch_size: 20
 
 runtime_policy:
   max_stage_parallelism: 4

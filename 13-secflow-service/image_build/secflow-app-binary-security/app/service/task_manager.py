@@ -12,11 +12,13 @@ import shutil
 import tarfile
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import func, or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, load_only
 
 from app.config import get_config
@@ -33,7 +35,17 @@ from app.model import (
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityTask,
+    build_archive_job_dedupe_key,
+    build_stage_item_identity_key,
     get_session_factory,
+)
+from app.observability import (
+    observe_archive_action,
+    observe_heartbeat_update,
+    observe_queue_depths,
+    observe_scheduler_loop,
+    observe_task_operation,
+    observe_worker_counts,
 )
 from app.schemas import (
     BinarySecurityActionResponse,
@@ -69,6 +81,7 @@ from app.service.fileserver import get_fileserver_client
 from app.service.firmware_unpacker import get_firmware_unpacker_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.system_analyse import get_system_analyse_client
+from app.service.task_queue import get_task_queue
 from app.time_utils import now_local
 
 
@@ -100,6 +113,19 @@ def _elapsed_seconds_since(value: datetime | None) -> float | None:
     if non_negative:
         return min(non_negative)
     return max(candidates)
+
+
+def _seconds_until(value: datetime | None) -> float | None:
+    if value is None:
+        return None
+    candidates = [
+        (value - _now()).total_seconds(),
+        (value - datetime.utcnow()).total_seconds(),
+    ]
+    non_negative = [remaining for remaining in candidates if remaining >= 0]
+    if non_negative:
+        return max(non_negative)
+    return min(candidates)
 
 
 def _slug(value: str) -> str:
@@ -508,13 +534,18 @@ class TaskManager:
         self._action_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, asyncio.Task] = {}
         self._action_workers: dict[str, asyncio.Task] = {}
+        self._archive_workers: set[asyncio.Task] = set()
         self._worker_lock = asyncio.Lock()
         self._action_worker_lock = asyncio.Lock()
+        self._archive_worker_lock = asyncio.Lock()
+        self._last_task_heartbeat_at: dict[str, datetime] = {}
+        self._last_queue_reconcile_at: datetime | None = None
 
     async def start(self) -> None:
         if self._running:
             return
         self._running = True
+        observe_worker_counts(task_workers=0, action_workers=0, archive_workers=0)
         self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
         self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
         self._action_loop_task = asyncio.create_task(
@@ -525,6 +556,7 @@ class TaskManager:
             self._downstream_reconcile_loop(),
             name="binary-security-downstream-reconcile",
         )
+        await self._seed_work_queues()
 
     async def stop(self) -> None:
         self._running = False
@@ -552,6 +584,11 @@ class TaskManager:
                 await self._downstream_reconcile_task
             except asyncio.CancelledError:
                 pass
+        archive_active = list(self._archive_workers)
+        for task in archive_active:
+            task.cancel()
+        if archive_active:
+            await asyncio.gather(*archive_active, return_exceptions=True)
         active = list(self._workers.values())
         for task in active:
             task.cancel()
@@ -562,6 +599,7 @@ class TaskManager:
             task.cancel()
         if action_active:
             await asyncio.gather(*action_active, return_exceptions=True)
+        observe_worker_counts(task_workers=0, action_workers=0, archive_workers=0)
 
     def prepare_task_id(self, db: Session, project_id: str) -> str:
         for _ in range(10):
@@ -707,6 +745,8 @@ class TaskManager:
                 if not await asyncio.to_thread(local_path.is_file):
                     raise ValidationError(f"上传文件缺失: {relative_path}")
                 stat = await asyncio.to_thread(local_path.stat)
+                self._validate_uploaded_archive_size(filename, stat.st_size, source_task=False)
+                self._check_storage_free_space(required_bytes=stat.st_size)
                 total_bytes += stat.st_size
                 actual_files.append(
                     {
@@ -719,6 +759,7 @@ class TaskManager:
         task.status = "ready_to_start"
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
+        task.lease_expires_at = None
         task.summary = {
             **task.summary,
             "input_files": actual_files,
@@ -752,6 +793,7 @@ class TaskManager:
         task.last_error = None
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
+        task.lease_expires_at = None
         task.started_at = None
         task.finished_at = None
         task.summary = {
@@ -768,6 +810,7 @@ class TaskManager:
         else:
             self._record_event(db, task, "source_tree_initialized", f"已初始化源码工程输入，共 {len(input_files)} 个文件")
         db.commit()
+        self._enqueue_task(task.id)
         return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def list_tasks(self, db: Session, *, project_id: str, status: str | None = None, task_type: str | None = None) -> BinarySecurityTaskListResponse:
@@ -886,42 +929,43 @@ class TaskManager:
         task_id: str,
         payload: BinarySecurityTaskConcurrencyUpdatePayload,
     ) -> BinarySecurityTaskDetailResponse:
-        task = self._task_or_404(db, project_id, task_id)
-        stage_sequence = self._stage_sequence_for_task(task)
-        allowed_stages = set(stage_sequence)
-        requested = payload.stage_parallelism or {}
-        invalid_stage = next((stage for stage in requested if stage not in allowed_stages), None)
-        if invalid_stage:
-            raise ValidationError(f"阶段不属于当前任务流程: {invalid_stage}")
+        with self._task_operation_lock(db, task_id):
+            task = self._task_or_404(db, project_id, task_id)
+            stage_sequence = self._stage_sequence_for_task(task)
+            allowed_stages = set(stage_sequence)
+            requested = payload.stage_parallelism or {}
+            invalid_stage = next((stage for stage in requested if stage not in allowed_stages), None)
+            if invalid_stage:
+                raise ValidationError(f"阶段不属于当前任务流程: {invalid_stage}")
 
-        policy = dict(task.policy or {})
-        current_parallelism = policy.get("stage_parallelism") if isinstance(policy.get("stage_parallelism"), dict) else {}
-        before = {
-            stage: max(1, int(current_parallelism.get(stage) or policy.get("max_stage_parallelism") or 1))
-            for stage in stage_sequence
-        }
-        updated = dict(before)
-        for stage_name, raw_value in requested.items():
-            try:
-                value = int(raw_value)
-            except (TypeError, ValueError):
-                raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数") from None
-            if value < 1 or value > 32:
-                raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数")
-            updated[stage_name] = value
+            policy = dict(task.policy or {})
+            current_parallelism = policy.get("stage_parallelism") if isinstance(policy.get("stage_parallelism"), dict) else {}
+            before = {
+                stage: max(1, int(current_parallelism.get(stage) or policy.get("max_stage_parallelism") or 1))
+                for stage in stage_sequence
+            }
+            updated = dict(before)
+            for stage_name, raw_value in requested.items():
+                try:
+                    value = int(raw_value)
+                except (TypeError, ValueError):
+                    raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数") from None
+                if value < 1 or value > 32:
+                    raise ValidationError(f"阶段 {stage_name} 并发必须是 1 到 32 之间的整数")
+                updated[stage_name] = value
 
-        policy["stage_parallelism"] = updated
-        policy["max_stage_parallelism"] = max(updated.values()) if updated else 1
-        task.policy = policy
-        self._record_event(
-            db,
-            task,
-            "task_concurrency_updated",
-            "任务阶段并发配置已更新",
-            payload={"before": before, "after": updated},
-        )
-        db.commit()
-        return self.get_task_detail(db, project_id=project_id, task_id=task_id)
+            policy["stage_parallelism"] = updated
+            policy["max_stage_parallelism"] = max(updated.values()) if updated else 1
+            task.policy = policy
+            self._record_event(
+                db,
+                task,
+                "task_concurrency_updated",
+                "任务阶段并发配置已更新",
+                payload={"before": before, "after": updated},
+            )
+            db.commit()
+            return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def get_module_selection(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityModuleSelectionResponse:
         task = self._task_or_404(db, project_id, task_id)
@@ -945,77 +989,78 @@ class TaskManager:
         task_id: str,
         selected_module_keys: list[str],
     ) -> BinarySecurityTaskDetailResponse:
-        task = self._task_or_404(db, project_id, task_id)
-        if task.status != TASK_STATUS_PENDING_MODULE_CONFIRMATION:
-            raise ValidationError("当前任务不处于等待模块确认状态")
-        summary = dict(task.summary or {})
-        candidate_modules = list(summary.get("candidate_modules") or [])
-        if not candidate_modules:
-            raise ValidationError("当前任务没有可确认的候选模块")
-        requested = [str(key or "").strip() for key in selected_module_keys if str(key or "").strip()]
-        if not requested:
-            raise ValidationError("至少选择 1 个模块")
-        candidate_map = {str(module.get("module_key") or ""): dict(module) for module in candidate_modules if str(module.get("module_key") or "").strip()}
-        invalid = [key for key in requested if key not in candidate_map]
-        if invalid:
-            raise ValidationError(f"存在不属于候选集合的模块: {invalid[0]}")
-        selected = self._mark_selected_modules([candidate_map[key] for key in requested], selected_by=MODULE_SELECTION_MODE_MANUAL_CONFIRM)
-        summary["selected_modules"] = selected
-        summary["high_risk_modules"] = selected
-        task.summary = summary
-        task.metrics = {
-            **task.metrics,
-            "selected_module_count": len(selected),
-        }
-        stage_run = db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == "system_analysis",
-        ).first()
-        if stage_run:
-            stage_run.status = "success"
-            stage_run.started_at = stage_run.started_at or _now()
-            stage_run.finished_at = stage_run.finished_at or _now()
-            stage_run.last_error = None
-            stage_run.counts = self._stage_counts(db, stage_run)
-            self._merge_stage_run_output_summary(
+        with self._task_operation_lock(db, task_id):
+            task = self._task_or_404(db, project_id, task_id)
+            if task.status != TASK_STATUS_PENDING_MODULE_CONFIRMATION:
+                raise ValidationError("当前任务不处于等待模块确认状态")
+            summary = dict(task.summary or {})
+            candidate_modules = list(summary.get("candidate_modules") or [])
+            if not candidate_modules:
+                raise ValidationError("当前任务没有可确认的候选模块")
+            requested = [str(key or "").strip() for key in selected_module_keys if str(key or "").strip()]
+            if not requested:
+                raise ValidationError("至少选择 1 个模块")
+            candidate_map = {str(module.get("module_key") or ""): dict(module) for module in candidate_modules if str(module.get("module_key") or "").strip()}
+            invalid = [key for key in requested if key not in candidate_map]
+            if invalid:
+                raise ValidationError(f"存在不属于候选集合的模块: {invalid[0]}")
+            selected = self._mark_selected_modules([candidate_map[key] for key in requested], selected_by=MODULE_SELECTION_MODE_MANUAL_CONFIRM)
+            summary["selected_modules"] = selected
+            summary["high_risk_modules"] = selected
+            task.summary = summary
+            task.metrics = {
+                **task.metrics,
+                "selected_module_count": len(selected),
+            }
+            stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == "system_analysis",
+            ).first()
+            if stage_run:
+                stage_run.status = "success"
+                stage_run.started_at = stage_run.started_at or _now()
+                stage_run.finished_at = stage_run.finished_at or _now()
+                stage_run.last_error = None
+                stage_run.counts = self._stage_counts(db, stage_run)
+                self._merge_stage_run_output_summary(
+                    task,
+                    stage_run,
+                    {
+                        "status": "success",
+                        "sync_status": "success",
+                        "error": None,
+                        "waiting_manual_confirmation": False,
+                        "selected_module_count": len(selected),
+                        "candidate_module_count": len(candidate_modules),
+                        "module_count": len(list(summary.get("system_analysis_modules") or [])),
+                        "high_risk_module_count": len(selected),
+                        "status_synced": True,
+                    },
+                )
+            current_stage = str(task.current_stage or "").strip()
+            task.status = "pending"
+            next_stage = self._next_incomplete_stage(db, task)
+            if next_stage == current_stage or not next_stage:
+                stage_sequence = self._stage_sequence_for_task(task)
+                if current_stage in stage_sequence:
+                    current_index = stage_sequence.index(current_stage)
+                    if current_index + 1 < len(stage_sequence):
+                        next_stage = stage_sequence[current_index + 1]
+            task.current_stage = next_stage or self._stage_sequence_for_task(task)[0]
+            task.last_error = None
+            self._invalidate_task_execution(task)
+            task.finished_at = None
+            self._record_event(
+                db,
                 task,
-                stage_run,
-                {
-                    "status": "success",
-                    "sync_status": "success",
-                    "error": None,
-                    "waiting_manual_confirmation": False,
-                    "selected_module_count": len(selected),
-                    "candidate_module_count": len(candidate_modules),
-                    "module_count": len(list(summary.get("system_analysis_modules") or [])),
-                    "high_risk_module_count": len(selected),
-                    "status_synced": True,
-                },
+                "module_selection_confirmed",
+                f"已确认 {len(selected)} 个模块，任务继续执行",
+                stage_name="system_analysis",
+                payload={"selected_module_keys": requested},
             )
-        current_stage = str(task.current_stage or "").strip()
-        task.status = "pending"
-        next_stage = self._next_incomplete_stage(db, task)
-        if next_stage == current_stage or not next_stage:
-            stage_sequence = self._stage_sequence_for_task(task)
-            if current_stage in stage_sequence:
-                current_index = stage_sequence.index(current_stage)
-                if current_index + 1 < len(stage_sequence):
-                    next_stage = stage_sequence[current_index + 1]
-        task.current_stage = next_stage or self._stage_sequence_for_task(task)[0]
-        task.last_error = None
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
-        task.finished_at = None
-        self._record_event(
-            db,
-            task,
-            "module_selection_confirmed",
-            f"已确认 {len(selected)} 个模块，任务继续执行",
-            stage_name="system_analysis",
-            payload={"selected_module_keys": requested},
-        )
-        db.commit()
-        return self.get_task_detail(db, project_id=project_id, task_id=task_id)
+            db.commit()
+            self._enqueue_task(task.id)
+            return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def get_timeline(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTimelineResponse:
         task = self._task_or_404(db, project_id, task_id)
@@ -1095,34 +1140,37 @@ class TaskManager:
         )
 
     async def cancel_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
-        task = self._task_or_404(db, project_id, task_id)
-        if task.status == "cancelled":
-            return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
-        task.status = "cancelled"
-        self._invalidate_task_execution(task)
-        task.finished_at = _now()
-        self._record_event(db, task, "task_cancelled", "任务已取消")
-        running_items = db.query(BinarySecurityStageItem).filter(
-            BinarySecurityStageItem.task_id == task.id,
-            BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
-        ).all()
-        for item in running_items:
-            item.status = "cancelled"
-            item.finished_at = _now()
-        await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
-        db.commit()
-        await self._cancel_local_worker(task.id)
-        token = self._service_token()
-        await asyncio.gather(
-            *(self._cancel_downstream(item, token) for item in running_items if item.downstream_task_id),
-            return_exceptions=True,
-        )
-        return BinarySecurityActionResponse(
-            task_id=task_id,
-            message="任务已取消",
-            cancelled_downstream_count=len([item for item in running_items if item.downstream_task_id]),
-            cleanup_status="cancelled",
-        )
+        with self._task_operation_lock(db, task_id):
+            task = self._task_or_404(db, project_id, task_id)
+            if task.status == "cancelled":
+                observe_task_operation("cancel", "already_cancelled")
+                return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
+            task.status = "cancelled"
+            self._invalidate_task_execution(task)
+            task.finished_at = _now()
+            self._record_event(db, task, "task_cancelled", "任务已取消")
+            running_items = db.query(BinarySecurityStageItem).filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
+            ).all()
+            for item in running_items:
+                item.status = "cancelled"
+                item.finished_at = _now()
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="cancelled")
+            db.commit()
+            await self._cancel_local_worker(task.id)
+            token = self._service_token()
+            await asyncio.gather(
+                *(self._cancel_downstream(item, token) for item in running_items if item.downstream_task_id),
+                return_exceptions=True,
+            )
+            observe_task_operation("cancel", "accepted")
+            return BinarySecurityActionResponse(
+                task_id=task_id,
+                message="任务已取消",
+                cancelled_downstream_count=len([item for item in running_items if item.downstream_task_id]),
+                cleanup_status="cancelled",
+            )
 
     async def delete_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
@@ -1174,23 +1222,27 @@ class TaskManager:
         )
 
     async def continue_task(self, db: Session, *, project_id: str, task_id: str) -> str:
-        task = self._task_or_404(db, project_id, task_id)
-        supported, reason, target_stage = self._task_continue_support(db, task)
-        if not supported:
-            raise ValidationError(reason or "当前任务不可继续")
-        if not target_stage:
-            raise ValidationError("当前任务未找到可继续的阶段")
-        self._accept_blocking_action(
-            db,
-            task,
-            action="continue",
-            preparing_status=TASK_STATUS_CONTINUE_PREPARING,
-            target_stage=target_stage,
-            message=f"继续任务已受理，后台正在准备从阶段 {target_stage} 继续",
-            event_type="task_continue_accepted",
-            event_payload={"target_stage": target_stage},
-        )
-        return target_stage
+        with self._task_operation_lock(db, task_id):
+            task = self._task_or_404(db, project_id, task_id)
+            supported, reason, target_stage = self._task_continue_support(db, task)
+            if not supported:
+                observe_task_operation("continue", "rejected")
+                raise ValidationError(reason or "当前任务不可继续")
+            if not target_stage:
+                observe_task_operation("continue", "rejected")
+                raise ValidationError("当前任务未找到可继续的阶段")
+            self._accept_blocking_action(
+                db,
+                task,
+                action="continue",
+                preparing_status=TASK_STATUS_CONTINUE_PREPARING,
+                target_stage=target_stage,
+                message=f"继续任务已受理，后台正在准备从阶段 {target_stage} 继续",
+                event_type="task_continue_accepted",
+                event_payload={"target_stage": target_stage},
+            )
+            observe_task_operation("continue", "accepted")
+            return target_stage
 
     async def _prepare_continue_task(self, db: Session, task: BinarySecurityTask, target_stage: str) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
@@ -1221,21 +1273,24 @@ class TaskManager:
         return affected_stages
 
     def retry_task(self, db: Session, *, project_id: str, task_id: str) -> None:
-        task = self._task_or_404(db, project_id, task_id)
-        supported, reason, stage_name = self._task_retry_support(db, task)
-        if not supported or not stage_name:
-            raise ValidationError(reason or "当前任务不支持安全重试")
-        first_stage = self._stage_sequence_for_task(task)[0]
-        self._accept_blocking_action(
-            db,
-            task,
-            action="retry",
-            preparing_status=TASK_STATUS_RETRY_PREPARING,
-            target_stage=first_stage,
-            message=f"清空并从头开始已受理，后台正在准备从阶段 {first_stage} 重新排队",
-            event_type="task_retry_accepted",
-            event_payload={"target_stage": first_stage},
-        )
+        with self._task_operation_lock(db, task_id):
+            task = self._task_or_404(db, project_id, task_id)
+            supported, reason, stage_name = self._task_retry_support(db, task)
+            if not supported or not stage_name:
+                observe_task_operation("retry", "rejected")
+                raise ValidationError(reason or "当前任务不支持安全重试")
+            first_stage = self._stage_sequence_for_task(task)[0]
+            self._accept_blocking_action(
+                db,
+                task,
+                action="retry",
+                preparing_status=TASK_STATUS_RETRY_PREPARING,
+                target_stage=first_stage,
+                message=f"清空并从头开始已受理，后台正在准备从阶段 {first_stage} 重新排队",
+                event_type="task_retry_accepted",
+                event_payload={"target_stage": first_stage},
+            )
+            observe_task_operation("retry", "accepted")
 
     async def _prepare_retry_task(self, db: Session, task: BinarySecurityTask) -> list[str]:
         stage_sequence = self._stage_sequence_for_task(task)
@@ -1319,9 +1374,28 @@ class TaskManager:
             payload={"retry_semantics": "stage_retry_reuse_current_downstream", "cleared_stages": affected_stages},
         )
         db.commit()
+        self._enqueue_task(task.id)
 
     def _run_sync(self, coro):
         return asyncio.run(coro)
+
+    def _schedule_coroutine(self, coro) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(coro)
+            return
+        loop.create_task(coro)
+
+    def _enqueue_task(self, task_id: str) -> None:
+        if not self.cfg.queue.enabled:
+            return
+        self._schedule_coroutine(get_task_queue().push_task(task_id))
+
+    def _enqueue_action(self, task_id: str) -> None:
+        if not self.cfg.queue.enabled:
+            return
+        self._schedule_coroutine(get_task_queue().push_action(task_id))
 
     def _stage_items_for_stages(
         self,
@@ -1362,6 +1436,46 @@ class TaskManager:
             return
         await self._cancel_downstream_refs(db, task, refs, token)
         await self._delete_downstream_refs(db, task, refs, token)
+
+    async def _seed_work_queues(self) -> None:
+        session_factory = get_session_factory()
+        db = session_factory()
+        try:
+            await self._reconcile_work_queues(db, force=True)
+        finally:
+            db.close()
+
+    async def _reconcile_work_queues(self, db: Session, *, force: bool = False) -> None:
+        if not self.cfg.queue.enabled:
+            return
+        now = _now()
+        interval = max(5, int(self.cfg.queue.reconcile_interval_seconds or 30))
+        if not force and self._last_queue_reconcile_at and (now - self._last_queue_reconcile_at).total_seconds() < interval:
+            return
+        self._last_queue_reconcile_at = now
+        self._reclaim_stale_dispatching_locked(db)
+        self._reclaim_stale_running_locked(db)
+        seed_batch = max(1, int(self.cfg.queue.seed_batch_size or 20))
+        pending_ids = [
+            row[0]
+            for row in db.query(BinarySecurityTask.id)
+            .filter(BinarySecurityTask.status == "pending")
+            .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
+            .limit(seed_batch)
+            .all()
+        ]
+        preparing_ids = [
+            row[0]
+            for row in db.query(BinarySecurityTask.id)
+            .filter(BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)))
+            .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
+            .limit(seed_batch)
+            .all()
+        ]
+        for task_id in pending_ids:
+            await get_task_queue().push_task(task_id)
+        for task_id in preparing_ids:
+            await get_task_queue().push_action(task_id)
 
     async def sync_downstream_status(
         self,
@@ -1646,6 +1760,7 @@ class TaskManager:
         task.last_error = None
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
+        task.lease_expires_at = None
         task.finished_at = None
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="running")
         self._record_event(
@@ -1670,6 +1785,7 @@ class TaskManager:
         extra_paths: list[str | Path] | None = None,
     ) -> BinarySecurityArchiveJob:
         downstream_task_id = str(item.downstream_task_id or "").strip()
+        job_dedupe_key = build_archive_job_dedupe_key(item.id, downstream_task_id)
         lock_digest = hashlib.sha1(f"{item.id}:{downstream_task_id}".encode("utf-8")).hexdigest()
         lock_name = f"bs_archive:{lock_digest}"
         locked = False
@@ -1686,8 +1802,9 @@ class TaskManager:
             existing = (
                 db.query(BinarySecurityArchiveJob)
                 .filter(
-                    BinarySecurityArchiveJob.item_id == item.id,
-                    BinarySecurityArchiveJob.downstream_task_id == downstream_task_id,
+                    BinarySecurityArchiveJob.task_id == task.id,
+                    BinarySecurityArchiveJob.stage_name == item.stage_name,
+                    BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
                     BinarySecurityArchiveJob.archive_status.in_(["pending", "running", "archived", "applying", "success"]),
                 )
                 .order_by(BinarySecurityArchiveJob.created_at.desc())
@@ -1698,8 +1815,9 @@ class TaskManager:
             failed = (
                 db.query(BinarySecurityArchiveJob)
                 .filter(
-                    BinarySecurityArchiveJob.item_id == item.id,
-                    BinarySecurityArchiveJob.downstream_task_id == downstream_task_id,
+                    BinarySecurityArchiveJob.task_id == task.id,
+                    BinarySecurityArchiveJob.stage_name == item.stage_name,
+                    BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
                     BinarySecurityArchiveJob.archive_status == "failed",
                 )
                 .order_by(BinarySecurityArchiveJob.created_at.desc())
@@ -1714,6 +1832,7 @@ class TaskManager:
                 item_key=item.item_key,
                 downstream_service=item.downstream_service,
                 downstream_task_id=downstream_task_id,
+                job_dedupe_key=job_dedupe_key,
             )
             job.task_id = task.id
             job.project_id = task.project_id
@@ -1721,6 +1840,7 @@ class TaskManager:
             job.item_key = item.item_key
             job.downstream_service = item.downstream_service
             job.downstream_task_id = downstream_task_id
+            job.job_dedupe_key = job_dedupe_key
             job.archive_status = "pending"
             job.owner_id = None
             job.error_message = None
@@ -1737,7 +1857,25 @@ class TaskManager:
             }
             if failed is None:
                 db.add(job)
-            db.flush()
+            try:
+                with self._savepoint(db):
+                    if failed is not None:
+                        db.add(job)
+                    db.flush()
+            except IntegrityError:
+                existing = (
+                    db.query(BinarySecurityArchiveJob)
+                    .filter(
+                        BinarySecurityArchiveJob.task_id == task.id,
+                        BinarySecurityArchiveJob.stage_name == item.stage_name,
+                        BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
+                    )
+                    .order_by(BinarySecurityArchiveJob.created_at.desc())
+                    .first()
+                )
+                if existing is None:
+                    raise
+                return existing
             # The archive worker may run in another process/session. Persist the
             # queued job before releasing the named lock so a concurrent sync path
             # can observe and reuse it instead of creating a duplicate job.
@@ -1890,48 +2028,61 @@ class TaskManager:
             payload={"action": action, "target_stage": target_stage, **(event_payload or {})},
         )
         db.commit()
+        self._enqueue_action(task.id)
 
     async def _blocking_action_dispatch_loop(self) -> None:
         session_factory = get_session_factory()
         while self._running:
+            task_id = None
             db = session_factory()
             try:
-                claimed_ids = self._claim_preparing_tasks(db)
-                if claimed_ids:
-                    async with self._action_worker_lock:
-                        for task_id in claimed_ids:
-                            if task_id in self._action_workers and not self._action_workers[task_id].done():
-                                continue
-                            self._action_workers[task_id] = asyncio.create_task(
-                                self._run_preparing_action(task_id),
-                                name=f"binary-security-action-{task_id}",
-                            )
+                with observe_scheduler_loop("action_dispatch"):
+                    task_id = await get_task_queue().pop_action(self.cfg.queue.block_timeout_seconds)
+                    if task_id:
+                        claimed_id = self._claim_preparing_task_by_id(db, task_id)
+                        if claimed_id:
+                            async with self._action_worker_lock:
+                                if claimed_id not in self._action_workers or self._action_workers[claimed_id].done():
+                                    self._action_workers[claimed_id] = asyncio.create_task(
+                                        self._run_preparing_action(claimed_id),
+                                        name=f"binary-security-action-{claimed_id}",
+                                    )
+                    else:
+                        await self._reconcile_work_queues(db)
+                    self._observe_runtime_metrics(db)
             finally:
                 db.close()
-            await asyncio.sleep(self.cfg.scheduler.poll_interval_seconds)
 
     async def _dispatch_loop(self) -> None:
         session_factory = get_session_factory()
         while self._running:
+            task_id = None
             db = session_factory()
             try:
-                claimed_ids = self._dispatch_once(db)
-                if claimed_ids:
-                    async with self._worker_lock:
-                        for task_id in claimed_ids:
-                            if task_id in self._workers and not self._workers[task_id].done():
-                                continue
-                            self._workers[task_id] = asyncio.create_task(self._run_task(task_id), name=f"binary-security-{task_id}")
+                with observe_scheduler_loop("task_dispatch"):
+                    task_id = await get_task_queue().pop_task(self.cfg.queue.block_timeout_seconds)
+                    if task_id:
+                        claimed_id = self._dispatch_task_by_id(db, task_id)
+                        if claimed_id:
+                            async with self._worker_lock:
+                                if claimed_id not in self._workers or self._workers[claimed_id].done():
+                                    self._workers[claimed_id] = asyncio.create_task(
+                                        self._run_task(claimed_id),
+                                        name=f"binary-security-{claimed_id}",
+                                    )
+                    else:
+                        await self._reconcile_work_queues(db)
+                    self._observe_runtime_metrics(db)
             finally:
                 db.close()
-            await asyncio.sleep(self.cfg.scheduler.poll_interval_seconds)
 
     def _claim_preparing_tasks(self, db: Session) -> list[str]:
+        lease_expires_at = self._next_lease_expiry(db)
         candidates = (
             db.query(BinarySecurityTask.id)
             .filter(
                 BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
-                BinarySecurityTask.dispatcher_instance_id.is_(None),
+                self._lease_filter_available(),
             )
             .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
             .limit(max(1, int(self.cfg.scheduler.task_concurrency or 2)))
@@ -1946,12 +2097,13 @@ class TaskManager:
                 .filter(
                     BinarySecurityTask.id == task_id,
                     BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
-                    BinarySecurityTask.dispatcher_instance_id.is_(None),
+                    self._lease_filter_available(),
                 )
                 .update(
                     {
                         BinarySecurityTask.dispatcher_instance_id: self.instance_id,
                         BinarySecurityTask.dispatch_started_at: started_at,
+                        BinarySecurityTask.lease_expires_at: lease_expires_at,
                         BinarySecurityTask.updated_at: started_at,
                     },
                     synchronize_session=False,
@@ -1963,6 +2115,31 @@ class TaskManager:
             db.commit()
         return claimed
 
+    def _claim_preparing_task_by_id(self, db: Session, task_id: str) -> str | None:
+        started_at = _now()
+        lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
+        updated = (
+            db.query(BinarySecurityTask)
+            .filter(
+                BinarySecurityTask.id == task_id,
+                BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)),
+                self._lease_filter_available(),
+            )
+            .update(
+                {
+                    BinarySecurityTask.dispatcher_instance_id: self.instance_id,
+                    BinarySecurityTask.dispatch_started_at: started_at,
+                    BinarySecurityTask.lease_expires_at: lease_expires_at,
+                    BinarySecurityTask.updated_at: started_at,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated:
+            db.commit()
+            return task_id
+        return None
+
     async def _run_preparing_action(self, task_id: str) -> None:
         session_factory = get_session_factory()
         db = session_factory()
@@ -1972,6 +2149,7 @@ class TaskManager:
                 task is None
                 or task.status not in TASK_PREPARING_STATUSES
                 or task.dispatcher_instance_id != self.instance_id
+                or not self._lease_is_active(task)
             ):
                 return
             action = str(task.pending_action or "").strip()
@@ -2016,7 +2194,7 @@ class TaskManager:
             task.last_error = None
             task.finished_at = None
             self._invalidate_task_execution(task)
-            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
             self._record_event(
                 db,
                 task,
@@ -2039,6 +2217,7 @@ class TaskManager:
                 },
             )
             db.commit()
+            self._enqueue_task(task.id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2052,7 +2231,7 @@ class TaskManager:
                 task.last_error = str(exc)
                 task.finished_at = _now()
                 self._invalidate_task_execution(task)
-                self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="failed")
+                await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="failed")
                 self._record_event(
                     db,
                     task,
@@ -2071,49 +2250,84 @@ class TaskManager:
     async def _archive_dispatch_loop(self) -> None:
         while self._running:
             try:
-                archived_job_id = self._next_archived_job()
-                if archived_job_id:
-                    await self._apply_archive_job_status(archived_job_id, None)
-                    continue
-                job_id = self._claim_archive_job()
-                if job_id:
-                    await self._process_archive_job(job_id)
-                    continue
+                with observe_scheduler_loop("archive_dispatch"):
+                    await self._schedule_archive_workers()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 pass
             await asyncio.sleep(max(1, self.cfg.scheduler.poll_interval_seconds))
 
+    async def _schedule_archive_workers(self) -> None:
+        max_workers = max(1, int(getattr(self.cfg.scheduler, "archive_job_concurrency", 0) or 1))
+        async with self._archive_worker_lock:
+            self._archive_workers = {task for task in self._archive_workers if not task.done()}
+            slots = max_workers - len(self._archive_workers)
+            if slots <= 0:
+                return
+            assignments: list[tuple[str, str]] = []
+            for _ in range(slots):
+                archived_job_id = await asyncio.to_thread(self._next_archived_job)
+                if archived_job_id:
+                    observe_archive_action("claim", "apply")
+                    assignments.append(("apply", archived_job_id))
+                    continue
+                job_id = await asyncio.to_thread(self._claim_archive_job)
+                if job_id:
+                    observe_archive_action("claim", "copy")
+                    assignments.append(("copy", job_id))
+                    continue
+                break
+            for work_type, job_id in assignments:
+                worker = asyncio.create_task(
+                    self._archive_worker(work_type, job_id),
+                    name=f"binary-security-archive-{work_type}-{job_id}",
+                )
+                self._archive_workers.add(worker)
+            self._observe_worker_counts()
+
+    async def _archive_worker(self, work_type: str, job_id: str) -> None:
+        try:
+            if work_type == "apply":
+                await self._apply_archive_job_status(job_id, None)
+            else:
+                await self._process_archive_job(job_id)
+        finally:
+            async with self._archive_worker_lock:
+                self._archive_workers.discard(asyncio.current_task())
+            self._observe_worker_counts()
+
     async def _downstream_reconcile_loop(self) -> None:
         interval_seconds = max(5, int(self.cfg.scheduler.stage_poll_interval_seconds or self.cfg.scheduler.poll_interval_seconds or 5))
         while self._running:
             db = get_session_factory()()
             try:
-                task_refs = self._list_tasks_needing_downstream_sync(db)
-                token = self._service_token()
-                results = await self._run_with_limits(
-                    task_refs,
-                    lambda ref: self._reconcile_downstream_task_ref(ref, token),
-                    concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
-                    timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
-                )
-                for ref, _, exc in results:
-                    if exc is None:
-                        continue
-                    try:
-                        task = self._task_or_404(db, ref["project_id"], ref["task_id"])
-                        self._record_event(
-                            db,
-                            task,
-                            "downstream_status_reconcile_failed",
-                            f"后台同步下游状态失败: {exc}",
-                            level="warning",
-                            payload={"task_id": ref["task_id"], "project_id": ref["project_id"], "error": str(exc)},
-                        )
-                        db.commit()
-                    except Exception:
-                        db.rollback()
+                with observe_scheduler_loop("downstream_reconcile"):
+                    task_refs = await asyncio.to_thread(self._list_tasks_needing_downstream_sync, db)
+                    token = self._service_token()
+                    results = await self._run_with_limits(
+                        task_refs,
+                        lambda ref: self._reconcile_downstream_task_ref(ref, token),
+                        concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
+                        timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
+                    )
+                    for ref, _, exc in results:
+                        if exc is None:
+                            continue
+                        try:
+                            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_status_reconcile_failed",
+                                f"后台同步下游状态失败: {exc}",
+                                level="warning",
+                                payload={"task_id": ref["task_id"], "project_id": ref["project_id"], "error": str(exc)},
+                            )
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+                    self._observe_runtime_metrics(db, reconcile_candidates=len(task_refs))
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
@@ -2166,8 +2380,12 @@ class TaskManager:
             db.close()
 
     def _list_tasks_needing_downstream_sync(self, db: Session) -> list[dict[str, str]]:
+        local_workers = {
+            task_id for task_id, worker in self._workers.items()
+            if not worker.done()
+        }
         rows = (
-            db.query(BinarySecurityTask.project_id, BinarySecurityTask.id)
+            db.query(BinarySecurityTask)
             .join(BinarySecurityStageItem, BinarySecurityStageItem.task_id == BinarySecurityTask.id)
             .filter(
                 BinarySecurityTask.status.in_(["pending", "dispatching", "running"]),
@@ -2178,7 +2396,16 @@ class TaskManager:
             .distinct()
             .all()
         )
-        return [{"project_id": str(project_id), "task_id": str(task_id)} for project_id, task_id in rows]
+        refs: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for task in rows:
+            if task.id in seen or task.id in local_workers:
+                continue
+            if not self._task_needs_downstream_reconcile(task):
+                continue
+            seen.add(task.id)
+            refs.append({"project_id": str(task.project_id), "task_id": str(task.id)})
+        return refs
 
     def _claim_archive_job(self) -> str | None:
         session_factory = get_session_factory()
@@ -2236,7 +2463,9 @@ class TaskManager:
     async def _process_archive_job(self, job_id: str) -> None:
         archived_root, error = await asyncio.to_thread(self._run_archive_copy_job, job_id)
         if error:
+            observe_archive_action("copy", "failed")
             return
+        observe_archive_action("copy", "archived")
         await self._apply_archive_job_status(job_id, archived_root)
 
     async def _wait_archive_job_completion(self, job_id: str, task_id: str) -> BinarySecurityArchiveJob | None:
@@ -2388,8 +2617,9 @@ class TaskManager:
                     "downstream_task_id": item.downstream_task_id,
                 },
             )
-            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             db.commit()
+            observe_archive_action("apply", "success")
         except Exception as exc:
             db.rollback()
             job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
@@ -2399,27 +2629,52 @@ class TaskManager:
                 job.completed_at = _now()
                 job.updated_at = _now()
                 db.commit()
+            observe_archive_action("apply", "failed")
         finally:
             db.close()
 
     def _dispatch_once(self, db: Session) -> list[str]:
-        lock_name = "secflow_binary_security_dispatch_lock"
-        locked = bool(db.execute(text("SELECT GET_LOCK(:name, :timeout)"), {"name": lock_name, "timeout": 1}).scalar())
-        if not locked:
-            db.rollback()
-            return []
-        try:
-            stale_reclaimed = self._reclaim_stale_dispatching_locked(db)
-            service_config = self._load_service_config(db)
-            active_count = self._active_dispatch_count(db)
-            slots = max(0, service_config.max_concurrent_tasks - active_count)
-            claimed_ids = self._claim_pending_tasks(db, slots)
-            if stale_reclaimed and not claimed_ids:
-                db.commit()
-            return claimed_ids
-        finally:
-            db.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+        stale_reclaimed = self._reclaim_stale_dispatching_locked(db)
+        stale_running_reclaimed = self._reclaim_stale_running_locked(db)
+        service_config = self._load_service_config(db)
+        active_count = self._active_dispatch_count(db)
+        slots = max(0, service_config.max_concurrent_tasks - active_count)
+        claimed_ids = self._claim_pending_tasks(db, slots)
+        if stale_reclaimed or stale_running_reclaimed or claimed_ids:
             db.commit()
+        return claimed_ids
+
+    def _dispatch_task_by_id(self, db: Session, task_id: str) -> str | None:
+        self._reclaim_stale_dispatching_locked(db)
+        self._reclaim_stale_running_locked(db)
+        service_config = self._load_service_config(db)
+        active_count = self._active_dispatch_count(db)
+        if active_count >= service_config.max_concurrent_tasks:
+            return None
+        started_at = _now()
+        lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
+        updated = (
+            db.query(BinarySecurityTask)
+            .filter(
+                BinarySecurityTask.id == task_id,
+                BinarySecurityTask.status == "pending",
+                self._lease_filter_available(),
+            )
+            .update(
+                {
+                    BinarySecurityTask.status: "dispatching",
+                    BinarySecurityTask.dispatcher_instance_id: self.instance_id,
+                    BinarySecurityTask.dispatch_started_at: started_at,
+                    BinarySecurityTask.lease_expires_at: lease_expires_at,
+                    BinarySecurityTask.updated_at: started_at,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated:
+            db.commit()
+            return task_id
+        return None
 
     async def _run_task(self, task_id: str) -> None:
         session_factory = get_session_factory()
@@ -2431,11 +2686,14 @@ class TaskManager:
                 task is None
                 or task.status != "dispatching"
                 or task.dispatcher_instance_id != self.instance_id
+                or not self._lease_is_active(task)
             ):
                 return
             if task.started_at is None:
                 task.started_at = _now()
-            task.dispatch_started_at = task.dispatch_started_at or _now()
+            started_at = task.dispatch_started_at or _now()
+            task.dispatch_started_at = started_at
+            task.lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
             execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
             task.status = "running"
             self._bind_execution_token(task)
@@ -2466,6 +2724,7 @@ class TaskManager:
                 task.last_error = str(exc)
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
+                task.lease_expires_at = None
                 task.finished_at = _now()
                 self._record_event(db, task, "task_failed", f"任务执行失败: {exc}", level="error")
                 db.commit()
@@ -2503,7 +2762,7 @@ class TaskManager:
                     stage_run.status = "success"
                     stage_run.started_at = stage_run.started_at or _now()
                     stage_run.finished_at = _now()
-                    self._persist_stage_run_output_summary(task, stage_run, {"reason": "disabled_by_stage_options"})
+                    await self._persist_stage_run_output_summary_async(task, stage_run, {"reason": "disabled_by_stage_options"})
                     stage_run.counts = self._stage_counts(db, stage_run)
                     task.stage_summary = {
                         **task.stage_summary,
@@ -2523,26 +2782,25 @@ class TaskManager:
                 stage_run = self._ensure_stage_run(db, task, stage_name)
                 stage_run.status = "running"
                 stage_run.started_at = stage_run.started_at or _now()
+                existing_stage_items = self._stage_items(db, task.id, stage_name) if task_retry_mode else []
                 if stage_retry_mode and stage_name == target_stage_name:
                     self._record_event(db, task, "stage_retry_started", f"阶段开始重试: {stage_name}", stage_name=stage_name)
-                elif task_retry_mode and self._stage_items(db, task.id, stage_name):
+                elif task_retry_mode and existing_stage_items:
                     self._record_event(db, task, "stage_retry_started", f"阶段开始安全续跑: {stage_name}", stage_name=stage_name)
                 self._record_event(db, task, "stage_started", f"阶段开始: {stage_name}", stage_name=stage_name)
                 db.commit()
                 retry_existing = False
                 if stage_retry_mode and stage_name == target_stage_name:
                     retry_existing = True
-                elif task_retry_mode and self._stage_items(db, task.id, stage_name):
+                elif task_retry_mode and existing_stage_items:
                     retry_existing = True
                 status, summary = await handler(db, task, stage_run, token, retry_existing)
-                db.refresh(stage_run)
                 stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else status
                 stage_run.finished_at = _now()
-                self._persist_stage_run_output_summary(task, stage_run, summary)
+                await self._persist_stage_run_output_summary_async(task, stage_run, summary)
                 stage_run.counts = self._stage_counts(db, stage_run)
                 if status in {"failed", "partial_success"}:
                     stage_run.last_error = summary.get("error")
-                db.commit()
                 task.stage_summary = {
                     **task.stage_summary,
                     stage_name: {
@@ -2573,7 +2831,7 @@ class TaskManager:
                     task.metrics = {**task.metrics, "vuln_result_count": int(summary.get("vuln_result_count", 0))}
                 db.commit()
                 if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
-                    self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+                    await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
                     db.commit()
                     return
                 if summary.get("archive_blocked"):
@@ -2582,6 +2840,7 @@ class TaskManager:
                     task.last_error = summary.get("error") or "总任务产物归档失败"
                     task.dispatcher_instance_id = None
                     task.dispatch_started_at = None
+                    task.lease_expires_at = None
                     task.finished_at = _now()
                     self._record_event(
                         db,
@@ -2609,7 +2868,7 @@ class TaskManager:
                     db.commit()
                     break
             if archive_blocked:
-                self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+                await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
                 db.commit()
                 return
             if stage_retry_mode or task_retry_mode:
@@ -2619,7 +2878,7 @@ class TaskManager:
                 summary.pop("stage_retry_context", None)
                 task.summary = summary
             self._finalize_task(db, task)
-            self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+            await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             db.commit()
         finally:
             db.close()
@@ -2628,6 +2887,45 @@ class TaskManager:
         row = db.query(BinarySecurityServiceConfig).filter(BinarySecurityServiceConfig.config_key == "global").first()
         raw = row.config if row else {}
         return BinarySecurityServiceConfigPayload(**raw)
+
+    def _lease_timeout_seconds(self, db: Session | None = None) -> int:
+        if db is not None:
+            try:
+                return max(15, int(self._load_service_config(db).lease_timeout_seconds))
+            except Exception:
+                pass
+        return 90
+
+    def _next_lease_expiry(self, db: Session | None = None, *, now_value: datetime | None = None) -> datetime:
+        return (now_value or _now()) + timedelta(seconds=self._lease_timeout_seconds(db))
+
+    def _lease_is_active(self, task: BinarySecurityTask) -> bool:
+        remaining = _seconds_until(task.lease_expires_at)
+        return remaining is not None and remaining > 0
+
+    def _lease_filter_available(self):
+        return or_(
+            BinarySecurityTask.lease_expires_at.is_(None),
+            BinarySecurityTask.lease_expires_at < _now(),
+        )
+
+    def _task_needs_downstream_reconcile(self, task: BinarySecurityTask) -> bool:
+        if task.status == "pending":
+            return True
+        if not str(task.dispatcher_instance_id or "").strip():
+            return True
+        if not self._lease_is_active(task):
+            return True
+        heartbeat_at = task.updated_at or task.dispatch_started_at
+        elapsed_seconds = _elapsed_seconds_since(heartbeat_at)
+        if elapsed_seconds is None:
+            return False
+        grace_seconds = max(
+            int(getattr(self.cfg.scheduler, "downstream_reconcile_grace_seconds", 0) or 0),
+            int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15) * 2,
+            30,
+        )
+        return elapsed_seconds >= grace_seconds
 
     def _active_dispatch_count(self, db: Session) -> int:
         return int(
@@ -2640,9 +2938,13 @@ class TaskManager:
     def _claim_pending_tasks(self, db: Session, slots: int) -> list[str]:
         if slots <= 0:
             return []
+        lease_expires_at = self._next_lease_expiry(db)
         candidates = (
             db.query(BinarySecurityTask.id)
-            .filter(BinarySecurityTask.status == "pending")
+            .filter(
+                BinarySecurityTask.status == "pending",
+                self._lease_filter_available(),
+            )
             .order_by(BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
             .limit(slots)
             .all()
@@ -2656,12 +2958,14 @@ class TaskManager:
                 .filter(
                     BinarySecurityTask.id == task_id,
                     BinarySecurityTask.status == "pending",
+                    self._lease_filter_available(),
                 )
                 .update(
                     {
                         BinarySecurityTask.status: "dispatching",
                         BinarySecurityTask.dispatcher_instance_id: self.instance_id,
                         BinarySecurityTask.dispatch_started_at: dispatch_started_at,
+                        BinarySecurityTask.lease_expires_at: lease_expires_at,
                         BinarySecurityTask.updated_at: dispatch_started_at,
                     },
                     synchronize_session=False,
@@ -2680,6 +2984,7 @@ class TaskManager:
             .filter(
                 BinarySecurityTask.status == "dispatching",
                 BinarySecurityTask.dispatch_started_at.isnot(None),
+                BinarySecurityTask.lease_expires_at.isnot(None),
             )
             .all()
         )
@@ -2693,12 +2998,17 @@ class TaskManager:
         for task in stale_rows:
             if task.id in local_workers:
                 continue
-            elapsed_seconds = _elapsed_seconds_since(task.dispatch_started_at)
-            if elapsed_seconds is None or elapsed_seconds < service_config.dispatch_timeout_seconds:
+            lease_remaining = _seconds_until(task.lease_expires_at)
+            if lease_remaining is None:
+                elapsed_seconds = _elapsed_seconds_since(task.dispatch_started_at)
+                if elapsed_seconds is None or elapsed_seconds < service_config.dispatch_timeout_seconds:
+                    continue
+            elif lease_remaining > 0:
                 continue
             task.status = "pending"
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
+            task.lease_expires_at = None
             task.last_error = None
             self._record_event(
                 db,
@@ -2720,6 +3030,7 @@ class TaskManager:
             .filter(
                 BinarySecurityTask.status == "running",
                 BinarySecurityTask.dispatch_started_at.isnot(None),
+                BinarySecurityTask.lease_expires_at.isnot(None),
             )
             .all()
         )
@@ -2733,9 +3044,13 @@ class TaskManager:
         for task in stale_rows:
             if task.id in local_workers:
                 continue
-            heartbeat_at = task.updated_at or task.dispatch_started_at
-            elapsed_seconds = _elapsed_seconds_since(heartbeat_at)
-            if elapsed_seconds is None or elapsed_seconds < timeout_seconds:
+            lease_remaining = _seconds_until(task.lease_expires_at)
+            if lease_remaining is None:
+                heartbeat_at = task.updated_at or task.dispatch_started_at
+                elapsed_seconds = _elapsed_seconds_since(heartbeat_at)
+                if elapsed_seconds is None or elapsed_seconds < timeout_seconds:
+                    continue
+            elif lease_remaining > 0:
                 continue
             stage_name = task.current_stage or self._stage_sequence_for_task(task)[0]
             stage_run = db.query(BinarySecurityStageRun).filter(
@@ -2768,6 +3083,7 @@ class TaskManager:
             task.last_error = "任务执行实例心跳超时，运行状态已回收"
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
+            task.lease_expires_at = None
             task.finished_at = _now()
             self._record_event(
                 db,
@@ -2807,15 +3123,74 @@ class TaskManager:
             "pending_positions": pending_positions,
         }
 
+    def _observe_worker_counts(self) -> None:
+        observe_worker_counts(
+            task_workers=len([task for task in self._workers.values() if not task.done()]),
+            action_workers=len([task for task in self._action_workers.values() if not task.done()]),
+            archive_workers=len([task for task in self._archive_workers if not task.done()]),
+        )
+
+    def _observe_runtime_metrics(self, db: Session, *, reconcile_candidates: int | None = None) -> None:
+        pending_tasks = int(
+            db.query(func.count(BinarySecurityTask.id))
+            .filter(BinarySecurityTask.status == "pending")
+            .scalar()
+            or 0
+        )
+        running_tasks = int(
+            db.query(func.count(BinarySecurityTask.id))
+            .filter(BinarySecurityTask.status.in_(["dispatching", "running"]))
+            .scalar()
+            or 0
+        )
+        preparing_tasks = int(
+            db.query(func.count(BinarySecurityTask.id))
+            .filter(BinarySecurityTask.status.in_(list(TASK_PREPARING_STATUSES)))
+            .scalar()
+            or 0
+        )
+        archive_pending_jobs = int(
+            db.query(func.count(BinarySecurityArchiveJob.id))
+            .filter(BinarySecurityArchiveJob.archive_status == "pending")
+            .scalar()
+            or 0
+        )
+        archive_running_jobs = int(
+            db.query(func.count(BinarySecurityArchiveJob.id))
+            .filter(BinarySecurityArchiveJob.archive_status == "running")
+            .scalar()
+            or 0
+        )
+        archive_applying_jobs = int(
+            db.query(func.count(BinarySecurityArchiveJob.id))
+            .filter(BinarySecurityArchiveJob.archive_status.in_(["archived", "applying"]))
+            .scalar()
+            or 0
+        )
+        observe_queue_depths(
+            pending_tasks=pending_tasks,
+            running_tasks=running_tasks,
+            preparing_tasks=preparing_tasks,
+            archive_pending_jobs=archive_pending_jobs,
+            archive_running_jobs=archive_running_jobs,
+            archive_applying_jobs=archive_applying_jobs,
+            reconcile_candidates=max(0, int(reconcile_candidates or 0)),
+        )
+        self._observe_worker_counts()
+
     def _finalize_task(self, db: Session, task: BinarySecurityTask) -> None:
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
+            task.lease_expires_at = None
+            self._last_task_heartbeat_at.pop(task.id, None)
             return
         if task.status == "cancelled":
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
+            task.lease_expires_at = None
             task.finished_at = _now()
+            self._last_task_heartbeat_at.pop(task.id, None)
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         statuses = [run.status for run in stage_runs]
@@ -2834,6 +3209,7 @@ class TaskManager:
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.finished_at = _now()
+        self._last_task_heartbeat_at.pop(task.id, None)
         self._record_event(db, task, "task_finished", f"任务结束: {task.status}")
 
     def _resolve_output_root(self, workspace_root: Path, custom_output_root: str | None) -> Path:
@@ -2946,9 +3322,41 @@ class TaskManager:
     def _source_temp_upload_root(self, task: BinarySecurityTask) -> Path:
         return ensure_dir(Path(task.workspace_root) / "run" / "upload-tmp")
 
+    def _check_storage_free_space(self, *, required_bytes: int = 0) -> None:
+        root = Path(self.cfg.services.fileserver.data_mount_path)
+        usage = shutil.disk_usage(root)
+        min_required = max(
+            int(getattr(self.cfg.storage, "min_free_disk_bytes", 0) or 0),
+            int(required_bytes or 0),
+        )
+        if usage.free < min_required:
+            raise ValidationError(f"存储空间不足，当前剩余 {usage.free} 字节，小于要求 {min_required} 字节")
+
+    def _validate_uploaded_archive_size(self, filename: str, size_bytes: int, *, source_task: bool) -> None:
+        max_upload = max(1, int(getattr(self.cfg.storage, "max_upload_file_bytes", 0) or 1))
+        if size_bytes > max_upload:
+            raise ValidationError(f"上传文件过大: {filename}，大小 {size_bytes} 超过限制 {max_upload} 字节")
+        if source_task:
+            max_archive = max(1, int(getattr(self.cfg.storage, "max_source_archive_bytes", 0) or 1))
+            if size_bytes > max_archive:
+                raise ValidationError(f"源码压缩包过大: {filename}，大小 {size_bytes} 超过限制 {max_archive} 字节")
+
     def _safe_extract_archive(self, archive_path: Path, target_dir: Path) -> int:
         ensure_dir(target_dir)
         extracted = 0
+        extracted_bytes = 0
+        max_files = max(1, int(getattr(self.cfg.storage, "max_source_extract_files", 0) or 1))
+        max_bytes = max(1, int(getattr(self.cfg.storage, "max_source_extract_bytes", 0) or 1))
+
+        def ensure_limits(member_name: str, size_bytes: int) -> None:
+            nonlocal extracted, extracted_bytes
+            extracted += 1
+            extracted_bytes += max(0, int(size_bytes or 0))
+            if extracted > max_files:
+                raise ValidationError(f"压缩包解压文件数超限: {member_name}")
+            if extracted_bytes > max_bytes:
+                raise ValidationError(f"压缩包解压总大小超限: {member_name}")
+
         if zipfile.is_zipfile(archive_path):
             with zipfile.ZipFile(archive_path) as archive:
                 for member in archive.infolist():
@@ -2958,9 +3366,13 @@ class TaskManager:
                     target_path = target_dir / member_name
                     if not _is_within_path(target_dir, target_path):
                         raise ValidationError(f"压缩包包含非法路径: {member.filename}")
-                    archive.extract(member, target_dir)
-                    if not member.is_dir():
-                        extracted += 1
+                    if member.is_dir():
+                        ensure_dir(target_path)
+                        continue
+                    ensure_limits(member_name, member.file_size)
+                    ensure_dir(target_path.parent)
+                    with archive.open(member, "r") as source, open(target_path, "wb") as dest:
+                        shutil.copyfileobj(source, dest, length=1024 * 1024)
             return extracted
         if tarfile.is_tarfile(archive_path):
             with tarfile.open(archive_path, "r:*") as archive:
@@ -2971,8 +3383,18 @@ class TaskManager:
                     target_path = target_dir / member_name
                     if not _is_within_path(target_dir, target_path):
                         raise ValidationError(f"压缩包包含非法路径: {member.name}")
-                archive.extractall(target_dir)
-                extracted = sum(1 for member in archive.getmembers() if member.isfile())
+                    if member.isdir():
+                        ensure_dir(target_path)
+                        continue
+                    if member.issym() or member.islnk() or not member.isfile():
+                        raise ValidationError(f"压缩包包含不安全条目: {member.name}")
+                    ensure_limits(member_name, member.size)
+                    ensure_dir(target_path.parent)
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise ValidationError(f"压缩包成员无法读取: {member.name}")
+                    with source, open(target_path, "wb") as dest:
+                        shutil.copyfileobj(source, dest, length=1024 * 1024)
             return extracted
         raise ValidationError(f"不支持的源码压缩文件格式: {archive_path.name}")
 
@@ -2997,6 +3419,13 @@ class TaskManager:
             if not await self._wait_for_uploaded_file(temp_path, timeout_seconds=10, interval_seconds=1):
                 raise ValidationError(f"上传文件缺失: {filename}")
             stat = await asyncio.to_thread(temp_path.stat)
+            self._validate_uploaded_archive_size(filename, stat.st_size, source_task=True)
+            self._check_storage_free_space(
+                required_bytes=min(
+                    int(getattr(self.cfg.storage, "max_source_extract_bytes", 0) or 0),
+                    stat.st_size * 4 if stat.st_size > 0 else 0,
+                )
+            )
             total_bytes += stat.st_size
             extracted_count += await asyncio.to_thread(self._safe_extract_archive, temp_path, input_dir)
             await asyncio.to_thread(temp_path.unlink, missing_ok=True)
@@ -3081,14 +3510,60 @@ class TaskManager:
                 or row.status not in {"dispatching", "running"}
                 or row.dispatcher_instance_id != expected_dispatcher_id
                 or current_token != expected_token
+                or not self._lease_is_active(row)
             ):
                 raise StaleTaskExecution(f"任务 {task.id} 当前执行 token 已失效")
         finally:
             session.close()
 
+    async def _ensure_task_execution_current_async(self, task: BinarySecurityTask) -> None:
+        await asyncio.to_thread(self._ensure_task_execution_current, task)
+
     def _invalidate_task_execution(self, task: BinarySecurityTask) -> None:
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
+        task.lease_expires_at = None
+        self._last_task_heartbeat_at.pop(task.id, None)
+
+    @contextmanager
+    def _task_operation_lock(self, db: Session, task_id: str, timeout_seconds: int = 1):
+        connection_factory = getattr(db, "connection", None)
+        if not callable(connection_factory):
+            yield
+            return
+        connection = connection_factory()
+        lock_name = f"secflow_binary_security_task_lock:{task_id}"
+        acquired = bool(
+            connection.exec_driver_sql(
+                "SELECT GET_LOCK(:name, :timeout)",
+                {"name": lock_name, "timeout": max(0, int(timeout_seconds))},
+            ).scalar()
+        )
+        if not acquired:
+            raise ValidationError("当前任务正被其他操作修改，请稍后重试")
+        try:
+            yield
+        finally:
+            try:
+                connection.exec_driver_sql(
+                    "SELECT RELEASE_LOCK(:name)",
+                    {"name": lock_name},
+                )
+            except Exception:
+                pass
+
+    @contextmanager
+    def _savepoint(self, db: Session):
+        begin_nested = getattr(db, "begin_nested", None)
+        if not callable(begin_nested):
+            yield None
+            return
+        nested = begin_nested()
+        try:
+            yield nested
+        except Exception:
+            nested.rollback()
+            raise
 
     def _stage_enabled(self, task: BinarySecurityTask, stage_name: str) -> bool:
         policy = task.policy or {}
@@ -3162,9 +3637,19 @@ class TaskManager:
             sequence_no=self._stage_sequence_for_task(task).index(stage_name) + 1,
             status="pending",
         )
-        db.add(stage_run)
-        db.flush()
-        return stage_run
+        try:
+            with self._savepoint(db):
+                db.add(stage_run)
+                db.flush()
+            return stage_run
+        except IntegrityError:
+            existing = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == stage_name,
+            ).first()
+            if existing is None:
+                raise
+            return existing
 
     def _record_event(
         self,
@@ -3764,6 +4249,24 @@ class TaskManager:
         stage_run.output_summary = compact
         return compact
 
+    async def _persist_stage_run_output_summary_async(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        full_summary: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        summary_payload = dict(full_summary or {})
+        summary_file: str | None = None
+        try:
+            path = self._stage_run_summary_path(task, stage_run)
+            await asyncio.to_thread(_write_json, path, summary_payload)
+            summary_file = str(path)
+        except Exception:
+            summary_file = None
+        compact = self._compact_stage_output_summary_for_db(task, stage_run, summary_payload, summary_file=summary_file)
+        stage_run.output_summary = compact
+        return compact
+
     def _merge_stage_run_output_summary(
         self,
         task: BinarySecurityTask,
@@ -3772,6 +4275,15 @@ class TaskManager:
     ) -> dict[str, Any]:
         merged = {**self._load_stage_run_output_summary_full(task, stage_run), **(patch or {})}
         return self._persist_stage_run_output_summary(task, stage_run, merged)
+
+    async def _merge_stage_run_output_summary_async(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun,
+        patch: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged = {**self._load_stage_run_output_summary_full(task, stage_run), **(patch or {})}
+        return await self._persist_stage_run_output_summary_async(task, stage_run, merged)
 
     def _item_stats(self, items: list[BinarySecurityStageItem]) -> dict[str, dict[str, int]]:
         stats: dict[str, dict[str, int]] = {}
@@ -4149,6 +4661,7 @@ class TaskManager:
         if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
+            task.lease_expires_at = None
             task.finished_at = None
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
@@ -4181,6 +4694,7 @@ class TaskManager:
             task.finished_at = None
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
+            task.lease_expires_at = None
             task.last_error = None
             summary = dict(task.summary or {})
             if summary.get("stale_from_stage") and next_stage in set(summary.get("stale_stages") or []):
@@ -4195,6 +4709,7 @@ class TaskManager:
                 f"下游状态同步完成，任务继续进入阶段: {next_stage}",
                 stage_name=next_stage,
             )
+            self._enqueue_task(task.id)
             return
         self._finalize_task(db, task)
 
@@ -4205,7 +4720,7 @@ class TaskManager:
         ).order_by(BinarySecurityStageItem.created_at.asc()).all()
 
     def _stage_item_identity(self, item_key: str, parent_key: str | None) -> str:
-        return f"{item_key}::{parent_key or ''}"
+        return build_stage_item_identity_key(item_key, parent_key)
 
     def _find_stage_item(
         self,
@@ -4216,11 +4731,18 @@ class TaskManager:
         item_key: str,
         parent_key: str | None,
     ) -> BinarySecurityStageItem | None:
+        identity_key = build_stage_item_identity_key(item_key, parent_key)
         items = db.query(BinarySecurityStageItem).filter(
             BinarySecurityStageItem.task_id == task_id,
             BinarySecurityStageItem.stage_name == stage_name,
-            BinarySecurityStageItem.item_key == item_key,
+            BinarySecurityStageItem.item_identity_key == identity_key,
         ).order_by(BinarySecurityStageItem.created_at.asc()).all()
+        if not items:
+            items = db.query(BinarySecurityStageItem).filter(
+                BinarySecurityStageItem.task_id == task_id,
+                BinarySecurityStageItem.stage_name == stage_name,
+                BinarySecurityStageItem.item_key == item_key,
+            ).order_by(BinarySecurityStageItem.created_at.asc()).all()
         matches = [item for item in items if (item.parent_key or None) == (parent_key or None)]
         if len(matches) > 1:
             raise ValidationError(f"阶段 {stage_name} 存在重复历史 item，无法安全重试: {item_key}")
@@ -4242,6 +4764,7 @@ class TaskManager:
         retrying: bool,
         running_status: str = "running",
     ) -> BinarySecurityStageItem:
+        identity_key = build_stage_item_identity_key(item_key, parent_key)
         item = self._find_stage_item(
             db,
             task_id=task.id,
@@ -4259,17 +4782,18 @@ class TaskManager:
                 item_key=item_key,
                 item_name=item_name,
                 parent_key=parent_key,
+                item_identity_key=identity_key,
                 status=running_status,
                 downstream_service=downstream_service,
                 started_at=_now(),
             )
             if retrying:
                 item.retry_count = 1
-            db.add(item)
         else:
             item.stage_run_id = stage_run.id
             item.item_name = item_name
             item.parent_key = parent_key
+            item.item_identity_key = identity_key
             item.status = running_status
             item.downstream_service = downstream_service
             item.error_message = None
@@ -4282,7 +4806,37 @@ class TaskManager:
         item.input_ref = input_ref
         if output_ref is not None:
             item.output_ref = output_ref
-        db.flush()
+        try:
+            with self._savepoint(db):
+                db.add(item)
+                db.flush()
+        except IntegrityError:
+            existing = self._find_stage_item(
+                db,
+                task_id=task.id,
+                stage_name=stage_name,
+                item_key=item_key,
+                parent_key=parent_key,
+            )
+            if existing is None:
+                raise
+            existing.stage_run_id = stage_run.id
+            existing.item_name = item_name
+            existing.parent_key = parent_key
+            existing.item_identity_key = identity_key
+            existing.status = running_status
+            existing.downstream_service = downstream_service
+            existing.error_message = None
+            existing.finished_at = None
+            existing.started_at = _now()
+            existing.payload = {}
+            existing.result = {}
+            if retrying:
+                existing.retry_count = int(existing.retry_count or 0) + 1
+            existing.input_ref = input_ref
+            if output_ref is not None:
+                existing.output_ref = output_ref
+            item = existing
         return item
 
     def _prepare_stage_items_for_execution(
@@ -4297,43 +4851,55 @@ class TaskManager:
         output_ref,
     ) -> None:
         """Persist every intended stage item as queued before fan-out execution starts."""
-        for input_item in inputs:
-            item_key, item_name, parent_key, input_ref = identity(input_item)
-            item = self._find_stage_item(
-                db,
-                task_id=task.id,
-                stage_name=stage_run.stage_name,
-                item_key=item_key,
-                parent_key=parent_key,
-            )
-            if item is None:
-                item = BinarySecurityStageItem(
-                    id=f"si_{uuid.uuid4().hex[:20]}",
-                    task_id=task.id,
-                    project_id=task.project_id,
-                    stage_run_id=stage_run.id,
-                    stage_name=stage_run.stage_name,
-                    item_key=item_key,
-                    item_name=item_name,
-                    parent_key=parent_key,
-                    status="queued",
-                    downstream_service=downstream_service,
-                )
-                db.add(item)
-            else:
-                item.stage_run_id = stage_run.id
-                item.item_name = item_name
-                item.parent_key = parent_key
-                item.status = "queued"
-                item.downstream_service = downstream_service
-                item.error_message = None
-                item.started_at = None
-                item.finished_at = None
-                item.payload = {}
-                item.result = {}
-            item.input_ref = input_ref
-            item.output_ref = output_ref(input_item)
-        db.commit()
+        last_error: Exception | None = None
+        for _ in range(2):
+            try:
+                for input_item in inputs:
+                    item_key, item_name, parent_key, input_ref = identity(input_item)
+                    identity_key = build_stage_item_identity_key(item_key, parent_key)
+                    item = self._find_stage_item(
+                        db,
+                        task_id=task.id,
+                        stage_name=stage_run.stage_name,
+                        item_key=item_key,
+                        parent_key=parent_key,
+                    )
+                    if item is None:
+                        item = BinarySecurityStageItem(
+                            id=f"si_{uuid.uuid4().hex[:20]}",
+                            task_id=task.id,
+                            project_id=task.project_id,
+                            stage_run_id=stage_run.id,
+                            stage_name=stage_run.stage_name,
+                            item_key=item_key,
+                            item_name=item_name,
+                            parent_key=parent_key,
+                            item_identity_key=identity_key,
+                            status="queued",
+                            downstream_service=downstream_service,
+                        )
+                        db.add(item)
+                    else:
+                        item.stage_run_id = stage_run.id
+                        item.item_name = item_name
+                        item.parent_key = parent_key
+                        item.item_identity_key = identity_key
+                        item.status = "queued"
+                        item.downstream_service = downstream_service
+                        item.error_message = None
+                        item.started_at = None
+                        item.finished_at = None
+                        item.payload = {}
+                        item.result = {}
+                    item.input_ref = input_ref
+                    item.output_ref = output_ref(input_item)
+                db.commit()
+                return
+            except IntegrityError as exc:
+                db.rollback()
+                last_error = exc
+                continue
+        raise last_error or ValidationError(f"阶段 {stage_run.stage_name} 初始化阶段子任务失败")
 
     def _invoke_existing_downstream_retry(
         self,
@@ -4851,32 +5417,50 @@ class TaskManager:
 
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
         while True:
-            self._ensure_task_execution_current(task)
-            self._touch_task_heartbeat(task.id)
+            await self._ensure_task_execution_current_async(task)
+            await self._touch_task_heartbeat_async(task.id)
             payload = await fetcher()
-            self._ensure_task_execution_current(task)
+            await self._ensure_task_execution_current_async(task)
             status = str(payload.get("status") or "").lower()
             if status in success_statuses:
                 return "success", payload
             if status in failure_statuses:
                 return "failed", payload
-            if self._is_task_cancelled(task.id):
+            if await self._is_task_cancelled_async(task.id):
                 if item and item.downstream_task_id:
                     await self._cancel_downstream(item, self._service_token())
                 return "cancelled", payload
             await asyncio.sleep(self.cfg.scheduler.stage_poll_interval_seconds)
 
     def _touch_task_heartbeat(self, task_id: str) -> None:
+        now = _now()
+        last_heartbeat_at = self._last_task_heartbeat_at.get(task_id)
+        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
+        if last_heartbeat_at and (now - last_heartbeat_at).total_seconds() < interval_seconds:
+            observe_heartbeat_update("skipped")
+            return
         session = get_session_factory()()
         try:
-            now = _now()
+            lease_expires_at = self._next_lease_expiry(session, now_value=now)
             session.query(BinarySecurityTask).filter(
                 BinarySecurityTask.id == task_id,
                 BinarySecurityTask.status == "running",
-            ).update({BinarySecurityTask.updated_at: now}, synchronize_session=False)
+                BinarySecurityTask.dispatcher_instance_id == self.instance_id,
+            ).update(
+                {
+                    BinarySecurityTask.updated_at: now,
+                    BinarySecurityTask.lease_expires_at: lease_expires_at,
+                },
+                synchronize_session=False,
+            )
             session.commit()
+            self._last_task_heartbeat_at[task_id] = now
+            observe_heartbeat_update("written")
         finally:
             session.close()
+
+    async def _touch_task_heartbeat_async(self, task_id: str) -> None:
+        await asyncio.to_thread(self._touch_task_heartbeat, task_id)
 
     def _is_task_cancelled(self, task_id: str) -> bool:
         session = get_session_factory()()
@@ -4885,6 +5469,9 @@ class TaskManager:
             return row is None or bool(row and row[0] == "cancelled")
         finally:
             session.close()
+
+    async def _is_task_cancelled_async(self, task_id: str) -> bool:
+        return await asyncio.to_thread(self._is_task_cancelled, task_id)
 
     async def _stage_firmware_unpack(
         self,
@@ -5909,17 +6496,17 @@ class TaskManager:
 
         async def wrapped(item: dict[str, Any]):
             async with semaphore:
-                self._ensure_task_execution_current(task)
-                if self._is_task_cancelled(task.id):
+                await self._ensure_task_execution_current_async(task)
+                if await self._is_task_cancelled_async(task.id):
                     return {"status": "cancelled", "error": "task cancelled", "item": item}
                 attempts = 0
                 result = await runner(item, initial_retry)
-                self._ensure_task_execution_current(task)
+                await self._ensure_task_execution_current_async(task)
                 while result.get("status") == "failed" and attempts < max(0, retries):
                     attempts += 1
-                    self._ensure_task_execution_current(task)
+                    await self._ensure_task_execution_current_async(task)
                     result = await runner(item, True)
-                    self._ensure_task_execution_current(task)
+                    await self._ensure_task_execution_current_async(task)
                     result["attempts"] = attempts + 1
                 return result
 

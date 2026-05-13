@@ -12,12 +12,17 @@ from urllib.request import Request, urlopen
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request as FastAPIRequest
+from fastapi.responses import Response
 
 from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
+from app.observability import observe_api_request, render_metrics
+from app.service.http_client import close_all_async_clients
 from app.service.registry import get_registry_service
+from app.service.task_queue import close_task_queue
 from app.service.task_manager import get_task_manager
 
 
@@ -119,6 +124,8 @@ async def lifespan(_: FastAPI):
             await get_task_manager().stop()
         if _registry_enabled():
             await get_registry_service().stop()
+        await close_task_queue()
+        await close_all_async_clients()
     except Exception as exc:
         logger.warning("Binary Security 服务关闭警告: %s", exc)
 
@@ -137,6 +144,29 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def prometheus_http_middleware(request: FastAPIRequest, call_next):
+    import time
+
+    started = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    observe_api_request(
+        method=request.method,
+        path=str(path),
+        status_code=response.status_code,
+        duration_seconds=time.perf_counter() - started,
+    )
+    return response
+
+
+@app.get("/metrics", include_in_schema=False)
+async def metrics_endpoint():
+    payload, content_type = render_metrics()
+    return Response(content=payload, media_type=content_type)
 
 setup_exception_handlers(app)
 app.include_router(router)

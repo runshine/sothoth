@@ -81,6 +81,11 @@ class StorageConfig(BaseModel):
     app_root_name: str = "app/secflow-app-binary-security"
     fileserver_subproject_name: str = "__binary_security__"
     require_input_exists: bool = True
+    min_free_disk_bytes: int = 1073741824
+    max_upload_file_bytes: int = 2147483648
+    max_source_archive_bytes: int = 2147483648
+    max_source_extract_bytes: int = 8589934592
+    max_source_extract_files: int = 200000
 
 
 class SchedulerConfig(BaseModel):
@@ -92,6 +97,16 @@ class SchedulerConfig(BaseModel):
     downstream_sync_concurrency: int = 8
     downstream_action_concurrency: int = 8
     downstream_request_timeout_seconds: int = 120
+
+
+class QueueConfig(BaseModel):
+    enabled: bool = True
+    redis_url: str = "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
+    task_queue_key: str = "secflow:binary-security:tasks"
+    action_queue_key: str = "secflow:binary-security:actions"
+    block_timeout_seconds: int = 5
+    reconcile_interval_seconds: int = 30
+    seed_batch_size: int = 20
 
 
 class RuntimePolicyConfig(BaseModel):
@@ -157,6 +172,7 @@ class Config(BaseModel):
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    queue: QueueConfig = Field(default_factory=QueueConfig)
     runtime_policy: RuntimePolicyConfig = Field(default_factory=RuntimePolicyConfig)
     services: ServicesConfig = Field(default_factory=ServicesConfig)
     app: AppConfig = Field(default_factory=AppConfig)

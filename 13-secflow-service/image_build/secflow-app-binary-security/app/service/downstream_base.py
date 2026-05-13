@@ -7,6 +7,7 @@ from typing import Any, Optional
 import httpx
 
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
+from app.service.http_client import get_shared_async_client
 
 
 class JsonHttpClient:
@@ -22,8 +23,8 @@ class JsonHttpClient:
 
     async def get(self, path: str, *, token: str | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(f"{self.base_url}{path}", headers=self._headers(token), params=params)
+            client = await get_shared_async_client(self.base_url, timeout=self.timeout)
+            resp = await client.get(f"{self.base_url}{path}", headers=self._headers(token), params=params)
         except httpx.TimeoutException:
             raise UpstreamError(f"下游服务 GET 超时: {self.base_url}{path}")
         except httpx.ConnectError as exc:
@@ -32,8 +33,8 @@ class JsonHttpClient:
 
     async def post(self, path: str, *, token: str | None = None, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.post(f"{self.base_url}{path}", headers=self._headers(token), json=json_body or {})
+            client = await get_shared_async_client(self.base_url, timeout=self.timeout)
+            resp = await client.post(f"{self.base_url}{path}", headers=self._headers(token), json=json_body or {})
         except httpx.TimeoutException:
             raise UpstreamError(f"下游服务 POST 超时: {self.base_url}{path}")
         except httpx.ConnectError as exc:
@@ -42,8 +43,8 @@ class JsonHttpClient:
 
     async def delete(self, path: str, *, token: str | None = None) -> dict[str, Any]:
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.delete(f"{self.base_url}{path}", headers=self._headers(token))
+            client = await get_shared_async_client(self.base_url, timeout=self.timeout)
+            resp = await client.delete(f"{self.base_url}{path}", headers=self._headers(token))
         except httpx.TimeoutException:
             raise UpstreamError(f"下游服务 DELETE 超时: {self.base_url}{path}")
         except httpx.ConnectError as exc:

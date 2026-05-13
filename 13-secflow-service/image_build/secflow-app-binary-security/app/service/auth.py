@@ -9,6 +9,7 @@ import httpx
 
 from app.config import get_config
 from app.exception import UnauthorizedError, UpstreamError
+from app.service.http_client import get_shared_async_client
 
 
 class TokenCacheEntry:
@@ -32,11 +33,11 @@ class AuthService:
                 return cached.user_info
 
         try:
-            async with httpx.AsyncClient(timeout=self.config.timeout) as client:
-                resp = await client.post(
-                    self.config.validate_url,
-                    headers={"Authorization": f"Bearer {token}"},
-                )
+            client = await get_shared_async_client("auth-service", timeout=self.config.timeout)
+            resp = await client.post(
+                self.config.validate_url,
+                headers={"Authorization": f"Bearer {token}"},
+            )
         except httpx.TimeoutException:
             raise UpstreamError("认证服务请求超时")
         except httpx.ConnectError as exc:

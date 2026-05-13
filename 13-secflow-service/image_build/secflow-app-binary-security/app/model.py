@@ -81,6 +81,7 @@ class BinarySecurityTask(Base, JsonMixin):
     last_error = Column(Text, nullable=True)
     dispatcher_instance_id = Column(String(128), nullable=True, index=True)
     dispatch_started_at = Column(DateTime, nullable=True, index=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=now_local, nullable=False)
@@ -388,6 +389,10 @@ def _ensure_compat_columns(engine) -> None:
         if "dispatch_started_at" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN dispatch_started_at DATETIME NULL"
+            )
+        if "lease_expires_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN lease_expires_at DATETIME NULL"
             )
         if "task_type" not in columns:
             statements.append(

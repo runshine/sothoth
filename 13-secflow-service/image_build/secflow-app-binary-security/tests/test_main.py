@@ -1,9 +1,11 @@
+import asyncio
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import main
+from app.observability import observe_api_request
 
 
 class MainRoleTests(unittest.TestCase):
@@ -43,6 +45,50 @@ class MainRoleTests(unittest.TestCase):
             "app.main.get_config", return_value=fake_config
         ):
             self.assertFalse(main._registry_enabled())
+
+    def test_metrics_endpoint_exposes_prometheus_payload(self):
+        observe_api_request("GET", "/health", 200, 0.01)
+        response = asyncio.run(main.metrics_endpoint())
+        self.assertEqual(200, response.status_code)
+        self.assertIn("text/plain", response.media_type or "")
+        body = response.body.decode("utf-8", errors="ignore")
+        self.assertIn("secflow_binary_security_api_requests_total", body)
+
+    def test_ready_route_returns_503_when_checks_fail(self):
+        async def fake_collect():
+            return {
+                "status": "not_ready",
+                "checks": {
+                    "database": {"ok": False, "detail": "db down"},
+                    "data_mount": {"ok": True, "detail": "ok"},
+                    "auth_service": {"ok": True, "detail": "ok"},
+                },
+            }
+
+        from app.api import tasks as task_routes
+
+        with patch("app.api.tasks.collect_readiness", side_effect=fake_collect):
+            response = asyncio.run(task_routes.ready_check())
+        self.assertEqual(503, response.status_code)
+        self.assertIn("not_ready", response.body.decode("utf-8", errors="ignore"))
+
+    def test_ready_route_returns_200_when_checks_pass(self):
+        async def fake_collect():
+            return {
+                "status": "ready",
+                "checks": {
+                    "database": {"ok": True, "detail": "ok"},
+                    "data_mount": {"ok": True, "detail": "ok"},
+                    "auth_service": {"ok": True, "detail": "ok"},
+                },
+            }
+
+        from app.api import tasks as task_routes
+
+        with patch("app.api.tasks.collect_readiness", side_effect=fake_collect):
+            response = asyncio.run(task_routes.ready_check())
+        self.assertEqual(200, response.status_code)
+        self.assertIn("ready", response.body.decode("utf-8", errors="ignore"))
 
 
 if __name__ == "__main__":
