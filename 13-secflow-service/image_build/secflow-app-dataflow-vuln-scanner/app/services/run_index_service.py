@@ -1510,6 +1510,10 @@ class RunIndexService:
             active_issues = load_active_issue_records_from_ledger(run_index.atomic_work_path)
             if active_issues is not None:
                 latest_issues = active_issues
+        try:
+            file_payloads = inspect_files(run_index.run_root_path, limit=1200)
+        except HTTPException:
+            file_payloads = self._list_run_files_rows(db, run_index)
 
         payload.update(
             {
@@ -1521,7 +1525,7 @@ class RunIndexService:
                 "manifests": _load_externalized_mapping_payload(run_index.run_root_path, run_index.manifests_json),
                 "latest_issues": latest_issues,
                 "atomic_work_path": run_index.atomic_work_path or "",
-                "files": self._list_run_files_rows(db, run_index, limit=1200),
+                "files": file_payloads,
                 "sessions": self._list_run_sessions_rows(db, run_index),
                 "run_log": run_index.log_tail_text or "",
                 "command": [str(item) for item in command],

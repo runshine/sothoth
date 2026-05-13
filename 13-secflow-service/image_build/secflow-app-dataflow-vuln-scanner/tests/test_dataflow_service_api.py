@@ -150,6 +150,18 @@ def test_profiles_tasks_and_effective_config(service_config_path, patch_mock_age
     assert "run/input/task.md" in artifact_paths
     assert "run/run.log" in artifact_paths
 
+    task_artifacts = client.get(f"/api/dataflow-vuln-scanner/tasks/{task_id}/artifacts")
+    assert task_artifacts.status_code == 200
+    artifacts_payload = task_artifacts.json()
+    assert artifacts_payload["workspace_root"]
+    assert artifacts_payload["run_id"] == run_resolve.json()["run_id"]
+    assert "run/input/task.md" in [item["path"] for item in artifacts_payload["files"]]
+
+    retry = client.post(f"/api/dataflow-vuln-scanner/tasks/{task_id}/retry", json={"extra_cycles": 1})
+    assert retry.status_code == 202
+    assert retry.json()["latest_execution_id"] != execution_id
+    _wait_for_task_status(client, task_id)
+
 
 def test_task_list_uses_lightweight_run_locator_without_full_run_summary(service_config_path, patch_mock_agent_runtime, monkeypatch):
     app = create_app()

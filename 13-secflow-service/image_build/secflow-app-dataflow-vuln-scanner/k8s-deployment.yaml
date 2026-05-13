@@ -4,7 +4,7 @@ metadata:
   name: secflow-app-dataflow-vuln-scanner-manager
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: secflow-app-dataflow-vuln-scanner
@@ -16,9 +16,17 @@ spec:
         role: manager
         name: secflow-app-dataflow-vuln-scanner-manager
     spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: secflow-app-dataflow-vuln-scanner
+            role: manager
       containers:
       - name: secflow-app-dataflow-vuln-scanner-manager
-        image: ghcr.io/q1ngh3/secflow-app-dataflow-vuln-scanner:latest
+        image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest
         imagePullPolicy: Always
         env:
         - name: TZ
@@ -84,12 +92,13 @@ spec:
           claimName: secflow-platform-fileserver-data-nfs-pvc
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: secflow-app-dataflow-vuln-scanner-worker
   namespace: secflow-ns
 spec:
-  replicas: 1
+  serviceName: secflow-app-dataflow-vuln-scanner-worker-headless
+  replicas: 2
   selector:
     matchLabels:
       app: secflow-app-dataflow-vuln-scanner
@@ -101,9 +110,17 @@ spec:
         role: worker
         name: secflow-app-dataflow-vuln-scanner-worker
     spec:
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app: secflow-app-dataflow-vuln-scanner
+            role: worker
       containers:
       - name: secflow-app-dataflow-vuln-scanner-worker
-        image: ghcr.io/q1ngh3/secflow-app-dataflow-vuln-scanner:latest
+        image: ghcr.io/runshine/secflow-app-dataflow-vuln-scanner:latest
         imagePullPolicy: Always
         env:
         - name: TZ
@@ -181,4 +198,20 @@ spec:
   ports:
   - name: http
     port: 80
+    targetPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-app-dataflow-vuln-scanner-worker-headless
+  namespace: secflow-ns
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: secflow-app-dataflow-vuln-scanner
+    role: worker
+  ports:
+  - name: http
+    port: 8080
     targetPort: 8080

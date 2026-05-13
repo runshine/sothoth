@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Body, Depends, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import ensure_project_access, get_current_subject, get_db
 from app.config import get_config
+from app.models.database import WorkflowExecution
 from app.schemas import (
     CreateEvolutionTaskRequest,
     ProjectFilesystemChildrenResponse,
@@ -153,6 +154,30 @@ async def create_evolution_task(
     get_scheduler_service().start_execution_now(created.latest_execution_id)
     db.expire_all()
     return get_execution_service().get_scan_task_summary(db, created.task_id, principal)
+
+
+@router.get("/tasks/{task_id}/artifacts", response_model=Dict[str, Any])
+async def get_task_artifacts(task_id: str, subject=Depends(get_current_subject), db: Session = Depends(get_db)):
+    principal, _ = subject
+    return get_execution_service().get_scan_task_artifacts(db, task_id, principal)
+
+
+@router.post(
+    "/tasks/{task_id}/retry",
+    response_model=ScanTaskResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_task(
+    task_id: str,
+    payload: RunRetryRequest | None = Body(default=None),
+    subject=Depends(get_current_subject),
+    db: Session = Depends(get_db),
+):
+    principal, _ = subject
+    result = get_execution_service().retry_scan_task(db, task_id, principal, payload)
+    if get_scheduler_service().start_execution_now(result.get("linked_execution_id")):
+        db.expire_all()
+    return get_execution_service().get_scan_task_summary(db, task_id, principal)
 
 
 @router.get("/runs", response_model=List[RunSummaryResponse])
@@ -308,8 +333,14 @@ async def retry_run(
     principal, _ = subject
     result = get_execution_service().retry_run(db, run_id, principal, payload)
     if get_scheduler_service().start_execution_now(result.get("linked_execution_id")):
-        result["status"] = "running"
-        result["message"] = "Run resume started"
+        db.expire_all()
+        execution = db.get(WorkflowExecution, result.get("linked_execution_id"))
+        if execution is not None and execution.status == "running":
+            result["status"] = "running"
+            result["message"] = "Run resume started"
+        elif execution is not None and execution.dispatch_status in {"queued", "dispatching"}:
+            result["status"] = "queued"
+            result["message"] = "Run resume queued"
     return result
 
 

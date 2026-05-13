@@ -87,3 +87,12 @@ scheduler:
   heartbeat_interval_seconds: 2
   worker_timeout_seconds: 300
   cleanup_interval_seconds: 5
+
+dataflow_worker:
+  base_url: http://dataflow-vuln-scanner-worker:8080
+  worker_urls:
+    - http://dataflow-vuln-scanner-worker:8080
+  api_key: null
+  timeout: 30
+  dispatch_retry_interval_seconds: 2
+  dispatch_max_retries: 1

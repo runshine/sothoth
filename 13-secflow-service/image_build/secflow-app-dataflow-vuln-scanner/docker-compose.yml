@@ -36,6 +36,7 @@ services:
 
   dataflow-vuln-scanner-worker:
     <<: *dataflow-vuln-scanner-base
+    container_name: dataflow-vuln-scanner-worker
     environment:
       <<: *dataflow-vuln-scanner-env
       SECFLOW_DATAFLOW_ROLE: worker

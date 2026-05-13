@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api import router
 from app.config import get_config, load_config
@@ -57,6 +58,21 @@ def create_app() -> FastAPI:
         version="3.0.0",
         lifespan=lifespan,
     )
+
+    @app.middleware("http")
+    async def worker_role_route_guard(request, call_next):
+        if get_scheduler_service().role == "worker":
+            path = request.url.path
+            allowed = (
+                path.startswith("/api/v1/jobs")
+                or path in {"/api/dataflow-vuln-scanner/health", "/api/dataflow-vuln-scanner/ready", "/openapi.json"}
+                or path.startswith("/docs")
+                or path.startswith("/redoc")
+            )
+            if not allowed:
+                return JSONResponse(status_code=404, content={"detail": "not found"})
+        return await call_next(request)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

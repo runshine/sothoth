@@ -1451,12 +1451,27 @@ class WorkerExecutor:
                 advisor_tokens=("global_completeness", "completeness", "全面"),
                 plan_kind="completeness",
             ),
+            "completeness_rework_summary": self._build_advisor_rework_summary(
+                review_state=review_state,
+                advisor_tokens=("global_completeness", "completeness", "全面"),
+                plan_kind="completeness",
+            ),
             "depth_rework_plan": self._build_advisor_driven_rework_plan(
                 review_state=review_state,
                 advisor_tokens=("global_depth", "depth", "深入"),
                 plan_kind="depth",
             ),
+            "depth_rework_summary": self._build_advisor_rework_summary(
+                review_state=review_state,
+                advisor_tokens=("global_depth", "depth", "深入"),
+                plan_kind="depth",
+            ),
             "result_repair_plan": self._build_result_repair_plan(
+                ctx=ctx,
+                review_state=review_state,
+                failed_files=failed_files,
+            ),
+            "result_repair_summary": self._build_result_repair_summary(
                 ctx=ctx,
                 review_state=review_state,
                 failed_files=failed_files,
@@ -1610,6 +1625,80 @@ class WorkerExecutor:
                 "required_action=重读源码证伪，真则补强，假则撤回或标记 false_positive。"
             )
         return "\n".join(lines)
+
+    def _build_advisor_rework_summary(
+        self,
+        *,
+        review_state: ReviewState,
+        advisor_tokens: tuple[str, ...],
+        plan_kind: str,
+    ) -> str:
+        records = [
+            record for record in reversed(review_state.global_review_history)
+            if self._record_matches_advisor(record, advisor_tokens)
+        ][:1]
+        if not records:
+            if plan_kind == "completeness":
+                return "- 当前没有可识别的全面性评审记录；triage 不需要为它分配专门漏报补扫方向。"
+            return "- 当前没有可识别的深入性评审记录；triage 不需要为它分配专门深挖方向。"
+
+        record = records[0]
+        advisor_id = str(getattr(record, "advisor_id", "") or "global_review")
+        role_name = str(getattr(record, "role_name", "") or advisor_id)
+        status = "PASS" if bool(getattr(record, "passed", False)) else "FAIL"
+        cycle = int(getattr(record, "cycle", 0) or 0)
+        lines = [f"- latest: Cycle {cycle} - {advisor_id} / {role_name} ({status})"]
+
+        scores = getattr(record, "scores", {}) or {}
+        if scores:
+            score_text = ", ".join(f"{key}={float(value):.2f}" for key, value in list(scores.items())[:6])
+            lines.append(f"- scores: {score_text}")
+
+        feedback = str(getattr(record, "feedback", "") or "").strip()
+        if feedback:
+            lines.append(f"- key_feedback: {self._clip_prompt_section(feedback, max_chars=320)}")
+
+        issues = [issue for issue in list(getattr(record, "issues", []) or []) if isinstance(issue, dict)]
+        if issues:
+            lines.append(f"- issue_count: {len(issues)}; top_signals:")
+            for issue in issues[:3]:
+                issue_id = ReviewState.prompt_safe_issue_id(
+                    issue.get("id") or issue.get("issue_id") or ""
+                ) or "(no-id)"
+                target = str(issue.get("target") or issue.get("path") or "(未指定 target)")[:120]
+                action = str(
+                    issue.get("required_action")
+                    or issue.get("detail")
+                    or issue.get("description")
+                    or ""
+                ).strip()[:160]
+                lines.append(f"  - `{issue_id}`: target={target}; action={action or '(无)'}")
+        else:
+            lines.append("- issue_count: 0; 只从 feedback 中提取具体代码路径或漏洞模式。")
+
+        return "\n".join(lines)
+
+    def _build_result_repair_summary(
+        self,
+        *,
+        ctx: WorkflowContext,
+        review_state: ReviewState,
+        failed_files: list[str],
+    ) -> str:
+        if not failed_files:
+            return "- 当前没有 failed result；triage 不需要安排误报修复。"
+
+        failed_items = [
+            item for item in review_state.get_failed_results(current_results=ctx.pre_cycle_result_files)
+            if item.filename in failed_files
+        ]
+        ordered_names = [item.filename for item in failed_items] or list(failed_files)
+        names = ", ".join(f"`{name}`" for name in ordered_names[:8])
+        extra = f"；另有 {len(ordered_names) - 8} 个" if len(ordered_names) > 8 else ""
+        return (
+            f"- P0 failed result: {names}{extra}。"
+            "triage 只需标记这些文件需要优先修复/撤回/补证；详细失败原因和源码核验由下一节点处理。"
+        )
 
     def _build_missed_hunt_variant_seeds(
         self,

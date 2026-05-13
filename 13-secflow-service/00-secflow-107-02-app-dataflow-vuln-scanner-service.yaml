@@ -13,3 +13,20 @@ spec:
       targetPort: 8080
       protocol: TCP
       name: secflow-app-dataflow-vuln-scanner
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: secflow-app-dataflow-vuln-scanner-worker-headless
+  namespace: secflow-ns
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: secflow-app-dataflow-vuln-scanner
+    role: worker
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http

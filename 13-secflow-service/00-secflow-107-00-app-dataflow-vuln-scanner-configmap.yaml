@@ -100,6 +100,16 @@ data:
       worker_timeout_seconds: 300
       cleanup_interval_seconds: 10
 
+    dataflow_worker:
+      base_url: "http://secflow-app-dataflow-vuln-scanner-worker-0.secflow-app-dataflow-vuln-scanner-worker-headless.secflow-ns.svc.cluster.local:8080"
+      worker_urls:
+        - "http://secflow-app-dataflow-vuln-scanner-worker-0.secflow-app-dataflow-vuln-scanner-worker-headless.secflow-ns.svc.cluster.local:8080"
+        - "http://secflow-app-dataflow-vuln-scanner-worker-1.secflow-app-dataflow-vuln-scanner-worker-headless.secflow-ns.svc.cluster.local:8080"
+      api_key: null
+      timeout: 30
+      dispatch_retry_interval_seconds: 2
+      dispatch_max_retries: 1
+
     logging:
       level: "INFO"
       format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"

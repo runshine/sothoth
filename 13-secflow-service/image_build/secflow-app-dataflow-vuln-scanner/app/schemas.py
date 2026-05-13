@@ -240,6 +240,10 @@ class ScanTaskAttemptResponse(BaseModel):
     status: str
     run_id: Optional[str] = None
     owner_pod_id: Optional[str]
+    worker_url: Optional[str] = None
+    worker_job_id: Optional[str] = None
+    dispatch_status: Optional[str] = None
+    dispatch_error: Optional[str] = None
     process_pid: Optional[int] = None
     process_host: Optional[str] = None
     process_status: Optional[str] = None

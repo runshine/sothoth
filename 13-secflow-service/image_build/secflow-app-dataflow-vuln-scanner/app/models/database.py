@@ -121,6 +121,10 @@ class WorkflowExecution(Base):
     output_task_count = Column(Integer, nullable=False, default=0)
     current_stage_id = Column(String(128))
     owner_pod_id = Column(String(128))
+    worker_url = Column(String(1024))
+    worker_job_id = Column(String(128))
+    dispatch_status = Column(String(32))
+    dispatch_error = Column(Text)
     process_pid = Column(Integer)
     process_host = Column(String(256))
     process_status = Column(String(32))
@@ -416,6 +420,8 @@ INDEX_DEFINITIONS = [
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_project", "CREATE INDEX ix_dfvs_exec_project ON {table} (project_id)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_status", "CREATE INDEX ix_dfvs_exec_status ON {table} (status)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_owner", "CREATE INDEX ix_dfvs_exec_owner ON {table} (owner_pod_id)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_worker_job", "CREATE INDEX ix_dfvs_exec_worker_job ON {table} (worker_job_id)"),
+    (WorkflowExecution.__tablename__, "ix_dfvs_exec_dispatch_status", "CREATE INDEX ix_dfvs_exec_dispatch_status ON {table} (dispatch_status)"),
     (WorkflowExecution.__tablename__, "ix_dfvs_exec_def_status", "CREATE INDEX ix_dfvs_exec_def_status ON {table} (workflow_definition_id, status)"),
     (WorkflowExecution.__tablename__, "ux_dfvs_exec_task_attempt", "CREATE UNIQUE INDEX ux_dfvs_exec_task_attempt ON {table} (trigger_task_id, attempt_no)"),
     (WorkflowExecutionEvent.__tablename__, "ix_dfvs_event_exec", "CREATE INDEX ix_dfvs_event_exec ON {table} (execution_id)"),
@@ -863,6 +869,10 @@ def run_auto_migrations() -> None:
         (tables["workflow_execution"], "workflow_definition_version_id", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN workflow_definition_version_id VARCHAR(64) NULL"),
         (tables["workflow_execution"], "attempt_no", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN attempt_no INTEGER NOT NULL DEFAULT 1"),
         (tables["workflow_execution"], "recovery_reason", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN recovery_reason VARCHAR(255) NULL"),
+        (tables["workflow_execution"], "worker_url", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN worker_url VARCHAR(1024) NULL"),
+        (tables["workflow_execution"], "worker_job_id", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN worker_job_id VARCHAR(128) NULL"),
+        (tables["workflow_execution"], "dispatch_status", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN dispatch_status VARCHAR(32) NULL"),
+        (tables["workflow_execution"], "dispatch_error", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN dispatch_error TEXT NULL"),
         (tables["workflow_execution"], "process_pid", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_pid INTEGER NULL"),
         (tables["workflow_execution"], "process_host", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_host VARCHAR(256) NULL"),
         (tables["workflow_execution"], "process_status", f"ALTER TABLE {tables['workflow_execution']} ADD COLUMN process_status VARCHAR(32) NULL"),

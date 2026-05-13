@@ -66,6 +66,7 @@ from app.services.run_index_service import (
     _load_externalized_mapping_payload,
     get_run_index_service,
 )
+from app.services.dataflow_worker_client import DataflowWorkerError, get_dataflow_worker_client
 from app.services.pi_vuln_adapter import (
     DbExecutionObserver,
     DbExecutionRecorder,
@@ -788,6 +789,10 @@ class ExecutionService:
             status=execution.status,
             run_id=run_id,
             owner_pod_id=execution.owner_pod_id,
+            worker_url=execution.worker_url,
+            worker_job_id=execution.worker_job_id,
+            dispatch_status=execution.dispatch_status,
+            dispatch_error=execution.dispatch_error,
             process_pid=execution.process_pid,
             process_host=execution.process_host,
             process_status=execution.process_status,
@@ -1043,6 +1048,54 @@ class ExecutionService:
             payload["signal"] = "kill"
             payload["exit_code"] = process.wait()
             return payload
+
+    def _cancel_worker_job(self, execution: WorkflowExecution | None) -> dict[str, Any]:
+        if execution is None or not execution.worker_url or not execution.worker_job_id:
+            return {"found": False, "signal": None}
+        try:
+            payload = get_dataflow_worker_client(execution.worker_url).cancel_job(execution.worker_job_id)
+            return {
+                "found": True,
+                "signal": "worker_cancel",
+                "worker_url": execution.worker_url,
+                "worker_job_id": execution.worker_job_id,
+                "worker_response": payload,
+            }
+        except DataflowWorkerError as exc:
+            return {
+                "found": False,
+                "signal": "worker_unreachable",
+                "worker_url": execution.worker_url,
+                "worker_job_id": execution.worker_job_id,
+                "error": str(exc),
+            }
+
+    def _record_worker_control_result(
+        self,
+        db: Session,
+        *,
+        execution: WorkflowExecution | None,
+        action: str,
+        payload: dict[str, Any],
+    ) -> None:
+        if execution is None or not execution.id or not payload.get("signal"):
+            return
+        signal_name = str(payload.get("signal") or "")
+        level = "warning" if signal_name == "worker_unreachable" else "info"
+        event_type = f"worker_{action}_{'deferred' if signal_name == 'worker_unreachable' else 'requested'}"
+        message = (
+            f"worker {action} requested but worker is unreachable"
+            if signal_name == "worker_unreachable"
+            else f"worker {action} requested"
+        )
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type=event_type,
+            message=message,
+            level=level,
+            payload_json=payload,
+        )
 
     def _write_run_control_state(self, run_root: str | Path | None, *, status_text: str, message: str) -> None:
         if not run_root:
@@ -1835,6 +1888,8 @@ class ExecutionService:
         execution.output_manifest_path = output_manifest_path
         execution.output_task_count = output_task_count
         execution.current_stage_id = None
+        execution.dispatch_status = execution_status
+        execution.dispatch_error = None if execution_status in {"succeeded", "cancelled"} else message
         if execution.process_status in {"running", "stop_requested", "delete_requested"}:
             execution.process_status = "exited"
             execution.process_finished_at = now
@@ -2610,6 +2665,102 @@ class ExecutionService:
             db.refresh(trigger)
         return self._scan_task_response(db, trigger)
 
+    def get_scan_task_artifacts(self, db: Session, task_id: str, principal: dict) -> dict[str, Any]:
+        """Compatibility artifact view for upstream orchestrators.
+
+        The canonical UI uses the Run APIs.  Binary-security historically called
+        ``/tasks/{task_id}/artifacts`` after polling a downstream dataflow-vuln
+        task, so keep a lightweight task-level envelope that points at the same
+        run directory and indexed files.
+        """
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+        run_index: RunIndex | None = None
+        if latest_execution is not None:
+            run_index = get_run_index_service().get_run_index_by_execution(db, latest_execution)
+            if run_index is None:
+                run_index = self._ensure_run_index_for_execution(db, latest_execution, trigger)
+        if run_index is None:
+            run_index = (
+                db.query(RunIndex)
+                .filter(RunIndex.linked_task_id == trigger.id, RunIndex.source_type == "execution_workspace")
+                .order_by(RunIndex.started_at.desc(), RunIndex.created_at.desc())
+                .first()
+            )
+        workspace_root = latest_execution.workspace_root if latest_execution is not None else None
+        run_payload: dict[str, Any] = {}
+        files: list[dict[str, Any]] = []
+        if run_index is not None:
+            workspace_root = run_index.run_root_path
+            run_payload = get_run_index_service().get_run_summary(db, run_index)
+            files = get_run_index_service().list_run_files(db, run_index, limit=20000)
+        return {
+            "task_id": trigger.id,
+            "project_id": trigger.project_id,
+            "status": trigger.status,
+            "execution_id": latest_execution.id if latest_execution is not None else None,
+            "workspace_root": workspace_root or "",
+            "run_id": run_index.id if run_index is not None else None,
+            "run": run_payload,
+            "files": files,
+        }
+
+    def retry_scan_task(self, db: Session, task_id: str, principal: dict, payload: RunRetryRequest | None = None) -> dict[str, Any]:
+        """Compatibility task-level retry used by upstream orchestrators.
+
+        Run-level retry is a resume operation and can fail preflight when older
+        runs do not have a complete session tree.  The historical task retry
+        contract means "submit this scanner task again", so create a fresh
+        execution attempt from the original task request instead.
+        """
+        trigger = self._trigger_or_404(db, task_id)
+        self._ensure_project_access(principal, trigger.project_id)
+        if trigger.status in {"pending", "queued", "running", "cancel_requested", "delete_requested"}:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task is still active and cannot be retried")
+        definition = db.get(WorkflowDefinition, trigger.workflow_definition_id)
+        if definition is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="workflow definition not found")
+        definition_version = (
+            self._definition_version_or_404(db, trigger.workflow_definition_version_id)
+            if trigger.workflow_definition_version_id
+            else get_workflow_service().get_profile_version_model(db, definition.id)
+        )
+        actor = _principal_id(principal)
+        manifest = TaskManifest.model_validate(trigger.input_tasks_json)
+        first_task = manifest.tasks[0] if manifest.tasks else None
+        metadata = dict(first_task.metadata or {}) if first_task is not None else {}
+        if isinstance(metadata.get("dataflow_scan_request"), dict):
+            execution = self._create_dataflow_cli_execution_attempt(
+                db,
+                trigger=trigger,
+                definition=definition,
+                definition_version=definition_version,
+                actor=actor,
+                recovery_reason="manual task retry requested",
+            )
+        else:
+            execution = self._create_execution_attempt(
+                db,
+                trigger=trigger,
+                definition=definition,
+                definition_version=definition_version,
+                actor=actor,
+                authorization_token=None,
+                recovery_reason="manual task retry requested",
+            )
+        trigger.retry_count = int(trigger.retry_count or 0) + 1
+        db.add(trigger)
+        db.commit()
+        self.record_event(
+            db,
+            execution_id=execution.id,
+            event_type="task_retry_queued",
+            message="manual task retry requested",
+            payload_json={"task_id": trigger.id, "attempt_no": execution.attempt_no, "request": (payload.model_dump(mode="json") if payload else {})},
+        )
+        return {"linked_execution_id": execution.id, "task_id": trigger.id}
+
     def _run_index_or_404(self, db: Session, run_index_id: str, principal: dict) -> Any:
         run_index = get_run_index_service()._run_index_or_404(db, run_index_id)
         self._ensure_project_access(principal, run_index.project_id)
@@ -3175,8 +3326,31 @@ class ExecutionService:
             )
             self._write_run_control_state(run_index.run_root_path, status_text="delete_requested", message="delete requested")
             db.commit()
-            stop_payload = self._signal_local_cli_process(execution.id, wait=True)
+            stop_payload = (
+                self._cancel_worker_job(execution)
+                if execution.worker_url and execution.worker_job_id
+                else self._signal_local_cli_process(execution.id, wait=True)
+            )
             process_pid = stop_payload.get("pid") or process_pid
+            if execution.worker_url and execution.worker_job_id:
+                self._record_worker_control_result(
+                    db,
+                    execution=execution,
+                    action="delete",
+                    payload=stop_payload,
+                )
+                if stop_payload.get("signal") == "worker_unreachable":
+                    return self._run_mutation_response(
+                        run_id=run_index_id,
+                        project_id=project_id,
+                        status_text="delete_requested",
+                        message="Run delete requested; worker unreachable",
+                        linked_task_id=linked_task_id,
+                        linked_execution_id=linked_execution_id,
+                        process_pid=process_pid,
+                        process_host=process_host,
+                        process_signal=stop_payload.get("signal"),
+                    )
             if stop_payload.get("exit_code") is not None or stop_payload.get("signal") == "already_exited":
                 if trigger is not None:
                     self._set_terminal_state(
@@ -3387,10 +3561,19 @@ class ExecutionService:
             trigger = self._trigger_or_404(db, run_index.linked_task_id)
             latest_execution = self._latest_execution_for_trigger(db, trigger.id)
             stop_payload = (
-                self._signal_local_cli_process(latest_execution.id, wait=False)
+                self._cancel_worker_job(latest_execution)
+                if latest_execution is not None and latest_execution.worker_url and latest_execution.worker_job_id
+                else self._signal_local_cli_process(latest_execution.id, wait=False)
                 if latest_execution is not None and latest_execution.status in {"running", "cancel_requested"}
                 else {"signal": None}
             )
+            if latest_execution is not None and latest_execution.worker_url and latest_execution.worker_job_id:
+                self._record_worker_control_result(
+                    db,
+                    execution=latest_execution,
+                    action="cancel",
+                    payload=stop_payload,
+                )
             status_text = "cancel_requested"
             message = "Run cancel requested"
             if latest_execution is None or latest_execution.status == "cancelled":
@@ -3514,6 +3697,11 @@ class ExecutionService:
         trigger = self._trigger_or_404(db, task_id)
         self._ensure_project_access(principal, trigger.project_id)
         latest_execution = self._latest_execution_for_trigger(db, trigger.id)
+        worker_bound_execution = (
+            latest_execution
+            if latest_execution is not None and latest_execution.worker_url and latest_execution.worker_job_id
+            else None
+        )
         now = now_local()
         if trigger.status == "pending":
             trigger.status = "cancelled"
@@ -3538,7 +3726,15 @@ class ExecutionService:
         db.commit()
         if signal_process and latest_execution is not None:
             self._write_run_control_state(latest_execution.workspace_root, status_text=trigger.status, message=trigger.message or "cancel requested")
-            if latest_execution.status in {"running", "cancel_requested"}:
+            if worker_bound_execution is not None:
+                stop_payload = self._cancel_worker_job(latest_execution)
+                self._record_worker_control_result(
+                    db,
+                    execution=latest_execution,
+                    action="cancel",
+                    payload=stop_payload,
+                )
+            elif latest_execution.status in {"running", "cancel_requested"}:
                 self._signal_local_cli_process(latest_execution.id, wait=False)
         db.refresh(trigger)
         return self._scan_task_response(db, trigger)

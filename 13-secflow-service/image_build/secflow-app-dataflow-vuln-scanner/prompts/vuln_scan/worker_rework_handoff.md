@@ -18,7 +18,7 @@
 - 不创建 JSON manifest。
 
 ## 输出要求
-如果本轮有新增、修改、撤回或重要 residual，创建或更新 `{supporting_docs_dir}/rework_closure_cycle_{cycle}.md`，控制在 80 行以内，只引用 `results/...` 和 `supporting_docs/...`。
+如果本轮有新增、修改、撤回或重要 residual，创建或更新 `{supporting_docs_dir}/rework_closure_cycle_{cycle}.md`，只引用 `results/...` 和 `supporting_docs/...`。
 
 如果本轮没有实际漏洞变化，只在回复中简短说明“无新增/修改/撤回”，不要额外创建文件。
 

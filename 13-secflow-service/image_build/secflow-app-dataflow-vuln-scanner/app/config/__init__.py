@@ -145,7 +145,7 @@ class ServiceConfig(BaseModel):
 class SchedulerConfig(BaseModel):
     enabled: bool = True
     # standalone keeps the historical single-pod behavior.  manager serves API
-    # traffic only; worker performs queue heartbeats and execution.
+    # traffic only; worker accepts explicitly assigned HTTP jobs.
     role: str = Field(default_factory=lambda: os.getenv("SECFLOW_DATAFLOW_ROLE") or os.getenv("ROLE") or "standalone")
     pod_id: str = Field(default_factory=lambda: os.getenv("POD_ID") or os.getenv("HOSTNAME") or "local-pod")
     host_name: str = Field(default_factory=lambda: os.getenv("HOSTNAME") or "localhost")
@@ -154,6 +154,15 @@ class SchedulerConfig(BaseModel):
     heartbeat_interval_seconds: int = 5
     worker_timeout_seconds: int = 300
     cleanup_interval_seconds: int = 10
+
+
+class DataflowWorkerConfig(BaseModel):
+    base_url: str = "http://secflow-app-dataflow-vuln-scanner-worker:8080"
+    worker_urls: list[str] = Field(default_factory=list)
+    api_key: Optional[str] = None
+    timeout: int = 30
+    dispatch_retry_interval_seconds: int = 2
+    dispatch_max_retries: int = 1
 
 
 class LoggingConfig(BaseModel):
@@ -173,6 +182,7 @@ class Config(BaseModel):
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     service: ServiceConfig = Field(default_factory=ServiceConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    dataflow_worker: DataflowWorkerConfig = Field(default_factory=DataflowWorkerConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
 

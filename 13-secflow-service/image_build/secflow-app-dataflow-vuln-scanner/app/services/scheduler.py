@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
+import time
 from datetime import timedelta
 from typing import Any, Dict, List
 
 from fastapi import HTTPException, status
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.config import get_config
@@ -18,10 +21,14 @@ from app.models.database import (
     get_db_session,
 )
 from app.schemas import SchedulerWorkerResponse
+from app.services.dataflow_worker_client import DataflowWorkerError, get_dataflow_worker_client
 from app.services.execution_service import get_execution_service
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
+
+ACTIVE_JOB_STATUSES = {"queued", "pending", "running", "cancel_requested", "delete_requested"}
+TERMINAL_EXECUTION_STATUSES = {"succeeded", "failed", "cancelled"}
 
 
 class SchedulerService:
@@ -39,6 +46,14 @@ class SchedulerService:
     @property
     def is_worker_role(self) -> bool:
         return self.role in {"standalone", "worker"} and self.capacity > 0
+
+    @property
+    def is_http_worker_role(self) -> bool:
+        return self.role in {"worker", "standalone"} and self.capacity > 0
+
+    @property
+    def is_manager_role(self) -> bool:
+        return self.role == "manager"
 
     @property
     def runs_worker(self) -> bool:
@@ -68,12 +83,19 @@ class SchedulerService:
         self._tasks = []
         if self.runs_worker:
             await asyncio.to_thread(self._heartbeat_once)
+            self._tasks.append(asyncio.create_task(self._heartbeat_loop(), name="scheduler-heartbeat"))
+        if self.runs_worker and self.role == "standalone":
             self._tasks.extend(
                 [
-                    asyncio.create_task(self._heartbeat_loop(), name="scheduler-heartbeat"),
                     asyncio.create_task(self._dispatch_loop(), name="scheduler-dispatch"),
                 ]
             )
+        elif self.runs_worker and self.role == "worker":
+            await asyncio.to_thread(self._start_assigned_jobs)
+            self._tasks.append(asyncio.create_task(self._assigned_dispatch_loop(), name="scheduler-assigned-dispatch"))
+        elif self.role == "manager":
+            await asyncio.to_thread(self._dispatch_pending_to_workers_once)
+            self._tasks.append(asyncio.create_task(self._manager_dispatch_loop(), name="scheduler-manager-dispatch"))
         if self.runs_manager or self.runs_worker:
             self._tasks.append(asyncio.create_task(self._cleanup_loop(), name="scheduler-cleanup"))
         logger.info("scheduler started role=%s worker_enabled=%s capacity=%s", self.role, self.runs_worker, self.capacity)
@@ -115,6 +137,11 @@ class SchedulerService:
             "scheduler_role": self.role,
             "worker_enabled": "true" if self.runs_worker else "false",
         }
+
+    def configured_worker_urls(self) -> list[str]:
+        cfg = get_config().dataflow_worker
+        workers = [url.rstrip("/") for url in (cfg.worker_urls or []) if url and url.strip()]
+        return workers or [cfg.base_url.rstrip("/")]
 
     def local_running_count(self) -> int:
         return len(self._running_tasks)
@@ -189,6 +216,122 @@ class SchedulerService:
                 if not execution_id:
                     break
                 self._schedule_execution(execution_id)
+
+    async def _assigned_dispatch_loop(self) -> None:
+        interval = get_config().scheduler.poll_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(self._start_assigned_jobs)
+
+    async def _manager_dispatch_loop(self) -> None:
+        interval = get_config().scheduler.poll_interval_seconds
+        while True:
+            await asyncio.sleep(interval)
+            await asyncio.to_thread(self._dispatch_pending_to_workers_once)
+
+    def _dispatch_pending_to_workers_once(self) -> None:
+        if not self.is_manager_role:
+            return
+        for execution_id in self._pending_worker_dispatch_execution_ids():
+            try:
+                self._dispatch_execution_to_worker(execution_id)
+            except Exception:
+                logger.exception("manager failed to dispatch pending execution %s", execution_id)
+
+    def _pending_worker_dispatch_execution_ids(self, limit: int = 32) -> list[str]:
+        db = get_db_session()
+        try:
+            rows = (
+                db.query(WorkflowExecution.id)
+                .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
+                .join(WorkflowDefinition, WorkflowExecution.workflow_definition_id == WorkflowDefinition.id)
+                .filter(
+                    WorkflowExecution.status == "pending",
+                    WorkflowExecution.owner_pod_id.is_(None),
+                    WorkflowExecution.worker_job_id.is_(None),
+                    or_(WorkflowExecution.dispatch_status.is_(None), WorkflowExecution.dispatch_status == ""),
+                    TriggerTask.status == "pending",
+                    WorkflowDefinition.enabled.is_(True),
+                )
+                .order_by(TriggerTask.priority.desc(), TriggerTask.created_at.asc())
+                .limit(limit)
+                .all()
+            )
+            return [str(row[0]) for row in rows]
+        finally:
+            db.close()
+
+    def _start_assigned_jobs(self) -> None:
+        if self.role != "worker" or self._worker_status != "active":
+            return
+        while self.local_running_count() < self.capacity:
+            execution_id = self._claim_next_assigned_execution()
+            if not execution_id:
+                break
+            self._schedule_execution_thread(execution_id)
+
+    def _claim_next_assigned_execution(self) -> str | None:
+        db = get_db_session()
+        try:
+            candidate = (
+                db.query(WorkflowExecution, TriggerTask)
+                .join(TriggerTask, WorkflowExecution.trigger_task_id == TriggerTask.id)
+                .filter(
+                    WorkflowExecution.status == "pending",
+                    WorkflowExecution.owner_pod_id == self.pod_id,
+                    WorkflowExecution.worker_job_id.isnot(None),
+                    WorkflowExecution.dispatch_status == "queued",
+                    TriggerTask.status == "pending",
+                )
+                .order_by(TriggerTask.priority.desc(), TriggerTask.created_at.asc())
+                .first()
+            )
+            if candidate is None:
+                return None
+            execution, trigger = candidate
+            return self._claim_assigned_execution(db, execution, trigger)
+        finally:
+            db.close()
+
+    def _claim_assigned_execution(self, db: Session, execution: WorkflowExecution, trigger: TriggerTask) -> str | None:
+        now = now_local()
+        updated_execution = (
+            db.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.id == execution.id,
+                WorkflowExecution.status == "pending",
+                WorkflowExecution.owner_pod_id == self.pod_id,
+                WorkflowExecution.dispatch_status == "queued",
+            )
+            .update(
+                {
+                    WorkflowExecution.status: "running",
+                    WorkflowExecution.started_at: now,
+                    WorkflowExecution.dispatch_status: "running",
+                    WorkflowExecution.dispatch_error: None,
+                    WorkflowExecution.message: f"started by worker {self.pod_id}",
+                },
+                synchronize_session=False,
+            )
+        )
+        updated_trigger = (
+            db.query(TriggerTask)
+            .filter(TriggerTask.id == trigger.id, TriggerTask.status == "pending")
+            .update(
+                {
+                    TriggerTask.status: "running",
+                    TriggerTask.started_at: now,
+                    TriggerTask.message: f"started by worker {self.pod_id}",
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated_execution != 1 or updated_trigger != 1:
+            db.rollback()
+            return None
+        db.commit()
+        logger.info("started assigned execution %s on worker %s", execution.id, self.pod_id)
+        return execution.id
 
     def _claim_next_execution(self) -> str | None:
         if not self.is_worker_role:
@@ -308,6 +451,10 @@ class SchedulerService:
     def start_execution_now(self, execution_id: str | None) -> bool:
         if not execution_id or execution_id in self._running_tasks:
             return False
+        if self.is_manager_role:
+            return self._dispatch_execution_to_worker(execution_id)
+        if self.role == "worker":
+            return False
         if not self.is_worker_role:
             return False
         if self._worker_status != "active" or self.local_running_count() >= self.capacity:
@@ -317,6 +464,156 @@ class SchedulerService:
             return False
         self._schedule_execution_thread(claimed_execution_id)
         return True
+
+    def _dispatch_execution_to_worker(self, execution_id: str) -> bool:
+        db = get_db_session()
+        worker_url = ""
+        last_error = ""
+        try:
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is None or execution.status != "pending":
+                return False
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            if trigger is None or trigger.status != "pending":
+                return False
+            worker_url = self._choose_dataflow_worker(db, execution_id)
+            message = f"dispatching to worker {worker_url}"
+            updated_execution = (
+                db.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.id == execution_id,
+                    WorkflowExecution.status == "pending",
+                    WorkflowExecution.owner_pod_id.is_(None),
+                    WorkflowExecution.worker_job_id.is_(None),
+                    or_(WorkflowExecution.dispatch_status.is_(None), WorkflowExecution.dispatch_status == ""),
+                )
+                .update(
+                    {
+                        WorkflowExecution.worker_url: worker_url,
+                        WorkflowExecution.worker_job_id: execution.id,
+                        WorkflowExecution.dispatch_status: "dispatching",
+                        WorkflowExecution.dispatch_error: None,
+                        WorkflowExecution.message: message,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if updated_execution != 1:
+                db.rollback()
+                return False
+            updated_trigger = (
+                db.query(TriggerTask)
+                .filter(TriggerTask.id == trigger.id, TriggerTask.status == "pending")
+                .update({TriggerTask.message: message}, synchronize_session=False)
+            )
+            if updated_trigger != 1:
+                db.rollback()
+                return False
+            db.commit()
+        finally:
+            db.close()
+
+        attempts = max(1, int(get_config().dataflow_worker.dispatch_max_retries or 1))
+        for attempt in range(1, attempts + 1):
+            try:
+                job = get_dataflow_worker_client(worker_url).create_job(
+                    {
+                        "execution_id": execution_id,
+                        "worker_url": worker_url,
+                    }
+                )
+                self._mark_dispatch_success(execution_id, worker_url, job)
+                return True
+            except DataflowWorkerError as exc:
+                last_error = str(exc)
+                if attempt < attempts:
+                    time.sleep(max(0, int(get_config().dataflow_worker.dispatch_retry_interval_seconds or 0)))
+
+        self._mark_dispatch_failure(execution_id, worker_url, last_error or "dataflow worker dispatch failed")
+        return False
+
+    def _choose_dataflow_worker(self, db: Session, execution_id: str) -> str:
+        workers = self.configured_worker_urls()
+        if len(workers) == 1:
+            return workers[0]
+
+        counts = {worker: 0 for worker in workers}
+        for worker in workers:
+            try:
+                jobs = get_dataflow_worker_client(worker).list_jobs()
+                counts[worker] += sum(1 for job in jobs if str(job.get("status") or "") in ACTIVE_JOB_STATUSES)
+            except Exception:
+                counts[worker] += 1_000_000
+
+        active_executions = (
+            db.query(WorkflowExecution)
+            .filter(WorkflowExecution.status.in_(list(ACTIVE_JOB_STATUSES)))
+            .all()
+        )
+        for execution in active_executions:
+            worker_url = str(execution.worker_url or "").rstrip("/")
+            if worker_url in counts:
+                counts[worker_url] += 1
+
+        salt = int(hashlib.sha256(execution_id.encode("utf-8")).hexdigest(), 16)
+        return min(enumerate(workers), key=lambda item: (counts[item[1]], (item[0] - salt) % len(workers)))[1]
+
+    def _mark_dispatch_success(self, execution_id: str, worker_url: str, job: dict[str, Any]) -> None:
+        db = get_db_session()
+        try:
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is None:
+                return
+            job_id = str(job.get("id") or job.get("job_id") or execution.worker_job_id or execution.id)
+            execution.worker_url = worker_url
+            execution.worker_job_id = job_id
+            execution.dispatch_status = str(job.get("status") or "queued")
+            execution.dispatch_error = None
+            if execution.status == "pending":
+                execution.message = f"queued on worker {worker_url}"
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            if trigger is not None and trigger.status == "pending":
+                trigger.message = execution.message
+                db.add(trigger)
+            db.add(execution)
+            db.commit()
+            get_execution_service().record_event(
+                db,
+                execution_id=execution_id,
+                event_type="worker_dispatch_succeeded",
+                message=f"execution dispatched to {worker_url}",
+                payload_json={"worker_url": worker_url, "job": job},
+            )
+        finally:
+            db.close()
+
+    def _mark_dispatch_failure(self, execution_id: str, worker_url: str, error: str) -> None:
+        db = get_db_session()
+        try:
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is None:
+                return
+            execution.worker_url = worker_url
+            execution.worker_job_id = execution.worker_job_id or execution.id
+            execution.dispatch_status = "failed"
+            execution.dispatch_error = error
+            execution.message = f"worker dispatch failed: {error}"
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            if trigger is not None and trigger.status == "pending":
+                trigger.message = execution.message
+                db.add(trigger)
+            db.add(execution)
+            db.commit()
+            get_execution_service().record_event(
+                db,
+                execution_id=execution_id,
+                event_type="worker_dispatch_failed",
+                message=execution.message,
+                level="warning",
+                payload_json={"worker_url": worker_url, "error": error},
+            )
+        finally:
+            db.close()
 
     def _schedule_execution(self, execution_id: str) -> None:
         if execution_id in self._running_tasks:
@@ -346,10 +643,175 @@ class SchedulerService:
             finally:
                 self._running_tasks.pop(execution_id, None)
                 self._heartbeat_once()
+                self._start_assigned_jobs()
 
         thread = threading.Thread(target=runner, name=f"execution-{execution_id}", daemon=True)
         self._running_tasks[execution_id] = thread
         thread.start()
+
+    def list_local_jobs(self) -> list[dict[str, Any]]:
+        if not self.is_http_worker_role:
+            return []
+        db = get_db_session()
+        try:
+            jobs = (
+                db.query(WorkflowExecution)
+                .filter(
+                    WorkflowExecution.owner_pod_id == self.pod_id,
+                    WorkflowExecution.worker_job_id.isnot(None),
+                )
+                .order_by(WorkflowExecution.created_at.desc())
+                .limit(200)
+                .all()
+            )
+            return [self._job_payload(item) for item in jobs]
+        finally:
+            db.close()
+
+    def get_local_job(self, job_id: str) -> dict[str, Any] | None:
+        db = get_db_session()
+        try:
+            execution = self._local_job_query(db, job_id)
+            return self._job_payload(execution) if execution is not None else None
+        finally:
+            db.close()
+
+    def create_local_job(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.is_http_worker_role or self.role == "manager":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="this service instance is not a dataflow worker")
+        if self._worker_status != "active":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"worker is {self._worker_status}")
+        execution_id = str(payload.get("execution_id") or "").strip()
+        if not execution_id:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="execution_id is required")
+        worker_url = str(payload.get("worker_url") or "").strip()
+
+        db = get_db_session()
+        try:
+            execution = db.get(WorkflowExecution, execution_id)
+            if execution is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="execution not found")
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            if trigger is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="trigger task not found")
+            if execution.status in TERMINAL_EXECUTION_STATUSES:
+                return self._job_payload(execution)
+            if execution.status != "pending" or trigger.status != "pending":
+                return self._job_payload(execution)
+            if execution.worker_job_id and execution.owner_pod_id not in {None, self.pod_id}:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="execution is assigned to another worker")
+
+            execution.owner_pod_id = self.pod_id
+            execution.worker_url = worker_url or execution.worker_url
+            execution.worker_job_id = execution.worker_job_id or execution.id
+            execution.dispatch_status = "queued"
+            execution.dispatch_error = None
+            execution.message = f"queued on worker {self.pod_id}"
+            trigger.message = execution.message
+            db.add(execution)
+            db.add(trigger)
+            db.commit()
+            job = self._job_payload(execution)
+            get_execution_service().record_event(
+                db,
+                execution_id=execution.id,
+                event_type="worker_job_queued",
+                message=f"worker job queued on {self.pod_id}",
+                payload_json={"worker_url": execution.worker_url, "worker_job_id": execution.worker_job_id},
+            )
+        finally:
+            db.close()
+
+        self._start_assigned_jobs()
+        return self.get_local_job(job["id"]) or job
+
+    def cancel_local_job(self, job_id: str) -> dict[str, Any]:
+        if not self.is_http_worker_role or self.role == "manager":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="this service instance is not a dataflow worker")
+        db = get_db_session()
+        try:
+            execution = self._local_job_query(db, job_id)
+            if execution is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
+            trigger = db.get(TriggerTask, execution.trigger_task_id)
+            now = now_local()
+            if execution.status == "pending":
+                execution.status = "cancelled"
+                execution.finished_at = now
+                execution.dispatch_status = "cancelled"
+                execution.process_status = "not_started"
+                execution.message = "cancelled before worker start"
+                if trigger is not None and trigger.status == "pending":
+                    trigger.status = "cancelled"
+                    trigger.finished_at = now
+                    trigger.message = execution.message
+                    db.add(trigger)
+                db.add(execution)
+                db.commit()
+                return self._job_payload(execution)
+
+            if execution.status in {"running", "cancel_requested", "delete_requested"}:
+                requested_status = "delete_requested" if execution.status == "delete_requested" else "cancel_requested"
+                execution.status = requested_status
+                execution.dispatch_status = requested_status
+                execution.process_status = "delete_requested" if requested_status == "delete_requested" else "stop_requested"
+                execution.message = "delete requested" if requested_status == "delete_requested" else "cancel requested"
+                if trigger is not None and trigger.status in {"running", "cancel_requested", "delete_requested"}:
+                    trigger.status = requested_status
+                    trigger.message = execution.message
+                    db.add(trigger)
+                db.add(execution)
+                db.commit()
+                if execution.workspace_root:
+                    get_execution_service()._write_run_control_state(
+                        execution.workspace_root,
+                        status_text=requested_status,
+                        message=execution.message or requested_status,
+                    )
+                get_execution_service()._signal_local_cli_process(execution.id, wait=False)
+                return self._job_payload(execution)
+
+            return self._job_payload(execution)
+        finally:
+            db.close()
+
+    def _local_job_query(self, db: Session, job_id: str) -> WorkflowExecution | None:
+        return (
+            db.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.owner_pod_id == self.pod_id,
+                WorkflowExecution.worker_job_id == job_id,
+            )
+            .first()
+            or db.query(WorkflowExecution)
+            .filter(
+                WorkflowExecution.owner_pod_id == self.pod_id,
+                WorkflowExecution.id == job_id,
+            )
+            .first()
+        )
+
+    @staticmethod
+    def _job_payload(execution: WorkflowExecution) -> dict[str, Any]:
+        status_text = str(execution.status or "pending")
+        if status_text == "pending" and execution.worker_job_id:
+            status_text = "queued"
+        elif status_text == "succeeded":
+            status_text = "success"
+        return {
+            "id": execution.worker_job_id or execution.id,
+            "execution_id": execution.id,
+            "task_id": execution.trigger_task_id,
+            "status": status_text,
+            "phase": execution.dispatch_status or execution.process_status or execution.status,
+            "worker_url": execution.worker_url or "",
+            "owner_pod_id": execution.owner_pod_id or "",
+            "process_pid": execution.process_pid,
+            "error": execution.dispatch_error or "",
+            "created_at": execution.created_at.isoformat() if execution.created_at else None,
+            "started_at": execution.started_at.isoformat() if execution.started_at else None,
+            "finished_at": execution.finished_at.isoformat() if execution.finished_at else None,
+        }
 
     async def _cleanup_loop(self) -> None:
         interval = get_config().scheduler.cleanup_interval_seconds
