@@ -39,6 +39,18 @@ TASK_STAGE_SEQUENCES = {
 }
 
 
+def normalize_parent_key(value: str | None) -> str:
+    return str(value or "").strip()
+
+
+def build_stage_item_identity_key(item_key: str | None, parent_key: str | None) -> str:
+    return f"{str(item_key or '').strip()}::{normalize_parent_key(parent_key)}"
+
+
+def build_archive_job_dedupe_key(item_id: str | None, downstream_task_id: str | None) -> str:
+    return f"{str(item_id or '').strip()}::{str(downstream_task_id or '').strip()}"
+
+
 class JsonMixin:
     def _load_json(self, raw: Optional[str], default: Any) -> Any:
         if not raw:
@@ -209,6 +221,7 @@ class BinarySecurityStageItem(Base, JsonMixin):
     item_key = Column(String(128), nullable=False, index=True)
     item_name = Column(String(255), nullable=True)
     parent_key = Column(String(128), nullable=True, index=True)
+    item_identity_key = Column(String(300), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
     retry_count = Column(Integer, nullable=False, default=0)
     downstream_service = Column(String(64), nullable=True)
@@ -291,6 +304,7 @@ class BinarySecurityArchiveJob(Base, JsonMixin):
     item_key = Column(String(128), nullable=True, index=True)
     downstream_service = Column(String(64), nullable=True, index=True)
     downstream_task_id = Column(String(128), nullable=True, index=True)
+    job_dedupe_key = Column(String(255), nullable=True, index=True)
     archive_status = Column(String(32), nullable=False, default="pending", index=True)
     owner_id = Column(String(128), nullable=True, index=True)
     payload_json = Column(Text, nullable=True)
@@ -421,6 +435,161 @@ def _ensure_compat_columns(engine) -> None:
         with engine.begin() as conn:
             for statement in index_statements:
                 conn.execute(text(statement))
+
+    stage_run_table = BinarySecurityStageRun.__tablename__
+    if inspector.has_table(stage_run_table):
+        indexes = {index["name"] for index in inspector.get_indexes(stage_run_table)}
+        _dedupe_stage_runs(engine, stage_run_table)
+        if "uq_bsr_task_stage" not in indexes:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX uq_bsr_task_stage ON {stage_run_table} (task_id, stage_name)"
+                    )
+                )
+
+    stage_item_table = BinarySecurityStageItem.__tablename__
+    if inspector.has_table(stage_item_table):
+        columns = {column["name"] for column in inspector.get_columns(stage_item_table)}
+        statements = []
+        if "item_identity_key" not in columns:
+            statements.append(
+                f"ALTER TABLE {stage_item_table} ADD COLUMN item_identity_key VARCHAR(300) NULL"
+            )
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"UPDATE {stage_item_table} "
+                    "SET item_identity_key = CONCAT(COALESCE(item_key, ''), '::', COALESCE(parent_key, '')) "
+                    "WHERE item_identity_key IS NULL OR item_identity_key = ''"
+                )
+            )
+        indexes = {index["name"] for index in inspect(engine).get_indexes(stage_item_table)}
+        _dedupe_stage_items(engine, stage_item_table)
+        if "uq_bsi_task_stage_identity" not in indexes:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX uq_bsi_task_stage_identity ON {stage_item_table} (task_id, stage_name, item_identity_key)"
+                    )
+                )
+
+    archive_job_table = BinarySecurityArchiveJob.__tablename__
+    if inspector.has_table(archive_job_table):
+        columns = {column["name"] for column in inspector.get_columns(archive_job_table)}
+        statements = []
+        if "job_dedupe_key" not in columns:
+            statements.append(
+                f"ALTER TABLE {archive_job_table} ADD COLUMN job_dedupe_key VARCHAR(255) NULL"
+            )
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    f"UPDATE {archive_job_table} "
+                    "SET job_dedupe_key = CONCAT(COALESCE(item_id, ''), '::', COALESCE(downstream_task_id, '')) "
+                    "WHERE job_dedupe_key IS NULL OR job_dedupe_key = ''"
+                )
+            )
+        indexes = {index["name"] for index in inspect(engine).get_indexes(archive_job_table)}
+        _dedupe_archive_jobs(engine, archive_job_table)
+        if "uq_bsaj_task_stage_dedupe" not in indexes:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        f"CREATE UNIQUE INDEX uq_bsaj_task_stage_dedupe ON {archive_job_table} (task_id, stage_name, job_dedupe_key)"
+                    )
+                )
+
+
+def _dedupe_stage_runs(engine, table_name: str) -> None:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT id, task_id, stage_name, updated_at, created_at "
+                f"FROM {table_name} ORDER BY task_id, stage_name, updated_at DESC, created_at DESC, id DESC"
+            )
+        ).mappings().all()
+        seen: set[tuple[str, str]] = set()
+        duplicate_ids: list[str] = []
+        for row in rows:
+            key = (str(row["task_id"] or ""), str(row["stage_name"] or ""))
+            if key in seen:
+                duplicate_ids.append(str(row["id"]))
+                continue
+            seen.add(key)
+        for duplicate_id in duplicate_ids:
+            conn.execute(text(f"DELETE FROM {table_name} WHERE id = :id"), {"id": duplicate_id})
+
+
+def _dedupe_stage_items(engine, table_name: str) -> None:
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT id, task_id, stage_name, item_identity_key, updated_at, created_at "
+                f"FROM {table_name} ORDER BY task_id, stage_name, item_identity_key, updated_at DESC, created_at DESC, id DESC"
+            )
+        ).mappings().all()
+        seen: set[tuple[str, str, str]] = set()
+        duplicate_ids: list[str] = []
+        for row in rows:
+            key = (
+                str(row["task_id"] or ""),
+                str(row["stage_name"] or ""),
+                str(row["item_identity_key"] or ""),
+            )
+            if key in seen:
+                duplicate_ids.append(str(row["id"]))
+                continue
+            seen.add(key)
+        for duplicate_id in duplicate_ids:
+            conn.execute(text(f"DELETE FROM {table_name} WHERE id = :id"), {"id": duplicate_id})
+
+
+def _dedupe_archive_jobs(engine, table_name: str) -> None:
+    status_priority = {
+        "success": 0,
+        "applying": 1,
+        "archived": 2,
+        "running": 3,
+        "pending": 4,
+        "failed": 5,
+        "skipped": 6,
+    }
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                f"SELECT id, task_id, stage_name, job_dedupe_key, archive_status, updated_at, created_at "
+                f"FROM {table_name}"
+            )
+        ).mappings().all()
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for row in rows:
+            key = (
+                str(row["task_id"] or ""),
+                str(row["stage_name"] or ""),
+                str(row["job_dedupe_key"] or ""),
+            )
+            grouped.setdefault(key, []).append(dict(row))
+        for duplicates in grouped.values():
+            if len(duplicates) <= 1:
+                continue
+            duplicates.sort(
+                key=lambda row: (
+                    status_priority.get(str(row.get("archive_status") or "").strip(), 99),
+                    row.get("updated_at") or datetime.min,
+                    row.get("created_at") or datetime.min,
+                    str(row.get("id") or ""),
+                ),
+                reverse=False,
+            )
+            for duplicate in duplicates[1:]:
+                conn.execute(text(f"DELETE FROM {table_name} WHERE id = :id"), {"id": str(duplicate["id"])})
 
 
 def get_db():

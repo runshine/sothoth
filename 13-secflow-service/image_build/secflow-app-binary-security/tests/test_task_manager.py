@@ -14,6 +14,8 @@ from app.model import (
     BinarySecurityTask,
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
+    build_archive_job_dedupe_key,
+    build_stage_item_identity_key,
 )
 from app.schemas import BinarySecurityArchiveJobResponse, BinarySecurityTaskConcurrencyUpdatePayload
 from app.service import task_manager as task_manager_module
@@ -125,6 +127,28 @@ class _AppendingModelAwareDb(_ModelAwareDb):
             self.tasks.append(obj)
 
 
+class _HeartbeatSession:
+    def __init__(self):
+        self.updates = 0
+        self.commits = 0
+
+    def query(self, *args, **kwargs):
+        return self
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def update(self, *args, **kwargs):
+        self.updates += 1
+        return 1
+
+    def commit(self):
+        self.commits += 1
+
+    def close(self):
+        pass
+
+
 class _StageRun:
     def __init__(self, stage_name, status):
         self.stage_name = stage_name
@@ -189,6 +213,13 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertIsNotNone(task.summary_json)
         self.assertEqual({"status": "created"}, task.summary)
+
+    def test_build_stage_item_identity_key_normalizes_parent_key(self):
+        self.assertEqual("entry-1::", build_stage_item_identity_key("entry-1", None))
+        self.assertEqual("entry-1::module-a", build_stage_item_identity_key("entry-1", " module-a "))
+
+    def test_build_archive_job_dedupe_key_uses_item_and_downstream_task(self):
+        self.assertEqual("item-1::task-1", build_archive_job_dedupe_key("item-1", "task-1"))
 
     def test_parse_system_analysis_modules_from_modules_list(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1521,53 +1552,54 @@ class TaskManagerTests(unittest.TestCase):
         )
 
     def test_retry_task_full_restart_cleans_existing_downstream_refs(self):
-        task = BinarySecurityTask(
-            id="task1",
-            project_id="p1",
-            name="n",
-            status="failed",
-            task_type=TASK_TYPE_BINARY,
-            firmware_source="project_filesystem",
-            firmware_path="/fw",
-            output_root="/o",
-            workspace_root="/w",
-        )
-        item = BinarySecurityStageItem(
-            id="item1",
-            task_id="task1",
-            project_id="p1",
-            stage_name="system_analysis",
-            item_key="fw1",
-            item_name="fw1",
-            parent_key="fw1",
-            downstream_service="system_analyse",
-            downstream_task_id="sa-1",
-            status="failed",
-        )
-        db = _ModelAwareDb(tasks=[task], stage_items=[item])
-        calls = []
-
-        async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
-            calls.append(
-                {
-                    "db": db_arg,
-                    "task_id": task_arg.id,
-                    "refs": refs_arg,
-                    "token": token_arg,
-                }
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
             )
+            item = BinarySecurityStageItem(
+                id="item1",
+                task_id="task1",
+                project_id="p1",
+                stage_name="system_analysis",
+                item_key="fw1",
+                item_name="fw1",
+                parent_key="fw1",
+                downstream_service="system_analyse",
+                downstream_task_id="sa-1",
+                status="failed",
+            )
+            db = _ModelAwareDb(tasks=[task], stage_items=[item])
+            calls = []
 
-        original_cleanup = self.manager._cleanup_downstream_refs
-        self.manager._cleanup_downstream_refs = fake_cleanup
-        try:
-            self.manager.retry_task(db, project_id="p1", task_id="task1")
-            self._finish_retry_prepare(db, task)
-        finally:
-            self.manager._cleanup_downstream_refs = original_cleanup
+            async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
+                calls.append(
+                    {
+                        "db": db_arg,
+                        "task_id": task_arg.id,
+                        "refs": refs_arg,
+                        "token": token_arg,
+                    }
+                )
 
-        self.assertEqual(1, len(calls))
-        self.assertEqual("task1", calls[0]["task_id"])
-        self.assertEqual("sa-1", calls[0]["refs"][0]["task_id"])
+            original_cleanup = self.manager._cleanup_downstream_refs
+            self.manager._cleanup_downstream_refs = fake_cleanup
+            try:
+                self.manager.retry_task(db, project_id="p1", task_id="task1")
+                self._finish_retry_prepare(db, task)
+            finally:
+                self.manager._cleanup_downstream_refs = original_cleanup
+
+            self.assertEqual(1, len(calls))
+            self.assertEqual("task1", calls[0]["task_id"])
+            self.assertEqual("sa-1", calls[0]["refs"][0]["task_id"])
 
     def test_continue_task_prefers_existing_downstream_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1613,7 +1645,7 @@ class TaskManagerTests(unittest.TestCase):
             self._finish_continue_prepare(db, task, stage)
             self.assertEqual("task_retry", task.execution_mode)
             self.assertEqual("system_analysis", task.target_stage_name)
-            self.assertEqual(1, len(db.stage_items))
+            self.assertEqual(0, len(db.stage_items))
 
     def test_retry_stage_requeues_failed_archive_job_and_marks_task_running(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2776,6 +2808,116 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("running", task.status)
         self.assertIsNone(task.last_error)
         self.assertTrue(db.closed)
+
+    def test_task_needs_downstream_reconcile_skips_fresh_running_task(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="worker-a",
+        )
+        task.dispatch_started_at = _now()
+        task.updated_at = _now()
+
+        self.assertFalse(self.manager._task_needs_downstream_reconcile(task))
+
+    def test_task_needs_downstream_reconcile_allows_stale_running_task(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="worker-a",
+        )
+        task.dispatch_started_at = _now() - timedelta(seconds=120)
+        task.updated_at = _now() - timedelta(seconds=120)
+
+        self.assertTrue(self.manager._task_needs_downstream_reconcile(task))
+
+    def test_touch_task_heartbeat_is_throttled(self):
+        session = _HeartbeatSession()
+        original_factory = task_manager_module.get_session_factory
+        self.manager.cfg.scheduler.heartbeat_update_interval_seconds = 15
+        task_manager_module.get_session_factory = lambda: (lambda: session)
+        try:
+            self.manager._touch_task_heartbeat("task1")
+            self.manager._touch_task_heartbeat("task1")
+        finally:
+            task_manager_module.get_session_factory = original_factory
+
+        self.assertEqual(1, session.updates)
+        self.assertEqual(1, session.commits)
+
+    def test_schedule_archive_workers_respects_configured_concurrency(self):
+        self.manager.cfg.scheduler.archive_job_concurrency = 2
+        assignments: list[tuple[str, str]] = []
+        archived_ids = iter(["aj-apply", None])
+        copy_ids = iter(["aj-copy-1", "aj-copy-2", None])
+
+        self.manager._next_archived_job = lambda: next(archived_ids)
+        self.manager._claim_archive_job = lambda: next(copy_ids)
+
+        async def fake_apply(job_id: str, archived_root):
+            assignments.append(("apply", job_id))
+
+        async def fake_process(job_id: str):
+            assignments.append(("copy", job_id))
+
+        self.manager._apply_archive_job_status = fake_apply
+        self.manager._process_archive_job = fake_process
+
+        async def run_case():
+            await self.manager._schedule_archive_workers()
+            workers = list(self.manager._archive_workers)
+            if workers:
+                await asyncio.gather(*workers)
+
+        asyncio.run(run_case())
+
+        self.assertEqual([("apply", "aj-apply"), ("copy", "aj-copy-1")], assignments)
+        self.assertEqual(0, len(self.manager._archive_workers))
+
+    def test_schedule_archive_workers_prefers_apply_jobs_before_copy_jobs(self):
+        self.manager.cfg.scheduler.archive_job_concurrency = 3
+        assignments: list[tuple[str, str]] = []
+        archived_ids = iter(["aj-1", "aj-2", None])
+        copy_ids = iter(["aj-copy", None])
+
+        self.manager._next_archived_job = lambda: next(archived_ids)
+        self.manager._claim_archive_job = lambda: next(copy_ids)
+
+        async def fake_apply(job_id: str, archived_root):
+            assignments.append(("apply", job_id))
+
+        async def fake_process(job_id: str):
+            assignments.append(("copy", job_id))
+
+        self.manager._apply_archive_job_status = fake_apply
+        self.manager._process_archive_job = fake_process
+
+        async def run_case():
+            await self.manager._schedule_archive_workers()
+            workers = list(self.manager._archive_workers)
+            if workers:
+                await asyncio.gather(*workers)
+
+        asyncio.run(run_case())
+
+        self.assertEqual(
+            [("apply", "aj-1"), ("apply", "aj-2"), ("copy", "aj-copy")],
+            assignments,
+        )
 
     def test_run_stage_pool_retries_existing_path_after_first_failure(self):
         calls: list[bool] = []

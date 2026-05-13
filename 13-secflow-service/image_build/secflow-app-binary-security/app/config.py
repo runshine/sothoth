@@ -88,7 +88,10 @@ class SchedulerConfig(BaseModel):
     poll_interval_seconds: int = 5
     task_concurrency: int = 2
     stage_poll_interval_seconds: int = 5
+    heartbeat_update_interval_seconds: int = 15
+    downstream_reconcile_grace_seconds: int = 30
     shutdown_grace_seconds: int = 10
+    archive_job_concurrency: int = 4
     downstream_sync_concurrency: int = 8
     downstream_action_concurrency: int = 8
     downstream_request_timeout_seconds: int = 120

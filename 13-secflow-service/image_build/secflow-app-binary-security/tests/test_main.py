@@ -1,9 +1,11 @@
+import asyncio
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import main
+from app.observability import observe_api_request
 
 
 class MainRoleTests(unittest.TestCase):
@@ -43,6 +45,14 @@ class MainRoleTests(unittest.TestCase):
             "app.main.get_config", return_value=fake_config
         ):
             self.assertFalse(main._registry_enabled())
+
+    def test_metrics_endpoint_exposes_prometheus_payload(self):
+        observe_api_request("GET", "/health", 200, 0.01)
+        response = asyncio.run(main.metrics_endpoint())
+        self.assertEqual(200, response.status_code)
+        self.assertIn("text/plain", response.media_type or "")
+        body = response.body.decode("utf-8", errors="ignore")
+        self.assertIn("secflow_binary_security_api_requests_total", body)
 
 
 if __name__ == "__main__":

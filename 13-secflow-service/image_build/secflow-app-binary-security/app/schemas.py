@@ -351,7 +351,7 @@ class BinarySecurityProjectConfigResponse(BaseModel):
 
 
 class BinarySecurityServiceConfigPayload(BaseModel):
-    max_concurrent_tasks: int = Field(default=50, ge=1, le=200)
+    max_concurrent_tasks: int = Field(default=20, ge=1, le=200)
     dispatch_timeout_seconds: int = Field(default=60, ge=10, le=600)
 
 
