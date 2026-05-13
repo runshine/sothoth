@@ -1,52 +1,30 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: secflow-app-system-analyse-worker
+  name: secflow-app-system-analyse-runner
   namespace: secflow-ns
 spec:
-  replicas: 1
+  replicas: 0
   selector:
     matchLabels:
-      name: secflow-app-system-analyse-worker
+      name: secflow-app-system-analyse-runner
   template:
     metadata:
       labels:
-        name: secflow-app-system-analyse-worker
+        name: secflow-app-system-analyse-runner
     spec:
       dnsPolicy: ClusterFirstWithHostNet
       containers:
-      - name: secflow-app-system-analyse-worker
+      - name: secflow-app-system-analyse-runner
         image: ghcr.io/runshine/secflow-app-system-analyse:latest
         imagePullPolicy: Always
         env:
           - name: SECFLOW_SYSTEM_ANALYSE_ROLE
-            value: manager
+            value: runner
           - name: POD_NAME
             valueFrom:
               fieldRef:
                 fieldPath: metadata.name
-          - name: SECFLOW_SYSTEM_ANALYSE_WORKER_TASK_CONCURRENCY
-            value: "1"
-          - name: SECFLOW_SYSTEM_ANALYSE_WORKER_POLL_INTERVAL
-            value: "3"
-          - name: SECFLOW_SYSTEM_ANALYSE_WORKER_POLL_JITTER
-            value: "2"
-          - name: SECFLOW_SYSTEM_ANALYSE_LEASE_HEARTBEAT_SECONDS
-            value: "15"
-          - name: SECFLOW_SYSTEM_ANALYSE_LEASE_TIMEOUT_SECONDS
-            value: "300"
-          - name: SECFLOW_SYSTEM_ANALYSE_WORKER_OVERLOAD_COOLDOWN
-            value: "30"
-          - name: SECFLOW_SYSTEM_ANALYSE_WORKER_IDLE_BACKOFF_MAX
-            value: "15"
-          - name: SECFLOW_SYSTEM_ANALYSE_WORKER_STALE_SWEEP_INTERVAL
-            value: "30"
-          - name: SECFLOW_SYSTEM_ANALYSE_MAX_RUNNING_TASKS_GLOBAL
-            value: "4"
-          - name: SECFLOW_SYSTEM_ANALYSE_GLOBAL_CLAIM_LOCK_KEY
-            value: "secflow:system-analyse:claim"
-          - name: SECFLOW_SYSTEM_ANALYSE_GLOBAL_CLAIM_LOCK_TIMEOUT_SECONDS
-            value: "1"
           - name: TZ
             value: Asia/Shanghai
           - name: PORT
@@ -63,10 +41,6 @@ spec:
             value: "10"
           - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_WORKER
             value: "1800"
-          - name: SECFLOW_SYSTEM_ANALYSE_STAGE_FLUSH_BATCH_SIZE
-            value: "20"
-          - name: SECFLOW_SYSTEM_ANALYSE_STAGE_FLUSH_MIN_INTERVAL
-            value: "10"
         ports:
         - containerPort: 8080
         volumeMounts:
