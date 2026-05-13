@@ -9,6 +9,7 @@ from pathlib import Path
 from app.config import get_config
 from app.model import get_engine
 from app.service.http_client import get_shared_async_client
+from app.service.task_manager import get_task_manager
 
 
 def _data_mount_path() -> Path:
@@ -64,10 +65,17 @@ async def collect_readiness() -> dict[str, object]:
     db_ok, db_detail = _check_database()
     data_ok, data_detail = _check_data_mount()
     auth_ok, auth_detail = await _check_auth_service()
+    scheduler_cfg = get_task_manager().runtime_status()
+    scheduler_checks = scheduler_cfg["loops"] if isinstance(scheduler_cfg.get("loops"), dict) else {}
+    scheduler_required = any(bool(value) for value in scheduler_checks.values())
+    scheduler_ok = (not get_config().scheduler.enabled) or (not scheduler_required) or all(
+        bool(value) for value in scheduler_checks.values()
+    )
     checks = {
         "database": {"ok": db_ok, "detail": db_detail},
         "data_mount": {"ok": data_ok, "detail": data_detail},
         "auth_service": {"ok": auth_ok, "detail": auth_detail},
+        "scheduler": {"ok": scheduler_ok, "detail": scheduler_cfg},
     }
     return {
         "status": "ready" if all(item["ok"] for item in checks.values()) else "not_ready",

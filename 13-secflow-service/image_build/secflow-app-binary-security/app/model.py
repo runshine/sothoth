@@ -222,6 +222,7 @@ class BinarySecurityStageItem(Base, JsonMixin):
     item_key = Column(String(128), nullable=False, index=True)
     item_name = Column(String(255), nullable=True)
     parent_key = Column(String(128), nullable=True, index=True)
+    item_identity_key = Column(String(255), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="pending", index=True)
     retry_count = Column(Integer, nullable=False, default=0)
     downstream_service = Column(String(64), nullable=True)
@@ -302,6 +303,7 @@ class BinarySecurityArchiveJob(Base, JsonMixin):
     stage_name = Column(String(64), nullable=False, index=True)
     item_id = Column(String(40), nullable=False, index=True)
     item_key = Column(String(128), nullable=True, index=True)
+    job_dedupe_key = Column(String(255), nullable=True, index=True)
     downstream_service = Column(String(64), nullable=True, index=True)
     downstream_task_id = Column(String(128), nullable=True, index=True)
     archive_status = Column(String(32), nullable=False, default="pending", index=True)
@@ -434,6 +436,48 @@ def _ensure_compat_columns(engine) -> None:
         if "ix_bst_project_status_created_id" not in indexes:
             index_statements.append(
                 f"CREATE INDEX ix_bst_project_status_created_id ON {task_table} (project_id, status, created_at, id)"
+            )
+        with engine.begin() as conn:
+            for statement in index_statements:
+                conn.execute(text(statement))
+    stage_item_table = BinarySecurityStageItem.__tablename__
+    if inspector.has_table(stage_item_table):
+        columns = {column["name"] for column in inspector.get_columns(stage_item_table)}
+        statements = []
+        if "item_identity_key" not in columns:
+            statements.append(
+                f"ALTER TABLE {stage_item_table} ADD COLUMN item_identity_key VARCHAR(255) NULL"
+            )
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+        indexes = {index["name"] for index in inspector.get_indexes(stage_item_table)}
+        index_statements = []
+        if "ix_bssi_task_stage_identity_created" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bssi_task_stage_identity_created ON {stage_item_table} "
+                "(task_id, stage_name, item_identity_key, created_at)"
+            )
+        with engine.begin() as conn:
+            for statement in index_statements:
+                conn.execute(text(statement))
+    archive_job_table = BinarySecurityArchiveJob.__tablename__
+    if inspector.has_table(archive_job_table):
+        columns = {column["name"] for column in inspector.get_columns(archive_job_table)}
+        statements = []
+        if "job_dedupe_key" not in columns:
+            statements.append(
+                f"ALTER TABLE {archive_job_table} ADD COLUMN job_dedupe_key VARCHAR(255) NULL"
+            )
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+        indexes = {index["name"] for index in inspector.get_indexes(archive_job_table)}
+        index_statements = []
+        if "ix_bsaj_task_stage_dedupe_status" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bsaj_task_stage_dedupe_status ON {archive_job_table} "
+                "(task_id, stage_name, job_dedupe_key, archive_status)"
             )
         with engine.begin() as conn:
             for statement in index_statements:

@@ -6,6 +6,7 @@ import asyncio
 import errno
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -13,7 +14,7 @@ import tarfile
 import uuid
 import zipfile
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
@@ -84,6 +85,7 @@ from app.service.system_analyse import get_system_analyse_client
 from app.service.task_queue import get_task_queue
 from app.time_utils import now_local
 
+logger = logging.getLogger(__name__)
 
 DB_SUMMARY_ITEM_LIMIT = 50
 DB_FAILURE_ITEM_LIMIT = 20
@@ -1379,23 +1381,32 @@ class TaskManager:
     def _run_sync(self, coro):
         return asyncio.run(coro)
 
-    def _schedule_coroutine(self, coro) -> None:
+    async def _run_scheduled_coroutine(self, coro, *, label: str) -> None:
+        try:
+            await coro
+        except Exception:
+            logger.exception("binary-security scheduled coroutine failed: %s", label)
+
+    def _schedule_coroutine(self, coro, *, label: str) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            asyncio.run(coro)
+            try:
+                asyncio.run(coro)
+            except Exception:
+                logger.exception("binary-security scheduled coroutine failed: %s", label)
             return
-        loop.create_task(coro)
+        loop.create_task(self._run_scheduled_coroutine(coro, label=label))
 
     def _enqueue_task(self, task_id: str) -> None:
         if not self.cfg.queue.enabled:
             return
-        self._schedule_coroutine(get_task_queue().push_task(task_id))
+        self._schedule_coroutine(get_task_queue().push_task(task_id), label=f"enqueue-task:{task_id}")
 
     def _enqueue_action(self, task_id: str) -> None:
         if not self.cfg.queue.enabled:
             return
-        self._schedule_coroutine(get_task_queue().push_action(task_id))
+        self._schedule_coroutine(get_task_queue().push_action(task_id), label=f"enqueue-action:{task_id}")
 
     def _stage_items_for_stages(
         self,
@@ -2050,6 +2061,11 @@ class TaskManager:
                     else:
                         await self._reconcile_work_queues(db)
                     self._observe_runtime_metrics(db)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("binary-security action dispatch loop crashed and recovered")
+                await asyncio.sleep(1)
             finally:
                 db.close()
 
@@ -2073,6 +2089,11 @@ class TaskManager:
                     else:
                         await self._reconcile_work_queues(db)
                     self._observe_runtime_metrics(db)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("binary-security task dispatch loop crashed and recovered")
+                await asyncio.sleep(1)
             finally:
                 db.close()
 
@@ -2899,6 +2920,26 @@ class TaskManager:
     def _next_lease_expiry(self, db: Session | None = None, *, now_value: datetime | None = None) -> datetime:
         return (now_value or _now()) + timedelta(seconds=self._lease_timeout_seconds(db))
 
+    def runtime_status(self) -> dict[str, object]:
+        loop_task_alive = bool(self._loop_task and not self._loop_task.done())
+        action_loop_alive = bool(self._action_loop_task and not self._action_loop_task.done())
+        archive_loop_alive = bool(self._archive_loop_task and not self._archive_loop_task.done())
+        reconcile_loop_alive = bool(self._downstream_reconcile_task and not self._downstream_reconcile_task.done())
+        return {
+            "running": self._running,
+            "loops": {
+                "task_dispatch": loop_task_alive,
+                "action_dispatch": action_loop_alive,
+                "archive_dispatch": archive_loop_alive,
+                "downstream_reconcile": reconcile_loop_alive,
+            },
+            "workers": {
+                "task_workers": len([task for task in self._workers.values() if not task.done()]),
+                "action_workers": len([task for task in self._action_workers.values() if not task.done()]),
+                "archive_workers": len([task for task in self._archive_workers if not task.done()]),
+            },
+        }
+
     def _lease_is_active(self, task: BinarySecurityTask) -> bool:
         remaining = _seconds_until(task.lease_expires_at)
         return remaining is not None and remaining > 0
@@ -3534,8 +3575,8 @@ class TaskManager:
         connection = connection_factory()
         lock_name = f"secflow_binary_security_task_lock:{task_id}"
         acquired = bool(
-            connection.exec_driver_sql(
-                "SELECT GET_LOCK(:name, :timeout)",
+            connection.execute(
+                text("SELECT GET_LOCK(:name, :timeout)"),
                 {"name": lock_name, "timeout": max(0, int(timeout_seconds))},
             ).scalar()
         )
@@ -3545,8 +3586,8 @@ class TaskManager:
             yield
         finally:
             try:
-                connection.exec_driver_sql(
-                    "SELECT RELEASE_LOCK(:name)",
+                connection.execute(
+                    text("SELECT RELEASE_LOCK(:name)"),
                     {"name": lock_name},
                 )
             except Exception:

@@ -35,6 +35,10 @@ class _FakeQuery:
     def options(self, *args, **kwargs):
         return self
 
+    def limit(self, *args, **kwargs):
+        del args, kwargs
+        return self
+
     def all(self):
         return list(self._rows)
 
@@ -111,6 +115,36 @@ class _ModelAwareDb:
 
     def close(self):
         pass
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar(self):
+        return self._value
+
+
+class _FakeConnection:
+    def __init__(self, lock_result=True):
+        self.lock_result = lock_result
+        self.calls = []
+
+    def execute(self, statement, params=None):
+        self.calls.append((str(statement), dict(params or {})))
+        sql = str(statement)
+        if "GET_LOCK" in sql:
+            return _ScalarResult(1 if self.lock_result else 0)
+        return _ScalarResult(1)
+
+
+class _LockingDb(_ModelAwareDb):
+    def __init__(self, connection):
+        super().__init__()
+        self._connection = connection
+
+    def connection(self):
+        return self._connection
 
 
 class _AppendingModelAwareDb(_ModelAwareDb):
@@ -262,6 +296,54 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(2, summaries[0].total_items)
         self.assertEqual(1, summaries[0].success_items)
         self.assertEqual(1, summaries[0].failed_items)
+
+    def test_task_operation_lock_uses_bound_text_query_and_releases_lock(self):
+        connection = _FakeConnection(lock_result=True)
+        db = _LockingDb(connection)
+
+        with self.manager._task_operation_lock(db, "task-1"):
+            pass
+
+        self.assertEqual(2, len(connection.calls))
+        self.assertIn("GET_LOCK", connection.calls[0][0])
+        self.assertEqual("secflow_binary_security_task_lock:task-1", connection.calls[0][1]["name"])
+        self.assertIn("RELEASE_LOCK", connection.calls[1][0])
+
+    def test_task_operation_lock_rejects_when_named_lock_not_acquired(self):
+        connection = _FakeConnection(lock_result=False)
+        db = _LockingDb(connection)
+
+        with self.assertRaises(ValidationError):
+            with self.manager._task_operation_lock(db, "task-1"):
+                pass
+
+    def test_runtime_status_reports_dispatch_loops(self):
+        self.manager._running = True
+
+        class _Task:
+            def __init__(self, done):
+                self._done = done
+
+            def done(self):
+                return self._done
+
+        self.manager._loop_task = _Task(False)
+        self.manager._action_loop_task = _Task(False)
+        self.manager._archive_loop_task = _Task(True)
+        self.manager._downstream_reconcile_task = _Task(False)
+
+        status = self.manager.runtime_status()
+
+        self.assertTrue(status["running"])
+        self.assertEqual(
+            {
+                "task_dispatch": True,
+                "action_dispatch": True,
+                "archive_dispatch": False,
+                "downstream_reconcile": True,
+            },
+            status["loops"],
+        )
 
     def test_aggregate_archive_stage_status_supports_applying(self):
         self.assertEqual("pending", self.manager._aggregate_archive_stage_status([]))
@@ -1523,53 +1605,54 @@ class TaskManagerTests(unittest.TestCase):
         )
 
     def test_retry_task_full_restart_cleans_existing_downstream_refs(self):
-        task = BinarySecurityTask(
-            id="task1",
-            project_id="p1",
-            name="n",
-            status="failed",
-            task_type=TASK_TYPE_BINARY,
-            firmware_source="project_filesystem",
-            firmware_path="/fw",
-            output_root="/o",
-            workspace_root="/w",
-        )
-        item = BinarySecurityStageItem(
-            id="item1",
-            task_id="task1",
-            project_id="p1",
-            stage_name="system_analysis",
-            item_key="fw1",
-            item_name="fw1",
-            parent_key="fw1",
-            downstream_service="system_analyse",
-            downstream_task_id="sa-1",
-            status="failed",
-        )
-        db = _ModelAwareDb(tasks=[task], stage_items=[item])
-        calls = []
-
-        async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
-            calls.append(
-                {
-                    "db": db_arg,
-                    "task_id": task_arg.id,
-                    "refs": refs_arg,
-                    "token": token_arg,
-                }
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root=str(Path(tmp) / "output"),
+                workspace_root=tmp,
             )
+            item = BinarySecurityStageItem(
+                id="item1",
+                task_id="task1",
+                project_id="p1",
+                stage_name="system_analysis",
+                item_key="fw1",
+                item_name="fw1",
+                parent_key="fw1",
+                downstream_service="system_analyse",
+                downstream_task_id="sa-1",
+                status="failed",
+            )
+            db = _ModelAwareDb(tasks=[task], stage_items=[item])
+            calls = []
 
-        original_cleanup = self.manager._cleanup_downstream_refs
-        self.manager._cleanup_downstream_refs = fake_cleanup
-        try:
-            self.manager.retry_task(db, project_id="p1", task_id="task1")
-            self._finish_retry_prepare(db, task)
-        finally:
-            self.manager._cleanup_downstream_refs = original_cleanup
+            async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
+                calls.append(
+                    {
+                        "db": db_arg,
+                        "task_id": task_arg.id,
+                        "refs": refs_arg,
+                        "token": token_arg,
+                    }
+                )
 
-        self.assertEqual(1, len(calls))
-        self.assertEqual("task1", calls[0]["task_id"])
-        self.assertEqual("sa-1", calls[0]["refs"][0]["task_id"])
+            original_cleanup = self.manager._cleanup_downstream_refs
+            self.manager._cleanup_downstream_refs = fake_cleanup
+            try:
+                self.manager.retry_task(db, project_id="p1", task_id="task1")
+                self._finish_retry_prepare(db, task)
+            finally:
+                self.manager._cleanup_downstream_refs = original_cleanup
+
+            self.assertEqual(1, len(calls))
+            self.assertEqual("task1", calls[0]["task_id"])
+            self.assertEqual("sa-1", calls[0]["refs"][0]["task_id"])
 
     def test_continue_task_prefers_existing_downstream_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2988,6 +3071,20 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(0, fake_client.create_calls)
         self.assertEqual("sat_existing", existing_item.downstream_task_id)
         self.assertEqual("success", result["status"])
+
+    def test_stage_item_supports_identity_key_field(self):
+        item = BinarySecurityStageItem(
+            id="i1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="module1",
+            item_identity_key="module1::root",
+            status="pending",
+        )
+
+        self.assertEqual("module1::root", item.item_identity_key)
 
     def test_run_with_limits_respects_concurrency(self):
         active = 0

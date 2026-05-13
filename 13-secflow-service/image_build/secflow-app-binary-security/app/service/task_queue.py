@@ -24,11 +24,11 @@ class TaskQueue:
 
     async def push_task(self, task_id: str) -> None:
         client = await self._client_or_create()
-        await client.rpush(self.config.task_queue_key, str(task_id))
+        await self._push_unique(client, self.config.task_queue_key, str(task_id))
 
     async def push_action(self, task_id: str) -> None:
         client = await self._client_or_create()
-        await client.rpush(self.config.action_queue_key, str(task_id))
+        await self._push_unique(client, self.config.action_queue_key, str(task_id))
 
     async def pop_task(self, timeout_seconds: int | None = None) -> Optional[str]:
         client = await self._client_or_create()
@@ -36,10 +36,7 @@ class TaskQueue:
             self.config.task_queue_key,
             timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
         )
-        if not result:
-            return None
-        _, value = result
-        return str(value or "").strip() or None
+        return await self._consume_result(client, self.config.task_queue_key, result)
 
     async def pop_action(self, timeout_seconds: int | None = None) -> Optional[str]:
         client = await self._client_or_create()
@@ -47,10 +44,25 @@ class TaskQueue:
             self.config.action_queue_key,
             timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
         )
+        return await self._consume_result(client, self.config.action_queue_key, result)
+
+    async def _push_unique(self, client: Redis, queue_key: str, task_id: str) -> None:
+        value = str(task_id or "").strip()
+        if not value:
+            return
+        dedupe_key = f"{queue_key}:dedupe"
+        added = await client.sadd(dedupe_key, value)
+        if added:
+            await client.rpush(queue_key, value)
+
+    async def _consume_result(self, client: Redis, queue_key: str, result) -> Optional[str]:
         if not result:
             return None
         _, value = result
-        return str(value or "").strip() or None
+        task_id = str(value or "").strip() or None
+        if task_id:
+            await client.srem(f"{queue_key}:dedupe", task_id)
+        return task_id
 
     async def close(self) -> None:
         async with self._lock:
