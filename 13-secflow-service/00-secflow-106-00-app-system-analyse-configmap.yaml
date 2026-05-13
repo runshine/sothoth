@@ -8,11 +8,11 @@ data:
     {
       "analyse_targets": ["binary", "script", "config"],
       "binary_arch": ["all"],
-      "parallel_modules": 40,
-      "parallel_sub_workers": 40,
-      "agent_max_retries": 100,
+      "parallel_modules": 20,
+      "parallel_sub_workers": 4,
+      "agent_max_retries": 5,
       "agent_retry_delay": 30,
-      "pi_max_retries": -1,
+      "pi_max_retries": 3,
       "pi_retry_delay": 10,
       "stages": {
         "classify":    {"min_rounds": 1, "max_rounds": -1, "pass_mode": "all"},
@@ -94,8 +94,10 @@ data:
       password: "Huawei12#$"
       name: "secflow_system_analyse"
       table_prefix: "secflow_app_sa_"
-      pool_size: 10
-      max_overflow: 20
+      pool_size: 8
+      max_overflow: 8
+      pool_timeout: 15
+      pool_recycle: 1800
 
     # Auth Service Configuration
     auth_service:

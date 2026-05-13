@@ -27,6 +27,14 @@ spec:
             value: "8080"
           - name: FILESERVER_ROOT
             value: /data/files
+          - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_SIZE_API
+            value: "5"
+          - name: SECFLOW_SYSTEM_ANALYSE_DB_MAX_OVERFLOW_API
+            value: "5"
+          - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_TIMEOUT_API
+            value: "10"
+          - name: SECFLOW_SYSTEM_ANALYSE_DB_POOL_RECYCLE_API
+            value: "1800"
         ports:
         - containerPort: 8080
         volumeMounts:
@@ -44,14 +52,14 @@ spec:
             cpu: "8"
         livenessProbe:
           httpGet:
-            path: /api/app/system-analyse/health
+            path: /api/app/system-analyse/livez
             port: 8080
           initialDelaySeconds: 30
           periodSeconds: 30
           timeoutSeconds: 60
         readinessProbe:
           httpGet:
-            path: /api/app/system-analyse/health
+            path: /api/app/system-analyse/readyz
             port: 8080
           initialDelaySeconds: 15
           periodSeconds: 15
