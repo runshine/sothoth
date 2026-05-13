@@ -103,6 +103,10 @@ def observe_duration(histogram: Histogram, *labels: str) -> Iterator[None]:
 
 
 def generate_metrics_payload() -> bytes:
+    try:
+        refresh_cluster_state_metrics()
+    except Exception as exc:
+        logger.debug("failed to refresh cluster state metrics before scrape: %s", exc)
     return generate_latest()
 
 
