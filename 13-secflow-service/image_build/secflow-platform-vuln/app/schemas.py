@@ -379,3 +379,16 @@ class TimelineItem(BaseModel):
     item_type: str
     created_at: datetime
     payload: dict[str, Any]
+
+
+class VulnEngineProjectConfigUpdateRequest(BaseModel):
+    project_id: str = Field(min_length=1, max_length=64)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class VulnEngineProjectConfigResponse(BaseModel):
+    project_id: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    updated_by: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
