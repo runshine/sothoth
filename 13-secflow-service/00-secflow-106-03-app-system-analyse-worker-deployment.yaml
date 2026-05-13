@@ -42,7 +42,7 @@ spec:
           - name: SECFLOW_SYSTEM_ANALYSE_WORKER_STALE_SWEEP_INTERVAL
             value: "30"
           - name: SECFLOW_SYSTEM_ANALYSE_MAX_RUNNING_TASKS_GLOBAL
-            value: "4"
+            value: "16"
           - name: SECFLOW_SYSTEM_ANALYSE_GLOBAL_CLAIM_LOCK_KEY
             value: "secflow:system-analyse:claim"
           - name: SECFLOW_SYSTEM_ANALYSE_GLOBAL_CLAIM_LOCK_TIMEOUT_SECONDS
