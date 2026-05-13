@@ -191,7 +191,7 @@ class SchedulerService:
                     metadata_json={"service": "secflow-app-dataflow-vuln-scanner", "role": self.role},
                 )
             else:
-                if self._worker_status != "draining" and worker.status in {"active", "draining"}:
+                if self._worker_status not in {"draining", "offline"} and worker.status in {"active", "draining"}:
                     self._worker_status = worker.status
                 worker.host_name = self.host_name
                 worker.capacity = self.capacity
@@ -812,12 +812,13 @@ class SchedulerService:
         deadline = time.monotonic() + max(0, int(wait_seconds or 0))
         while self._running_tasks and time.monotonic() < deadline:
             time.sleep(1)
+        self._worker_status = "offline"
         try:
             self._heartbeat_once()
         except Exception:
             logger.exception("failed to publish worker drain completion heartbeat")
         return {
-            "status": "draining",
+            "status": "offline",
             "pod_id": self.pod_id,
             "reason": reason,
             "cancel_requested": len(cancelled),
