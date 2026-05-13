@@ -166,3 +166,4 @@ jobs:
             ghcr.io/runshine/secflow-app-system-analyse:arm64-${{ needs.prepare.outputs.date_tag }}
           docker manifest push ghcr.io/runshine/secflow-app-system-analyse:latest
           docker manifest push ghcr.io/runshine/secflow-app-system-analyse:${{ needs.prepare.outputs.date_tag }}
+
