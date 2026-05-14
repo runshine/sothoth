@@ -1122,6 +1122,8 @@ class AtomicWorkflowEngine:
         }
         if actionable == {"framework"}:
             return "framework"
+        if issues and all(AtomicWorkflowEngine._is_summary_or_ledger_issue(item) for item in issues):
+            return "summary_or_ledger"
         if actionable:
             if actionable <= {"report", "summary", "ledger"}:
                 return "summary_or_ledger"
@@ -1137,6 +1139,62 @@ class AtomicWorkflowEngine:
         if categories and categories <= report_categories:
             return "summary_or_ledger"
         return "analysis"
+
+    @staticmethod
+    def _is_summary_or_ledger_issue(issue: dict) -> bool:
+        owner = str(issue.get("actionable_by") or issue.get("owner") or "").strip().lower()
+        category = str(issue.get("category") or "").strip().lower()
+        blocking_type = str(issue.get("blocking_type") or issue.get("blocker_type") or "").strip().lower()
+        text = " ".join(
+            str(issue.get(key) or "")
+            for key in (
+                "id",
+                "category",
+                "blocking_type",
+                "target",
+                "required_action",
+                "detail",
+                "description",
+                "acceptance_criteria",
+            )
+        ).lower()
+        summary_blocking_types = {
+            "documentation_gap",
+            "ledger_sync",
+            "metadata_sync",
+            "summary_only_evidence",
+            "format_gap",
+            "report_completeness",
+            "limitations_honesty",
+        }
+        ledger_sync_markers = (
+            "coverage_ledger.json",
+            "issue_ledger.json",
+            "evidence_sources",
+            "status=documented",
+            "同步到 coverage_ledger",
+            "同步到 ledger",
+        )
+        has_ledger_sync_marker = any(marker in text for marker in ledger_sync_markers)
+        security_markers = ("export", "used", "input", "sink", "源码", "函数", "漏洞", "cwe", "边界", "绕过")
+        if owner == "worker" and any(marker in text for marker in security_markers) and not has_ledger_sync_marker and blocking_type not in summary_blocking_types:
+            return False
+        if owner in {"report", "summary", "ledger"}:
+            return True
+        if category in {
+            "report_completeness",
+            "limitations_honesty",
+            "summary",
+            "ledger",
+            "metadata",
+            "metadata_sync",
+            "format",
+            "format_gap",
+        }:
+            return True
+        if blocking_type in summary_blocking_types:
+            return True
+        return has_ledger_sync_marker
 
     @staticmethod
     def _result_fingerprint_digest(fingerprints: dict[str, str]) -> str:
