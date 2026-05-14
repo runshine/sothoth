@@ -105,6 +105,10 @@ def _now() -> datetime:
     return now_local()
 
 
+def _isoformat_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
 def _elapsed_seconds_since(value: datetime | None) -> float | None:
     """Return elapsed seconds for naive DB datetimes across UTC/UTC+8 writers.
 
@@ -4519,6 +4523,15 @@ class TaskManager:
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         stage_summaries = self._build_stage_summaries(db, task, stage_sequence, stage_runs, items)
+        manual_operation_state = self._build_manual_operation_state(
+            db,
+            task,
+            task_retry_supported=task_retry_supported,
+            task_retry_reason=task_retry_reason,
+            task_continue_supported=task_continue_supported,
+            task_continue_reason=task_continue_reason,
+            stage_summaries=stage_summaries,
+        )
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -4554,7 +4567,85 @@ class TaskManager:
             task_continue_supported=task_continue_supported,
             task_continue_reason=task_continue_reason,
             stage_summaries=stage_summaries,
+            manual_operation_state=manual_operation_state,
         )
+
+    def _build_manual_operation_state(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        task_retry_supported: bool,
+        task_retry_reason: str | None,
+        task_continue_supported: bool,
+        task_continue_reason: str | None,
+        stage_summaries: list[BinarySecurityStageSummary],
+    ) -> dict[str, Any]:
+        now_value = _now()
+        lock_active = bool(task.operation_lock_expires_at and task.operation_lock_expires_at > now_value)
+        operation_type = str(task.operation_lock_type or task.pending_action or "").strip() or None
+        operation_owner = str(task.operation_lock_owner or "").strip() or None
+        has_stage_retry = any(bool(summary.retry_supported) for summary in stage_summaries)
+        preparing = task.status in TASK_PREPARING_STATUSES
+        running = task.status in {"dispatching", "running"}
+        waiting_modules = task.status in {TASK_STATUS_PENDING_MODULE_CONFIRMATION, "waiting_confirmation"}
+
+        can_cancel = task.status not in TASK_TERMINAL_STATUSES and not preparing and not lock_active
+        can_continue = bool(task_continue_supported) and not lock_active
+        can_retry = bool(task_retry_supported) and not lock_active
+        can_retry_stage = has_stage_retry and not lock_active and not running and not preparing
+        can_delete = not lock_active
+        can_edit_policy = task.status not in {"dispatching", "running"} | TASK_PREPARING_STATUSES and not lock_active
+        can_confirm_modules = waiting_modules and not lock_active
+
+        blocking_code: str | None = None
+        blocking_reason: str | None = None
+        overall = "ready"
+        summary = "当前任务允许手工操作"
+        if lock_active:
+            blocking_code = "task_operation_in_progress"
+            blocking_reason = f"当前任务正在执行 {operation_type or '未知'} 操作，请稍后重试"
+            overall = "in_progress"
+            summary = blocking_reason
+        elif preparing:
+            blocking_code = "task_preparing"
+            blocking_reason = f"当前任务正在执行 {task.pending_action or operation_type or '后台准备'}，暂不可手工操作"
+            overall = "in_progress"
+            summary = blocking_reason
+        elif waiting_modules:
+            blocking_code = "pending_module_confirmation"
+            blocking_reason = "当前任务等待模块确认，请先确认模块后再执行其他操作"
+            overall = "blocked"
+            summary = blocking_reason
+        elif running:
+            blocking_code = "task_running"
+            blocking_reason = f"当前任务正在执行中，当前状态 {task.status} 下仅支持取消或同步状态"
+            overall = "blocked"
+            summary = blocking_reason
+        elif not any([can_cancel, can_continue, can_retry, can_retry_stage, can_delete, can_edit_policy, can_confirm_modules]):
+            blocking_code = "no_manual_operation"
+            blocking_reason = task_continue_reason or task_retry_reason or "当前任务暂无可执行的手工操作"
+            overall = "blocked"
+            summary = blocking_reason
+
+        return {
+            "overall": overall,
+            "summary": summary,
+            "blocking_code": blocking_code,
+            "blocking_reason": blocking_reason,
+            "operation_in_progress": lock_active or preparing,
+            "operation_type": operation_type,
+            "operation_owner": operation_owner,
+            "operation_expires_at": _isoformat_or_none(task.operation_lock_expires_at),
+            "operation_heartbeat_at": _isoformat_or_none(task.operation_lock_heartbeat_at),
+            "can_cancel": can_cancel,
+            "can_continue": can_continue,
+            "can_retry": can_retry,
+            "can_retry_stage": can_retry_stage,
+            "can_delete": can_delete,
+            "can_edit_policy": can_edit_policy,
+            "can_confirm_modules": can_confirm_modules,
+        }
 
     def _stage_item_response(self, item: BinarySecurityStageItem) -> BinarySecurityStageItemResponse:
         return BinarySecurityStageItemResponse(
