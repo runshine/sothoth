@@ -23,7 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, load_only
 
 from app.config import get_config
-from app.exception import NotFoundError, ValidationError
+from app.exception import ConflictError, NotFoundError, ValidationError
 from app.model import (
     STAGE_SEQUENCE,
     TASK_STAGE_SEQUENCES,
@@ -1585,6 +1585,7 @@ class TaskManager:
         if not refs:
             return
         await self._cancel_downstream_refs(db, task, refs, token)
+        await self._ensure_downstream_refs_inactive(db, task, refs, token)
         await self._delete_downstream_refs(db, task, refs, token)
 
     async def _seed_work_queues(self) -> None:
@@ -5941,6 +5942,64 @@ class TaskManager:
         db.commit()
         return success_count
 
+    async def _fetch_downstream_ref_payload(self, ref: dict[str, str], token: str | None) -> dict[str, Any]:
+        service = str(ref.get("service") or "").strip()
+        task_id = str(ref.get("task_id") or "").strip()
+        project_id = str(ref.get("project_id") or "").strip()
+        if not service or not task_id:
+            raise ValidationError("下游引用缺少 service/task_id")
+        if service == "firmware_unpacker":
+            return await get_firmware_unpacker_client().get_task(project_id, task_id, token or "")
+        if service == "system_analyse":
+            return await get_system_analyse_client().get_task(task_id)
+        if service == "binary_to_source":
+            return await get_binary_to_source_client().get_task(project_id, task_id, token or "")
+        if service == "entry_analyse":
+            return await get_entry_analyse_client().get_task(task_id)
+        if service == "dataflow_analyse":
+            return await get_dataflow_analyse_client().get_task(task_id)
+        if service == "dataflow_vuln_scanner":
+            return await get_dataflow_vuln_scanner_client().get_task(task_id, token or "")
+        raise ValidationError(f"未知下游服务: {service}")
+
+    async def _wait_downstream_ref_inactive(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        ref: dict[str, str],
+        token: str | None,
+    ) -> None:
+        del db, task
+        # system-analyse rejects delete while running. Wait for it to actually
+        # leave queued/running before we rebuild the stage and create a new task.
+        if str(ref.get("service") or "").strip() != "system_analyse":
+            return
+        timeout_seconds = max(
+            int(self.cfg.scheduler.downstream_request_timeout_seconds or 120),
+            int(self.cfg.scheduler.stage_poll_interval_seconds or 5) * 2,
+        )
+        deadline = _now() + timedelta(seconds=timeout_seconds)
+        while _now() <= deadline:
+            try:
+                payload = await self._fetch_downstream_ref_payload(ref, token)
+            except NotFoundError:
+                return
+            mapped_status = self._map_downstream_status(str(payload.get("status") or "")) or str(payload.get("status") or "").lower()
+            if mapped_status not in {"queued", "running", "dispatching", "pending"}:
+                return
+            await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
+        raise ValidationError(f"旧下游任务仍在运行，不能安全继续: {ref.get('service')}:{ref.get('task_id')}")
+
+    async def _ensure_downstream_refs_inactive(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        refs: list[dict[str, str]],
+        token: str | None,
+    ) -> None:
+        for ref in refs:
+            await self._wait_downstream_ref_inactive(db, task, ref, token)
+
     async def _delete_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
         for ref in refs:
             self._record_event(
@@ -5981,6 +6040,8 @@ class TaskManager:
             if exc is None and ok:
                 success_count += 1
                 continue
+            if isinstance(exc, ConflictError):
+                raise ValidationError(f"旧下游任务仍在运行，不能安全删除: {ref['service']}:{ref['task_id']}") from exc
             self._record_event(
                 db,
                 task,

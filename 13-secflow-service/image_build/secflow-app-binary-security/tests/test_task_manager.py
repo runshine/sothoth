@@ -1841,6 +1841,99 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("task1", calls[0]["task_id"])
             self.assertEqual("sa-1", calls[0]["refs"][0]["task_id"])
 
+    def test_cleanup_downstream_refs_waits_for_system_analyse_to_stop_before_delete(self):
+        refs = [{"service": "system_analyse", "task_id": "sat-1", "project_id": "p1", "stage_name": "system_analysis"}]
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+        )
+        db = _ModelAwareDb(tasks=[task])
+        calls = []
+        responses = iter([
+            {"status": "running"},
+            {"status": "cancelled"},
+        ])
+
+        async def fake_cancel(*args, **kwargs):
+            calls.append("cancel")
+            return 1
+
+        async def fake_delete(*args, **kwargs):
+            calls.append("delete")
+            return 1
+
+        async def fake_fetch(*args, **kwargs):
+            calls.append("fetch")
+            return next(responses)
+
+        async def fake_sleep(*args, **kwargs):
+            return None
+
+        original_cancel = self.manager._cancel_downstream_refs
+        original_delete = self.manager._delete_downstream_refs
+        original_fetch = self.manager._fetch_downstream_ref_payload
+        original_sleep = task_manager_module.asyncio.sleep
+        self.manager._cancel_downstream_refs = fake_cancel
+        self.manager._delete_downstream_refs = fake_delete
+        self.manager._fetch_downstream_ref_payload = fake_fetch
+        task_manager_module.asyncio.sleep = fake_sleep
+        try:
+            asyncio.run(self.manager._cleanup_downstream_refs(db, task, refs, None))
+        finally:
+            self.manager._cancel_downstream_refs = original_cancel
+            self.manager._delete_downstream_refs = original_delete
+            self.manager._fetch_downstream_ref_payload = original_fetch
+            task_manager_module.asyncio.sleep = original_sleep
+
+        self.assertEqual(["cancel", "fetch", "fetch", "delete"], calls)
+
+    def test_cleanup_downstream_refs_raises_when_system_analyse_stays_running(self):
+        refs = [{"service": "system_analyse", "task_id": "sat-1", "project_id": "p1", "stage_name": "system_analysis"}]
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+        )
+        db = _ModelAwareDb(tasks=[task])
+
+        async def fake_cancel(*args, **kwargs):
+            return 1
+
+        async def fake_fetch(*args, **kwargs):
+            return {"status": "running"}
+
+        async def fake_sleep(*args, **kwargs):
+            return None
+
+        original_cancel = self.manager._cancel_downstream_refs
+        original_fetch = self.manager._fetch_downstream_ref_payload
+        original_sleep = task_manager_module.asyncio.sleep
+        self.manager._cancel_downstream_refs = fake_cancel
+        self.manager._fetch_downstream_ref_payload = fake_fetch
+        task_manager_module.asyncio.sleep = fake_sleep
+        self.manager.cfg.scheduler.downstream_request_timeout_seconds = 0
+        self.manager.cfg.scheduler.stage_poll_interval_seconds = 0
+        try:
+            with self.assertRaises(ValidationError):
+                asyncio.run(self.manager._cleanup_downstream_refs(db, task, refs, None))
+        finally:
+            self.manager._cancel_downstream_refs = original_cancel
+            self.manager._fetch_downstream_ref_payload = original_fetch
+            task_manager_module.asyncio.sleep = original_sleep
+
     def test_continue_task_prefers_existing_downstream_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = BinarySecurityTask(
